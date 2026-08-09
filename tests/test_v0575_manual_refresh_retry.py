@@ -9,6 +9,7 @@ def make_manager(tmp_path: Path) -> AnimeManager:
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
     cfg.library.root_dir = tmp_path / "library"
+    cfg.paths.cache_dir = tmp_path / "cache"
     cfg.library.root_dir.mkdir(parents=True, exist_ok=True)
     return AnimeManager(cfg, log=lambda _message: None)
 

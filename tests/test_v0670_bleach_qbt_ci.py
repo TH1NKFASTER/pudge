@@ -89,7 +89,7 @@ def test_alignment_generation_requeues_only_playback_copies_from_alignment_cache
     assert unaffected is not None
     assert unaffected.subtitle_path == unaffected_playback.resolve()
     assert final_pipeline_cache_available(video, cfg) is False
-    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
 
 
 def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(

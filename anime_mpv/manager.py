@@ -2657,6 +2657,51 @@ class AnimeManager:
             removed += 1
         return removed
 
+    def _repair_legacy_qbittorrent_paths(self, client, items: list[DownloadItem]) -> int:
+        """Repair qBittorrent save paths left behind by the Anime MPV -> Pudge rename."""
+        set_location = getattr(client, "set_location", None)
+        if not callable(set_location):
+            return 0
+        recheck = getattr(client, "recheck", None)
+        current_root = self.config.library.root_dir.expanduser().resolve()
+        repaired = 0
+        for item in items:
+            if str(item.state or "").casefold() != "missingfiles":
+                continue
+            raw_save = str(item.save_path or "").strip()
+            if not raw_save:
+                continue
+            old_save = Path(raw_save).expanduser()
+            target: Path | None = None
+            for legacy_name in LEGACY_APP_NAMES:
+                legacy_root = current_root.parent / legacy_name
+                try:
+                    relative = old_save.relative_to(legacy_root)
+                except ValueError:
+                    continue
+                candidate = current_root / relative
+                if candidate.exists():
+                    target = candidate.resolve()
+                    break
+            if target is None:
+                continue
+            try:
+                set_location(item.torrent_hash, target)
+                if callable(recheck):
+                    recheck(item.torrent_hash)
+            except QBittorrentError as exc:
+                self.logger.warning(
+                    "FAIL step=qbittorrent.legacy_path torrent=%s old=%r new=%r error=%r",
+                    item.torrent_hash, str(old_save), str(target), str(exc),
+                )
+                continue
+            repaired += 1
+            self.logger.info(
+                "REPAIR step=qbittorrent.legacy_path torrent=%s old=%r new=%r recheck=%s",
+                item.torrent_hash, str(old_save), str(target), callable(recheck),
+            )
+        return repaired
+
     def sync_downloads(self) -> int:
         self._last_missing_episode_rows = 0
         completed_paths: list[Path] = []
@@ -2671,6 +2716,9 @@ class AnimeManager:
                     *LEGACY_APP_SLUGS,
                 }
                 all_items = client.torrents(category="")
+                repaired_paths = self._repair_legacy_qbittorrent_paths(client, all_items)
+                if repaired_paths:
+                    all_items = client.torrents(category="")
                 items = [
                     item
                     for item in all_items
@@ -4080,7 +4128,7 @@ class AnimeManager:
         return repaired
 
     def _requeue_legacy_generated_subtitles(self) -> int:
-        generation = "15"
+        generation = "16"
         previous_generation = self.db.get_state("subtitle_validation_generation", "")
         if previous_generation == generation:
             return 0
@@ -4132,6 +4180,29 @@ class AnimeManager:
             folder = relative.parts[0] if relative is not None and relative.parts else ""
             if previous_generation == "14":
                 if folder != "playback-srt" or subtitle.name not in aligned_playback_names:
+                    continue
+            if previous_generation == "15":
+                # v15 could miss stale aligned playback files when the old
+                # synced/ALASS source had already been pruned. Reconstruct the
+                # playback filename that a direct clean of the recorded Jimaku
+                # candidate would have produced. A different current filename
+                # proves that an intermediate transformed/aligned SRT was used.
+                if folder != "playback-srt" or not latest:
+                    continue
+                if str(latest.get("source") or "").casefold() != "jimaku":
+                    continue
+                candidate_value = str(latest.get("candidate_path") or "").strip()
+                candidate = Path(candidate_value).expanduser() if candidate_value else None
+                if candidate is None or not candidate.is_file():
+                    continue
+                try:
+                    candidate_stat = candidate.stat()
+                    direct_digest = hashlib.sha1(
+                        f"{candidate.resolve()}:{candidate_stat.st_size}:{candidate_stat.st_mtime_ns}:playback-srt-v12".encode()
+                    ).hexdigest()[:20]
+                except OSError:
+                    continue
+                if subtitle.name == f"v12-{direct_digest}.srt":
                     continue
             if previous_generation == "2" and folder != "alass":
                 continue

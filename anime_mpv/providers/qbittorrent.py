@@ -451,6 +451,38 @@ class QBittorrentClient:
         self.login()
         self._set_category_and_tags(torrent_hash, category=category, tags=tags)
 
+    def set_location(self, torrent_hash: str, location: Path) -> None:
+        """Move qBittorrent's save location without touching the torrent files."""
+        value = str(torrent_hash or "").strip()
+        if not value:
+            return
+        target = location.expanduser()
+        self.login()
+        try:
+            response = self.client.post(
+                "/api/v2/torrents/setLocation",
+                data={"hashes": value, "location": str(target)},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise QBittorrentError(
+                f"Не удалось обновить путь торрента qBittorrent: {exc}"
+            ) from exc
+
+    def recheck(self, torrent_hash: str) -> None:
+        value = str(torrent_hash or "").strip()
+        if not value:
+            return
+        self.login()
+        try:
+            response = self.client.post(
+                "/api/v2/torrents/recheck",
+                data={"hashes": value},
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise QBittorrentError(f"Не удалось перепроверить торрент qBittorrent: {exc}") from exc
+
     def add_release(
         self,
         release: NyaaRelease,

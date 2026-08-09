@@ -123,4 +123,4 @@ def test_generation_eleven_requeues_only_generated_playback_outputs(tmp_path: Pa
     alass = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
     assert playback is not None and playback.subtitle_path is None
     assert alass is not None and alass.subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "16"

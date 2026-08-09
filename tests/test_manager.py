@@ -1071,6 +1071,7 @@ def test_regular_maintenance_searches_missing_before_upgrades(tmp_path: Path, mo
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
     cfg.library.root_dir = tmp_path / "library"
+    cfg.paths.cache_dir = tmp_path / "cache"
     manager = AnimeManager(cfg, log=lambda _message: None)
     order: list[str] = []
 
@@ -1096,6 +1097,7 @@ def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_p
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
     cfg.library.root_dir = tmp_path / "library"
+    cfg.paths.cache_dir = tmp_path / "cache"
     manager = AnimeManager(cfg, log=lambda _message: None)
     order: list[str] = []
 
@@ -1457,7 +1459,7 @@ def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
 
 
 def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -> None:
@@ -1630,7 +1632,7 @@ def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
 
 
 def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeypatch) -> None:
