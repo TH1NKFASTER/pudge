@@ -16,7 +16,7 @@ from .logging_utils import configure_logging, timed_step
 from .subtitle_formats import parse_srt
 
 
-SEMANTIC_CACHE_SCHEMA = "semantic-v3"
+SEMANTIC_CACHE_SCHEMA = "semantic-v4"
 SEMANTIC_CACHE_ACCEPTED_TTL_SECONDS = 30 * 24 * 3600
 SEMANTIC_CACHE_REJECTED_TTL_SECONDS = 6 * 3600
 
@@ -338,33 +338,49 @@ class OllamaClient:
                 except (TypeError, ValueError):
                     sample_scores.append(0.0)
 
-        # Models sometimes reject an otherwise correct track because one sampled
-        # group contains a title card, song, sign, or credits. Aggregate the
-        # per-sample judgements locally and allow one isolated outlier when the
-        # remaining interior samples agree strongly. This is intentionally only
-        # enabled when a complete score vector was returned.
+        # Treat the per-sample score vector as the auditable evidence. Some local
+        # models produce internally contradictory aggregate fields (for example,
+        # reason="samples 2-6 strongly align" while reporting similarity=0.15 and
+        # matched_samples=2/6). A complete score vector lets us reconcile that
+        # contradiction deterministically; timing activity remains a separate gate.
         robust_accepted = False
         robust_similarity = 0.0
         robust_matches = 0
         required_matches = len(samples)
+        consensus_kind = ""
         if len(sample_scores) == len(samples):
             robust_matches = sum(score >= 0.55 for score in sample_scores)
-            required_matches = len(samples) - 1 if len(samples) >= 5 else len(samples)
+            if len(samples) >= 6:
+                required_matches = len(samples) - 1
+            elif len(samples) >= 5:
+                required_matches = len(samples) - 1
             retained = sorted(sample_scores, reverse=True)[:required_matches]
             robust_similarity = statistics.median(retained) if retained else 0.0
             robust_accepted = (
                 robust_matches >= required_matches
-                and robust_similarity >= threshold
-                and max(sample_scores, default=0.0) >= 0.75
+                and robust_similarity >= max(threshold, 0.70)
+                and max(sample_scores, default=0.0) >= 0.80
             )
+            if robust_accepted:
+                consensus_kind = (
+                    "unanimous"
+                    if robust_matches == len(samples)
+                    else "near_unanimous"
+                    if robust_matches >= len(samples) - 1
+                    else "strong_majority"
+                )
 
         strict_accepted = same_episode and usable and similarity >= threshold
         accepted = strict_accepted or robust_accepted
         reason = str(result.get("reason") or ("accepted" if accepted else "semantic_mismatch"))
-        if robust_accepted and not strict_accepted:
-            reason = f"accepted_with_one_semantic_outlier: {reason}"
+        if robust_accepted:
             matched = max(matched, robust_matches)
             similarity = max(similarity, robust_similarity)
+        if robust_accepted and not strict_accepted:
+            if robust_matches == len(samples) - 1:
+                reason = f"accepted_with_one_semantic_outlier: {reason}"
+            else:
+                reason = f"accepted_from_sample_scores:{consensus_kind}: {reason}"
 
         final_result = {
             "accepted": accepted,
@@ -382,6 +398,7 @@ class OllamaClient:
             "robust_similarity": round(robust_similarity, 4),
             "robust_matches": robust_matches,
             "robust_required_matches": required_matches,
+            "semantic_consensus_kind": consensus_kind,
             "cached": False,
         }
         if cache_path is not None:

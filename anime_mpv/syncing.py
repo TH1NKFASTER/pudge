@@ -94,22 +94,75 @@ def _apply_robust_semantic_activity_gate(
     *,
     minimum_activity: float = 0.65,
 ) -> dict[str, object]:
-    """Require strong clock agreement when semantic acceptance ignored one outlier."""
-    if not bool(validation.get("accepted")):
-        return validation
-    if not bool(validation.get("robust_semantic_acceptance")):
-        return validation
+    """Cross-check semantic evidence against an independent timing signal."""
     if bool(validation.get("strict_semantic_acceptance")):
         return validation
 
     weighted = float(activity.get("weighted") or 0.0) if activity.get("available") else 0.0
-    validation["robust_activity_threshold"] = minimum_activity
-    validation["robust_activity_score"] = round(weighted, 4)
-    if weighted < minimum_activity:
-        validation["accepted"] = False
-        validation["reason"] = (
-            f"robust_semantic_activity_too_low:{weighted:.4f}<{minimum_activity:.4f}"
+    try:
+        matched = int(validation.get("robust_matches") or validation.get("matched_samples") or 0)
+        total = int(validation.get("total_samples") or 0)
+        similarity = float(
+            validation.get("robust_similarity")
+            or validation.get("similarity")
+            or 0.0
         )
+    except (TypeError, ValueError):
+        matched, total, similarity = 0, 0, 0.0
+
+    scores = validation.get("sample_scores")
+    complete_scores = isinstance(scores, list) and total > 0 and len(scores) == total
+
+    if bool(validation.get("accepted")) and bool(
+        validation.get("robust_semantic_acceptance")
+    ):
+        required_activity = float(minimum_activity)
+
+        if total >= 5 and matched >= total and similarity >= 0.85:
+            required_activity = 0.50
+        elif total >= 5 and matched >= total - 1 and similarity >= 0.75:
+            required_activity = 0.60
+        elif total >= 6 and matched >= total - 2 and similarity >= 0.75:
+            required_activity = 0.78
+
+        validation["robust_activity_threshold"] = required_activity
+        validation["robust_activity_score"] = round(weighted, 4)
+
+        if weighted < required_activity:
+            validation["accepted"] = False
+            validation["reason"] = (
+                f"robust_semantic_activity_too_low:"
+                f"{weighted:.4f}<{required_activity:.4f}"
+            )
+        return validation
+
+    if (
+        not bool(validation.get("accepted"))
+        and complete_scores
+        and total >= 6
+        and matched >= total - 2
+        and similarity >= 0.75
+    ):
+        required_activity = 0.78
+        validation["robust_activity_threshold"] = required_activity
+        validation["robust_activity_score"] = round(weighted, 4)
+
+        if weighted >= required_activity:
+            validation["accepted"] = True
+            validation["activity_assisted_semantic_acceptance"] = True
+            validation["matched_samples"] = max(
+                int(validation.get("matched_samples") or 0),
+                matched,
+            )
+            validation["similarity"] = max(
+                float(validation.get("similarity") or 0.0),
+                similarity,
+            )
+            validation["reason"] = (
+                "accepted_from_sample_scores_with_activity: "
+                + str(validation.get("reason") or "semantic majority")
+            )
+
     return validation
 
 
@@ -3818,6 +3871,15 @@ def optimize_subtitle(
                         # global clock can recover even when a non-linear ALASS map sampled
                         # the wrong scenes (BLEACH absolute E43 / DSNP vs TVA).
                         offset_attempts: list[dict[str, object]] = []
+                        accepted_offset_candidates: list[
+                            tuple[
+                                tuple[float, float, float, float, float],
+                                Path,
+                                dict[str, object],
+                                dict[str, object],
+                                float,
+                            ]
+                        ] = []
                         recovered = False
                         for estimate in estimate_constant_subtitle_offsets(
                             semantic_source,
@@ -3892,20 +3954,74 @@ def optimize_subtitle(
                             if not shifted_accepted:
                                 continue
 
-                            shifted_validation["constant_offset_attempts"] = list(offset_attempts)
-                            timing_reference_validation = shifted_validation
-                            prealigned_reference_path = shifted_semantic
+                            try:
+                                semantic_matches = float(
+                                    shifted_validation.get("matched_samples") or 0
+                                )
+                                semantic_total = max(
+                                    1.0, float(shifted_validation.get("total_samples") or 1)
+                                )
+                                semantic_similarity = float(
+                                    shifted_validation.get("similarity") or 0.0
+                                )
+                                activity_score = float(
+                                    shifted_activity.get("weighted") or 0.0
+                                )
+                                estimate_priority = float(
+                                    estimate.get("semantic_priority") or 0.0
+                                )
+                            except (TypeError, ValueError):
+                                semantic_matches = 0.0
+                                semantic_total = 1.0
+                                semantic_similarity = 0.0
+                                activity_score = 0.0
+                                estimate_priority = 0.0
+                            accepted_offset_candidates.append(
+                                (
+                                    (
+                                        semantic_matches / semantic_total,
+                                        semantic_similarity,
+                                        activity_score,
+                                        estimate_priority,
+                                        -abs(candidate_offset),
+                                    ),
+                                    shifted_semantic,
+                                    dict(shifted_validation),
+                                    dict(estimate),
+                                    candidate_offset,
+                                )
+                            )
+
+                        if accepted_offset_candidates:
+                            (
+                                _best_rank,
+                                best_shifted_path,
+                                best_validation,
+                                best_estimate,
+                                best_offset,
+                            ) = max(accepted_offset_candidates, key=lambda item: item[0])
+                            best_validation["constant_offset_attempts"] = list(offset_attempts)
+                            timing_reference_validation = best_validation
+                            prealigned_reference_path = best_shifted_path
                             prealigned_reference_result = _result(
                                 "applied",
                                 sync_was_successful=True,
                                 engine="embedded-reference+constant-offset",
-                                output=str(shifted_semantic),
-                                offset_seconds=round(candidate_offset, 3),
+                                output=str(best_shifted_path),
+                                offset_seconds=round(best_offset, 3),
                                 framerate_scale_factor=1.0,
-                                constant_offset_estimate=dict(estimate),
+                                constant_offset_estimate=best_estimate,
                             )
                             recovered = True
-                            break
+                            if verbose:
+                                print(
+                                    "  Выбран лучший constant-offset эталон: "
+                                    f"offset={best_offset:+.2f}s, "
+                                    f"similarity={best_validation.get('similarity', '-')}, "
+                                    f"phrases={best_validation.get('matched_samples', '-')}/"
+                                    f"{best_validation.get('total_samples', '-')}, "
+                                    f"activity={best_validation.get('reference_activity', {}).get('weighted', '-')}"
+                                )
 
                         if not recovered:
                             if offset_attempts:

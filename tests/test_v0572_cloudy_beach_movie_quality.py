@@ -128,4 +128,4 @@ def test_rejected_semantic_cache_expires_quickly(tmp_path: Path, monkeypatch) ->
 
     assert second["cached"] is False
     assert calls == 2
-    assert SEMANTIC_CACHE_SCHEMA == "semantic-v3"
+    assert SEMANTIC_CACHE_SCHEMA == "semantic-v4"

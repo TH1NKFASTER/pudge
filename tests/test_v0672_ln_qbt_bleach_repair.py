@@ -24,7 +24,7 @@ def _cfg(tmp_path: Path) -> AppConfig:
 
 
 def test_v0672_version() -> None:
-    assert __version__ == "0.6.73"
+    assert __version__ == "0.6.74"
 
 
 def test_alignment_generation_uses_history_when_old_sync_source_was_pruned(

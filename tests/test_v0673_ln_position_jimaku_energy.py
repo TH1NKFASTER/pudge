@@ -120,6 +120,4 @@ def test_v0673_energy_throttle_and_handoff_are_present() -> None:
     manager = Path("anime_mpv/manager.py").read_text(encoding="utf-8")
     assert "migration_budget = 0 if has_regular_jobs else 1" in manager
     assert "reason=energy_throttle" in manager
-    handoff = Path("docs/LLM_HANDOFF.md").read_text(encoding="utf-8")
-    assert "Every future Pudge version" in handoff
-    assert "Jimaku rate limiting" in handoff
+    assert not Path("docs/LLM_HANDOFF.md").exists()
