@@ -2,7 +2,7 @@
 
 Pudge is a macOS anime library/player manager built around AniList, Nyaa, qBittorrent/aria2, mpv and Japanese subtitles.
 
-Current version: **0.6.69**.
+Current version: **0.6.70**.
 
 ## Install a release
 
@@ -11,7 +11,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then:
 ```bash
 cd ~/Downloads
 rm -rf pudge
-unzip pudge-macos-v0.6.69.zip
+unzip pudge-macos-v0.6.70.zip
 cd pudge
 ./install.sh
 ```

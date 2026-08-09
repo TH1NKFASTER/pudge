@@ -31,6 +31,8 @@ def test_completed_watch_order_card_has_ready_status() -> None:
 def test_installer_force_reinstalls_bundled_wheel() -> None:
     installer = INSTALLER.read_text(encoding="utf-8")
 
+    assert '[[ -d "$PROJECT_DIR/.git" ]]' in installer
+    assert 'pip wheel "$PROJECT_DIR"' in installer
     assert 'WHEEL_CANDIDATES=("$PROJECT_DIR"/anime_mpv-*.whl(N))' in installer
     assert 'pip install --force-reinstall --no-deps "$WHEEL_PATH"' in installer
 

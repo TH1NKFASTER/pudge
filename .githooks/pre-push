@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -u
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+BATCHES=4
+FAILED=0
+
+echo "=== Pudge: running all tests before push ==="
+
+for ((i=0; i<BATCHES; i++)); do
+  echo
+  echo "=== Test batch $((i + 1))/$BATCHES ==="
+
+  python3 scripts/run_test_batch.py \
+    --batch "$i" \
+    --batches "$BATCHES"
+
+  STATUS=$?
+
+  if [ "$STATUS" -ne 0 ]; then
+    FAILED=1
+  fi
+done
+
+echo
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "❌ Tests failed. git push cancelled."
+  exit 1
+fi
+
+echo "✅ All test batches passed. Continuing git push."
+exit 0

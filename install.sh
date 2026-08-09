@@ -70,9 +70,23 @@ rm -rf "$VENV_DIR"
 python3.12 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
 
-WHEEL_CANDIDATES=("$PROJECT_DIR"/anime_mpv-*.whl(N))
+WHEEL_BUILD_DIR=""
+if [[ -d "$PROJECT_DIR/.git" ]]; then
+  # Development checkout: always build the wheel from the current working tree.
+  # This prevents a stale wheel from a previous version from being installed
+  # after applying a source patch. Keep build artifacts out of the repository.
+  WHEEL_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_SLUG}-wheel.XXXXXX")"
+  trap '[[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"' EXIT
+  "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
+  "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
+    --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
+  WHEEL_CANDIDATES=("$WHEEL_BUILD_DIR"/anime_mpv-*.whl(N))
+else
+  # Release ZIPs already contain the exact wheel built by GitHub Actions.
+  WHEEL_CANDIDATES=("$PROJECT_DIR"/anime_mpv-*.whl(N))
+fi
 if (( ${#WHEEL_CANDIDATES[@]} != 1 )) || [[ ! -f "${WHEEL_CANDIDATES[1]}" ]]; then
-  echo "Installer error: expected exactly one anime_mpv wheel next to install.sh." >&2
+  echo "Installer error: expected exactly one anime_mpv wheel." >&2
   exit 1
 fi
 WHEEL_PATH="${WHEEL_CANDIDATES[1]}"

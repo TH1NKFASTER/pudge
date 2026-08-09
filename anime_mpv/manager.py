@@ -268,7 +268,16 @@ class AnimeManager:
                     if episode is not None
                     else f"{title} is ready to watch with subtitles."
                 )
-        delivered = send_native_notification(subtitle, message)
+        try:
+            delivered = send_native_notification(subtitle, message)
+        except Exception as exc:
+            # Notifications are best-effort UI. A macOS notification backend
+            # failure must never roll back an otherwise successful subtitle job.
+            delivered = False
+            self.logger.warning(
+                "FALLBACK step=notification.ready media_id=%s episode=%s error=%r",
+                media_id, episode, str(exc),
+            )
         if delivered:
             self.db.set_state(episode_key, "delivered")
             if notify_full and full_key:
@@ -4071,11 +4080,32 @@ class AnimeManager:
         return repaired
 
     def _requeue_legacy_generated_subtitles(self) -> int:
-        generation = "14"
+        generation = "15"
         previous_generation = self.db.get_state("subtitle_validation_generation", "")
         if previous_generation == generation:
             return 0
         cache_root = self.config.paths.cache_dir.expanduser().resolve()
+
+        # v15 changes the alignment algorithm.  Do not rebuild every cleaned
+        # playback SRT: only files whose v12 playback copy can be traced back to
+        # an alignment cache are affected. This keeps the one-time migration
+        # small while invalidating stale ffsubsync/ALASS results such as Bleach.
+        aligned_playback_names: set[str] = set()
+        if previous_generation == "14":
+            for folder in ("synced", "alass", "piecewise", "reference-piecewise"):
+                root = cache_root / folder
+                if not root.is_dir():
+                    continue
+                for source in root.glob("*.srt"):
+                    try:
+                        stat = source.stat()
+                    except OSError:
+                        continue
+                    digest = hashlib.sha1(
+                        f"{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v12".encode()
+                    ).hexdigest()[:20]
+                    aligned_playback_names.add(f"v12-{digest}.srt")
+
         queued = 0
         for item in self.db.episodes():
             subtitle = item.subtitle_path
@@ -4089,15 +4119,20 @@ class AnimeManager:
                 relative = None
             if not generated:
                 continue
-            # v14 changes OCR text extraction only.  Users already on v13 do
-            # not need every ordinary generated subtitle rebuilt; requeue just
+
+            latest = self.db.latest_selected_subtitle(item.video_path)
+            if latest and str(latest.get("source") or "").casefold() == "manual":
+                continue
+
+            # v14 changes OCR text extraction only. Users already on v13 do not
+            # need every ordinary generated subtitle rebuilt; requeue just
             # OCR-derived rows (including legacy OCR lineage).
             if previous_generation == "13" and not self._is_legacy_ocr_prepared_subtitle(item):
                 continue
-            # Generation 7 never permits piecewise retiming to reorder dialogue,
-            # emits no sub-300 ms cues, and keeps timestamps away from exactly
-            # 00:00:00. Existing generated playback files must be rebuilt.
             folder = relative.parts[0] if relative is not None and relative.parts else ""
+            if previous_generation == "14":
+                if folder != "playback-srt" or subtitle.name not in aligned_playback_names:
+                    continue
             if previous_generation == "2" and folder != "alass":
                 continue
             if previous_generation in {"3", "4"} and folder not in {"alass", "reference-piecewise"}:
@@ -4110,21 +4145,17 @@ class AnimeManager:
                 "reference-piecewise",
             }:
                 continue
-            # Generations 8–14 rebuild only final playback copies. Generation
-            # 9 added group-aware timing; generation 10 re-ranks near-equal
-            # SRT/ASS variants; generation 11 prevents cross-language groups
-            # from stretching internal Japanese cue boundaries; generation 12
-            # keeps cold-open offsets from being interpolated across edit gaps;
-            # generation 13 ignores duplicated overlapping SFX when anchoring
-            # the first dialogue in a short cold-open; generation 14 rebuilds
-            # OCR-derived playback text with spatial furigana filtering.
             if previous_generation in {"7", "8", "9", "10", "11", "12", "13"} and folder != "playback-srt":
                 continue
+
+            # The DB selection is not the only fast path. prepare-only can also
+            # return an old final-pipeline manifest, so invalidate both layers.
+            invalidate_final_pipeline_result(item.video_path, self.config)
             self.db.invalidate_subtitle(
                 item.video_path,
                 item.media_id,
                 item.episode,
-                "Повторная подготовка после улучшения OCR/furigana cleanup",
+                "Повторная подготовка после обновления синхронизации субтитров",
             )
             queued += 1
         self.db.set_state("subtitle_validation_generation", generation)

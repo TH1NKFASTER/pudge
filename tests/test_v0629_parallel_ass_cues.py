@@ -123,4 +123,4 @@ def test_generation_eight_requeues_only_old_playback_srt(tmp_path: Path) -> None
     alass = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
     assert playback is not None and playback.subtitle_path is None
     assert alass is not None and alass.subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "14"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "15"

@@ -73,5 +73,5 @@ def test_ui_keeps_refresh_in_checking_state_for_priority_subtitle_jobs() -> None
     assert "function prioritySubtitleJobs()" in html
     assert "status.subtitleCheckingBackground" in html
     assert "toast.refreshedSubtitlesQueued" in html
-    assert "ui.startupRunning||ui.startupMaintenanceRunning||prioritySubtitleJobs().length" in html
+    assert "ui.startupRunning||ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" in html
     assert "foreground.subtitle_manual_refresh" not in html  # backend concern only

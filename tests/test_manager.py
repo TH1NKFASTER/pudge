@@ -1457,7 +1457,7 @@ def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "14"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
 
 
 def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -> None:
@@ -1630,7 +1630,7 @@ def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "14"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "15"
 
 
 def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeypatch) -> None:

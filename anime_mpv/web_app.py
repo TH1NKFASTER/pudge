@@ -1513,9 +1513,20 @@ class WebAppApi:
         try:
             with timed_step(self.logger, "foreground.poll", mode="downloads-only"):
                 try:
-                    with timed_step(self.logger, "foreground.qbittorrent"):
-                        stats["downloads"] = self.manager.sync_downloads()
-                    completed_paths = self.manager.last_completed_video_paths
+                    completed_paths: tuple[Path, ...] = ()
+                    try:
+                        with timed_step(self.logger, "foreground.qbittorrent"):
+                            stats["downloads"] = self.manager.sync_downloads()
+                        completed_paths = self.manager.last_completed_video_paths
+                    except Exception as exc:
+                        # Subtitle preparation is independent from the torrent Web
+                        # API. If qBittorrent is closed, keep draining due/manual
+                        # subtitle jobs instead of leaving Checking stuck forever.
+                        self.manager.log(str(exc))
+                        self.logger.warning(
+                            "FALLBACK step=foreground.qbittorrent reason=unavailable continue=subtitles error=%r",
+                            str(exc),
+                        )
                     with maintenance_lock(
                         self.config.paths.cache_dir,
                         blocking=False,
