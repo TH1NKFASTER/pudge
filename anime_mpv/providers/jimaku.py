@@ -136,6 +136,51 @@ class JimakuClient:
     def close(self) -> None:
         self.client.close()
 
+    def _rate_limit_file(self) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / "jimaku-api" / "rate-limit.json"
+
+    def _rate_limit_remaining(self) -> float:
+        marker = self._rate_limit_file()
+        if marker is None:
+            return 0.0
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            until = float(payload.get("until") or 0.0) if isinstance(payload, dict) else 0.0
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return 0.0
+        return max(0.0, until - time.time())
+
+    @staticmethod
+    def _retry_after_seconds(value: str) -> float:
+        try:
+            seconds = float(str(value or "").strip())
+        except ValueError:
+            seconds = 600.0
+        return max(30.0, min(3600.0, seconds))
+
+    @staticmethod
+    def _rate_limit_message(seconds: float) -> str:
+        minutes = max(1, int((max(0.0, seconds) + 59) // 60))
+        return f"Jimaku rate limited (429); retry in {minutes} min"
+
+    def _set_rate_limit(self, seconds: float) -> float:
+        seconds = max(30.0, float(seconds))
+        marker = self._rate_limit_file()
+        if marker is not None:
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+                temporary.write_text(
+                    json.dumps({"until": time.time() + seconds, "status": 429}),
+                    encoding="utf-8",
+                )
+                temporary.replace(marker)
+            except OSError:
+                pass
+        return seconds
+
     def _get_json(self, path: str, params: dict[str, object] | None = None):
         safe_params = dict(params or {})
         cache_path: Path | None = None
@@ -171,6 +216,17 @@ class JimakuClient:
             except (OSError, ValueError, json.JSONDecodeError):
                 stale_payload = None
 
+        rate_limit_remaining = self._rate_limit_remaining()
+        if rate_limit_remaining > 0:
+            if stale_payload is not None:
+                count = len(stale_payload) if isinstance(stale_payload, list) else 1
+                self.logger.warning(
+                    "FALLBACK step=jimaku.http path=%s cache=stale count=%s reason=rate_limited remaining_s=%.0f",
+                    path, count, rate_limit_remaining,
+                )
+                return stale_payload
+            raise JimakuError(self._rate_limit_message(rate_limit_remaining))
+
         last_network_error: httpx.HTTPError | None = None
         for attempt in range(3):
             try:
@@ -182,6 +238,19 @@ class JimakuClient:
                     attempt=attempt + 1,
                 ):
                     response = self.client.get(urljoin(self.base_url, path), params=params)
+                    status_code = int(getattr(response, "status_code", 200) or 200)
+                    if status_code == 429:
+                        cooldown = self._set_rate_limit(
+                            self._retry_after_seconds(response.headers.get("Retry-After", ""))
+                        )
+                        if stale_payload is not None:
+                            count = len(stale_payload) if isinstance(stale_payload, list) else 1
+                            self.logger.warning(
+                                "FALLBACK step=jimaku.http path=%s cache=stale count=%s reason=429 cooldown_s=%.0f",
+                                path, count, cooldown,
+                            )
+                            return stale_payload
+                        raise JimakuError(self._rate_limit_message(cooldown))
                     response.raise_for_status()
                     payload = response.json()
                 count = len(payload) if isinstance(payload, list) else 1

@@ -85,6 +85,15 @@ _NETWORK_RETRY_MARKERS = (
 )
 
 
+def _subtitle_retry_is_rate_limit(detail: str) -> bool:
+    lowered = str(detail or "").casefold()
+    return bool(
+        "jimaku rate limited" in lowered
+        or "429 too many requests" in lowered
+        or re.search(r"\b429\b.*\btoo many requests\b", lowered)
+    )
+
+
 def _subtitle_retry_is_network_error(detail: str) -> bool:
     """Return whether preparation failed because an external service was unreachable.
 
@@ -92,6 +101,8 @@ def _subtitle_retry_is_network_error(detail: str) -> bool:
     timeouts must continue using the user-selected subtitle interval.
     """
     lowered = str(detail or "").casefold()
+    if _subtitle_retry_is_rate_limit(lowered):
+        return True
     if any(marker in lowered for marker in _NETWORK_RETRY_MARKERS):
         return True
     return bool(
@@ -110,6 +121,8 @@ def _subtitle_retry_delay_seconds(
 ) -> float:
     """Use the configured interval unless this is a network/service failure."""
     configured = max(1.0, float(poll_minutes) * 60.0)
+    if _subtitle_retry_is_rate_limit(detail):
+        return configured
     if not _subtitle_retry_is_network_error(detail):
         return configured
     if int(attempts) <= 12:
@@ -3338,6 +3351,30 @@ class AnimeManager:
         else:
             jobs = self.db.claim_due_subtitle_jobs(limit)
 
+        if not preferred_paths and jobs:
+            migration_marker = "Повторная подготовка после обновления синхронизации субтитров"
+            has_regular_jobs = any(
+                migration_marker not in str(row["last_error"] or "") for row in jobs
+            )
+            migration_budget = 0 if has_regular_jobs else 1
+            runnable_jobs = []
+            for queued in jobs:
+                is_migration = migration_marker in str(queued["last_error"] or "")
+                if is_migration and migration_budget <= 0:
+                    delay = max(5 * 60, self.config.agent.subtitle_poll_minutes * 60)
+                    self.db.defer_subtitle_job(
+                        Path(str(queued["video_path"])), migration_marker, delay
+                    )
+                    self.logger.info(
+                        "RETRY step=subtitle.prepare reason=energy_throttle media_id=%s episode=%s video=%s delay_s=%s",
+                        queued["media_id"], queued["episode"], Path(str(queued["video_path"])).name, delay,
+                    )
+                    continue
+                if is_migration:
+                    migration_budget -= 1
+                runnable_jobs.append(queued)
+            jobs = runnable_jobs
+
         def requeue_unstarted(start_index: int) -> None:
             for queued in jobs[start_index:]:
                 queued_video = Path(str(queued["video_path"]))
@@ -3708,8 +3745,9 @@ class AnimeManager:
                 # stricter: a cache file can still exist while the current run
                 # explicitly rejects it.
                 self.db.clear_subtitle_selection(video)
-                attempts = int(job["attempts"] or 0) + 1
                 detail = completed.stderr.strip() or completed.stdout.strip()[-1000:]
+                rate_limited = _subtitle_retry_is_rate_limit(detail)
+                attempts = int(job["attempts"] or 0) + (0 if rate_limited else 1)
                 delay = _subtitle_retry_delay_seconds(
                     poll_minutes=self.config.agent.subtitle_poll_minutes,
                     attempts=attempts,
@@ -3717,11 +3755,14 @@ class AnimeManager:
                 )
                 network_backoff = _subtitle_retry_is_network_error(detail)
                 self.logger.info(
-                    "RETRY step=subtitle.prepare media_id=%s episode=%s video=%s attempts=%s delay_s=%s network_backoff=%s reason=%r",
+                    "RETRY step=subtitle.prepare media_id=%s episode=%s video=%s attempts=%s delay_s=%s network_backoff=%s rate_limited=%s reason=%r",
                     job["media_id"], job["episode"], video.name, attempts, delay,
-                    network_backoff, detail or "Субтитры пока не найдены",
+                    network_backoff, rate_limited, detail or "Субтитры пока не найдены",
                 )
-                self.db.postpone_subtitle_job(video, detail or "Субтитры пока не найдены", delay)
+                if rate_limited:
+                    self.db.defer_subtitle_job(video, detail or "Jimaku rate limited (429)", delay)
+                else:
+                    self.db.postpone_subtitle_job(video, detail or "Субтитры пока не найдены", delay)
         return ready
 
     def _prune_empty_library_dirs(self) -> int:

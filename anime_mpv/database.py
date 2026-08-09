@@ -1315,6 +1315,22 @@ class Database:
                 )
         return rows
 
+    def defer_subtitle_job(self, video_path: Path, error: str, delay_seconds: float) -> None:
+        """Return a claimed job to pending without counting a media/preparation failure."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE subtitle_jobs SET state='pending',priority=0,next_check=?,last_error=?,updated_at=?
+                WHERE video_path=?
+                """,
+                (now + delay_seconds, error[-1000:], now, str(video_path)),
+            )
+            conn.execute(
+                "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                (now, str(video_path)),
+            )
+
     def postpone_subtitle_job(self, video_path: Path, error: str, delay_seconds: float) -> None:
         with self.connect() as conn:
             conn.execute(
