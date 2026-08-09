@@ -35,7 +35,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.20:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
+        f"syncing-v0.3.21:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
         f"{config.skip_on_low_quality}:{config.vad}:{config.fix_framerate}:{config.gss}:"
@@ -510,7 +510,7 @@ def estimate_constant_subtitle_offsets(
         source_starts,
         reference_starts,
         limit=limit,
-        maximum_candidates=64,
+        maximum_candidates=32,
     )
     landmark_hypotheses = [
         key * 0.20
@@ -518,19 +518,62 @@ def estimate_constant_subtitle_offsets(
             landmark_votes.items(),
             key=lambda item: (item[1], -abs(item[0])),
             reverse=True,
-        )[:32]
+        )[:16]
     ]
     hypotheses = list(dict.fromkeys([*pair_hypotheses, *landmark_hypotheses, 0.0]))
     evaluated: list[tuple[tuple[float, ...], dict[str, object]]] = []
     seen: set[int] = set()
+
+    def evaluate_once(shift: float) -> None:
+        shift = max(-limit, min(limit, shift))
+        key = int(round(shift * 1000))
+        if key in seen:
+            return
+        seen.add(key)
+        evaluated.append(evaluate(shift))
+
+    # The old implementation refined every coarse hypothesis with 13 expensive
+    # activity evaluations. With ~100 hypotheses that meant >1000 full-episode
+    # scans. Score coarse hypotheses once, then refine only the strongest seeds.
     for hypothesis in hypotheses:
-        for step in range(-6, 7):
-            shift = max(-limit, min(limit, hypothesis + step * 0.05))
-            key = int(round(shift * 1000))
-            if key in seen:
+        evaluate_once(hypothesis)
+
+    coarse_ranked = sorted(evaluated, key=lambda item: item[0], reverse=True)
+    refinement_seeds: list[float] = []
+
+    def add_refinement_seeds(
+        items: list[tuple[tuple[float, ...], dict[str, object]]],
+        target_count: int,
+    ) -> None:
+        for _rank, payload in items:
+            if len(refinement_seeds) >= target_count:
+                return
+            shift = float(payload.get("offset_seconds") or 0.0)
+            if any(abs(shift - existing) < 0.35 for existing in refinement_seeds):
                 continue
-            seen.add(key)
-            evaluated.append(evaluate(shift))
+            refinement_seeds.append(shift)
+
+    add_refinement_seeds(coarse_ranked, 4)
+    add_refinement_seeds(
+        sorted(
+            evaluated,
+            key=lambda item: float(item[1]["activity_correlation"]),
+            reverse=True,
+        ),
+        6,
+    )
+    add_refinement_seeds(
+        sorted(evaluated, key=lambda item: float(item[1]["onset_z_score"]), reverse=True),
+        7,
+    )
+    add_refinement_seeds(
+        sorted(evaluated, key=lambda item: float(item[1]["landmark_support"]), reverse=True),
+        8,
+    )
+
+    for seed in refinement_seeds:
+        for step in range(-4, 5):
+            evaluate_once(seed + step * 0.05)
 
     ranked = sorted(evaluated, key=lambda item: item[0], reverse=True)
     selected: list[dict[str, object]] = []
@@ -571,6 +614,7 @@ def estimate_constant_subtitle_offsets(
     for index, payload in enumerate(selected, start=1):
         payload["candidate_rank"] = index
         payload["candidate_hypotheses"] = len(hypotheses)
+        payload["candidate_evaluations"] = len(evaluated)
     return selected or [{"available": False, "reason": "no_candidates"}]
 
 
