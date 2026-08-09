@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.6.68"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-test:
+    name: Tests ${{ matrix.batch }}/4
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [1, 2, 3, 4]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev,sync]"
+
+      - name: Verify tag version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: python scripts/check_release_tag.py "$RELEASE_TAG"
+
+      - name: Run test batch
+        run: python scripts/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4
+
+  build-release:
+    name: Build macOS release ZIP
+    needs: verify-and-test
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Build release archive
+        run: SKIP_TESTS=1 ./build_release.sh
+
+      - name: Locate archive
+        id: archive
+        shell: bash
+        run: |
+          archive=$(find dist -maxdepth 1 -name 'pudge-macos-v*.zip' -print -quit)
+          test -n "$archive"
+          echo "path=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pudge-macos
+          path: ${{ steps.archive.outputs.path }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          ARCHIVE: ${{ steps.archive.outputs.path }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$ARCHIVE" \
+              --title "Pudge $RELEASE_TAG" \
+              --generate-notes
+          fi

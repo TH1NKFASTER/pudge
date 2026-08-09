@@ -1,0 +1,176 @@
+[ui]
+language = "en"
+onboarding_completed = false
+escape_exits_fullscreen = true
+notifications_enabled = true
+permissions_requested = false
+
+[paths]
+watched_media_dirs = []
+subtitle_dirs = []
+cache_dir = "~/Library/Caches/pudge"
+max_scanned_files = 8000
+
+[library]
+root_dir = "~/Movies/pudge"
+database_path = "~/.local/share/pudge/library.sqlite3"
+recursive = true
+cover_cache_dir = "~/Library/Caches/pudge/covers"
+disk_limit_enabled = true
+disk_limit_gb = 500.0
+
+[nyaa]
+enabled = true
+base_url = "https://nyaa.si"
+category = "1_2"
+proxy_mode = "direct_then_proxy"
+proxy_url = ""
+pre_search_command = ""
+auto_download_current = true
+subsplease_rss_enabled = false
+subsplease_rss_preferred = false
+auto_require_trusted = true
+only_trusted_groups = false
+min_release_score = 72.0
+min_seeders = 1
+preferred_resolution = "1080p"
+preferred_video_codecs = ["HEVC", "AV1", "AVC"]
+preferred_sources = ["BluRay", "WEB-DL", "WEBRip"]
+require_japanese_audio = true
+avoid_upscaled = true
+trusted_groups = ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
+preferred_groups = ["EMBER", "Judas", "Anime Time"]
+blocked_groups = []
+episode_min_size_mb = 250
+episode_max_size_mb = 3500
+max_auto_download_per_anime = 2
+auto_upgrade_downloaded = true
+upgrade_min_score_gain = 30.0
+upgrade_check_hours = 24.0
+max_upgrade_checks_per_run = 2
+
+[qbittorrent]
+enabled = false
+base_url = "http://127.0.0.1:8080"
+username = "admin"
+password = ""
+api_key = ""
+verify_tls = true
+category = "pudge"
+pre_download_command = ""
+paused_on_add = false
+auto_start_app = true
+
+[aria2]
+enabled = true
+binary = "aria2c"
+rpc_port = 6801
+auto_start = true
+paused_on_add = false
+
+[agent]
+enabled = true
+torrent_poll_minutes = 10
+anilist_refresh_minutes = 120
+subtitle_poll_minutes = 30
+delete_after_watched_hours = 24.0
+delete_only_managed_files = true
+keep_batch_until_completed = true
+
+[playback]
+enabled = true
+rewind_seconds = 15.0
+save_interval_seconds = 30.0
+
+[shortcuts]
+app_watching = "Cmd+1"
+app_planning = "Cmd+2"
+app_library = "Cmd+3"
+app_settings = "Cmd+4"
+app_planning_search = "Cmd+F"
+mpv_mark_watched = "Ctrl+a"
+mpv_open_anilist = "Ctrl+b"
+mpv_correct_match = "c"
+
+[diagnostics]
+energy_monitoring_enabled = false
+energy_sample_seconds = 30.0
+
+[tools]
+mpv = "mpv"
+ffmpeg = "ffmpeg"
+ffprobe = "ffprobe"
+alass = "alass"
+mpv_extra_args = []
+
+[jimaku]
+api_key = ""
+base_url = "https://jimaku.cc"
+
+[anilist]
+enabled = true
+endpoint = "https://graphql.anilist.co"
+client_id = ""
+access_token = ""
+auto_update_progress = false
+watched_threshold = 0.8333333333333334
+watched_max_remaining_minutes = 10.0
+add_if_missing = false
+update_when_rewatching = true
+completed_to_rewatching_on_episode_one = false
+complete_current_final = true
+complete_rewatching_final = true
+mapping_cache_hours = 24.0
+relations_by_release_date = true
+
+[llm]
+enabled = false
+base_url = "http://127.0.0.1:11434"
+api_key = ""
+model = "qwen3.5:9b-q8_0"
+ambiguity_margin = 8.0
+think = false
+keep_alive = "10m"
+temperature = 0.0
+num_ctx = 8192
+timeout_seconds = 90.0
+validate_embedded_reference = true
+embedded_reference_sample_count = 6
+embedded_reference_phrases_per_sample = 4
+embedded_reference_min_similarity = 0.65
+
+[matching]
+local_min_score = 68.0
+jimaku_min_score = 45.0
+prefer_srt = true
+convert_ass_to_srt = true
+srt_alignment_tolerance_ratio = 0.002
+srt_alignment_tolerance_absolute = 50.0
+evaluate_all_jimaku = true
+max_jimaku_candidates = 0
+ocr_image_subtitles = false
+
+[sync]
+enabled = true
+engine = "auto"
+compare_engines = true
+max_offset_seconds = 120.0
+quality_max_offset_seconds = 45.0
+skip_on_low_quality = true
+vad = "subs_then_webrtc"
+fix_framerate = true
+gss = false
+alass_split_penalty = 7.0
+alass_timeout_seconds = 240.0
+segment_validation = true
+segment_count = 5
+segment_window_seconds = 90.0
+segment_max_offset_seconds = 45.0
+piecewise_repair = true
+piecewise_min_offset_seconds = 0.75
+piecewise_jump_threshold_seconds = 2.5
+piecewise_max_correction_seconds = 60.0
+pgs_onset_alignment = true
+pgs_onset_pulse_seconds = 0.4
+pgs_onset_tolerance_seconds = 0.75
+pgs_onset_min_improvement = 0.08

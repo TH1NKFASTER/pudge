@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anime-mpv"
+version = "0.6.68"
+description = "macOS anime library manager with AniList, Nyaa, qBittorrent, mpv and Japanese subtitles"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "anime-mpv" }]
+dependencies = [
+  "httpx>=0.27,<1",
+  "rapidfuzz>=3.9,<4",
+  "charset-normalizer>=3.3,<4",
+  "pillow>=10,<13",
+  "socksio>=1.0,<2",
+  "pywebview>=5.4,<7",
+  "pyobjc-core>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-Vision>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-WebKit>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-Security>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-UserNotifications>=10.3; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+sync = ["ffsubsync>=0.4.31,<0.5"]
+dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+
+[project.scripts]
+anime-mpv = "anime_mpv.cli:main"
+anime-mpv-agent = "anime_mpv.agent:main"
+
+[tool.setuptools.packages.find]
+include = ["anime_mpv*"]
+
+[tool.setuptools.package-data]
+anime_mpv = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.png", "assets/*.png", "THIRD_PARTY_NOTICES.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

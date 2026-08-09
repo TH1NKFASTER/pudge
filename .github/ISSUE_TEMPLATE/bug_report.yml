@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a Pudge problem with enough context to reproduce it.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Pudge version
+      placeholder: 0.6.68
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the anime/episode and what Pudge did.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste only the relevant log excerpt. Remove secrets/tokens first.
+      render: text
+  - type: textarea
+    id: extra
+    attributes:
+      label: Extra context
+      description: Release filename, subtitle filename, screenshots or reproduction details.

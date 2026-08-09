@@ -1,0 +1,45 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / package output
+build/
+dist/
+*.egg-info/
+*.whl
+*.zip
+
+# IDEs
+.idea/
+.vscode/
+
+# Local config / secrets
+.env
+.env.*
+config.toml
+*.local.toml
+
+# Logs / caches
+*.log
+.cache/
+
+# Temporary files
+*.tmp
+*.swp
+*~
