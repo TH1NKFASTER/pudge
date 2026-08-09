@@ -4,32 +4,28 @@ set -u
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
-BATCHES=4
-FAILED=0
+PY="$ROOT/.venv-test/bin/python"
 
-echo "=== Pudge: running all tests before push ==="
-
-for ((i=0; i<BATCHES; i++)); do
-  echo
-  echo "=== Test batch $((i + 1))/$BATCHES ==="
-
-  python3 scripts/run_test_batch.py \
-    --batch "$i" \
-    --batches "$BATCHES"
-
-  STATUS=$?
-
-  if [ "$STATUS" -ne 0 ]; then
-    FAILED=1
-  fi
-done
-
-echo
-
-if [ "$FAILED" -ne 0 ]; then
-  echo "❌ Tests failed. git push cancelled."
+if [ ! -x "$PY" ]; then
+  echo "❌ .venv-test is missing."
+  echo "Run: python3.12 -m venv .venv-test && .venv-test/bin/python -m pip install -e '.[dev,sync]'"
   exit 1
 fi
 
-echo "✅ All test batches passed. Continuing git push."
-exit 0
+FAILED=0
+
+for i in 0 1 2 3; do
+  echo
+  echo "=== Test batch $((i + 1))/4 ==="
+
+  "$PY" scripts/run_test_batch.py --batch "$i" --batches 4
+
+  [ $? -ne 0 ] && FAILED=1
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "❌ Tests failed. Push cancelled."
+  exit 1
+fi
+
+echo "✅ All tests passed."

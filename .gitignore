@@ -43,3 +43,5 @@ config.toml
 *.tmp
 *.swp
 *~
+
+.venv-test/
