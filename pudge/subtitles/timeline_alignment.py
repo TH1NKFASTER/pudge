@@ -748,9 +748,6 @@ def _insert_override_segment(
         parts.append(right)
 
     new_segments = segments[:index] + parts + segments[index + 1:]
-    new_boundaries = (
-        boundaries[:max(0, index - 0)]
-    )
     # Rebuild boundaries from interval endpoints to avoid index arithmetic.
     interval_bounds: list[float] = []
     for i in range(len(new_segments) - 1):
