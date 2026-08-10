@@ -1,4 +1,4 @@
-from anime_mpv.filename import fold_search_title, normalize_title, parse_anime_filename, title_similarity
+from pudge.filename import fold_search_title, normalize_title, parse_anime_filename, title_similarity
 
 
 def test_erai_filename():

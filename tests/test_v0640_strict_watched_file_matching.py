@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def test_external_scan_never_falls_back_to_permissive_local_fuzzy_match(monkeypatch, tmp_path: Path):
@@ -25,7 +25,7 @@ def test_external_scan_never_falls_back_to_permissive_local_fuzzy_match(monkeypa
         )
     )
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -85,9 +85,9 @@ def test_watched_folder_rejects_high_fuzzy_but_low_literal_title_match(monkeypat
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeAniListClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeAniListClient)
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -132,9 +132,9 @@ def test_scan_removes_existing_false_match_inside_active_watched_folder(monkeypa
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeAniListClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeAniListClient)
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 

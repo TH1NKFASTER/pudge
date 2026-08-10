@@ -2,7 +2,7 @@ from importlib.resources import files
 
 
 def _lua_source() -> str:
-    return files("anime_mpv").joinpath("mpv_scripts/anime_mpv_anilist.lua").read_text(
+    return files("pudge").joinpath("mpv_scripts/pudge_anilist.lua").read_text(
         encoding="utf-8"
     )
 
@@ -10,7 +10,7 @@ def _lua_source() -> str:
 def test_lua_tracker_has_separate_auto_update_switch():
     source = _lua_source()
 
-    assert "ANIME_MPV_ANILIST_AUTO_UPDATE" in source
+    assert "PUDGE_ANILIST_AUTO_UPDATE" in source
     assert "if not auto_update or triggered" in source
 
 
@@ -18,9 +18,9 @@ def test_lua_tracker_keeps_manual_hotkeys_when_auto_update_is_off():
     source = _lua_source()
 
     assert "AniList: ручной режим" in source
-    assert "ANIME_MPV_SHORTCUT_MARK_WATCHED" in source
+    assert "PUDGE_SHORTCUT_MARK_WATCHED" in source
     assert "add_reliable_binding(shortcut_mark_watched" in source
-    assert "ANIME_MPV_SHORTCUT_CORRECT_MATCH" in source
+    assert "PUDGE_SHORTCUT_CORRECT_MATCH" in source
     assert "mp.add_key_binding(shortcut_correct_match" in source
 
 

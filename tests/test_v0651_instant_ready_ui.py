@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.web_app import WebAppApi
-from anime_mpv.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
 
 
 def _make_api(tmp_path: Path) -> WebAppApi:
@@ -46,7 +46,7 @@ def test_web_api_exposes_cheap_ready_marker_and_state_payload(tmp_path: Path) ->
 
 
 def test_ui_watches_ready_marker_and_refreshes_immediately_on_focus_and_home() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     assert "readyStateWatchTimer:null" in html
     assert "await pywebview.api.ui_state_versions()" in html

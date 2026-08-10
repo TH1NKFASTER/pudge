@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv.providers.anilist import _overlay_relation_list_entries
+from pudge.providers.anilist import _overlay_relation_list_entries
 
 
 def test_completed_collection_entry_marks_nested_relation_watched() -> None:
@@ -37,7 +37,7 @@ def test_completed_collection_entry_marks_nested_relation_watched() -> None:
 
 
 def test_planning_left_click_is_cover_only_and_hover_uses_large_preview() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
 

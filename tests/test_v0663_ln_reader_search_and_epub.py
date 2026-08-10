@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.light_novels import LightNovelService
+from pudge.config import AppConfig
+from pudge.light_novels import LightNovelService
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -156,7 +156,7 @@ def test_reader_settings_round_trip(tmp_path: Path) -> None:
 
 
 def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert 'data-page="downloads"' not in html
     assert '<section id="downloads"' not in html
     assert 'id="settingsMaintenance"' in html
@@ -182,7 +182,7 @@ def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
 
 
 def test_anilist_429_external_match_has_scan_level_circuit_breaker() -> None:
-    source = Path("anime_mpv/manager.py").read_text(encoding="utf-8")
+    source = Path("pudge/manager.py").read_text(encoding="utf-8")
     block = source[source.index("resolver_rate_limited = False"):source.index("def strict_external_title_score")]
     assert "resolver_rate_limited" in block
     resolve = source[source.index("def resolve_external(identity)"):source.index("def identity_score", source.index("def resolve_external(identity)"))]

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.database import Database
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.providers.anilist import _as_date_string
-from anime_mpv.syncing import subtitle_quality_accepted
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.providers.anilist import _as_date_string
+from pudge.syncing import subtitle_quality_accepted
+from pudge.web_app import WebAppApi
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -142,7 +142,7 @@ def test_manager_refuses_ready_exit_code_for_sup(tmp_path: Path, monkeypatch) ->
                 "",
             )
 
-    monkeypatch.setattr("anime_mpv.manager.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
 
     assert manager.process_subtitle_jobs(limit=1) == 0
     stored = manager.db.episode_by_path(video.resolve())

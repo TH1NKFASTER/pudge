@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 INSTALLER = ROOT / "install.sh"
 
 
@@ -33,7 +33,7 @@ def test_installer_force_reinstalls_bundled_wheel() -> None:
 
     assert '[[ -d "$PROJECT_DIR/.git" ]]' in installer
     assert 'pip wheel "$PROJECT_DIR"' in installer
-    assert 'WHEEL_CANDIDATES=("$PROJECT_DIR"/anime_mpv-*.whl(N))' in installer
+    assert 'WHEEL_CANDIDATES=("$PROJECT_DIR"/pudge-*.whl(N))' in installer
     assert 'pip install --force-reinstall --no-deps "$WHEEL_PATH"' in installer
 
 

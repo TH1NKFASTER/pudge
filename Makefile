@@ -21,14 +21,14 @@ bump:
 	$(PYTHON) scripts/bump_version.py $(VERSION)
 
 lint:
-	$(PYTHON) -m ruff check --select E9,F63,F7 anime_mpv tests scripts
-	$(PYTHON) -m ruff check --select E9,F anime_mpv/audiobooks.py anime_mpv/manga.py anime_mpv/subtitles anime_mpv/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
-	node --check anime_mpv/web/settings.js
-	node --check anime_mpv/web/media.js
+	$(PYTHON) -m ruff check --select E9,F63,F7 pudge tests scripts
+	$(PYTHON) -m ruff check --select E9,F pudge/audiobooks.py pudge/manga.py pudge/subtitles pudge/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
+	node --check pudge/web/settings.js
+	node --check pudge/web/media.js
 
 release:
 	./build_release.sh
 
 clean:
 	rm -rf build dist *.egg-info .pytest_cache .ruff_cache
-	find anime_mpv tests scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+	find pudge tests scripts -type d -name __pycache__ -prune -exec rm -rf {} +

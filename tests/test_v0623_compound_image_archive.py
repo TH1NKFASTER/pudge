@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from anime_mpv.models import JimakuFile, VideoIdentity
-from anime_mpv.providers.jimaku import find_7zip, materialize_jimaku_files
+from pudge.models import JimakuFile, VideoIdentity
+from pudge.providers.jimaku import find_7zip, materialize_jimaku_files
 
 
 class FakeJimakuClient:
@@ -34,7 +34,7 @@ def test_find_7zip_uses_app_injected_absolute_path(tmp_path: Path, monkeypatch) 
     tool = tmp_path / "7zz"
     tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     tool.chmod(0o755)
-    monkeypatch.setenv("ANIME_MPV_7ZIP", str(tool))
+    monkeypatch.setenv("PUDGE_7ZIP", str(tool))
     monkeypatch.setenv("PATH", "")
 
     assert find_7zip() == str(tool)
@@ -48,7 +48,7 @@ def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(
     payload = tmp_path / "payload.sup"
     payload.write_bytes(b"PG subtitle payload")
     tool = _fake_7zz(tmp_path, payload)
-    monkeypatch.setenv("ANIME_MPV_7ZIP", str(tool))
+    monkeypatch.setenv("PUDGE_7ZIP", str(tool))
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     item = JimakuFile(
@@ -80,5 +80,5 @@ def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(
 def test_installer_injects_sevenzip_into_app_and_agent() -> None:
     installer = Path("install.sh").read_text(encoding="utf-8")
     assert 'SEVENZIP_BIN="$(brew --prefix sevenzip)/bin/7zz"' in installer
-    assert "ANIME_MPV_7ZIP" in installer
+    assert "PUDGE_7ZIP" in installer
     assert "sevenzip_path = os.environ[\"SEVENZIP_BIN\"]" in installer

@@ -1,4 +1,4 @@
-from anime_mpv.subtitle_formats import format_preference_bonus
+from pudge.subtitle_formats import format_preference_bonus
 
 
 def test_native_srt_gets_stronger_general_format_bonus() -> None:

@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryEpisode
+from pudge.database import Database
+from pudge.manager_models import LibraryEpisode
 
 
 def _episode(video: Path, *, state: str = "ready") -> LibraryEpisode:

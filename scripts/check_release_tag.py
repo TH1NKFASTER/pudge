@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def package_version() -> str:
-    init_file = ROOT / "anime_mpv" / "__init__.py"
+    init_file = ROOT / "pudge" / "__init__.py"
     match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_file.read_text(), re.MULTILINE)
     if not match:
         raise SystemExit(f"Could not read __version__ from {init_file}")
@@ -34,7 +34,7 @@ def main() -> int:
     tag = args.tag.removeprefix("v")
 
     if package != project:
-        raise SystemExit(f"Version mismatch: anime_mpv.__version__={package!r}, pyproject={project!r}")
+        raise SystemExit(f"Version mismatch: pudge.__version__={package!r}, pyproject={project!r}")
     if tag != package:
         raise SystemExit(f"Tag {args.tag!r} does not match source version {package!r}")
 

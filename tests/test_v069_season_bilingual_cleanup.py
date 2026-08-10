@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode, NyaaRelease
-from anime_mpv.providers.nyaa import _expected_season, score_release
-from anime_mpv.subtitle_formats import clean_srt_for_playback, parse_srt
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode, NyaaRelease
+from pudge.providers.nyaa import _expected_season, score_release
+from pudge.subtitle_formats import clean_srt_for_playback, parse_srt
 
 
 def _release(title: str) -> NyaaRelease:

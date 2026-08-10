@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.providers.nyaa import release_episode, score_release, search_ranked
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.providers.nyaa import release_episode, score_release, search_ranked
 
 
 WRONG_TITLE = (

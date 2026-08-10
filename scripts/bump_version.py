@@ -27,7 +27,7 @@ def main() -> int:
         raise SystemExit("Version must look like 0.6.69")
 
     replace_once(
-        ROOT / "anime_mpv" / "__init__.py",
+        ROOT / "pudge" / "__init__.py",
         r'^__version__\s*=\s*["\'][^"\']+["\']',
         f'__version__ = "{args.version}"',
     )

@@ -1,4 +1,4 @@
-from anime_mpv.language import japanese_text_metrics
+from pudge.language import japanese_text_metrics
 
 
 def test_japanese_text():

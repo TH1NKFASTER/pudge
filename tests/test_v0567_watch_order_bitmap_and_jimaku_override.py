@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.cli import _find_online_subtitles
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.models import (
+from pudge.cli import _find_online_subtitles
+from pudge.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.models import (
     AniListAnime,
     EmbeddedSubtitle,
     JimakuEntry,
@@ -15,11 +15,11 @@ from anime_mpv.models import (
     SubtitleCandidate,
     VideoIdentity,
 )
-from anime_mpv.web_app import WebAppApi
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -56,7 +56,7 @@ def test_bitmap_embedded_subtitle_is_waiting_for_text_and_kept_for_library(
     video.write_bytes(b"video")
 
     monkeypatch.setattr(
-        "anime_mpv.library.find_embedded_japanese_subtitles",
+        "pudge.library.find_embedded_japanese_subtitles",
         lambda *args, **kwargs: [
             EmbeddedSubtitle(
                 stream_index=3,
@@ -124,7 +124,7 @@ def test_bitmap_subtitle_is_not_on_ready_home_and_only_library_can_enable_it(
 
     commands: list[list[str]] = []
     monkeypatch.setattr(
-        "anime_mpv.web_app.subprocess.Popen",
+        "pudge.web_app.subprocess.Popen",
         lambda command, **kwargs: commands.append(command) or FakeProcess(),
     )
 
@@ -166,18 +166,18 @@ def test_jimaku_entry_12479_uses_normal_exact_anilist_mapping(
     )
 
     monkeypatch.setattr(
-        "anime_mpv.cli.JimakuClient.search_entries",
+        "pudge.cli.JimakuClient.search_entries",
         lambda self, *, anilist_id=None, query=None: [entry]
         if anilist_id == 211711 or "I am a hero too" in str(query or "")
         else [],
     )
     monkeypatch.setattr(
-        "anime_mpv.cli.JimakuClient.files_for_episode",
+        "pudge.cli.JimakuClient.files_for_episode",
         lambda self, entry_id, episode, alternative_episodes=(): [jimaku_file]
         if entry_id == 12479
         else [],
     )
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient.close", lambda self: None)
+    monkeypatch.setattr("pudge.cli.JimakuClient.close", lambda self: None)
 
     def fake_materialize(client, item, identity, video, cache_dir, **kwargs):
         return [
@@ -191,7 +191,7 @@ def test_jimaku_entry_12479_uses_normal_exact_anilist_mapping(
             )
         ]
 
-    monkeypatch.setattr("anime_mpv.cli.materialize_jimaku_files", fake_materialize)
+    monkeypatch.setattr("pudge.cli.materialize_jimaku_files", fake_materialize)
 
     candidates = _find_online_subtitles(
         video,
@@ -215,5 +215,5 @@ def test_jimaku_entry_12479_uses_normal_exact_anilist_mapping(
     assert candidates[0].details["entry_anilist_match"] is True
     assert candidates[0].details["single_special_exact_entry"] is True
     assert "KNOWN_JIMAKU_ENTRY_OVERRIDES" not in (
-        ROOT / "anime_mpv" / "cli.py"
+        ROOT / "pudge" / "cli.py"
     ).read_text(encoding="utf-8")

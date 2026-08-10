@@ -7,13 +7,13 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from anime_mpv.audiobooks import AudiobookService
-from anime_mpv.backup import create_backup, restore_backup
-from anime_mpv.database import LATEST_SCHEMA_VERSION, Database
-from anime_mpv.manga import MangaService
-from anime_mpv.subtitles.selection import upgrade_is_better
-from anime_mpv.subtitles.stt import prepare_japanese_stt_reference
-from anime_mpv.subtitles.video_segments import choose_edit_boundary
+from pudge.audiobooks import AudiobookService
+from pudge.backup import create_backup, restore_backup
+from pudge.database import LATEST_SCHEMA_VERSION, Database
+from pudge.manga import MangaService
+from pudge.subtitles.selection import upgrade_is_better
+from pudge.subtitles.stt import prepare_japanese_stt_reference
+from pudge.subtitles.video_segments import choose_edit_boundary
 
 
 def test_quality_upgrade_never_uses_filename_score() -> None:
@@ -127,7 +127,7 @@ def test_stt_reference_is_generated_once_and_cached(tmp_path: Path, monkeypatch)
             Path(command[-1]).write_bytes(b"audio")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr("anime_mpv.subtitles.stt.subprocess.run", fake_run)
+    monkeypatch.setattr("pudge.subtitles.stt.subprocess.run", fake_run)
     first, info = prepare_japanese_stt_reference(
         video, tmp_path / "cache", ffmpeg_path="ffmpeg", model="tiny", timeout_seconds=60
     )
@@ -169,7 +169,7 @@ def test_audiobook_imports_duration_and_chapters(tmp_path: Path, monkeypatch) ->
         ],
     }
     monkeypatch.setattr(
-        "anime_mpv.audiobooks.subprocess.run",
+        "pudge.audiobooks.subprocess.run",
         lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr=""),
     )
     service = AudiobookService(db, ffprobe="ffprobe", mpv="mpv", cache_dir=tmp_path / "cache")

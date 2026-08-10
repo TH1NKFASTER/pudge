@@ -4,10 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryEpisode
-from anime_mpv.ocr import _VisionTextRow, _filter_probable_furigana_rows
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode
+from pudge.ocr import _VisionTextRow, _filter_probable_furigana_rows
 
 
 def _config(tmp_path: Path) -> AppConfig:

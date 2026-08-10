@@ -4,13 +4,13 @@ import json
 import time
 from pathlib import Path
 
-from anime_mpv.config import LLMConfig
-from anime_mpv.llm import (
+from pudge.config import LLMConfig
+from pudge.llm import (
     OllamaClient,
     SEMANTIC_CACHE_REJECTED_TTL_SECONDS,
     SEMANTIC_CACHE_SCHEMA,
 )
-from anime_mpv.syncing import subtitle_quality_accepted
+from pudge.syncing import subtitle_quality_accepted
 
 
 def test_exact_linked_movie_ignores_noisy_semantic_samples_when_timing_is_strong() -> None:

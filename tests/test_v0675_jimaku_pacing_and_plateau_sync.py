@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.providers.jimaku import (
+from pudge.providers.jimaku import (
     JIMAKU_LOCAL_BURST_CAPACITY,
     JIMAKU_LOCAL_REQUESTS_PER_MINUTE,
     JimakuClient,
 )
-from anime_mpv.syncing import (
+from pudge.syncing import (
     _stable_offset_cluster,
     _stable_two_plateau_offsets,
 )
@@ -87,8 +87,8 @@ def test_two_noisy_or_nearly_identical_plateaus_are_rejected() -> None:
 
 
 def test_v0675_source_wires_local_rate_limit_and_plateau_repair() -> None:
-    jimaku = Path("anime_mpv/providers/jimaku.py").read_text(encoding="utf-8")
-    syncing = Path("anime_mpv/syncing.py").read_text(encoding="utf-8")
+    jimaku = Path("pudge/providers/jimaku.py").read_text(encoding="utf-8")
+    syncing = Path("pudge/syncing.py").read_text(encoding="utf-8")
 
     assert "self._acquire_request_slot(path)" in jimaku
     assert "request-budget.json" in jimaku

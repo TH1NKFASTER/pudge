@@ -11,14 +11,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from anime_mpv.config import AppConfig, SyncConfig
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.providers.jimaku import JimakuClient
-from anime_mpv.providers.nyaa import _quality_score
-from anime_mpv.syncing import parse_srt, repair_with_embedded_reference_piecewise, write_srt
+from pudge.config import AppConfig, SyncConfig
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime
+from pudge.providers.jimaku import JimakuClient
+from pudge.providers.nyaa import _quality_score
+from pudge.syncing import parse_srt, repair_with_embedded_reference_piecewise, write_srt
 
 
 def test_preferred_resolution_gets_ten_extra_points():
@@ -54,7 +54,7 @@ def test_jimaku_dns_failure_retries_then_uses_stale_positive_cache(monkeypatch, 
         raise httpx.ConnectError("[Errno 8] nodename nor servname provided", request=request)
 
     monkeypatch.setattr(client.client, "get", fail)
-    monkeypatch.setattr("anime_mpv.providers.jimaku.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("pudge.providers.jimaku.time.sleep", lambda _seconds: None)
     try:
         assert client._get_json(path, params) == payload
         assert attempts == 3
@@ -75,7 +75,7 @@ def test_external_scan_uses_identity_resolver_before_title_only_match(monkeypatc
         titles=["Example Anime Season 3"],
         progress=0,
     )
-    monkeypatch.setattr("anime_mpv.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
+    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
 
     rows = scan_library(
         root,
@@ -159,7 +159,7 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
             "onset_ratio": 0.95,
         }
 
-    monkeypatch.setattr("anime_mpv.syncing._windowed_reference_shift", fake_window)
+    monkeypatch.setattr("pudge.syncing._windowed_reference_shift", fake_window)
 
     def fake_compare(path, _reference, priority_seconds=None):
         improved = "reference-piecewise" in str(path)
@@ -170,7 +170,7 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
             "weighted": 0.90 if improved else 0.80,
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.compare_timing_activity", fake_compare)
+    monkeypatch.setattr("pudge.syncing.compare_timing_activity", fake_compare)
     output, result = repair_with_embedded_reference_piecewise(
         candidate,
         reference,
@@ -187,7 +187,7 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
 
 
 def test_web_ui_accumulated_v0637_changes_present():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "Configure only the features you use" not in html
     assert 'id="s_watched_folders"' in html
     assert 'id="s_subtitle_folders"' in html

@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def _html() -> str:
-    return Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    return Path("pudge/web/index.html").read_text(encoding="utf-8")
 
 
 def test_foreground_poll_detects_subtitle_state_changes_not_only_download_progress():

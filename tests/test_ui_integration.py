@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-WEB = ROOT / "anime_mpv" / "web"
+WEB = ROOT / "pudge" / "web"
 
 
 class _Assets(HTMLParser):
@@ -31,8 +31,8 @@ def test_web_pages_and_external_modules_are_wired() -> None:
     parser = _Assets()
     parser.feed((WEB / "index.html").read_text(encoding="utf-8"))
     assert {"current", "lightnovels", "manga", "audiobooks", "planned", "settings"} <= parser.ids
-    assert {"settings.js", "media.js"} <= set(parser.scripts)
-    assert {"settings.css", "media.css"} <= set(parser.styles)
+    assert {"settings.js", "media.js", "debug.js"} <= set(parser.scripts)
+    assert {"settings.css", "media.css", "debug.css"} <= set(parser.styles)
     for asset in parser.scripts + parser.styles:
         assert (WEB / asset).is_file()
 
@@ -41,7 +41,7 @@ def test_external_javascript_has_real_syntax_check() -> None:
     node = shutil.which("node")
     if node is None:
         return
-    for script in (WEB / "settings.js", WEB / "media.js"):
+    for script in (WEB / "settings.js", WEB / "media.js", WEB / "debug.js"):
         subprocess.run([node, "--check", str(script)], check=True, capture_output=True, text=True)
 
 

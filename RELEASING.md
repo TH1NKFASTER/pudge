@@ -10,7 +10,7 @@ Use the version helper:
 make bump VERSION=0.6.69
 ```
 
-It updates `anime_mpv/__init__.py`, `pyproject.toml` and the README example together.
+It updates `pudge/__init__.py`, `pyproject.toml` and the README example together.
 
 ## 2. Run checks locally
 
@@ -23,7 +23,7 @@ make lint
 
 ```bash
 git status --short
-git add anime_mpv tests scripts .github README.md CHANGELOG.md DEVELOPMENT.md \
+git add pudge tests scripts .github README.md CHANGELOG.md DEVELOPMENT.md \
   CONTRIBUTING.md SECURITY.md LICENSE RELEASING.md pyproject.toml \
   config.example.toml install.sh build_release.sh
 git diff --cached --check
@@ -40,7 +40,7 @@ git push origin v0.6.69
 
 GitHub Actions will then:
 
-1. verify that the tag matches `anime_mpv.__version__`;
+1. verify that the tag matches `pudge.__version__`;
 2. run the full test suite in four macOS batches;
 3. build `pudge-macos-v0.6.69.zip`;
 4. create a GitHub Release and attach the ZIP.

@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from pudge.web_app import WebAppApi
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -47,7 +47,7 @@ def test_activity_payload_exposes_anime_titles(tmp_path: Path) -> None:
 
 
 def test_activity_html_never_uses_anilist_id_as_display_title() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     start = html.index("function renderDownloads()")
     end = html.index("function input(", start)
     activity = html[start:end]

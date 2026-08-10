@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.subtitle_formats import convert_to_plain_srt, parse_srt
+from pudge.subtitle_formats import convert_to_plain_srt, parse_srt
 
 
 def test_broadcast_ass_parallel_lines_keep_shared_timing(tmp_path: Path) -> None:
@@ -85,9 +85,9 @@ Dialogue: 0,0:00:14.50,0:00:18.00,Default,,0,0,0,,第二
 
 
 def test_generation_eight_requeues_only_old_playback_srt(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"

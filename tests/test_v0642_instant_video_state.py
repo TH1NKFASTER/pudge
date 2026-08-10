@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryEpisode
-from anime_mpv.pipeline_cache import load_final_pipeline_result, save_final_pipeline_result
-from anime_mpv.subtitle_formats import clean_srt_for_playback
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode
+from pudge.pipeline_cache import load_final_pipeline_result, save_final_pipeline_result
+from pudge.subtitle_formats import clean_srt_for_playback
+from pudge.web_app import WebAppApi
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -56,7 +56,7 @@ def test_disabling_ocr_immediately_moves_ready_episode_to_waiting_text(tmp_path:
     )
 
     monkeypatch.setattr(
-        "anime_mpv.manager.japanese_subtitle_details",
+        "pudge.manager.japanese_subtitle_details",
         lambda *args, **kwargs: ("external_bitmap", bitmap, None),
     )
     changed = manager.invalidate_disabled_ocr_subtitles()
@@ -103,10 +103,10 @@ def test_save_settings_returns_reconciled_state_and_requests_immediate_recheck(t
         LibraryEpisode(None, "Anime", 1, video, subtitle_path=ocr_srt, state="ready", subtitle_origin="ocr")
     )
     monkeypatch.setattr(
-        "anime_mpv.manager.japanese_subtitle_details",
+        "pudge.manager.japanese_subtitle_details",
         lambda *args, **kwargs: ("external_bitmap", bitmap, None),
     )
-    monkeypatch.setattr("anime_mpv.web_app.request_folder_access", lambda paths: {})
+    monkeypatch.setattr("pudge.web_app.request_folder_access", lambda paths: {})
 
     result = api.save_settings({"ocr_image_subtitles": False})
 
@@ -136,7 +136,7 @@ def test_legacy_cleaned_ocr_cache_is_recognized_without_db_origin(tmp_path: Path
     assert manager._is_legacy_ocr_prepared_subtitle(persisted) is True
 
 def test_web_ui_applies_settings_state_and_polls_priority_jobs_immediately() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "duePrioritySubtitleJobs" in html
     assert "document.hidden||!ui.windowActive?5000:1000" in html
     assert "if(r.state)ui.state=r.state" in html

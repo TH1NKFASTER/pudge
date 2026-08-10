@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.relation_graphs import compact_relations_from_graph
-from anime_mpv.web_app import WebAppApi
+from pudge.relation_graphs import compact_relations_from_graph
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def test_other_edges_are_excluded_from_relation_graphs() -> None:
@@ -26,7 +26,7 @@ def test_other_edges_are_excluded_from_relation_graphs() -> None:
 
     html = HTML.read_text(encoding="utf-8")
     assert html.count("'SHARED_CHARACTERS','RELATED','OTHER'") >= 3
-    provider = (ROOT / "anime_mpv" / "providers" / "anilist.py").read_text(encoding="utf-8")
+    provider = (ROOT / "pudge" / "providers" / "anilist.py").read_text(encoding="utf-8")
     assert '{"CHARACTER", "SHARED_CHARACTERS", "RELATED", "OTHER"}' in provider
 
 
@@ -51,7 +51,7 @@ def test_reveal_subtitle_accepts_pgs_and_embedded_video(tmp_path: Path, monkeypa
     api = WebAppApi(tmp_path / "config.toml")
     calls: list[list[str]] = []
     monkeypatch.setattr(
-        "anime_mpv.web_app.subprocess.Popen",
+        "pudge.web_app.subprocess.Popen",
         lambda command, *args, **kwargs: calls.append(command),
     )
 

@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.light_novels import LightNovelService
+from pudge.config import AppConfig
+from pudge.light_novels import LightNovelService
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -106,7 +106,7 @@ def test_anilist_open_and_finish_volume(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_light_novel_ui_is_wired():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert 'data-page="lightnovels"' in html
     assert 'id="lnReaderShell"' in html
     assert "light_novel_chapter" in html

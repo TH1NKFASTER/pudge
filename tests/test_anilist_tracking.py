@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv.anilist_tracking import (
+from pudge.anilist_tracking import (
     TrackingPayload,
     create_tracking_file,
     load_mapping,
@@ -9,7 +9,7 @@ from anime_mpv.anilist_tracking import (
     read_tracking_file,
     save_mapping,
 )
-from anime_mpv.models import AniListAnime, VideoIdentity
+from pudge.models import AniListAnime, VideoIdentity
 
 
 def test_tracking_payload_roundtrip_and_permissions(tmp_path: Path):

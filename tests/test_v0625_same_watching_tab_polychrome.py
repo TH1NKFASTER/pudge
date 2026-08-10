@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def test_clicking_active_watching_tab_does_not_restart_polychrome() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     start = html.index("function setPage(page,force=false)")
     end = html.index("function updateCount()", start)
     body = html[start:end]

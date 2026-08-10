@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.models import AniListAnime
-from anime_mpv.providers.anilist import AniListClient
-from anime_mpv.providers.nyaa import search_ranked
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.models import AniListAnime
+from pudge.providers.anilist import AniListClient
+from pudge.providers.nyaa import search_ranked
 
 
 def _node(media_id: int, title: str, episodes: int, year: int) -> AniListAnime:

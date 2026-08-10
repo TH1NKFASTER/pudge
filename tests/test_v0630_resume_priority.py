@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.web_app import WebAppApi
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -52,7 +52,7 @@ def test_mid_episode_resume_card_wins_over_ready_section(tmp_path: Path) -> None
 
 def test_player_exit_refreshes_mid_episode_state() -> None:
     html = (
-        Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html"
+        Path(__file__).parents[1] / "pudge" / "web" / "index.html"
     ).read_text(encoding="utf-8")
 
     assert (

@@ -2,14 +2,14 @@ from pathlib import Path
 
 
 def _lua() -> str:
-    return Path("anime_mpv/mpv_scripts/anime_mpv_anilist.lua").read_text(encoding="utf-8")
+    return Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
 
 
 def test_ctrl_a_uses_forced_binding_with_old_mpv_fallback() -> None:
     source = _lua()
     assert "mp.add_forced_key_binding(key, name, callback" in source
-    assert "add_reliable_binding(shortcut_mark_watched, 'anime_mpv_anilist_update'" in source
-    assert "ANIME_MPV_SHORTCUT_MARK_WATCHED" in source
+    assert "add_reliable_binding(shortcut_mark_watched, 'pudge_anilist_update'" in source
+    assert "PUDGE_SHORTCUT_MARK_WATCHED" in source
     assert "mp.add_key_binding(key, name, callback)" in source
 
 

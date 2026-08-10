@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.light_novels import LightNovelService, _plain_html, _volume_from_text
+from pudge.config import AppConfig
+from pudge.light_novels import LightNovelService, _plain_html, _volume_from_text
 
 
 def _cfg(tmp_path: Path) -> AppConfig:
@@ -35,7 +35,7 @@ def test_volume_parser_understands_fullwidth_japanese_subseries_and_repairs_rows
 
 
 def test_ui_removes_library_adds_planning_type_filter_and_hides_technical_ln_copy() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert 'data-page="library"' not in html
     assert '<section id="library"' not in html
     assert 'function renderLibrary()' not in html
@@ -46,7 +46,7 @@ def test_ui_removes_library_adds_planning_type_filter_and_hides_technical_ln_cop
 
 
 def test_ln_renderer_uses_jiten_absolute_ruby_offsets_only() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     block = html[html.index("function renderLnTokenBody"):html.index("function renderLnParagraph")]
     assert "rawStart-tokenStart" in block
     assert "rawEnd-tokenStart" in block
@@ -55,7 +55,7 @@ def test_ln_renderer_uses_jiten_absolute_ruby_offsets_only() -> None:
 
 
 def test_interactive_refresh_defers_subtitle_processing_and_prioritizes_nyaa(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.manager import AnimeManager
+    from pudge.manager import AnimeManager
 
     manager = AnimeManager(_cfg(tmp_path))
     order: list[str] = []

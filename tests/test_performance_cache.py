@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.cli import _deduplicate_subtitle_candidates, _find_online_subtitles
-from anime_mpv.config import AppConfig, LLMConfig
-from anime_mpv.llm import OllamaClient
-from anime_mpv.models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
-from anime_mpv.pipeline_cache import (
+from pudge.cli import _deduplicate_subtitle_candidates, _find_online_subtitles
+from pudge.config import AppConfig, LLMConfig
+from pudge.llm import OllamaClient
+from pudge.models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
+from pudge.pipeline_cache import (
     final_pipeline_cache_available,
     load_final_pipeline_result,
     save_final_pipeline_result,
@@ -148,7 +148,7 @@ def test_exact_anilist_jimaku_match_skips_name_search(tmp_path: Path, monkeypatc
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient", FakeJimaku)
+    monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
     anime = AniListAnime(
         id=123,
         titles=["Anime"],
@@ -173,7 +173,7 @@ def test_exact_anilist_jimaku_match_skips_name_search(tmp_path: Path, monkeypatc
 
 
 def test_process_video_uses_final_cache_without_discovery(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.cli import build_parser, process_video
+    from pudge.cli import build_parser, process_video
 
     cfg = AppConfig()
     cfg.paths.cache_dir = tmp_path / "cache"
@@ -194,11 +194,11 @@ def test_process_video_uses_final_cache_without_discovery(tmp_path: Path, monkey
     )
 
     monkeypatch.setattr(
-        "anime_mpv.cli.find_embedded_japanese_subtitles",
+        "pudge.cli.find_embedded_japanese_subtitles",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("probe called")),
     )
     monkeypatch.setattr(
-        "anime_mpv.cli.find_local_subtitles",
+        "pudge.cli.find_local_subtitles",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("local search called")),
     )
     launched: list[list[str]] = []
@@ -207,7 +207,7 @@ def test_process_video_uses_final_cache_without_discovery(tmp_path: Path, monkey
         launched.append(command)
         return 0
 
-    monkeypatch.setattr("anime_mpv.cli.run_mpv", fake_run)
+    monkeypatch.setattr("pudge.cli.run_mpv", fake_run)
     args = build_parser().parse_args([str(video)])
     args.config = tmp_path / "config.toml"
 
@@ -220,7 +220,7 @@ def test_process_video_uses_final_cache_without_discovery(tmp_path: Path, monkey
 def test_exact_anilist_movie_uses_unfiltered_files_and_overrides_filename_score(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from anime_mpv.models import JimakuFile
+    from pudge.models import JimakuFile
 
     cfg = AppConfig()
     cfg.paths.cache_dir = tmp_path / "cache"
@@ -284,8 +284,8 @@ def test_exact_anilist_movie_uses_unfiltered_files_and_overrides_filename_score(
             )
         ]
 
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient", FakeJimaku)
-    monkeypatch.setattr("anime_mpv.cli.materialize_jimaku_files", fake_materialize)
+    monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
+    monkeypatch.setattr("pudge.cli.materialize_jimaku_files", fake_materialize)
     anime = AniListAnime(
         id=100723,
         titles=["Boku no Hero Academia THE MOVIE: Futari no Hero"],

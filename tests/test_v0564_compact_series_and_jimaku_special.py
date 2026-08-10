@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.cli import _find_online_subtitles
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
-from anime_mpv.web_app import WebAppApi
+from pudge.cli import _find_online_subtitles
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -117,12 +117,12 @@ def test_exact_title_single_special_is_accepted_without_jimaku_anilist_id(
     def fake_search(self, *, anilist_id=None, query=None):
         return [] if anilist_id is not None else [entry]
 
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient.search_entries", fake_search)
+    monkeypatch.setattr("pudge.cli.JimakuClient.search_entries", fake_search)
     monkeypatch.setattr(
-        "anime_mpv.cli.JimakuClient.files_for_episode",
+        "pudge.cli.JimakuClient.files_for_episode",
         lambda self, entry_id, episode, alternative_episodes=(): [file],
     )
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient.close", lambda self: None)
+    monkeypatch.setattr("pudge.cli.JimakuClient.close", lambda self: None)
 
     def fake_materialize(client, item, identity, video, cache_dir, **kwargs):
         return [
@@ -135,7 +135,7 @@ def test_exact_title_single_special_is_accepted_without_jimaku_anilist_id(
             )
         ]
 
-    monkeypatch.setattr("anime_mpv.cli.materialize_jimaku_files", fake_materialize)
+    monkeypatch.setattr("pudge.cli.materialize_jimaku_files", fake_materialize)
 
     candidates = _find_online_subtitles(
         video,

@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.providers.nyaa import (
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.providers.nyaa import (
     NyaaError,
     SubsPleaseClient,
     parse_subsplease_rss,
@@ -115,8 +115,8 @@ def test_manager_falls_back_to_subsplease_after_nyaa_error(monkeypatch):
     def fallback(*args, **kwargs):
         return [fallback_release]
 
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", fail_nyaa)
-    monkeypatch.setattr("anime_mpv.manager.search_subsplease_ranked", fallback)
+    monkeypatch.setattr("pudge.manager.search_ranked", fail_nyaa)
+    monkeypatch.setattr("pudge.manager.search_subsplease_ranked", fallback)
 
     manager = AnimeManager.__new__(AnimeManager)
     manager.config = AppConfig()
@@ -145,7 +145,7 @@ def test_subsplease_setting_round_trips(tmp_path: Path):
 
 
 def test_settings_ui_exposes_subsplease_checkbox():
-    html = Path("anime_mpv/web/index.html").read_text()
+    html = Path("pudge/web/index.html").read_text()
 
     assert "settings.useSubsPleaseRss':'Use SubsPlease RSS fallback'" in html
     assert "settings.useSubsPleaseRss':'Использовать RSS SubsPlease'" in html

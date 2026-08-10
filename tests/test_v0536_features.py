@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.database import Database
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryEpisode, NyaaRelease
-from anime_mpv.models import AniListAnime, JimakuFile, VideoIdentity
-from anime_mpv.providers.anilist import AniListClient
-from anime_mpv.providers.jimaku import JimakuClient, materialize_jimaku_files
-from anime_mpv.providers.nyaa import score_release
-from anime_mpv.manager_models import LibraryAnime
+from pudge.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode, NyaaRelease
+from pudge.models import AniListAnime, JimakuFile, VideoIdentity
+from pudge.providers.anilist import AniListClient
+from pudge.providers.jimaku import JimakuClient, materialize_jimaku_files
+from pudge.providers.nyaa import score_release
+from pudge.manager_models import LibraryAnime
 
 
 def _anime(media_id: int, title: str, episodes: int) -> AniListAnime:
@@ -100,7 +100,7 @@ def test_jimaku_accepts_absolute_episode_alias_and_normalizes_candidate(tmp_path
 
 
 def test_continue_watching_records_position_and_rewinds_in_web_payload(tmp_path: Path) -> None:
-    from anime_mpv.web_app import WebAppApi
+    from pudge.web_app import WebAppApi
 
     cfg = AppConfig()
     cfg.library.root_dir = tmp_path
@@ -178,7 +178,7 @@ def test_video_quality_policy_blocks_explicit_bad_releases() -> None:
 
 
 def test_continue_watching_marks_movie_for_web_label(tmp_path: Path) -> None:
-    from anime_mpv.web_app import WebAppApi
+    from pudge.web_app import WebAppApi
 
     cfg = AppConfig()
     cfg.library.root_dir = tmp_path
@@ -205,6 +205,6 @@ def test_continue_watching_marks_movie_for_web_label(tmp_path: Path) -> None:
 
 
 def test_continue_watching_movie_uses_movie_label() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text()
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
     assert "'label.continueMovie':'Movie • resume at {time}'" in html
     assert "a.is_movie?t('label.continueMovie'" in html

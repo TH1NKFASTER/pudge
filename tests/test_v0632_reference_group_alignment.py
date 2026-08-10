@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.subtitle_formats import parse_srt, write_srt
-from anime_mpv.syncing import refine_with_embedded_reference_groups
+from pudge.subtitle_formats import parse_srt, write_srt
+from pudge.syncing import refine_with_embedded_reference_groups
 
 
 def _fixture_cues() -> tuple[list[tuple[float, float, str]], list[tuple[float, float, str]]]:

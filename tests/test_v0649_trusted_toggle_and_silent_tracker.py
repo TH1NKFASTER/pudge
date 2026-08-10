@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import NyaaRelease
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import NyaaRelease
+from pudge.web_app import WebAppApi
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -98,7 +98,7 @@ def test_only_trusted_groups_is_exposed_and_saved_by_web_settings(tmp_path: Path
     assert api.config.nyaa.only_trusted_groups is True
     assert load_config(cfg.config_path).nyaa.only_trusted_groups is True
 
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "s_only_trusted_groups" in html
     assert "Только доверенные группы для автоскачивания" in html
     assert "Only trusted groups for automatic downloads" in html
@@ -106,7 +106,7 @@ def test_only_trusted_groups_is_exposed_and_saved_by_web_settings(tmp_path: Path
 
 
 def test_auto_tracker_has_no_startup_future_completion_osd() -> None:
-    lua = Path("anime_mpv/mpv_scripts/anime_mpv_anilist.lua").read_text(encoding="utf-8")
+    lua = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
     assert "after %.1f%% and within %.1f min of the end" not in lua
     assert "после %.1f%% и не раньше чем за %.1f мин до конца" not in lua
     assert "AniList tracker loaded:" in lua

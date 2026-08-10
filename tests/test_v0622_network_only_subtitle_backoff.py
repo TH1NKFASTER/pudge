@@ -3,14 +3,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.manager import (
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.manager import (
     AnimeManager,
     _subtitle_retry_delay_seconds,
     _subtitle_retry_is_network_error,
 )
-from anime_mpv.manager_models import LibraryEpisode
+from pudge.manager_models import LibraryEpisode
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -115,7 +115,7 @@ def test_high_attempt_non_network_prepare_failure_retries_in_ten_minutes(
                 "",
             )
 
-    monkeypatch.setattr("anime_mpv.manager.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
     started = time.time()
     assert manager.process_subtitle_jobs(limit=1) == 0
     job = next(row for row in manager.db.subtitle_jobs() if row["video_path"] == str(video.resolve()))

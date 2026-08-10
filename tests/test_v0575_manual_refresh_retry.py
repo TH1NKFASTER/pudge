@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:

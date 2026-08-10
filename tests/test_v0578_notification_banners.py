@@ -4,12 +4,12 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import anime_mpv.notifications as notifications
-from anime_mpv.notifications import (
+import pudge.notifications as notifications
+from pudge.notifications import (
     _foreground_presentation_options,
     _install_foreground_notification_delegate,
 )
-from anime_mpv.web_app import _request_notification_permission_after_launch
+from pudge.web_app import _request_notification_permission_after_launch
 
 
 def test_presentation_options_include_banner_list_and_sound() -> None:
@@ -73,7 +73,7 @@ def test_permission_is_requested_when_regular_app_opens(monkeypatch, tmp_path: P
     logs: list[tuple[str, tuple[object, ...]]] = []
 
     monkeypatch.setattr(
-        "anime_mpv.web_app.request_notification_permission",
+        "pudge.web_app.request_notification_permission",
         lambda timeout=12.0: calls.append(timeout)
         or {"supported": True, "granted": True, "error": ""},
     )

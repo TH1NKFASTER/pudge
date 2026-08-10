@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def _version(db: Database) -> int:

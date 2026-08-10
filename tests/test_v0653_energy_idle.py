@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def _html() -> str:
-    return (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    return (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
 
 
 def test_idle_polychrome_has_no_infinite_animation() -> None:

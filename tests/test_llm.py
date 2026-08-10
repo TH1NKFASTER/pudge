@@ -1,5 +1,5 @@
-from anime_mpv.config import LLMConfig
-from anime_mpv.llm import build_chat_payload
+from pudge.config import LLMConfig
+from pudge.llm import build_chat_payload
 
 
 def test_chat_payload_contains_stable_json_options():
@@ -21,7 +21,7 @@ def test_chat_payload_contains_stable_json_options():
 
 from pathlib import Path
 
-from anime_mpv.llm import OllamaClient, build_subtitle_semantic_samples
+from pudge.llm import OllamaClient, build_subtitle_semantic_samples
 
 
 def _write_srt(path: Path, prefix: str) -> None:

@@ -3,8 +3,8 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-from anime_mpv.models import JimakuFile, VideoIdentity
-from anime_mpv.providers.jimaku import materialize_jimaku_files
+from pudge.models import JimakuFile, VideoIdentity
+from pudge.providers.jimaku import materialize_jimaku_files
 
 
 class FakeJimakuClient:
@@ -51,7 +51,7 @@ def test_zip_exposes_all_japanese_variants_for_episode(tmp_path: Path):
 
 
 def test_movie_archive_file_gets_confidence_without_episode_number(tmp_path: Path):
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     item = JimakuFile(
         url="https://example.test/movie.sup.7z",
@@ -118,7 +118,7 @@ def test_7z_archive_exposes_sup_subtitle(tmp_path: Path, monkeypatch):
 
 
 def test_jimaku_exact_episode_uploaded_before_airing_gets_soft_penalty(tmp_path: Path):
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     item = JimakuFile(
         url="https://example.test/episode.srt",
@@ -141,7 +141,7 @@ def test_jimaku_exact_episode_uploaded_before_airing_gets_soft_penalty(tmp_path:
 
 
 def test_files_for_episode_falls_back_to_unfiltered_entry_files():
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     target = JimakuFile(
         url="https://example.test/carameliser-05.srt",
@@ -167,7 +167,7 @@ def test_files_for_episode_falls_back_to_unfiltered_entry_files():
 
 
 def test_carameliser_atx_exact_episode_survives_airing_date_penalty(tmp_path: Path):
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     item = JimakuFile(
         url="https://example.test/carameliser-05.srt",
@@ -190,7 +190,7 @@ def test_carameliser_atx_exact_episode_survives_airing_date_penalty(tmp_path: Pa
 
 
 def test_jimaku_rank_exposes_diagnostic_score_components(tmp_path: Path):
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     item = JimakuFile(
         url="https://example.test/carameliser-05.srt",
@@ -216,7 +216,7 @@ def test_jimaku_rank_exposes_diagnostic_score_components(tmp_path: Path):
 
 
 def test_files_for_episode_rejects_explicit_range_outside_requested_episode():
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     wrong_pack = JimakuFile(
         url="https://example.test/mushoku-01-02.srt",
@@ -239,7 +239,7 @@ def test_files_for_episode_rejects_explicit_range_outside_requested_episode():
 
 
 def test_jimaku_rank_hard_rejects_explicit_range_outside_episode(tmp_path: Path):
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     wrong_pack = JimakuFile(
         url="https://example.test/mushoku-01-02.srt",
@@ -268,7 +268,7 @@ def test_jimaku_rank_hard_rejects_explicit_range_outside_episode(tmp_path: Path)
 
 
 def test_files_for_episode_expands_sparse_server_results_to_all_entry_variants():
-    from anime_mpv.providers.jimaku import JimakuClient
+    from pudge.providers.jimaku import JimakuClient
 
     netflix = JimakuFile(
         url="https://example.test/netflix-02.srt",

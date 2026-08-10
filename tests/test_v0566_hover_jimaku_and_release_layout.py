@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.language import has_japanese_marker, is_japanese_subtitle
+from pudge.language import has_japanese_marker, is_japanese_subtitle
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def test_watch_order_hover_list_stays_inside_card_cover() -> None:

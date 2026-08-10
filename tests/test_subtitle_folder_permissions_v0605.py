@@ -4,10 +4,10 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.local_search import find_local_subtitles
-from anime_mpv.models import VideoIdentity
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, load_config, write_config
+from pudge.local_search import find_local_subtitles
+from pudge.models import VideoIdentity
+from pudge.web_app import WebAppApi
 
 
 def test_new_config_does_not_implicitly_scan_downloads(tmp_path: Path):
@@ -82,7 +82,7 @@ def test_permission_probe_includes_library_watched_and_subtitle_folders(monkeypa
         captured.extend(Path(path) for path in paths)
         return {str(path): True for path in paths}
 
-    monkeypatch.setattr("anime_mpv.web_app.request_folder_access", fake_request)
+    monkeypatch.setattr("pudge.web_app.request_folder_access", fake_request)
 
     api = WebAppApi.__new__(WebAppApi)
     api.config = AppConfig()
@@ -101,7 +101,7 @@ def test_permission_probe_includes_library_watched_and_subtitle_folders(monkeypa
 
 
 def test_web_ui_exposes_optional_subtitle_folder_and_requests_access_early():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "settings.subtitleFolder':'Subtitle Inbox'" in html
     assert "settings.subtitleFolder':'Subtitle Inbox'" in html
     assert "id=\"s_subtitle_folders\"" in html

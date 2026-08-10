@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def test_scan_merges_pre_rename_and_pudge_rows_for_same_physical_episode(monkeypatch, tmp_path: Path) -> None:
     movies = tmp_path / "Movies"
     current_root = movies / "pudge"
     current_root.mkdir(parents=True)
-    legacy_root = movies / "Anime MPV"
+    legacy_root = movies / "pudge"
 
     video_name = "Seihantai na Kimi to Boku 2nd Season S02E06.mkv"
     current_video = current_root / video_name
@@ -62,7 +62,7 @@ def test_scan_merges_pre_rename_and_pudge_rows_for_same_physical_episode(monkeyp
     manager.db.record_playback(current_video, 0.0, 1440.0)
 
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: ("none", None, None),
     )
 
@@ -82,7 +82,7 @@ def test_scan_rewrites_single_stale_legacy_row_before_rescan(monkeypatch, tmp_pa
     movies = tmp_path / "Movies"
     current_root = movies / "pudge"
     current_root.mkdir(parents=True)
-    legacy_root = movies / "Anime MPV"
+    legacy_root = movies / "pudge"
     current_video = current_root / "Example Anime S01E03.mkv"
     current_video.write_bytes(b"video")
 
@@ -105,7 +105,7 @@ def test_scan_rewrites_single_stale_legacy_row_before_rescan(monkeypatch, tmp_pa
         )
     )
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: ("none", None, None),
     )
 

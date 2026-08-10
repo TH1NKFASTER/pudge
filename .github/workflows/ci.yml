@@ -37,7 +37,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m compileall -q anime_mpv scripts
+      - run: python -m compileall -q pudge scripts
 
   lint:
     name: Lint and UI modules
@@ -51,16 +51,16 @@ jobs:
       - name: Install lint dependencies
         run: python -m pip install -e ".[dev]"
       - name: Check fatal Python errors
-        run: python -m ruff check --select E9,F63,F7 anime_mpv tests scripts
+        run: python -m ruff check --select E9,F63,F7 pudge tests scripts
       - name: Lint new pipeline and media modules
-        run: python -m ruff check --select E9,F anime_mpv/audiobooks.py anime_mpv/manga.py anime_mpv/subtitles anime_mpv/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
+        run: python -m ruff check --select E9,F pudge/audiobooks.py pudge/manga.py pudge/subtitles pudge/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Check JavaScript modules
         run: |
-          node --check anime_mpv/web/settings.js
-          node --check anime_mpv/web/media.js
+          node --check pudge/web/settings.js
+          node --check pudge/web/media.js
 
   macos-smoke:
     name: macOS smoke

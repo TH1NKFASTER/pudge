@@ -1,0 +1,11 @@
+.pudge-study-card,.pudge-translation-pop{position:fixed;z-index:13050;display:none;border:1px solid #4b6482;border-radius:10px;background:#091321;color:#dce7f6;box-shadow:0 16px 48px rgba(0,0,0,.55)}
+.pudge-study-card.open,.pudge-translation-pop.open{display:block}
+.pudge-study-card{width:min(420px,calc(100vw - 24px));max-height:min(520px,calc(100vh - 24px));overflow:auto;padding:12px}
+.pudge-study-head{display:flex;align-items:flex-start;gap:10px}.pudge-study-head>div{min-width:0;flex:1}.pudge-study-head h3{margin:0 0 4px;font-size:20px;overflow-wrap:anywhere}.pudge-study-head button{flex:0 0 auto}
+.pudge-study-reading{color:#b7c7dc;min-height:1em}.pudge-study-subtle{color:#8798ad;font-size:11px}.pudge-study-meanings{margin:10px 0;display:grid;gap:6px;line-height:1.45}
+.pudge-study-card select{width:100%;max-width:100%;margin:2px 0 10px;padding:7px;background:#0f1b2a;color:#dce7f6;border:1px solid #334862;border-radius:7px}
+.pudge-study-actions{display:flex;gap:6px;flex-wrap:wrap}.pudge-study-actions button{padding:6px 9px}
+.pudge-study-word{cursor:pointer;border-radius:3px;padding:0 1px}.pudge-study-word:hover{background:rgba(111,140,255,.18)}
+.pudge-study-word.state-new{color:inherit}.pudge-study-word.state-learning{color:#f4bd63}.pudge-study-word.state-due{color:#ff7d8c}.pudge-study-word.state-known{color:#57d38c}.pudge-study-word.state-blacklisted{color:#7d8795}
+.pudge-translation-pop{width:min(460px,calc(100vw - 24px));max-height:min(320px,calc(100vh - 24px));overflow:auto;padding:12px;line-height:1.55;white-space:pre-wrap}
+.pudge-translation-pop.loading{color:#a9b8ca}

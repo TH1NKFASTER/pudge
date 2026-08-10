@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import time
 
-from anime_mpv.cli import _jimaku_episode_aliases
-from anime_mpv.config import AppConfig
-from anime_mpv.models import AniListAnime
-from anime_mpv.syncing import subtitle_quality_accepted
+from pudge.cli import _jimaku_episode_aliases
+from pudge.config import AppConfig
+from pudge.models import AniListAnime
+from pudge.syncing import subtitle_quality_accepted
 
 
 def _quality_result(*, activity: float, matched: int, score: float, exact_title: bool, cues: int):
@@ -102,9 +102,9 @@ def test_bleach_absolute_jimaku_alias_is_mapped_back_to_current_cour(tmp_path):
 def test_rejected_alass_tries_constant_offset_before_audio(tmp_path, monkeypatch):
     from pathlib import Path
 
-    from anime_mpv.config import SyncConfig
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.config import SyncConfig
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "Bleach.2004.S17E43.mkv"
     source = tmp_path / "Nanako-Bleach-E43.srt"
@@ -118,11 +118,11 @@ def test_rejected_alass_tries_constant_offset_before_audio(tmp_path, monkeypatch
     write_srt([(s + 15.7, e + 15.7, t) for s, e, t in cues], alass)
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {"language": "eng", "title": "English"}),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_with_alass",
+        "pudge.syncing.synchronize_with_alass",
         lambda *args, **kwargs: (
             alass,
             {
@@ -134,7 +134,7 @@ def test_rejected_alass_tries_constant_offset_before_audio(tmp_path, monkeypatch
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.estimate_constant_subtitle_offsets",
+        "pudge.syncing.estimate_constant_subtitle_offsets",
         lambda *args, **kwargs: [
             {
                 "available": True,
@@ -169,7 +169,7 @@ def test_rejected_alass_tries_constant_offset_before_audio(tmp_path, monkeypatch
             }
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_subtitle",
+        "pudge.syncing.synchronize_subtitle",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("audio/FFT must not run after constant-offset recovery")
         ),

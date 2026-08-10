@@ -3,7 +3,7 @@ from pathlib import Path
 
 def _html() -> str:
     return (
-        Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html"
+        Path(__file__).parents[1] / "pudge" / "web" / "index.html"
     ).read_text(encoding="utf-8")
 
 

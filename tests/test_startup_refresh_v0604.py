@@ -8,12 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.maintenance_lock import maintenance_lock
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.providers.nyaa import NyaaClient, NyaaError, search_ranked
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig
+from pudge.maintenance_lock import maintenance_lock
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.providers.nyaa import NyaaClient, NyaaError, search_ranked
+from pudge.web_app import WebAppApi
 
 
 def _anime() -> LibraryAnime:
@@ -88,7 +88,7 @@ def test_automatic_nyaa_search_stops_when_wall_clock_budget_is_used(monkeypatch)
             raise NyaaError("504")
 
     moments = iter([0.0, 0.0, 19.0])
-    monkeypatch.setattr("anime_mpv.providers.nyaa.time.monotonic", lambda: next(moments))
+    monkeypatch.setattr("pudge.providers.nyaa.time.monotonic", lambda: next(moments))
     client = Client()
 
     with pytest.raises(NyaaError, match="budget exhausted"):
@@ -117,7 +117,7 @@ def test_automatic_manager_search_uses_short_timeout_and_budget(monkeypatch):
         captured.update(kwargs)
         return [_release()]
 
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", fake_search)
+    monkeypatch.setattr("pudge.manager.search_ranked", fake_search)
 
     releases = manager.search_releases(194829, episode=5, automatic=True)
 
@@ -174,7 +174,7 @@ def test_startup_maintenance_returns_before_heavy_pass_finishes():
 
 
 def test_web_ui_keeps_full_startup_refresh_but_does_not_block_page():
-    html = Path("anime_mpv/web/index.html").read_text()
+    html = Path("pudge/web/index.html").read_text()
 
     assert "startup_maintenance_status" in html
     assert "Startup refresh continues in the background" in html
@@ -183,7 +183,7 @@ def test_web_ui_keeps_full_startup_refresh_but_does_not_block_page():
 
 
 def test_initial_refresh_button_stays_disabled_until_background_maintenance_finishes():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     assert "setLocalRefreshUi(ui.startupMaintenanceRunning" in html
     assert "setLocalRefreshUi(true,'status.startup')" in html
@@ -193,6 +193,6 @@ def test_initial_refresh_button_stays_disabled_until_background_maintenance_fini
 
 
 def test_startup_poll_forces_visible_home_refresh_before_maintenance_finishes():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     assert "ui.state=r.state;if(ui.windowActive)renderDataPages(true);else ui.pendingDataRender=true" in html

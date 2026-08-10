@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BRAND_FILE = ROOT / "anime_mpv" / "brand.env"
+BRAND_FILE = ROOT / "pudge" / "brand.env"
 
 
 def default_slug(name: str) -> str:
@@ -81,8 +81,8 @@ def main() -> int:
     example = ROOT / "config.example.toml"
     if example.is_file():
         text = example.read_text(encoding="utf-8")
-        old_name = old.get("APP_NAME", "Anime MPV")
-        old_slug = old.get("APP_SLUG", "anime-mpv")
+        old_name = old.get("APP_NAME", "pudge")
+        old_slug = old.get("APP_SLUG", "pudge")
         text = text.replace(f"~/Library/Caches/{old_slug}", f"~/Library/Caches/{slug}")
         text = text.replace(f"~/.local/share/{old_slug}", f"~/.local/share/{slug}")
         text = text.replace(f"~/Movies/{old_name}", f"~/Movies/{args.name}")

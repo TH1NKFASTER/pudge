@@ -1,5 +1,5 @@
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.providers.nyaa import NyaaError, search_ranked
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.providers.nyaa import NyaaError, search_ranked
 
 
 def _anime() -> LibraryAnime:

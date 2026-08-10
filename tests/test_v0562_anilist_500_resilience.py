@@ -5,10 +5,10 @@ from pathlib import Path
 
 import httpx
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.providers.anilist import AniListClient
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import LibraryAnime
+from pudge.providers.anilist import AniListClient
+from pudge.web_app import WebAppApi
 
 
 def _client(handler) -> AniListClient:
@@ -198,6 +198,6 @@ def test_planning_mutation_stays_successful_when_refresh_fails(tmp_path: Path, m
 
 
 def test_ui_explains_saved_mutation_with_delayed_refresh() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text()
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
     assert "toast.anilistRefreshPending" in html
     assert "r.refresh_pending?t('toast.anilistRefreshPending')" in html

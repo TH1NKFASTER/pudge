@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv.player import build_mpv_command, run_mpv
+from pudge.player import build_mpv_command, run_mpv
 
 
 def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path):
@@ -28,7 +28,7 @@ def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path
 
 
 def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path):
-    script = tmp_path / "anime_mpv_anilist.lua"
+    script = tmp_path / "pudge_anilist.lua"
     command = build_mpv_command(
         "mpv",
         Path("episode.mkv"),
@@ -87,8 +87,8 @@ def test_run_mpv_focus_uses_direct_process_and_waits(monkeypatch):
         def wait(self):
             return 0
 
-    monkeypatch.setattr("anime_mpv.player.subprocess.Popen", lambda command, env=None: calls.append(command) or FakeProcess())
-    monkeypatch.setattr("anime_mpv.player._focus_mpv_process", lambda pid: calls.append(["focus", str(pid)]))
+    monkeypatch.setattr("pudge.player.subprocess.Popen", lambda command, env=None: calls.append(command) or FakeProcess())
+    monkeypatch.setattr("pudge.player._focus_mpv_process", lambda pid: calls.append(["focus", str(pid)]))
 
     result = run_mpv(["mpv", "--fs", "--", "episode.mkv"], focus=True)
 
