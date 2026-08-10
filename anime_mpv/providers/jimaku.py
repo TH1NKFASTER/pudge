@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import json
+import fcntl
 import time
 import re
 from datetime import datetime, timezone
@@ -25,6 +26,13 @@ from ..subtitle_formats import format_preference_bonus, subtitle_bilingual_cjk_p
 
 SUBTITLE_EXTENSIONS = TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS
 ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar"}
+
+# jimaku.cc documents a 25 requests/minute limit per API key. Keep a
+# deliberate safety margin while still allowing a small interactive burst.
+# Four initial tokens + 20/min sustained traffic stays below 25 requests in
+# the first minute and then settles at one network request every ~3 seconds.
+JIMAKU_LOCAL_REQUESTS_PER_MINUTE = 20.0
+JIMAKU_LOCAL_BURST_CAPACITY = 4.0
 
 
 def find_7zip() -> str | None:
@@ -122,6 +130,7 @@ class JimakuClient:
         self.base_url = base_url.rstrip("/")
         self.cache_dir = cache_dir
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
+        self._api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
         self.logger = configure_logging()
         self.client = httpx.Client(
             timeout=45,
@@ -135,6 +144,104 @@ class JimakuClient:
 
     def close(self) -> None:
         self.client.close()
+
+    def _request_budget_file(self) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / "jimaku-api" / "request-budget.json"
+
+    def _reserve_request_slot(self, *, now: float | None = None) -> float:
+        """Reserve one shared Jimaku request slot and return required wait seconds.
+
+        All prepare-only subprocesses share this small on-disk token bucket. We
+        reserve future tokens while holding a filesystem lock so simultaneous
+        processes queue behind each other instead of all waking for the same slot.
+        """
+        marker = self._request_budget_file()
+        if marker is None:
+            return 0.0
+
+        moment = time.time() if now is None else float(now)
+        refill_per_second = JIMAKU_LOCAL_REQUESTS_PER_MINUTE / 60.0
+        capacity = JIMAKU_LOCAL_BURST_CAPACITY
+        if refill_per_second <= 0.0 or capacity <= 0.0:
+            return 0.0
+
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = marker.with_name("request-budget.lock")
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    payload: dict[str, object] = {}
+                    if marker.is_file():
+                        try:
+                            loaded = json.loads(marker.read_text(encoding="utf-8"))
+                            if isinstance(loaded, dict):
+                                payload = loaded
+                        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                            payload = {}
+
+                    same_key = str(payload.get("key_hash") or "") == self._api_key_hash
+                    try:
+                        tokens = float(payload.get("tokens")) if same_key else capacity
+                        updated_at = float(payload.get("updated_at")) if same_key else moment
+                    except (TypeError, ValueError):
+                        tokens = capacity
+                        updated_at = moment
+
+                    elapsed = max(0.0, moment - updated_at)
+                    tokens = min(capacity, tokens + elapsed * refill_per_second)
+
+                    if tokens >= 1.0:
+                        wait_seconds = 0.0
+                    else:
+                        wait_seconds = (1.0 - tokens) / refill_per_second
+
+                    # Reserving even a future token is intentional. Negative token
+                    # balances serialize several concurrent processes into
+                    # distinct future slots: 3s, 6s, 9s, ... instead of a thundering herd.
+                    tokens -= 1.0
+                    temporary = marker.with_name(
+                        f"{marker.name}.{os.getpid()}.tmp"
+                    )
+                    temporary.write_text(
+                        json.dumps(
+                            {
+                                "key_hash": self._api_key_hash,
+                                "tokens": tokens,
+                                "updated_at": moment,
+                                "requests_per_minute": JIMAKU_LOCAL_REQUESTS_PER_MINUTE,
+                                "burst_capacity": JIMAKU_LOCAL_BURST_CAPACITY,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    temporary.replace(marker)
+                    return max(0.0, wait_seconds)
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            # Pacing is protective rather than correctness-critical. A damaged or
+            # read-only cache directory must not make Jimaku unusable.
+            self.logger.warning(
+                "FALLBACK step=jimaku.local_rate_limit reason=lock_error error=%r",
+                str(exc),
+            )
+            return 0.0
+
+    def _acquire_request_slot(self, path: str) -> None:
+        wait_seconds = self._reserve_request_slot()
+        if wait_seconds <= 0.0:
+            return
+        self.logger.info(
+            "WAIT step=jimaku.local_rate_limit path=%s wait_s=%.2f rate_per_minute=%.1f burst=%.1f",
+            path,
+            wait_seconds,
+            JIMAKU_LOCAL_REQUESTS_PER_MINUTE,
+            JIMAKU_LOCAL_BURST_CAPACITY,
+        )
+        time.sleep(wait_seconds)
 
     def _rate_limit_file(self) -> Path | None:
         if self.cache_dir is None:
@@ -230,6 +337,7 @@ class JimakuClient:
         last_network_error: httpx.HTTPError | None = None
         for attempt in range(3):
             try:
+                self._acquire_request_slot(path)
                 with timed_step(
                     self.logger,
                     "jimaku.http",

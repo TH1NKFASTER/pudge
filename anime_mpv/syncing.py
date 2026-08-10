@@ -35,7 +35,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.21:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
+        f"syncing-v0.3.22:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
         f"{config.skip_on_low_quality}:{config.vad}:{config.fix_framerate}:{config.gss}:"
@@ -2422,6 +2422,328 @@ def _windowed_reference_shift(
     }
 
 
+def _stable_offset_cluster(
+    values: list[float],
+    *,
+    tolerance: float = 0.45,
+) -> dict[str, object] | None:
+    """Return the strongest compact offset cluster, ignoring isolated aliases."""
+    if len(values) < 2:
+        return None
+    tolerance = max(0.10, float(tolerance))
+    best: list[float] = []
+    for center in values:
+        group = [value for value in values if abs(value - center) <= tolerance]
+        if len(group) > len(best):
+            best = group
+        elif len(group) == len(best) and group:
+            current_spread = max(group) - min(group)
+            best_spread = max(best) - min(best) if best else float("inf")
+            if current_spread < best_spread:
+                best = group
+    if len(best) < 2:
+        return None
+    median = float(statistics.median(best))
+    inliers = [value for value in values if abs(value - median) <= tolerance]
+    if len(inliers) < 2:
+        return None
+    return {
+        "offset_seconds": round(float(statistics.median(inliers)), 4),
+        "support": len(inliers),
+        "total": len(values),
+        "support_ratio": round(len(inliers) / len(values), 4),
+        "spread_seconds": round(max(inliers) - min(inliers), 4),
+        "values": [round(value, 4) for value in inliers],
+    }
+
+
+def _stable_two_plateau_offsets(
+    before_values: list[float],
+    after_values: list[float],
+    *,
+    minimum_delta_seconds: float = 0.55,
+    maximum_delta_seconds: float = 3.0,
+) -> dict[str, object] | None:
+    """Recognize two nearby but genuinely distinct timing plateaus.
+
+    This intentionally targets small edit differences that the ordinary
+    large-jump detector ignores. Both sides must independently form a compact
+    cluster, so two noisy ffsubsync maxima are not enough.
+    """
+    before = _stable_offset_cluster(before_values)
+    after = _stable_offset_cluster(after_values)
+    if before is None or after is None:
+        return None
+    if float(before["support_ratio"]) < 0.60 or float(after["support_ratio"]) < 0.60:
+        return None
+
+    left = float(before["offset_seconds"])
+    right = float(after["offset_seconds"])
+    delta = abs(right - left)
+    if not minimum_delta_seconds <= delta <= maximum_delta_seconds:
+        return None
+    return {
+        "before": before,
+        "after": after,
+        "before_offset_seconds": left,
+        "after_offset_seconds": right,
+        "delta_seconds": round(delta, 4),
+    }
+
+
+def _repair_stable_opening_plateaus(
+    aligned: Path,
+    reference: Path,
+    candidate_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    force: bool = False,
+    verbose: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    """Repair a small stable clock change across an opening/title-card gap.
+
+    Some releases use one constant offset before the OP and another, only about
+    a second away, afterwards. The older piecewise logic looked specifically for
+    large jumps, so it interpolated through this edit. Here each side must be
+    supported by several independent subtitle-activity probes and the final
+    candidate still has to improve the exact embedded-reference activity score.
+    """
+    if len(candidate_cues) < 12 or len(reference_cues) < 12:
+        return aligned, _result("opening_plateau_too_few_cues", applied=False)
+
+    duration = max(
+        max(end for _start, end, _text in candidate_cues),
+        max(end for _start, end, _text in reference_cues),
+    )
+    if duration < 300.0:
+        return aligned, _result("opening_plateau_too_short", applied=False)
+
+    gap_candidates = [
+        (previous_end, next_start, next_start - previous_end)
+        for (_previous_start, previous_end, _previous_text),
+            (next_start, _next_end, _next_text)
+        in zip(candidate_cues, candidate_cues[1:])
+        if next_start - previous_end >= 20.0
+        and previous_end >= 20.0
+        and next_start <= min(duration * 0.45, 10 * 60.0)
+    ]
+    if not gap_candidates:
+        return aligned, _result("opening_plateau_gap_not_found", applied=False)
+
+    max_shift = min(
+        12.0,
+        max(4.0, float(config.piecewise_max_correction_seconds)),
+    )
+    evaluated: list[dict[str, object]] = []
+
+    for gap_start, gap_end, gap_seconds in sorted(
+        gap_candidates,
+        key=lambda item: item[2],
+        reverse=True,
+    )[:4]:
+        pre_regions = [
+            (max(0.0, gap_start - 75.0), gap_start),
+            (max(0.0, gap_start - 120.0), gap_start),
+            (max(0.0, gap_start - 180.0), max(0.0, gap_start - 20.0)),
+        ]
+        post_regions = [
+            (gap_end, min(duration, gap_end + 75.0)),
+            (gap_end, min(duration, gap_end + 120.0)),
+            (min(duration, gap_end + 20.0), min(duration, gap_end + 180.0)),
+        ]
+
+        def probe(regions: list[tuple[float, float]]) -> tuple[list[float], list[dict[str, object]]]:
+            values: list[float] = []
+            details: list[dict[str, object]] = []
+            seen: set[tuple[int, int]] = set()
+            for region_start, region_end in regions:
+                if region_end - region_start < 25.0:
+                    continue
+                key = (int(round(region_start * 10)), int(round(region_end * 10)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                result = _windowed_reference_shift(
+                    candidate_cues,
+                    reference_cues,
+                    region_start=region_start,
+                    region_end=region_end,
+                    max_shift_seconds=max_shift,
+                )
+                details.append(result)
+                if result.get("confident"):
+                    values.append(float(result.get("shift_seconds") or 0.0))
+            return values, details
+
+        before_values, before_probes = probe(pre_regions)
+        after_values, after_probes = probe(post_regions)
+        plateau = _stable_two_plateau_offsets(before_values, after_values)
+        item: dict[str, object] = {
+            "gap_start": round(gap_start, 3),
+            "gap_end": round(gap_end, 3),
+            "gap_seconds": round(gap_seconds, 3),
+            "before_values": [round(value, 4) for value in before_values],
+            "after_values": [round(value, 4) for value in after_values],
+            "before_probes": before_probes,
+            "after_probes": after_probes,
+            "plateau": plateau,
+        }
+        evaluated.append(item)
+        if plateau is None:
+            continue
+
+    valid = [item for item in evaluated if isinstance(item.get("plateau"), dict)]
+    if not valid:
+        return aligned, _result(
+            "opening_plateau_not_stable",
+            applied=False,
+            candidates=evaluated,
+        )
+
+    def plan_rank(item: dict[str, object]) -> tuple[int, float, float]:
+        plateau = item["plateau"]
+        assert isinstance(plateau, dict)
+        before = plateau["before"]
+        after = plateau["after"]
+        assert isinstance(before, dict) and isinstance(after, dict)
+        support = int(before.get("support") or 0) + int(after.get("support") or 0)
+        return (
+            support,
+            float(item.get("gap_seconds") or 0.0),
+            -float(plateau.get("delta_seconds") or 0.0),
+        )
+
+    best = max(valid, key=plan_rank)
+    plateau = best["plateau"]
+    assert isinstance(plateau, dict)
+    before_offset = float(plateau["before_offset_seconds"])
+    after_offset = float(plateau["after_offset_seconds"])
+    boundary = float(best["gap_end"])
+
+    corrections = [
+        before_offset if (start + end) / 2.0 < boundary else after_offset
+        for start, end, _text in candidate_cues
+    ]
+    repaired, sequence_safety = _retime_cues_without_reordering(
+        candidate_cues,
+        corrections,
+    )
+    if repaired is None:
+        return aligned, _result(
+            "opening_plateau_unsafe_sequence",
+            applied=False,
+            plan=best,
+            sequence_safety=sequence_safety,
+            candidates=evaluated,
+        )
+
+    aligned_stat = aligned.stat()
+    reference_stat = reference.stat()
+    digest = hashlib.sha1(
+        (
+            f"reference-opening-plateau-v1:{aligned.resolve()}:{aligned_stat.st_size}:"
+            f"{aligned_stat.st_mtime_ns}:{reference.resolve()}:{reference_stat.st_size}:"
+            f"{reference_stat.st_mtime_ns}:{boundary:.3f}:{before_offset:.4f}:"
+            f"{after_offset:.4f}"
+        ).encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "reference-opening-plateau"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+    if force:
+        output.unlink(missing_ok=True)
+    if not output.exists() or output.stat().st_size <= 0:
+        write_srt(repaired, output, preserve_order=True)
+
+    before_activity = compare_timing_activity(aligned, reference)
+    after_activity = compare_timing_activity(output, reference)
+    priority_seconds = min(duration, max(120.0, boundary + 60.0))
+    before_opening = compare_timing_activity(
+        aligned,
+        reference,
+        priority_seconds=priority_seconds,
+    )
+    after_opening = compare_timing_activity(
+        output,
+        reference,
+        priority_seconds=priority_seconds,
+    )
+    if not all(
+        payload.get("available")
+        for payload in (before_activity, after_activity, before_opening, after_opening)
+    ):
+        output.unlink(missing_ok=True)
+        return aligned, _result(
+            "opening_plateau_metrics_unavailable",
+            applied=False,
+            plan=best,
+            candidates=evaluated,
+        )
+
+    weighted_gain = float(after_activity.get("weighted") or 0.0) - float(
+        before_activity.get("weighted") or 0.0
+    )
+    start_gain = float(after_opening.get("start") or 0.0) - float(
+        before_opening.get("start") or 0.0
+    )
+    middle_loss = float(before_activity.get("middle") or 0.0) - float(
+        after_activity.get("middle") or 0.0
+    )
+    accepted = (
+        middle_loss <= 0.020
+        and (
+            weighted_gain >= 0.004
+            or (start_gain >= 0.015 and weighted_gain >= -0.001)
+        )
+    )
+    if verbose:
+        print(
+            "  Stable opening plateaus: "
+            f"before={before_offset:+.2f}s, after={after_offset:+.2f}s, "
+            f"boundary={boundary:.2f}s, delta={float(plateau['delta_seconds']):.2f}s, "
+            f"weighted_gain={weighted_gain:+.4f}, start_gain={start_gain:+.4f}, "
+            f"middle_loss={middle_loss:+.4f}, accepted={accepted}"
+        )
+    if not accepted:
+        output.unlink(missing_ok=True)
+        return aligned, _result(
+            "opening_plateau_no_improvement",
+            applied=False,
+            plan=best,
+            candidates=evaluated,
+            before=before_activity,
+            after=after_activity,
+            before_opening=before_opening,
+            after_opening=after_opening,
+            weighted_gain=round(weighted_gain, 4),
+            start_gain=round(start_gain, 4),
+            middle_loss=round(middle_loss, 4),
+        )
+
+    return output, _result(
+        "applied",
+        applied=True,
+        strategy="stable_opening_plateaus",
+        output=str(output),
+        boundary_seconds=round(boundary, 3),
+        before_offset_seconds=round(before_offset, 4),
+        after_offset_seconds=round(after_offset, 4),
+        delta_seconds=round(float(plateau["delta_seconds"]), 4),
+        plan=best,
+        candidates=evaluated,
+        before=before_activity,
+        after=after_activity,
+        before_opening=before_opening,
+        after_opening=after_opening,
+        weighted_gain=round(weighted_gain, 4),
+        start_gain=round(start_gain, 4),
+        middle_loss=round(middle_loss, 4),
+        sequence_safety=sequence_safety,
+    )
+
+
 def repair_with_embedded_reference_piecewise(
     aligned: Path,
     reference: Path,
@@ -2456,6 +2778,19 @@ def repair_with_embedded_reference_piecewise(
     )
     if duration < 180.0:
         return aligned, _result("reference_piecewise_too_short", applied=False)
+
+    plateau_path, plateau_result = _repair_stable_opening_plateaus(
+        aligned,
+        reference,
+        candidate_cues,
+        reference_cues,
+        cache_dir,
+        config,
+        force=force,
+        verbose=verbose,
+    )
+    if plateau_result.get("applied"):
+        return plateau_path, plateau_result
 
     # Large equal windows are good for gradual drift across an episode, but they
     # can completely hide a cold-open-only error: a 5-6 second mismatch in the
