@@ -62,4 +62,4 @@ def test_constant_offset_search_is_bounded_and_keeps_small_global_shift(tmp_path
 
 def test_sync_cache_generation_changed_for_new_alignment_algorithm():
     source = Path("anime_mpv/syncing.py").read_text(encoding="utf-8")
-    assert "syncing-v0.3.22:" in source
+    assert "syncing-v0.3.23:" in source

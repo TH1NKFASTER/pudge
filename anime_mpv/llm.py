@@ -425,6 +425,168 @@ class OllamaClient:
         )
         return final_result
 
+
+    def match_subtitle_anchor_regions(
+        self,
+        regions: list[dict[str, Any]],
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Match clearly equivalent JP/EN dialogue groups inside small time windows.
+
+        The caller has already established that both subtitle tracks belong to
+        the same episode. This method does not estimate timing itself; it only
+        identifies which ordered subtitle groups translate each other so the
+        exact embedded-English timestamps can be used as clock anchors.
+        """
+        normalized_regions: list[dict[str, Any]] = []
+        for region in regions[:6]:
+            if not isinstance(region, dict):
+                continue
+            name = str(region.get("name") or "").strip()
+            japanese = region.get("japanese")
+            english = region.get("english")
+            if not name or not isinstance(japanese, list) or not isinstance(english, list):
+                continue
+            normalized_regions.append(
+                {
+                    "name": name,
+                    "japanese": japanese[:14],
+                    "english": english[:28],
+                }
+            )
+        if not normalized_regions:
+            return {"accepted": False, "reason": "no_regions", "regions": []}
+
+        cache_path: Path | None = None
+        if self.cache_dir is not None:
+            try:
+                raw = json.dumps(normalized_regions, ensure_ascii=False, sort_keys=True)
+                digest = hashlib.sha256(
+                    (
+                        f"anchor-regions-v1:{self.model}:{self.config.think}:"
+                        f"{self.config.temperature}:{self.config.num_ctx}:{raw}"
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+                cache_path = self.cache_dir / "llm-anchor-alignment" / f"{digest}.json"
+                if not force and cache_path.is_file():
+                    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        age = time.time() - float(payload.get("cached_at") or 0.0)
+                        result = payload.get("result")
+                        ttl = (
+                            SEMANTIC_CACHE_ACCEPTED_TTL_SECONDS
+                            if isinstance(result, dict) and bool(result.get("accepted"))
+                            else SEMANTIC_CACHE_REJECTED_TTL_SECONDS
+                        )
+                        if isinstance(result, dict) and age < ttl:
+                            cached = dict(result)
+                            cached["cached"] = True
+                            return cached
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                cache_path = None
+
+        system = (
+            "The Japanese and English subtitle tracks are already verified to belong to the same episode. "
+            "For each named region, match only subtitle groups that clearly express the same spoken dialogue. "
+            "Use meaning, speaker intent, names and actions; timestamps are only a loose search window and must "
+            "not decide a match. The embedded English track may contain opening/ending song lyrics, accessibility "
+            "captions, signs, or other lines completely absent from the Japanese track. Leave those English rows "
+            "unmatched. Japanese and English may split one spoken sentence differently, so one-to-many and "
+            "many-to-one groups of up to 3 rows are allowed. Preserve narrative order and never reuse a row. "
+            "Return strict JSON: {\"regions\":[{\"name\":string,\"matches\":["
+            "{\"japanese\":[integer,...],\"english\":[integer,...],\"confidence\":0..1}]}]}. "
+            "Indices are the zero-based index fields supplied in each region. Omit uncertain matches."
+        )
+        result = self._json_chat(
+            system,
+            json.dumps({"regions": normalized_regions}, ensure_ascii=False),
+        )
+        if not isinstance(result, dict):
+            return {
+                "accepted": False,
+                "reason": "llm_request_failed",
+                "regions": [],
+                "cached": False,
+            }
+
+        allowed_names = {str(item["name"]) for item in normalized_regions}
+        parsed_regions: list[dict[str, Any]] = []
+        total_matches = 0
+        raw_regions = result.get("regions")
+        if isinstance(raw_regions, list):
+            for raw_region in raw_regions:
+                if not isinstance(raw_region, dict):
+                    continue
+                name = str(raw_region.get("name") or "").strip()
+                if name not in allowed_names:
+                    continue
+                parsed_matches: list[dict[str, Any]] = []
+                raw_matches = raw_region.get("matches")
+                if isinstance(raw_matches, list):
+                    for raw_match in raw_matches:
+                        if not isinstance(raw_match, dict):
+                            continue
+
+                        def parse_indices(value: object) -> list[int]:
+                            source = value if isinstance(value, list) else [value]
+                            output: list[int] = []
+                            for item in source:
+                                try:
+                                    output.append(int(item))
+                                except (TypeError, ValueError):
+                                    pass
+                            return sorted(set(output))
+
+                        japanese = parse_indices(raw_match.get("japanese"))
+                        english = parse_indices(raw_match.get("english"))
+                        try:
+                            confidence = max(
+                                0.0,
+                                min(1.0, float(raw_match.get("confidence") or 0.0)),
+                            )
+                        except (TypeError, ValueError):
+                            confidence = 0.0
+                        if (
+                            not japanese
+                            or not english
+                            or len(japanese) > 3
+                            or len(english) > 3
+                            or confidence < 0.50
+                        ):
+                            continue
+                        parsed_matches.append(
+                            {
+                                "japanese": japanese,
+                                "english": english,
+                                "confidence": round(confidence, 4),
+                            }
+                        )
+                total_matches += len(parsed_matches)
+                parsed_regions.append({"name": name, "matches": parsed_matches})
+
+        final = {
+            "accepted": total_matches >= 2,
+            "reason": "matched" if total_matches >= 2 else "too_few_matches",
+            "regions": parsed_regions,
+            "total_matches": total_matches,
+            "cached": False,
+        }
+        if cache_path is not None:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(
+                    json.dumps(
+                        {"cached_at": time.time(), "result": final},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+        return final
+
+
     def improve_identity(self, identity: VideoIdentity) -> VideoIdentity:
         system = (
             "Parse anime release filenames. Return strict JSON with keys title, episode, season, year. "

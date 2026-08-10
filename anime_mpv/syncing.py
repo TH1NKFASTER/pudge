@@ -35,7 +35,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.22:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
+        f"syncing-v0.3.23:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
         f"{config.skip_on_low_quality}:{config.vad}:{config.fix_framerate}:{config.gss}:"
@@ -2744,12 +2744,835 @@ def _repair_stable_opening_plateaus(
     )
 
 
+
+def _reference_repair_engine_suffix(result: dict[str, object]) -> str:
+    if str(result.get("strategy") or "") == "embedded_reference_dialogue_anchors":
+        return "+reference-dialogue-anchors"
+    return "+reference-piecewise"
+
+
+def _reference_only_opening_gap(
+    candidate_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    *,
+    max_clock_error_seconds: float = 12.0,
+) -> dict[str, object] | None:
+    """Find an early JP-silent / embedded-reference-active opening region."""
+    if len(candidate_cues) < 8 or len(reference_cues) < 8:
+        return None
+    duration = max(
+        max(end for _start, end, _text in candidate_cues),
+        max(end for _start, end, _text in reference_cues),
+    )
+    limit = max(2.0, float(max_clock_error_seconds))
+    candidates: list[dict[str, object]] = []
+    for (_left_start, left_end, _left_text), (right_start, _right_end, _right_text) in zip(
+        candidate_cues,
+        candidate_cues[1:],
+    ):
+        gap_seconds = float(right_start - left_end)
+        if (
+            gap_seconds < 45.0
+            or left_end < 15.0
+            or right_start > min(duration * 0.45, 10 * 60.0)
+        ):
+            continue
+        interior_start = left_end + min(8.0, gap_seconds * 0.12)
+        interior_end = right_start - min(8.0, gap_seconds * 0.12)
+        reference_inside = [
+            cue
+            for cue in reference_cues
+            if (
+                (cue[0] + cue[1]) / 2.0 >= interior_start - limit
+                and (cue[0] + cue[1]) / 2.0 <= interior_end + limit
+            )
+        ]
+        if len(reference_inside) < 4:
+            continue
+        active_seconds = sum(max(0.0, end - start) for start, end, _text in reference_inside)
+        if active_seconds < 10.0:
+            continue
+        candidates.append(
+            {
+                "gap_start": round(float(left_end), 3),
+                "gap_end": round(float(right_start), 3),
+                "gap_seconds": round(gap_seconds, 3),
+                "reference_cues": len(reference_inside),
+                "reference_active_seconds": round(active_seconds, 3),
+            }
+        )
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda item: (
+            int(item["reference_cues"]),
+            float(item["reference_active_seconds"]),
+            float(item["gap_seconds"]),
+            -float(item["gap_start"]),
+        ),
+    )
+
+
+def _anchor_region_cluster(
+    offsets: list[dict[str, object]],
+    *,
+    tolerance: float = 0.90,
+    minimum_support: int = 2,
+) -> dict[str, object] | None:
+    if not offsets:
+        return None
+
+    minimum_support = max(1, int(minimum_support))
+
+    if minimum_support == 1 and len(offsets) == 1:
+        item = offsets[0]
+        value = float(item["offset_seconds"])
+        return {
+            "offset_seconds": round(value, 4),
+            "support": 1,
+            "total": 1,
+            "support_ratio": 1.0,
+            "spread_seconds": 0.0,
+            "values": [round(value, 4)],
+            "matches": [item],
+            "mean_confidence": round(float(item.get("confidence") or 0.0), 4),
+        }
+
+    values = [float(item["offset_seconds"]) for item in offsets]
+    cluster = _stable_offset_cluster(values, tolerance=tolerance)
+    if cluster is None:
+        return None
+    center = float(cluster["offset_seconds"])
+    inliers = [
+        item
+        for item in offsets
+        if abs(float(item["offset_seconds"]) - center) <= tolerance
+    ]
+    if len(inliers) < minimum_support:
+        return None
+    return {
+        **cluster,
+        "matches": inliers,
+        "mean_confidence": round(
+            statistics.fmean(float(item.get("confidence") or 0.0) for item in inliers),
+            4,
+        ),
+    }
+
+
+def _repair_with_embedded_reference_dialogue_anchors(
+    aligned: Path,
+    reference: Path,
+    candidate_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    cache_dir: Path,
+    config: SyncConfig,
+    llm: OllamaClient,
+    *,
+    force: bool = False,
+    verbose: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    """Use semantically matched dialogue timestamps as the primary video clock.
+
+    The embedded text track belongs to the exact video, so once the LLM has
+    already verified the episode identity its timestamps are ground truth.
+    English-only opening lyrics are represented as a reference-only gap and are
+    deliberately left unmatched rather than treated as timing evidence.
+    """
+    max_shift = min(
+        15.0,
+        max(8.0, float(config.piecewise_max_correction_seconds)),
+    )
+    opening = _reference_only_opening_gap(
+        candidate_cues,
+        reference_cues,
+        max_clock_error_seconds=max_shift,
+    )
+    if opening is None:
+        return aligned, _result("reference_dialogue_opening_gap_not_found", applied=False)
+
+    gap_start = float(opening["gap_start"])
+    gap_end = float(opening["gap_end"])
+    duration = max(
+        max(end for _start, end, _text in candidate_cues),
+        max(end for _start, end, _text in reference_cues),
+    )
+
+    candidate_dialogue = [
+        cue for cue in candidate_cues if not _is_reference_non_dialogue(cue[2])
+    ]
+    if len(candidate_dialogue) < 12:
+        return aligned, _result("reference_dialogue_too_few_candidate_cues", applied=False)
+
+    def select_range(start: float, end: float, *, limit: int = 10) -> list[tuple[float, float, str]]:
+        selected = [
+            cue
+            for cue in candidate_dialogue
+            if cue[1] >= start and cue[0] <= end
+        ]
+        if len(selected) <= limit:
+            return selected
+        center = (start + end) / 2.0
+        ranked = sorted(
+            selected,
+            key=lambda cue: abs(((cue[0] + cue[1]) / 2.0) - center),
+        )[:limit]
+        return sorted(ranked, key=lambda cue: cue[0])
+
+    before = select_range(max(0.0, gap_start - 150.0), gap_start - 0.01, limit=10)
+    after = select_range(gap_end + 0.01, min(duration, gap_end + 180.0), limit=10)
+
+    def select_near(center: float, *, limit: int = 8) -> list[tuple[float, float, str]]:
+        ranked = sorted(
+            candidate_dialogue,
+            key=lambda cue: abs(((cue[0] + cue[1]) / 2.0) - center),
+        )
+        selected = sorted(ranked[:limit], key=lambda cue: cue[0])
+        return [
+            cue
+            for cue in selected
+            if cue[0] >= gap_end + 5.0
+        ]
+
+    middle = select_near(max(gap_end + 120.0, duration * 0.52), limit=8)
+    late = select_near(max(gap_end + 240.0, duration * 0.80), limit=8)
+
+    raw_regions = [
+        ("before_opening", before),
+        ("after_opening", after),
+        ("middle", middle),
+        ("late", late),
+    ]
+    region_payloads: list[dict[str, object]] = []
+    region_lookup: dict[str, dict[str, list[dict[str, object]]]] = {}
+    for name, japanese_cues in raw_regions:
+        minimum_region_cues = 1 if name == "before_opening" else 3
+        if len(japanese_cues) < minimum_region_cues:
+            continue
+        region_start = min(start for start, _end, _text in japanese_cues)
+        region_end = max(end for _start, end, _text in japanese_cues)
+        english_cues = [
+            cue
+            for cue in reference_cues
+            if cue[1] >= region_start - max_shift - 4.0
+            and cue[0] <= region_end + max_shift + 4.0
+            and not _is_reference_non_dialogue(cue[2])
+        ]
+        if len(english_cues) < minimum_region_cues:
+            continue
+        if len(english_cues) > 22:
+            center = (region_start + region_end) / 2.0
+            english_cues = sorted(
+                sorted(
+                    english_cues,
+                    key=lambda cue: abs(((cue[0] + cue[1]) / 2.0) - center),
+                )[:22],
+                key=lambda cue: cue[0],
+            )
+
+        japanese_rows = [
+            {
+                "index": index,
+                "start": round(float(start), 3),
+                "end": round(float(end), 3),
+                "text": str(text)[:260],
+            }
+            for index, (start, end, text) in enumerate(japanese_cues)
+        ]
+        english_rows = [
+            {
+                "index": index,
+                "start": round(float(start), 3),
+                "end": round(float(end), 3),
+                "text": str(text)[:260],
+            }
+            for index, (start, end, text) in enumerate(english_cues)
+        ]
+        region_payloads.append(
+            {
+                "name": name,
+                "japanese": japanese_rows,
+                "english": english_rows,
+            }
+        )
+        region_lookup[name] = {
+            "japanese": japanese_rows,
+            "english": english_rows,
+        }
+
+    if not any(item["name"] == "before_opening" for item in region_payloads):
+        return aligned, _result("reference_dialogue_before_region_missing", applied=False)
+    if not any(item["name"] == "after_opening" for item in region_payloads):
+        return aligned, _result("reference_dialogue_after_region_missing", applied=False)
+
+    matched_regions = []
+    total_anchor_matches = 0
+
+    for region in region_payloads:
+        one_result = llm.match_subtitle_anchor_regions(
+            [region],
+            force=force,
+        )
+        regions = one_result.get("regions")
+        if isinstance(regions, list):
+            for matched_region in regions:
+                if not isinstance(matched_region, dict):
+                    continue
+                matched_regions.append(matched_region)
+                matches = matched_region.get("matches")
+                if isinstance(matches, list):
+                    total_anchor_matches += len(matches)
+
+    match_result = {
+        "accepted": total_anchor_matches >= 2,
+        "reason": "matched" if total_anchor_matches >= 2 else "too_few_matches",
+        "regions": matched_regions,
+        "total_matches": total_anchor_matches,
+        "per_region_requests": True,
+    }
+
+    if not bool(match_result.get("accepted")):
+        return aligned, _result(
+            "reference_dialogue_llm_match_failed",
+            applied=False,
+            opening=opening,
+            llm_result=match_result,
+        )
+
+    region_offsets: dict[str, list[dict[str, object]]] = {}
+    for region in match_result.get("regions", []):
+        if not isinstance(region, dict):
+            continue
+        name = str(region.get("name") or "")
+        lookup = region_lookup.get(name)
+        if lookup is None:
+            continue
+        japanese_rows = lookup["japanese"]
+        english_rows = lookup["english"]
+        last_japanese = -1
+        last_english = -1
+        used_japanese: set[int] = set()
+        used_english: set[int] = set()
+        accepted_matches: list[dict[str, object]] = []
+        for match in region.get("matches", []):
+            if not isinstance(match, dict):
+                continue
+            try:
+                confidence = float(match.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if confidence < 0.68:
+                continue
+
+            def indices(value: object) -> list[int]:
+                raw = value if isinstance(value, list) else [value]
+                parsed: list[int] = []
+                for item in raw:
+                    try:
+                        parsed.append(int(item))
+                    except (TypeError, ValueError):
+                        pass
+                return sorted(set(parsed))
+
+            japanese_indexes = indices(match.get("japanese"))
+            english_indexes = indices(match.get("english"))
+            if (
+                not japanese_indexes
+                or not english_indexes
+                or len(japanese_indexes) > 3
+                or len(english_indexes) > 3
+                or min(japanese_indexes) <= last_japanese
+                or min(english_indexes) <= last_english
+                or used_japanese.intersection(japanese_indexes)
+                or used_english.intersection(english_indexes)
+                or max(japanese_indexes) >= len(japanese_rows)
+                or max(english_indexes) >= len(english_rows)
+            ):
+                continue
+            ja_group = [japanese_rows[index] for index in japanese_indexes]
+            en_group = [english_rows[index] for index in english_indexes]
+            ja_start = min(float(item["start"]) for item in ja_group)
+            ja_end = max(float(item["end"]) for item in ja_group)
+            en_start = min(float(item["start"]) for item in en_group)
+            en_end = max(float(item["end"]) for item in en_group)
+            start_offset = en_start - ja_start
+            end_offset = en_end - ja_end
+            if abs(start_offset) > max_shift:
+                continue
+
+            # Translation subtitles frequently keep the same spoken line
+            # on screen for different lengths. The beginning of the matched
+            # utterance is the reliable clock anchor; cue end is diagnostic only.
+            offset = start_offset
+            accepted_matches.append(
+                {
+                    "offset_seconds": round(offset, 4),
+                    "start_offset_seconds": round(start_offset, 4),
+                    "end_offset_seconds": round(end_offset, 4),
+                    "confidence": round(confidence, 4),
+                    "japanese": japanese_indexes,
+                    "english": english_indexes,
+                    "candidate_time": round((ja_start + ja_end) / 2.0, 3),
+                    "reference_time": round((en_start + en_end) / 2.0, 3),
+                }
+            )
+            used_japanese.update(japanese_indexes)
+            used_english.update(english_indexes)
+            last_japanese = max(japanese_indexes)
+            last_english = max(english_indexes)
+        region_offsets[name] = accepted_matches
+
+    # Build a real semantic clock timeline instead of assuming that every
+    # post-opening cue shares one offset. Different releases may contain
+    # additional/removed material at several points in the episode.
+
+    before_matches = region_offsets.get("before_opening", [])
+    before_lookup = region_lookup.get("before_opening")
+
+    if not before_matches or before_lookup is None:
+        return aligned, _result(
+            "reference_dialogue_before_not_stable",
+            applied=False,
+            opening=opening,
+            region_offsets=region_offsets,
+            llm_result=match_result,
+        )
+
+    strongest_before = max(
+        before_matches,
+        key=lambda item: float(item.get("confidence") or 0.0),
+    )
+    if float(strongest_before.get("confidence") or 0.0) < 0.88:
+        return aligned, _result(
+            "reference_dialogue_before_not_confident",
+            applied=False,
+            opening=opening,
+            region_offsets=region_offsets,
+            llm_result=match_result,
+        )
+
+    def expand_compact_group(
+        rows: list[dict[str, object]],
+        indexes: list[int],
+        *,
+        maximum_gap: float = 2.5,
+    ) -> list[int]:
+        if not indexes:
+            return []
+
+        left = min(indexes)
+        right = max(indexes)
+
+        while left > 0:
+            previous = rows[left - 1]
+            current = rows[left]
+            gap = float(current["start"]) - float(previous["end"])
+            if gap > maximum_gap:
+                break
+            left -= 1
+
+        while right + 1 < len(rows):
+            current = rows[right]
+            following = rows[right + 1]
+            gap = float(following["start"]) - float(current["end"])
+            if gap > maximum_gap:
+                break
+            right += 1
+
+        return list(range(left, right + 1))
+
+    before_ja_indexes = [
+        int(index) for index in strongest_before.get("japanese", [])
+    ]
+    before_en_indexes = [
+        int(index) for index in strongest_before.get("english", [])
+    ]
+
+    before_ja_indexes = expand_compact_group(
+        before_lookup["japanese"],
+        before_ja_indexes,
+    )
+    before_en_indexes = expand_compact_group(
+        before_lookup["english"],
+        before_en_indexes,
+    )
+
+    before_ja_rows = [
+        before_lookup["japanese"][index]
+        for index in before_ja_indexes
+    ]
+    before_en_rows = [
+        before_lookup["english"][index]
+        for index in before_en_indexes
+    ]
+
+    if not before_ja_rows or not before_en_rows:
+        return aligned, _result(
+            "reference_dialogue_before_block_missing",
+            applied=False,
+            opening=opening,
+            region_offsets=region_offsets,
+            llm_result=match_result,
+        )
+
+    before_ja_start = min(float(item["start"]) for item in before_ja_rows)
+    before_ja_end = max(float(item["end"]) for item in before_ja_rows)
+    before_en_start = min(float(item["start"]) for item in before_en_rows)
+    before_en_end = max(float(item["end"]) for item in before_en_rows)
+
+    before_offset = before_en_start - before_ja_start
+    if abs(before_offset) > max_shift:
+        return aligned, _result(
+            "reference_dialogue_before_offset_too_large",
+            applied=False,
+            opening=opening,
+            before_offset_seconds=round(before_offset, 4),
+        )
+
+    cold_match = {
+        "offset_seconds": round(before_offset, 4),
+        "start_offset_seconds": round(before_offset, 4),
+        "end_offset_seconds": round(before_en_end - before_ja_end, 4),
+        "confidence": round(
+            float(strongest_before.get("confidence") or 0.0),
+            4,
+        ),
+        "japanese": before_ja_indexes,
+        "english": before_en_indexes,
+        "candidate_time": round(
+            (before_ja_start + before_ja_end) / 2.0,
+            3,
+        ),
+        "reference_time": round(
+            (before_en_start + before_en_end) / 2.0,
+            3,
+        ),
+        "region": "before_opening",
+    }
+
+    before_cluster = {
+        "offset_seconds": round(before_offset, 4),
+        "support": 1,
+        "total": 1,
+        "support_ratio": 1.0,
+        "spread_seconds": 0.0,
+        "values": [round(before_offset, 4)],
+        "matches": [cold_match],
+        "mean_confidence": cold_match["confidence"],
+    }
+
+    timeline_anchors: list[dict[str, object]] = [
+        {
+            "region": "before_opening",
+            "time": float(cold_match["candidate_time"]),
+            "offset_seconds": round(before_offset, 4),
+            "support": 1,
+            "matches": [cold_match],
+        }
+    ]
+
+    regional_clusters: dict[str, dict[str, object]] = {}
+
+    for name in ("after_opening", "middle", "late"):
+        cluster = _anchor_region_cluster(
+            region_offsets.get(name, []),
+            tolerance=0.90,
+        )
+        if cluster is None:
+            continue
+
+        matches = [
+            item
+            for item in cluster.get("matches", [])
+            if isinstance(item, dict)
+        ]
+        if len(matches) < 2:
+            continue
+
+        mean_confidence = statistics.fmean(
+            float(item.get("confidence") or 0.0)
+            for item in matches
+        )
+        if mean_confidence < 0.88:
+            continue
+
+        anchor_time = statistics.median(
+            float(item["candidate_time"])
+            for item in matches
+        )
+
+        tagged_matches = []
+        for item in matches:
+            tagged = dict(item)
+            tagged["region"] = name
+            tagged_matches.append(tagged)
+
+        cluster = {
+            **cluster,
+            "matches": tagged_matches,
+            "anchor_time": round(anchor_time, 3),
+        }
+        regional_clusters[name] = cluster
+
+        timeline_anchors.append(
+            {
+                "region": name,
+                "time": round(anchor_time, 3),
+                "offset_seconds": round(
+                    float(cluster["offset_seconds"]),
+                    4,
+                ),
+                "support": int(cluster.get("support") or len(matches)),
+                "matches": tagged_matches,
+            }
+        )
+
+    if "after_opening" not in regional_clusters:
+        return aligned, _result(
+            "reference_dialogue_after_not_stable",
+            applied=False,
+            opening=opening,
+            before_cluster=before_cluster,
+            region_offsets=region_offsets,
+            llm_result=match_result,
+        )
+
+    if len(regional_clusters) < 2:
+        return aligned, _result(
+            "reference_dialogue_timeline_too_sparse",
+            applied=False,
+            opening=opening,
+            before_cluster=before_cluster,
+            regions=sorted(regional_clusters),
+            region_offsets=region_offsets,
+            llm_result=match_result,
+        )
+
+    timeline_anchors.sort(key=lambda item: float(item["time"]))
+
+    # Use nearest semantic clock anchor (piecewise constant timeline).
+    # This is deliberately not a linear interpolation: release differences are
+    # commonly caused by inserted/removed sections, which create clock jumps.
+    boundaries: list[float] = []
+
+    for index in range(len(timeline_anchors) - 1):
+        left = timeline_anchors[index]
+        right = timeline_anchors[index + 1]
+
+        boundary = (
+            float(left["time"]) + float(right["time"])
+        ) / 2.0
+
+        # The first clock transition is known to happen inside the JP-silent
+        # opening. Clamp it there rather than allowing the midpoint to leak
+        # into spoken dialogue.
+        if (
+            left["region"] == "before_opening"
+            and right["region"] == "after_opening"
+        ):
+            boundary = min(
+                gap_end,
+                max(gap_start, boundary),
+            )
+
+        boundaries.append(boundary)
+
+    def correction_for_time(timestamp: float) -> float:
+        for index, boundary in enumerate(boundaries):
+            if timestamp < boundary:
+                return float(
+                    timeline_anchors[index]["offset_seconds"]
+                )
+        return float(timeline_anchors[-1]["offset_seconds"])
+
+    corrections = [
+        correction_for_time((start + end) / 2.0)
+        for start, end, _text in candidate_cues
+    ]
+
+    if max(abs(value) for value in corrections) < 0.12:
+        return aligned, _result(
+            "reference_dialogue_already_aligned",
+            applied=False,
+            opening=opening,
+            timeline_anchors=timeline_anchors,
+        )
+
+    repaired, sequence_safety = _retime_cues_without_reordering(
+        candidate_cues,
+        corrections,
+    )
+    if repaired is None:
+        return aligned, _result(
+            "reference_dialogue_unsafe_sequence",
+            applied=False,
+            opening=opening,
+            before_cluster=before_cluster,
+            timeline_anchors=timeline_anchors,
+            boundaries=[round(value, 3) for value in boundaries],
+            sequence_safety=sequence_safety,
+        )
+
+    aligned_stat = aligned.stat()
+    reference_stat = reference.stat()
+
+    anchor_signature = ",".join(
+        f"{float(item['time']):.3f}:{float(item['offset_seconds']):.4f}"
+        for item in timeline_anchors
+    )
+
+    digest = hashlib.sha1(
+        (
+            f"reference-dialogue-anchor-v2:"
+            f"{aligned.resolve()}:{aligned_stat.st_size}:"
+            f"{aligned_stat.st_mtime_ns}:"
+            f"{reference.resolve()}:{reference_stat.st_size}:"
+            f"{reference_stat.st_mtime_ns}:"
+            f"{anchor_signature}"
+        ).encode()
+    ).hexdigest()[:20]
+
+    output_dir = cache_dir / "reference-dialogue-anchor"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+
+    if force:
+        output.unlink(missing_ok=True)
+
+    if not output.exists() or output.stat().st_size <= 0:
+        write_srt(repaired, output, preserve_order=True)
+
+    all_anchor_offsets: list[float] = []
+    residuals_after: list[float] = []
+
+    for anchor in timeline_anchors:
+        anchor_offset = float(anchor["offset_seconds"])
+        for item in anchor.get("matches", []):
+            value = float(item["offset_seconds"])
+            all_anchor_offsets.append(value)
+            residuals_after.append(abs(value - anchor_offset))
+
+    anchor_mae_before = statistics.fmean(
+        abs(value)
+        for value in all_anchor_offsets
+    )
+    anchor_mae_after = statistics.fmean(residuals_after)
+
+    before_activity = compare_timing_activity(aligned, reference)
+    after_activity = compare_timing_activity(output, reference)
+
+    middle_loss = (
+        float(before_activity.get("middle") or 0.0)
+        - float(after_activity.get("middle") or 0.0)
+        if before_activity.get("available")
+        and after_activity.get("available")
+        else 0.0
+    )
+
+    weighted_loss = (
+        float(before_activity.get("weighted") or 0.0)
+        - float(after_activity.get("weighted") or 0.0)
+        if before_activity.get("available")
+        and after_activity.get("available")
+        else 0.0
+    )
+
+    accepted = (
+        anchor_mae_after <= 0.75
+        and anchor_mae_before - anchor_mae_after >= 0.50
+        and middle_loss <= 0.035
+        and weighted_loss <= 0.020
+    )
+
+    after_offset = float(
+        regional_clusters["after_opening"]["offset_seconds"]
+    )
+
+    post_matches = []
+    for name, cluster in regional_clusters.items():
+        post_matches.extend(cluster.get("matches", []))
+
+    post_cluster = {
+        "offset_seconds": round(after_offset, 4),
+        "support": len(post_matches),
+        "matches": post_matches,
+        "regions": sorted(regional_clusters),
+    }
+
+    if verbose:
+        compact_anchors = [
+            (
+                str(item["region"]),
+                round(float(item["time"]), 1),
+                round(float(item["offset_seconds"]), 2),
+                int(item.get("support") or 0),
+            )
+            for item in timeline_anchors
+        ]
+        print(
+            "  Direct embedded-reference dialogue anchors: "
+            f"anchors={compact_anchors}, "
+            f"boundaries={[round(value, 1) for value in boundaries]}, "
+            f"anchor_mae={anchor_mae_before:.2f}"
+            f"->{anchor_mae_after:.2f}s, "
+            f"activity={before_activity.get('weighted', '-')}"
+            f"->{after_activity.get('weighted', '-')}, "
+            f"accepted={accepted}"
+        )
+
+    if not accepted:
+        output.unlink(missing_ok=True)
+        return aligned, _result(
+            "reference_dialogue_no_safe_improvement",
+            applied=False,
+            opening=opening,
+            before_cluster=before_cluster,
+            post_cluster=post_cluster,
+            timeline_anchors=timeline_anchors,
+            boundaries=[round(value, 3) for value in boundaries],
+            region_offsets=region_offsets,
+            llm_result=match_result,
+            anchor_mae_before=round(anchor_mae_before, 4),
+            anchor_mae_after=round(anchor_mae_after, 4),
+            before_activity=before_activity,
+            after_activity=after_activity,
+            middle_loss=round(middle_loss, 4),
+            weighted_loss=round(weighted_loss, 4),
+        )
+
+    return output, _result(
+        "applied",
+        applied=True,
+        strategy="embedded_reference_dialogue_anchors",
+        output=str(output),
+        opening=opening,
+        before_offset_seconds=round(before_offset, 4),
+        after_offset_seconds=round(after_offset, 4),
+        before_cluster=before_cluster,
+        post_cluster=post_cluster,
+        post_regions=sorted(regional_clusters),
+        timeline_anchors=timeline_anchors,
+        boundaries=[round(value, 3) for value in boundaries],
+        region_offsets=region_offsets,
+        anchor_mae_before=round(anchor_mae_before, 4),
+        anchor_mae_after=round(anchor_mae_after, 4),
+        before_activity=before_activity,
+        after_activity=after_activity,
+        middle_loss=round(middle_loss, 4),
+        weighted_loss=round(weighted_loss, 4),
+        sequence_safety=sequence_safety,
+    )
+
+
+
 def repair_with_embedded_reference_piecewise(
     aligned: Path,
     reference: Path,
     cache_dir: Path,
     config: SyncConfig,
     *,
+    llm: OllamaClient | None = None,
     force: bool = False,
     verbose: bool = False,
 ) -> tuple[Path, dict[str, object]]:
@@ -2778,6 +3601,46 @@ def repair_with_embedded_reference_piecewise(
     )
     if duration < 180.0:
         return aligned, _result("reference_piecewise_too_short", applied=False)
+
+    if llm is not None:
+        direct_path, direct_result = _repair_with_embedded_reference_dialogue_anchors(
+            aligned,
+            reference,
+            candidate_cues,
+            reference_cues,
+            cache_dir,
+            config,
+            llm,
+            force=force,
+            verbose=verbose,
+        )
+        if direct_result.get("applied"):
+            return direct_path, direct_result
+        if verbose:
+            print(
+                "  Direct embedded-reference dialogue anchors: "
+                f"fallback reason={direct_result.get('reason', '-')}"
+            )
+            region_offsets = direct_result.get("region_offsets")
+            if isinstance(region_offsets, dict):
+                for region_name, matches in region_offsets.items():
+                    if not isinstance(matches, list):
+                        continue
+                    compact = [
+                        {
+                            "offset": item.get("offset_seconds"),
+                            "start": item.get("start_offset_seconds"),
+                            "end": item.get("end_offset_seconds"),
+                            "confidence": item.get("confidence"),
+                            "ja": item.get("japanese"),
+                            "en": item.get("english"),
+                        }
+                        for item in matches
+                        if isinstance(item, dict)
+                    ]
+                    print(
+                        f"    anchor region {region_name}: {compact}"
+                    )
 
     plateau_path, plateau_result = _repair_stable_opening_plateaus(
         aligned,
@@ -4182,6 +5045,7 @@ def optimize_subtitle(
                             timing_reference,
                             cache_dir,
                             config,
+                            llm=llm,
                             force=force,
                             verbose=verbose,
                         )
@@ -4193,9 +5057,6 @@ def optimize_subtitle(
                         prealigned_reference_result = dict(direct_result)
                         prealigned_reference_result["engine"] = "embedded-reference+alass"
                         if repair_result.get("applied"):
-                            prealigned_reference_result["engine"] = (
-                                "embedded-reference+alass+reference-piecewise"
-                            )
                             prealigned_reference_result["reference_piecewise_repair"] = repair_result
                             prealigned_reference_result["output"] = str(aligned_semantic)
                     else:
@@ -4336,17 +5197,41 @@ def optimize_subtitle(
                                 best_offset,
                             ) = max(accepted_offset_candidates, key=lambda item: item[0])
                             best_validation["constant_offset_attempts"] = list(offset_attempts)
+
+                            repaired_path, repair_result = repair_with_embedded_reference_piecewise(
+                                best_shifted_path,
+                                timing_reference,
+                                cache_dir,
+                                config,
+                                llm=llm,
+                                force=force,
+                                verbose=verbose,
+                            )
+                            final_reference_path = (
+                                repaired_path
+                                if repair_result.get("applied")
+                                else best_shifted_path
+                            )
+
+                            best_validation["reference_piecewise_repair"] = repair_result
+                            best_validation["reference_activity"] = compare_timing_activity(
+                                final_reference_path,
+                                timing_reference,
+                            )
                             timing_reference_validation = best_validation
-                            prealigned_reference_path = best_shifted_path
+                            prealigned_reference_path = final_reference_path
+
                             prealigned_reference_result = _result(
                                 "applied",
                                 sync_was_successful=True,
                                 engine="embedded-reference+constant-offset",
-                                output=str(best_shifted_path),
+                                output=str(final_reference_path),
                                 offset_seconds=round(best_offset, 3),
                                 framerate_scale_factor=1.0,
                                 constant_offset_estimate=best_estimate,
                             )
+                            if repair_result.get("applied"):
+                                prealigned_reference_result["reference_piecewise_repair"] = repair_result
                             recovered = True
                             if verbose:
                                 print(
@@ -4418,7 +5303,11 @@ def optimize_subtitle(
                 and isinstance(alass_result.get("reference_piecewise_repair"), dict)
                 and alass_result["reference_piecewise_repair"].get("applied")
             ):
-                base_engine += "+reference-piecewise"
+                suffix = _reference_repair_engine_suffix(
+                    alass_result["reference_piecewise_repair"]
+                )
+                if suffix not in base_engine:
+                    base_engine += suffix
             alass_result["engine"] = base_engine
             if timing_reference is not None:
                 alass_result["timing_reference"] = str(timing_reference)
@@ -5356,6 +6245,7 @@ def optimize_candidates(
                     timing_reference,
                     cache_dir,
                     config,
+                    llm=llm,
                     force=force,
                     verbose=verbose,
                 )
@@ -5391,9 +6281,13 @@ def optimize_candidates(
                         "reason": "applied",
                         "sync_was_successful": True,
                         "engine": (
-                            "embedded-reference+alass+reference-piecewise+trusted-clock"
-                            if repair_result.get("applied")
-                            else "embedded-reference+alass+trusted-clock"
+                            "embedded-reference+alass"
+                            + (
+                                _reference_repair_engine_suffix(repair_result)
+                                if repair_result.get("applied")
+                                else ""
+                            )
+                            + "+trusted-clock"
                         ),
                         "output": str(aligned),
                         "timing_reference": str(timing_reference),
@@ -5476,6 +6370,7 @@ def optimize_candidates(
                     timing_reference,
                     cache_dir,
                     config,
+                    llm=llm,
                     force=force,
                     verbose=verbose,
                 )
@@ -5500,9 +6395,12 @@ def optimize_candidates(
                         "reason": "applied",
                         "sync_was_successful": True,
                         "engine": (
-                            "embedded-reference+alass+reference-piecewise"
-                            if repair_result.get("applied")
-                            else "embedded-reference+alass"
+                            "embedded-reference+alass"
+                            + (
+                                _reference_repair_engine_suffix(repair_result)
+                                if repair_result.get("applied")
+                                else ""
+                            )
                         ),
                         "output": str(aligned),
                         "timing_reference": str(timing_reference),
