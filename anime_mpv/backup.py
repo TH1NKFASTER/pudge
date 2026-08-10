@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -12,7 +13,92 @@ from typing import Any
 from .branding import APP_NAME, BACKUP_APP_ID, APP_SLUG
 
 
-BACKUP_FORMAT = 1
+BACKUP_FORMAT = 2
+
+_CONFIG_SECRET_KEYS = {
+    ("jimaku", "api_key"),
+    ("anilist", "access_token"),
+    ("llm", "api_key"),
+    ("qbittorrent", "password"),
+    ("qbittorrent", "api_key"),
+    ("nyaa", "proxy_url"),
+}
+_DATABASE_SECRET_KEYS = {"jiten_api_key", "jpdb_api_token"}
+
+
+def _config_secret_values(text: str) -> dict[tuple[str, str], str]:
+    section = ""
+    values: dict[tuple[str, str], str] = {}
+    for line in text.splitlines():
+        section_match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if section_match:
+            section = section_match.group(1).strip().casefold()
+            continue
+        assignment = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$", line)
+        if assignment:
+            key = assignment.group(2).casefold()
+            if (section, key) in _CONFIG_SECRET_KEYS:
+                values[(section, key)] = assignment.group(4)
+    return values
+
+
+def _redact_config(text: str) -> tuple[str, int]:
+    section = ""
+    lines: list[str] = []
+    redacted = 0
+    for line in text.splitlines():
+        section_match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if section_match:
+            section = section_match.group(1).strip().casefold()
+            lines.append(line)
+            continue
+        assignment = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$", line)
+        if assignment and (section, assignment.group(2).casefold()) in _CONFIG_SECRET_KEYS:
+            lines.append(f'{assignment.group(1)}{assignment.group(2)}{assignment.group(3)}""')
+            redacted += 1
+        else:
+            lines.append(line)
+    return "\n".join(lines) + ("\n" if text.endswith("\n") else ""), redacted
+
+
+def _merge_config_secrets(restored: str, current: str) -> str:
+    current_values = _config_secret_values(current)
+    section = ""
+    lines: list[str] = []
+    for line in restored.splitlines():
+        section_match = re.match(r"^\s*\[([^]]+)]\s*(?:#.*)?$", line)
+        if section_match:
+            section = section_match.group(1).strip().casefold()
+            lines.append(line)
+            continue
+        assignment = re.match(r"^(\s*)([A-Za-z0-9_-]+)(\s*=\s*)(.*)$", line)
+        identity = (section, assignment.group(2).casefold()) if assignment else None
+        if assignment and identity in current_values:
+            lines.append(
+                f"{assignment.group(1)}{assignment.group(2)}{assignment.group(3)}{current_values[identity]}"
+            )
+        else:
+            lines.append(line)
+    return "\n".join(lines) + ("\n" if restored.endswith("\n") else "")
+
+
+def _read_database_secrets(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    try:
+        with sqlite3.connect(path) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
+            ).fetchone()
+            if not exists:
+                return {}
+            rows = conn.execute(
+                "SELECT key,value FROM ln_settings WHERE key IN (?,?)",
+                tuple(sorted(_DATABASE_SECRET_KEYS)),
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {str(key): str(value) for key, value in rows if str(value)}
 
 
 def _sqlite_snapshot(source: Path, target: Path) -> None:
@@ -37,6 +123,7 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
             sqlite3.connect(db_copy).close()
 
         cached_files: list[dict[str, str]] = []
+        redacted_secret_count = 0
         with sqlite3.connect(db_copy) as conn:
             conn.row_factory = sqlite3.Row
             try:
@@ -45,6 +132,23 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
                 ).fetchall()
             except sqlite3.Error:
                 rows = []
+            try:
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
+                ).fetchone()
+                if exists:
+                    cursor = conn.execute(
+                        "UPDATE ln_settings SET value='' WHERE key IN (?,?) AND value<>''",
+                        tuple(sorted(_DATABASE_SECRET_KEYS)),
+                    )
+                    redacted_secret_count += int(cursor.rowcount or 0)
+                    conn.commit()
+                    # Rebuild pages so removed tokens cannot survive in SQLite
+                    # freelist space inside the supposedly sanitized archive.
+                    conn.execute("VACUUM")
+                    conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.Error:
+                pass
         for index, row in enumerate(rows, start=1):
             original = Path(str(row["subtitle_path"])).expanduser()
             try:
@@ -68,11 +172,18 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
             "cache_dir": str(cache_dir),
             "cached_files": cached_files,
             "includes_media": False,
+            "secrets_included": False,
+            "redacted_secret_count": redacted_secret_count,
         }
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             if config_path.exists():
-                archive.write(config_path, "config.toml")
+                redacted_config, config_secret_count = _redact_config(
+                    config_path.read_text(encoding="utf-8")
+                )
+                redacted_secret_count += config_secret_count
+                manifest["redacted_secret_count"] = redacted_secret_count
+                archive.writestr("config.toml", redacted_config)
+            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             archive.write(db_copy, "library.sqlite3")
             for item in cached_files:
                 archive.write(Path(item["original"]), item["archive"])
@@ -94,7 +205,8 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
             if "manifest.json" not in names or "library.sqlite3" not in names:
                 raise ValueError(f"This is not an {APP_NAME} backup")
             manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            if manifest.get("app") != BACKUP_APP_ID or int(manifest.get("format", 0)) != BACKUP_FORMAT:
+            backup_format = int(manifest.get("format", 0))
+            if manifest.get("app") != BACKUP_APP_ID or backup_format not in {1, BACKUP_FORMAT}:
                 raise ValueError(f"Unsupported {APP_NAME} backup format")
             archive.extract("library.sqlite3", tmp)
             if "config.toml" in names:
@@ -113,6 +225,7 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                     shutil.copyfileobj(source, destination)
                 restored_paths[original] = str(target)
 
+        existing_database_secrets = _read_database_secrets(database_path.expanduser())
         restored_db = tmp / "library.sqlite3"
         with sqlite3.connect(restored_db) as conn:
             conn.execute("PRAGMA journal_mode=DELETE")
@@ -124,6 +237,17 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                     "UPDATE episodes SET subtitle_path=? WHERE subtitle_path=?",
                     (new_path, old_path),
                 )
+            if existing_database_secrets:
+                table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
+                ).fetchone()
+                if table:
+                    for key, value in existing_database_secrets.items():
+                        conn.execute(
+                            "INSERT INTO ln_settings(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (key, value),
+                        )
             conn.commit()
 
         database_path = database_path.expanduser()
@@ -135,7 +259,14 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
         if restored_config.exists():
             config_path = config_path.expanduser()
             config_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(restored_config, config_path)
+            if backup_format >= 2 and config_path.is_file():
+                merged = _merge_config_secrets(
+                    restored_config.read_text(encoding="utf-8"),
+                    config_path.read_text(encoding="utf-8"),
+                )
+                config_path.write_text(merged, encoding="utf-8")
+            else:
+                shutil.copy2(restored_config, config_path)
             config_path.chmod(0o600)
     return {
         "path": str(archive_path),

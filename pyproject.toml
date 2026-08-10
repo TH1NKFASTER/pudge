@@ -26,7 +26,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-sync = ["ffsubsync>=0.4.31,<0.5"]
+sync = [
+  "ffsubsync>=0.4.31,<0.5",
+  "mlx-whisper>=0.4.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+manga = ["manga-ocr>=0.1.14,<1"]
 dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
 
 [project.scripts]
@@ -37,7 +41,7 @@ anime-mpv-agent = "anime_mpv.agent:main"
 include = ["anime_mpv*"]
 
 [tool.setuptools.package-data]
-anime_mpv = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.png", "assets/*.png", "THIRD_PARTY_NOTICES.md"]
+anime_mpv = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "assets/*.png", "THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

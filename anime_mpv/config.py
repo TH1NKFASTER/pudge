@@ -196,7 +196,9 @@ class LLMConfig:
     temperature: float = 0.0
     num_ctx: int = 8192
     timeout_seconds: float = 90.0
-    validate_embedded_reference: bool = True
+    # Subtitle processing is deterministic by default. The local LLM remains
+    # available for title ambiguity and an explicitly enabled semantic fallback.
+    validate_embedded_reference: bool = False
     embedded_reference_sample_count: int = 6
     embedded_reference_phrases_per_sample: int = 4
     embedded_reference_min_similarity: float = 0.65
@@ -244,6 +246,11 @@ class SyncConfig:
     pgs_onset_pulse_seconds: float = 0.4
     pgs_onset_tolerance_seconds: float = 0.75
     pgs_onset_min_improvement: float = 0.08
+    use_container_chapters: bool = True
+    japanese_stt_fallback: bool = True
+    japanese_stt_model: str = "mlx-community/whisper-tiny"
+    japanese_stt_timeout_seconds: float = 600.0
+    japanese_stt_min_activity: float = 0.55
 
 
 @dataclass(slots=True)
@@ -495,7 +502,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             temperature=float(llm.get("temperature", 0.0)),
             num_ctx=int(llm.get("num_ctx", 8192)),
             timeout_seconds=float(llm.get("timeout_seconds", 90.0)),
-            validate_embedded_reference=bool(llm.get("validate_embedded_reference", True)),
+            validate_embedded_reference=bool(llm.get("subtitle_semantic_checks", False)),
             embedded_reference_sample_count=int(llm.get("embedded_reference_sample_count", 6)),
             embedded_reference_phrases_per_sample=int(llm.get("embedded_reference_phrases_per_sample", 4)),
             embedded_reference_min_similarity=float(llm.get("embedded_reference_min_similarity", 0.65)),
@@ -539,6 +546,17 @@ def load_config(path: Path | None = None) -> AppConfig:
             pgs_onset_pulse_seconds=float(sync.get("pgs_onset_pulse_seconds", 0.4)),
             pgs_onset_tolerance_seconds=float(sync.get("pgs_onset_tolerance_seconds", 0.75)),
             pgs_onset_min_improvement=float(sync.get("pgs_onset_min_improvement", 0.08)),
+            use_container_chapters=bool(sync.get("use_container_chapters", True)),
+            japanese_stt_fallback=bool(sync.get("japanese_stt_fallback", True)),
+            japanese_stt_model=str(
+                sync.get("japanese_stt_model", "mlx-community/whisper-tiny")
+            ).strip() or "mlx-community/whisper-tiny",
+            japanese_stt_timeout_seconds=max(
+                60.0, float(sync.get("japanese_stt_timeout_seconds", 600.0))
+            ),
+            japanese_stt_min_activity=max(
+                0.0, min(1.0, float(sync.get("japanese_stt_min_activity", 0.55)))
+            ),
         ),
         config_path=config_path,
     )
@@ -695,7 +713,7 @@ keep_alive = {_toml_string(config.llm.keep_alive)}
 temperature = {config.llm.temperature}
 num_ctx = {config.llm.num_ctx}
 timeout_seconds = {config.llm.timeout_seconds}
-validate_embedded_reference = {_toml_bool(config.llm.validate_embedded_reference)}
+subtitle_semantic_checks = {_toml_bool(config.llm.validate_embedded_reference)}
 embedded_reference_sample_count = {config.llm.embedded_reference_sample_count}
 embedded_reference_phrases_per_sample = {config.llm.embedded_reference_phrases_per_sample}
 embedded_reference_min_similarity = {config.llm.embedded_reference_min_similarity}
@@ -739,6 +757,11 @@ pgs_onset_alignment = {_toml_bool(config.sync.pgs_onset_alignment)}
 pgs_onset_pulse_seconds = {config.sync.pgs_onset_pulse_seconds}
 pgs_onset_tolerance_seconds = {config.sync.pgs_onset_tolerance_seconds}
 pgs_onset_min_improvement = {config.sync.pgs_onset_min_improvement}
+use_container_chapters = {_toml_bool(config.sync.use_container_chapters)}
+japanese_stt_fallback = {_toml_bool(config.sync.japanese_stt_fallback)}
+japanese_stt_model = {_toml_string(config.sync.japanese_stt_model)}
+japanese_stt_timeout_seconds = {config.sync.japanese_stt_timeout_seconds}
+japanese_stt_min_activity = {config.sync.japanese_stt_min_activity}
 '''
     destination.write_text(text, encoding="utf-8")
     destination.chmod(0o600)

@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS subtitle_jobs (
     attempts INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL DEFAULT 0,
     next_check REAL NOT NULL DEFAULT 0,
+    stage TEXT NOT NULL DEFAULT 'queued',
+    lease_until REAL NOT NULL DEFAULT 0,
+    heartbeat_at REAL NOT NULL DEFAULT 0,
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    action_code TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL,
     FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
@@ -281,7 +286,51 @@ CREATE TABLE IF NOT EXISTS relation_graph_members (
 
 CREATE INDEX IF NOT EXISTS idx_relation_graph_members_graph
 ON relation_graph_members(graph_id);
+
+CREATE TABLE IF NOT EXISTS manga_books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    page_count INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0,
+    reading_direction TEXT NOT NULL DEFAULT 'rtl',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS manga_ocr_cache (
+    book_id INTEGER NOT NULL,
+    page_index INTEGER NOT NULL,
+    region_key TEXT NOT NULL DEFAULT 'full',
+    text TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(book_id,page_index,region_key),
+    FOREIGN KEY(book_id) REFERENCES manga_books(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audiobooks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    duration REAL NOT NULL DEFAULT 0,
+    position REAL NOT NULL DEFAULT 0,
+    finished INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audiobook_chapters (
+    book_id INTEGER NOT NULL,
+    chapter_index INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    start REAL NOT NULL DEFAULT 0,
+    end REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(book_id,chapter_index),
+    FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+);
 """
+
+LATEST_SCHEMA_VERSION = 2
 
 
 class Database:
@@ -294,6 +343,31 @@ class Database:
 
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
+        version_row = conn.execute("PRAGMA user_version").fetchone()
+        version = int(version_row[0] if version_row else 0)
+        if version < 1:
+            self._migrate_v1(conn)
+            conn.execute("PRAGMA user_version=1")
+        if version < 2:
+            self._migrate_v2(conn)
+            conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
+        conn.execute(
+            "INSERT OR IGNORE INTO state(key,value,updated_at) VALUES('ui_state_version','0',?)",
+            (time.time(),),
+        )
+
+    @staticmethod
+    def _ensure_column(
+        conn: sqlite3.Connection,
+        table: str,
+        column: str,
+        declaration: str,
+    ) -> None:
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _migrate_v1(self, conn: sqlite3.Connection) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(anime)").fetchall()}
         if "season_year" not in columns:
             conn.execute("ALTER TABLE anime ADD COLUMN season_year INTEGER")
@@ -335,9 +409,56 @@ class Database:
             conn.execute(
                 "ALTER TABLE subtitle_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
             )
-        conn.execute(
-            "INSERT OR IGNORE INTO state(key,value,updated_at) VALUES('ui_state_version','0',?)",
-            (time.time(),),
+    def _migrate_v2(self, conn: sqlite3.Connection) -> None:
+        for column, declaration in (
+            ("stage", "TEXT NOT NULL DEFAULT 'queued'"),
+            ("lease_until", "REAL NOT NULL DEFAULT 0"),
+            ("heartbeat_at", "REAL NOT NULL DEFAULT 0"),
+            ("progress_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("action_code", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            self._ensure_column(conn, "subtitle_jobs", column, declaration)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS manga_books (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                page_count INTEGER NOT NULL DEFAULT 0,
+                position INTEGER NOT NULL DEFAULT 0,
+                reading_direction TEXT NOT NULL DEFAULT 'rtl',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS manga_ocr_cache (
+                book_id INTEGER NOT NULL,
+                page_index INTEGER NOT NULL,
+                region_key TEXT NOT NULL DEFAULT 'full',
+                text TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(book_id,page_index,region_key),
+                FOREIGN KEY(book_id) REFERENCES manga_books(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS audiobooks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                duration REAL NOT NULL DEFAULT 0,
+                position REAL NOT NULL DEFAULT 0,
+                finished INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audiobook_chapters (
+                book_id INTEGER NOT NULL,
+                chapter_index INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                start REAL NOT NULL DEFAULT 0,
+                end REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY(book_id,chapter_index),
+                FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+            );
+            """
         )
 
     @contextmanager
@@ -1096,7 +1217,8 @@ class Database:
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                     episode=COALESCE(excluded.episode,subtitle_jobs.episode),
-                    state='pending',attempts=0,next_check=excluded.next_check,
+                    state='pending',stage='queued',attempts=0,next_check=excluded.next_check,
+                    lease_until=0,heartbeat_at=0,progress_json='{}',action_code='',
                     last_error=excluded.last_error,updated_at=excluded.updated_at
                 """,
                 (str(video_path), media_id, episode, now, error[-1000:], now),
@@ -1123,7 +1245,8 @@ class Database:
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                     episode=COALESCE(excluded.episode,subtitle_jobs.episode),
-                    state='pending',next_check=excluded.next_check,
+                    state='pending',stage='queued',next_check=excluded.next_check,
+                    lease_until=0,heartbeat_at=0,progress_json='{}',action_code='',
                     priority=MAX(subtitle_jobs.priority,excluded.priority),
                     last_error=excluded.last_error,updated_at=excluded.updated_at
                 """,
@@ -1186,19 +1309,19 @@ class Database:
         with self.connect() as conn:
             existing = conn.execute(
                 "SELECT video_path FROM subtitle_jobs "
-                "WHERE state IN ('pending','processing')"
+                "WHERE state IN ('pending','processing','needs_action')"
             ).fetchall()
             for row in existing:
                 affected_paths.add(str(row["video_path"]))
             conn.execute(
-                "UPDATE subtitle_jobs SET state='pending',next_check=?,"
+                "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
                 "priority=MAX(priority,?),last_error='Manual refresh',updated_at=? "
                 "WHERE state='pending'",
                 (now, priority, now),
             )
             if recover_processing:
                 conn.execute(
-                    "UPDATE subtitle_jobs SET state='pending',next_check=?,"
+                    "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
                     "priority=MAX(priority,?),last_error='Manual refresh',updated_at=? "
                     "WHERE state='processing'",
                     (now, priority, now),
@@ -1233,7 +1356,7 @@ class Database:
                     ON CONFLICT(video_path) DO UPDATE SET
                         media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                         episode=COALESCE(excluded.episode,subtitle_jobs.episode),
-                        state='pending',next_check=excluded.next_check,
+                        state='pending',stage='queued',action_code='',next_check=excluded.next_check,
                         priority=MAX(subtitle_jobs.priority,excluded.priority),
                         last_error=excluded.last_error,updated_at=excluded.updated_at
                     """,
@@ -1277,9 +1400,10 @@ class Database:
                 paths = [str(row["video_path"]) for row in rows]
                 placeholders = ",".join("?" for _ in paths)
                 conn.execute(
-                    f"UPDATE subtitle_jobs SET state='processing',next_check=?,updated_at=? "
+                    f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
+                    f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',updated_at=? "
                     f"WHERE video_path IN ({placeholders})",
-                    (now + lease_seconds, now, *paths),
+                    (now + lease_seconds, now + lease_seconds, now, now, *paths),
                 )
         return rows
 
@@ -1309,9 +1433,10 @@ class Database:
                 claimed = [str(row["video_path"]) for row in rows]
                 claimed_placeholders = ",".join("?" for _ in claimed)
                 conn.execute(
-                    f"UPDATE subtitle_jobs SET state='processing',next_check=?,updated_at=? "
+                    f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
+                    f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',updated_at=? "
                     f"WHERE video_path IN ({claimed_placeholders})",
-                    (now + lease_seconds, now, *claimed),
+                    (now + lease_seconds, now + lease_seconds, now, now, *claimed),
                 )
         return rows
 
@@ -1321,7 +1446,8 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """
-                UPDATE subtitle_jobs SET state='pending',priority=0,next_check=?,last_error=?,updated_at=?
+                UPDATE subtitle_jobs SET state='pending',stage='retry_scheduled',priority=0,
+                lease_until=0,next_check=?,last_error=?,updated_at=?
                 WHERE video_path=?
                 """,
                 (now + delay_seconds, error[-1000:], now, str(video_path)),
@@ -1335,7 +1461,8 @@ class Database:
         with self.connect() as conn:
             conn.execute(
                 """
-                UPDATE subtitle_jobs SET attempts=attempts+1,priority=0,next_check=?,last_error=?,updated_at=?
+                UPDATE subtitle_jobs SET attempts=attempts+1,stage='retry_scheduled',priority=0,
+                lease_until=0,next_check=?,last_error=?,updated_at=?
                 WHERE video_path=?
                 """,
                 (time.time() + delay_seconds, error[-1000:], time.time(), str(video_path)),
@@ -1347,6 +1474,57 @@ class Database:
             conn.execute(
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
                 (time.time(), str(video_path)),
+            )
+
+    def update_subtitle_job_stage(
+        self,
+        video_path: Path,
+        stage: str,
+        *,
+        progress: dict[str, object] | None = None,
+        lease_seconds: float = 25 * 60,
+    ) -> None:
+        """Persist worker progress and renew its processing lease."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE subtitle_jobs
+                SET state='processing',stage=?,heartbeat_at=?,lease_until=?,next_check=?,
+                    progress_json=?,updated_at=?
+                WHERE video_path=?
+                """,
+                (
+                    str(stage),
+                    now,
+                    now + max(30.0, float(lease_seconds)),
+                    now + max(30.0, float(lease_seconds)),
+                    json.dumps(progress or {}, ensure_ascii=False),
+                    now,
+                    str(video_path),
+                ),
+            )
+
+    def mark_subtitle_job_needs_action(
+        self,
+        video_path: Path,
+        error: str,
+        action_code: str,
+    ) -> None:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE subtitle_jobs
+                SET state='needs_action',stage='needs_action',attempts=attempts+1,
+                    priority=0,lease_until=0,next_check=0,last_error=?,action_code=?,updated_at=?
+                WHERE video_path=?
+                """,
+                (error[-1000:], str(action_code), now, str(video_path)),
+            )
+            conn.execute(
+                "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                (now, str(video_path)),
             )
 
     def priority_subtitle_job_count(self, *, min_priority: int = 200) -> int:

@@ -52,6 +52,8 @@ from .relation_graphs import (
     next_relation_refresh_at,
     relation_retry_at,
 )
+from .subtitles.jobs import read_job_report
+from .subtitles.selection import upgrade_is_better
 
 
 LogFn = Callable[[str], None]
@@ -3125,6 +3127,11 @@ class AnimeManager:
                 "previous_embedded_sid": item.embedded_subtitle_id,
                 "previous_state": item.state,
                 "previous_score": latest.get("score") if latest else None,
+                "previous_quality": (
+                    latest.get("details", {}).get("quality")
+                    if latest and isinstance(latest.get("details"), dict)
+                    else None
+                ),
                 "previous_source": latest.get("source") if latest else "legacy",
                 "previous_origin": item.subtitle_origin,
                 "requested_at": now,
@@ -3524,6 +3531,11 @@ class AnimeManager:
             # ``anime-mpv --prepare-only`` manually. Manual preparation must
             # preempt this background worker just like normal playback.
             env["ANIME_MPV_BACKGROUND_PREPARE"] = "1"
+            status_path = self.config.paths.cache_dir / "subtitle-job-status" / (
+                hashlib.sha1(str(video).encode("utf-8")).hexdigest() + ".json"
+            )
+            status_path.unlink(missing_ok=True)
+            env["PUDGE_SUBTITLE_JOB_STATUS"] = str(status_path)
             try:
                 with timed_step(
                     self.logger,
@@ -3541,7 +3553,19 @@ class AnimeManager:
                     )
                     deadline = time.monotonic() + 20 * 60
                     cancelled_for_foreground = False
+                    last_report_stage = ""
                     while process.poll() is None:
+                        report = read_job_report(status_path)
+                        if report is not None:
+                            report_stage = str(report.get("stage") or "")
+                            if report_stage and report_stage != last_report_stage:
+                                details = report.get("details")
+                                self.db.update_subtitle_job_stage(
+                                    video,
+                                    report_stage,
+                                    progress=details if isinstance(details, dict) else {},
+                                )
+                                last_report_stage = report_stage
                         if foreground_active(self.config.paths.cache_dir):
                             cancelled_for_foreground = True
                             process.terminate()
@@ -3561,6 +3585,16 @@ class AnimeManager:
                         stdout,
                         stderr,
                     )
+                    final_report = read_job_report(status_path)
+                    if final_report is not None:
+                        final_stage = str(final_report.get("stage") or "")
+                        if final_stage and final_stage != last_report_stage:
+                            details = final_report.get("details")
+                            self.db.update_subtitle_job_stage(
+                                video,
+                                final_stage,
+                                progress=details if isinstance(details, dict) else {},
+                            )
                     if cancelled_for_foreground:
                         if not restore_upgrade_selection("Foreground playback requested"):
                             self.db.clear_subtitle_selection(video)
@@ -3584,6 +3618,8 @@ class AnimeManager:
                         self.config.agent.subtitle_poll_minutes * 60,
                     )
                 continue
+            finally:
+                status_path.unlink(missing_ok=True)
             subtitle: Path | None = None
             embedded_subtitle_id: int | None = None
             prepare_status = ""
@@ -3626,22 +3662,33 @@ class AnimeManager:
                     old_score = float(old_score_raw) if old_score_raw is not None else None
                 except (TypeError, ValueError):
                     old_score = None
-                new_score_raw = subtitle_meta.get("score")
+                previous_quality = upgrade_request.get("previous_quality")
+                if not isinstance(previous_quality, dict):
+                    previous_quality = None
+                candidate_quality = subtitle_meta.get("quality")
+                if not isinstance(candidate_quality, dict):
+                    candidate_quality = None
+                new_score_raw = (
+                    candidate_quality.get("score")
+                    if candidate_quality is not None
+                    else subtitle_meta.get("score")
+                )
                 try:
                     new_score = float(new_score_raw) if new_score_raw is not None else None
                 except (TypeError, ValueError):
                     new_score = None
+                quality_better, quality_reason = upgrade_is_better(
+                    previous_quality,
+                    candidate_quality,
+                    minimum_gain=float(self.config.matching.subtitle_upgrade_min_score_gain),
+                )
                 accepted_upgrade = bool(
                     completed.returncode == 0
                     and prepare_status == "ready"
                     and not image_subtitle
                     and (subtitle is not None or embedded_subtitle_id is not None)
                     and new_score is not None
-                    and (
-                        old_score is None
-                        or new_score - old_score
-                        >= float(self.config.matching.subtitle_upgrade_min_score_gain)
-                    )
+                    and quality_better
                 )
                 if accepted_upgrade:
                     self.db.set_subtitle_ready(
@@ -3661,9 +3708,7 @@ class AnimeManager:
                         score=new_score,
                         status="upgraded",
                         reason=(
-                            "First scored candidate"
-                            if old_score is None
-                            else f"Score improved by {new_score - old_score:.1f}"
+                            quality_reason
                         ),
                         details=subtitle_meta,
                     )
@@ -3680,13 +3725,8 @@ class AnimeManager:
                         video, previous_path, previous_sid,
                         origin=str(upgrade_request.get("previous_origin") or ""),
                     )
-                    reason = "No better subtitle candidate"
-                    if new_score is not None and old_score is not None:
-                        reason = (
-                            f"Score gain {new_score - old_score:.1f} is below "
-                            f"{self.config.matching.subtitle_upgrade_min_score_gain:.1f}"
-                        )
-                    elif completed.returncode != 0:
+                    reason = quality_reason or "No better subtitle candidate"
+                    if completed.returncode != 0:
                         reason = completed.stderr.strip() or completed.stdout.strip()[-1000:] or reason
                     self.db.record_subtitle_history(
                         video_path=video,
@@ -3718,9 +3758,16 @@ class AnimeManager:
                 # a PGS/SUP path ready merely because the subprocess exited 0.
                 attempts = int(job["attempts"] or 0) + 1
                 delay = self.config.agent.subtitle_poll_minutes * 60
-                self.db.postpone_subtitle_job(
-                    video, "Waiting for Japanese text subtitles", delay
-                )
+                if attempts >= 3 and not self.config.matching.ocr_image_subtitles:
+                    self.db.mark_subtitle_job_needs_action(
+                        video,
+                        "Only image subtitles are available; OCR is disabled",
+                        "enable_subtitle_ocr",
+                    )
+                else:
+                    self.db.postpone_subtitle_job(
+                        video, "Waiting for Japanese text subtitles", delay
+                    )
                 # postpone_subtitle_job uses the generic waiting state; restore
                 # the more precise bitmap-fallback state afterwards.
                 self.db.set_waiting_text_subtitles(
@@ -3780,7 +3827,31 @@ class AnimeManager:
                     job["media_id"], job["episode"], video.name, attempts, delay,
                     network_backoff, rate_limited, detail or "Субтитры пока не найдены",
                 )
-                if rate_limited:
+                permission_error = any(
+                    marker in detail.casefold()
+                    for marker in ("permission denied", "operation not permitted", "access denied")
+                )
+                if permission_error:
+                    self.db.mark_subtitle_job_needs_action(
+                        video, detail or "Folder access is required", "grant_folder_access"
+                    )
+                elif (
+                    not self.config.jimaku.api_key.strip()
+                    and attempts >= 1
+                    and any(
+                        marker in detail.casefold()
+                        for marker in (
+                            "jimaku api key",
+                            "jimaku key",
+                            "api-ключ jimaku",
+                            "jimaku не настроен",
+                        )
+                    )
+                ):
+                    self.db.mark_subtitle_job_needs_action(
+                        video, detail or "Jimaku API key is required", "configure_jimaku"
+                    )
+                elif rate_limited:
                     self.db.defer_subtitle_job(video, detail or "Jimaku rate limited (429)", delay)
                 else:
                     self.db.postpone_subtitle_job(video, detail or "Субтитры пока не найдены", delay)

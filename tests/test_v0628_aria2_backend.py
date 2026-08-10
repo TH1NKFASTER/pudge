@@ -211,6 +211,6 @@ def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, mo
 def test_first_experience_explains_qbittorrent_is_optional() -> None:
     root = Path(__file__).resolve().parents[1]
     html = (root / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "Anime MPV всё равно будет автоматически скачивать через управляемый aria2c" in html
-    assert "возможностей управления будет меньше" in html
+    assert "автоматические загрузки выполнит управляемый aria2c" in html
+    assert "с меньшим набором функций" in html
     assert "Torrent: ${d.qbt_enabled?'qBittorrent':'aria2'}" in html

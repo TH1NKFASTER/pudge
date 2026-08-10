@@ -193,7 +193,7 @@ def test_ln_cards_and_settings_match_v0672_ui() -> None:
     assert "action.anilistDocs" not in settings_block
     assert html.count("https://docs.anilist.co/guide/auth/") == 1
 
-    assert "semantically validate subtitle sync candidates" in html
-    assert "translate selected Japanese text in the Light Novel reader" in html
-    assert "семантически проверять варианты синхронизации субтитров" in html
-    assert "переводить выделенный японский текст" in html
+    assert "Allow LLM subtitle verification (expensive)" in html
+    assert "Light Novel translation" in html
+    assert "Разрешить LLM-проверку субтитров (дорого)" in html
+    assert "перевода в читалке ранобэ" in html

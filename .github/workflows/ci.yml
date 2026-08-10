@@ -38,3 +38,40 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m compileall -q anime_mpv scripts
+
+  lint:
+    name: Lint and UI modules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install lint dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Check fatal Python errors
+        run: python -m ruff check --select E9,F63,F7 anime_mpv tests scripts
+      - name: Lint new pipeline and media modules
+        run: python -m ruff check --select E9,F anime_mpv/audiobooks.py anime_mpv/manga.py anime_mpv/subtitles anime_mpv/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check JavaScript modules
+        run: |
+          node --check anime_mpv/web/settings.js
+          node --check anime_mpv/web/media.js
+
+  macos-smoke:
+    name: macOS smoke
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install core test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run migration, media and UI smoke tests
+        run: python -m pytest -q tests/test_p0_p1_features.py tests/test_ui_integration.py tests/test_config.py

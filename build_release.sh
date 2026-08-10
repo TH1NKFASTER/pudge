@@ -23,7 +23,8 @@ STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"
 rm -rf "$PROJECT_DIR/dist/release"
 mkdir -p "$STAGE"
 cp -R anime_mpv tests "$STAGE/"
-cp install.sh README.md config.example.toml pyproject.toml build_release.sh rename_brand.py brand_migration.py "$STAGE/"
+cp install.sh README.md config.example.toml pyproject.toml build_release.sh rename_brand.py brand_migration.py \
+  LICENSE SECURITY.md CONTRIBUTING.md DEVELOPMENT.md RELEASING.md CHANGELOG.md "$STAGE/"
 cp "dist/anime_mpv-${VERSION}-py3-none-any.whl" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh"
 

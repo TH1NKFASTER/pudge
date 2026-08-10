@@ -25,6 +25,8 @@ from .logging_utils import configure_logging, timed_step
 from .models import SubtitleCandidate
 from .pgs import build_time_mapper, onset_match_score, onset_times, parse_pgs_cues, retime_sup
 from .subtitle_formats import convert_to_plain_srt, parse_srt, write_srt
+from .subtitles.video_segments import choose_edit_boundary, probe_container_edit_points
+from .subtitles.stt import prepare_japanese_stt_reference
 
 _SCORE_RE = re.compile(r"\bscore:\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 _ALASS_SHIFT_RE = re.compile(r"shifted block .*? by\s+([+-]?\d+:\d{2}:\d{2}(?:\.\d+)?)", re.IGNORECASE)
@@ -2870,6 +2872,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
     config: SyncConfig,
     llm: OllamaClient,
     *,
+    edit_points: list[dict[str, object]] | None = None,
     force: bool = False,
     verbose: bool = False,
 ) -> tuple[Path, dict[str, object]]:
@@ -3360,9 +3363,15 @@ def _repair_with_embedded_reference_dialogue_anchors(
         left = timeline_anchors[index]
         right = timeline_anchors[index + 1]
 
-        boundary = (
+        midpoint = (
             float(left["time"]) + float(right["time"])
         ) / 2.0
+        boundary, _boundary_evidence = choose_edit_boundary(
+            float(left["time"]),
+            float(right["time"]),
+            midpoint=midpoint,
+            edit_points=edit_points or (),
+        )
 
         # The first clock transition is known to happen inside the JP-silent
         # opening. Clamp it there rather than allowing the midpoint to leak
@@ -3459,6 +3468,27 @@ def _repair_with_embedded_reference_dialogue_anchors(
     )
     anchor_mae_after = statistics.fmean(residuals_after)
 
+    # Hold out each match from sufficiently populated regional clusters. This
+    # prevents the same semantic anchor from both defining and validating its
+    # own clock plateau. The single high-confidence cold-open match is excluded
+    # because it intentionally represents a different edit segment.
+    holdout_residuals: list[float] = []
+    for anchor in timeline_anchors:
+        matches = [item for item in anchor.get("matches", []) if isinstance(item, dict)]
+        if len(matches) < 3:
+            continue
+        values = [float(item["offset_seconds"]) for item in matches]
+        for index, actual in enumerate(values):
+            training = values[:index] + values[index + 1 :]
+            predicted = float(statistics.median(training))
+            holdout_residuals.append(abs(actual - predicted))
+    holdout_p95 = None
+    if holdout_residuals:
+        ordered_holdout = sorted(holdout_residuals)
+        holdout_p95 = ordered_holdout[
+            min(len(ordered_holdout) - 1, max(0, math.ceil(len(ordered_holdout) * 0.95) - 1))
+        ]
+
     before_activity = compare_timing_activity(aligned, reference)
     after_activity = compare_timing_activity(output, reference)
 
@@ -3483,6 +3513,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
         and anchor_mae_before - anchor_mae_after >= 0.50
         and middle_loss <= 0.035
         and weighted_loss <= 0.020
+        and (holdout_p95 is None or holdout_p95 <= 1.25)
     )
 
     after_offset = float(
@@ -3535,6 +3566,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
             llm_result=match_result,
             anchor_mae_before=round(anchor_mae_before, 4),
             anchor_mae_after=round(anchor_mae_after, 4),
+            holdout_p95_seconds=(round(holdout_p95, 4) if holdout_p95 is not None else None),
             before_activity=before_activity,
             after_activity=after_activity,
             middle_loss=round(middle_loss, 4),
@@ -3557,6 +3589,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
         region_offsets=region_offsets,
         anchor_mae_before=round(anchor_mae_before, 4),
         anchor_mae_after=round(anchor_mae_after, 4),
+        holdout_p95_seconds=(round(holdout_p95, 4) if holdout_p95 is not None else None),
         before_activity=before_activity,
         after_activity=after_activity,
         middle_loss=round(middle_loss, 4),
@@ -3573,6 +3606,7 @@ def repair_with_embedded_reference_piecewise(
     config: SyncConfig,
     *,
     llm: OllamaClient | None = None,
+    edit_points: list[dict[str, object]] | None = None,
     force: bool = False,
     verbose: bool = False,
 ) -> tuple[Path, dict[str, object]]:
@@ -3611,6 +3645,7 @@ def repair_with_embedded_reference_piecewise(
             cache_dir,
             config,
             llm,
+            edit_points=edit_points,
             force=force,
             verbose=verbose,
         )
@@ -3928,17 +3963,24 @@ def repair_with_embedded_reference_piecewise(
                 for gap in cue_gaps
                 if gap[0] <= right_time and gap[1] >= left_time
             ]
-            if not overlapping:
+            midpoint = (left_time + right_time) / 2.0
+            boundary, evidence = choose_edit_boundary(
+                left_time,
+                right_time,
+                midpoint=midpoint,
+                edit_points=edit_points or (),
+                cue_gaps=overlapping,
+            )
+            if evidence.get("kind") == "midpoint":
                 continue
-            gap_start, gap_end, gap_seconds = max(overlapping, key=lambda item: item[2])
             edit_boundaries.append(
                 {
                     "left_time": float(left_time),
                     "right_time": float(right_time),
-                    "boundary": float(gap_end),
+                    "boundary": float(boundary),
                     "left_offset": float(left_offset),
                     "right_offset": float(right_offset),
-                    "gap_seconds": float(gap_seconds),
+                    "gap_seconds": float(evidence.get("gap_seconds") or 0.0),
                 }
             )
 
@@ -4875,6 +4917,77 @@ def synchronize_pgs_with_embedded_reference(
     return output, result
 
 
+def _try_japanese_stt_fallback(
+    video: Path,
+    subtitle: Path,
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    alass_path: str,
+    verbose: bool,
+) -> tuple[Path | None, dict[str, object]]:
+    if not config.japanese_stt_fallback:
+        return None, _result("stt_disabled", sync_was_successful=False)
+    reference, stt = prepare_japanese_stt_reference(
+        video,
+        cache_dir,
+        ffmpeg_path=ffmpeg_path,
+        model=config.japanese_stt_model,
+        timeout_seconds=config.japanese_stt_timeout_seconds,
+        # Transcription is content-addressed and expensive; force-searching
+        # subtitle providers must not invalidate the speech cache.
+        force=False,
+    )
+    if reference is None:
+        return None, _result("stt_reference_unavailable", sync_was_successful=False, stt=stt)
+    aligned, result = synchronize_with_alass(
+        reference,
+        subtitle,
+        cache_dir,
+        config,
+        alass_path=alass_path,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        force=False,
+        verbose=verbose,
+    )
+    if not bool(result.get("sync_was_successful")):
+        result["stt"] = stt
+        result["reason"] = "stt_alass_failed"
+        return None, result
+    activity = compare_timing_activity(aligned, reference)
+    try:
+        score = float(activity.get("weighted") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    if not bool(activity.get("available")) or score < config.japanese_stt_min_activity:
+        result.update(
+            {
+                "sync_was_successful": False,
+                "reason": "stt_activity_gate_failed",
+                "stt": stt,
+                "reference_activity": activity,
+            }
+        )
+        return None, result
+    result.update(
+        {
+            "engine": "japanese-stt+alass",
+            "reason": "applied",
+            "selection_reason": "last_resort_cached_stt",
+            "timing_reference": str(reference),
+            "timing_reference_language": "ja",
+            "reference_activity": activity,
+            "reference_activity_score": score,
+            "reference_alignment_reliable": True,
+            "stt": stt,
+        }
+    )
+    return aligned, result
+
+
 def optimize_subtitle(
     video: Path,
     subtitle: Path,
@@ -4891,6 +5004,11 @@ def optimize_subtitle(
     validate_embedded_reference_with_llm: bool = False,
 ) -> tuple[Path, dict[str, object]]:
     """Choose a safe timing strategy and never trust ambiguous local FFT peaks."""
+    container_edit_points = (
+        probe_container_edit_points(video, ffprobe_path)
+        if config.use_container_chapters
+        else []
+    )
     if subtitle.suffix.casefold() == ".sup":
         if not config.enabled:
             return subtitle, _result("disabled", sync_was_successful=False)
@@ -5046,6 +5164,7 @@ def optimize_subtitle(
                             cache_dir,
                             config,
                             llm=llm,
+                            edit_points=container_edit_points,
                             force=force,
                             verbose=verbose,
                         )
@@ -5204,6 +5323,7 @@ def optimize_subtitle(
                                 cache_dir,
                                 config,
                                 llm=llm,
+                                edit_points=container_edit_points,
                                 force=force,
                                 verbose=verbose,
                             )
@@ -5316,10 +5436,10 @@ def optimize_subtitle(
                 if timing_reference_validation is not None:
                     alass_result["timing_reference_validation"] = timing_reference_validation
 
-                # The LLM has already confirmed that this is the same episode,
-                # and the reference track comes from the exact video being played.
-                # Therefore a structurally valid direct ALASS result is the preferred
-                # clock. Do not let a global audio score override the cold open again.
+                # The reference track comes from the exact video being played.
+                # A structurally valid direct ALASS result is therefore the preferred
+                # clock; deterministic local windows and chapter cuts can refine it
+                # without waking the LLM or letting global audio override the cold open.
                 activity_path = alass_out
                 if activity_path.suffix.casefold() in {".ass", ".ssa"}:
                     activity_path, conversion = convert_to_plain_srt(
@@ -5351,6 +5471,38 @@ def optimize_subtitle(
                     else {"available": False, "reason": "baseline_unavailable"}
                 )
                 aligned_activity = compare_timing_activity(activity_path, timing_reference)
+                if (
+                    reference_ok
+                    and config.piecewise_repair
+                    and not isinstance(alass_result.get("reference_piecewise_repair"), dict)
+                ):
+                    repaired_path, repair_result = repair_with_embedded_reference_piecewise(
+                        activity_path,
+                        timing_reference,
+                        cache_dir,
+                        config,
+                        llm=None,
+                        edit_points=container_edit_points,
+                        force=force,
+                        verbose=verbose,
+                    )
+                    alass_result["reference_piecewise_repair"] = repair_result
+                    if repair_result.get("applied"):
+                        activity_path = repaired_path
+                        reference_ok, reference_reason, structure = (
+                            _validate_embedded_reference_output(
+                                source_for_gate,
+                                activity_path,
+                                timing_reference,
+                            )
+                        )
+                        aligned_activity = compare_timing_activity(
+                            activity_path,
+                            timing_reference,
+                        )
+                        suffix = _reference_repair_engine_suffix(repair_result)
+                        if suffix not in str(alass_result.get("engine") or ""):
+                            alass_result["engine"] = str(alass_result.get("engine") or "alass") + suffix
                 alass_result["baseline_reference_activity"] = baseline_activity
                 alass_result["reference_activity"] = aligned_activity
                 alass_result["reference_activity_reason"] = reference_reason
@@ -5512,6 +5664,20 @@ def optimize_subtitle(
                     source_path=subtitle,
                 )
             if not successful:
+                if engine == "auto":
+                    stt_path, stt_result = _try_japanese_stt_fallback(
+                        video,
+                        subtitle,
+                        cache_dir,
+                        config,
+                        ffmpeg_path=ffmpeg_path,
+                        ffprobe_path=ffprobe_path,
+                        alass_path=alass_path,
+                        verbose=verbose,
+                    )
+                    if stt_path is not None:
+                        return stt_path, stt_result
+                    ff_result["stt_fallback"] = stt_result
                 return subtitle, ff_result
             path, result = successful[-1]
             return _maybe_repair_piecewise(
@@ -5534,6 +5700,21 @@ def optimize_subtitle(
             item_result.setdefault("timing_reference_validation", timing_reference_validation)
 
     if not successful:
+        if engine == "auto":
+            stt_path, stt_result = _try_japanese_stt_fallback(
+                video,
+                subtitle,
+                cache_dir,
+                config,
+                ffmpeg_path=ffmpeg_path,
+                ffprobe_path=ffprobe_path,
+                alass_path=alass_path,
+                verbose=verbose,
+            )
+            if stt_path is not None:
+                return stt_path, stt_result
+            if failed:
+                failed[0]["stt_fallback"] = stt_result
         return subtitle, failed[0] if failed else _result("alignment_failed", sync_was_successful=False)
 
     # A text subtitle embedded in the same video is a stronger timing reference
@@ -6093,14 +6274,21 @@ def optimize_candidates(
 ) -> tuple[SubtitleCandidate | None, Path | None, dict[str, object]]:
     """Score every candidate with one shared audio analysis, then optimize the winner."""
     candidate_list = list(candidates)
+    container_edit_points = (
+        probe_container_edit_points(video, ffprobe_path)
+        if config.use_container_chapters
+        else []
+    )
     if not candidate_list:
         return None, None, _result("no_candidates", sync_was_successful=False)
 
-    # Prefer a subtitle clock before extracting audio. For every text candidate,
-    # ALASS first aligns the full onset structure to an embedded text track. The
-    # LLM then checks the already-aligned excerpts. Only if all such candidates
-    # fail do we pay for FFT/VAD candidate scoring.
-    if validate_embedded_reference_with_llm and llm is not None:
+    # Prefer a subtitle clock before extracting audio. Container chapters make
+    # the deterministic exact-episode consensus and local cut repair useful even
+    # when semantic LLM checks are disabled (the default). Only ambiguous
+    # candidates enter the optional LLM loop below.
+    if config.use_container_chapters or (
+        validate_embedded_reference_with_llm and llm is not None
+    ):
         timing_reference, timing_reference_result = extract_embedded_timing_reference(
             video,
             cache_dir,
@@ -6246,6 +6434,7 @@ def optimize_candidates(
                     cache_dir,
                     config,
                     llm=llm,
+                    edit_points=container_edit_points,
                     force=force,
                     verbose=verbose,
                 )
@@ -6328,8 +6517,13 @@ def optimize_candidates(
                     )
                 return candidate, aligned, final_result
 
+            semantic_candidates = (
+                sorted_prealigned[:5]
+                if validate_embedded_reference_with_llm and llm is not None
+                else []
+            )
             for semantic_index, item in enumerate(
-                sorted_prealigned[:5],
+                semantic_candidates,
                 start=1,
             ):
                 _rank, candidate, aligned, alass_result, activity, structure = item
@@ -6371,6 +6565,7 @@ def optimize_candidates(
                     cache_dir,
                     config,
                     llm=llm,
+                    edit_points=container_edit_points,
                     force=force,
                     verbose=verbose,
                 )

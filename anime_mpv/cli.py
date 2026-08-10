@@ -46,6 +46,10 @@ from .player import build_mpv_command, run_mpv
 from .providers.anilist import AniListClient, AniListError
 from .providers.jimaku import JimakuClient, JimakuError, find_7zip, materialize_jimaku_files
 from .subtitle_formats import clean_srt_for_playback, convert_to_plain_srt, parse_srt
+from .subtitles.discovery import deduplicate_candidates
+from .subtitles.jobs import SubtitleJobReporter
+from .subtitles.models import SubtitleJobStage
+from .subtitles.validation import quality_from_result
 from .syncing import optimize_candidates, optimize_subtitle, subtitle_quality_accepted
 
 
@@ -153,13 +157,15 @@ def _choose_with_optional_llm(
     identity: VideoIdentity,
     llm: OllamaClient | None,
     ambiguity_margin: float,
+    *,
+    allow_llm: bool = True,
 ) -> SubtitleCandidate | None:
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0]
     margin = candidates[0].score - candidates[1].score
-    if llm is not None and margin < ambiguity_margin:
+    if allow_llm and llm is not None and margin < ambiguity_margin:
         index = llm.select_subtitle(identity, candidates)
         if index is not None:
             return candidates[index]
@@ -203,45 +209,8 @@ def _deduplicate_subtitle_candidates(
     *,
     ffmpeg_path: str,
 ) -> tuple[list[SubtitleCandidate], int]:
-    by_path: dict[str, SubtitleCandidate] = {}
-    for candidate in candidates:
-        key = str(candidate.path.resolve())
-        current = by_path.get(key)
-        if current is None or candidate.score > current.score:
-            by_path[key] = candidate
-
-    selected: dict[str, SubtitleCandidate] = {}
-    passthrough: list[SubtitleCandidate] = []
-    for candidate in by_path.values():
-        fingerprint = _subtitle_content_fingerprint(
-            candidate,
-            cache_dir,
-            ffmpeg_path=ffmpeg_path,
-        )
-        if fingerprint is None:
-            passthrough.append(candidate)
-            continue
-        current = selected.get(fingerprint)
-        if current is None:
-            selected[fingerprint] = candidate
-            continue
-        current_rank = (
-            int(current.path.suffix.casefold() == ".srt"),
-            current.score,
-        )
-        candidate_rank = (
-            int(candidate.path.suffix.casefold() == ".srt"),
-            candidate.score,
-        )
-        if candidate_rank > current_rank:
-            selected[fingerprint] = candidate
-
-    result = sorted(
-        [*selected.values(), *passthrough],
-        key=lambda item: item.score,
-        reverse=True,
-    )
-    return result, max(0, len(candidates) - len(result))
+    # Compatibility wrapper for callers/tests from the pre-package pipeline.
+    return deduplicate_candidates(candidates, cache_dir, ffmpeg_path=ffmpeg_path)
 
 
 def _choose_anilist(
@@ -1256,6 +1225,8 @@ def process_video(
         raise RuntimeError(f"Видео не найдено: {video}")
     logger = configure_logging()
     pipeline_timer = StageTimer(logger, video=video.name)
+    reporter = SubtitleJobReporter.from_environment()
+    reporter.update(SubtitleJobStage.DISCOVERING, video=video.name)
     if not args.prepare_only:
         mark_foreground(config.paths.cache_dir, video=video)
     if args.resync:
@@ -1422,6 +1393,7 @@ def process_video(
     bitmap_candidate_fallback: SubtitleCandidate | None = None
     selected_candidate: SubtitleCandidate | None = None
     selected_source = ""
+    alignment_result: dict[str, object] = {}
     generated_by_ocr = False
     ocr_source_path: Path | None = None
     ocr_source_embedded_stream_index: int | None = None
@@ -1527,6 +1499,7 @@ def process_video(
         # When full comparison is enabled, a merely acceptable local subtitle
         # should not block a substantially better Jimaku release.
         if not args.offline and (config.matching.evaluate_all_jimaku or not candidates):
+            reporter.update(SubtitleJobStage.DOWNLOADING_CANDIDATES, video=video.name)
             candidates.extend(
                 _find_online_subtitles(
                     video,
@@ -1544,6 +1517,11 @@ def process_video(
             candidates,
             config.paths.cache_dir,
             ffmpeg_path=config.tools.ffmpeg,
+        )
+        reporter.update(
+            SubtitleJobStage.NORMALIZING,
+            video=video.name,
+            candidates=len(candidates),
         )
         logger.info(
             "RESULT step=subtitle.deduplicate video=%s before=%s after=%s removed=%s",
@@ -1571,6 +1549,7 @@ def process_video(
                 identity,
                 llm,
                 config.llm.ambiguity_margin,
+                allow_llm=False,
             )
             candidates = text_candidates
             logger.info(
@@ -1595,6 +1574,11 @@ def process_video(
             and config.sync.enabled
             and not args.no_sync
         ):
+            reporter.update(
+                SubtitleJobStage.ALIGNING,
+                video=video.name,
+                candidates=len(candidates),
+            )
             print(f"Сравниваю тайминг {len(candidates)} доступных вариантов…")
             best, optimized_path, result = optimize_candidates(
                 video,
@@ -1612,6 +1596,8 @@ def process_video(
                 llm=llm,
                 validate_embedded_reference_with_llm=config.llm.validate_embedded_reference,
             )
+            alignment_result = dict(result)
+            reporter.update(SubtitleJobStage.VALIDATING, video=video.name)
             if best is not None and optimized_path is not None:
                 selected_candidate = best
                 selected_source = best.source
@@ -1638,6 +1624,7 @@ def process_video(
                     identity,
                     llm,
                     config.llm.ambiguity_margin,
+                    allow_llm=False,
                 )
                 if chosen is not None:
                     selected_candidate = chosen
@@ -1650,6 +1637,7 @@ def process_video(
                 identity,
                 llm,
                 config.llm.ambiguity_margin,
+                allow_llm=False,
             )
             if chosen is not None:
                 selected_candidate = chosen
@@ -1667,9 +1655,21 @@ def process_video(
         pipeline_timer.mark("candidate_selection", selected=subtitle or "")
 
     if subtitle is not None and not args.no_sync and not already_synced:
+        reporter.update(SubtitleJobStage.ALIGNING, video=video.name, candidates=1)
         print("Синхронизация: анализирую аудио и тайминги…")
         candidate_path = subtitle
         synchronized_path, result = _sync_one(video, subtitle, args, config, llm)
+        alignment_result = dict(result)
+        if selected_candidate is not None:
+            alignment_result.setdefault(
+                "candidate_context",
+                {
+                    "source": selected_candidate.source,
+                    "filename_score": selected_candidate.score,
+                    **selected_candidate.details,
+                },
+            )
+        reporter.update(SubtitleJobStage.VALIDATING, video=video.name)
         _print_sync_result(synchronized_path, result)
         is_bitmap_candidate = candidate_path.suffix.casefold() in (
             IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
@@ -1701,7 +1701,9 @@ def process_video(
             f"использую графический fallback: {subtitle}"
         )
         if not args.no_sync:
+            reporter.update(SubtitleJobStage.ALIGNING, video=video.name, candidates=1)
             synchronized_path, result = _sync_one(video, subtitle, args, config, llm)
+            alignment_result = dict(result)
             _print_sync_result(synchronized_path, result)
             if bool(result.get("sync_was_successful")):
                 subtitle = synchronized_path
@@ -1797,6 +1799,7 @@ def process_video(
         pipeline_timer.mark("subtitle_conversion", reason=conversion_result.get("reason"))
 
     if subtitle is not None and subtitle.suffix.casefold() == ".srt":
+        reporter.update(SubtitleJobStage.SELECTING, video=video.name)
         source_subtitle = subtitle
         cleaned_subtitle, cleanup_result = clean_srt_for_playback(
             subtitle,
@@ -1834,6 +1837,7 @@ def process_video(
 
     if subtitle is None and subtitle_id is None:
         if args.prepare_only:
+            reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
             print("Японские субтитры пока не найдены")
             print("PREPARE_STATUS=waiting_subtitles")
             return 4
@@ -1875,10 +1879,35 @@ def process_video(
         pipeline_timer.mark("final_cache", cache="write")
 
     if args.prepare_only:
+        quality_input = dict(alignment_result)
+        if subtitle_id is not None and not quality_input:
+            quality_input = {
+                "sync_was_successful": True,
+                "reference_alignment_reliable": True,
+                "engine": "embedded-exact",
+                "reason": "embedded_exact_video_clock",
+            }
+        quality_accepted = bool(
+            not selected_image_subtitle
+            and (subtitle is not None or subtitle_id is not None)
+        )
+        quality_reason = str(
+            quality_input.get("candidate_quality_reason")
+            or quality_input.get("reason")
+            or ("embedded exact video clock" if subtitle_id is not None else "prepared")
+        )
+        quality = quality_from_result(
+            quality_input,
+            accepted=quality_accepted,
+            reason=quality_reason,
+        )
         metadata = {
             "source": selected_source or (selected_candidate.source if selected_candidate else ""),
             "name": selected_candidate.name if selected_candidate else (subtitle.name if subtitle else "embedded" if subtitle_id is not None else ""),
-            "score": selected_candidate.score if selected_candidate else None,
+            # The public score is final prepared quality. Filename ranking is
+            # retained only as discovery evidence and never drives upgrades.
+            "score": quality.score,
+            "filename_score": selected_candidate.score if selected_candidate else None,
             "candidate_path": str(selected_candidate.path) if selected_candidate else str(subtitle or ""),
             "final_path": str(subtitle or ""),
             "embedded_sid": subtitle_id,
@@ -1886,9 +1915,12 @@ def process_video(
             "generated_by_ocr": bool(generated_by_ocr),
             "ocr_source_path": str(ocr_source_path or ""),
             "ocr_source_embedded_stream_index": ocr_source_embedded_stream_index,
+            "alignment": quality_input,
+            "quality": quality.as_dict(),
         }
         print("PREPARED_SUBTITLE_META=" + json.dumps(metadata, ensure_ascii=False, default=str))
         if selected_image_subtitle:
+            reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name, bitmap=True)
             # Bitmap PGS/SUP is a Library-only fallback, never a completed
             # background preparation result. Remove a manifest written by an
             # older release so future retries continue searching for text.
@@ -1906,6 +1938,12 @@ def process_video(
         if subtitle_id is not None:
             print(f"PREPARED_EMBEDDED_SID={subtitle_id}")
         print("PREPARE_STATUS=ready")
+        reporter.update(
+            SubtitleJobStage.READY,
+            video=video.name,
+            confidence=quality.confidence.value,
+            quality=quality.score,
+        )
         return 0
 
     tracking_file: Path | None = None

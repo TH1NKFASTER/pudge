@@ -35,6 +35,8 @@ from .maintenance_lock import maintenance_lock
 from .backup import create_backup, restore_backup
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
 from .light_novels import LightNovelService, LightNovelError
+from .manga import MangaService
+from .audiobooks import AudiobookService
 
 
 class WebAppApi:
@@ -50,6 +52,13 @@ class WebAppApi:
         self.logger = configure_logging()
         self.manager = AnimeManager(self.config, log=self.logger.info)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
+        self.manga = MangaService(self.manager.db)
+        self.audiobooks = AudiobookService(
+            self.manager.db,
+            ffprobe=self.config.tools.ffprobe,
+            mpv=self.config.tools.mpv,
+            cache_dir=self.config.paths.cache_dir,
+        )
         self.logger.info("APP session_start version=%s platform=%s", __version__, platform.platform())
         self.window: Any | None = None
         self.asset_base = ""
@@ -975,6 +984,7 @@ class WebAppApi:
         # play action launches from 00:00 instead of using the resume point.
         priority = (
             "continue_watching",
+            "needs_action",
             "new_ready",
             "completed_ready",
             "waiting",
@@ -1041,6 +1051,11 @@ class WebAppApi:
         """
         downloaded = self._downloaded_payloads(anime_by_id)
         pending_local = self._pending_local_payloads(anime_by_id)
+        needs_action_by_path = {
+            str(row["video_path"]): row
+            for row in self.manager.db.subtitle_jobs()
+            if str(row["state"] or "") == "needs_action"
+        }
         ready_by_media = {
             int(item["media_id"]): item
             for item in downloaded
@@ -1054,6 +1069,7 @@ class WebAppApi:
                 downloads_by_media.setdefault(int(item.media_id), item)
         sections: dict[str, list[dict[str, Any]]] = {
             "continue_watching": self._continue_payloads(anime_by_id),
+            "needs_action": [],
             "new_ready": [],
             "completed_ready": [],
             "waiting": [],
@@ -1137,7 +1153,14 @@ class WebAppApi:
             anime = anime_by_id.get(int(media_id)) if media_id is not None else None
             if self._is_future_unreleased(anime):
                 continue
-            sections["waiting"].append(item)
+            local = item.get("local") if isinstance(item.get("local"), dict) else {}
+            action_job = needs_action_by_path.get(str(local.get("video_path") or ""))
+            if action_job is not None:
+                item["action_code"] = str(action_job["action_code"] or "")
+                item["action_error"] = str(action_job["last_error"] or "")
+                sections["needs_action"].append(item)
+            else:
+                sections["waiting"].append(item)
 
         for anime in self.manager.db.anime_list(("DROPPED",)):
             local_items = [item for item in self.manager.db.episodes(anime.media_id) if item.video_path.is_file()]
@@ -1158,6 +1181,7 @@ class WebAppApi:
             )
         )
         sections["completed_ready"].sort(key=lambda item: str(item["title"]).casefold())
+        sections["needs_action"].sort(key=lambda item: str(item["title"]).casefold())
         sections["waiting"].sort(
             key=lambda item: (
                 item.get("next_airing_at") or 10**15,
@@ -1251,6 +1275,10 @@ class WebAppApi:
             "llm_url": cfg.llm.base_url,
             "llm_api_key": cfg.llm.api_key,
             "llm_model": cfg.llm.model,
+            "subtitle_semantic_checks": cfg.llm.validate_embedded_reference,
+            "use_container_chapters": cfg.sync.use_container_chapters,
+            "japanese_stt_fallback": cfg.sync.japanese_stt_fallback,
+            "japanese_stt_model": cfg.sync.japanese_stt_model,
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
             "shortcut_mpv_open_anilist": cfg.shortcuts.mpv_open_anilist,
             "shortcut_mpv_correct_match": cfg.shortcuts.mpv_correct_match,
@@ -1312,6 +1340,10 @@ class WebAppApi:
             media_id = int(row["media_id"]) if row["media_id"] is not None else None
             anime = anime_by_id.get(media_id) if media_id is not None else None
             video_path = str(row["video_path"])
+            try:
+                progress = json.loads(str(row["progress_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                progress = {}
             jobs.append({
                 "video": Path(video_path).name,
                 "video_path": video_path,
@@ -1323,6 +1355,10 @@ class WebAppApi:
                 ),
                 "episode": int(row["episode"]) if row["episode"] is not None else None,
                 "state": str(row["state"] or "pending"),
+                "stage": str(row["stage"] or "queued"),
+                "action_code": str(row["action_code"] or ""),
+                "heartbeat_at": float(row["heartbeat_at"] or 0),
+                "progress": progress if isinstance(progress, dict) else {},
                 "attempts": int(row["attempts"] or 0),
                 "priority": int(row["priority"] or 0),
                 "next_check": float(row["next_check"] or 0),
@@ -1603,6 +1639,71 @@ class WebAppApi:
 
     def light_novel_state(self) -> dict[str, Any]:
         return self.light_novels.state()
+
+    def manga_state(self) -> dict[str, Any]:
+        return self.manga.state()
+
+    def choose_manga_file(self) -> dict[str, Any]:
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("Manga archives (*.cbz;*.zip)",),
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        selected = list(result) if isinstance(result, (list, tuple)) else [result]
+        books: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for value in selected:
+            try:
+                books.append(self.manga.import_file(Path(str(value))))
+            except Exception as exc:
+                errors.append(f"{Path(str(value)).name}: {exc}")
+        return {"cancelled": False, "books": books, "errors": errors, "state": self.manga.state()}
+
+    def manga_page(self, book_id: int, page_index: int) -> dict[str, Any]:
+        return self.manga.page(int(book_id), int(page_index))
+
+    def manga_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
+        return self.manga.ocr_page(int(book_id), int(page_index))
+
+    def audiobook_state(self) -> dict[str, Any]:
+        return self.audiobooks.state()
+
+    def choose_audiobook_file(self) -> dict[str, Any]:
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=True,
+                file_types=("Audiobooks (*.m4b;*.m4a;*.mp3;*.aac;*.opus;*.ogg;*.flac;*.wav)",),
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        selected = list(result) if isinstance(result, (list, tuple)) else [result]
+        books: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for value in selected:
+            try:
+                books.append(self.audiobooks.import_file(Path(str(value))))
+            except Exception as exc:
+                errors.append(f"{Path(str(value)).name}: {exc}")
+        return {"cancelled": False, "books": books, "errors": errors, "state": self.audiobooks.state()}
+
+    def audiobook_play(self, book_id: int, start: float | None = None) -> dict[str, Any]:
+        return self.audiobooks.play(int(book_id), None if start is None else float(start))
 
     def light_novel_refresh(self) -> dict[str, Any]:
         return self.light_novels.refresh_state()
@@ -1911,10 +2012,29 @@ class WebAppApi:
         cfg.llm.base_url = str(values.get("llm_url", cfg.llm.base_url)).strip().rstrip("/")
         cfg.llm.api_key = str(values.get("llm_api_key", cfg.llm.api_key)).strip()
         cfg.llm.model = str(values.get("llm_model", cfg.llm.model)).strip()
+        cfg.llm.validate_embedded_reference = bool(
+            values.get("subtitle_semantic_checks", cfg.llm.validate_embedded_reference)
+        )
+        cfg.sync.use_container_chapters = bool(
+            values.get("use_container_chapters", cfg.sync.use_container_chapters)
+        )
+        cfg.sync.japanese_stt_fallback = bool(
+            values.get("japanese_stt_fallback", cfg.sync.japanese_stt_fallback)
+        )
+        cfg.sync.japanese_stt_model = str(
+            values.get("japanese_stt_model", cfg.sync.japanese_stt_model)
+        ).strip() or "mlx-community/whisper-tiny"
         write_config(cfg, self.config_path)
         self.config = load_config(self.config_path)
         self.manager = AnimeManager(self.config, log=self.logger.info)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
+        self.manga = MangaService(self.manager.db)
+        self.audiobooks = AudiobookService(
+            self.manager.db,
+            ffprobe=self.config.tools.ffprobe,
+            mpv=self.config.tools.mpv,
+            cache_dir=self.config.paths.cache_dir,
+        )
         self.light_novels.save_settings(ln_values)
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
         if self.config.diagnostics.energy_monitoring_enabled:
@@ -2826,6 +2946,13 @@ class WebAppApi:
             self.config = load_config(self.config_path)
             self.manager = AnimeManager(self.config, log=self.logger.info)
             self.light_novels = LightNovelService(self.config, logger=self.logger)
+            self.manga = MangaService(self.manager.db)
+            self.audiobooks = AudiobookService(
+                self.manager.db,
+                ffprobe=self.config.tools.ffprobe,
+                mpv=self.config.tools.mpv,
+                cache_dir=self.config.paths.cache_dir,
+            )
             self.logger.info("DONE step=backup.restore path=%r", str(selected))
             return {"ok": True, **restored, "state": self.get_state()}
         except Exception as exc:

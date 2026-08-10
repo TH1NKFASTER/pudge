@@ -22,7 +22,11 @@ make lint
 ## 3. Commit and push
 
 ```bash
-git add -A
+git status --short
+git add anime_mpv tests scripts .github README.md CHANGELOG.md DEVELOPMENT.md \
+  CONTRIBUTING.md SECURITY.md LICENSE RELEASING.md pyproject.toml \
+  config.example.toml install.sh build_release.sh
+git diff --cached --check
 git commit -m "Pudge v0.6.69"
 git push
 ```
@@ -42,3 +46,7 @@ GitHub Actions will then:
 4. create a GitHub Release and attach the ZIP.
 
 If any test batch fails, the release ZIP is not published.
+
+Do not publish from a working tree containing unreviewed generated files. The
+tag must point at the reviewed release commit; do not move an existing public
+tag. This keeps the maintainer handoff reproducible.

@@ -1,4 +1,15 @@
-# pudge v0.6.68
+# Pudge changelog
+
+## Unreleased
+
+- Split subtitle preparation into explicit discovery, normalization, alignment, validation and selection stages with persisted worker progress and leases.
+- Subtitle upgrades now compare final validated alignment quality; container chapters help anchor opening/transition edits, and cached tiny Japanese STT is available only as a last resort.
+- Local LLM subtitle checks are off by default. Backups redact credentials and retain current secrets during restore.
+- Added categorized Settings, a shorter profile-based onboarding flow and a focused Home section for genuine user-action blockers. Activity remains intentionally hidden.
+- Added initial CBZ/ZIP manga reading with lazy MangaOCR and audiobook playback with chapters and saved mpv position.
+- Added versioned SQLite migrations, external UI modules, integration tests and public project/security/contribution documentation.
+
+## v0.6.68
 
 
 
