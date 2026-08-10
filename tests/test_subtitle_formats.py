@@ -1,4 +1,4 @@
-from anime_mpv.subtitle_formats import format_preference_bonus
+from pudge.subtitle_formats import format_preference_bonus
 
 
 def test_srt_is_preferred_over_ass():
@@ -11,7 +11,7 @@ def test_format_preference_can_be_disabled():
 
 
 def test_ass_is_converted_to_plain_srt_without_styles(tmp_path):
-    from anime_mpv.subtitle_formats import convert_to_plain_srt
+    from pudge.subtitle_formats import convert_to_plain_srt
 
     source = tmp_path / "styled.ass"
     source.write_text(
@@ -35,14 +35,14 @@ def test_ass_is_converted_to_plain_srt_without_styles(tmp_path):
 
 
 def test_plain_subtitle_text_removes_isolated_hangul_prefix_before_japanese():
-    from anime_mpv.subtitle_formats import plain_subtitle_text
+    from pudge.subtitle_formats import plain_subtitle_text
 
     assert plain_subtitle_text("모巨大生物が出現しました") == "巨大生物が出現しました"
     assert plain_subtitle_text("한국어 자막") == "한국어 자막"
 
 
 def test_plain_subtitle_text_removes_angle_wrappers_and_speaker_labels():
-    from anime_mpv.subtitle_formats import plain_subtitle_text
+    from pudge.subtitle_formats import plain_subtitle_text
 
     source = "＜（黒絵）\nずっと　自分が嫌いだった＞"
     assert plain_subtitle_text(source) == "ずっと　自分が嫌いだった"
@@ -50,13 +50,13 @@ def test_plain_subtitle_text_removes_angle_wrappers_and_speaker_labels():
 
 
 def test_plain_subtitle_text_preserves_standalone_stage_direction():
-    from anime_mpv.subtitle_formats import plain_subtitle_text
+    from pudge.subtitle_formats import plain_subtitle_text
 
     assert plain_subtitle_text("（ドアが開く）") == "（ドアが開く）"
 
 
 def test_plain_subtitle_text_removes_embedded_furigana():
-    from anime_mpv.subtitle_formats import plain_subtitle_text
+    from pudge.subtitle_formats import plain_subtitle_text
 
     assert plain_subtitle_text("漢字（かんじ）です") == "漢字です"
     assert plain_subtitle_text("｜明日《あした》") == "明日"
@@ -66,7 +66,7 @@ def test_plain_subtitle_text_removes_embedded_furigana():
 
 
 def test_clean_srt_for_playback_creates_clean_copy(tmp_path):
-    from anime_mpv.subtitle_formats import clean_srt_for_playback
+    from pudge.subtitle_formats import clean_srt_for_playback
 
     source = tmp_path / "episode.srt"
     source.write_text(
@@ -90,7 +90,7 @@ def test_clean_srt_for_playback_creates_clean_copy(tmp_path):
 
 
 def test_write_srt_separates_exactly_touching_cues(tmp_path):
-    from anime_mpv.subtitle_formats import write_srt
+    from pudge.subtitle_formats import write_srt
 
     output = tmp_path / "touching.srt"
     write_srt(
@@ -107,7 +107,7 @@ def test_write_srt_separates_exactly_touching_cues(tmp_path):
 
 
 def test_write_srt_removes_real_overlaps_for_mpv(tmp_path):
-    from anime_mpv.subtitle_formats import write_srt
+    from pudge.subtitle_formats import write_srt
 
     output = tmp_path / "overlap.srt"
     write_srt(
@@ -124,7 +124,7 @@ def test_write_srt_removes_real_overlaps_for_mpv(tmp_path):
 
 
 def test_clean_srt_for_playback_invalidates_old_cached_timing(tmp_path):
-    from anime_mpv.subtitle_formats import clean_srt_for_playback
+    from pudge.subtitle_formats import clean_srt_for_playback
 
     source = tmp_path / "episode.srt"
     source.write_text(
@@ -142,7 +142,7 @@ def test_clean_srt_for_playback_invalidates_old_cached_timing(tmp_path):
 
 
 def test_write_srt_never_starts_exactly_at_zero(tmp_path):
-    from anime_mpv.subtitle_formats import write_srt
+    from pudge.subtitle_formats import write_srt
 
     output = tmp_path / "zero-start.srt"
     write_srt([(0.0, 1.0, "最初")], output)
@@ -152,7 +152,7 @@ def test_write_srt_never_starts_exactly_at_zero(tmp_path):
 
 
 def test_write_srt_never_emits_sub_300ms_cue_after_collision(tmp_path):
-    from anime_mpv.subtitle_formats import parse_srt, write_srt
+    from pudge.subtitle_formats import parse_srt, write_srt
 
     output = tmp_path / "short-after-overlap.srt"
     write_srt(

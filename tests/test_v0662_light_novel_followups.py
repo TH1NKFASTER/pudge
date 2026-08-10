@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.light_novels import LightNovelError, LightNovelService
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig
+from pudge.light_novels import LightNovelError, LightNovelService
+from pudge.web_app import WebAppApi
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -73,7 +73,7 @@ def test_bind_can_use_anilist_search_result_not_in_user_list(tmp_path: Path, mon
 
 
 def test_ui_moves_ln_settings_and_reorders_navigation():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     anime = html.index('data-page="current"')
     novels = html.index('data-page="lightnovels"')
     planning = html.index('data-page="planned"')
@@ -90,7 +90,7 @@ def test_ui_moves_ln_settings_and_reorders_navigation():
 
 
 def test_file_dialog_allows_multiple_books():
-    source = Path("anime_mpv/web_app.py").read_text(encoding="utf-8")
+    source = Path("pudge/web_app.py").read_text(encoding="utf-8")
     block = source[source.index("def choose_light_novel_file") : source.index("def light_novel_open")]
     assert "allow_multiple=True" in block
     assert '"books": books' in block

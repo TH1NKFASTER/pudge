@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from anime_mpv.logging_utils import configure_logging, tail_log, timed_step
+from pudge.logging_utils import configure_logging, tail_log, timed_step
 
 
 def test_timed_step_writes_duration(tmp_path: Path) -> None:

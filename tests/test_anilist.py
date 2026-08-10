@@ -4,7 +4,7 @@ import json
 
 import httpx
 
-from anime_mpv.providers.anilist import AniListClient
+from pudge.providers.anilist import AniListClient
 
 
 def _client(handler) -> AniListClient:
@@ -307,7 +307,7 @@ def test_resolve_absolute_episode_across_sequel_cours():
         return httpx.Response(200, json={"data": {"Media": relation_map[media_id]}})
 
     client = _client(handler)
-    start = __import__("anime_mpv.models", fromlist=["AniListAnime"]).AniListAnime(
+    start = __import__("pudge.models", fromlist=["AniListAnime"]).AniListAnime(
         id=101,
         titles=["Bleach: Thousand-Year Blood War"],
         synonyms=[],
@@ -361,7 +361,7 @@ def test_resolve_absolute_episode_returns_none_without_main_sequel():
         )
 
     client = _client(handler)
-    start = __import__("anime_mpv.models", fromlist=["AniListAnime"]).AniListAnime(
+    start = __import__("pudge.models", fromlist=["AniListAnime"]).AniListAnime(
         id=101,
         titles=["Example"],
         synonyms=[],
@@ -441,7 +441,7 @@ def test_resolve_absolute_episode_recovers_root_from_cached_later_cour():
         return httpx.Response(200, json={"data": {"Media": item}})
 
     client = _client(handler)
-    cached_fourth = __import__("anime_mpv.models", fromlist=["AniListAnime"]).AniListAnime(
+    cached_fourth = __import__("pudge.models", fromlist=["AniListAnime"]).AniListAnime(
         id=204,
         titles=["Bleach: Thousand-Year Blood War Part 4"],
         synonyms=[],

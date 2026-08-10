@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.providers.nyaa import (
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.providers.nyaa import (
     parse_rss,
     release_episode,
     release_episode_range,
@@ -92,8 +92,8 @@ def test_database_library_and_cleanup(tmp_path: Path) -> None:
 def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None:
     import httpx
 
-    from anime_mpv.manager_models import NyaaRelease
-    from anime_mpv.providers.qbittorrent import QBittorrentClient
+    from pudge.manager_models import NyaaRelease
+    from pudge.providers.qbittorrent import QBittorrentClient
 
     seen: list[tuple[str, bytes]] = []
 
@@ -103,7 +103,7 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
         if request.url.path.endswith("/categories"):
             return httpx.Response(200, json={})
         if request.url.path.endswith("/createCategory"):
-            assert b"category=anime-mpv" in body
+            assert b"category=pudge" in body
             return httpx.Response(200, text="")
         if request.url.path.endswith("/info"):
             return httpx.Response(200, json=[])
@@ -124,7 +124,7 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
                 },
             )
         if request.url.path.endswith("/setCategory"):
-            assert b"category=anime-mpv" in body
+            assert b"category=pudge" in body
             return httpx.Response(200, text="")
         if request.url.path.endswith("/createTags"):
             return httpx.Response(200, text="")
@@ -156,7 +156,7 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
     client.add_release(
         release,
         save_path=tmp_path / "Example",
-        category="anime-mpv",
+        category="pudge",
         tags=["anime: Example", "episode: 1"],
     )
     assert any(path.endswith("/add") for path, _ in seen)
@@ -166,15 +166,15 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
 def test_qbittorrent_409_duplicate_is_idempotent(tmp_path: Path) -> None:
     import httpx
 
-    from anime_mpv.manager_models import NyaaRelease
-    from anime_mpv.providers.qbittorrent import QBittorrentClient
+    from pudge.manager_models import NyaaRelease
+    from pudge.providers.qbittorrent import QBittorrentClient
 
     info_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal info_calls
         if request.url.path.endswith("/categories"):
-            return httpx.Response(200, json={"anime-mpv": {}})
+            return httpx.Response(200, json={"pudge": {}})
         if request.url.path.endswith("/info"):
             info_calls += 1
             if info_calls == 1:
@@ -208,7 +208,7 @@ def test_qbittorrent_409_duplicate_is_idempotent(tmp_path: Path) -> None:
     client.add_release(
         release,
         save_path=tmp_path,
-        category="anime-mpv",
+        category="pudge",
         tags=["anilist-1"],
     )
     assert info_calls >= 2
@@ -274,7 +274,7 @@ def test_database_migrates_old_anime_columns(tmp_path: Path) -> None:
 def test_qbittorrent_api_key_uses_bearer_header() -> None:
     import httpx
 
-    from anime_mpv.providers.qbittorrent import QBittorrentClient
+    from pudge.providers.qbittorrent import QBittorrentClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer secret-key"
@@ -295,14 +295,14 @@ def test_qbittorrent_api_key_uses_bearer_header() -> None:
 
 
 def test_nyaa_proxy_url_normalization() -> None:
-    from anime_mpv.providers.nyaa import NyaaClient
+    from pudge.providers.nyaa import NyaaClient
 
     assert NyaaClient(proxy_url="[::1]:1080").proxy_url == "socks5://[::1]:1080"
     assert NyaaClient(proxy_url="socks://127.0.0.1:1080").proxy_url == "socks5://127.0.0.1:1080"
 
 
 def test_library_scan_marks_embedded_japanese_subtitles_ready(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.library import scan_library
+    from pudge.library import scan_library
 
     db = Database(tmp_path / "embedded.sqlite3")
     db.upsert_anime(LibraryAnime(media_id=77, title="Eureka Evrika", status="CURRENT"))
@@ -311,10 +311,10 @@ def test_library_scan_marks_embedded_japanese_subtitles_ready(tmp_path: Path, mo
     video = root / "Eureka Evrika - 05.mkv"
     video.write_bytes(b"video")
 
-    from anime_mpv.models import EmbeddedSubtitle
+    from pudge.models import EmbeddedSubtitle
 
     monkeypatch.setattr(
-        "anime_mpv.library.find_embedded_japanese_subtitles",
+        "pudge.library.find_embedded_japanese_subtitles",
         lambda *args, **kwargs: [
             EmbeddedSubtitle(
                 stream_index=2,
@@ -340,7 +340,7 @@ def test_nyaa_prefers_correct_recent_1080p_season_over_seeded_480p_wrong_season(
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime
 
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(
         media_id=3,
@@ -398,7 +398,7 @@ def test_nyaa_prefers_correct_recent_1080p_season_over_seeded_480p_wrong_season(
 
 
 def test_nyaa_explicit_wrong_season_is_hard_penalized() -> None:
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(media_id=3, title="Example 3rd Season")
     release = NyaaRelease(
@@ -433,7 +433,7 @@ def test_nyaa_explicit_wrong_season_is_hard_penalized() -> None:
 
 
 def test_nyaa_batch_scoring_strongly_prefers_full_large_pack() -> None:
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(
         media_id=88,
@@ -491,9 +491,9 @@ def test_nyaa_batch_scoring_strongly_prefers_full_large_pack() -> None:
 
 
 def test_manager_uses_readable_qbittorrent_tags(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import NyaaRelease
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -535,8 +535,8 @@ def test_manager_uses_readable_qbittorrent_tags(tmp_path: Path, monkeypatch) -> 
 
 
 def test_manager_requeues_old_generated_subtitle_once(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -574,7 +574,7 @@ def test_manager_requeues_old_generated_subtitle_once(tmp_path: Path) -> None:
 def test_qbittorrent_reads_new_readable_tags() -> None:
     import httpx
 
-    from anime_mpv.providers.qbittorrent import QBittorrentClient
+    from pudge.providers.qbittorrent import QBittorrentClient
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v2/torrents/info"
@@ -609,9 +609,9 @@ def test_qbittorrent_reads_new_readable_tags() -> None:
 
 
 def test_completed_series_pack_registers_all_video_files(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import DownloadItem
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import DownloadItem
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -625,7 +625,7 @@ def test_completed_series_pack_registers_all_video_files(tmp_path: Path, monkeyp
     (pack / "Pack Anime - 01.mkv").write_bytes(b"one")
     (pack / "Pack Anime - 02.mkv").write_bytes(b"two")
     monkeypatch.setattr(
-        "anime_mpv.manager.japanese_subtitle_source",
+        "pudge.manager.japanese_subtitle_source",
         lambda *args, **kwargs: ("embedded", None),
     )
 
@@ -649,7 +649,7 @@ def test_completed_series_pack_registers_all_video_files(tmp_path: Path, monkeyp
 
 
 def test_nyaa_short_title_requires_whole_token_match() -> None:
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(media_id=1, title="Akira", titles=["Akira"], duration=124)
     wrong = NyaaRelease(
@@ -702,7 +702,7 @@ def test_nyaa_short_title_requires_whole_token_match() -> None:
 
 
 def test_nyaa_penalizes_episode_below_800_mib() -> None:
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(media_id=2, title="Example Anime", titles=["Example Anime"], duration=24)
 
@@ -743,7 +743,7 @@ def test_nyaa_penalizes_episode_below_800_mib() -> None:
 
 
 def test_nyaa_uses_thirty_mib_per_minute_for_nonstandard_duration() -> None:
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     anime = LibraryAnime(media_id=3, title="Short Anime", titles=["Short Anime"], duration=12)
 
@@ -784,8 +784,8 @@ def test_nyaa_uses_thirty_mib_per_minute_for_nonstandard_duration() -> None:
 
 
 def test_auto_search_skips_fully_watched_current_anime(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -818,8 +818,8 @@ def test_auto_search_skips_fully_watched_current_anime(tmp_path: Path, monkeypat
 
 
 def test_auto_search_skips_when_release_boundary_is_unknown(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -853,7 +853,7 @@ def test_auto_search_skips_when_release_boundary_is_unknown(tmp_path: Path, monk
 
 
 def _upgrade_release(info_hash: str, score: float):
-    from anime_mpv.manager_models import NyaaRelease
+    from pudge.manager_models import NyaaRelease
 
     return NyaaRelease(
         title=f"[Group] Upgrade - 05 [1080p] [{info_hash[:8]}]",
@@ -873,9 +873,9 @@ def _upgrade_release(info_hash: str, score: float):
 
 
 def _upgrade_manager(tmp_path: Path):
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import DownloadItem
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import DownloadItem
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -959,7 +959,7 @@ def test_downloaded_episode_upgrade_skips_small_gain(tmp_path: Path, monkeypatch
 def test_upgrade_replaces_old_file_even_while_new_subtitles_are_pending(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from anime_mpv.manager_models import DownloadItem, LibraryEpisode
+    from pudge.manager_models import DownloadItem, LibraryEpisode
 
     manager = _upgrade_manager(tmp_path)
     new_video = tmp_path / "Upgrade Show - 05 new.mkv"
@@ -1017,7 +1017,7 @@ def test_upgrade_replaces_old_file_even_while_new_subtitles_are_pending(
 def test_reconcile_orphaned_scored_duplicate_versions(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from anime_mpv.manager_models import DownloadItem, LibraryEpisode
+    from pudge.manager_models import DownloadItem, LibraryEpisode
 
     manager = _upgrade_manager(tmp_path)
     new_video = tmp_path / "Upgrade Show - 05 better.mkv"
@@ -1064,8 +1064,8 @@ def test_reconcile_orphaned_scored_duplicate_versions(
 
 
 def test_regular_maintenance_searches_missing_before_upgrades(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1090,8 +1090,8 @@ def test_regular_maintenance_searches_missing_before_upgrades(tmp_path: Path, mo
 
 
 def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1117,8 +1117,8 @@ def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_p
     assert order == ["downloads", "scan", "missing", "upgrade"]
 
 def test_nyaa_search_uses_ascii_folded_title_variant() -> None:
-    from anime_mpv.manager_models import LibraryAnime
-    from anime_mpv.providers.nyaa import search_ranked
+    from pudge.manager_models import LibraryAnime
+    from pudge.providers.nyaa import search_ranked
 
     class FakeClient:
         def __init__(self) -> None:
@@ -1153,7 +1153,7 @@ def test_nyaa_search_uses_ascii_folded_title_variant() -> None:
 
 
 def test_subtitle_jobs_are_claimed_once(tmp_path: Path) -> None:
-    from anime_mpv.database import Database
+    from pudge.database import Database
 
     db = Database(tmp_path / "claim.sqlite3")
     video = tmp_path / "episode.mkv"
@@ -1170,9 +1170,9 @@ def test_subtitle_jobs_are_claimed_once(tmp_path: Path) -> None:
 def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, monkeypatch) -> None:
     import subprocess
 
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryAnime, LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1220,7 +1220,7 @@ def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, mon
                 "",
             )
 
-    monkeypatch.setattr("anime_mpv.manager.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
 
     assert manager.process_subtitle_jobs(limit=1) == 1
     command = calls[0]
@@ -1234,8 +1234,8 @@ def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, mon
 
 
 def test_global_local_subtitle_with_wrong_title_is_not_a_candidate(tmp_path: Path) -> None:
-    from anime_mpv.local_search import find_local_subtitles
-    from anime_mpv.models import VideoIdentity
+    from pudge.local_search import find_local_subtitles
+    from pudge.models import VideoIdentity
 
     video_dir = tmp_path / "video"
     other_dir = tmp_path / "other"
@@ -1262,9 +1262,9 @@ def test_global_local_subtitle_with_wrong_title_is_not_a_candidate(tmp_path: Pat
 
 
 def test_manager_generation_four_from_two_requeues_only_direct_alass_outputs(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1305,9 +1305,9 @@ def test_failed_subtitle_validation_clears_stale_prepared_path(
 ) -> None:
     import subprocess
 
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1349,7 +1349,7 @@ def test_failed_subtitle_validation_clears_stale_prepared_path(
                 "",
             )
 
-    monkeypatch.setattr("anime_mpv.manager.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
 
     assert manager.process_subtitle_jobs(limit=1) == 0
     stored = manager.db.episode_by_path(video.resolve())
@@ -1360,8 +1360,8 @@ def test_failed_subtitle_validation_clears_stale_prepared_path(
 
 
 def test_repair_stale_subtitle_selection_clears_path_with_active_job(tmp_path: Path) -> None:
-    from anime_mpv.database import Database
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.database import Database
+    from pudge.manager_models import LibraryEpisode
 
     db = Database(tmp_path / "library.sqlite3")
     video = tmp_path / "Anime - 06.mkv"
@@ -1388,8 +1388,8 @@ def test_repair_stale_subtitle_selection_clears_path_with_active_job(tmp_path: P
 
 
 def test_library_refresh_preserves_valid_prepared_subtitle_state(tmp_path: Path) -> None:
-    from anime_mpv.database import Database
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.database import Database
+    from pudge.manager_models import LibraryEpisode
 
     db = Database(tmp_path / "library.sqlite3")
     video = tmp_path / "Anime - 06.mkv"
@@ -1425,9 +1425,9 @@ def test_library_refresh_preserves_valid_prepared_subtitle_state(tmp_path: Path)
 
 
 def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1463,8 +1463,8 @@ def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) 
 
 
 def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -1509,7 +1509,7 @@ def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeClient)
 
     manager.sync_anilist()
 
@@ -1522,8 +1522,8 @@ def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -
 
 
 def test_cleanup_verifies_anilist_before_deleting(monkeypatch, tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -1567,15 +1567,15 @@ def test_background_prepare_marker_is_set_on_manager_child_source() -> None:
     # Regression guard: manager-spawned --prepare-only workers must identify
     # themselves so a manual --prepare-only can claim foreground priority.
     from inspect import getsource
-    from anime_mpv.manager import AnimeManager
+    from pudge.manager import AnimeManager
 
     source = getsource(AnimeManager.process_subtitle_jobs)
-    assert 'env["ANIME_MPV_BACKGROUND_PREPARE"] = "1"' in source
+    assert 'env["PUDGE_BACKGROUND_PREPARE"] = "1"' in source
 
 
 def test_same_directory_named_subtitle_for_another_show_is_not_a_candidate(tmp_path: Path) -> None:
-    from anime_mpv.local_search import find_local_subtitles
-    from anime_mpv.models import VideoIdentity
+    from pudge.local_search import find_local_subtitles
+    from pudge.models import VideoIdentity
 
     video = tmp_path / "Seihantai na Kimi to Boku 2nd Season - 05.mkv"
     wrong = tmp_path / "Reincarnated.as.a.Sword.S01E05.WEBRip.Netflix.ja[cc].srt"
@@ -1598,9 +1598,9 @@ def test_same_directory_named_subtitle_for_another_show_is_not_a_candidate(tmp_p
 
 
 def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1636,9 +1636,9 @@ def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: 
 
 
 def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryAnime, LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1651,7 +1651,7 @@ def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeyp
     )
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        "anime_mpv.manager.send_native_notification",
+        "pudge.manager.send_native_notification",
         lambda subtitle, message: calls.append((subtitle, message)) or True,
     )
 
@@ -1676,9 +1676,9 @@ def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeyp
 
 
 def test_ready_notification_can_be_disabled_without_later_duplicate(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryAnime, LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -1696,7 +1696,7 @@ def test_ready_notification_can_be_disabled_without_later_duplicate(tmp_path: Pa
     )
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(
-        "anime_mpv.manager.send_native_notification",
+        "pudge.manager.send_native_notification",
         lambda subtitle, message: calls.append((subtitle, message)) or True,
     )
 
@@ -1709,8 +1709,8 @@ def test_ready_notification_can_be_disabled_without_later_duplicate(tmp_path: Pa
 
 
 def test_startup_maintenance_runs_one_subtitle_job_when_agent_disabled(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
 
     cfg = AppConfig()
     cfg.agent.enabled = False
@@ -1734,9 +1734,9 @@ def test_startup_maintenance_runs_one_subtitle_job_when_agent_disabled(tmp_path:
 
 
 def test_library_scan_reuses_known_no_subtitle_result(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.database import Database
-    from anime_mpv.library import scan_library
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.database import Database
+    from pudge.library import scan_library
+    from pudge.manager_models import LibraryEpisode
 
     db = Database(tmp_path / "known-none.sqlite3")
     root = tmp_path / "library"
@@ -1754,7 +1754,7 @@ def test_library_scan_reuses_known_no_subtitle_result(tmp_path: Path, monkeypatc
     )
 
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("known result must not be probed again")),
     )
 

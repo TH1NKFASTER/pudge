@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
 
 
 def _cfg(tmp_path: Path) -> AppConfig:
@@ -69,7 +69,7 @@ def test_priority_job_count_tracks_manual_refresh_until_attempt(tmp_path: Path) 
 
 
 def test_ui_keeps_refresh_in_checking_state_for_priority_subtitle_jobs() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function prioritySubtitleJobs()" in html
     assert "status.subtitleCheckingBackground" in html
     assert "toast.refreshedSubtitlesQueued" in html

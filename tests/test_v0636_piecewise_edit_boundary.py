@@ -1,8 +1,8 @@
 from pathlib import Path
 
-import anime_mpv.syncing as syncing
-from anime_mpv.config import SyncConfig
-from anime_mpv.subtitle_formats import parse_srt, write_srt
+import pudge.syncing as syncing
+from pudge.config import SyncConfig
+from pudge.subtitle_formats import parse_srt, write_srt
 
 
 def test_reference_piecewise_does_not_smear_cold_open_shift_across_long_gap(

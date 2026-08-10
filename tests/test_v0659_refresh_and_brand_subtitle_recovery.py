@@ -6,10 +6,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.web_app import WebAppApi
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -71,7 +71,7 @@ def test_manual_refresh_requests_blocking_maintenance_lock(tmp_path: Path, monke
         seen.append(blocking)
         yield True
 
-    monkeypatch.setattr("anime_mpv.manager.maintenance_lock", fake_lock)
+    monkeypatch.setattr("pudge.manager.maintenance_lock", fake_lock)
     monkeypatch.setattr(manager, "_run_once_unlocked", lambda **_kwargs: {"auto": 0})
 
     assert manager.run_once(force_subtitle_retry=True, wait_for_maintenance=True) == {"auto": 0}
@@ -142,7 +142,7 @@ def _write_srt(path: Path, end_seconds: int) -> None:
 
 
 def test_alass_structure_does_not_blame_existing_long_movie_sign_cues(tmp_path: Path) -> None:
-    from anime_mpv.syncing import _validate_embedded_reference_output
+    from pudge.syncing import _validate_embedded_reference_output
 
     reference = tmp_path / "reference.srt"
     source = tmp_path / "source.srt"
@@ -157,7 +157,7 @@ def test_alass_structure_does_not_blame_existing_long_movie_sign_cues(tmp_path: 
 
 
 def test_alass_structure_still_rejects_output_that_itself_grows_too_long(tmp_path: Path) -> None:
-    from anime_mpv.syncing import _validate_embedded_reference_output
+    from pudge.syncing import _validate_embedded_reference_output
 
     reference = tmp_path / "reference.srt"
     source = tmp_path / "source.srt"

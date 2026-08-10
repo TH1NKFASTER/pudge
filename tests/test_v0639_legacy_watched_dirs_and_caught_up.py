@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def test_v0637_distinct_watched_dirs_migrate_to_new_key(tmp_path: Path) -> None:
@@ -103,6 +103,6 @@ def test_scan_preserves_ready_external_row_when_watch_folder_removed(tmp_path: P
 
 
 def test_caught_up_never_uses_readiness_diagnosis() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function mediaInHomeSection(section,mediaId)" in html
     assert "if(mediaInHomeSection('caught_up',anime.media_id))return false;" in html

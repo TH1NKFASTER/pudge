@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
 
 
 def _anime() -> LibraryAnime:
@@ -70,8 +70,8 @@ def test_preferred_subsplease_skips_nyaa_when_rss_has_suitable_release(monkeypat
         calls.append("nyaa")
         return [_release("nyaa")]
 
-    monkeypatch.setattr("anime_mpv.manager.search_subsplease_ranked", rss)
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", nyaa)
+    monkeypatch.setattr("pudge.manager.search_subsplease_ranked", rss)
+    monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     releases = _manager().search_releases(135865, episode=5)
 
@@ -92,8 +92,8 @@ def test_preferred_subsplease_falls_back_to_nyaa_when_rss_has_no_suitable_releas
         calls.append("nyaa")
         return [nyaa_release]
 
-    monkeypatch.setattr("anime_mpv.manager.search_subsplease_ranked", rss)
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", nyaa)
+    monkeypatch.setattr("pudge.manager.search_subsplease_ranked", rss)
+    monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     releases = _manager().search_releases(135865, episode=5)
 
@@ -116,7 +116,7 @@ def test_preference_setting_round_trips(tmp_path: Path):
 
 
 def test_settings_ui_exposes_rss_first_checkbox():
-    html = Path("anime_mpv/web/index.html").read_text()
+    html = Path("pudge/web/index.html").read_text()
 
     assert "settings.preferSubsPleaseRss':'Prefer SubsPlease RSS before Nyaa'" in html
     assert "settings.preferSubsPleaseRss':'Сначала использовать RSS SubsPlease'" in html
@@ -137,8 +137,8 @@ def test_default_order_keeps_nyaa_first_and_skips_rss_when_nyaa_is_suitable(monk
         calls.append("nyaa")
         return [nyaa_release]
 
-    monkeypatch.setattr("anime_mpv.manager.search_subsplease_ranked", rss)
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", nyaa)
+    monkeypatch.setattr("pudge.manager.search_subsplease_ranked", rss)
+    monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     manager = _manager()
     manager.config.nyaa.subsplease_rss_preferred = False
@@ -149,7 +149,7 @@ def test_default_order_keeps_nyaa_first_and_skips_rss_when_nyaa_is_suitable(monk
 
 
 def test_preferred_rss_error_falls_back_to_nyaa(monkeypatch):
-    from anime_mpv.providers.nyaa import NyaaError
+    from pudge.providers.nyaa import NyaaError
 
     calls: list[str] = []
     nyaa_release = _release("nyaa")
@@ -162,8 +162,8 @@ def test_preferred_rss_error_falls_back_to_nyaa(monkeypatch):
         calls.append("nyaa")
         return [nyaa_release]
 
-    monkeypatch.setattr("anime_mpv.manager.search_subsplease_ranked", rss)
-    monkeypatch.setattr("anime_mpv.manager.search_ranked", nyaa)
+    monkeypatch.setattr("pudge.manager.search_subsplease_ranked", rss)
+    monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     releases = _manager().search_releases(135865, episode=5)
 

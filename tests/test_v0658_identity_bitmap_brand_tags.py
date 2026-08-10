@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
-from anime_mpv.providers.anilist import AniListError
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager import AnimeManager
+from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
+from pudge.providers.anilist import AniListError
+from pudge.web_app import WebAppApi
 
 
 def test_managed_planning_folder_restores_movie_identity(monkeypatch, tmp_path: Path) -> None:
@@ -34,7 +34,7 @@ def test_managed_planning_folder_restores_movie_identity(monkeypatch, tmp_path: 
         )
     )
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -214,9 +214,9 @@ def test_catmahjong_stale_match_is_removed_even_when_anilist_is_rate_limited(mon
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", RateLimitedClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", RateLimitedClient)
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -241,8 +241,8 @@ def test_web_state_exposes_pudge_brand_for_sidebar(tmp_path: Path) -> None:
     assert state["branding"]["slug"] == "pudge"
 
 def test_asset_server_renders_brand_before_state_load(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.web_app import WebAppApi, _start_asset_server
+    from pudge.config import AppConfig
+    from pudge.web_app import WebAppApi, _start_asset_server
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"

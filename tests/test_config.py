@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv.config import (
+from pudge.config import (
     AniListConfig,
     AppConfig,
     LLMConfig,
@@ -74,7 +74,7 @@ def test_config_round_trip(tmp_path: Path):
 
 
 def test_load_config_accepts_string_path(tmp_path):
-    from anime_mpv.config import load_config
+    from pudge.config import load_config
 
     path = tmp_path / "config.toml"
     config = load_config(str(path))

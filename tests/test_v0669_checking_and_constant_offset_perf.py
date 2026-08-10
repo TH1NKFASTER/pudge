@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv import syncing
+from pudge import syncing
 
 
 def _write_srt(path: Path, starts: list[float]) -> None:
@@ -20,7 +20,7 @@ def _write_srt(path: Path, starts: list[float]) -> None:
 
 
 def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active():
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function nextPrioritySubtitleDelay()" in html
     assert "activeDownloads().length>0||duePrioritySubtitleJobs().length>0" in html
     assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" in html
@@ -61,5 +61,6 @@ def test_constant_offset_search_is_bounded_and_keeps_small_global_shift(tmp_path
 
 
 def test_sync_cache_generation_changed_for_new_alignment_algorithm():
-    source = Path("anime_mpv/syncing.py").read_text(encoding="utf-8")
-    assert "syncing-v0.3.23:" in source
+    source = Path("pudge/syncing.py").read_text(encoding="utf-8")
+    assert "syncing-v0.3." in source
+    assert "timeline-monotonic-boundaries" in source

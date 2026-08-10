@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import NyaaRelease
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import NyaaRelease
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -105,7 +105,7 @@ def test_auto_search_current_actually_schedules_bleach_absolute_release(tmp_path
     manager.config.nyaa.auto_download_current = True
     manager.config.qbittorrent.enabled = True
     manager.db.upsert_anime(
-        __import__("anime_mpv.manager_models", fromlist=["LibraryAnime"]).LibraryAnime(
+        __import__("pudge.manager_models", fromlist=["LibraryAnime"]).LibraryAnime(
             media_id=191562,
             title="BLEACH: Sennen Kessen-hen - Kashin-tan",
             status="CURRENT",
@@ -134,8 +134,8 @@ def test_auto_search_current_actually_schedules_bleach_absolute_release(tmp_path
 
 
 def test_automatic_release_search_keeps_same_alias_count_as_find_episode(tmp_path: Path, monkeypatch) -> None:
-    import anime_mpv.manager as manager_module
-    from anime_mpv.manager_models import LibraryAnime
+    import pudge.manager as manager_module
+    from pudge.manager_models import LibraryAnime
 
     manager = _manager(tmp_path)
     manager.config.nyaa.enabled = True

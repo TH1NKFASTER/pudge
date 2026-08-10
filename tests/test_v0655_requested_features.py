@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.energy_diagnostics import EnergyDiagnosticsMonitor
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.providers.nyaa import SubsPleaseClient, _quality_score
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, load_config, write_config
+from pudge.energy_diagnostics import EnergyDiagnosticsMonitor
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.providers.nyaa import SubsPleaseClient, _quality_score
+from pudge.web_app import WebAppApi
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
-LUA = ROOT / "anime_mpv" / "mpv_scripts" / "anime_mpv_anilist.lua"
+HTML = ROOT / "pudge" / "web" / "index.html"
+LUA = ROOT / "pudge" / "mpv_scripts" / "pudge_anilist.lua"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -97,9 +97,9 @@ def test_only_mpv_shortcuts_are_configurable_and_app_shortcuts_are_standard(tmp_
     assert "shortcut_mpv_mark_watched" in html
 
     lua = LUA.read_text(encoding="utf-8")
-    assert "ANIME_MPV_SHORTCUT_MARK_WATCHED" in lua
-    assert "ANIME_MPV_SHORTCUT_OPEN_ANILIST" in lua
-    assert "ANIME_MPV_SHORTCUT_CORRECT_MATCH" in lua
+    assert "PUDGE_SHORTCUT_MARK_WATCHED" in lua
+    assert "PUDGE_SHORTCUT_OPEN_ANILIST" in lua
+    assert "PUDGE_SHORTCUT_CORRECT_MATCH" in lua
     assert "add_reliable_binding(shortcut_mark_watched" in lua
 
 
@@ -151,11 +151,11 @@ def test_highest_resolution_prefers_higher_standard_resolution() -> None:
 
 def test_energy_diagnostics_is_opt_in_and_collects_related_process_activity(monkeypatch) -> None:
     rows = [
-        {"pid": 100, "ppid": 1, "cpu_percent": 4.0, "memory_percent": 1.0, "rss_mb": 50.0, "elapsed": "1:00", "command": "Anime MPV"},
+        {"pid": 100, "ppid": 1, "cpu_percent": 4.0, "memory_percent": 1.0, "rss_mb": 50.0, "elapsed": "1:00", "command": "pudge"},
         {"pid": 101, "ppid": 100, "cpu_percent": 6.0, "memory_percent": 2.0, "rss_mb": 70.0, "elapsed": "0:40", "command": "WebKit WebContent"},
         {"pid": 202, "ppid": 1, "cpu_percent": 10.0, "memory_percent": 3.0, "rss_mb": 100.0, "elapsed": "4:00", "command": "/opt/homebrew/bin/mpv /tmp/a.mkv"},
     ]
-    monkeypatch.setattr("anime_mpv.energy_diagnostics.os.getpid", lambda: 100)
+    monkeypatch.setattr("pudge.energy_diagnostics.os.getpid", lambda: 100)
     monkeypatch.setattr(EnergyDiagnosticsMonitor, "_process_rows", staticmethod(lambda: rows))
     monitor = EnergyDiagnosticsMonitor(interval_seconds=30)
     sample = monitor.sample()

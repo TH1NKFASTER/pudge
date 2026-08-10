@@ -8,8 +8,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.light_novels import LightNovelService
+from pudge.config import AppConfig
+from pudge.light_novels import LightNovelService
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -64,8 +64,11 @@ def test_binding_one_volume_propagates_to_existing_siblings(tmp_path: Path) -> N
 
 
 def test_online_selection_translation_is_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    service = LightNovelService(cfg(tmp_path))
-    service.save_settings({"translation_language": "ru"})
+    c = cfg(tmp_path)
+    c.ui.language = "ru"
+    service = LightNovelService(c)
+    # Legacy overrides must no longer win over General -> Language.
+    service.save_settings({"translation_language": "en"})
     calls: list[tuple[str, str]] = []
 
     def fake_get(url: str, **kwargs):
@@ -90,8 +93,9 @@ def test_local_llm_is_translation_fallback_with_200_chars_context(tmp_path: Path
     c.llm.enabled = True
     c.llm.base_url = "http://127.0.0.1:11434"
     c.llm.model = "local-model"
+    c.ui.language = "en"
     service = LightNovelService(c)
-    service.save_settings({"translation_language": "en"})
+    service.save_settings({"translation_language": "ru"})
     seen: dict[str, object] = {}
 
     def fail_get(*_args, **_kwargs):
@@ -149,14 +153,14 @@ def test_light_novel_state_refresh_is_background_and_deduplicated(tmp_path: Path
 
 
 def test_reader_ui_owns_appearance_and_selection_translation() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     settings_block = html[html.index("function renderSettings(){"):html.index("function fillSettings")]
     assert 'id="lnReaderAppearance"' in html
     assert 'id="lnrFont"' in html and 'id="lnrFurigana"' in html and 'id="lnrCustomCss"' in html
     assert 'id="s_ln_reader_font"' not in settings_block
     assert 'id="s_ln_furigana"' not in settings_block
     assert 'id="s_ln_custom_css"' not in settings_block
-    assert 'id="s_ln_translation_language"' in settings_block
+    assert 'id="s_ln_translation_language"' not in settings_block
     assert "light_novel_translate" in html
     assert ".slice(-200)" in html
     assert "light_novel_cancel_reader_background" in html
@@ -165,10 +169,10 @@ def test_reader_ui_owns_appearance_and_selection_translation() -> None:
 
 
 def test_cli_reuses_library_anilist_identity_for_absolute_bleach(tmp_path: Path) -> None:
-    from anime_mpv.cli import _resolve_tracking_anilist
-    from anime_mpv.database import Database
-    from anime_mpv.filename import parse_anime_filename
-    from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+    from pudge.cli import _resolve_tracking_anilist
+    from pudge.database import Database
+    from pudge.filename import parse_anime_filename
+    from pudge.manager_models import LibraryAnime, LibraryEpisode
 
     c = cfg(tmp_path)
     c.anilist.enabled = True
@@ -209,8 +213,8 @@ def test_cli_reuses_library_anilist_identity_for_absolute_bleach(tmp_path: Path)
 
 def test_cli_jimaku_alias_uses_manager_release_numbering_cache(tmp_path: Path) -> None:
     import logging
-    from anime_mpv.cli import _jimaku_episode_aliases
-    from anime_mpv.models import AniListAnime
+    from pudge.cli import _jimaku_episode_aliases
+    from pudge.models import AniListAnime
 
     c = cfg(tmp_path)
     anime = AniListAnime(

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv import media
+from pudge import media
 
 
 def test_embedded_bitmap_does_not_hide_text_candidate(monkeypatch) -> None:

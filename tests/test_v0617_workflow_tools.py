@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv import ocr
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge import ocr
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -99,7 +99,7 @@ def test_ocr_quality_gate_flags_weak_results_and_accepts_normal_results() -> Non
 
 
 def test_web_ui_exposes_settings_maintenance_diagnostics_and_repair() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'data-page="downloads"' not in html
     assert 'id="settingsMaintenance"' in html
     assert "openEpisodeDiagnostics" in html

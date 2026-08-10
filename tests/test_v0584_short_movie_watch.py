@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv import cli
-from anime_mpv.anilist_tracking import TrackingPayload, create_tracking_file
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge import cli
+from pudge.anilist_tracking import TrackingPayload, create_tracking_file
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -121,7 +121,7 @@ def test_short_planned_special_auto_completes_and_updates_local_card(
 
 
 def test_mpv_samples_active_watch_time_every_second() -> None:
-    source = Path("anime_mpv/mpv_scripts/anime_mpv_anilist.lua").read_text(encoding="utf-8")
+    source = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
     assert "local active_timer = nil" in source
     assert "mp.add_periodic_timer(1.0, accumulate_active_time)" in source
     assert "if active_timer then active_timer:stop() end" in source

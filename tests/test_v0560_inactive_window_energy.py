@@ -3,7 +3,7 @@ from pathlib import Path
 
 def test_inactive_window_pauses_all_css_animations() -> None:
     html = (
-        Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html"
+        Path(__file__).parents[1] / "pudge" / "web" / "index.html"
     ).read_text(encoding="utf-8")
 
     assert "html.ui-inactive *" in html
@@ -14,7 +14,7 @@ def test_inactive_window_pauses_all_css_animations() -> None:
 
 def test_inactive_window_defers_render_and_slows_polling() -> None:
     html = (
-        Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html"
+        Path(__file__).parents[1] / "pudge" / "web" / "index.html"
     ).read_text(encoding="utf-8")
 
     assert "windowActive:!document.hidden&&document.hasFocus()" in html

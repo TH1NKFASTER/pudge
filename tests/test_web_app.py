@@ -3,9 +3,9 @@ from __future__ import annotations
 import urllib.request
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.web_app import WebAppApi, _start_asset_server
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import LibraryAnime
+from pudge.web_app import WebAppApi, _start_asset_server
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -73,13 +73,13 @@ def test_asset_server_serves_web_ui(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
 
-    assert "Anime MPV" in html
+    assert "pudge" in html
     assert "plannedFilter" in html
     assert "-webkit-overflow-scrolling:touch" in html
 
 
 def test_planned_filters_match_actual_anilist_media_status() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "const isFinished=a=>String(a.media_status||'').trim().toUpperCase()==='FINISHED'" in html
     assert "if(filter==='finished')items=items.filter(isFinished)" in html
     assert "if(filter==='unfinished')items=items.filter(a=>!isFinished(a))" in html
@@ -100,7 +100,7 @@ def test_qbt_test_uses_unsaved_form_values(tmp_path: Path, monkeypatch) -> None:
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.web_app.QBittorrentClient", FakeClient)
+    monkeypatch.setattr("pudge.web_app.QBittorrentClient", FakeClient)
     result = api.test_qbittorrent(
         {
             "qbt_url": "http://localhost:9191",
@@ -141,7 +141,7 @@ def test_play_deduplicates_same_video(tmp_path: Path, monkeypatch) -> None:
         calls.append((command, kwargs))
         return process
 
-    monkeypatch.setattr("anime_mpv.web_app.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
 
     first = api.play(str(video))
     second = api.play(str(video))
@@ -154,15 +154,15 @@ def test_play_deduplicates_same_video(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_web_ui_has_play_progress_and_nyaa_socks_preset() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "play_status" in html
     assert "Запускаю…" in html
     assert "socks5://[::1]:1080" in html
-    assert "Прокси применяется только к запросам Anime MPV в Nyaa" in html
+    assert "Прокси применяется только к запросам pudge в Nyaa" in html
 
 
 def test_web_state_reports_ready_without_sidecar_as_embedded(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     video = tmp_path / "embedded.mkv"
@@ -184,7 +184,7 @@ def test_web_state_reports_ready_without_sidecar_as_embedded(tmp_path: Path) -> 
 
 
 def test_not_yet_released_cards_hide_progress_and_freshness() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "const unreleased=a.media_status==='NOT_YET_RELEASED'" in html
     assert "const progress=unreleased?'':`<div class=\"meta\">${t('label.watched')}:" in html
     assert "const freshness=planned||unreleased?'':a.outdated?" in html
@@ -248,7 +248,7 @@ def test_manual_anilist_sync_can_run_again(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_refresh_button_is_reset_after_each_local_refresh() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "localRefreshing:false" in html
     assert "ui.localRefreshing=false" in html
     assert "duePrioritySubtitleJobs().length>0" in html
@@ -256,7 +256,7 @@ def test_refresh_button_is_reset_after_each_local_refresh() -> None:
 
 
 def test_watchable_anime_cards_have_polychrome_gloss() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "function isWatchable(a)" in html
     assert "polychrome-flow" in html
     assert "cover-shell.polychrome" in html
@@ -265,12 +265,12 @@ def test_watchable_anime_cards_have_polychrome_gloss() -> None:
 
 
 def test_not_yet_released_planned_card_has_no_download_button() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "a.media_status==='NOT_YET_RELEASED'?'':`<button data-action=\"release\"" in html
 
 
 def test_web_ui_defaults_to_english_and_offers_russian() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert '<html lang="en">' in html
     assert "'nav.current':'Anime'" in html
     assert "'nav.current':'Аниме'" in html
@@ -278,7 +278,7 @@ def test_web_ui_defaults_to_english_and_offers_russian() -> None:
 
 
 def test_web_ui_has_polychrome_a_logo_and_stronger_cover_foil() -> None:
-    root = Path(__file__).parents[1] / "anime_mpv"
+    root = Path(__file__).parents[1] / "pudge"
     html = (root / "web" / "index.html").read_text(encoding="utf-8")
     assert (root / "assets" / "app-icon.png").is_file()
     assert (root / "web" / "app-logo.png").is_file()
@@ -288,7 +288,7 @@ def test_web_ui_has_polychrome_a_logo_and_stronger_cover_foil() -> None:
 
 
 def test_startup_workflow_uses_adaptive_energy_efficient_polling() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "startup_maintenance" in html
     assert "poll_downloads_and_subtitles" in html
     assert "foregroundPollDelay" in html
@@ -391,7 +391,7 @@ def test_asset_server_serves_logo(tmp_path: Path) -> None:
 
 
 def test_startup_syncs_anilist_before_background_maintenance() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     sequence = html[html.index("async function startupSequence"):html.index("async function loadState")]
     assert sequence.index("syncAniList(true)") < sequence.index("startup_maintenance")
     assert "setTimeout(pollStartupMaintenance,3000)" in html
@@ -399,7 +399,7 @@ def test_startup_syncs_anilist_before_background_maintenance() -> None:
 
 
 def test_web_ui_exposes_timing_diagnostics() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="openDiagnosticsPage"' in html
     assert 'id="diagnostics" class="page"' in html
     assert "get_recent_logs" in html
@@ -408,14 +408,14 @@ def test_web_ui_exposes_timing_diagnostics() -> None:
 
 
 def test_runtime_icon_is_applied_to_cocoa_process() -> None:
-    source = (Path(__file__).parents[1] / "anime_mpv" / "web_app.py").read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "pudge" / "web_app.py").read_text(encoding="utf-8")
     assert "setApplicationIconImage_" in source
     assert "webview.start(on_started" in source
     assert 'assets" / "app-icon.png"' in source
 
 
 def test_macos_runtime_identity_sets_process_name_in_source() -> None:
-    source = Path(__file__).parents[1].joinpath("anime_mpv/web_app.py").read_text(encoding="utf-8")
+    source = Path(__file__).parents[1].joinpath("pudge/web_app.py").read_text(encoding="utf-8")
     assert 'setProcessName_(APP_NAME)' in source
     assert 'setObject_forKey_(APP_NAME, "CFBundleDisplayName")' in source
 
@@ -428,7 +428,7 @@ def test_installer_sets_bundle_display_name() -> None:
 
 
 def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, monkeypatch) -> None:
-    from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+    from pudge.manager_models import LibraryAnime, LibraryEpisode
 
     api = make_api(tmp_path)
     video = tmp_path / "Otome Kaijuu Carameliser - 05.mkv"
@@ -468,7 +468,7 @@ def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, mo
         calls.append(command)
         return FakeProcess()
 
-    monkeypatch.setattr("anime_mpv.web_app.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
 
     api.play(str(video))
     command = calls[0]
@@ -481,14 +481,14 @@ def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, mo
 
 
 def test_up_to_date_card_hides_missing_next_episode_message() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "!planned&&a.outdated?`<div class=\"subtle\">${t('label.localMissing'" in html
 
 
 def test_marking_episode_watched_updates_cached_progress_and_list_status(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     video = (tmp_path / "episode-05.mkv").resolve()
@@ -525,7 +525,7 @@ def test_marking_episode_watched_updates_cached_progress_and_list_status(tmp_pat
 
 
 def test_play_status_reports_watched_episode_and_cached_progress(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     video = (tmp_path / "episode-03.mkv").resolve()
@@ -553,7 +553,7 @@ def test_play_status_reports_watched_episode_and_cached_progress(tmp_path: Path)
 
 
 def test_play_monitor_refreshes_cards_when_episode_is_counted() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "if(status.watched&&!watchedReported)" in html
@@ -567,7 +567,7 @@ def test_installer_builds_real_native_named_app_bundle() -> None:
     assert '"$VENV_DIR/bin/python" -m PyInstaller' in source
     assert '--name "$APP_NAME"' in source
     assert 'CFBundleExecutable $APP_NAME' in source
-    assert 'ANIME_MPV_PYTHON' in source
+    assert 'PUDGE_PYTHON' in source
     assert "osacompile" not in source
 
 
@@ -575,7 +575,7 @@ def test_installer_builds_real_native_named_app_bundle() -> None:
 def test_play_does_not_use_stale_subtitle_from_non_ready_episode(
     tmp_path: Path, monkeypatch
 ) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     video = tmp_path / "Mushoku Tensei III - 06.mkv"
@@ -605,7 +605,7 @@ def test_play_does_not_use_stale_subtitle_from_non_ready_episode(
         calls.append(command)
         return FakeProcess()
 
-    monkeypatch.setattr("anime_mpv.web_app.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
 
     api.play(str(video))
     command = calls[0]
@@ -613,7 +613,7 @@ def test_play_does_not_use_stale_subtitle_from_non_ready_episode(
 
 
 def test_home_state_groups_ready_downloaded_episodes(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     api.manager.db.upsert_anime(
@@ -644,7 +644,7 @@ def test_home_state_groups_ready_downloaded_episodes(tmp_path: Path) -> None:
 
 
 def test_current_page_uses_actionable_home_sections_without_all_anime() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "section.newReady':'Новые серии готовы" in html
@@ -657,7 +657,7 @@ def test_current_page_uses_actionable_home_sections_without_all_anime() -> None:
     assert "Все аниме" not in html
 
 def test_home_state_marks_all_downloaded_episodes_ready(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     api.manager.db.upsert_anime(
@@ -690,7 +690,7 @@ def test_home_state_marks_all_downloaded_episodes_ready(tmp_path: Path) -> None:
 
 
 def test_downloaded_episode_text_uses_ranges_and_all_ready_label() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "function formatEpisodeRanges(values)" in html
@@ -700,7 +700,7 @@ def test_downloaded_episode_text_uses_ranges_and_all_ready_label() -> None:
     assert "'label.readyAll':'Готово всё'" in html
 
 def test_ready_home_cards_do_not_duplicate_title_on_hover() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     ready_template = html.split("function readyHomeCard(a){", 1)[1].split(
@@ -715,7 +715,7 @@ def test_ready_home_cards_do_not_duplicate_title_on_hover() -> None:
 def test_home_sections_group_airing_finished_waiting_and_caught_up(tmp_path: Path) -> None:
     from datetime import date, timedelta
 
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     today = date.today()
@@ -816,7 +816,7 @@ def test_home_sections_group_airing_finished_waiting_and_caught_up(tmp_path: Pat
 def test_recent_finale_requires_only_last_episode_remaining(tmp_path: Path) -> None:
     from datetime import date
 
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     anime = LibraryAnime(
@@ -871,7 +871,7 @@ def test_onboarding_can_be_completed_and_skipped(tmp_path: Path) -> None:
 
 
 def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "section.essential" in html
     assert "section.additional" in html
     assert "runSetupGuide" in html
@@ -882,14 +882,14 @@ def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> No
 
 
 def test_final_pipeline_cache_schema_bumped_for_cold_open_fix() -> None:
-    from anime_mpv import pipeline_cache
+    from pudge import pipeline_cache
 
     assert pipeline_cache._CACHE_SCHEMA == "final-pipeline-v9"
 
 
 
 def test_library_payload_groups_episodes_and_uses_cover(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     cover = api.config.library.cover_cache_dir / "123.jpg"
@@ -926,14 +926,14 @@ def test_library_payload_groups_episodes_and_uses_cover(tmp_path: Path) -> None:
 
 
 def test_library_page_is_removed_from_web_ui() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'data-page="library"' not in html
     assert '<section id="library"' not in html
     assert 'function renderLibrary()' not in html
 
 
 def test_settings_are_flat_and_optional_fields_are_conditional() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'class="settings-flat"' in html
     assert 'id="settings-anilist-fields"' in html
     assert 'id="settings-llm-fields"' in html
@@ -943,14 +943,14 @@ def test_settings_are_flat_and_optional_fields_are_conditional() -> None:
 
 
 def test_onboarding_uses_left_aligned_toggles_and_recommends_anilist() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "Connect AniList (strongly advised)" in html
     assert 'class="onboarding-toggle"' in html
     assert 'id="o_anilist_fields"' in html
 
 
 def test_web_ui_final_rating_context_menu_and_compact_navigation() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "label.final" in html
     assert "showScoreModal" in html
     assert "data-context-action=\"drop\"" in html
@@ -964,7 +964,7 @@ def test_web_ui_final_rating_context_menu_and_compact_navigation() -> None:
 
 
 def test_sidebar_status_is_hidden_and_refresh_button_shows_progress() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="status" class="status" hidden' in html
     assert "'action.refreshing':'Refreshing…'" in html
     assert "'action.refreshing':'Обновление…'" in html
@@ -975,7 +975,7 @@ def test_sidebar_status_is_hidden_and_refresh_button_shows_progress() -> None:
 
 
 def test_drop_group_contains_only_local_pending_files(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     anime = LibraryAnime(
@@ -1001,7 +1001,7 @@ def test_drop_group_contains_only_local_pending_files(tmp_path: Path) -> None:
 
 
 def test_play_status_requests_final_rating_once(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     anime = LibraryAnime(media_id=88, title="Final Show", status="COMPLETED", progress=12, episodes=12)
@@ -1021,7 +1021,7 @@ def test_play_status_requests_final_rating_once(tmp_path: Path) -> None:
 
 
 def test_ready_sections_are_responsive_and_statuses_are_compact() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'class="ready-sections"' in html
     assert ".ready-sections { display:grid" in html
     assert "'label.waitingSubs':'Waiting for subs'" in html
@@ -1030,20 +1030,20 @@ def test_ready_sections_are_responsive_and_statuses_are_compact() -> None:
 
 
 def test_library_sort_controls_are_removed_with_library_page() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="librarySort"' not in html
     assert 'ui.librarySort' not in html
 
 
 def test_escape_fullscreen_is_dispatched_to_cocoa_main_thread() -> None:
-    source = (Path(__file__).parents[1] / "anime_mpv" / "web_app.py").read_text(encoding="utf-8")
+    source = (Path(__file__).parents[1] / "pudge" / "web_app.py").read_text(encoding="utf-8")
     assert "AppHelper.callAfter(self._exit_fullscreen_on_main_thread)" in source
     assert "self._fullscreen_exit_pending" in source
     assert "native_window.toggleFullScreen_(None)" in source
 
 
 def test_overflow_titles_use_custom_webview_tooltip() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'id="titleTooltip"' in html
     assert "function titleIsClipped(el)" in html
     assert "probe=el.cloneNode(true)" in html
@@ -1054,7 +1054,7 @@ def test_overflow_titles_use_custom_webview_tooltip() -> None:
 
 
 def test_score_modal_uses_weighted_one_second_fortune_wheel() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "const SCORE_WHEEL_WEIGHTS=[1,2,4,7,10,10,7,4,2,1]" in html
     assert "function chooseWheelResult(previous=null)" in html
     assert "function spinScoreWheel(c)" in html
@@ -1066,7 +1066,7 @@ def test_score_modal_uses_weighted_one_second_fortune_wheel() -> None:
 
 
 def test_unreleased_planning_menu_hides_move_to_watching() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "const unreleased=String(a.media_status||'').trim().toUpperCase()==='NOT_YET_RELEASED'" in html
     assert "const watchingAction=unreleased?'':" in html
 
@@ -1077,7 +1077,7 @@ def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -
     subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
     calls: list[list[str]] = []
 
-    monkeypatch.setattr("anime_mpv.web_app.subprocess.Popen", lambda command, *args, **kwargs: calls.append(command))
+    monkeypatch.setattr("pudge.web_app.subprocess.Popen", lambda command, *args, **kwargs: calls.append(command))
 
     result = api.reveal_subtitle_file(str(subtitle))
 
@@ -1086,7 +1086,7 @@ def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -
 
 
 def test_library_external_subtitle_has_filename_tooltip_and_reveal_action() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'data-action="reveal-subtitle"' in html
     assert "e.subtitle_filename||revealPath" in html
     assert "pywebview.api.reveal_subtitle_file(target.dataset.path)" in html
@@ -1094,7 +1094,7 @@ def test_library_external_subtitle_has_filename_tooltip_and_reveal_action() -> N
 
 
 def test_score_wheel_has_no_extra_post_result_cooldown() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "rerollReadyAt" not in html
     assert "scheduleScoreRerollUnlock" not in html
     assert "c.generatedScore=result.score;c.lastScore=result.score;c.spinning=false" in html
@@ -1110,13 +1110,13 @@ def test_save_settings_persists_notifications_toggle(tmp_path: Path) -> None:
 
 
 def test_settings_ui_contains_notifications_toggle() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "s_notifications" in html
     assert "notifications_enabled:c('s_notifications')" in html
 
 
 def test_home_moves_resumable_ready_anime_to_continue_watching(tmp_path: Path) -> None:
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
     anime = LibraryAnime(
@@ -1150,7 +1150,7 @@ def test_home_moves_resumable_ready_anime_to_continue_watching(tmp_path: Path) -
 
 
 def test_continue_watching_renders_before_ready_sections() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text()
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
     render_start = html.index("function renderCurrent()")
     render_end = html.index("function buildPlannedOnce()", render_start)
     render_current = html[render_start:render_end]

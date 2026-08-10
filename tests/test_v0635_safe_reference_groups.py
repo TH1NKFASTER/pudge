@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.subtitle_formats import parse_srt, write_srt
-from anime_mpv.syncing import refine_with_embedded_reference_groups
+from pudge.subtitle_formats import parse_srt, write_srt
+from pudge.syncing import refine_with_embedded_reference_groups
 
 
 def test_split_merge_does_not_scale_japanese_cues_to_longer_english_groups(tmp_path: Path) -> None:

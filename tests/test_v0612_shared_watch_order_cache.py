@@ -3,9 +3,9 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -71,7 +71,7 @@ def test_full_graph_is_shared_between_all_component_entries(tmp_path: Path, monk
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeClient)
 
     first = manager.relation_graph(10)
     second = manager.relation_graph(20)
@@ -107,7 +107,7 @@ def test_due_refresh_updates_only_one_component_per_pass(tmp_path: Path, monkeyp
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeClient)
     manager.relation_graph(10)
     cached = manager.db.relation_graph_for_media(10)
     assert cached is not None
@@ -166,7 +166,7 @@ def test_startup_anilist_sync_uses_compact_list_and_preserves_relations(
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeClient)
 
     manager.sync_anilist()
 
@@ -177,7 +177,7 @@ def test_startup_anilist_sync_uses_compact_list_and_preserves_relations(
 
 
 def test_watch_order_modal_has_component_refresh_button() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "refresh_relation_graph" in html

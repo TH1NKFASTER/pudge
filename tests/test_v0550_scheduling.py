@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import anime_mpv.manager_models as manager_models
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.web_app import WebAppApi
+import pudge.manager_models as manager_models
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime
+from pudge.web_app import WebAppApi
 
 
 def test_cached_airing_time_marks_episode_released(monkeypatch) -> None:

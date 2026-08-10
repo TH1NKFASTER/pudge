@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def test_download_polling_is_eta_adaptive_and_uses_requested_thresholds() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "downloadPollHistory:new Map()" in html
     assert "function adaptiveDownloadPollDelay" in html
     assert "if(progress>=.95)return 2000" in html
@@ -15,6 +15,6 @@ def test_download_polling_is_eta_adaptive_and_uses_requested_thresholds() -> Non
 
 
 def test_old_90_and_98_percent_poll_thresholds_are_gone() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert ">=.98" not in html
     assert ">=.90" not in html

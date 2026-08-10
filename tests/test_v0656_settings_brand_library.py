@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.energy_diagnostics import EnergyDiagnosticsMonitor
-from anime_mpv.library import scan_library
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.energy_diagnostics import EnergyDiagnosticsMonitor
+from pudge.library import scan_library
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def test_shortcuts_are_last_settings_block_and_are_press_to_capture() -> None:
@@ -76,7 +76,7 @@ def test_managed_library_detaches_stale_catmahjong_false_match(monkeypatch, tmp_
         )
     )
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -91,13 +91,13 @@ def test_managed_library_detaches_stale_catmahjong_false_match(monkeypatch, tmp_
 
 def test_energy_log_separates_app_and_external_context(monkeypatch) -> None:
     rows = [
-        {"pid": 100, "ppid": 1, "cpu_percent": 5.0, "memory_percent": 1.0, "rss_mb": 40.0, "elapsed": "02:00", "command": "/Applications/Anime MPV.app/Contents/MacOS/Anime MPV"},
+        {"pid": 100, "ppid": 1, "cpu_percent": 5.0, "memory_percent": 1.0, "rss_mb": 40.0, "elapsed": "02:00", "command": "/Applications/pudge.app/Contents/MacOS/pudge"},
         {"pid": 101, "ppid": 100, "cpu_percent": 7.0, "memory_percent": 1.0, "rss_mb": 60.0, "elapsed": "01:59", "command": "python worker.py"},
         {"pid": 102, "ppid": 1, "cpu_percent": 3.0, "memory_percent": 1.0, "rss_mb": 30.0, "elapsed": "01:59", "command": "/System/Library/Frameworks/WebKit.framework/com.apple.WebKit.GPU"},
         {"pid": 200, "ppid": 1, "cpu_percent": 11.0, "memory_percent": 1.0, "rss_mb": 80.0, "elapsed": "10:00", "command": "/Applications/qBittorrent.app/Contents/MacOS/qbittorrent"},
         {"pid": 300, "ppid": 1, "cpu_percent": 50.0, "memory_percent": 1.0, "rss_mb": 20.0, "elapsed": "2-00:00:00", "command": "/System/Library/Frameworks/WebKit.framework/com.apple.WebKit.GPU"},
     ]
-    monkeypatch.setattr("anime_mpv.energy_diagnostics.os.getpid", lambda: 100)
+    monkeypatch.setattr("pudge.energy_diagnostics.os.getpid", lambda: 100)
     monkeypatch.setattr(EnergyDiagnosticsMonitor, "_process_rows", staticmethod(lambda: rows))
     sample = EnergyDiagnosticsMonitor(interval_seconds=30).sample()
     assert sample["app_cpu_percent"] == 15.0
@@ -108,12 +108,12 @@ def test_energy_log_separates_app_and_external_context(monkeypatch) -> None:
 
 
 def test_branding_is_centralized_for_install_and_runtime() -> None:
-    brand = (ROOT / "anime_mpv" / "brand.env").read_text(encoding="utf-8")
+    brand = (ROOT / "pudge" / "brand.env").read_text(encoding="utf-8")
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     release = (ROOT / "build_release.sh").read_text(encoding="utf-8")
     html = HTML.read_text(encoding="utf-8")
     assert 'APP_NAME="pudge"' in brand
-    assert 'source "$PROJECT_DIR/anime_mpv/brand.env"' in installer
+    assert 'source "$PROJECT_DIR/pudge/brand.env"' in installer
     assert 'APP_PATH="$APP_DIR/$APP_NAME.app"' in installer
     assert '--osx-bundle-identifier "$APP_BUNDLE_ID"' in installer
     assert 'STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"' in release

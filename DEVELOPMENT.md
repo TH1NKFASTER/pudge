@@ -12,6 +12,10 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev,sync]"
 ```
 
+## UI copy
+
+Keep implementation details out of user-facing copy. Do not add explanatory text such as how cards are grouped, which metadata provider is preferred, cache behavior, internal pipelines, or other technical implementation notes unless the information helps the user make a decision or complete an action.
+
 ## Tests
 
 Run the complete suite:

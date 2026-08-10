@@ -1,10 +1,10 @@
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.providers.anilist import _primary_studio, _relation_node_payload
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime
+from pudge.providers.anilist import _primary_studio, _relation_node_payload
+from pudge.web_app import WebAppApi
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -80,7 +80,7 @@ def test_planning_payload_contains_root_and_relation_studios(tmp_path: Path) -> 
 
 
 def test_planning_ui_shows_studio_only_in_row_and_large_relation_preview() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     assert "'label.studio':'Studio: {studio}'" in html

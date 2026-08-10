@@ -2,12 +2,12 @@ from pathlib import Path
 
 import httpx
 
-from anime_mpv import __version__
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import DownloadItem, LibraryEpisode
-from anime_mpv.providers.qbittorrent import QBittorrentClient
-from anime_mpv.subtitle_formats import clean_srt_for_playback
+from pudge import __version__
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import DownloadItem, LibraryEpisode
+from pudge.providers.qbittorrent import QBittorrentClient
+from pudge.subtitle_formats import clean_srt_for_playback
 
 
 def _srt(text: str = "日本語") -> str:
@@ -174,7 +174,7 @@ def test_manager_repairs_missingfiles_after_brand_rename(tmp_path: Path) -> None
 
 
 def test_ln_cards_and_settings_match_v0672_ui() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     assert ".ln-card-body{display:flex;min-width:0;flex-direction:column}" in html
     assert ".ln-card-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}" in html

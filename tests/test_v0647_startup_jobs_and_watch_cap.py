@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig
+from pudge.web_app import WebAppApi
 
 
 def test_startup_uses_same_forced_subtitle_retry_pipeline_as_refresh() -> None:
-    source = Path("anime_mpv/manager.py").read_text(encoding="utf-8")
+    source = Path("pudge/manager.py").read_text(encoding="utf-8")
     start = source.index("def _run_startup_once_unlocked")
     end = source.index("def _clear_jimaku_api_cache", start)
     block = source[start:end]
@@ -19,7 +19,7 @@ def test_startup_uses_same_forced_subtitle_retry_pipeline_as_refresh() -> None:
 
 
 def test_watch_cap_is_exposed_next_to_percentage_in_web_settings() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     threshold = html.index("s_anilist_threshold")
     cap = html.index("s_anilist_max_remaining")
@@ -30,13 +30,13 @@ def test_watch_cap_is_exposed_next_to_percentage_in_web_settings() -> None:
 
 
 def test_watch_cap_is_sent_to_mpv_tracker() -> None:
-    source = Path("anime_mpv/cli.py").read_text(encoding="utf-8")
-    assert '"ANIME_MPV_ANILIST_MAX_REMAINING_MINUTES"' in source
+    source = Path("pudge/cli.py").read_text(encoding="utf-8")
+    assert '"PUDGE_ANILIST_MAX_REMAINING_MINUTES"' in source
     assert "config.anilist.watched_max_remaining_minutes" in source
 
 
 def test_lua_requires_both_percent_and_remaining_time() -> None:
-    source = Path("anime_mpv/mpv_scripts/anime_mpv_anilist.lua").read_text(encoding="utf-8")
+    source = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
 
     assert "if not percent or percent < threshold * 100 then return end" in source
     assert "local remaining_seconds = math.max(0, duration - position)" in source

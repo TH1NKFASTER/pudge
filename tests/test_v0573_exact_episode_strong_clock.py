@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import SyncConfig
-from anime_mpv.models import SubtitleCandidate
-from anime_mpv.syncing import optimize_candidates, subtitle_quality_accepted
+from pudge.config import SyncConfig
+from pudge.models import SubtitleCandidate
+from pudge.syncing import optimize_candidates, subtitle_quality_accepted
 
 
 def _candidate(path: Path, *, activity_score: float = 0.93) -> SubtitleCandidate:
@@ -39,11 +39,11 @@ def test_exact_numbered_episode_strong_clock_skips_noisy_llm_and_audio(
 
     candidate = _candidate(subtitle)
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {"language": "eng", "title": "CR"}),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_with_alass",
+        "pudge.syncing.synchronize_with_alass",
         lambda *args, **kwargs: (
             aligned,
             {
@@ -55,7 +55,7 @@ def test_exact_numbered_episode_strong_clock_skips_noisy_llm_and_audio(
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing._validate_embedded_reference_output",
+        "pudge.syncing._validate_embedded_reference_output",
         lambda *args, **kwargs: (
             True,
             "ok",
@@ -67,15 +67,15 @@ def test_exact_numbered_episode_strong_clock_skips_noisy_llm_and_audio(
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.compare_timing_activity",
+        "pudge.syncing.compare_timing_activity",
         lambda *args, **kwargs: {"available": True, "weighted": 0.93},
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.repair_with_embedded_reference_piecewise",
+        "pudge.syncing.repair_with_embedded_reference_piecewise",
         lambda *args, **kwargs: (aligned, {"applied": False}),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.prepare_speech_reference",
+        "pudge.syncing.prepare_speech_reference",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("audio fallback must not run")
         ),
@@ -110,18 +110,18 @@ def test_exact_numbered_episode_strong_clock_still_requires_very_high_activity(
 
     candidate = _candidate(subtitle, activity_score=0.91)
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {}),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_with_alass",
+        "pudge.syncing.synchronize_with_alass",
         lambda *args, **kwargs: (
             aligned,
             {"reason": "applied", "sync_was_successful": True},
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing._validate_embedded_reference_output",
+        "pudge.syncing._validate_embedded_reference_output",
         lambda *args, **kwargs: (
             True,
             "ok",
@@ -129,7 +129,7 @@ def test_exact_numbered_episode_strong_clock_still_requires_very_high_activity(
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.compare_timing_activity",
+        "pudge.syncing.compare_timing_activity",
         lambda *args, **kwargs: {"available": True, "weighted": 0.91},
     )
 
@@ -143,7 +143,7 @@ def test_exact_numbered_episode_strong_clock_still_requires_very_high_activity(
 
     # Stop immediately after proving the strict shortcut did not activate.
     monkeypatch.setattr(
-        "anime_mpv.syncing.prepare_speech_reference",
+        "pudge.syncing.prepare_speech_reference",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no shortcut")),
     )
 

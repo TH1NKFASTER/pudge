@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from anime_mpv.models import SubtitleCandidate
-from anime_mpv.syncing import (
+from pudge.models import SubtitleCandidate
+from pudge.syncing import (
     _exact_jimaku_timing_consensus,
     _rank_embedded_reference_candidates,
 )
@@ -85,9 +85,9 @@ def test_exact_strong_clock_consensus_honors_srt_tolerance_order(tmp_path: Path)
 
 
 def test_generation_eleven_requeues_only_generated_playback_outputs(tmp_path: Path) -> None:
-    from anime_mpv.config import AppConfig
-    from anime_mpv.manager import AnimeManager
-    from anime_mpv.manager_models import LibraryEpisode
+    from pudge.config import AppConfig
+    from pudge.manager import AnimeManager
+    from pudge.manager_models import LibraryEpisode
 
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"

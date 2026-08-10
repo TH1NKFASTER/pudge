@@ -6,9 +6,9 @@ import types
 from argparse import Namespace
 from pathlib import Path
 
-from anime_mpv.config import SyncConfig
-from anime_mpv.models import SubtitleCandidate
-from anime_mpv.syncing import (
+from pudge.config import SyncConfig
+from pudge.models import SubtitleCandidate
+from pudge.syncing import (
     optimize_candidates,
     synchronize_subtitle,
     synchronize_with_alass,
@@ -178,9 +178,9 @@ def test_candidate_optimizer_prefers_best_alignment_score(tmp_path: Path, monkey
             "engine": "ffsubsync",
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.prepare_speech_reference", fake_prepare)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
-    monkeypatch.setattr("anime_mpv.syncing.optimize_subtitle", fake_optimize)
+    monkeypatch.setattr("pudge.syncing.prepare_speech_reference", fake_prepare)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.optimize_subtitle", fake_optimize)
     candidate, output, result = optimize_candidates(
         video,
         candidates,
@@ -232,9 +232,9 @@ def test_candidate_optimizer_prefers_srt_within_alignment_tolerance(tmp_path: Pa
             "engine": "ffsubsync",
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.prepare_speech_reference", fake_prepare)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
-    monkeypatch.setattr("anime_mpv.syncing.optimize_subtitle", fake_optimize)
+    monkeypatch.setattr("pudge.syncing.prepare_speech_reference", fake_prepare)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.optimize_subtitle", fake_optimize)
 
     candidate, _, result = optimize_candidates(
         video,
@@ -253,7 +253,7 @@ def test_candidate_optimizer_prefers_srt_within_alignment_tolerance(tmp_path: Pa
 
 
 def test_auto_engine_uses_local_segments_not_only_global_score(tmp_path: Path, monkeypatch):
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     subtitle = tmp_path / "source.srt"
@@ -302,11 +302,11 @@ def test_auto_engine_uses_local_segments_not_only_global_score(tmp_path: Path, m
             "segments": [],
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
-    monkeypatch.setattr("anime_mpv.syncing.evaluate_segment_alignment", fake_segments)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.evaluate_segment_alignment", fake_segments)
     monkeypatch.setattr(
-        "anime_mpv.syncing._maybe_repair_piecewise",
+        "pudge.syncing._maybe_repair_piecewise",
         lambda video, path, result, *args, **kwargs: (path, result),
     )
 
@@ -323,8 +323,8 @@ def test_auto_engine_uses_local_segments_not_only_global_score(tmp_path: Path, m
 
 
 def test_piecewise_repair_uses_different_offsets_across_episode(tmp_path: Path):
-    from anime_mpv.subtitle_formats import parse_srt
-    from anime_mpv.syncing import apply_piecewise_repair
+    from pudge.subtitle_formats import parse_srt
+    from pudge.syncing import apply_piecewise_repair
 
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
@@ -355,7 +355,7 @@ def test_piecewise_repair_uses_different_offsets_across_episode(tmp_path: Path):
 
 
 def test_short_segment_window_is_not_forced_to_thirty_seconds():
-    from anime_mpv.syncing import _segment_windows
+    from pudge.syncing import _segment_windows
 
     windows = _segment_windows(600.0, 5, 15.0)
 
@@ -364,7 +364,7 @@ def test_short_segment_window_is_not_forced_to_thirty_seconds():
 
 
 def test_local_clip_keeps_cues_outside_nominal_window_with_padding():
-    from anime_mpv.syncing import _clip_cues_for_local_alignment
+    from pudge.syncing import _clip_cues_for_local_alignment
 
     cues = [
         (35.0, 37.0, "opening cue"),
@@ -382,7 +382,7 @@ def test_local_clip_keeps_cues_outside_nominal_window_with_padding():
 
 
 def test_piecewise_repair_uses_original_source_instead_of_shifted_output(tmp_path: Path, monkeypatch):
-    from anime_mpv.syncing import _maybe_repair_piecewise
+    from pudge.syncing import _maybe_repair_piecewise
 
     video = tmp_path / "video.mkv"
     source = tmp_path / "source.srt"
@@ -430,8 +430,8 @@ def test_piecewise_repair_uses_original_source_instead_of_shifted_output(tmp_pat
         assert diagnostics is source_diagnostics
         return repaired, {"applied": True, "reason": "applied"}
 
-    monkeypatch.setattr("anime_mpv.syncing.evaluate_segment_alignment", fake_evaluate)
-    monkeypatch.setattr("anime_mpv.syncing.apply_piecewise_repair", fake_apply)
+    monkeypatch.setattr("pudge.syncing.evaluate_segment_alignment", fake_evaluate)
+    monkeypatch.setattr("pudge.syncing.apply_piecewise_repair", fake_apply)
 
     output, result = _maybe_repair_piecewise(
         video,
@@ -456,7 +456,7 @@ def test_piecewise_repair_uses_original_source_instead_of_shifted_output(tmp_pat
 
 
 def test_diagnostic_rank_prioritizes_opening_and_ending_coverage():
-    from anime_mpv.syncing import _diagnostic_rank
+    from pudge.syncing import _diagnostic_rank
 
     middle_only = {
         "available": True,
@@ -481,7 +481,7 @@ def test_diagnostic_rank_prioritizes_opening_and_ending_coverage():
 
 
 def test_segment_reliability_rejects_boundary_oscillation():
-    from anime_mpv.syncing import _segment_reliability
+    from pudge.syncing import _segment_reliability
 
     offsets = [9.93, -44.99, 22.21, -43.77, 43.04, 44.92, -27.46, -43.61, 42.77, 45.0]
     result = _segment_reliability(offsets, max_offset=45.0, jump_threshold=2.5)
@@ -491,7 +491,7 @@ def test_segment_reliability_rejects_boundary_oscillation():
 
 
 def test_piecewise_repair_refuses_unreliable_diagnostics(tmp_path: Path):
-    from anime_mpv.syncing import apply_piecewise_repair
+    from pudge.syncing import apply_piecewise_repair
 
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
@@ -524,7 +524,7 @@ def test_piecewise_repair_refuses_unreliable_diagnostics(tmp_path: Path):
 def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable(
     tmp_path: Path, monkeypatch
 ):
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     subtitle = tmp_path / "source.srt"
@@ -534,7 +534,7 @@ def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable
         path.write_text("x", encoding="utf-8")
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (None, {"reason": "not_found"}),
     )
 
@@ -555,9 +555,9 @@ def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable
             "framerate_scale_factor": 1.0,
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_with_alass",
+        "pudge.syncing.synchronize_with_alass",
         lambda *args, **kwargs: (
             alass_output,
             {
@@ -582,11 +582,11 @@ def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable
         "segments": [],
     }
     monkeypatch.setattr(
-        "anime_mpv.syncing.evaluate_segment_alignment",
+        "pudge.syncing.evaluate_segment_alignment",
         lambda *args, **kwargs: dict(unreliable),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing._maybe_repair_piecewise",
+        "pudge.syncing._maybe_repair_piecewise",
         lambda video, path, result, *args, **kwargs: (path, result),
     )
 
@@ -604,7 +604,7 @@ def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable
 
 
 def test_selects_english_default_embedded_timing_reference():
-    from anime_mpv.syncing import _select_timing_reference_stream
+    from pudge.syncing import _select_timing_reference_stream
 
     streams = [
         {
@@ -630,7 +630,7 @@ def test_selects_english_default_embedded_timing_reference():
 
 
 def test_llm_rejection_prevents_embedded_reference_alignment(tmp_path: Path, monkeypatch):
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     subtitle = tmp_path / "japanese.srt"
@@ -644,7 +644,7 @@ def test_llm_rejection_prevents_embedded_reference_alignment(tmp_path: Path, mon
         )
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (
             timing_reference,
             {"reason": "applied", "language": "eng", "title": "CR"},
@@ -688,10 +688,10 @@ def test_llm_rejection_prevents_embedded_reference_alignment(tmp_path: Path, mon
                 "total_samples": 6,
             }
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
     monkeypatch.setattr(
-        "anime_mpv.syncing.evaluate_segment_alignment",
+        "pudge.syncing.evaluate_segment_alignment",
         lambda *args, **kwargs: {
             "available": False,
             "reliable": False,
@@ -699,7 +699,7 @@ def test_llm_rejection_prevents_embedded_reference_alignment(tmp_path: Path, mon
         },
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing._maybe_repair_piecewise",
+        "pudge.syncing._maybe_repair_piecewise",
         lambda video, path, result, *args, **kwargs: (path, result),
     )
 
@@ -719,7 +719,7 @@ def test_llm_rejection_prevents_embedded_reference_alignment(tmp_path: Path, mon
 
 
 def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monkeypatch):
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     subtitle = tmp_path / "japanese.srt"
@@ -731,7 +731,7 @@ def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monk
         path.write_text(payload, encoding="utf-8")
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (
             timing_reference,
             {"reason": "applied", "language": "eng", "title": "CR"},
@@ -770,8 +770,8 @@ def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monk
                 "total_samples": 6,
             }
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", fake_sync)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", fake_sync)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
 
     output, result = optimize_subtitle(
         video,
@@ -790,7 +790,7 @@ def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monk
 
 
 def test_timing_activity_detects_cold_open_improvement(tmp_path: Path):
-    from anime_mpv.syncing import compare_timing_activity, _embedded_reference_is_better
+    from pudge.syncing import compare_timing_activity, _embedded_reference_is_better
 
     reference = tmp_path / "reference.srt"
     baseline = tmp_path / "baseline.srt"
@@ -821,7 +821,7 @@ def test_timing_activity_detects_cold_open_improvement(tmp_path: Path):
 
 
 def test_embedded_reference_rejects_middle_degradation():
-    from anime_mpv.syncing import _embedded_reference_is_better
+    from pudge.syncing import _embedded_reference_is_better
 
     accepted, reason = _embedded_reference_is_better(
         {"available": True, "start": 0.2, "middle": 0.95, "weighted": 0.7, "full": 0.8},
@@ -833,7 +833,7 @@ def test_embedded_reference_rejects_middle_degradation():
 
 
 def test_llm_accepted_alass_failure_is_reported_without_local_noise(tmp_path: Path, monkeypatch):
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     subtitle = tmp_path / "japanese.srt"
@@ -844,14 +844,14 @@ def test_llm_accepted_alass_failure_is_reported_without_local_noise(tmp_path: Pa
         path.write_text(payload, encoding="utf-8")
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (
             timing_reference,
             {"reason": "applied", "language": "eng", "title": "CR"},
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_subtitle",
+        "pudge.syncing.synchronize_subtitle",
         lambda *args, **kwargs: (
             ff_output,
             {
@@ -864,7 +864,7 @@ def test_llm_accepted_alass_failure_is_reported_without_local_noise(tmp_path: Pa
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_with_alass",
+        "pudge.syncing.synchronize_with_alass",
         lambda *args, **kwargs: (
             subtitle,
             {
@@ -886,7 +886,7 @@ def test_llm_accepted_alass_failure_is_reported_without_local_noise(tmp_path: Pa
             }
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.evaluate_segment_alignment",
+        "pudge.syncing.evaluate_segment_alignment",
         lambda *args, **kwargs: {
             "available": False,
             "reliable": False,
@@ -940,8 +940,8 @@ def test_alass_normalizes_srt_reference_and_source(tmp_path: Path):
 
 
 def test_relative_semantic_samples_ignore_constant_timing_shift(tmp_path: Path):
-    from anime_mpv.llm import build_subtitle_semantic_samples
-    from anime_mpv.subtitle_formats import write_srt
+    from pudge.llm import build_subtitle_semantic_samples
+    from pudge.subtitle_formats import write_srt
 
     japanese = tmp_path / "japanese.srt"
     english = tmp_path / "english.srt"
@@ -973,8 +973,8 @@ def test_relative_semantic_samples_ignore_constant_timing_shift(tmp_path: Path):
 def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
     tmp_path: Path, monkeypatch
 ):
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"video")
@@ -998,14 +998,14 @@ def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
     write_srt(aligned_cues, alass_output)
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (
             timing_reference,
             {"reason": "applied", "language": "eng", "title": "CR"},
         ),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.synchronize_subtitle",
+        "pudge.syncing.synchronize_subtitle",
         lambda *args, **kwargs: (
             subtitle,
             {
@@ -1029,7 +1029,7 @@ def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
             "alass_constant_shift": True,
         }
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
 
     class AcceptingLLM:
         modes: list[str] = []
@@ -1063,8 +1063,8 @@ def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
 
 
 def test_subtitle_shift_summary_detects_constant_offset(tmp_path: Path):
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import _subtitle_shift_summary
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import _subtitle_shift_summary
 
     source = tmp_path / "source.srt"
     aligned = tmp_path / "aligned.srt"
@@ -1085,8 +1085,8 @@ def test_subtitle_shift_summary_detects_constant_offset(tmp_path: Path):
 
 
 def test_constant_offset_estimator_handles_different_cue_splitting(tmp_path: Path):
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import estimate_constant_subtitle_offset
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import estimate_constant_subtitle_offset
 
     source = tmp_path / "japanese.srt"
     reference = tmp_path / "english.srt"
@@ -1119,8 +1119,8 @@ def test_constant_offset_estimator_handles_different_cue_splitting(tmp_path: Pat
 
 
 def test_onset_and_semantic_reference_run_before_fft(tmp_path: Path, monkeypatch):
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"video")
@@ -1135,7 +1135,7 @@ def test_onset_and_semantic_reference_run_before_fft(tmp_path: Path, monkeypatch
     write_srt(aligned_cues, aligned)
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {"language": "eng", "title": "CR"}),
     )
     calls: list[str] = []
@@ -1160,8 +1160,8 @@ def test_onset_and_semantic_reference_run_before_fft(tmp_path: Path, monkeypatch
         calls.append("fft")
         raise AssertionError("FFT must not run after a valid embedded subtitle reference")
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", forbidden_fft)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", forbidden_fft)
 
     output, result = optimize_subtitle(
         video,
@@ -1181,8 +1181,8 @@ def test_onset_and_semantic_reference_run_before_fft(tmp_path: Path, monkeypatch
 def test_constant_offset_estimator_rejects_dense_boundary_false_peak(tmp_path: Path):
     import random
 
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import estimate_constant_subtitle_offset
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import estimate_constant_subtitle_offset
 
     source = tmp_path / "japanese.srt"
     reference = tmp_path / "english.srt"
@@ -1222,8 +1222,8 @@ def test_constant_offset_estimator_rejects_dense_boundary_false_peak(tmp_path: P
 def test_constant_offset_estimator_keeps_diverse_semantic_candidates(tmp_path: Path):
     import random
 
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import estimate_constant_subtitle_offsets
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import estimate_constant_subtitle_offsets
 
     source = tmp_path / "japanese.srt"
     reference = tmp_path / "english.srt"
@@ -1255,8 +1255,8 @@ def test_constant_offset_estimator_keeps_diverse_semantic_candidates(tmp_path: P
 
 
 def test_semantic_validation_tries_next_offset_before_fft(tmp_path: Path, monkeypatch):
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import optimize_subtitle
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"video")
@@ -1269,11 +1269,11 @@ def test_semantic_validation_tries_next_offset_before_fft(tmp_path: Path, monkey
     write_srt([(start + 28.0, end + 28.0, text) for start, end, text in cues], aligned)
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {"language": "eng", "title": "CR"}),
     )
     monkeypatch.setattr(
-        "anime_mpv.syncing.estimate_constant_subtitle_offsets",
+        "pudge.syncing.estimate_constant_subtitle_offsets",
         lambda *args, **kwargs: [
             {
                 "available": True,
@@ -1325,8 +1325,8 @@ def test_semantic_validation_tries_next_offset_before_fft(tmp_path: Path, monkey
         calls.append("fft")
         raise AssertionError("FFT must not run after a later offset candidate is accepted")
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", forbidden_fft)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", forbidden_fft)
 
     output, result = optimize_subtitle(
         video,
@@ -1345,9 +1345,9 @@ def test_semantic_validation_tries_next_offset_before_fft(tmp_path: Path, monkey
 
 
 def test_optimize_candidates_uses_embedded_subtitles_before_audio(tmp_path: Path, monkeypatch):
-    from anime_mpv.models import SubtitleCandidate
-    from anime_mpv.subtitle_formats import write_srt
-    from anime_mpv.syncing import optimize_candidates
+    from pudge.models import SubtitleCandidate
+    from pudge.subtitle_formats import write_srt
+    from pudge.syncing import optimize_candidates
 
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"video")
@@ -1360,7 +1360,7 @@ def test_optimize_candidates_uses_embedded_subtitles_before_audio(tmp_path: Path
     write_srt([(start + 28.0, end + 28.0, text) for start, end, text in cues], aligned)
 
     monkeypatch.setattr(
-        "anime_mpv.syncing.extract_embedded_timing_reference",
+        "pudge.syncing.extract_embedded_timing_reference",
         lambda *args, **kwargs: (reference, {"language": "eng", "title": "CR"}),
     )
 
@@ -1394,9 +1394,9 @@ def test_optimize_candidates_uses_embedded_subtitles_before_audio(tmp_path: Path
     def forbidden_audio(*_args, **_kwargs):
         raise AssertionError("audio/FFT candidate scoring must not run")
 
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_with_alass", fake_alass)
-    monkeypatch.setattr("anime_mpv.syncing.prepare_speech_reference", forbidden_audio)
-    monkeypatch.setattr("anime_mpv.syncing.synchronize_subtitle", forbidden_audio)
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr("pudge.syncing.prepare_speech_reference", forbidden_audio)
+    monkeypatch.setattr("pudge.syncing.synchronize_subtitle", forbidden_audio)
 
     candidate, output, result = optimize_candidates(
         video,
@@ -1416,7 +1416,7 @@ def test_optimize_candidates_uses_embedded_subtitles_before_audio(tmp_path: Path
 
 
 def test_robust_semantic_acceptance_requires_strong_activity():
-    from anime_mpv.syncing import _apply_robust_semantic_activity_gate
+    from pudge.syncing import _apply_robust_semantic_activity_gate
 
     validation = {
         "accepted": True,
@@ -1438,7 +1438,7 @@ def test_robust_semantic_acceptance_requires_strong_activity():
 
 
 def test_subtitle_quality_gate_rejects_unreliable_segment_metrics():
-    from anime_mpv.syncing import subtitle_quality_accepted
+    from pudge.syncing import subtitle_quality_accepted
 
     accepted, reason = subtitle_quality_accepted(
         {
@@ -1456,7 +1456,7 @@ def test_subtitle_quality_gate_rejects_unreliable_segment_metrics():
 
 
 def test_subtitle_quality_gate_rejects_semantic_episode_mismatch():
-    from anime_mpv.syncing import subtitle_quality_accepted
+    from pudge.syncing import subtitle_quality_accepted
 
     accepted, reason = subtitle_quality_accepted(
         {
@@ -1474,7 +1474,7 @@ def test_subtitle_quality_gate_rejects_semantic_episode_mismatch():
 
 
 def test_subtitle_quality_gate_accepts_exact_jimaku_boundary_only_mismatch():
-    from anime_mpv.syncing import subtitle_quality_accepted
+    from pudge.syncing import subtitle_quality_accepted
 
     accepted, reason = subtitle_quality_accepted(
         {
@@ -1499,7 +1499,7 @@ def test_subtitle_quality_gate_accepts_exact_jimaku_boundary_only_mismatch():
 
 
 def test_subtitle_quality_gate_still_rejects_exact_jimaku_large_jumps():
-    from anime_mpv.syncing import subtitle_quality_accepted
+    from pudge.syncing import subtitle_quality_accepted
 
     accepted, reason = subtitle_quality_accepted(
         {
@@ -1524,9 +1524,9 @@ def test_subtitle_quality_gate_still_rejects_exact_jimaku_large_jumps():
 
 
 def test_embedded_reference_piecewise_repairs_cold_open_drift(tmp_path: Path):
-    from anime_mpv.config import SyncConfig
-    from anime_mpv.subtitle_formats import parse_srt, write_srt
-    from anime_mpv.syncing import (
+    from pudge.config import SyncConfig
+    from pudge.subtitle_formats import parse_srt, write_srt
+    from pudge.syncing import (
         compare_timing_activity,
         repair_with_embedded_reference_piecewise,
     )
@@ -1569,9 +1569,9 @@ def test_embedded_reference_piecewise_repairs_cold_open_drift(tmp_path: Path):
 
 
 def test_embedded_reference_piecewise_rejects_short_cold_open_when_it_reorders_dialogue(tmp_path: Path):
-    from anime_mpv.config import SyncConfig
-    from anime_mpv.subtitle_formats import parse_srt, write_srt
-    from anime_mpv.syncing import repair_with_embedded_reference_piecewise
+    from pudge.config import SyncConfig
+    from pudge.subtitle_formats import parse_srt, write_srt
+    from pudge.syncing import repair_with_embedded_reference_piecewise
 
     reference = tmp_path / "english-short-open.srt"
     aligned = tmp_path / "japanese-short-open-alass.srt"
@@ -1605,9 +1605,9 @@ def test_embedded_reference_piecewise_rejects_short_cold_open_when_it_reorders_d
 
 
 def test_embedded_reference_piecewise_rejects_large_cold_open_when_it_reorders_dialogue(tmp_path: Path):
-    from anime_mpv.config import SyncConfig
-    from anime_mpv.subtitle_formats import parse_srt, write_srt
-    from anime_mpv.syncing import repair_with_embedded_reference_piecewise
+    from pudge.config import SyncConfig
+    from pudge.subtitle_formats import parse_srt, write_srt
+    from pudge.syncing import repair_with_embedded_reference_piecewise
 
     reference = tmp_path / "english-title-card.srt"
     aligned = tmp_path / "japanese-title-card-alass.srt"
@@ -1644,7 +1644,7 @@ def test_embedded_reference_piecewise_rejects_large_cold_open_when_it_reorders_d
 
 
 def test_optimize_candidates_retries_after_primary_quality_failure(tmp_path: Path, monkeypatch):
-    import anime_mpv.syncing as syncing
+    import pudge.syncing as syncing
 
     video = tmp_path / "Odd Taxi - 02.mkv"
     first = tmp_path / "netflix-02.srt"
@@ -1719,7 +1719,7 @@ def test_optimize_candidates_retries_after_primary_quality_failure(tmp_path: Pat
 
 
 def test_exact_jimaku_timing_consensus_accepts_three_strong_independent_files(tmp_path: Path):
-    from anime_mpv.syncing import _exact_jimaku_timing_consensus
+    from pudge.syncing import _exact_jimaku_timing_consensus
 
     items = []
     for index, activity in enumerate((0.93, 0.91, 0.89, 0.84), start=1):
@@ -1756,7 +1756,7 @@ def test_exact_jimaku_timing_consensus_accepts_three_strong_independent_files(tm
 
 
 def test_exact_jimaku_timing_consensus_stays_strict_for_ambiguous_files(tmp_path: Path):
-    from anime_mpv.syncing import _exact_jimaku_timing_consensus
+    from pudge.syncing import _exact_jimaku_timing_consensus
 
     items = []
     for index, activity in enumerate((0.95, 0.94), start=1):
@@ -1794,9 +1794,9 @@ def test_embedded_reference_piecewise_rejects_sparse_reference_false_cold_shift(
     tmp_path: Path,
     monkeypatch,
 ):
-    import anime_mpv.syncing as syncing
-    from anime_mpv.config import SyncConfig
-    from anime_mpv.subtitle_formats import write_srt
+    import pudge.syncing as syncing
+    from pudge.config import SyncConfig
+    from pudge.subtitle_formats import write_srt
 
     reference = tmp_path / "english-sparse-opening.srt"
     aligned = tmp_path / "japanese-cc-alass.srt"
@@ -1861,7 +1861,7 @@ def test_embedded_reference_piecewise_rejects_sparse_reference_false_cold_shift(
 
 
 def test_piecewise_sequence_guard_rejects_dialogue_reordering():
-    from anime_mpv.syncing import _retime_cues_without_reordering
+    from pudge.syncing import _retime_cues_without_reordering
 
     cues = [
         (10.0, 12.0, "first"),
@@ -1879,7 +1879,7 @@ def test_piecewise_sequence_guard_rejects_dialogue_reordering():
 
 
 def test_piecewise_sequence_guard_clamps_start_and_preserves_duration():
-    from anime_mpv.syncing import _retime_cues_without_reordering
+    from pudge.syncing import _retime_cues_without_reordering
 
     repaired, details = _retime_cues_without_reordering(
         [(0.05, 1.05, "opening")],

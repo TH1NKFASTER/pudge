@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from anime_mpv.pgs import (
+from pudge.pgs import (
     PGS_CLOCK,
     build_time_mapper,
     onset_match_score,
@@ -74,9 +74,9 @@ def test_onset_match_score_tolerates_extra_pgs_events() -> None:
 
 
 def test_sync_pgs_against_embedded_reference(monkeypatch, tmp_path: Path) -> None:
-    from anime_mpv.config import SyncConfig
-    from anime_mpv import syncing
-    from anime_mpv.subtitle_formats import parse_srt, write_srt
+    from pudge.config import SyncConfig
+    from pudge import syncing
+    from pudge.subtitle_formats import parse_srt, write_srt
 
     video = tmp_path / "movie.mkv"
     video.write_bytes(b"video")

@@ -4,10 +4,10 @@ from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 import logging
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, NyaaRelease
-from anime_mpv.providers.nyaa import (
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, NyaaRelease
+from pudge.providers.nyaa import (
     fresh_trusted_zero_seeders_allowed,
     parse_rss,
     score_release,

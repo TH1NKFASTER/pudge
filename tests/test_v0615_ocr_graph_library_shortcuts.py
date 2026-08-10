@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv import ocr
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.relation_graphs import compact_relations_from_graph
-from anime_mpv.web_app import WebAppApi
+from pudge import ocr
+from pudge.config import AppConfig, load_config, write_config
+from pudge.relation_graphs import compact_relations_from_graph
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def _pgs_segment(pts: int, segment_type: int, payload: bytes) -> bytes:
@@ -166,7 +166,7 @@ def test_library_episode_width_card_link_shortcuts_and_polychrome_restart() -> N
 
 
 def test_ocr_is_a_prepare_time_fallback_after_text_selection() -> None:
-    source = (ROOT / "anime_mpv" / "cli.py").read_text(encoding="utf-8")
+    source = (ROOT / "pudge" / "cli.py").read_text(encoding="utf-8")
     discovery = source.index("if subtitle is None and subtitle_id is None and not args.fast_play:")
     ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play:")
     ready = source.index('print("PREPARE_STATUS=ready")')
@@ -178,7 +178,7 @@ def test_ocr_is_a_prepare_time_fallback_after_text_selection() -> None:
 
 def test_installer_verifies_and_records_current_version_dynamically() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'EXPECTED_VERSION="${WHEEL_NAME#anime_mpv-}"' in installer
+    assert 'EXPECTED_VERSION="${WHEEL_NAME#pudge-}"' in installer
     assert 'assert installed == expected, (installed, expected)' in installer
     assert 'assert __version__ == expected, (__version__, expected)' in installer
     assert "printf '%s\\n' \"$EXPECTED_VERSION\" > \"$DATA_DIR/installed-version.txt\"" in installer
@@ -186,7 +186,7 @@ def test_installer_verifies_and_records_current_version_dynamically() -> None:
 
 
 def test_text_candidates_are_selected_before_bitmap_ocr_fallback() -> None:
-    source = (ROOT / "anime_mpv" / "cli.py").read_text(encoding="utf-8")
+    source = (ROOT / "pudge" / "cli.py").read_text(encoding="utf-8")
     split = source.index("text_candidates = [")
     optimization = source.index("best, optimized_path, result = optimize_candidates(")
     ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play:")

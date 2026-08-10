@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import LLMConfig
-from anime_mpv.llm import OllamaClient
-from anime_mpv.manager import _localize_preparation_detail
-from anime_mpv.syncing import _apply_robust_semantic_activity_gate
+from pudge.config import LLMConfig
+from pudge.llm import OllamaClient
+from pudge.manager import _localize_preparation_detail
+from pudge.syncing import _apply_robust_semantic_activity_gate
 
 
 def _write_srt(path: Path, prefix: str) -> None:

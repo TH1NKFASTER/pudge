@@ -2,15 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import DownloadItem, LibraryAnime
-from anime_mpv.permissions import request_folder_access
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import DownloadItem, LibraryAnime
+from pudge.permissions import request_folder_access
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -54,7 +54,7 @@ def torrent(
         added_on=1,
         completed_on=1 if progress >= 0.999 else 0,
         raw={
-            "category": "anime-mpv" if linked else "",
+            "category": "pudge" if linked else "",
             "_tag_set": [
                 "anime: Mahou Shoujo Madoka☆Magica: Hangyaku no Monogatari",
                 "anilist: 119321",
@@ -153,11 +153,11 @@ def test_permission_preflight_touches_folder_and_persists_flag(tmp_path: Path, m
     api = WebAppApi(cfg.config_path)
 
     monkeypatch.setattr(
-        "anime_mpv.web_app.request_folder_access",
+        "pudge.web_app.request_folder_access",
         lambda paths: {str(Path(path)): True for path in paths},
     )
     monkeypatch.setattr(
-        "anime_mpv.web_app.request_notification_permission",
+        "pudge.web_app.request_notification_permission",
         lambda: {"supported": True, "granted": True, "error": ""},
     )
 

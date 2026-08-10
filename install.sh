@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${0:A:h}"
-source "$PROJECT_DIR/anime_mpv/brand.env"
+source "$PROJECT_DIR/pudge/brand.env"
 LEGACY_NAMES=("${(@s:|:)APP_LEGACY_NAMES}")
 LEGACY_SLUGS=("${(@s:|:)APP_LEGACY_SLUGS}")
 LEGACY_BUNDLE_IDS=("${(@s:|:)APP_LEGACY_BUNDLE_IDS}")
@@ -66,6 +66,36 @@ if [[ ! -x "$ARIA2_BIN" ]]; then
 fi
 
 mkdir -p "$DATA_DIR" "$BIN_DIR" "$APP_DIR" "$LOG_DIR" "$LAUNCH_AGENTS"
+
+# Preserve the optional MangaOCR capability across updates. The installer
+# recreates the runtime venv, so remember whether OCR was available before
+# deleting it. A surviving model-ready marker also counts: in that case the
+# Python package must be restored even if the old venv itself is damaged.
+MANGA_OCR_WAS_INSTALLED=0
+if [[ -x "$VENV_DIR/bin/python" ]]; then
+  if CONFIG_PATH="$CONFIG_PATH" "$VENV_DIR/bin/python" - <<'PYMANGAOLD'
+import importlib.util
+import os
+from pathlib import Path
+
+installed = importlib.util.find_spec("manga_ocr") is not None
+model_ready = False
+try:
+    from pudge.config import load_config
+    config = load_config(Path(os.environ["CONFIG_PATH"]).expanduser())
+    marker = Path(config.paths.cache_dir) / "manga-ocr" / "model-ready.json"
+    model_ready = marker.exists()
+except Exception:
+    pass
+
+raise SystemExit(0 if installed or model_ready else 1)
+PYMANGAOLD
+  then
+    MANGA_OCR_WAS_INSTALLED=1
+    echo "MangaOCR detected; it will be preserved across this update."
+  fi
+fi
+
 rm -rf "$VENV_DIR"
 python3.12 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
@@ -80,13 +110,13 @@ if [[ -d "$PROJECT_DIR/.git" ]]; then
   "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
   "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
     --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
-  WHEEL_CANDIDATES=("$WHEEL_BUILD_DIR"/anime_mpv-*.whl(N))
+  WHEEL_CANDIDATES=("$WHEEL_BUILD_DIR"/pudge-*.whl(N))
 else
   # Release ZIPs already contain the exact wheel built by GitHub Actions.
-  WHEEL_CANDIDATES=("$PROJECT_DIR"/anime_mpv-*.whl(N))
+  WHEEL_CANDIDATES=("$PROJECT_DIR"/pudge-*.whl(N))
 fi
 if (( ${#WHEEL_CANDIDATES[@]} != 1 )) || [[ ! -f "${WHEEL_CANDIDATES[1]}" ]]; then
-  echo "Installer error: expected exactly one anime_mpv wheel." >&2
+  echo "Installer error: expected exactly one pudge wheel." >&2
   exit 1
 fi
 WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
@@ -97,34 +127,45 @@ WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 "$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
 "$VENV_DIR/bin/python" -m pip install --force-reinstall --no-deps "$WHEEL_PATH"
 
+if (( MANGA_OCR_WAS_INSTALLED )); then
+  echo "Restoring MangaOCR..."
+  "$VENV_DIR/bin/python" -m pip install --upgrade "manga-ocr>=0.1.14,<1"
+  "$VENV_DIR/bin/python" - <<'PYMANGANEW'
+import importlib.util
+
+if importlib.util.find_spec("manga_ocr") is None:
+    raise SystemExit("Installer error: MangaOCR was present before update but could not be restored.")
+PYMANGANEW
+fi
+
 # Fail before touching the app bundle if the packaged Python modules are absent
 # or the installed code does not match the bundled wheel. Derive the expected
 # version from the wheel name so release bumps cannot leave a stale constant.
 WHEEL_NAME="${WHEEL_PATH:t}"
-EXPECTED_VERSION="${WHEEL_NAME#anime_mpv-}"
+EXPECTED_VERSION="${WHEEL_NAME#pudge-}"
 EXPECTED_VERSION="${EXPECTED_VERSION%%-*}"
 EXPECTED_VERSION="$EXPECTED_VERSION" "$VENV_DIR/bin/python" - <<'PYVERIFY'
 import os
 from importlib.metadata import version as distribution_version
 
-from anime_mpv.config import load_config
-from anime_mpv import __version__
+from pudge.config import load_config
+from pudge import __version__
 
 expected = os.environ["EXPECTED_VERSION"]
-installed = distribution_version("anime-mpv")
+installed = distribution_version("pudge")
 assert installed == expected, (installed, expected)
 assert __version__ == expected, (__version__, expected)
 assert callable(load_config)
 PYVERIFY
-ln -sfn "$VENV_DIR/bin/anime-mpv" "$BIN_DIR/$APP_CLI"
-ln -sfn "$VENV_DIR/bin/anime-mpv-agent" "$BIN_DIR/$APP_AGENT_CLI"
+ln -sfn "$VENV_DIR/bin/pudge" "$BIN_DIR/$APP_CLI"
+ln -sfn "$VENV_DIR/bin/pudge-agent" "$BIN_DIR/$APP_AGENT_CLI"
 for legacy_cli in "${LEGACY_CLIS[@]}"; do
   [[ -z "$legacy_cli" || "$legacy_cli" == "$APP_CLI" ]] && continue
-  ln -sfn "$VENV_DIR/bin/anime-mpv" "$BIN_DIR/$legacy_cli"
+  ln -sfn "$VENV_DIR/bin/pudge" "$BIN_DIR/$legacy_cli"
 done
 for legacy_cli in "${LEGACY_AGENT_CLIS[@]}"; do
   [[ -z "$legacy_cli" || "$legacy_cli" == "$APP_AGENT_CLI" ]] && continue
-  ln -sfn "$VENV_DIR/bin/anime-mpv-agent" "$BIN_DIR/$legacy_cli"
+  ln -sfn "$VENV_DIR/bin/pudge-agent" "$BIN_DIR/$legacy_cli"
 done
 
 if [[ ! -f "$CONFIG_PATH" ]]; then
@@ -142,7 +183,7 @@ MPV_BIN="$MPV_BIN" FFMPEG_BIN="$FFMPEG_BIN" FFPROBE_BIN="$FFPROBE_BIN" ALASS_BIN
   "$VENV_DIR/bin/python" - <<'PYCONFIG'
 import os
 from pathlib import Path
-from anime_mpv.config import load_config, write_config
+from pudge.config import load_config, write_config
 
 path = Path(os.environ["CONFIG_PATH"])
 config = load_config(path)
@@ -150,7 +191,8 @@ config.tools.mpv = os.environ["MPV_BIN"]
 config.tools.ffmpeg = os.environ["FFMPEG_BIN"]
 config.tools.ffprobe = os.environ["FFPROBE_BIN"]
 config.tools.alass = os.environ["ALASS_BIN"]
-config.aria2.enabled = True
+# Updating Pudge must not alter the user's torrent-backend choice.
+# aria2 remains installed and available, but enabled/disabled is persisted.
 config.aria2.binary = os.environ["ARIA2_BIN"]
 write_config(config, path)
 PYCONFIG
@@ -161,20 +203,20 @@ fi
 
 # Build a real native app bundle. An AppleScript wrapper launches a detached
 # Homebrew Python process, which macOS labels as "Python" in Dock and Cmd+Tab.
-# PyInstaller gives the Cocoa process an actual Anime MPV bundle/executable.
+# PyInstaller gives the Cocoa process an actual pudge bundle/executable.
 "$VENV_DIR/bin/python" -m pip install --upgrade "pyinstaller>=6.10,<7"
 
 BUILD_DIR="$DATA_DIR/app-build"
 PACKAGE_DIR="$("$VENV_DIR/bin/python" - <<'PYPACKAGE'
 from pathlib import Path
-import anime_mpv
-print(Path(anime_mpv.__file__).resolve().parent)
+import pudge
+print(Path(pudge.__file__).resolve().parent)
 PYPACKAGE
 )"
 ICON_SOURCE="$PACKAGE_DIR/assets/app-icon.png"
 ICONSET="$BUILD_DIR/AnimeMPV.iconset"
 ICNS_PATH="$BUILD_DIR/AnimeMPV.icns"
-APP_ENTRY="$BUILD_DIR/anime_mpv_app.py"
+APP_ENTRY="$BUILD_DIR/pudge_app.py"
 HOOK_DIR="$BUILD_DIR/hooks"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR" "$ICONSET" "$HOOK_DIR"
@@ -218,21 +260,21 @@ entry.write_text(
     "import os\n"
     "import sys\n"
     "from pathlib import Path\n"
-    f"os.environ['ANIME_MPV_PYTHON'] = {python_path!r}\n"
-    f"os.environ['ANIME_MPV_CONFIG'] = {config_path!r}\n"
-    f"os.environ['ANIME_MPV_7ZIP'] = {sevenzip_path!r}\n"
-    f"os.environ['ANIME_MPV_ARIA2C'] = {aria2_path!r}\n"
-    "from anime_mpv.notifications import maybe_handle_notification_helper\n"
+    f"os.environ['PUDGE_PYTHON'] = {python_path!r}\n"
+    f"os.environ['PUDGE_CONFIG'] = {config_path!r}\n"
+    f"os.environ['PUDGE_7ZIP'] = {sevenzip_path!r}\n"
+    f"os.environ['PUDGE_ARIA2C'] = {aria2_path!r}\n"
+    "from pudge.notifications import maybe_handle_notification_helper\n"
     "notification_result = maybe_handle_notification_helper(sys.argv[1:])\n"
     "if notification_result is not None:\n"
     "    raise SystemExit(notification_result)\n"
-    "from anime_mpv.app_ui import launch_app\n"
-    "raise SystemExit(launch_app(Path(os.environ['ANIME_MPV_CONFIG'])))\n",
+    "from pudge.app_ui import launch_app\n"
+    "raise SystemExit(launch_app(Path(os.environ['PUDGE_CONFIG'])))\n",
     encoding="utf-8",
 )
 PYAPP
 
-pkill -f "anime_mpv.cli --app" >/dev/null 2>&1 || true
+pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
 for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
   [[ -z "$app_name" ]] && continue
   pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
@@ -266,7 +308,7 @@ PYINSTALLER_ARGS=(
   --distpath "$BUILD_DIR/dist"
   --workpath "$BUILD_DIR/work"
   --specpath "$BUILD_DIR/spec"
-  --collect-all anime_mpv
+  --collect-all pudge
   --collect-all webview
   --hidden-import webview.platforms.cocoa
   --hidden-import UserNotifications
@@ -323,7 +365,7 @@ cat > "$AGENT_PLIST" <<PLIST
   <array>
     <string>$VENV_DIR/bin/python</string>
     <string>-m</string>
-    <string>anime_mpv.agent</string>
+    <string>pudge.agent</string>
     <string>--scheduled</string>
     <string>--config</string>
     <string>$CONFIG_PATH</string>
@@ -336,9 +378,9 @@ cat > "$AGENT_PLIST" <<PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$BIN_DIR</string>
-    <key>ANIME_MPV_7ZIP</key><string>$SEVENZIP_BIN</string>
-    <key>ANIME_MPV_ARIA2C</key><string>$ARIA2_BIN</string>
-    <key>ANIME_MPV_NOTIFICATION_HELPER</key><string>$APP_PATH/Contents/MacOS/$APP_NAME</string>
+    <key>PUDGE_7ZIP</key><string>$SEVENZIP_BIN</string>
+    <key>PUDGE_ARIA2C</key><string>$ARIA2_BIN</string>
+    <key>PUDGE_NOTIFICATION_HELPER</key><string>$APP_PATH/Contents/MacOS/$APP_NAME</string>
   </dict>
 </dict>
 </plist>

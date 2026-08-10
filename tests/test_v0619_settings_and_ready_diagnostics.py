@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 def web_html() -> str:
-    return (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    return (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
 
 
 def test_settings_render_before_experimental_pages_and_have_error_boundary() -> None:

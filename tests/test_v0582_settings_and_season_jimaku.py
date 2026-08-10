@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.cli import _find_online_subtitles
-from anime_mpv.config import AppConfig
-from anime_mpv.models import AniListAnime, JimakuEntry, VideoIdentity
+from pudge.cli import _find_online_subtitles
+from pudge.config import AppConfig
+from pudge.models import AniListAnime, JimakuEntry, VideoIdentity
 
 
 def test_settings_renderer_declares_payload_before_reading_version() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     start = html.index("function renderSettings(){")
     end = html.index("function fillSettings", start)
     function = html[start:end]
@@ -59,7 +59,7 @@ def test_explicit_season_keeps_exact_anilist_jimaku_entry(tmp_path: Path, monkey
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient", FakeJimaku)
+    monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
     anime = AniListAnime(
         id=200637,
         titles=[

@@ -5,13 +5,13 @@ from pathlib import Path
 
 import httpx
 
-from anime_mpv import __version__, cli
-from anime_mpv.anilist_tracking import TrackingPayload, create_tracking_file
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.providers.anilist import AniListClient
-from anime_mpv.web_app import WebAppApi
+from pudge import __version__, cli
+from pudge.anilist_tracking import TrackingPayload, create_tracking_file
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.providers.anilist import AniListClient
+from pudge.web_app import WebAppApi
 
 
 def _client(handler) -> AniListClient:
@@ -128,8 +128,8 @@ def test_version_is_exposed_in_regular_and_advanced_settings(tmp_path: Path) -> 
     api = WebAppApi(tmp_path / "config.toml")
     assert api._settings_payload()["version"] == __version__
 
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
-    advanced = Path("anime_mpv/settings_ui.py").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
+    advanced = Path("pudge/settings_ui.py").read_text(encoding="utf-8")
     assert "${t('settings.version')}: ${escapeHtml(s.version||'—')}" in html
     assert 'text=f"Версия: {__version__}"' in advanced
 

@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from anime_mpv import cli
-from anime_mpv.config import AppConfig
-from anime_mpv.models import AniListAnime, VideoIdentity
+from pudge import cli
+from pudge.config import AppConfig
+from pudge.models import AniListAnime, VideoIdentity
 
 
 def _anime(*, episodes: int | None, media_format: str) -> AniListAnime:
@@ -27,8 +27,8 @@ def test_multi_entry_special_without_filename_episode_remains_ambiguous() -> Non
 
 
 def test_mpv_tracker_uses_ui_language_and_defaults_to_english() -> None:
-    source = Path("anime_mpv/mpv_scripts/anime_mpv_anilist.lua").read_text(encoding="utf-8")
-    assert "ANIME_MPV_UI_LANGUAGE" in source
+    source = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
+    assert "PUDGE_UI_LANGUAGE" in source
     assert "or 'en'" in source
     assert "AniList: tracking is unavailable for this file" in source
     assert "AniList: трекер недоступен для этого файла" in source

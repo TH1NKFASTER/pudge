@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import NyaaRelease
-from anime_mpv.providers.aria2 import Aria2Client
+from pudge.config import AppConfig, load_config, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import NyaaRelease
+from pudge.providers.aria2 import Aria2Client
 
 
 def release() -> NyaaRelease:
@@ -97,7 +97,7 @@ def test_aria2_add_and_list_preserves_anime_metadata(tmp_path: Path, monkeypatch
     client.add_release(
         release(),
         save_path=tmp_path / "downloads",
-        category="anime-mpv",
+        category="pudge",
         tags=["anime: Example", "anilist: 123", "episode: 1", "score: 96"],
     )
     items = client.torrents()
@@ -145,12 +145,12 @@ def test_aria2_delete_removes_owned_metadata(tmp_path: Path, monkeypatch) -> Non
 
 def test_release_contains_aria2_ui_and_installer() -> None:
     root = Path(__file__).resolve().parents[1]
-    html = (root / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     installer = (root / "install.sh").read_text(encoding="utf-8")
     assert "s_aria2_enabled" in html
     assert "pywebview.api.test_aria2" in html
     assert "brew --prefix aria2" in installer
-    assert "ANIME_MPV_ARIA2C" in installer
+    assert "PUDGE_ARIA2C" in installer
 
 
 def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, monkeypatch) -> None:
@@ -210,7 +210,7 @@ def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, mo
 
 def test_first_experience_explains_qbittorrent_is_optional() -> None:
     root = Path(__file__).resolve().parents[1]
-    html = (root / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "автоматические загрузки выполнит управляемый aria2c" in html
     assert "с меньшим набором функций" in html
     assert "Torrent: ${d.qbt_enabled?'qBittorrent':'aria2'}" in html

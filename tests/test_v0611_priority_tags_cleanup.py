@@ -5,11 +5,11 @@ from pathlib import Path
 
 import httpx
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
-from anime_mpv.providers.qbittorrent import QBittorrentClient
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.manager import AnimeManager
+from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from pudge.providers.qbittorrent import QBittorrentClient
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -43,7 +43,7 @@ def test_completed_download_queues_high_priority_job(tmp_path: Path, monkeypatch
     video = manager.config.library.root_dir / "Koukaku - 05.mkv"
     video.write_bytes(b"video")
     monkeypatch.setattr(
-        "anime_mpv.manager.japanese_subtitle_source",
+        "pudge.manager.japanese_subtitle_source",
         lambda *args, **kwargs: ("none", None),
     )
 

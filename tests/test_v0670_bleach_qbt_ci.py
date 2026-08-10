@@ -1,14 +1,14 @@
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryEpisode
-from anime_mpv.pipeline_cache import (
+from pudge.config import AppConfig, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode
+from pudge.pipeline_cache import (
     final_pipeline_cache_available,
     save_final_pipeline_result,
 )
-from anime_mpv.subtitle_formats import clean_srt_for_playback
-from anime_mpv.web_app import WebAppApi
+from pudge.subtitle_formats import clean_srt_for_playback
+from pudge.web_app import WebAppApi
 
 
 def _srt(text: str = "日本語") -> str:
@@ -123,7 +123,7 @@ def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(
 
 
 def test_random_score_wheel_explanation_is_removed() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "The wheel chooses one score; middle values have larger sectors." not in html
     assert "Колесо выбирает одну оценку; у средних значений сектора больше." not in html
     assert "const introHtml=intro?" in html

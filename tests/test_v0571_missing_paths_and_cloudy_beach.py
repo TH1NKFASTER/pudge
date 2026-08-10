@@ -4,13 +4,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from anime_mpv.cli import _find_online_subtitles
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
-from anime_mpv.providers.jimaku import JimakuClient
-from anime_mpv.web_app import WebAppApi
+from pudge.cli import _find_online_subtitles
+from pudge.config import AppConfig, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
+from pudge.providers.jimaku import JimakuClient
+from pudge.web_app import WebAppApi
 
 
 def config_for(tmp_path: Path) -> AppConfig:
@@ -176,8 +176,8 @@ def test_cloudy_beach_exact_title_overrides_conflicting_parent_anilist_entry(
             )
         ]
 
-    monkeypatch.setattr("anime_mpv.cli.JimakuClient", FakeJimaku)
-    monkeypatch.setattr("anime_mpv.cli.materialize_jimaku_files", fake_materialize)
+    monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
+    monkeypatch.setattr("pudge.cli.materialize_jimaku_files", fake_materialize)
 
     stale_parent_hint = AniListAnime(
         id=180746,

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 
-HTML = Path('anime_mpv/web/index.html').read_text(encoding='utf-8')
+HTML = Path('pudge/web/index.html').read_text(encoding='utf-8')
 
 
 def test_startup_poll_does_not_rebuild_watching_when_home_is_unchanged() -> None:

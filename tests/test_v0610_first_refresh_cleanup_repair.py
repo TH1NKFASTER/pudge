@@ -7,12 +7,12 @@ from types import SimpleNamespace
 
 import httpx
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.providers.qbittorrent import QBittorrentClient
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.providers.qbittorrent import QBittorrentClient
+from pudge.web_app import WebAppApi
 
 
 def test_qbittorrent_start_uses_modern_endpoint() -> None:
@@ -198,7 +198,7 @@ def test_cleanup_repairs_and_deletes_overdue_episode(tmp_path: Path) -> None:
 
 
 def test_filename_uses_season_and_title_from_parent_directories(tmp_path: Path) -> None:
-    from anime_mpv.filename import parse_anime_filename
+    from pudge.filename import parse_anime_filename
 
     video = tmp_path / "Otomege Sekai wa Mob ni Kibishii Sekai desu" / "Season 02" / "Episode 05.mkv"
     identity = parse_anime_filename(video)
@@ -209,7 +209,7 @@ def test_filename_uses_season_and_title_from_parent_directories(tmp_path: Path) 
 
 
 def test_library_uses_anilist_sidecar_before_fuzzy_title_matching(tmp_path: Path) -> None:
-    from anime_mpv.library import scan_library
+    from pudge.library import scan_library
 
     db = Database(tmp_path / "library.sqlite3")
     db.upsert_anime(LibraryAnime(media_id=159309, title="Otomege season two"))

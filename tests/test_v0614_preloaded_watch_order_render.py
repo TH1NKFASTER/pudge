@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from anime_mpv.database import Database
+from pudge.database import Database
 
 
 def test_relation_graph_cache_returns_one_shared_component(tmp_path: Path) -> None:
@@ -27,7 +27,7 @@ def test_relation_graph_cache_returns_one_shared_component(tmp_path: Path) -> No
 
 
 def test_watch_order_renders_cached_graph_before_showing_modal() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
 
@@ -47,7 +47,7 @@ def test_watch_order_renders_cached_graph_before_showing_modal() -> None:
 
 
 def test_uncached_watch_order_does_not_show_empty_modal_before_delay() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
     )
     function = html.split("async function openWatchOrder(mediaId){", 1)[1].split(

@@ -59,7 +59,7 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 ## v0.6.56
 
 - Configurable mpv shortcuts now use key capture; app navigation stays standard/dynamic.
-- Centralized product branding in `anime_mpv/brand.env` with `rename_brand.py`.
+- Centralized product branding in `pudge/brand.env` with `rename_brand.py`.
 - Fixed false local movie matches, relation alternative previews, conditional subtitle-upgrade settings, Library duration, and energy diagnostics scoping.
 
 - Polychrome one-shot animation is 1.5x slower, no longer double-starts, and hover triggering survives card rerenders.

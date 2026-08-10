@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import anime_mpv.syncing as syncing
-from anime_mpv.config import LLMConfig, SyncConfig
-from anime_mpv.llm import OllamaClient
-from anime_mpv.subtitle_formats import parse_srt, write_srt
+import pudge.syncing as syncing
+from pudge.config import LLMConfig, SyncConfig
+from pudge.llm import OllamaClient
+from pudge.subtitle_formats import parse_srt, write_srt
 
 
 class _SemanticAnchorLLM:
@@ -183,14 +183,15 @@ def test_llm_anchor_matcher_preserves_unmatched_english_lyrics(
 
 
 def test_v0676_wires_direct_reference_before_old_piecewise_and_removes_score_copy() -> None:
-    syncing_source = Path("anime_mpv/syncing.py").read_text(encoding="utf-8")
-    web_source = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    syncing_source = Path("pudge/syncing.py").read_text(encoding="utf-8")
+    web_source = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
     direct = syncing_source.index("_repair_with_embedded_reference_dialogue_anchors(")
     fallback = syncing_source.index("_repair_stable_opening_plateaus(", direct)
     assert direct < fallback
     assert "reference-dialogue-anchor-v2" in syncing_source
-    assert "syncing-v0.3.23:" in syncing_source
+    assert "syncing-v0.3." in syncing_source
+    assert "timeline-monotonic-boundaries" in syncing_source
     assert "modal.randomScoreText" not in web_source
 
 

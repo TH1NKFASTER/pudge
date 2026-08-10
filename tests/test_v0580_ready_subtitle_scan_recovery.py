@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager_models import LibraryEpisode
-from anime_mpv.pipeline_cache import save_final_pipeline_result
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager_models import LibraryEpisode
+from pudge.pipeline_cache import save_final_pipeline_result
 
 
 def test_library_scan_does_not_enqueue_valid_ready_prepared_subtitle(
@@ -33,7 +33,7 @@ def test_library_scan_does_not_enqueue_valid_ready_prepared_subtitle(
     )
 
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: ("none", None, None),
     )
 
@@ -82,7 +82,7 @@ def test_library_scan_restores_reset_row_from_valid_final_pipeline_cache(
     db.queue_subtitle_job(video.resolve(), 128547, 2)
 
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("valid final cache must avoid subtitle reprobe")
         ),
@@ -158,7 +158,7 @@ def test_library_scan_preserves_bitmap_fallback_while_text_job_remains(
     db.queue_subtitle_job(video.resolve(), 1, None)
 
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("valid bitmap fallback must be preserved")
         ),

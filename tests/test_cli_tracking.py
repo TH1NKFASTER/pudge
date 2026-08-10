@@ -1,5 +1,5 @@
-from anime_mpv.cli import _anilist_episode
-from anime_mpv.models import AniListAnime, VideoIdentity
+from pudge.cli import _anilist_episode
+from pudge.models import AniListAnime, VideoIdentity
 
 
 def _anime(*, episodes=12, format="TV"):

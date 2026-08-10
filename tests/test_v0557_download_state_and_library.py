@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager import AnimeManager
+from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
+from pudge.web_app import WebAppApi
 
 
 ROOT = Path(__file__).parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:

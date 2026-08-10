@@ -1,4 +1,4 @@
-from anime_mpv.syncing import subtitle_quality_accepted
+from pudge.syncing import subtitle_quality_accepted
 
 
 def test_exact_numbered_jimaku_episode_can_override_noisy_llm_title_card_sample():

@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv.branding import APP_NAME, APP_SLUG, DEFAULT_LIBRARY_DIR, LEGACY_APP_NAMES, LEGACY_APP_SLUGS
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.library import scan_library
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
+from pudge.branding import APP_NAME, APP_SLUG, DEFAULT_LIBRARY_DIR, LEGACY_APP_NAMES, LEGACY_APP_SLUGS
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.library import scan_library
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 from brand_migration import migrate_paths, rewrite_config
 
 ROOT = Path(__file__).parents[1]
@@ -98,7 +98,7 @@ def test_managed_library_detaches_false_match_even_with_stale_torrent_hash(monke
             torrent_hash="deadbeef",
         )
     )
-    monkeypatch.setattr("anime_mpv.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
+    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
 
     rows = scan_library(root, db)
     assert len(rows) == 1
@@ -143,8 +143,8 @@ def test_external_library_removes_false_match_with_stale_hash(monkeypatch, tmp_p
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeAniListClient)
-    monkeypatch.setattr("anime_mpv.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeAniListClient)
+    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_a, **_k: ("none", None, None))
 
     manager = AnimeManager(cfg, log=lambda _message: None)
     manager.db.upsert_anime(LibraryAnime(media_id=999, title="Mahoutsukai no Yoru", synonyms=["Mahoyo"]))

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.manager_models import LibraryAnime
-from anime_mpv.providers.anilist import AniListClient
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.manager_models import LibraryAnime
+from pudge.providers.anilist import AniListClient
+from pudge.web_app import WebAppApi
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -191,7 +191,7 @@ def test_anilist_library_caches_nested_relation_metadata(monkeypatch) -> None:
 
 
 def test_planning_ui_has_cover_chain_tooltips_and_context_actions() -> None:
-    html = (Path(__file__).parents[1] / "anime_mpv" / "web" / "index.html").read_text(encoding="utf-8")
+    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "prequel_levels" in html
     assert "sequel_levels" in html
     assert "relation-node-cover" in html

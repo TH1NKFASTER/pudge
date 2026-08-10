@@ -5,10 +5,10 @@ import json
 import time
 from pathlib import Path
 
-from anime_mpv.config import AppConfig
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryEpisode
-from anime_mpv.providers.jimaku import JimakuClient
+from pudge.config import AppConfig
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode
+from pudge.providers.jimaku import JimakuClient
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -113,7 +113,7 @@ def test_scan_ensures_missing_local_subtitle_job_without_resetting_backoff(
     video = manager.config.library.root_dir / "Mushoku Tensei III - 06.mkv"
     video.write_bytes(b"video")
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_args, **_kwargs: ("none", None, None),
     )
 

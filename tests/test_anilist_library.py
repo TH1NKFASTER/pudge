@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from anime_mpv.providers.anilist import AniListClient
+from pudge.providers.anilist import AniListClient
 
 
 def test_anilist_library_parses_current_and_planning(monkeypatch) -> None:
@@ -71,7 +71,7 @@ def test_episode_airing_at_uses_exact_schedule_query(monkeypatch) -> None:
 
 
 def test_library_maps_episode_duration(monkeypatch) -> None:
-    from anime_mpv.providers.anilist import AniListClient
+    from pudge.providers.anilist import AniListClient
 
     client = AniListClient("https://example.invalid")
     responses = iter(

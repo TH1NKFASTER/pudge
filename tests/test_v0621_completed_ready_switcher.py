@@ -5,7 +5,7 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-HTML = ROOT / "anime_mpv" / "web" / "index.html"
+HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def _function(source: str, name: str) -> str:

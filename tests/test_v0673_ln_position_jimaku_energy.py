@@ -6,11 +6,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from anime_mpv.config import AppConfig
-from anime_mpv.database import Database
-from anime_mpv.light_novels import LightNovelService
-from anime_mpv.manager import _subtitle_retry_is_network_error, _subtitle_retry_is_rate_limit
-from anime_mpv.providers.jimaku import JimakuClient, JimakuError
+from pudge.config import AppConfig
+from pudge.database import Database
+from pudge.light_novels import LightNovelService
+from pudge.manager import _subtitle_retry_is_network_error, _subtitle_retry_is_rate_limit
+from pudge.providers.jimaku import JimakuClient, JimakuError
 
 
 def _cfg(tmp_path: Path) -> AppConfig:
@@ -23,7 +23,7 @@ def _cfg(tmp_path: Path) -> AppConfig:
 
 
 def test_v0673_ln_reader_width_state_and_position_frontend() -> None:
-    html = Path("anime_mpv/web/index.html").read_text(encoding="utf-8")
+    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert 'id="lnrWidth" type="number" min="360" max="2400"' in html
     assert "calc((100vw - 900px)/2)" not in html
     assert "function lnStudyStateLabel" in html
@@ -117,7 +117,7 @@ def test_v0673_defer_does_not_increment_attempts(tmp_path: Path) -> None:
 
 
 def test_v0673_energy_throttle_and_handoff_are_present() -> None:
-    manager = Path("anime_mpv/manager.py").read_text(encoding="utf-8")
+    manager = Path("pudge/manager.py").read_text(encoding="utf-8")
     assert "migration_budget = 0 if has_regular_jobs else 1" in manager
     assert "reason=energy_throttle" in manager
     assert not Path("docs/LLM_HANDOFF.md").exists()

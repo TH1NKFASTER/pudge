@@ -6,10 +6,10 @@ import time
 import zipfile
 from pathlib import Path
 
-from anime_mpv.backup import create_backup, restore_backup
-from anime_mpv.config import AppConfig, load_config, write_config
-from anime_mpv.database import Database
-from anime_mpv.manager import AnimeManager
+from pudge.backup import create_backup, restore_backup
+from pudge.config import AppConfig, load_config, write_config
+from pudge.database import Database
+from pudge.manager import AnimeManager
 
 
 def _insert_anime_and_episode(
@@ -241,7 +241,7 @@ def test_upgrade_settings_round_trip(tmp_path: Path) -> None:
 def test_web_ui_exposes_selected_competitor_features() -> None:
     source = (
         Path(__file__).resolve().parents[1]
-        / "anime_mpv"
+        / "pudge"
         / "web"
         / "index.html"
     ).read_text(encoding="utf-8")

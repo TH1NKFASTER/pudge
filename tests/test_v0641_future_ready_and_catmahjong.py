@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from anime_mpv.config import AppConfig, write_config
-from anime_mpv.filename import title_similarity
-from anime_mpv.library import scan_library
-from anime_mpv.manager import AnimeManager
-from anime_mpv.manager_models import LibraryAnime, LibraryEpisode
-from anime_mpv.web_app import WebAppApi
+from pudge.config import AppConfig, write_config
+from pudge.filename import title_similarity
+from pudge.library import scan_library
+from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryAnime, LibraryEpisode
+from pudge.web_app import WebAppApi
 
 
 def test_catmahjong_explains_old_mahoyo_false_positive_but_external_scan_rejects_it(monkeypatch, tmp_path: Path):
@@ -22,7 +22,7 @@ def test_catmahjong_explains_old_mahoyo_false_positive_but_external_scan_rejects
     video = root / "catmahjong.mp4"
     video.write_bytes(b"video")
 
-    from anime_mpv.database import Database
+    from pudge.database import Database
 
     db = Database(tmp_path / "library.sqlite3")
     db.upsert_anime(
@@ -35,7 +35,7 @@ def test_catmahjong_explains_old_mahoyo_false_positive_but_external_scan_rejects
         )
     )
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
@@ -86,9 +86,9 @@ def test_scan_revalidates_and_removes_old_ready_false_match(monkeypatch, tmp_pat
         def close(self):
             pass
 
-    monkeypatch.setattr("anime_mpv.manager.AniListClient", FakeAniListClient)
+    monkeypatch.setattr("pudge.manager.AniListClient", FakeAniListClient)
     monkeypatch.setattr(
-        "anime_mpv.library.japanese_subtitle_details",
+        "pudge.library.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
     )
 
