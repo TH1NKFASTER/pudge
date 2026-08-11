@@ -85,7 +85,7 @@ def test_ui_moves_ln_settings_and_reorders_navigation():
     render_ln = html[html.index("function renderLightNovels()") : html.index("function lnVocabMap")]
     assert "s_ln_jiten_key" not in render_ln
     assert "Light Novel settings" not in render_ln
-    assert "light_novel_search_anilist" in html
+    assert "media_identity_search" in html
     assert "plannedItems()" in html and "ui.lnState?.planning" in html
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from . import __version__
 from .branding import APP_NAME
 from .config import AppConfig, load_config, write_config
+from .jimaku_trial import apply_jimaku_trial
 from .llm import list_models
 from .providers.anilist import AniListClient, AniListError
 from .tk_utils import SmoothScrollController, enable_edit_shortcuts
@@ -193,7 +194,7 @@ def launch_settings(config_path: Path) -> int:
         foreground="#666666",
     ).grid(row=16, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-    jimaku_key_var = tk.StringVar(value=config.jimaku.api_key)
+    jimaku_key_var = tk.StringVar(value=config.jimaku.personal_api_key)
     jimaku_url_var = tk.StringVar(value=config.jimaku.base_url)
     anilist_enabled_var = tk.BooleanVar(value=config.anilist.enabled)
     anilist_url_var = tk.StringVar(value=config.anilist.endpoint)
@@ -493,8 +494,10 @@ def launch_settings(config_path: Path) -> int:
             if not 0 <= config.llm.embedded_reference_min_similarity <= 1:
                 raise ValueError("Минимальное смысловое сходство должно быть от 0 до 1")
 
-            config.jimaku.api_key = jimaku_key_var.get().strip()
+            config.jimaku.personal_api_key = jimaku_key_var.get().strip()
+            config.jimaku.api_key = config.jimaku.personal_api_key
             config.jimaku.base_url = jimaku_url_var.get().strip().rstrip("/")
+            apply_jimaku_trial(config)
             config.anilist.enabled = bool(anilist_enabled_var.get())
             config.anilist.endpoint = anilist_url_var.get().strip()
             config.anilist.client_id = anilist_client_id_var.get().strip()

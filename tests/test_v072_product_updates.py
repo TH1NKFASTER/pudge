@@ -125,6 +125,30 @@ def test_development_update_reinstalls_an_uninstalled_source_revision(
     )
     assert result["available"] is True
     assert result["source_revision"] == "new-revision"
+    assert result["remote_revision"] == "new-revision"
+
+
+def test_development_install_merges_the_checked_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    updater = AppUpdater()
+    launched: list[tuple[Path, list[str]]] = []
+    monkeypatch.setattr(
+        updater,
+        "_development_status",
+        lambda _source: {
+            "available": True,
+            "blocked": False,
+            "branch": "main",
+            "source_revision": "a" * 40,
+            "remote_revision": "b" * 40,
+        },
+    )
+    monkeypatch.setattr(updater, "_launch_script", lambda path, command: launched.append((path, command)))
+    updater._development_worker({"source_path": str(tmp_path), "channel": "development"})
+    assert launched == [
+        (tmp_path.resolve(), ["git", "-C", str(tmp_path.resolve()), "merge", "--ff-only", "b" * 40])
+    ]
 
 
 def test_release_archive_rejects_path_traversal(tmp_path: Path) -> None:

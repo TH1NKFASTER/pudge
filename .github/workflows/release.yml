@@ -61,7 +61,11 @@ jobs:
         run: python -m pip install --upgrade pip setuptools wheel
 
       - name: Build release archive
-        run: SKIP_TESTS=1 ./build_release.sh
+        env:
+          PUDGE_TRIAL_JIMAKU_API_KEY: ${{ secrets.PUDGE_TRIAL_JIMAKU_API_KEY }}
+        run: |
+          test -n "$PUDGE_TRIAL_JIMAKU_API_KEY"
+          SKIP_TESTS=1 ./build_release.sh
 
       - name: Locate archive
         id: archive

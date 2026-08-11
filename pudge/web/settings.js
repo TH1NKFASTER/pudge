@@ -9,14 +9,14 @@
     if (has('s_subtitle_folders', 's_ocr_image_subtitles')) return 'subtitles';
     if (has('s_qbt_enabled', 's_aria2_enabled', 's_nyaa_enabled')) return 'downloads';
     if (has('s_ln_jiten_key', 'mangaOcrStatus', 'installMangaOcr')) return 'reading';
-    if (has('s_playback_enabled')) return 'playback';
+    if (has('s_playback_enabled')) return 'advanced';
     if (has('s_agent_enabled')) return 'advanced';
     return 'advanced';
   };
 
   const labels = {
-    en: {essential: 'Essential', library: 'Library', subtitles: 'Subtitles', downloads: 'Downloads', reading: 'Reading', playback: 'Playback', advanced: 'Advanced'},
-    ru: {essential: 'Основное', library: 'Библиотека', subtitles: 'Субтитры', downloads: 'Загрузки', reading: 'Чтение', playback: 'Просмотр', advanced: 'Дополнительно'},
+    en: {essential: 'Essential', library: 'Library', subtitles: 'Subtitles', downloads: 'Downloads', reading: 'Reading', advanced: 'Advanced'},
+    ru: {essential: 'Основное', library: 'Библиотека', subtitles: 'Субтитры', downloads: 'Загрузки', reading: 'Чтение', advanced: 'Дополнительно'},
   };
 
   let active = 'essential';

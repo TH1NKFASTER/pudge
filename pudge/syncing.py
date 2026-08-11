@@ -39,7 +39,8 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.36-timeline-monotonic-boundaries:{tag}:{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
+        f"syncing-v0.3.37-timeline-monotonic-boundaries-sparse-cold-open:{tag}:"
+        f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
         f"{config.skip_on_low_quality}:{config.vad}:{config.fix_framerate}:{config.gss}:"
@@ -2894,6 +2895,8 @@ def _repair_stable_opening_plateaus(
 def _reference_repair_engine_suffix(result: dict[str, object]) -> str:
     if str(result.get("strategy") or "") == "embedded_reference_dialogue_anchors":
         return "+reference-dialogue-anchors"
+    if str(result.get("strategy") or "") == "sparse_cold_open":
+        return "+sparse-cold-open"
     return "+reference-piecewise"
 
 
@@ -3743,6 +3746,218 @@ def _repair_with_embedded_reference_dialogue_anchors(
 
 
 
+def _repair_sparse_cold_open(
+    aligned: Path,
+    reference: Path,
+    candidate_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    cache_dir: Path,
+    *,
+    force: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    """Repair a short spoken prologue before a long non-dialogue opening.
+
+    Broadcast captions can keep music/SFX cues throughout an opening while the
+    embedded translation stays empty. Broad activity windows then hide a local
+    prologue clock. Match a compact onset fingerprint, require the first main
+    dialogue to already be aligned, and move the whole pre-main block rigidly.
+    """
+    candidate_dialogue = [
+        (index, cue)
+        for index, cue in enumerate(candidate_cues)
+        if not _is_reference_non_dialogue(cue[2])
+    ]
+    reference_dialogue = [
+        (index, cue)
+        for index, cue in enumerate(reference_cues)
+        if not _is_reference_non_dialogue(cue[2])
+    ]
+    diagnostics: dict[str, object] = {
+        "applied": False,
+        "reason": "sparse_cold_open_not_applicable",
+    }
+    if len(candidate_dialogue) < 4 or len(reference_dialogue) < 4:
+        diagnostics["reason"] = "sparse_cold_open_too_few_dialogue_cues"
+        return aligned, diagnostics
+
+    split: int | None = None
+    for position in range(3, min(7, len(candidate_dialogue))):
+        _left_index, left = candidate_dialogue[position - 1]
+        _right_index, right = candidate_dialogue[position]
+        if (
+            candidate_dialogue[0][1][0] <= 45.0
+            and left[1] <= 90.0
+            and right[0] - left[1] >= 45.0
+            and right[0] <= 240.0
+        ):
+            split = position
+            break
+    if split is None:
+        diagnostics["reason"] = "sparse_cold_open_dialogue_gap_not_found"
+        return aligned, diagnostics
+
+    cold_dialogue = candidate_dialogue[:split]
+    next_dialogue_index, next_dialogue = candidate_dialogue[split]
+    post_error = min(
+        abs(float(cue[0]) - float(next_dialogue[0]))
+        for _index, cue in reference_dialogue
+    )
+    diagnostics.update(
+        {
+            "cold_dialogue_cues": len(cold_dialogue),
+            "cold_block_cues": next_dialogue_index,
+            "next_dialogue_start": round(float(next_dialogue[0]), 3),
+            "post_opening_error_seconds": round(post_error, 4),
+        }
+    )
+    if post_error > 0.90:
+        diagnostics["reason"] = "sparse_cold_open_post_dialogue_not_stable"
+        return aligned, diagnostics
+
+    reference_limit = float(next_dialogue[0]) - 20.0
+    eligible_reference = [
+        cue for _index, cue in reference_dialogue if float(cue[1]) <= reference_limit
+    ]
+    count = len(cold_dialogue)
+    if len(eligible_reference) < count:
+        diagnostics["reason"] = "sparse_cold_open_reference_block_missing"
+        return aligned, diagnostics
+
+    source_starts = [float(cue[0]) for _index, cue in cold_dialogue]
+    source_ends = [float(cue[1]) for _index, cue in cold_dialogue]
+    candidates: list[dict[str, object]] = []
+    for start_index in range(len(eligible_reference) - count + 1):
+        block = eligible_reference[start_index : start_index + count]
+        reference_starts = [float(cue[0]) for cue in block]
+        reference_ends = [float(cue[1]) for cue in block]
+        offsets = [
+            reference_time - source_time
+            for source_time, reference_time in zip(source_starts, reference_starts)
+        ]
+        offsets.extend(
+            reference_time - source_time
+            for source_time, reference_time in zip(source_ends, reference_ends)
+        )
+        correction = float(statistics.median(offsets))
+        dispersion = max(abs(value - correction) for value in offsets)
+        relative_errors = [
+            abs(
+                (reference_starts[index] - reference_starts[0])
+                - (source_starts[index] - source_starts[0])
+            )
+            for index in range(1, count)
+        ]
+        fingerprint_error = statistics.fmean(relative_errors)
+        candidates.append(
+            {
+                "block": block,
+                "reference_start": reference_starts[0],
+                "correction": correction,
+                "dispersion": dispersion,
+                "fingerprint_error": fingerprint_error,
+                "score": dispersion + fingerprint_error,
+            }
+        )
+
+    candidates.sort(key=lambda item: float(item["score"]))
+    best = candidates[0]
+    best_block = best["block"]
+    assert isinstance(best_block, list)
+    best_reference_starts = [float(cue[0]) for cue in best_block]
+    correction = float(best["correction"])
+    dispersion = float(best["dispersion"])
+    fingerprint_error = float(best["fingerprint_error"])
+    runner_up_margin = (
+        float(candidates[1]["score"]) - float(best["score"])
+        if len(candidates) > 1
+        else None
+    )
+    before_error = statistics.fmean(
+        abs(reference_time - source_time)
+        for source_time, reference_time in zip(source_starts, best_reference_starts)
+    )
+    after_error = statistics.fmean(
+        abs(reference_time - (source_time + correction))
+        for source_time, reference_time in zip(source_starts, best_reference_starts)
+    )
+    diagnostics.update(
+        {
+            "reference_start": round(float(best["reference_start"]), 3),
+            "correction_seconds": round(correction, 4),
+            "offset_dispersion_seconds": round(dispersion, 4),
+            "gap_fingerprint_error_seconds": round(fingerprint_error, 4),
+            "runner_up_margin": (
+                round(runner_up_margin, 4) if runner_up_margin is not None else None
+            ),
+            "onset_mae_before_seconds": round(before_error, 4),
+            "onset_mae_after_seconds": round(after_error, 4),
+        }
+    )
+    if not 2.5 <= abs(correction) <= 20.0:
+        diagnostics["reason"] = "sparse_cold_open_correction_out_of_range"
+        return aligned, diagnostics
+    if dispersion > 0.80 or fingerprint_error > 0.80:
+        diagnostics["reason"] = "sparse_cold_open_fingerprint_unstable"
+        return aligned, diagnostics
+    if runner_up_margin is not None and runner_up_margin < 0.75:
+        diagnostics["reason"] = "sparse_cold_open_fingerprint_ambiguous"
+        return aligned, diagnostics
+    if before_error - after_error < 2.0 or after_error > 0.65:
+        diagnostics["reason"] = "sparse_cold_open_does_not_improve"
+        return aligned, diagnostics
+
+    shifted = [
+        (
+            start + correction if index < next_dialogue_index else start,
+            end + correction if index < next_dialogue_index else end,
+            text,
+        )
+        for index, (start, end, text) in enumerate(candidate_cues)
+    ]
+    if any(start < 0.0 or end <= start for start, end, _text in shifted):
+        diagnostics["reason"] = "sparse_cold_open_invalid_timestamps"
+        return aligned, diagnostics
+    if any(
+        shifted[index][0] + 0.001 < shifted[index - 1][0]
+        for index in range(1, len(shifted))
+    ):
+        diagnostics["reason"] = "sparse_cold_open_reorders_cues"
+        return aligned, diagnostics
+    if (
+        next_dialogue_index > 0
+        and shifted[next_dialogue_index - 1][1] > float(next_dialogue[0]) - 0.10
+    ):
+        diagnostics["reason"] = "sparse_cold_open_overlaps_main_dialogue"
+        return aligned, diagnostics
+
+    aligned_stat = aligned.stat()
+    reference_stat = reference.stat()
+    digest = hashlib.sha1(
+        (
+            f"sparse-cold-open-v1:{aligned.resolve()}:{aligned_stat.st_size}:"
+            f"{aligned_stat.st_mtime_ns}:{reference.resolve()}:{reference_stat.st_size}:"
+            f"{reference_stat.st_mtime_ns}:{correction:.6f}:{next_dialogue_index}"
+        ).encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "reference-sparse-cold-open"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+    if force:
+        output.unlink(missing_ok=True)
+    if not output.exists() or output.stat().st_size <= 0:
+        write_srt(shifted, output, preserve_order=True)
+
+    diagnostics.update(
+        {
+            "applied": True,
+            "reason": "sparse_cold_open_fingerprint_improved",
+            "strategy": "sparse_cold_open",
+            "output": str(output),
+        }
+    )
+    return output, diagnostics
+
+
 def repair_with_embedded_reference_piecewise(
     aligned: Path,
     reference: Path,
@@ -3779,6 +3994,17 @@ def repair_with_embedded_reference_piecewise(
     )
     if duration < 180.0:
         return aligned, _result("reference_piecewise_too_short", applied=False)
+
+    sparse_path, sparse_result = _repair_sparse_cold_open(
+        aligned,
+        reference,
+        candidate_cues,
+        reference_cues,
+        cache_dir,
+        force=force,
+    )
+    if sparse_result.get("applied"):
+        return sparse_path, sparse_result
 
     if llm is not None:
         direct_path, direct_result = _repair_with_embedded_reference_dialogue_anchors(

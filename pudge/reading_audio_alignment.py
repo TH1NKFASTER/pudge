@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import bisect
 import unicodedata
-from typing import Any, Iterable
+from collections.abc import Iterable
+from itertools import pairwise
+from typing import Any
 
 
 _IGNORED_CATEGORIES = {"Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps", "Zl", "Zp", "Zs"}
@@ -49,20 +51,26 @@ def _transcript_clock(segments: Iterable[dict[str, Any]]) -> tuple[str, list[flo
     return "".join(text_parts), times
 
 
-def _anchor_chain(novel: str, transcript: str, *, size: int) -> list[tuple[int, int]]:
+def _anchor_chain(
+    novel: str,
+    transcript: str,
+    *,
+    size: int,
+    maximum_occurrences: int = 4,
+) -> list[tuple[int, int]]:
     if len(novel) < size or len(transcript) < size:
         return []
     transcript_index: dict[str, list[int]] = {}
     for index in range(len(transcript) - size + 1):
         key = transcript[index : index + size]
         rows = transcript_index.setdefault(key, [])
-        if len(rows) <= 4:
+        if len(rows) <= maximum_occurrences:
             rows.append(index)
 
     candidates: list[tuple[int, int]] = []
     for novel_index in range(len(novel) - size + 1):
         matches = transcript_index.get(novel[novel_index : novel_index + size]) or []
-        if 0 < len(matches) <= 4:
+        if 0 < len(matches) <= maximum_occurrences:
             candidates.extend((novel_index, transcript_index_) for transcript_index_ in matches)
     if not candidates:
         return []
@@ -91,8 +99,11 @@ def _anchor_chain(novel: str, transcript: str, *, size: int) -> list[tuple[int, 
         cursor = previous[cursor]
     chain.reverse()
 
-    # Dense overlapping n-grams describe the same spoken word. Keep a compact
-    # clock that is still fine-grained enough for word highlighting.
+    # Keep almost every monotonic match.  Older builds kept one point per three
+    # normalized characters.  That was enough to identify a chapter but could
+    # drift visibly inside long sentences and around a chapter transition.
+    # One point per two characters is still small compared with the cached STT
+    # result and gives seeking/highlighting a substantially denser clock.
     compact: list[tuple[int, int]] = []
     for novel_index, transcript_index_ in chain:
         if compact and (
@@ -100,10 +111,135 @@ def _anchor_chain(novel: str, transcript: str, *, size: int) -> list[tuple[int, 
             or transcript_index_ <= compact[-1][1]
         ):
             continue
-        if compact and novel_index - compact[-1][0] < 3:
+        if compact and novel_index - compact[-1][0] < 2:
             continue
         compact.append((novel_index, transcript_index_))
     return compact
+
+
+def _best_dense_anchor_chain(novel: str, transcript: str) -> tuple[int, list[tuple[int, int]]]:
+    """Return the densest reliable monotonic clock shared by LN and STT.
+
+    Longer n-grams establish an unambiguous backbone.  A shorter chain is used
+    only when it agrees with the same broad start/end corridor, which prevents
+    common Japanese particles from creating a plausible but wrong timeline.
+    """
+
+    candidates: list[tuple[int, list[tuple[int, int]]]] = []
+    for size, occurrences in ((11, 8), (9, 6), (7, 4), (5, 3), (4, 2)):
+        chain = _anchor_chain(
+            novel,
+            transcript,
+            size=size,
+            maximum_occurrences=occurrences,
+        )
+        if len(chain) >= 8:
+            candidates.append((size, chain))
+    if not candidates:
+        return 0, []
+
+    backbone_size, backbone = candidates[0]
+    best_size, best = backbone_size, backbone
+    backbone_novel_span = max(1, backbone[-1][0] - backbone[0][0])
+    backbone_audio_span = max(1, backbone[-1][1] - backbone[0][1])
+    for size, chain in candidates[1:]:
+        novel_overlap = min(backbone[-1][0], chain[-1][0]) - max(backbone[0][0], chain[0][0])
+        audio_overlap = min(backbone[-1][1], chain[-1][1]) - max(backbone[0][1], chain[0][1])
+        if novel_overlap < backbone_novel_span * 0.65 or audio_overlap < backbone_audio_span * 0.65:
+            continue
+        if len(chain) > len(best):
+            best_size, best = size, chain
+    return best_size, best
+
+
+def _clip_activity_regions(
+    regions: Iterable[dict[str, Any]],
+    start: float,
+    end: float,
+) -> list[dict[str, float]]:
+    clipped: list[dict[str, float]] = []
+    for row in regions:
+        if not isinstance(row, dict):
+            continue
+        try:
+            region_start = max(float(start), float(row.get("start") or 0.0))
+            region_end = min(float(end), float(row.get("end") or 0.0))
+        except (TypeError, ValueError):
+            continue
+        if region_end - region_start >= 0.015:
+            clipped.append(
+                {"start": round(region_start, 3), "end": round(region_end, 3)}
+            )
+    return clipped
+
+
+def _activity_ratio(
+    regions: Iterable[dict[str, Any]],
+    start: float,
+    end: float,
+    position: float,
+) -> float:
+    """Measure progress in spoken time, holding still through quiet gaps."""
+
+    start = float(start)
+    end = max(start + 0.02, float(end))
+    position = max(start, min(end, float(position)))
+    clipped = _clip_activity_regions(regions, start, end)
+    total = sum(float(row["end"]) - float(row["start"]) for row in clipped)
+    if total < max(0.04, (end - start) * 0.025):
+        return (position - start) / (end - start)
+    elapsed = 0.0
+    for row in clipped:
+        region_start = float(row["start"])
+        region_end = float(row["end"])
+        if position <= region_start:
+            break
+        elapsed += max(0.0, min(position, region_end) - region_start)
+        if position < region_end:
+            break
+    return max(0.0, min(1.0, elapsed / total))
+
+
+def _time_for_activity_ratio(
+    regions: Iterable[dict[str, Any]],
+    start: float,
+    end: float,
+    ratio: float,
+) -> float:
+    start = float(start)
+    end = max(start + 0.02, float(end))
+    ratio = max(0.0, min(1.0, float(ratio)))
+    clipped = _clip_activity_regions(regions, start, end)
+    total = sum(float(row["end"]) - float(row["start"]) for row in clipped)
+    if total < max(0.04, (end - start) * 0.025):
+        return start + ratio * (end - start)
+    remaining = ratio * total
+    for row in clipped:
+        region_start = float(row["start"])
+        length = float(row["end"]) - region_start
+        if remaining < length - 1e-6:
+            return region_start + remaining
+        remaining -= length
+    return float(clipped[-1]["end"])
+
+
+def _acoustic_chapter_boundary(
+    left_time: float,
+    right_time: float,
+    regions: Iterable[dict[str, Any]],
+) -> float:
+    """Prefer the next phrase onset after the longest chapter-sized pause."""
+
+    fallback = (float(left_time) + float(right_time)) / 2
+    clipped = _clip_activity_regions(regions, float(left_time), float(right_time))
+    if len(clipped) < 2:
+        return fallback
+    gaps = [
+        (float(right["start"]) - float(left["end"]), float(right["start"]))
+        for left, right in pairwise(clipped)
+    ]
+    gap, next_onset = max(gaps, default=(0.0, fallback))
+    return next_onset if gap >= 0.18 else fallback
 
 
 def align_light_novel_to_transcript(
@@ -112,6 +248,7 @@ def align_light_novel_to_transcript(
     *,
     duration: float,
     model: str,
+    speech_regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     transcript, transcript_times = _transcript_clock(segments)
     chapter_ranges: list[dict[str, Any]] = []
@@ -137,11 +274,7 @@ def align_light_novel_to_transcript(
     if len(transcript) < 40 or len(novel) < 40:
         raise ValueError("STT produced too little Japanese text for alignment")
 
-    anchor_size = 7
-    anchors = _anchor_chain(novel, transcript, size=anchor_size)
-    if len(anchors) < 8:
-        anchor_size = 5
-        anchors = _anchor_chain(novel, transcript, size=anchor_size)
+    anchor_size, anchors = _best_dense_anchor_chain(novel, transcript)
     if len(anchors) < 8:
         raise ValueError("Not enough matching STT/LN anchors")
 
@@ -195,10 +328,11 @@ def align_light_novel_to_transcript(
     for index, chapter in enumerate(aligned):
         if index:
             previous = aligned[index - 1]
-            boundary = (
-                float(previous["last_anchor_time"])
-                + float(chapter["first_anchor_time"])
-            ) / 2
+            boundary = _acoustic_chapter_boundary(
+                float(previous["last_anchor_time"]),
+                float(chapter["first_anchor_time"]),
+                speech_regions or [],
+            )
             previous["end"] = round(max(float(previous["start"]) + 0.25, boundary), 3)
             chapter["start"] = round(max(0.0, boundary), 3)
         else:
@@ -214,16 +348,22 @@ def align_light_novel_to_transcript(
             *chapter["anchors"],
             {"offset": chapter["normalized_length"], "time": chapter["end"]},
         ]
+        chapter["speech_regions"] = _clip_activity_regions(
+            speech_regions or [],
+            float(chapter["start"]),
+            float(chapter["end"]),
+        )
         for key in ("first_anchor_time", "last_anchor_time", "estimated_start", "estimated_end"):
             chapter.pop(key, None)
 
     return {
-        "schema": "reading-audio-v1",
+        "schema": "reading-audio-v3",
         "model": str(model),
         "duration": round(float(duration), 3),
         "transcript_characters": len(transcript),
         "novel_characters": len(novel),
         "anchor_count": len(anchors),
+        "anchor_size": anchor_size,
         "chapters": aligned,
         "confidence": round(sum(float(row["confidence"]) for row in aligned) / len(aligned), 4),
     }
@@ -244,12 +384,52 @@ def audio_position_for_light_novel(
         return None
     target = max(0.0, min(1.0, float(progress))) * max(1, int(chapter["normalized_length"]))
     anchors = list(chapter.get("anchors") or [])
-    for left, right in zip(anchors, anchors[1:]):
+    speech_regions = list(chapter.get("speech_regions") or [])
+    for left, right in pairwise(anchors):
         left_offset, right_offset = float(left["offset"]), float(right["offset"])
         if target <= right_offset:
             ratio = (target - left_offset) / max(1.0, right_offset - left_offset)
-            return float(left["time"]) + ratio * (float(right["time"]) - float(left["time"]))
+            return _time_for_activity_ratio(
+                speech_regions,
+                float(left["time"]),
+                float(right["time"]),
+                ratio,
+            )
     return float(chapter["end"])
+
+
+def audio_position_for_light_novel_offset(
+    alignment: dict[str, Any], chapter_index: int, character_offset: int
+) -> float | None:
+    """Resolve a normalized LN character offset on the acoustic speech clock."""
+
+    chapter = next(
+        (
+            row
+            for row in alignment.get("chapters") or []
+            if int(row.get("chapter_index") or 0) == int(chapter_index)
+        ),
+        None,
+    )
+    if not isinstance(chapter, dict):
+        return None
+    anchors = [row for row in chapter.get("anchors") or [] if isinstance(row, dict)]
+    if not anchors:
+        return None
+    target = max(0.0, min(float(character_offset), float(chapter.get("normalized_length") or 0)))
+    speech_regions = list(chapter.get("speech_regions") or [])
+    for left, right in pairwise(anchors):
+        left_offset = float(left.get("offset") or 0.0)
+        right_offset = float(right.get("offset") or left_offset)
+        if target <= right_offset:
+            ratio = (target - left_offset) / max(1.0, right_offset - left_offset)
+            return _time_for_activity_ratio(
+                speech_regions,
+                float(left.get("time") or 0.0),
+                float(right.get("time") or 0.0),
+                ratio,
+            )
+    return float(anchors[-1].get("time") or chapter.get("end") or 0.0)
 
 
 def light_novel_position_for_audio(
@@ -272,19 +452,48 @@ def light_novel_position_for_audio(
             ),
         ),
     )
-    anchors = list(chapter.get("anchors") or [])
+    anchors = [row for row in chapter.get("anchors") or [] if isinstance(row, dict)]
+    if not anchors:
+        return None
     target_offset = 0.0
-    for left, right in zip(anchors, anchors[1:]):
+    left_anchor = anchors[0]
+    right_anchor = anchors[0]
+    speech_regions = list(chapter.get("speech_regions") or [])
+    for left, right in pairwise(anchors):
         if float(position) <= float(right["time"]):
-            ratio = (float(position) - float(left["time"])) / max(0.02, float(right["time"]) - float(left["time"]))
+            ratio = _activity_ratio(
+                speech_regions,
+                float(left["time"]),
+                float(right["time"]),
+                float(position),
+            )
             target_offset = float(left["offset"]) + max(0.0, min(1.0, ratio)) * (float(right["offset"]) - float(left["offset"]))
+            left_anchor = left
+            right_anchor = right
             break
     else:
         target_offset = float(chapter["normalized_length"])
+        if len(anchors) > 1:
+            left_anchor, right_anchor = anchors[-2], anchors[-1]
     length = max(1, int(chapter["normalized_length"]))
+    anchor_window: dict[str, Any] = {
+        "left_time": float(left_anchor["time"]),
+        "left_offset": float(left_anchor["offset"]),
+        "right_time": float(right_anchor["time"]),
+        "right_offset": float(right_anchor["offset"]),
+    }
+    window_activity = _clip_activity_regions(
+        speech_regions,
+        float(left_anchor["time"]),
+        float(right_anchor["time"]),
+    )
+    if window_activity:
+        anchor_window["activity"] = window_activity
     return {
         "chapter_index": int(chapter["chapter_index"]),
         "chapter_progress": max(0.0, min(1.0, target_offset / length)),
         "chapter_char_offset": int(round(target_offset)),
+        "chapter_char_offset_exact": round(target_offset, 4),
         "chapter_char_count": length,
+        "anchor_window": anchor_window,
     }

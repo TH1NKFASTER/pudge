@@ -6,6 +6,11 @@
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[ch]));
   const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
+  const STUDY_THEMES = new Set(['balanced','jiten','jpdb','focus','underline','none','custom']);
+  const STUDY_COLORS = {
+    new: '#f3f6fb', learning: '#f4bd63', due: '#ff7d8c',
+    known: '#57d38c', blacklisted: '#7d8795',
+  };
 
   const registry = new Map();
   let tokenSequence = 0;
@@ -41,6 +46,20 @@
     return 'new';
   }
 
+  function applyStudyAppearance(settings = {}, target = document.documentElement) {
+    if (!target?.style) return;
+    const theme = String(settings.word_color_theme || 'balanced').toLowerCase();
+    target.dataset.pudgeStudyTheme = STUDY_THEMES.has(theme) ? theme : 'balanced';
+    for (const [state, fallback] of Object.entries(STUDY_COLORS)) {
+      const value = String(settings[`word_color_${state}`] || fallback);
+      target.style.setProperty(`--pudge-study-${state}`, value);
+    }
+    target.style.setProperty(
+      '--pudge-pitch-color',
+      String(settings.pitch_accent_color || '#9ec5ff')
+    );
+  }
+
   function stateLabel(card = {}) {
     const state = normalizeState(card);
     const labels = ru()
@@ -61,6 +80,147 @@
     }
     out += esc(text.slice(last));
     return out || esc(text);
+  }
+
+  function pitchMorae(reading) {
+    const small = new Set(['ゃ','ゅ','ょ','ャ','ュ','ョ','ァ','ィ','ゥ','ェ','ォ']);
+    const cleaned = String(reading || '').replace(/[^\u3040-\u30ffー]/g, '');
+    const morae = [];
+    for (const character of cleaned) {
+      if (morae.length && small.has(character)) morae[morae.length - 1] += character;
+      else morae.push(character);
+    }
+    return morae;
+  }
+
+  function pitchClass(accent, moraCount) {
+    if (accent === 0) return 'heiban';
+    if (accent === 1 && moraCount > 1) return 'atamadaka';
+    if (accent === moraCount) return 'odaka';
+    return 'nakadaka';
+  }
+
+  function pitchPattern(accent, moraCount) {
+    const values = [];
+    for (let index = 0; index <= moraCount; index += 1) {
+      if (accent === 0) values.push(index > 0);
+      else if (index === 0) values.push(accent === 1);
+      else if (index < moraCount) values.push(index < accent);
+      else values.push(false);
+    }
+    return values;
+  }
+
+  function tokenReading(surface, token = {}, card = {}) {
+    const text = String(surface || '');
+    const tokenStart = Number(token.start || 0);
+    const ranges = [];
+    for (const ruby of Array.isArray(token.rubies) ? token.rubies : []) {
+      const rawStart = Number(ruby?.start);
+      const rawEnd = Number(ruby?.end ?? (rawStart + Number(ruby?.length || 0)));
+      const reading = String(ruby?.text || '').replace(/[^\u3040-\u30ffー]/g, '');
+      const start = rawStart - tokenStart;
+      const end = rawEnd - tokenStart;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || !reading ||
+          start < 0 || end <= start || start >= text.length) continue;
+      ranges.push({start, end: Math.min(text.length, end), reading});
+    }
+    ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+    if (!ranges.length) return String(token.reading || card.reading || '');
+    let position = 0, reading = '';
+    for (const range of ranges) {
+      if (range.start < position) continue;
+      reading += text.slice(position, range.start);
+      reading += range.reading;
+      position = range.end;
+    }
+    reading += text.slice(position);
+    return /[\u3400-\u9fff々〆ヵヶ]/.test(reading)
+      ? String(token.reading || card.reading || '')
+      : reading;
+  }
+
+  function inflectedPitchCard(surface, token = {}, card = {}) {
+    const reading = tokenReading(surface, token, card);
+    const dictionaryReading = String(card.reading || '');
+    const moraCount = pitchMorae(reading).length;
+    const direct = token.pitchAccents || token.pitch_accents;
+    const source = Array.isArray(direct) && direct.length
+      ? direct
+      : (card.pitchAccents || card.pitch_accents || []);
+    const pitchAccents = [...new Set(source.map(value => Number(value))
+      .filter(value => Number.isInteger(value) && value >= 0)
+      .map(value => value === 0 ? 0 : Math.min(value, moraCount)))]
+      .filter(value => value <= moraCount);
+    return {
+      ...card,
+      reading: reading || dictionaryReading,
+      pitchAccents,
+      pitchDerived: Boolean(
+        reading && dictionaryReading &&
+        pitchMorae(reading).join('') !== pitchMorae(dictionaryReading).join('') &&
+        !(Array.isArray(direct) && direct.length)
+      ),
+    };
+  }
+
+  function renderPitchAccent(card = {}) {
+    const morae = pitchMorae(card.reading || '');
+    if (!morae.length) return '';
+    const accents = [...new Set(
+      (card.pitchAccents || card.pitch_accents || [])
+        .map(value => Number(value))
+        .filter(value => Number.isInteger(value) && value >= 0 && value <= morae.length)
+    )];
+    if (!accents.length) return '';
+    const rows = accents.map(accent => {
+      const pattern = pitchPattern(accent, morae.length);
+      const nodes = [...morae, '・'].map((mora, index) => {
+        const high = pattern[index];
+        const next = pattern[index + 1];
+        const transition = index < pattern.length - 1 && high !== next
+          ? (high ? ' drop' : ' rise') : '';
+        const particle = index === morae.length ? ' particle' : '';
+        return `<span class="pudge-pitch-mora ${high ? 'high' : 'low'}${transition}${particle}">${esc(mora)}</span>`;
+      }).join('');
+      const type = pitchClass(accent, morae.length);
+      return `<div class="pudge-pitch-row pitch-${type}" title="${esc(type)}"><span class="pudge-pitch-number">${accent}</span><span class="pudge-pitch-track">${nodes}</span></div>`;
+    }).join('');
+    return `<div class="pudge-study-pitch"><span class="pudge-study-pitch-label">${ru() ? 'Акцент' : 'Pitch accent'}</span>${rows}</div>`;
+  }
+
+  function renderInlinePitch(card = {}) {
+    const morae = pitchMorae(card.reading || '');
+    const accent = (card.pitchAccents || card.pitch_accents || [])
+      .map(value => Number(value))
+      .find(value => Number.isInteger(value) && value >= 0 && value <= morae.length);
+    if (!morae.length || accent === undefined) return '';
+    const pattern = pitchPattern(accent, morae.length);
+    const type = pitchClass(accent, morae.length);
+    const nodes = morae.map((mora, index) => {
+      const high = pattern[index];
+      const next = pattern[index + 1];
+      const transition = high !== next ? (high ? ' drop' : ' rise') : '';
+      return `<span class="pudge-pitch-mora ${high ? 'high' : 'low'}${transition}">${esc(mora)}</span>`;
+    }).join('');
+    const detail = card.pitchDerived
+      ? (ru() ? 'форма: акцент перенесён со словарной формы' : 'inflection: contour derived from dictionary form')
+      : `${type} ${accent}`;
+    return `<span class="pudge-inline-pitch pitch-${type}${card.pitchDerived ? ' pitch-derived' : ''}" title="${esc(detail)}">${nodes}</span>`;
+  }
+
+  function normalizedKana(value) {
+    return String(value || '').normalize('NFKC').replace(/[ァ-ヶ]/g, character =>
+      String.fromCharCode(character.charCodeAt(0) - 0x60)
+    );
+  }
+
+  function renderInlinePitchOnSurface(surface, card = {}) {
+    const text = String(surface || '');
+    const reading = String(card.reading || '');
+    if (!text || !reading || /[^ぁ-ゟ゠-ヿー]/u.test(text)) return '';
+    if (normalizedKana(text) !== normalizedKana(reading)) return '';
+    return renderInlinePitch({...card, reading:text});
   }
 
   function position(el, rect) {
@@ -90,14 +250,24 @@
     return API().light_novel_translate(text, context, targetLanguage, mediaId);
   }
 
-  async function openStudyCard({token, target, backend = 'jiten', sentence = ''}) {
+  async function openStudyCard({token, target, backend = 'jiten', sentence = '', actions = []}) {
     if (!token || !target) return;
     const {card: pop} = ensureUi();
+    // Manga replaces the OCR region DOM when it becomes active. Keep the
+    // original on-screen anchor so the async deck request cannot move the card
+    // to (0, 0) after the clicked word has been detached.
+    const anchorRect = target.getBoundingClientRect();
     const card = token.card || {};
+    const extraActions = new Map(
+      (Array.isArray(actions) ? actions : [])
+        .filter(action => action && action.id && typeof action.run === 'function')
+        .map(action => [String(action.id), action])
+    );
     activeToken = {
       token,
       backend: String(backend || 'jiten'),
       sentence: String(sentence || token.sentence || ''),
+      extraActions,
     };
     const meaningsRaw = card.meanings || card.meaningsChunks || [];
     const meanings = Array.isArray(meaningsRaw) ? meaningsRaw.flat?.() || meaningsRaw : [];
@@ -111,11 +281,12 @@
         <button data-pudge-study-close aria-label="Close">×</button>
       </div>
       <div class="pudge-study-subtle">${esc(status)}${card.frequencyRank ? ` • Frequency #${Number(card.frequencyRank)}` : ''}</div>
-      <div class="pudge-study-meanings">
+      ${renderPitchAccent(card)}
+      <ol class="pudge-study-meanings">
         ${meanings.length
-          ? meanings.slice(0, 8).map(x => `<div>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</div>`).join('')
-          : `<div class="pudge-study-subtle">${ru() ? 'Нет значений' : 'No meanings returned'}</div>`}
-      </div>
+          ? meanings.slice(0, 8).map(x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')
+          : `<li class="pudge-study-subtle">${ru() ? 'Нет значений' : 'No meanings returned'}</li>`}
+      </ol>
       <select id="pudgeStudyDeck"><option value="">${ru() ? 'Колода…' : 'Study deck…'}</option></select>
       <div class="pudge-study-actions">
         <button data-pudge-study-review="again">${ru() ? 'Снова' : 'Again'}</button>
@@ -123,9 +294,12 @@
         <button data-pudge-study-review="good">${ru() ? 'Хорошо' : 'Good'}</button>
         <button data-pudge-study-review="easy">${ru() ? 'Легко' : 'Easy'}</button>
         <button data-pudge-study-add>${ru() ? 'Добавить' : 'Add'}</button>
+        ${[...extraActions.entries()].map(([id, action]) =>
+          `<button class="pudge-study-extra-action" data-pudge-study-extra-action="${esc(id)}">${esc(action.label || id)}</button>`
+        ).join('')}
       </div>`;
     pop.classList.add('open');
-    position(pop, target.getBoundingClientRect());
+    position(pop, anchorRect);
     try {
       const decks = await apiDecks(activeToken.backend);
       if (activeToken?.token !== token) return;
@@ -134,7 +308,7 @@
         select.innerHTML = `<option value="">${ru() ? 'Колода…' : 'Study deck…'}</option>` +
           (decks || []).map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('');
       }
-      position(pop, target.getBoundingClientRect());
+      position(pop, anchorRect);
     } catch (error) {
       const select = document.getElementById('pudgeStudyDeck');
       if (select) {
@@ -216,6 +390,7 @@
   }
 
   function renderParsedParagraph(payload, paragraphIndex, {backend = 'jiten'} = {}) {
+    if (payload?.settings) applyStudyAppearance(payload.settings);
     const paragraphs = payload?.paragraphs || [];
     const text = String(paragraphs[Number(paragraphIndex)] || '');
     if (!text) return '';
@@ -247,6 +422,7 @@
   }
 
   function renderParsedText(payload, {backend = 'jiten'} = {}) {
+    if (payload?.settings) applyStudyAppearance(payload.settings);
     const paragraphs = payload?.paragraphs || [];
     return paragraphs.map((_, paragraphIndex) =>
       renderParsedParagraph(payload, paragraphIndex, {backend})
@@ -291,6 +467,20 @@
     const close = event.target.closest?.('[data-pudge-study-close]');
     if (close) {
       closeStudyCard();
+      return;
+    }
+    const extra = event.target.closest?.('[data-pudge-study-extra-action]');
+    if (extra && activeToken) {
+      const action = activeToken.extraActions?.get(String(extra.dataset.pudgeStudyExtraAction || ''));
+      if (action) {
+        extra.disabled = true;
+        try {
+          await action.run();
+          if (action.close !== false) closeStudyCard();
+        } finally {
+          extra.disabled = false;
+        }
+      }
       return;
     }
     const word = event.target.closest?.('[data-pudge-study-token]');
@@ -338,6 +528,7 @@
       closeStudyCard();
       return;
     }
+    if (event.target.closest?.('[data-ln-token]')) return;
     const pop = document.getElementById('pudgeStudyCard');
     if (pop?.classList.contains('open') && !event.target.closest?.('#pudgeStudyCard')) closeStudyCard();
   }, true);
@@ -363,6 +554,10 @@
       close: closeStudyCard,
       renderParsedText,
       renderParsedParagraph,
+      inlinePitch: renderInlinePitch,
+      inlinePitchOnSurface: renderInlinePitchOnSurface,
+      inflectedPitchCard,
+      applyAppearance: applyStudyAppearance,
     },
     translation: {
       translateSelection,

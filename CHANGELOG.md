@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## v0.7.3
+
+- Added Jiten filters and sorts to Planning; enriched compact and full Light Novel cards with progress, AniList and Jiten facts; and restored wide audiobook playback cards with linked covers.
+- Kept reader color controls and custom CSS in sync, added a separate pitch-accent color, rendered matching-kana pitch directly in the word, and limited pitch accent to horizontal reading.
+- Moved character-name cues to the Light Novel context menu, aligned chapter selection beside the title, numbered dictionary definitions, and disabled unavailable dependent controls.
+- Changed Light Novel Nyaa searches to Literature / Raw title searches, recognizes volume ranges, selects only the requested volume from batch torrents and removes the completed torrent while keeping that volume.
+- Reworked Planning per-episode downloads as a persistent background job: local files are checked first, user-requested searches use the complete alias budget, and results appear only after the whole run finishes.
+- Fixed Planning episode controls so the automatic-download action and per-episode status labels use stable, non-overlapping rows.
+- Added an optional Jimaku key from GitHub Actions for the first 48 hours; it is not persisted to user config, and personal keys take priority.
+- Added a persistent Job Center with cancellation, retry and history for Nyaa episode runs, OCR, audiobook STT and imports.
+- Formalized video/subtitle/OCR/Ready transitions and records accepted state changes so scans cannot demote validated or user-controlled states.
+- Added inflected-form pitch diagrams in the Light Novel reader, two-click Finish Volume, and a local Remove Finished action that does not reduce AniList progress.
+- Added conservative LN/audiobook auto-linking, AniList identity propagation and Find LN on Nyaa from an audiobook.
+- Added detailed user-scenario and algorithm documentation, including Jimaku trial and state-machine behavior.
+- Made bitmap-subtitle states deterministic across library scans and exposes Enable OCR immediately when OCR is disabled.
+- Audiobook Stop now pauses mpv before reading the final position, and the forward seek control is consistently +15 seconds.
+- Added full-text inline Jiten pitch-accent diagrams to the Light Novel reader with an independent appearance toggle.
+- Exposed automatic per-episode downloads directly on Planning anime cards when released episodes are available.
+- Added cached acoustic speech timing using waveform energy and FFT spectral flux so paired-reading highlights pause between spoken phrases.
+- Made Light Novel word-color choices visible as persistent swatches with their exact hex values.
+- Added shared Jiten word-color presets and custom state colors for Light Novels, Manga and Visual Novels, plus mora-level pitch-accent diagrams in word cards.
+- Simplified audiobook-analysis status to a percentage, isolated each STT run's temporary files, refreshed AniList automatically after credential changes, and moved playback controls into Advanced settings.
+- Corrected the Jimaku account link, removed the technical API-reference shortcut, and omitted hours from countdowns longer than one day.
+- Preserved expanded audiobook chapter lists during live polling, passed the configured ffmpeg location to MLX Whisper, and resumed incomplete audiobook STT immediately at app startup.
+- Moved Planning search suggestions below existing entries, fixed the in-reader Names editor stacking, and consolidated paired-audio controls into the Light Novel toolbar.
+- Audiobook STT now exposes live percentage progress in both the audiobook library and paired reader.
+- Added step-by-step Jimaku and AniList credential guides with direct registration, account, developer and OAuth links.
 - Added a manual in-app updater with app-bundle rollback: release installs download the matching GitHub Release ZIP and verify SHA-256, while development checkouts allow only clean fast-forward updates from the official origin.
 - Enriched finished Planning cards with lazily loaded Jiten length, difficulty and, when a Jiten API key is configured, known-word coverage.
 - Expanded the AniList character glossary with unambiguous Japanese first/last-name variants so selection translation preserves short character references more reliably.

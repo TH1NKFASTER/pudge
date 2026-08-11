@@ -491,7 +491,8 @@ class QBittorrentClient:
         category: str,
         tags: list[str],
         paused: bool = False,
-    ) -> None:
+        stop_at_metadata: bool = False,
+    ) -> str:
         self._run_hook()
         self.login()
         target = save_path.expanduser()
@@ -504,7 +505,7 @@ class QBittorrentClient:
         if existing is not None:
             torrent_hash = str(existing.get("hash") or release.info_hash)
             self._set_category_and_tags(torrent_hash, category=category, tags=tags)
-            return
+            return torrent_hash
 
         # API 2.11 / qBittorrent 5.2 renamed `paused` to `stopped` and
         # `root_folder` to `contentLayout`. URL/magnet additions do not require
@@ -512,9 +513,13 @@ class QBittorrentClient:
         payload = {
             "urls": release.magnet,
             "savepath": str(target),
-            "stopped": "true" if paused else "false",
+            # MetadataReceived lets a magnet fetch its file list and then stops it
+            # before payload files begin downloading.
+            "stopped": "true" if paused and not stop_at_metadata else "false",
             "contentLayout": "Original",
         }
+        if stop_at_metadata:
+            payload["stopCondition"] = "MetadataReceived"
         try:
             response = self.client.post("/api/v2/torrents/add", data=payload)
         except httpx.HTTPError as exc:
@@ -530,7 +535,7 @@ class QBittorrentClient:
                 if existing is not None:
                     torrent_hash = str(existing.get("hash") or release.info_hash)
                     self._set_category_and_tags(torrent_hash, category=category, tags=tags)
-                    return
+                    return torrent_hash
             detail = response.text.strip()
             suffix = f" Ответ qBittorrent: {detail}" if detail and detail != "Conflict" else ""
             raise QBittorrentError(
@@ -576,6 +581,7 @@ class QBittorrentClient:
         torrent_hash = torrent_ids[0] if torrent_ids else release.info_hash
         if torrent_hash:
             self._set_category_and_tags(torrent_hash, category=category, tags=tags)
+        return str(torrent_hash or "")
 
     def start(self, torrent_hash: str) -> None:
         """Explicitly start/resume a torrent after adding it.
@@ -676,6 +682,31 @@ class QBittorrentClient:
         except (httpx.HTTPError, ValueError) as exc:
             raise QBittorrentError(f"Не удалось получить файлы торрента: {exc}") from exc
         return list(payload) if isinstance(payload, list) else []
+
+    def set_file_priority(
+        self,
+        torrent_hash: str,
+        file_ids: list[int],
+        priority: int,
+    ) -> None:
+        """Select or skip individual files in a multi-file torrent."""
+
+        ids = sorted({int(value) for value in file_ids if int(value) >= 0})
+        if not str(torrent_hash or "").strip() or not ids:
+            return
+        self.login()
+        try:
+            response = self.client.post(
+                "/api/v2/torrents/filePrio",
+                data={
+                    "hash": str(torrent_hash).strip(),
+                    "id": "|".join(str(value) for value in ids),
+                    "priority": int(priority),
+                },
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise QBittorrentError(f"Не удалось выбрать файлы торрента: {exc}") from exc
 
     def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
         self.login()

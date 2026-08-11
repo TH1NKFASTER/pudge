@@ -122,7 +122,7 @@ def test_settings_ui_exposes_rss_first_checkbox():
     assert "settings.preferSubsPleaseRss':'Сначала использовать RSS SubsPlease'" in html
     assert "checkbox('s_subsplease_preferred',t('settings.preferSubsPleaseRss'))" in html
     assert "subsplease_rss_preferred:c('s_subsplease_preferred')" in html
-    assert "preferred.disabled=!rss.checked" in html
+    assert "setStandaloneSettingAvailability(preferred,enabled('s_nyaa_enabled')&&rss.checked)" in html
 
 
 def test_default_order_keeps_nyaa_first_and_skips_rss_when_nyaa_is_suitable(monkeypatch):

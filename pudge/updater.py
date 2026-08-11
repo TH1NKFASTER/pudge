@@ -194,6 +194,7 @@ class AppUpdater:
             "detail": blocked,
             "installed_revision": installed_revision,
             "source_revision": head,
+            "remote_revision": remote_sha,
             "release_url": f"https://github.com/{GITHUB_REPOSITORY}/tree/{branch or 'main'}",
         }
 
@@ -275,9 +276,21 @@ class AppUpdater:
                 return
             path = Path(str(source["source_path"])).resolve()
             branch = str(status.get("branch") or "")
+            remote_revision = str(status.get("remote_revision") or "")
+            if not remote_revision:
+                raise UpdateError("GitHub did not return a revision to install")
+            self._set_state(
+                "installing",
+                f"Installing {remote_revision[:10]} from {branch}",
+                channel="development",
+                available=True,
+                branch=branch,
+                source_revision=status.get("source_revision"),
+                remote_revision=remote_revision,
+            )
             self._launch_script(
                 path,
-                ["git", "-C", str(path), "pull", "--ff-only", "origin", branch],
+                ["git", "-C", str(path), "merge", "--ff-only", remote_revision],
             )
         except Exception as exc:
             self._log("APP update development failed: %s", exc)

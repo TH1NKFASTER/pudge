@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 import unicodedata
@@ -387,6 +389,7 @@ class LightNovelSettings:
     jpdb_api_token: str = ""
     study_backend: str = "jiten"
     show_furigana: bool = True
+    show_pitch_accent: bool = True
     custom_css: str = ""
     parse_ahead: str = "next"
     auto_download_nyaa: bool = False
@@ -401,6 +404,13 @@ class LightNovelSettings:
     reader_indent: float = 1.0
     reader_vertical: bool = False
     reader_mode: str = "scroll"
+    word_color_theme: str = "balanced"
+    word_color_new: str = "#f3f6fb"
+    word_color_learning: str = "#f4bd63"
+    word_color_due: str = "#ff7d8c"
+    word_color_known: str = "#57d38c"
+    word_color_blacklisted: str = "#7d8795"
+    pitch_accent_color: str = "#9ec5ff"
     translation_language: str = "en"
 
 
@@ -408,6 +418,14 @@ class LightNovelService:
     CONTENT_SCHEMA = 4
     JITEN_BASE = "https://api.jiten.moe/api"
     JPDB_BASE = "https://jpdb.io"
+    WORD_COLOR_THEMES = {
+        "balanced", "jiten", "jpdb", "focus", "underline", "none", "custom"
+    }
+
+    @staticmethod
+    def _word_color(value: Any, fallback: str) -> str:
+        candidate = str(value or "").strip().lower()
+        return candidate if re.fullmatch(r"#[0-9a-f]{6}", candidate) else fallback
 
     def __init__(self, config: Any, *, logger: Any = None) -> None:
         self.config = config
@@ -499,6 +517,24 @@ class LightNovelService:
                     provider TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS character_name_overrides (
+                    media_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    preferred TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(media_id,source)
+                );
+                CREATE TABLE IF NOT EXISTS media_identities (
+                    kind TEXT NOT NULL,
+                    local_id INTEGER NOT NULL,
+                    anilist_id INTEGER NOT NULL,
+                    anilist_type TEXT NOT NULL DEFAULT 'MANGA',
+                    title TEXT NOT NULL DEFAULT '',
+                    cover_url TEXT NOT NULL DEFAULT '',
+                    site_url TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(kind,local_id)
+                );
                 """
             )
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_books)")}
@@ -517,6 +553,7 @@ class LightNovelService:
             jpdb_api_token=values.get("jpdb_api_token", ""),
             study_backend=values.get("study_backend", "jiten") if values.get("study_backend", "jiten") in {"jiten", "jpdb"} else "jiten",
             show_furigana=values.get("show_furigana", "1") != "0",
+            show_pitch_accent=values.get("show_pitch_accent", "1") != "0",
             custom_css=values.get("custom_css", ""),
             parse_ahead=values.get("parse_ahead", "next") if values.get("parse_ahead", "next") in {"current", "next", "book"} else "next",
             auto_download_nyaa=values.get("auto_download_nyaa", "0") == "1",
@@ -531,6 +568,21 @@ class LightNovelService:
             reader_indent=max(0.0, min(5.0, float(values.get("reader_indent", "1.0") or 1.0))),
             reader_vertical=values.get("reader_vertical", "0") == "1",
             reader_mode=values.get("reader_mode", "scroll") if values.get("reader_mode", "scroll") in {"scroll", "pages"} else "scroll",
+            word_color_theme=(
+                values.get("word_color_theme", "balanced")
+                if values.get("word_color_theme", "balanced") in self.WORD_COLOR_THEMES
+                else "balanced"
+            ),
+            word_color_new=self._word_color(values.get("word_color_new"), "#f3f6fb"),
+            word_color_learning=self._word_color(values.get("word_color_learning"), "#f4bd63"),
+            word_color_due=self._word_color(values.get("word_color_due"), "#ff7d8c"),
+            word_color_known=self._word_color(values.get("word_color_known"), "#57d38c"),
+            word_color_blacklisted=self._word_color(
+                values.get("word_color_blacklisted"), "#7d8795"
+            ),
+            pitch_accent_color=self._word_color(
+                values.get("pitch_accent_color"), "#9ec5ff"
+            ),
             # Selection translation is intentionally not an independent setting.
             # It always follows General -> Language; legacy ln_settings rows are ignored.
             translation_language=(
@@ -543,9 +595,13 @@ class LightNovelService:
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {
             "jiten_api_key", "jpdb_api_token", "study_backend", "show_furigana",
+            "show_pitch_accent",
             "custom_css", "parse_ahead", "auto_download_nyaa", "nyaa_category",
             "reader_font", "reader_theme", "reader_font_size", "reader_text_color", "reader_background_color",
             "reader_width", "reader_line_height", "reader_indent", "reader_vertical", "reader_mode",
+            "word_color_theme", "word_color_new", "word_color_learning", "word_color_due",
+            "word_color_known", "word_color_blacklisted",
+            "pitch_accent_color",
         }
         current = self.settings()
         payload = {
@@ -553,6 +609,9 @@ class LightNovelService:
             "jpdb_api_token": str(values.get("jpdb_api_token", current.jpdb_api_token)).strip(),
             "study_backend": str(values.get("study_backend", current.study_backend)).strip().lower(),
             "show_furigana": "1" if bool(values.get("show_furigana", current.show_furigana)) else "0",
+            "show_pitch_accent": (
+                "1" if bool(values.get("show_pitch_accent", current.show_pitch_accent)) else "0"
+            ),
             "custom_css": str(values.get("custom_css", current.custom_css)),
             "parse_ahead": str(values.get("parse_ahead", current.parse_ahead)).strip().lower(),
             "auto_download_nyaa": "1" if bool(values.get("auto_download_nyaa", current.auto_download_nyaa)) else "0",
@@ -567,6 +626,31 @@ class LightNovelService:
             "reader_indent": str(max(0.0, min(5.0, float(values.get("reader_indent", current.reader_indent) or 1.0)))),
             "reader_vertical": "1" if bool(values.get("reader_vertical", current.reader_vertical)) else "0",
             "reader_mode": str(values.get("reader_mode", current.reader_mode)).strip().lower(),
+            "word_color_theme": str(
+                values.get("word_color_theme", current.word_color_theme)
+            ).strip().lower(),
+            "word_color_new": self._word_color(
+                values.get("word_color_new", current.word_color_new), current.word_color_new
+            ),
+            "word_color_learning": self._word_color(
+                values.get("word_color_learning", current.word_color_learning),
+                current.word_color_learning,
+            ),
+            "word_color_due": self._word_color(
+                values.get("word_color_due", current.word_color_due), current.word_color_due
+            ),
+            "word_color_known": self._word_color(
+                values.get("word_color_known", current.word_color_known),
+                current.word_color_known,
+            ),
+            "word_color_blacklisted": self._word_color(
+                values.get("word_color_blacklisted", current.word_color_blacklisted),
+                current.word_color_blacklisted,
+            ),
+            "pitch_accent_color": self._word_color(
+                values.get("pitch_accent_color", current.pitch_accent_color),
+                current.pitch_accent_color,
+            ),
         }
         if payload["study_backend"] not in {"jiten", "jpdb"}:
             payload["study_backend"] = "jiten"
@@ -574,6 +658,8 @@ class LightNovelService:
             payload["parse_ahead"] = "next"
         if payload["reader_mode"] not in {"scroll", "pages"}:
             payload["reader_mode"] = "scroll"
+        if payload["word_color_theme"] not in self.WORD_COLOR_THEMES:
+            payload["word_color_theme"] = "balanced"
         with self._connect() as conn:
             for key, value in payload.items():
                 if key in allowed:
@@ -587,6 +673,7 @@ class LightNovelService:
             "jpdb_api_token": s.jpdb_api_token,
             "study_backend": s.study_backend,
             "show_furigana": s.show_furigana,
+            "show_pitch_accent": s.show_pitch_accent,
             "custom_css": s.custom_css,
             "parse_ahead": s.parse_ahead,
             "auto_download_nyaa": s.auto_download_nyaa,
@@ -601,6 +688,13 @@ class LightNovelService:
             "reader_indent": s.reader_indent,
             "reader_vertical": s.reader_vertical,
             "reader_mode": s.reader_mode,
+            "word_color_theme": s.word_color_theme,
+            "word_color_new": s.word_color_new,
+            "word_color_learning": s.word_color_learning,
+            "word_color_due": s.word_color_due,
+            "word_color_known": s.word_color_known,
+            "word_color_blacklisted": s.word_color_blacklisted,
+            "pitch_accent_color": s.pitch_accent_color,
             "translation_language": s.translation_language,
         }
 
@@ -774,7 +868,8 @@ class LightNovelService:
         self._repair_missing_volumes()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT b.*,COUNT(c.id) AS chapter_count FROM ln_books b
+                """SELECT b.*,COUNT(c.id) AS chapter_count,
+                          COALESCE(SUM(LENGTH(c.text)),0) AS character_count FROM ln_books b
                    LEFT JOIN ln_chapters c ON c.book_id=b.id GROUP BY b.id ORDER BY b.updated_at DESC,b.title COLLATE NOCASE"""
             ).fetchall()
         result: list[dict[str, Any]] = []
@@ -1046,6 +1141,7 @@ class LightNovelService:
                 "speech_duration_ms": int(selected.get("speechDuration") or 0),
                 "coverage_available": authenticated and selected.get("coverage") is not None,
                 "known_coverage": max(0.0, min(100.0, coverage)),
+                "expected_comprehension": max(0.0, min(100.0, coverage)),
                 "learning_coverage": max(0.0, min(100.0, learning)),
             }
         self._jiten_media_cache.put(cache_key, result)
@@ -1398,13 +1494,50 @@ class LightNovelService:
             raise LightNovelError("Local LLM returned no translation")
         return translated
 
-    def character_glossary(self, media_id: int | None) -> list[dict[str, str]]:
-        if not media_id or not self.config.anilist.enabled or not self.config.anilist.access_token:
+    def character_glossary_overrides(self, media_id: int | None) -> list[dict[str, str]]:
+        if not media_id:
             return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source,preferred FROM character_name_overrides WHERE media_id=? "
+                "ORDER BY length(source) DESC,source", (int(media_id),)
+            ).fetchall()
+        return [{"source": str(row["source"]), "preferred": str(row["preferred"]), "user_override": True} for row in rows]
+
+    def save_character_glossary_override(self, media_id: int, source: str, preferred: str) -> list[dict[str, str]]:
+        source_text, preferred_text = str(source or "").strip(), str(preferred or "").strip()
+        if not source_text or not preferred_text:
+            raise LightNovelError("Both the source name and preferred name are required")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO character_name_overrides(media_id,source,preferred,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(media_id,source) DO UPDATE SET preferred=excluded.preferred,updated_at=excluded.updated_at",
+                (int(media_id), source_text, preferred_text, time.time()),
+            )
+        return self.character_glossary(int(media_id))
+
+    def delete_character_glossary_override(self, media_id: int, source: str) -> list[dict[str, str]]:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM character_name_overrides WHERE media_id=? AND source=?", (int(media_id), str(source or "").strip()))
+        return self.character_glossary(int(media_id))
+
+    def _merge_character_glossary(self, media_id: int, generated: list[dict[str, str]]) -> list[dict[str, str]]:
+        merged = {str(item.get("source") or ""): dict(item) for item in generated}
+        for item in self.character_glossary_overrides(int(media_id)):
+            merged[str(item["source"])] = dict(item)
+        rows = [item for source, item in merged.items() if source and item.get("preferred")]
+        rows.sort(key=lambda item: len(str(item["source"])), reverse=True)
+        return rows
+
+    def character_glossary(self, media_id: int | None) -> list[dict[str, str]]:
+        if not media_id:
+            return []
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return self.character_glossary_overrides(int(media_id))
         key = {"media_id": int(media_id)}
         cached = self._character_cache.get(key, ttl_seconds=30 * 24 * 3600)
         if isinstance(cached, list):
-            return [dict(item) for item in cached if isinstance(item, dict)]
+            return self._merge_character_glossary(int(media_id), [dict(item) for item in cached if isinstance(item, dict)])
         query = """
         query($id:Int!){Media(id:$id){characters(page:1,perPage:50,sort:[ROLE,RELEVANCE,ID]){edges{role node{name{first middle last full native alternative}}}}}}
         """
@@ -1412,7 +1545,7 @@ class LightNovelService:
             data = self._anilist_post(query, {"id": int(media_id)})
         except Exception as exc:
             self._log("AniList character glossary unavailable for %s: %s", media_id, exc)
-            return []
+            return self.character_glossary_overrides(int(media_id))
         candidates: dict[str, set[str]] = {}
 
         def add(source: Any, preferred: Any) -> None:
@@ -1457,7 +1590,7 @@ class LightNovelService:
             older_than_seconds=180 * 24 * 3600,
             max_entries=500,
         )
-        return rows
+        return self._merge_character_glossary(int(media_id), rows)
 
     @staticmethod
     def _protect_character_names(
@@ -1594,7 +1727,7 @@ class LightNovelService:
         if not uid:
             return []
         collection_query = """
-        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl}}}}}
+        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl}}}}}
         """
         collection = self._anilist_post(collection_query, {"userId": int(uid)}).get("MediaListCollection") or {}
         items: list[dict[str, Any]] = []
@@ -1612,6 +1745,8 @@ class LightNovelService:
                     "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0,
                     "chapters": media.get("chapters"), "volumes": media.get("volumes"), "media_status": media.get("status"),
                     "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                    "mean_score": media.get("meanScore"), "genres": media.get("genres") or [],
+                    "year": (media.get("startDate") or {}).get("year"),
                     "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
                 })
         self._anilist_cache = (time.monotonic(), [dict(item) for item in items])
@@ -1644,7 +1779,7 @@ class LightNovelService:
         if not cleaned:
             return []
         gql = """
-        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
+        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self._anilist_post(gql, {"search": cleaned, "perPage": max(1, min(25, int(limit)))})
         out: list[dict[str, Any]] = []
@@ -1657,19 +1792,21 @@ class LightNovelService:
                 "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0,
                 "progress_volumes": entry.get("progressVolumes") or 0, "chapters": media.get("chapters"), "volumes": media.get("volumes"),
                 "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                "mean_score": media.get("meanScore"), "genres": media.get("genres") or [],
+                "year": (media.get("startDate") or {}).get("year"),
                 "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
             })
         return out
 
     def _anilist_novel_by_id(self, media_id: int) -> dict[str, Any]:
         gql = """
-        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}
+        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}
         """
         media = self._anilist_post(gql, {"id": int(media_id)}).get("Media") or {}
         if str(media.get("format") or "").upper() != "NOVEL":
             raise LightNovelError("Selected AniList entry is not a light novel")
         titles = media.get("title") or {}; entry = media.get("mediaListEntry") or {}
-        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "", "user_score": float(entry.get("score")) if entry.get("score") is not None else None}
+        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "", "mean_score": media.get("meanScore"), "genres": media.get("genres") or [], "year": (media.get("startDate") or {}).get("year"), "user_score": float(entry.get("score")) if entry.get("score") is not None else None}
 
     @staticmethod
     def _match_title(value: str) -> str:
@@ -1717,6 +1854,18 @@ class LightNovelService:
             conn.execute("UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,anilist_total_volumes=?,anilist_user_score=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?", (int(media_id), str(item.get("status") or ""), int(item.get("progress_volumes") or 0), item.get("volumes"), item.get("user_score"), str(item.get("cover") or ""), time.time(), int(book_id)))
         self._propagate_series_anilist(int(book_id))
         return self.book(book_id)
+
+    def unbind_anilist(self, book_id: int) -> dict[str, Any]:
+        book = self.book(int(book_id))
+        series_key = str(book.get("series_key") or _series_key(str(book.get("title") or "")))
+        ids = [int(item["id"]) for item in self.books() if str(item.get("series_key") or "") == series_key] or [int(book_id)]
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE ln_books SET anilist_id=NULL,anilist_status='',anilist_progress_volumes=0,anilist_total_volumes=NULL,anilist_user_score=NULL,updated_at=? WHERE id IN ({placeholders})",
+                (time.time(), *ids),
+            )
+        return self.book(int(book_id))
 
     def set_score(self, book_id: int, score: float) -> dict[str, Any]:
         with self._connect() as conn:
@@ -1770,8 +1919,66 @@ class LightNovelService:
             conn.execute("UPDATE ln_books SET finished=1,anilist_status=?,anilist_progress_volumes=MAX(anilist_progress_volumes,?),updated_at=? WHERE id=?", (status, volume, time.time(), int(book_id)))
         return self.book(book_id)
 
-    def search_nyaa(self, query: str) -> list[dict[str, Any]]:
+    def set_finished(self, book_id: int, finished: bool) -> dict[str, Any]:
+        """Set the local Finished badge without reducing AniList progress."""
+
+        if bool(finished):
+            return self.finish_volume(int(book_id))
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ln_books SET finished=0,updated_at=? WHERE id=?",
+                (time.time(), int(book_id)),
+            )
+        return self.book(int(book_id))
+
+    @staticmethod
+    def _nyaa_title(value: str) -> str:
+        text = _series_title(html.unescape(str(value or "")))
+        text = re.sub(r"(?i)\b(?:light[ ._-]*novel|novel)\b", " ", text)
+        text = re.sub(r"(?i)\b(?:vol(?:ume)?|v)\s*[._ -]*0*\d{1,3}\b", " ", text)
+        text = re.sub(r"第\s*0*\d{1,3}\s*巻", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _literature_volume_range(value: str) -> tuple[int, int] | None:
+        text = unicodedata.normalize("NFKC", str(value or ""))
+        patterns = (
+            r"(?i)\b(?:vol(?:ume)?s?|v)\s*0*(\d{1,3})\s*[-~–—]\s*(?:vol(?:ume)?s?|v)?\s*0*(\d{1,3})\b",
+            r"第?\s*0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})\s*巻",
+            r"(?i)(?:^|[\s\[(])0*(\d{1,3})\s*[-~–—]\s*0*(\d{1,3})(?=$|[\s._\])])",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            start, end = int(match.group(1)), int(match.group(2))
+            if 0 < start <= end <= 999:
+                return start, end
+        return None
+
+    @classmethod
+    def _release_volume_match(cls, title: str, target_volume: int) -> tuple[bool, tuple[int, int] | None, bool]:
+        target = int(target_volume or 0)
+        volume_range = cls._literature_volume_range(title)
+        if target <= 0:
+            return True, volume_range, False
+        if volume_range is not None:
+            return volume_range[0] <= target <= volume_range[1], volume_range, False
+        explicit = _volume_from_text(title)
+        if explicit is not None:
+            return int(explicit) == target, (int(explicit), int(explicit)), True
+        return True, None, False
+
+    def search_nyaa(
+        self,
+        query: str,
+        *,
+        target_volume: int | None = None,
+    ) -> list[dict[str, Any]]:
         settings = self.settings()
+        clean_query = self._nyaa_title(query)
+        if not clean_query:
+            return []
         client = NyaaClient(
             self.config.nyaa.base_url,
             category=settings.nyaa_category,
@@ -1779,17 +1986,39 @@ class LightNovelService:
             proxy_url=self.config.nyaa.proxy_url,
             pre_search_command=self.config.nyaa.pre_search_command,
         )
-        releases = client.search(query, category=settings.nyaa_category)
-        # Literature releases are ranked conservatively: title match first, then seeders, then size.
-        words = {w for w in re.findall(r"[a-z0-9]+", query.casefold()) if len(w) > 2}
-        def score(r: NyaaRelease) -> tuple[int, int, int]:
+        releases = client.search(clean_query, category="3_3")
+        target = max(0, int(target_volume or 0))
+        eligible: list[tuple[NyaaRelease, tuple[int, int] | None, bool]] = []
+        for release in releases:
+            matches, volume_range, exact = self._release_volume_match(release.title, target)
+            if matches:
+                eligible.append((release, volume_range, exact))
+        # Prefer a release that explicitly contains the requested volume, then title
+        # match and availability. Unlabelled releases remain as a fallback.
+        words = {w for w in re.findall(r"[a-z0-9]+", clean_query.casefold()) if len(w) > 2}
+        def score(row: tuple[NyaaRelease, tuple[int, int] | None, bool]) -> tuple[int, int, int, int]:
+            r, volume_range, exact = row
             title_words = set(re.findall(r"[a-z0-9]+", r.title.casefold()))
             overlap = len(words & title_words)
-            return (overlap, int(r.seeders), int(r.size_bytes))
-        releases.sort(key=score, reverse=True)
+            volume_score = 3 if exact else (2 if volume_range is not None else 1)
+            return (volume_score, overlap, int(r.seeders), int(r.size_bytes))
+        eligible.sort(key=score, reverse=True)
         return [
-            {"title": r.title, "torrent_url": r.torrent_url, "link": r.link, "info_hash": r.info_hash, "seeders": r.seeders, "size": r.size_text, "trusted": r.trusted}
-            for r in releases[:30]
+            {
+                "title": r.title,
+                "torrent_url": r.torrent_url,
+                "link": r.link,
+                "info_hash": r.info_hash,
+                "seeders": r.seeders,
+                "size": r.size_text,
+                "trusted": r.trusted,
+                "target_volume": target or None,
+                "volume_start": volume_range[0] if volume_range else None,
+                "volume_end": volume_range[1] if volume_range else None,
+                "volume_range": list(volume_range) if volume_range else None,
+                "contains_target_volume": bool(target and volume_range),
+            }
+            for r, volume_range, _exact in eligible[:30]
         ]
 
     def download_nyaa_release(self, release: dict[str, Any]) -> dict[str, Any]:
@@ -1806,11 +2035,223 @@ class LightNovelService:
             self.config.qbittorrent.api_key, verify_tls=self.config.qbittorrent.verify_tls,
             pre_download_command=self.config.qbittorrent.pre_download_command, auto_start_app=self.config.qbittorrent.auto_start_app,
         )
+        target_volume = max(0, int(release.get("target_volume") or 0))
         try:
-            torrent_hash = qbt.add_release(item, save_path=self.root, category=f"{APP_SLUG}-ln", tags=[APP_SLUG, "light-novel"])
+            torrent_hash = qbt.add_release(
+                item,
+                save_path=self.root,
+                category=f"{APP_SLUG}-ln",
+                tags=[APP_SLUG, "light-novel"] + ([f"volume: {target_volume}"] if target_volume else []),
+                paused=bool(target_volume),
+                stop_at_metadata=bool(target_volume),
+            )
+            selected_files: list[str] = []
+            if target_volume:
+                selected_files = self._select_torrent_volume_files(
+                    qbt,
+                    torrent_hash,
+                    target_volume,
+                    allow_unlabelled=(
+                        int(release.get("volume_start") or 0) == target_volume
+                        and int(release.get("volume_end") or 0) == target_volume
+                    ),
+                )
+                qbt.start(torrent_hash)
+        except Exception:
+            if target_volume and 'torrent_hash' in locals() and torrent_hash:
+                try:
+                    qbt.delete(torrent_hash, delete_files=True)
+                except Exception:
+                    pass
+            raise
         finally:
             qbt.close()
-        return {"ok": True, "torrent_hash": torrent_hash}
+        if target_volume and torrent_hash:
+            threading.Thread(
+                target=self._finish_volume_torrent,
+                args=(str(torrent_hash), target_volume),
+                name=f"ln-volume-{target_volume}-download",
+                daemon=True,
+            ).start()
+        return {
+            "ok": True,
+            "torrent_hash": torrent_hash,
+            "target_volume": target_volume or None,
+            "selected_files": selected_files if target_volume else [],
+        }
+
+    def _qbt_client(self) -> QBittorrentClient:
+        return QBittorrentClient(
+            self.config.qbittorrent.base_url,
+            self.config.qbittorrent.username,
+            self.config.qbittorrent.password,
+            self.config.qbittorrent.api_key,
+            verify_tls=self.config.qbittorrent.verify_tls,
+            pre_download_command=self.config.qbittorrent.pre_download_command,
+            auto_start_app=self.config.qbittorrent.auto_start_app,
+        )
+
+    @staticmethod
+    def _downloadable_literature_file(name: str) -> bool:
+        return Path(str(name or "")).suffix.casefold() in {
+            ".epub", ".txt", ".pdf", ".mobi", ".azw3", ".zip", ".rar", ".7z"
+        }
+
+    @classmethod
+    def _torrent_file_volume(cls, name: str) -> int | None:
+        path = Path(str(name or ""))
+        parts = [path.stem, *reversed(path.parts[:-1])]
+        for part in parts:
+            if cls._literature_volume_range(part) is not None:
+                continue
+            explicit = _volume_from_text(part)
+            if explicit is not None:
+                return explicit
+            normalized = unicodedata.normalize("NFKC", part)
+            matches = re.findall(
+                r"(?:^|[\s._\-\[\]()])0*(\d{1,3})(?=$|[\s._\-\[\]()])",
+                normalized,
+            )
+            if matches:
+                number = int(matches[-1])
+                if 0 < number <= 300:
+                    return number
+        return None
+
+    def _select_torrent_volume_files(
+        self,
+        qbt: QBittorrentClient,
+        torrent_hash: str,
+        target_volume: int,
+        *,
+        allow_unlabelled: bool = False,
+    ) -> list[str]:
+        deadline = time.monotonic() + 35.0
+        files: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            files = qbt.files(torrent_hash)
+            if files:
+                break
+            time.sleep(0.5)
+        if not files:
+            raise LightNovelError("Could not read the torrent file list")
+        candidates = [row for row in files if self._downloadable_literature_file(str(row.get("name") or ""))]
+        selected = [
+            row for row in candidates
+            if self._torrent_file_volume(str(row.get("name") or "")) == int(target_volume)
+        ]
+        if not selected and allow_unlabelled:
+            selected = candidates
+        if not selected:
+            archives = []
+            for row in candidates:
+                name = str(row.get("name") or "")
+                if Path(name).suffix.casefold() not in {".zip", ".rar", ".7z"}:
+                    continue
+                volume_range = self._literature_volume_range(name)
+                if volume_range and volume_range[0] <= int(target_volume) <= volume_range[1]:
+                    archives.append(row)
+            if archives:
+                selected = archives[:1]
+        if not selected:
+            raise LightNovelError(f"Volume {target_volume} is not a separate file in this torrent")
+        all_ids = [int(row.get("index")) for row in files if row.get("index") is not None]
+        selected_ids = [int(row.get("index")) for row in selected if row.get("index") is not None]
+        qbt.set_file_priority(torrent_hash, all_ids, 0)
+        qbt.set_file_priority(torrent_hash, selected_ids, 6)
+        return [str(row.get("name") or "") for row in selected]
+
+    def _materialize_selected_volume(
+        self,
+        selected: list[dict[str, Any]],
+        target_volume: int,
+    ) -> list[Path]:
+        archives: list[Path] = []
+        extracted = 0
+        for row in selected:
+            relative = Path(str(row.get("name") or ""))
+            source = (self.root / relative).resolve()
+            try:
+                source.relative_to(self.root.resolve())
+            except ValueError as exc:
+                raise LightNovelError("Torrent file is outside the Light Novels folder") from exc
+            suffix = source.suffix.casefold()
+            if suffix not in {".zip", ".rar", ".7z"}:
+                continue
+            if not source.is_file():
+                raise LightNovelError(f"Downloaded archive is missing: {relative.name}")
+            archives.append(source)
+            if suffix == ".zip":
+                with zipfile.ZipFile(source) as archive:
+                    members = [
+                        name for name in archive.namelist()
+                        if Path(name).suffix.casefold() in {".epub", ".txt"}
+                        and self._torrent_file_volume(name) == int(target_volume)
+                    ]
+                    for member in members:
+                        destination = self._selected_volume_destination(Path(member).name, target_volume)
+                        with archive.open(member) as src, destination.open("wb") as dst:
+                            shutil.copyfileobj(src, dst)
+                        extracted += 1
+                continue
+            from .providers.jimaku import find_7zip
+
+            tool = find_7zip()
+            if not tool:
+                raise LightNovelError("7-Zip is required to extract this Light Novel batch")
+            with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ln-volume-") as temp_dir:
+                completed = subprocess.run(
+                    [tool, "x", "-y", f"-o{temp_dir}", str(source)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    raise LightNovelError(f"Could not extract {relative.name}")
+                for candidate in Path(temp_dir).rglob("*"):
+                    if (
+                        candidate.is_file()
+                        and candidate.suffix.casefold() in {".epub", ".txt"}
+                        and self._torrent_file_volume(str(candidate.relative_to(temp_dir))) == int(target_volume)
+                    ):
+                        shutil.copy2(
+                            candidate,
+                            self._selected_volume_destination(candidate.name, target_volume),
+                        )
+                        extracted += 1
+        if archives and not extracted:
+            raise LightNovelError(f"Volume {target_volume} was not found inside the downloaded archive")
+        return archives
+
+    def _selected_volume_destination(self, name: str, target_volume: int) -> Path:
+        safe_name = Path(str(name or "")).name or f"volume-{int(target_volume):02d}.epub"
+        destination = self.root / safe_name
+        if not destination.exists():
+            return destination
+        return self.root / f"{destination.stem}-volume-{int(target_volume):02d}{destination.suffix}"
+
+    def _finish_volume_torrent(self, torrent_hash: str, target_volume: int) -> None:
+        qbt = self._qbt_client()
+        try:
+            deadline = time.monotonic() + 14 * 24 * 3600
+            while time.monotonic() < deadline:
+                files = qbt.files(torrent_hash)
+                selected = [row for row in files if int(row.get("priority") or 0) > 0]
+                if selected and all(float(row.get("progress") or 0.0) >= 0.999 for row in selected):
+                    archives = self._materialize_selected_volume(selected, target_volume)
+                    qbt.delete(torrent_hash, delete_files=False)
+                    for archive in archives:
+                        archive.unlink(missing_ok=True)
+                    self.scan_downloaded()
+                    self._log("LN volume download complete volume=%s", target_volume)
+                    return
+                time.sleep(20.0)
+        except Exception as exc:
+            self._log("LN volume download monitor failed volume=%s error=%s", target_volume, exc)
+        finally:
+            qbt.close()
 
     def auto_download_missing(self) -> list[dict[str, Any]]:
         if not self.settings().auto_download_nyaa or not self.config.qbittorrent.enabled:
@@ -1826,8 +2267,8 @@ class LightNovelService:
             local = books_by_media.get(media_id)
             if local and int(local.get("volume") or 0) >= next_volume and not int(local.get("finished") or 0):
                 continue
-            query = f"{novel.get('title','')} light novel volume {next_volume:02d}"
-            releases = self.search_nyaa(query)
+            query = self._nyaa_title(str(novel.get("title") or ""))
+            releases = self.search_nyaa(query, target_volume=next_volume)
             if not releases:
                 continue
             best = next((r for r in releases if int(r.get("seeders") or 0) > 0), releases[0])
@@ -1842,8 +2283,25 @@ class LightNovelService:
         literature = [dict(item) for item in (self._anilist_cache[1] if self._anilist_cache is not None else [])]
         novels = [item for item in literature if str(item.get("format") or "").upper() == "NOVEL"]
         planning = [item for item in literature if str(item.get("status") or "").upper() == "PLANNING"]
+        by_media = {
+            int(item["media_id"]): item
+            for item in novels
+            if item.get("media_id") is not None
+        }
+        books = self.books()
+        for book in books:
+            media_id = book.get("anilist_id")
+            item = by_media.get(int(media_id)) if media_id is not None else None
+            if not item:
+                continue
+            book["anilist_mean_score"] = item.get("mean_score")
+            book["anilist_genres"] = list(item.get("genres") or [])
+            book["anilist_year"] = item.get("year")
+            book["anilist_media_status"] = item.get("media_status")
+            if not book.get("cover_url") and item.get("cover"):
+                book["cover_url"] = item["cover"]
         return {
-            "books": self.books(), "anilist": novels, "planning": planning, "settings": self.settings_payload(),
+            "books": books, "anilist": novels, "planning": planning, "settings": self.settings_payload(),
             "refreshing": bool(self._state_refreshing), "version": int(self._state_version),
         }
 

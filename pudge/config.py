@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .branding import CACHE_DIR, CONFIG_DIR, DEFAULT_DATABASE_PATH, DEFAULT_LIBRARY_DIR, QBITTORRENT_CATEGORY
+from .jimaku_trial import apply_jimaku_trial, persisted_jimaku_api_key
 
 
 APP_DIR = CONFIG_DIR
@@ -164,6 +165,9 @@ class ToolsConfig:
 class JimakuConfig:
     api_key: str = ""
     base_url: str = "https://jimaku.cc"
+    personal_api_key: str = ""
+    trial_active: bool = False
+    trial_expires_at: float = 0.0
 
 
 @dataclass(slots=True)
@@ -469,6 +473,9 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         jimaku=JimakuConfig(
             api_key=os.getenv("JIMAKU_API_KEY", str(jimaku.get("api_key", ""))).strip(),
+            personal_api_key=os.getenv(
+                "JIMAKU_API_KEY", str(jimaku.get("api_key", ""))
+            ).strip(),
             base_url=str(jimaku.get("base_url", "https://jimaku.cc")).rstrip("/"),
         ),
         anilist=AniListConfig(
@@ -564,6 +571,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     cfg.library.root_dir.mkdir(parents=True, exist_ok=True)
     cfg.library.database_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.library.cover_cache_dir.mkdir(parents=True, exist_ok=True)
+    apply_jimaku_trial(cfg)
     return cfg
 
 
@@ -683,7 +691,7 @@ alass = {_toml_string(config.tools.alass)}
 mpv_extra_args = {_toml_string_list(config.tools.mpv_extra_args)}
 
 [jimaku]
-api_key = {_toml_string(config.jimaku.api_key)}
+api_key = {_toml_string(persisted_jimaku_api_key(config.jimaku))}
 base_url = {_toml_string(config.jimaku.base_url)}
 
 [anilist]

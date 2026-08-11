@@ -2,7 +2,7 @@
 
 Pudge is a macOS media companion focused on anime with Japanese subtitles. It combines a local library, AniList progress, Nyaa downloads, qBittorrent/aria2, mpv playback, subtitle discovery and automatic timing repair in one native window.
 
-Current version: **0.7.2**.
+Current version: **0.7.3**.
 
 ## What it does
 
@@ -14,6 +14,8 @@ Current version: **0.7.2**.
 - keeps Activity out of the primary navigation while surfacing only genuine user-action blockers on Home.
 
 Pudge is local-first. The optional local LLM is disabled for subtitle decisions by default. API tokens are not included in exported backups.
+
+See the [user guide](docs/USER_GUIDE.md) for end-to-end scenarios and [algorithms/state model](docs/ALGORITHMS.md) for the matching, subtitle, pitch-accent and job rules.
 
 ## Requirements
 
@@ -40,7 +42,27 @@ development checkouts update only from the official origin when the current
 branch is clean and can be fast-forwarded. The previous app bundle is restored
 automatically if installation fails.
 
-The first STT fallback may download a small MLX Whisper model. Subtitle transcription only runs after deterministic alignment methods fail. Light Novel/audiobook transcription starts explicitly from the paired-reading tray. Both results are content-addressed and cached.
+The first STT fallback may download a small MLX Whisper model. Subtitle transcription only runs after deterministic alignment methods fail. Audiobook transcription starts automatically after import, continues in the background outside the reader, reports live progress, and is cached by content. Linked Light Novels are aligned automatically when that transcript is ready.
+
+## Jimaku and AniList credentials
+
+### Jimaku
+
+Official release builds may include a shared Jimaku key for the first 48 hours. A personal key always takes priority. The shared key is injected from a GitHub Actions repository secret during release builds and is not committed to the source tree.
+
+1. Open [Jimaku registration/login](https://jimaku.cc/login) and choose **Register**. Jimaku asks only for a username and password; no email is required.
+2. After signing in, open [your Jimaku account](https://jimaku.cc/account) and copy the API key.
+3. In Pudge, open **Settings → Jimaku**, paste the key, and save.
+
+### AniList
+
+1. Sign in to AniList and open [Developer settings](https://anilist.co/settings/developer).
+2. Choose **Create New Client**. Set the name to `Pudge` and the redirect URL to `https://anilist.co/api/v2/oauth/pin`, then save.
+3. Copy the numeric Client ID into **Settings → AniList → Client ID** in Pudge.
+4. Choose **Get access token** in Pudge, authorize the application on AniList, and copy the issued token into **AniList access token**.
+5. Save Pudge settings. Pudge updates AniList data automatically after the credentials change.
+
+The token grants access to your AniList account and should be treated like a password. The flow follows AniList's [implicit-grant authentication guide](https://docs.anilist.co/guide/auth/).
 
 Manga reading works without OCR. To enable on-demand [MangaOCR](https://github.com/kha-white/manga-ocr) in an installed release:
 

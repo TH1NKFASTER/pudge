@@ -34,6 +34,7 @@ dist/
 .env.*
 config.toml
 *.local.toml
+pudge/assets/jimaku-trial-key
 
 # Logs / caches
 *.log

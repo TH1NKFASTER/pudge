@@ -981,6 +981,7 @@ class MangaService:
         book_id: int,
         *,
         progress: Callable[[int, int, int | None], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not self.ocr_available():
             raise RuntimeError("MangaOCR is not installed. Install it from Settings → Reading.")
@@ -1010,6 +1011,13 @@ class MangaService:
         page_regions: dict[int, list[dict[str, Any]]] = {}
         with zipfile.ZipFile(archive_path) as archive:
             for index in missing:
+                if cancelled is not None and cancelled():
+                    return {
+                        **self.ocr_cache_status(int(book_id)),
+                        "ok": False,
+                        "cancelled": True,
+                        "errors": [],
+                    }
                 image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
                 page_regions[index] = self._vision_text_regions(image)
         manifest_path.write_text(
@@ -1044,6 +1052,19 @@ class MangaService:
             )
             last_reported = -1
             while process.poll() is None:
+                if cancelled is not None and cancelled():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                    return {
+                        **self.ocr_cache_status(int(book_id)),
+                        "ok": False,
+                        "cancelled": True,
+                        "errors": [],
+                    }
                 try:
                     payload = json.loads(progress_path.read_text(encoding="utf-8"))
                     processed = max(0, int(payload.get("done") or 0))

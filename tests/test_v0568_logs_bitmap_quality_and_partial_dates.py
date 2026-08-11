@@ -149,7 +149,10 @@ def test_manager_refuses_ready_exit_code_for_sup(tmp_path: Path, monkeypatch) ->
     assert stored is not None
     assert stored.state == "waiting_text_subtitles"
     assert stored.subtitle_path == subtitle
-    assert len(manager.db.subtitle_jobs()) == 1
+    jobs = manager.db.subtitle_jobs()
+    assert len(jobs) == 1
+    assert jobs[0]["state"] == "needs_action"
+    assert jobs[0]["action_code"] == "enable_subtitle_ocr"
 
 
 def test_anilist_partial_dates_are_preserved() -> None:

@@ -69,7 +69,7 @@ def test_audiobook_ui_has_busy_state_speed_and_skip_controls() -> None:
     assert "audiobook-import-status" in media
     assert "data-audio-speed" in media
     assert "seek-audio" in media
-    assert "-15" in media and "+30" in media
+    assert "-15" in media and "+15" in media
     assert "audiobook-card.playing" in css
     assert "def audiobook_set_speed" in app
     assert "def audiobook_seek" in app

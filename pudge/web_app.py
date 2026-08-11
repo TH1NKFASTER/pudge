@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.server
+import html
 import json
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ from typing import Any
 from . import __version__
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
 from .config import load_config, write_config
+from .jimaku_trial import apply_jimaku_trial
+from .job_center import JobCenter
 from .manager import AnimeManager
 from .providers.qbittorrent import QBittorrentClient
 from .providers.aria2 import Aria2Client
@@ -40,6 +43,16 @@ from .audiobooks import AudiobookService
 from .debug_snapshot import DebugSnapshotService
 from .metadata_cache import MetadataCache
 from .updater import AppUpdater
+from .visual_novels import VisualNovelService
+
+
+def _plain_anilist_description(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"(?i)<br\s*/?>|</p\s*>|</li\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text).replace("\xa0", " ")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 class WebAppApi:
@@ -54,6 +67,7 @@ class WebAppApi:
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
         self.manager = AnimeManager(self.config, log=self.logger.info)
+        self.job_center = JobCenter(self.manager.db)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
             self.manager.db,
@@ -65,9 +79,17 @@ class WebAppApi:
             ffprobe=self.config.tools.ffprobe,
             mpv=self.config.tools.mpv,
             cache_dir=self.config.paths.cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
             python=python_executable(),
             stt_model=self.config.sync.japanese_stt_model,
+            job_center=self.job_center,
         )
+        threading.Thread(
+            target=self.audiobooks.resume_pending_transcriptions,
+            name="audiobook-stt-resume",
+            daemon=True,
+        ).start()
+        self.visual_novels = VisualNovelService(logger=self.logger)
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
@@ -104,6 +126,24 @@ class WebAppApi:
         self._manga_ocr_run_lock = threading.Lock()
         self._manga_book_ocr_threads: dict[int, threading.Thread] = {}
         self._manga_book_ocr_state: dict[int, dict[str, Any]] = {}
+        self._manga_ocr_cancel_events: dict[int, threading.Event] = {}
+        self._manga_ocr_job_ids: dict[int, str] = {}
+        self._planning_episode_download_lock = threading.Lock()
+        self._planning_episode_download_thread: threading.Thread | None = None
+        self._planning_episode_cancel_event: threading.Event | None = None
+        self._planning_episode_job_id = ""
+        self._import_cancel_events: dict[str, threading.Event] = {}
+        self._planning_episode_download_state: dict[str, Any] = {
+            "status": "idle",
+            "running": False,
+            "media_id": None,
+            "title": "",
+            "total": 0,
+            "current": 0,
+            "episodes": [],
+            "started_at": 0.0,
+            "finished_at": 0.0,
+        }
         self._startup_anilist_sync_done = False
         self._startup_maintenance_done = False
         self._startup_maintenance_thread: threading.Thread | None = None
@@ -121,6 +161,26 @@ class WebAppApi:
     def close(self) -> None:
         self.energy_monitor.stop()
         self.audiobooks.stop_all()
+        self.visual_novels.stop()
+
+    def visual_novel_windows(self) -> list[dict[str, Any]]:
+        return self.visual_novels.windows()
+
+    def visual_novel_state(self) -> dict[str, Any]:
+        return self.visual_novels.state()
+
+    def visual_novel_start(self, window_id: int, title: str = "") -> dict[str, Any]:
+        return self.visual_novels.start(int(window_id), str(title or ""))
+
+    def visual_novel_stop(self) -> dict[str, Any]:
+        return self.visual_novels.stop()
+
+    def visual_novel_parse(self, text: str) -> dict[str, Any]:
+        return self.light_novels.parse_study_text(str(text or ""))
+
+    def open_screen_recording_settings(self) -> dict[str, Any]:
+        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+        return {"ok": True}
 
     def set_window(self, window: Any) -> None:
         self.window = window
@@ -1238,6 +1298,7 @@ class WebAppApi:
         return sections
 
     def _settings_payload(self) -> dict[str, Any]:
+        apply_jimaku_trial(self.config)
         cfg = self.config
         return {
             "version": __version__,
@@ -1300,7 +1361,12 @@ class WebAppApi:
             "anilist_threshold": round(cfg.anilist.watched_threshold * 100, 2),
             "anilist_max_remaining_minutes": cfg.anilist.watched_max_remaining_minutes,
             "relations_by_release_date": cfg.anilist.relations_by_release_date,
-            "jimaku_api_key": cfg.jimaku.api_key,
+            "jimaku_api_key": cfg.jimaku.personal_api_key,
+            "jimaku_trial_active": cfg.jimaku.trial_active,
+            "jimaku_trial_expires_at": cfg.jimaku.trial_expires_at,
+            "jimaku_trial_remaining_seconds": max(
+                0, int(cfg.jimaku.trial_expires_at - time.time())
+            ) if cfg.jimaku.trial_active else 0,
             "ocr_image_subtitles": cfg.matching.ocr_image_subtitles,
             "auto_upgrade_subtitles": cfg.matching.auto_upgrade_subtitles,
             "subtitle_upgrade_min_score_gain": cfg.matching.subtitle_upgrade_min_score_gain,
@@ -1878,13 +1944,53 @@ class WebAppApi:
                     "page_index": page_index,
                     "errors": [],
                 }
+            job_id = self._manga_ocr_job_ids.get(book_id, "")
+            if job_id:
+                self.job_center.update(
+                    job_id,
+                    state="running",
+                    current=done,
+                    total=total,
+                    message=f"OCR page {min(total, done + 1)}/{total}",
+                )
 
         try:
-            result = self.manga.ocr_book(book_id, progress=on_progress)
+            cancel_event = self._manga_ocr_cancel_events.get(book_id)
+            result = self.manga.ocr_book(
+                book_id,
+                progress=on_progress,
+                cancelled=cancel_event.is_set if cancel_event is not None else None,
+            )
+            if result.get("cancelled"):
+                with self._manga_book_ocr_lock:
+                    self._manga_book_ocr_state[book_id] = {
+                        **result,
+                        "state": "cancelled",
+                        "running": False,
+                        "errors": [],
+                    }
+                job_id = self._manga_ocr_job_ids.get(book_id, "")
+                if job_id:
+                    self.job_center.cancelled(job_id)
+                return
             region_texts = self.manga.cached_region_texts(book_id)
             parse_errors: list[str] = []
             parsed_count = 0
             for page_index, text in region_texts:
+                if cancel_event is not None and cancel_event.is_set():
+                    with self._manga_book_ocr_lock:
+                        self._manga_book_ocr_state[book_id] = {
+                            **result,
+                            "state": "cancelled",
+                            "running": False,
+                            "parsed_regions": parsed_count,
+                            "total_regions": len(region_texts),
+                            "errors": parse_errors,
+                        }
+                    job_id = self._manga_ocr_job_ids.get(book_id, "")
+                    if job_id:
+                        self.job_center.cancelled(job_id)
+                    return
                 with self._manga_book_ocr_lock:
                     self._manga_book_ocr_state[book_id] = {
                         **result,
@@ -1911,6 +2017,13 @@ class WebAppApi:
                     "total_regions": len(region_texts),
                     "errors": [*result.get("errors", []), *parse_errors],
                 }
+            job_id = self._manga_ocr_job_ids.get(book_id, "")
+            if job_id:
+                self.job_center.finish(
+                    job_id,
+                    message="Manga OCR ready",
+                    result={"book_id": book_id, "cached_pages": result.get("cached_pages", 0)},
+                )
         except Exception as exc:
             self.logger.exception("FAIL step=manga_ocr.book book_id=%s error=%r", book_id, str(exc))
             cache = self.manga.ocr_cache_status(book_id)
@@ -1921,6 +2034,11 @@ class WebAppApi:
                     "running": False,
                     "errors": [str(exc)],
                 }
+            job_id = self._manga_ocr_job_ids.get(book_id, "")
+            if job_id:
+                self.job_center.fail(job_id, exc)
+        finally:
+            self._manga_ocr_cancel_events.pop(book_id, None)
 
     def _run_serialized_manga_book_ocr(self, book_id: int) -> None:
         # MangaOCR is a large model. Serializing volumes prevents two imports
@@ -1928,7 +2046,12 @@ class WebAppApi:
         with self._manga_ocr_run_lock:
             self._run_manga_book_ocr(int(book_id))
 
-    def start_manga_ocr_book(self, book_id: int, refresh: bool = False) -> dict[str, Any]:
+    def start_manga_ocr_book(
+        self,
+        book_id: int,
+        refresh: bool = False,
+        attempt_of: str = "",
+    ) -> dict[str, Any]:
         book_id = int(book_id)
         if not self.manga.ocr_available():
             raise RuntimeError("MangaOCR is not installed. Install it from Settings → Reading.")
@@ -1943,6 +2066,19 @@ class WebAppApi:
                     "running": True,
                     "errors": [],
                 }
+                cancel_event = threading.Event()
+                self._manga_ocr_cancel_events[book_id] = cancel_event
+                try:
+                    title = str(self.manga._book(book_id)["title"] or f"Manga {book_id}")
+                except Exception:
+                    title = f"Manga {book_id}"
+                self._manga_ocr_job_ids[book_id] = self.job_center.start(
+                    "ocr",
+                    f"OCR · {title}",
+                    payload={"book_id": book_id},
+                    total=float(self.manga.ocr_cache_status(book_id).get("total_pages") or 0),
+                    attempt_of=str(attempt_of or ""),
+                )
                 thread = threading.Thread(
                     target=self._run_serialized_manga_book_ocr,
                     args=(book_id,),
@@ -1969,9 +2105,20 @@ class WebAppApi:
         if not result:
             return {"cancelled": True}
         selected = list(result) if isinstance(result, (list, tuple)) else [result]
+        paths = [str(value) for value in selected]
+        job_id = self.job_center.start(
+            "import",
+            "Import manga",
+            payload={"media_kind": "manga", "paths": paths},
+            total=len(paths),
+        )
+        cancel_event = threading.Event()
+        self._import_cancel_events[job_id] = cancel_event
         books: list[dict[str, Any]] = []
         errors: list[str] = []
-        for value in selected:
+        for index, value in enumerate(selected, 1):
+            if cancel_event.is_set():
+                break
             try:
                 book = self.manga.import_file(Path(str(value)))
                 books.append(book)
@@ -1979,6 +2126,24 @@ class WebAppApi:
                     self.start_manga_ocr_book(int(book["id"]))
             except Exception as exc:
                 errors.append(f"{Path(str(value)).name}: {exc}")
+            self.job_center.update(
+                job_id,
+                state="running",
+                current=index,
+                total=len(selected),
+                message=f"Imported {len(books)}/{len(selected)}",
+            )
+        self._import_cancel_events.pop(job_id, None)
+        if cancel_event.is_set():
+            self.job_center.cancelled(job_id)
+        elif books:
+            self.job_center.finish(
+                job_id,
+                message=f"Imported {len(books)}; errors {len(errors)}",
+                result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
+            )
+        else:
+            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
         return {"cancelled": False, "books": books, "errors": errors, "state": self.manga.state()}
 
     def manga_page(self, book_id: int, page_index: int) -> dict[str, Any]:
@@ -2007,6 +2172,134 @@ class WebAppApi:
     def audiobook_state(self) -> dict[str, Any]:
         return self.audiobooks.state()
 
+    def job_center_state(self) -> dict[str, Any]:
+        jobs = self.job_center.jobs()
+        return {
+            "jobs": jobs,
+            "active_count": sum(1 for job in jobs if job.get("can_cancel")),
+        }
+
+    def job_center_cancel(self, job_id: str) -> dict[str, Any]:
+        job = self.job_center.get(str(job_id))
+        if job is None:
+            raise KeyError(f"Unknown job {job_id}")
+        kind = str(job.get("kind") or "")
+        payload = job.get("payload") or {}
+        requested = self.job_center.request_cancel(str(job_id))
+        if not requested:
+            return self.job_center_state()
+        if kind == "nyaa" and str(job_id) == self._planning_episode_job_id:
+            if self._planning_episode_cancel_event is not None:
+                self._planning_episode_cancel_event.set()
+        elif kind == "ocr":
+            event = self._manga_ocr_cancel_events.get(int(payload.get("book_id") or 0))
+            if event is not None:
+                event.set()
+        elif kind == "stt":
+            self.audiobooks.cancel_transcription(int(payload.get("audiobook_id") or 0))
+        elif kind == "import":
+            event = self._import_cancel_events.get(str(job_id))
+            if event is not None:
+                event.set()
+        if kind == "import" and str(job_id) not in self._import_cancel_events:
+            self.job_center.cancelled(str(job_id))
+        return self.job_center_state()
+
+    def _retry_import_worker(
+        self,
+        job_id: str,
+        media_kind: str,
+        paths: list[str],
+        cancel_event: threading.Event,
+    ) -> None:
+        imported = 0
+        errors: list[str] = []
+        try:
+            for index, raw in enumerate(paths, 1):
+                if cancel_event.is_set():
+                    self.job_center.cancelled(job_id)
+                    return
+                path = Path(str(raw))
+                try:
+                    if media_kind == "manga":
+                        self.manga.import_file(path)
+                    elif media_kind == "audiobook_folder":
+                        self.audiobooks.import_folder(path)
+                    elif media_kind == "audiobook":
+                        self.audiobooks.import_file(path)
+                    else:
+                        book = self.light_novels.import_file(path)
+                        self.audiobooks.auto_link_light_novel(int(book["id"]))
+                    imported += 1
+                except Exception as exc:
+                    errors.append(f"{path.name}: {exc}")
+                self.job_center.update(
+                    job_id,
+                    state="running",
+                    current=index,
+                    total=len(paths),
+                    message=f"Imported {imported}/{len(paths)}",
+                )
+            if cancel_event.is_set():
+                self.job_center.cancelled(job_id)
+                return
+            if imported:
+                self.job_center.finish(
+                    job_id,
+                    message=f"Imported {imported}; errors {len(errors)}",
+                    result={"imported": imported, "errors": errors},
+                )
+            else:
+                self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
+        finally:
+            self._import_cancel_events.pop(job_id, None)
+
+    def job_center_retry(self, job_id: str) -> dict[str, Any]:
+        previous = self.job_center.get(str(job_id))
+        if previous is None:
+            raise KeyError(f"Unknown job {job_id}")
+        if not bool(previous.get("can_retry")):
+            raise ValueError("Only failed or cancelled jobs can be retried")
+        kind = str(previous.get("kind") or "")
+        payload = previous.get("payload") or {}
+        if kind == "nyaa":
+            self.start_planning_episode_download(
+                int(payload.get("media_id") or 0), attempt_of=str(job_id)
+            )
+        elif kind == "ocr":
+            self.start_manga_ocr_book(
+                int(payload.get("book_id") or 0),
+                refresh=True,
+                attempt_of=str(job_id),
+            )
+        elif kind == "stt":
+            self.audiobooks.prepare_transcription(
+                int(payload.get("audiobook_id") or 0),
+                force=True,
+                attempt_of=str(job_id),
+            )
+        elif kind == "import":
+            paths = [str(value) for value in payload.get("paths") or []]
+            media_kind = str(payload.get("media_kind") or "light_novel")
+            retry_id = self.job_center.start(
+                "import",
+                str(previous.get("title") or "Import"),
+                payload={"media_kind": media_kind, "paths": paths},
+                total=len(paths),
+                attempt_of=str(job_id),
+            )
+            event = threading.Event()
+            self._import_cancel_events[retry_id] = event
+            threading.Thread(
+                target=self._retry_import_worker,
+                args=(retry_id, media_kind, paths, event),
+                name=f"{APP_SLUG}-import-retry",
+                daemon=True,
+            ).start()
+        else:
+            raise ValueError(f"Job type {kind} cannot be retried")
+        return self.job_center_state()
+
     def choose_audiobook_file(self) -> dict[str, Any]:
         if self.window is None:
             return {"cancelled": True}
@@ -2023,13 +2316,42 @@ class WebAppApi:
         if not result:
             return {"cancelled": True}
         selected = list(result) if isinstance(result, (list, tuple)) else [result]
+        paths = [str(value) for value in selected]
+        job_id = self.job_center.start(
+            "import",
+            "Import audiobooks",
+            payload={"media_kind": "audiobook", "paths": paths},
+            total=len(paths),
+        )
+        cancel_event = threading.Event()
+        self._import_cancel_events[job_id] = cancel_event
         books: list[dict[str, Any]] = []
         errors: list[str] = []
-        for value in selected:
+        for index, value in enumerate(selected, 1):
+            if cancel_event.is_set():
+                break
             try:
                 books.append(self.audiobooks.import_file(Path(str(value))))
             except Exception as exc:
                 errors.append(f"{Path(str(value)).name}: {exc}")
+            self.job_center.update(
+                job_id,
+                state="running",
+                current=index,
+                total=len(selected),
+                message=f"Imported {len(books)}/{len(selected)}",
+            )
+        self._import_cancel_events.pop(job_id, None)
+        if cancel_event.is_set():
+            self.job_center.cancelled(job_id)
+        elif books:
+            self.job_center.finish(
+                job_id,
+                message=f"Imported {len(books)}; errors {len(errors)}",
+                result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
+            )
+        else:
+            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
         return {"cancelled": False, "books": books, "errors": errors, "state": self.audiobooks.state()}
 
     def choose_audiobook_folder(self) -> dict[str, Any]:
@@ -2043,10 +2365,32 @@ class WebAppApi:
         if not result:
             return {"cancelled": True}
         raw = result[0] if isinstance(result, (list, tuple)) else result
+        job_id = self.job_center.start(
+            "import",
+            "Import audiobook folder",
+            payload={"media_kind": "audiobook_folder", "paths": [str(raw)]},
+            total=1,
+        )
+        cancel_event = threading.Event()
+        self._import_cancel_events[job_id] = cancel_event
         try:
             book = self.audiobooks.import_folder(Path(str(raw)))
         except Exception as exc:
+            self._import_cancel_events.pop(job_id, None)
+            if cancel_event.is_set():
+                self.job_center.cancelled(job_id)
+                return {"cancelled": True, "state": self.audiobooks.state()}
+            self.job_center.fail(job_id, exc)
             return {"cancelled": False, "error": str(exc), "state": self.audiobooks.state()}
+        self._import_cancel_events.pop(job_id, None)
+        if cancel_event.is_set():
+            self.job_center.cancelled(job_id)
+            return {"cancelled": True, "state": self.audiobooks.state()}
+        self.job_center.finish(
+            job_id,
+            message="Audiobook folder imported",
+            result={"book_ids": [int(book["id"])]},
+        )
         return {"cancelled": False, "book": book, "state": self.audiobooks.state()}
 
     def audiobook_play(self, book_id: int, start: float | None = None, speed: float = 1.0) -> dict[str, Any]:
@@ -2125,6 +2469,20 @@ class WebAppApi:
             None if speed is None else float(speed),
         )
 
+    def light_novel_play_paired_at_offset(
+        self,
+        book_id: int,
+        chapter_index: int,
+        character_offset: int,
+        speed: float | None = None,
+    ) -> dict[str, Any]:
+        return self.audiobooks.play_paired_at_offset(
+            int(book_id),
+            int(chapter_index),
+            int(character_offset),
+            None if speed is None else float(speed),
+        )
+
     def light_novel_paired_state(self, book_id: int) -> dict[str, Any]:
         return self.audiobooks.paired_state(int(book_id))
 
@@ -2197,13 +2555,44 @@ class WebAppApi:
         if not result:
             return {"cancelled": True}
         selected = list(result) if isinstance(result, (list, tuple)) else [result]
+        paths = [str(value) for value in selected]
+        job_id = self.job_center.start(
+            "import",
+            "Import Light Novels",
+            payload={"media_kind": "light_novel", "paths": paths},
+            total=len(paths),
+        )
+        cancel_event = threading.Event()
+        self._import_cancel_events[job_id] = cancel_event
         books: list[dict[str, Any]] = []
         errors: list[str] = []
-        for value in selected:
+        for index, value in enumerate(selected, 1):
+            if cancel_event.is_set():
+                break
             try:
-                books.append(self.light_novels.import_file(Path(str(value))))
+                book = self.light_novels.import_file(Path(str(value)))
+                books.append(book)
+                self.audiobooks.auto_link_light_novel(int(book["id"]))
             except Exception as exc:
                 errors.append(f"{Path(str(value)).name}: {exc}")
+            self.job_center.update(
+                job_id,
+                state="running",
+                current=index,
+                total=len(selected),
+                message=f"Imported {len(books)}/{len(selected)}",
+            )
+        self._import_cancel_events.pop(job_id, None)
+        if cancel_event.is_set():
+            self.job_center.cancelled(job_id)
+        elif books:
+            self.job_center.finish(
+                job_id,
+                message=f"Imported {len(books)}; errors {len(errors)}",
+                result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
+            )
+        else:
+            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
         state = self.light_novels.state()
         return {"cancelled": False, "books": books, "book": books[0] if books else None, "errors": errors, "state": state}
 
@@ -2229,6 +2618,9 @@ class WebAppApi:
     def light_novel_finish_volume(self, book_id: int) -> dict[str, Any]:
         return self.light_novels.finish_volume(int(book_id))
 
+    def light_novel_set_finished(self, book_id: int, finished: bool) -> dict[str, Any]:
+        return self.light_novels.set_finished(int(book_id), bool(finished))
+
     def light_novel_delete(self, book_id: int) -> dict[str, Any]:
         self.audiobooks.unlink_light_novel(int(book_id))
         result = self.light_novels.delete_book(int(book_id), delete_file=False)
@@ -2236,10 +2628,73 @@ class WebAppApi:
         return result
 
     def light_novel_bind_anilist(self, book_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self.light_novels.bind_anilist(int(book_id), int(media_id), selection if isinstance(selection, dict) else None)
+        result = self.light_novels.bind_anilist(
+            int(book_id), int(media_id), selection if isinstance(selection, dict) else None
+        )
+        self.audiobooks.auto_link_light_novel(int(book_id))
+        return result
+
+    def light_novel_unbind_anilist(self, book_id: int) -> dict[str, Any]:
+        return self.light_novels.unbind_anilist(int(book_id))
 
     def light_novel_search_anilist(self, query: str) -> list[dict[str, Any]]:
         return self.light_novels.search_anilist_novels(str(query or "").strip())
+
+    def character_glossary(self, media_id: int) -> list[dict[str, str]]:
+        return self.light_novels.character_glossary(int(media_id))
+
+    def save_character_glossary_override(self, media_id: int, source: str, preferred: str) -> list[dict[str, str]]:
+        return self.light_novels.save_character_glossary_override(int(media_id), source, preferred)
+
+    def delete_character_glossary_override(self, media_id: int, source: str) -> list[dict[str, str]]:
+        return self.light_novels.delete_character_glossary_override(int(media_id), source)
+
+    def media_identity_search(self, kind: str, query: str) -> list[dict[str, Any]]:
+        normalized = str(kind or "").strip().lower()
+        if normalized in {"novel", "light_novel", "ln", "audiobook"}:
+            return self.light_novels.search_anilist_novels(str(query or "").strip())
+        if normalized == "manga":
+            return self.manga_search_anilist(str(query or "").strip())
+        return self.planning_search_anilist(str(query or "").strip())
+
+    def media_identity_current(self, kind: str, local_id: int) -> dict[str, Any]:
+        normalized = str(kind or "").strip().lower()
+        if normalized in {"novel", "light_novel", "ln"}:
+            return self.light_novels.book(int(local_id))
+        if normalized == "manga":
+            return self.manga._book(int(local_id))
+        with self.manager.db.connect() as conn:
+            row = conn.execute("SELECT * FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id))).fetchone()
+        return dict(row) if row is not None else {"kind": normalized, "local_id": int(local_id)}
+
+    def media_identity_bind(self, kind: str, local_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = str(kind or "").strip().lower()
+        item = dict(selection or {})
+        if normalized in {"novel", "light_novel", "ln"}:
+            result = self.light_novels.bind_anilist(int(local_id), int(media_id), item)
+            self.audiobooks.auto_link_light_novel(int(local_id))
+            return result
+        if normalized == "manga":
+            return self.manga_bind_anilist(int(local_id), int(media_id), item)
+        with self.manager.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO media_identities(kind,local_id,anilist_id,anilist_type,title,cover_url,site_url,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(kind,local_id) DO UPDATE SET anilist_id=excluded.anilist_id,anilist_type=excluded.anilist_type,title=excluded.title,cover_url=excluded.cover_url,site_url=excluded.site_url,updated_at=excluded.updated_at",
+                (normalized, int(local_id), int(media_id), "ANIME" if item.get("media_kind") == "anime" else "MANGA", str(item.get("title") or ""), str(item.get("cover") or ""), str(item.get("site_url") or ""), time.time()),
+            )
+        if normalized == "audiobook":
+            self.audiobooks.auto_link_audiobook(int(local_id))
+        return self.media_identity_current(normalized, int(local_id))
+
+    def media_identity_unbind(self, kind: str, local_id: int) -> dict[str, Any]:
+        normalized = str(kind or "").strip().lower()
+        if normalized in {"novel", "light_novel", "ln"}:
+            return self.light_novels.unbind_anilist(int(local_id))
+        if normalized == "manga":
+            return self.manga_unbind_anilist(int(local_id))
+        with self.manager.db.connect() as conn:
+            conn.execute("DELETE FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id)))
+        return {"kind": normalized, "local_id": int(local_id)}
 
     def set_literature_score(
         self,
@@ -2286,8 +2741,35 @@ class WebAppApi:
             deck_id=payload.get("deck_id"),
         )
 
-    def light_novel_search_nyaa(self, query: str) -> list[dict[str, Any]]:
-        return self.light_novels.search_nyaa(str(query or "").strip())
+    def light_novel_search_nyaa(
+        self,
+        query: str,
+        target_volume: int | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.light_novels.search_nyaa(
+            str(query or "").strip(),
+            target_volume=int(target_volume or 0) or None,
+        )
+
+    def audiobook_search_light_novel_nyaa(self, audiobook_id: int) -> dict[str, Any]:
+        book = self.audiobooks.book(int(audiobook_id))
+        linked = book.get("linked_light_novel") or {}
+        title = str(
+            linked.get("title")
+            or book.get("anilist_title")
+            or book.get("title")
+            or ""
+        ).strip()
+        volume = int(linked.get("volume") or 0)
+        query = self.light_novels._nyaa_title(title)
+        return {
+            "query": query,
+            "category": "3_3",
+            "target_volume": volume or None,
+            "releases": self.light_novels.search_nyaa(
+                query, target_volume=volume or None
+            ),
+        }
 
     def light_novel_download_nyaa(self, release: dict[str, Any]) -> dict[str, Any]:
         return self.light_novels.download_nyaa_release(release or {})
@@ -2312,6 +2794,9 @@ class WebAppApi:
             "jpdb_api_token": values.get("ln_jpdb_api_token", ln_current.jpdb_api_token),
             "study_backend": values.get("ln_study_backend", ln_current.study_backend),
             "show_furigana": values.get("ln_show_furigana", ln_current.show_furigana),
+            "show_pitch_accent": values.get(
+                "ln_show_pitch_accent", ln_current.show_pitch_accent
+            ),
             "custom_css": values.get("ln_custom_css", ln_current.custom_css),
             "parse_ahead": values.get("ln_parse_ahead", ln_current.parse_ahead),
             "auto_download_nyaa": values.get("ln_auto_download_nyaa", ln_current.auto_download_nyaa),
@@ -2331,6 +2816,11 @@ class WebAppApi:
         old_jimaku_key = str(cfg.jimaku.api_key or "")
         old_subtitle_dirs = tuple(str(path.expanduser()) for path in cfg.paths.subtitle_dirs)
         old_watched_dirs = tuple(str(path.expanduser()) for path in cfg.paths.download_dirs)
+        old_anilist_connection = (
+            bool(cfg.anilist.enabled),
+            str(cfg.anilist.client_id or ""),
+            str(cfg.anilist.access_token or ""),
+        )
         language = str(values.get("language", cfg.ui.language)).strip().lower()
         cfg.ui.language = language if language in {"en", "ru"} else "en"
         cfg.ui.escape_exits_fullscreen = bool(
@@ -2476,7 +2966,12 @@ class WebAppApi:
         cfg.diagnostics.energy_sample_seconds = max(
             10.0, float(values.get("energy_sample_seconds", cfg.diagnostics.energy_sample_seconds))
         )
-        cfg.jimaku.api_key = str(values.get("jimaku_api_key", cfg.jimaku.api_key)).strip()
+        personal_jimaku_key = str(
+            values.get("jimaku_api_key", cfg.jimaku.personal_api_key)
+        ).strip()
+        cfg.jimaku.personal_api_key = personal_jimaku_key
+        cfg.jimaku.api_key = personal_jimaku_key
+        apply_jimaku_trial(cfg)
         cfg.matching.ocr_image_subtitles = bool(
             values.get("ocr_image_subtitles", cfg.matching.ocr_image_subtitles)
         )
@@ -2541,9 +3036,15 @@ class WebAppApi:
             ffprobe=self.config.tools.ffprobe,
             mpv=self.config.tools.mpv,
             cache_dir=self.config.paths.cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
             python=python_executable(),
             stt_model=self.config.sync.japanese_stt_model,
         )
+        threading.Thread(
+            target=self.audiobooks.resume_pending_transcriptions,
+            name="audiobook-stt-resume",
+            daemon=True,
+        ).start()
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
@@ -2583,6 +3084,29 @@ class WebAppApi:
             except Exception as exc:
                 self.logger.warning("FALLBACK step=settings.instant_library_scan error=%r", str(exc))
 
+        new_anilist_connection = (
+            bool(self.config.anilist.enabled),
+            str(self.config.anilist.client_id or ""),
+            str(self.config.anilist.access_token or ""),
+        )
+        anilist_refresh_error = ""
+        if (
+            new_anilist_connection != old_anilist_connection
+            and new_anilist_connection[0]
+            and new_anilist_connection[1]
+            and new_anilist_connection[2]
+        ):
+            try:
+                with self._anilist_sync_lock:
+                    anilist_stats = self.manager.refresh_anilist_cache()
+                reconcile_stats["anilist"] = int(anilist_stats.get("anime") or 0)
+            except Exception as exc:
+                anilist_refresh_error = str(exc)
+                self.logger.warning(
+                    "RETRY step=settings.auto_anilist_refresh error=%r",
+                    anilist_refresh_error,
+                )
+
         folder_access = request_folder_access(
             [self.config.library.root_dir, *self.config.paths.download_dirs, *self.config.paths.subtitle_dirs]
         )
@@ -2603,6 +3127,7 @@ class WebAppApi:
                 reconcile_stats.get("ocr_invalidated")
                 or reconcile_stats.get("subtitle_requeued")
             ),
+            "anilist_refresh_error": anilist_refresh_error,
             "state": state,
         }
 
@@ -2840,7 +3365,10 @@ class WebAppApi:
         }
         cached = self._planning_search_cache.get(cache_key, ttl_seconds=24 * 3600)
         if isinstance(cached, list):
-            return [dict(item) for item in cached if isinstance(item, dict)]
+            rows = [dict(item) for item in cached if isinstance(item, dict)]
+            for item in rows:
+                item["description"] = _plain_anilist_description(item.get("description"))
+            return rows
         gql = """
         query($search:String!){
           anime:Page(page:1,perPage:8){media(search:$search,type:ANIME,sort:SEARCH_MATCH){
@@ -2880,7 +3408,7 @@ class WebAppApi:
                         or titles.get("native")
                         or "",
                         "native_title": titles.get("native") or "",
-                        "description": media.get("description") or "",
+                        "description": _plain_anilist_description(media.get("description")),
                         "year": media.get("seasonYear"),
                         "episodes": media.get("episodes"),
                         "duration": media.get("duration"),
@@ -3684,9 +4212,15 @@ class WebAppApi:
                 ffprobe=self.config.tools.ffprobe,
                 mpv=self.config.tools.mpv,
                 cache_dir=self.config.paths.cache_dir,
+                ffmpeg=self.config.tools.ffmpeg,
                 python=python_executable(),
                 stt_model=self.config.sync.japanese_stt_model,
             )
+            threading.Thread(
+                target=self.audiobooks.resume_pending_transcriptions,
+                name="audiobook-stt-resume",
+                daemon=True,
+            ).start()
             self._planning_search_cache = MetadataCache(
                 self.config.paths.cache_dir,
                 "anilist-planning-search",
@@ -3790,6 +4324,269 @@ class WebAppApi:
             int(media_id), item, episode=episode, batch=bool(batch)
         )
         return {"ok": True, "added": bool(added), "already_downloading": not added}
+
+    def add_best_planning_episode(self, media_id: int, episode: int) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            raise KeyError(f"Unknown AniList id={media_id}")
+        finished = str(anime.media_status or "").upper() == "FINISHED"
+        available = int(
+            (anime.episodes if finished else anime.released_episodes)
+            or max(0, int(anime.next_airing_episode or 1) - 1)
+            or 0
+        )
+        episode = int(episode)
+        if episode < 1 or (available and episode > available):
+            raise ValueError(f"Episode {episode} is not released")
+        local = self._local_episode_for_relative(anime, episode)
+        if local is not None and local.video_path.is_file():
+            return {
+                "ok": True,
+                "episode": episode,
+                "local": True,
+                "release": None,
+            }
+        release = self.manager.search_and_add_best(
+            int(media_id),
+            episode=episode,
+            batch=False,
+            # This is a user-requested background job, not the short periodic
+            # agent pass. Use the complete alias search so later title aliases
+            # such as "Goodbye Lara" are not lost to the automatic time budget.
+            automatic=False,
+        )
+        return {
+            "ok": release is not None,
+            "episode": episode,
+            "local": False,
+            "release": asdict(release) if release is not None else None,
+        }
+
+    @staticmethod
+    def _planning_released_episode_count(anime: LibraryAnime) -> int:
+        finished = str(anime.media_status or "").upper() == "FINISHED"
+        if finished:
+            return max(0, int(anime.episodes or anime.released_episodes or 0))
+        before_next = max(0, int(anime.next_airing_episode or 1) - 1)
+        return max(0, int(anime.released_episodes or 0), before_next, int(anime.progress or 0))
+
+    def _planning_local_episodes(
+        self,
+        anime: LibraryAnime,
+        total: int,
+        *,
+        manager: AnimeManager | None = None,
+    ) -> list[int]:
+        active_manager = manager or self.manager
+        local: list[int] = []
+        rows = active_manager.db.episodes(anime.media_id)
+        for episode in range(1, int(total) + 1):
+            match = next(
+                (
+                    item
+                    for item in rows
+                    if item.video_path.is_file()
+                    and self._display_episode_number(anime, item.episode) == episode
+                ),
+                None,
+            )
+            if match is not None:
+                local.append(episode)
+        return local
+
+    def planning_episode_download_preview(self, media_id: int) -> dict[str, Any]:
+        media_id = int(media_id)
+        anime = self.manager.db.get_anime(media_id)
+        if anime is None:
+            raise KeyError(f"Unknown AniList id={media_id}")
+        if self._downloads_enabled():
+            try:
+                self.manager.sync_downloads()
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=planning_episode.preview_downloads media_id=%s error=%r",
+                    media_id,
+                    str(exc),
+                )
+        self.manager.scan_library()
+        total = self._planning_released_episode_count(anime)
+        return {
+            "media_id": media_id,
+            "title": anime.title,
+            "total": total,
+            "local_episodes": self._planning_local_episodes(anime, total),
+        }
+
+    def _planning_episode_download_payload(self) -> dict[str, Any]:
+        with self._planning_episode_download_lock:
+            payload = dict(self._planning_episode_download_state)
+            payload["episodes"] = [
+                dict(item) for item in self._planning_episode_download_state.get("episodes", [])
+            ]
+            thread = self._planning_episode_download_thread
+            payload["running"] = bool(thread is not None and thread.is_alive())
+        return payload
+
+    def planning_episode_download_status(self) -> dict[str, Any]:
+        return self._planning_episode_download_payload()
+
+    def _run_planning_episode_download(
+        self,
+        manager: AnimeManager,
+        anime: LibraryAnime,
+        total: int,
+    ) -> None:
+        media_id = int(anime.media_id)
+        results: list[dict[str, Any]] = []
+        cancelled = False
+        try:
+            if manager.downloads_enabled():
+                try:
+                    manager.sync_downloads()
+                except Exception as exc:
+                    self.logger.warning(
+                        "FALLBACK step=planning_episode.downloads media_id=%s error=%r",
+                        media_id,
+                        str(exc),
+                    )
+            manager.scan_library()
+            local_episodes = set(
+                self._planning_local_episodes(anime, total, manager=manager)
+            )
+            for episode in range(1, total + 1):
+                cancel_event = getattr(self, "_planning_episode_cancel_event", None)
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
+                with self._planning_episode_download_lock:
+                    self._planning_episode_download_state["current"] = episode
+                if episode in local_episodes:
+                    results.append({"episode": episode, "status": "local", "error": ""})
+                else:
+                    try:
+                        release = manager.search_and_add_best(
+                            media_id,
+                            episode=episode,
+                            batch=False,
+                            automatic=False,
+                        )
+                        results.append(
+                            {
+                                "episode": episode,
+                                "status": "added" if release is not None else "missing",
+                                "release": release.title if release is not None else "",
+                                "error": "",
+                            }
+                        )
+                    except Exception as exc:
+                        self.logger.exception(
+                            "FAIL step=planning_episode.download media_id=%s episode=%s",
+                            media_id,
+                            episode,
+                        )
+                        results.append(
+                            {"episode": episode, "status": "error", "error": str(exc)}
+                        )
+                with self._planning_episode_download_lock:
+                    self._planning_episode_download_state["episodes"] = [
+                        dict(item) for item in results
+                    ]
+                job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
+                if job_id and getattr(self, "job_center", None) is not None:
+                    self.job_center.update(
+                        job_id,
+                        state="running",
+                        current=episode,
+                        total=total,
+                        message=f"Episode {episode}/{total}",
+                    )
+            status = "cancelled" if cancelled else "done"
+        except Exception as exc:
+            self.logger.exception(
+                "FAIL step=planning_episode.batch media_id=%s", media_id
+            )
+            results.append({"episode": None, "status": "error", "error": str(exc)})
+            status = "failed"
+        finally:
+            with self._planning_episode_download_lock:
+                self._planning_episode_download_state.update(
+                    {
+                        "status": status,
+                        "running": False,
+                        "current": total,
+                        "episodes": [dict(item) for item in results],
+                        "finished_at": time.time(),
+                    }
+                )
+            job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
+            if job_id and getattr(self, "job_center", None) is not None:
+                if status == "done":
+                    self.job_center.finish(
+                        job_id,
+                        message="Episode search complete",
+                        result={"media_id": media_id, "episodes": results},
+                    )
+                elif status == "cancelled":
+                    self.job_center.cancelled(job_id)
+                else:
+                    error = next(
+                        (row.get("error") for row in reversed(results) if row.get("error")),
+                        "Episode search failed",
+                    )
+                    self.job_center.fail(job_id, error)
+
+    def start_planning_episode_download(
+        self, media_id: int, attempt_of: str = ""
+    ) -> dict[str, Any]:
+        media_id = int(media_id)
+        anime = self.manager.db.get_anime(media_id)
+        if anime is None:
+            raise KeyError(f"Unknown AniList id={media_id}")
+        total = self._planning_released_episode_count(anime)
+        if total < 1:
+            raise ValueError("No released episodes")
+        with self._planning_episode_download_lock:
+            running = self._planning_episode_download_thread
+            if running is not None and running.is_alive():
+                return self._planning_episode_download_payload_unlocked()
+            self._planning_episode_download_state = {
+                "status": "running",
+                "running": True,
+                "media_id": media_id,
+                "title": anime.title,
+                "total": total,
+                "current": 0,
+                "episodes": [],
+                "started_at": time.time(),
+                "finished_at": 0.0,
+            }
+            self._planning_episode_cancel_event = threading.Event()
+            self._planning_episode_job_id = self.job_center.start(
+                "nyaa",
+                f"Nyaa · {anime.title}",
+                payload={"media_id": media_id},
+                total=total,
+                attempt_of=str(attempt_of or ""),
+            )
+            manager = self.manager
+            thread = threading.Thread(
+                target=self._run_planning_episode_download,
+                args=(manager, anime, total),
+                name=f"{APP_SLUG}-planning-episodes-{media_id}",
+                daemon=True,
+            )
+            self._planning_episode_download_thread = thread
+            thread.start()
+            return self._planning_episode_download_payload_unlocked()
+
+    def _planning_episode_download_payload_unlocked(self) -> dict[str, Any]:
+        payload = dict(self._planning_episode_download_state)
+        payload["episodes"] = [
+            dict(item) for item in self._planning_episode_download_state.get("episodes", [])
+        ]
+        thread = self._planning_episode_download_thread
+        payload["running"] = bool(thread is not None and thread.is_alive())
+        return payload
 
 
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):

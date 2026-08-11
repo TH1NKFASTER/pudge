@@ -142,6 +142,12 @@ def test_reader_settings_round_trip(tmp_path: Path) -> None:
         "reader_indent": 1.5,
         "reader_vertical": True,
         "reader_mode": "pages",
+        "word_color_theme": "underline",
+        "word_color_new": "#123456",
+        "word_color_learning": "#234567",
+        "word_color_due": "#345678",
+        "word_color_known": "#456789",
+        "word_color_blacklisted": "#56789a",
     })
     assert payload["reader_font"] == "mincho"
     assert payload["reader_theme"] == "sepia"
@@ -149,10 +155,14 @@ def test_reader_settings_round_trip(tmp_path: Path) -> None:
     assert payload["reader_width"] == 777
     assert payload["reader_vertical"] is True
     assert payload["reader_mode"] == "pages"
+    assert payload["word_color_theme"] == "underline"
+    assert payload["word_color_due"] == "#345678"
     service2 = LightNovelService(service.config)
     restored = service2.settings_payload()
     assert restored["reader_line_height"] == 2.1
     assert restored["reader_indent"] == 1.5
+    assert restored["word_color_new"] == "#123456"
+    assert restored["word_color_blacklisted"] == "#56789a"
 
 
 def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
@@ -174,7 +184,8 @@ def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
     for control in (
         'lnrFont', 'lnrFontSize', 'lnrTheme', 'lnrTextColor', 'lnrBgColor',
         'lnrWidth', 'lnrLineHeight', 'lnrIndent', 'lnrVertical', 'lnrMode',
-        'lnrFurigana', 'lnrCustomCss',
+        'lnrFurigana', 'lnrWordTheme', 'lnrWordNew', 'lnrWordLearning',
+        'lnrWordDue', 'lnrWordKnown', 'lnrWordBlacklisted', 'lnrCustomCss',
     ):
         assert control in html
     settings_block = html[html.index("function renderSettings(){"):html.index("function fillSettings")]

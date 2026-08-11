@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.2"
+version = "0.7.3"
 description = "macOS anime library manager with AniList, Nyaa, qBittorrent, mpv and Japanese subtitles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,7 +41,7 @@ pudge-agent = "pudge.agent:main"
 include = ["pudge*"]
 
 [tool.setuptools.package-data]
-pudge = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "assets/*.png", "THIRD_PARTY_NOTICES.md"]
+pudge = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "assets/*", "THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

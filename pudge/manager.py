@@ -19,6 +19,7 @@ from .branding import APP_SLUG, LEGACY_APP_NAMES, LEGACY_APP_SLUGS
 from .database import Database
 from .filename import parse_anime_filename, title_similarity
 from .language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS
+from .jimaku_trial import apply_jimaku_trial
 from .library import (
     VIDEO_EXTENSIONS,
     japanese_subtitle_details,
@@ -2059,8 +2060,14 @@ class AnimeManager:
         episode: int | None,
         batch: bool,
         require_score: float | None = None,
+        automatic: bool = False,
     ) -> NyaaRelease | None:
-        releases = self.search_releases(media_id, episode=episode, batch=batch)
+        releases = self.search_releases(
+            media_id,
+            episode=episode,
+            batch=batch,
+            automatic=bool(automatic),
+        )
         threshold = self.config.nyaa.min_release_score if require_score is None else require_score
         best = next(
             (
@@ -3109,6 +3116,7 @@ class AnimeManager:
         The current selection is preserved in state and restored unless the new
         candidate improves the recorded score by the configured threshold.
         """
+        apply_jimaku_trial(self.config)
         if not self.config.matching.auto_upgrade_subtitles and not force:
             return 0
         if not self.config.jimaku.api_key.strip():
@@ -3417,6 +3425,7 @@ class AnimeManager:
         *,
         preferred_paths: tuple[Path, ...] | list[Path] | None = None,
     ) -> int:
+        apply_jimaku_trial(self.config)
         if foreground_active(self.config.paths.cache_dir):
             self.logger.info(
                 "SKIP step=subtitle.process reason=foreground_active limit=%s", limit
@@ -3861,7 +3870,7 @@ class AnimeManager:
                 # a PGS/SUP path ready merely because the subprocess exited 0.
                 attempts = int(job["attempts"] or 0) + 1
                 delay = self.config.agent.subtitle_poll_minutes * 60
-                if attempts >= 3 and not self.config.matching.ocr_image_subtitles:
+                if not self.config.matching.ocr_image_subtitles:
                     self.db.mark_subtitle_job_needs_action(
                         video,
                         "Only image subtitles are available; OCR is disabled",

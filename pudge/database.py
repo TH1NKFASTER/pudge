@@ -9,6 +9,7 @@ from typing import Iterable, Iterator
 
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from .episode_state import transition_episode_state, stronger_episode_state
 
 
 SCHEMA = """
@@ -100,6 +101,38 @@ CREATE TABLE IF NOT EXISTS subtitle_jobs (
     updated_at REAL NOT NULL,
     FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS episode_state_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_path TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    trigger TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_episode_state_history_video
+ON episode_state_history(video_path,created_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    current REAL NOT NULL DEFAULT 0,
+    total REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    attempt_of TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    finished_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_jobs_state_updated
+ON app_jobs(state,updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS release_history (
     info_hash TEXT PRIMARY KEY,
@@ -368,9 +401,29 @@ CREATE TABLE IF NOT EXISTS reading_audio_links (
     updated_at REAL NOT NULL,
     FOREIGN KEY(audiobook_id) REFERENCES audiobooks(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS character_name_overrides (
+    media_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    preferred TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(media_id,source)
+);
+
+CREATE TABLE IF NOT EXISTS media_identities (
+    kind TEXT NOT NULL,
+    local_id INTEGER NOT NULL,
+    anilist_id INTEGER NOT NULL,
+    anilist_type TEXT NOT NULL DEFAULT 'MANGA',
+    title TEXT NOT NULL DEFAULT '',
+    cover_url TEXT NOT NULL DEFAULT '',
+    site_url TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(kind,local_id)
+);
 """
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 class Database:
@@ -393,6 +446,9 @@ class Database:
             conn.execute("PRAGMA user_version=2")
         if version < 3:
             self._migrate_v3(conn)
+            conn.execute("PRAGMA user_version=3")
+        if version < 4:
+            self._migrate_v4(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -550,6 +606,30 @@ class Database:
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 FOREIGN KEY(audiobook_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+    def _migrate_v4(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS character_name_overrides (
+                media_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                preferred TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(media_id,source)
+            );
+            CREATE TABLE IF NOT EXISTS media_identities (
+                kind TEXT NOT NULL,
+                local_id INTEGER NOT NULL,
+                anilist_id INTEGER NOT NULL,
+                anilist_type TEXT NOT NULL DEFAULT 'MANGA',
+                title TEXT NOT NULL DEFAULT '',
+                cover_url TEXT NOT NULL DEFAULT '',
+                site_url TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(kind,local_id)
             );
             """
         )
@@ -888,6 +968,14 @@ class Database:
     def upsert_episode(self, episode: LibraryEpisode, *, downloaded_at: float | None = None) -> None:
         now = time.time()
         with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT state FROM episodes WHERE video_path=?", (str(episode.video_path),)
+            ).fetchone()
+            requested_state = transition_episode_state(
+                str(previous["state"]) if previous is not None else "local",
+                episode.state,
+                trigger="scan",
+            )
             conn.execute(
                 """
                 INSERT INTO episodes(
@@ -899,27 +987,23 @@ class Database:
                     title=excluded.title,episode=COALESCE(excluded.episode,episodes.episode),
                     subtitle_path=CASE
                         WHEN excluded.subtitle_path IS NOT NULL THEN excluded.subtitle_path
-                        WHEN episodes.state IN ('ready','watched') THEN episodes.subtitle_path
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        THEN episodes.subtitle_path
                         ELSE NULL
                     END,
                     embedded_subtitle_id=CASE
                         WHEN excluded.embedded_subtitle_id IS NOT NULL THEN excluded.embedded_subtitle_id
-                        WHEN episodes.state IN ('ready','watched') THEN episodes.embedded_subtitle_id
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        THEN episodes.embedded_subtitle_id
                         ELSE NULL
                     END,
                     subtitle_origin=CASE
                         WHEN excluded.subtitle_origin!='' THEN excluded.subtitle_origin
-                        WHEN episodes.state IN ('ready','watched') THEN episodes.subtitle_origin
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        THEN episodes.subtitle_origin
                         ELSE ''
                     END,
-                    state=CASE
-                        WHEN episodes.state='watched' THEN 'watched'
-                        WHEN episodes.state='dropped' THEN 'dropped'
-                        WHEN episodes.state='ready'
-                             AND excluded.state IN ('local','waiting_subtitles')
-                        THEN 'ready'
-                        ELSE excluded.state
-                    END,
+                    state=excluded.state,
                     torrent_hash=CASE WHEN excluded.torrent_hash!='' THEN excluded.torrent_hash ELSE episodes.torrent_hash END,
                     downloaded_at=COALESCE(excluded.downloaded_at,episodes.downloaded_at),
                     watched_at=COALESCE(excluded.watched_at,episodes.watched_at),
@@ -934,7 +1018,7 @@ class Database:
                     str(episode.subtitle_path) if episode.subtitle_path else None,
                     episode.embedded_subtitle_id,
                     episode.subtitle_origin,
-                    episode.state,
+                    requested_state,
                     episode.torrent_hash,
                     downloaded_at,
                     episode.watched_at,
@@ -942,6 +1026,40 @@ class Database:
                     now,
                 ),
             )
+            if previous is not None and str(previous["state"]) != requested_state:
+                conn.execute(
+                    "INSERT INTO episode_state_history(video_path,from_state,to_state,trigger,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (str(episode.video_path), str(previous["state"]), requested_state, "scan", now),
+                )
+
+    @staticmethod
+    def _transition_episode(
+        conn: sqlite3.Connection,
+        video_path: Path,
+        requested: str,
+        *,
+        trigger: str,
+    ) -> str:
+        row = conn.execute(
+            "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
+        ).fetchone()
+        if row is None:
+            return str(requested)
+        current = str(row["state"] or "local")
+        resolved = transition_episode_state(current, requested, trigger=trigger)
+        if resolved != current:
+            now = time.time()
+            conn.execute(
+                "UPDATE episodes SET state=?,updated_at=? WHERE video_path=?",
+                (resolved, now, str(video_path)),
+            )
+            conn.execute(
+                "INSERT INTO episode_state_history(video_path,from_state,to_state,trigger,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (str(video_path), current, resolved, str(trigger), now),
+            )
+        return resolved
 
     def episodes(self, media_id: int | None = None) -> list[LibraryEpisode]:
         sql = "SELECT * FROM episodes"
@@ -1132,19 +1250,23 @@ class Database:
                 "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
             ).fetchone()
             now = time.time()
+            resolved = self._transition_episode(
+                conn, video_path, "ready", trigger="subtitle_ready"
+            )
             conn.execute(
                 "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=?,subtitle_origin=?,"
-                "state='ready',updated_at=? WHERE video_path=?",
+                "state=?,updated_at=? WHERE video_path=?",
                 (
                     str(subtitle_path) if subtitle_path else None,
                     embedded_subtitle_id,
                     str(origin or ""),
+                    resolved,
                     now,
                     str(video_path),
                 ),
             )
             conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),))
-            if previous is not None and str(previous["state"] or "") != "ready":
+            if previous is not None and str(previous["state"] or "") != resolved and resolved == "ready":
                 version = str(time.time_ns())
                 conn.execute(
                     "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
@@ -1161,12 +1283,16 @@ class Database:
     ) -> None:
         """Keep a bitmap fallback for Library-only playback and retry text subs."""
         with self.connect() as conn:
+            resolved = self._transition_episode(
+                conn, video_path, "waiting_text_subtitles", trigger="bitmap_detected"
+            )
             conn.execute(
                 "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=?,subtitle_origin='bitmap',"
-                "state='waiting_text_subtitles',updated_at=? WHERE video_path=?",
+                "state=?,updated_at=? WHERE video_path=?",
                 (
                     str(subtitle_path) if subtitle_path else None,
                     embedded_subtitle_id,
+                    resolved,
                     time.time(),
                     str(video_path),
                 ),
@@ -1175,10 +1301,13 @@ class Database:
     def clear_subtitle_selection(self, video_path: Path) -> None:
         """Drop a stale prepared subtitle while keeping the retry job intact."""
         with self.connect() as conn:
+            resolved = self._transition_episode(
+                conn, video_path, "waiting_subtitles", trigger="subtitle_invalidated"
+            )
             conn.execute(
                 "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
-                "state='waiting_subtitles',updated_at=? WHERE video_path=?",
-                (time.time(), str(video_path)),
+                "state=?,updated_at=? WHERE video_path=?",
+                (resolved, time.time(), str(video_path)),
             )
 
     def repair_bitmap_ready_rows(self) -> int:
@@ -2407,14 +2536,6 @@ class Database:
         if old_value == new_value:
             return False
 
-        state_rank = {
-            "dropped": 0,
-            "local": 1,
-            "waiting_subtitles": 2,
-            "waiting_text_subtitles": 3,
-            "ready": 4,
-            "watched": 5,
-        }
         now = time.time()
         with self.connect() as conn:
             old = conn.execute("SELECT * FROM episodes WHERE video_path=?", (old_value,)).fetchone()
@@ -2430,7 +2551,7 @@ class Database:
             else:
                 old_state = str(old["state"] or "local")
                 new_state = str(new["state"] or "local")
-                state = old_state if state_rank.get(old_state, 1) > state_rank.get(new_state, 1) else new_state
+                state = stronger_episode_state(old_state, new_state)
 
                 old_playback_at = float(old["playback_updated_at"] or 0.0)
                 new_playback_at = float(new["playback_updated_at"] or 0.0)

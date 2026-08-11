@@ -4,6 +4,7 @@ import urllib.request
 from pathlib import Path
 
 from pudge.config import AppConfig, write_config
+from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime
 from pudge.web_app import WebAppApi, _start_asset_server
 
@@ -61,6 +62,40 @@ def test_save_settings_persists_api_keys(tmp_path: Path) -> None:
     assert api.config.llm.api_key == "llm-key"
     assert api.config.qbittorrent.api_key == "qbt-key"
     assert api.config.ui.language == "en"
+
+
+def test_changed_anilist_credentials_refresh_automatically(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    api = make_api(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AnimeManager,
+        "refresh_anilist_cache",
+        lambda self: calls.append(self.config.anilist.access_token)
+        or {"anime": 3, "covers": 3},
+    )
+
+    first = api.save_settings(
+        {
+            "anilist_enabled": True,
+            "anilist_client_id": "12345",
+            "anilist_token": "new-token",
+        }
+    )
+    second = api.save_settings(
+        {
+            "anilist_enabled": True,
+            "anilist_client_id": "12345",
+            "anilist_token": "new-token",
+        }
+    )
+
+    assert first["anilist_refresh_error"] == ""
+    assert first["reconcile"]["anilist"] == 3
+    assert second["reconcile"].get("anilist") is None
+    assert calls == ["new-token"]
 
 
 def test_asset_server_serves_web_ui(tmp_path: Path) -> None:
@@ -876,7 +911,9 @@ def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> No
     assert "section.additional" in html
     assert "runSetupGuide" in html
     assert "onboardingSkip" in html
-    assert "https://jimaku.cc/api/docs" in html
+    assert "https://jimaku.cc/account" in html
+    assert "https://jimaku.cc/profile" not in html
+    assert "https://jimaku.cc/api/docs" not in html
     assert "https://anilist.co/settings/developer" in html
     assert "if(ui.state.settings.onboarding_completed)void startupSequence();else showOnboarding(false);" in html
 

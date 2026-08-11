@@ -554,6 +554,7 @@
 
   function activateTextRegion(target) {
     if (!target || !currentBook) return;
+    if (target.classList.contains('active') && target.querySelector('.manga-v2-region-content')) return;
     for (const active of document.querySelectorAll('.manga-v2-text-region.active')) {
       if (active !== target) deactivateTextRegion(active);
     }
@@ -702,12 +703,13 @@
     const link = `<button data-manga-context-action="anilist-search">${linked
       ? (ru() ? 'Изменить AniList' : 'Change AniList')
       : (ru() ? 'Найти в AniList' : 'Find on AniList')}</button>`;
+    const names = linked ? `<button data-manga-context-action="names">${ru() ? 'Имена персонажей' : 'Character names'}</button>` : '';
     const ocr = book.ocr_complete
       ? (ru() ? 'Повторить OCR тома' : 'Rebuild volume OCR')
       : (ru() ? 'OCR тома' : 'OCR volume');
     menu.innerHTML = `
       <button data-manga-context-action="read">${ru() ? 'Читать' : 'Read'}</button>
-      ${openAniList}${score}${link}
+      ${openAniList}${score}${link}${names}
       <button data-manga-context-action="ocr-book">${ocr}</button>`;
     positionMangaContextMenu(menu, x, y);
   }
@@ -1066,6 +1068,8 @@
         await window.PudgeMedia?.showMangaAniListSearch?.(
           Number(book.id), seriesTitle(book),
         );
+      } else if (type === 'names') {
+        await window.showCharacterGlossaryEditor?.(anilistId(book), seriesTitle(book));
       } else if (type === 'ocr-book') {
         void startLibraryBookOcr(book, Boolean(book.ocr_complete));
       }

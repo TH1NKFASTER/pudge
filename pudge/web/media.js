@@ -13,6 +13,7 @@
   let openPage = 0;
   let mangaAniListBookId = null;
   let mangaAniListResults = [];
+  let audioLnNyaaRows = [];
   let pageLoadToken = 0;
   let ocrRequestToken = 0;
   const mangaOcrPollers = new Map();
@@ -24,12 +25,16 @@
     root.innerHTML = `<div class="media-head"><div><h2>${ru()?'Манга':'Manga'}</h2><p>${ru()?'CBZ/ZIP, чтение справа налево. OCR можно сделать заранее для всей книги.':'CBZ/ZIP, right-to-left reading. OCR can be precomputed for the whole book.'}</p></div><button id="mangaImport" class="primary">${ru()?'Добавить CBZ':'Add CBZ'}</button></div><div class="media-grid">${books.map(book => {const cached=Number(book.ocr_cached_pages||0),total=Number(book.page_count||0),ready=!!book.ocr_complete;const cover=book.cover_url?`<img class="media-card-art" src="${esc(book.cover_url)}" alt="" style="object-fit:cover">`:`<div class="media-card-art">漫</div>`;const anilist=book.anilist_id?`<button data-media-action="open-manga-anilist" data-url="${esc(book.site_url||`https://anilist.co/manga/${book.anilist_id}`)}">AniList</button><button data-media-action="find-manga-anilist" data-id="${book.id}" data-title="${esc(book.title)}">${ru()?'Изменить связь':'Change link'}</button>`:`<button data-media-action="find-manga-anilist" data-id="${book.id}" data-title="${esc(book.title)}">${ru()?'Найти в AniList':'Find on AniList'}</button>`;return `<article class="media-card">${cover}<strong>${esc(book.title)}</strong><span>${Number(book.position||0)+1} / ${book.page_count}</span><button data-media-action="read-manga" data-id="${book.id}">${ru()?'Читать':'Read'}</button>${anilist}<button data-media-action="ocr-all-manga" data-id="${book.id}" ${ready?'disabled':''}>${ready?(ru()?'OCR готов':'OCR ready'):(cached?`OCR ${cached}/${total}`:(ru()?'OCR всей манги':'OCR whole manga'))}</button></article>`}).join('')}</div>${books.length?'':`<div class="empty">${ru()?'Добавьте CBZ или ZIP с изображениями страниц.':'Add a CBZ or ZIP containing page images.'}</div>`}`;
   };
 
-  const audioSpeed = bookId => {
+  const savedAudioSpeed = bookId => {
     const key=`pudge.audiobook.speed.${Number(bookId)}`;
     const value=Number(localStorage.getItem(key)||1);
     return [0.75,1,1.25,1.5,1.75,2,2.5,3].includes(value)?value:1;
   };
-  const saveAudioSpeed = (bookId,value) => localStorage.setItem(`pudge.audiobook.speed.${Number(bookId)}`,String(value));
+  const audioSpeed = bookId => {
+    const book=(audioState.books||[]).find(item=>Number(item.id)===Number(bookId));
+    const value=Number(book?.speed??savedAudioSpeed(bookId));
+    return [0.75,1,1.25,1.5,1.75,2,2.5,3].includes(value)?value:1;
+  };
   const formatAudioTime = value => {
     const total = Math.max(0, Math.floor(Number(value || 0)));
     const hours = Math.floor(total / 3600);
@@ -39,22 +44,36 @@
       ? `${hours}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`
       : `${minutes}:${String(seconds).padStart(2,'0')}`;
   };
+  const audioPreparation = transcription => {
+    const status=String(transcription?.status||'');
+    if (!status || transcription?.ready) return '';
+    if (status==='error') return `<div class="audiobook-preparation danger">${ru()?'Разбор аудио завершился ошибкой':'Audio analysis failed'}${transcription.error?`: ${esc(transcription.error)}`:''}</div>`;
+    const percent=Math.max(0,Math.min(100,Math.round(Number(transcription.progress_percent||0))));
+    const label=status==='queued'?(ru()?'Разбор аудио ожидает запуска':'Audio analysis is queued'):(ru()?'Разбор аудио':'Audio analysis');
+    return `<div class="audiobook-preparation"><div><strong>${label}</strong><span>${percent}%</span></div><progress max="100" value="${percent}"></progress></div>`;
+  };
   const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
   const renderAudio = () => {
     const root = $('audiobooksContent');
     if (!root) return;
+    const openChapterBooks=new Set(
+      [...root.querySelectorAll('.audiobook-chapters[open][data-book-id]')]
+        .map(node=>Number(node.dataset.bookId))
+        .filter(Number.isFinite)
+    );
     const books = audioState.books || [];
     const fileBusy=audioImportBusy==='file',folderBusy=audioImportBusy==='folder';
     root.innerHTML = `<div class="media-head"><div><h2>${ru()?'Аудиокниги':'Audiobooks'}</h2><p>${ru()?'Продолжайте с сохранённого места, меняйте скорость и переходите по главам.':'Resume where you left off, change speed, and jump between chapters.'}</p></div><div class="setting-inline-actions"><button id="audiobookImport" class="primary" ${audioImportBusy?'disabled':''}>${fileBusy?(ru()?'Добавляю…':'Adding…'):(ru()?'Добавить файл':'Add file')}</button><button id="audiobookImportFolder" ${audioImportBusy?'disabled':''}>${folderBusy?(ru()?'Сканирую папку…':'Scanning folder…'):(ru()?'Добавить папку':'Add folder')}</button></div></div>${audioImportBusy?`<div class="audiobook-import-status"><span class="audiobook-pulse"></span>${folderBusy?(ru()?'Читаю файлы и главы. Большие папки могут занять немного времени.':'Reading files and chapters. Large folders can take a little while.'):(ru()?'Читаю метаданные аудиокниги…':'Reading audiobook metadata…')}</div>`:''}<div class="audiobook-list">${books.map(book => {
       const pct=book.duration?Math.min(100,book.position/book.duration*100):0;
       const remaining=Math.max(0,Number(book.duration||0)-Number(book.position||0));
-      const speed=Number(book.speed||audioSpeed(book.id));
+      const speed=Number(book.speed??audioSpeed(book.id));
       const play=book.playing?`<button class="primary" data-media-action="stop-audio" data-id="${book.id}">${ru()?'Стоп':'Stop'}</button>`:`<button class="primary" data-media-action="play-audio" data-id="${book.id}">${book.position>1?(ru()?'Продолжить':'Resume'):(ru()?'Слушать':'Play')}</button>`;
       const speeds=[0.75,1,1.25,1.5,1.75,2,2.5,3].map(value=>`<option value="${value}" ${value===speed?'selected':''}>${value}×</option>`).join('');
       const bookmarks=(book.bookmarks||[]).map(mark=>`<button class="audiobook-bookmark" data-media-action="seek-audio-to" data-id="${book.id}" data-position="${Number(mark.position||0)}">${esc(mark.title||formatAudioTime(mark.position))}<span data-media-action="delete-audio-bookmark" data-bookmark-id="${Number(mark.id)}">×</span></button>`).join('');
-      return `<article class="audiobook-card ${book.playing?'playing':''}"><div class="audiobook-main"><div class="audiobook-title-row"><strong>${esc(book.title)}</strong>${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span>${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"></div><div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="30">+30s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters"><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map(chapter=>`<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapter.start}">${esc(chapter.title)}</button>`).join('')}</div></details>`:''}</article>`
+      return `<article class="audiobook-card ${book.playing?'playing':''}"><div class="audiobook-main"><div class="audiobook-title-row"><strong>${esc(book.title)}</strong>${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span>${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">+15s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map(chapter=>`<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapter.start}">${esc(chapter.title)}</button>`).join('')}</div></details>`:''}</article>`
     }).join('')}</div>${books.length?'':`<div class="empty">${ru()?'Поддерживаются отдельные аудиофайлы и папки, где каждый файл — отдельная глава.':'Single audio files and folders where each file is a chapter are supported.'}</div>`}`;
+    [...root.querySelectorAll('.audiobook-controls')].forEach((controls,index)=>{const book=books[index];if(!book)return;const card=controls.closest('.audiobook-card'),before=controls.querySelector('.danger-action');if(book.cover_url&&card){card.classList.add('has-cover');const cover=document.createElement(book.anilist_id?'button':'div');cover.className='audiobook-cover';if(book.anilist_id){cover.dataset.mediaAction='open-audio-cover';cover.dataset.url=String(book.anilist_site_url||`https://anilist.co/manga/${book.anilist_id}`);cover.title='AniList';}cover.innerHTML=`<img src="${esc(book.cover_url)}" alt="">`;card.prepend(cover);}const identity=document.createElement('button');identity.dataset.mediaAction='identify-audio';identity.dataset.id=String(book.id);identity.dataset.title=String(book.title||'');identity.textContent=book.anilist_id?(ru()?'Изменить AniList':'Change AniList'):'AniList';controls.insertBefore(identity,before);const search=document.createElement('button');search.dataset.mediaAction='find-audio-ln';search.dataset.id=String(book.id);search.textContent=ru()?'Найти LN на Nyaa':'Find LN on Nyaa';controls.insertBefore(search,before);});
   };
 
   const loadManga = async () => {
@@ -71,8 +90,11 @@
     renderAudio();
     window.updateCount?.();
     if (audioPollTimer) clearTimeout(audioPollTimer);
-    if ((audioState.books||[]).some(book=>book.playing) && document.querySelector('.nav button[data-page="audiobooks"]')?.classList.contains('active')) {
-      audioPollTimer=setTimeout(()=>void loadAudio(),1500);
+    const active=document.querySelector('.nav button[data-page="audiobooks"]')?.classList.contains('active');
+    const playing=(audioState.books||[]).some(book=>book.playing);
+    const busy=(audioState.books||[]).some(book=>book.playing||['queued','transcribing'].includes(String(book.transcription?.status||'')));
+    if (active && busy) {
+      audioPollTimer=setTimeout(()=>void loadAudio(),playing?750:1200);
     }
   };
 
@@ -143,6 +165,7 @@
   };
 
   const showMangaAniListSearch = async (bookId, title) => {
+    if (window.showMediaIdentity) return window.showMediaIdentity('manga', Number(bookId), title || '');
     mangaAniListBookId = Number(bookId);
     mangaAniListResults = [];
     const modalTitle = $('modalTitle'), modalBody = $('modalBody'), backdrop = $('modalBackdrop');
@@ -202,8 +225,33 @@
     const action = event.target.closest('[data-media-action]');
     if (!action) return;
     const type = action.dataset.mediaAction;
+    if (type === 'open-audio-cover') {
+      if (action.dataset.url) await pywebview.api.open_url(action.dataset.url);
+      return;
+    }
     if (type === 'find-manga-anilist') {
       await showMangaAniListSearch(Number(action.dataset.id), action.dataset.title || '');
+      return;
+    }
+    if (type === 'identify-audio') {
+      await window.showMediaIdentity?.('audiobook', Number(action.dataset.id), action.dataset.title || '');
+      return;
+    }
+    if (type === 'find-audio-ln') {
+      $('modalTitle').textContent=ru()?'Ранобэ на Nyaa':'Light Novel on Nyaa';
+      $('modalBody').innerHTML=`<div class="empty">${ru()?'Ищу релизы…':'Searching releases…'}</div>`;
+      $('modalBackdrop').classList.add('open');
+      const result=await pywebview.api.audiobook_search_light_novel_nyaa(Number(action.dataset.id));
+      audioLnNyaaRows=result.releases||[];
+      const rows=audioLnNyaaRows.map((row,index)=>`<div class="ln-nyaa-row"><span class="title" title="${esc(row.title||'')}">${esc(row.title||'')}</span><span>${Number(row.seeders||0)} seeds · ${esc(row.size||'')}</span><button data-media-action="download-audio-ln-release" data-index="${index}">${ru()?'Скачать':'Download'}</button></div>`).join('');
+      $('modalBody').innerHTML=rows||`<div class="empty">${ru()?'Ничего не найдено':'No releases found'}</div>`;
+      return;
+    }
+    if (type === 'download-audio-ln-release') {
+      const release=audioLnNyaaRows[Number(action.dataset.index)];
+      if(!release)return;
+      await pywebview.api.light_novel_download_nyaa(release);
+      window.toast?.(ru()?'Торрент ранобэ добавлен':'Light Novel torrent added');
       return;
     }
     if (type === 'open-manga-anilist') {
@@ -300,9 +348,8 @@
     if(sleep){const result=await pywebview.api.audiobook_sleep_timer(Number(sleep.dataset.id),sleep.value||'off');audioState=result.state||await pywebview.api.audiobook_state();renderAudio();return;}
     const control=event.target.closest?.('[data-audio-speed]');
     if(!control)return;
-    const id=Number(control.dataset.id),speed=Number(control.value||1);saveAudioSpeed(id,speed);
-    const book=(audioState.books||[]).find(item=>Number(item.id)===id);
-    if(book?.playing){const result=await pywebview.api.audiobook_set_speed(id,speed);audioState=result.state||audioState;renderAudio();}
+    const id=Number(control.dataset.id),speed=Number(control.value||1);
+    const result=await pywebview.api.audiobook_set_speed(id,speed);audioState=result.state||await pywebview.api.audiobook_state();renderAudio();
   });
 
   document.addEventListener('keydown', event => {
