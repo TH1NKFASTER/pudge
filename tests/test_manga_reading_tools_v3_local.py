@@ -59,9 +59,9 @@ def test_manga_reader_has_nonblocking_study_parse_zoom_and_toolbar_recovery() ->
     manga = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
     css = (ROOT / "pudge/web/manga_reader_v2.css").read_text(encoding="utf-8")
 
-    assert "manga_ocr_cached_page" in manga
-    assert "Plain OCR becomes selectable immediately" in manga
-    assert "void parseOcrStudyText" in manga
+    assert "manga_ocr_cached_page" not in manga
+    assert "renderRegionContent(target, region, parsed)" in manga
+    assert "parseRegionsSequentially" in manga
     assert "gesturestart" in manga
     assert "gesturechange" in manga
     assert "event.ctrlKey || event.metaKey || event.altKey" in manga

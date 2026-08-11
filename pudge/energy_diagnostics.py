@@ -154,6 +154,18 @@ class EnergyDiagnosticsMonitor:
     @classmethod
     def _related_processes(cls, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         own_pid = os.getpid()
+        # ``ps`` includes itself in its snapshot. Counting that short-lived
+        # child made the diagnostics monitor appear as application activity on
+        # every sample and kept a useless process row in long logs.
+        rows = [
+            row
+            for row in rows
+            if not (
+                str(row.get("command") or "").lstrip().startswith("ps axo ")
+                and "pid=,ppid=,%cpu=,%mem=,rss=,etime=,command="
+                in str(row.get("command") or "")
+            )
+        ]
         by_parent: dict[int, list[int]] = {}
         by_pid = {int(row["pid"]): dict(row) for row in rows}
         for row in rows:

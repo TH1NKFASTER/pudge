@@ -154,6 +154,7 @@ def test_energy_diagnostics_is_opt_in_and_collects_related_process_activity(monk
         {"pid": 100, "ppid": 1, "cpu_percent": 4.0, "memory_percent": 1.0, "rss_mb": 50.0, "elapsed": "1:00", "command": "pudge"},
         {"pid": 101, "ppid": 100, "cpu_percent": 6.0, "memory_percent": 2.0, "rss_mb": 70.0, "elapsed": "0:40", "command": "WebKit WebContent"},
         {"pid": 202, "ppid": 1, "cpu_percent": 10.0, "memory_percent": 3.0, "rss_mb": 100.0, "elapsed": "4:00", "command": "/opt/homebrew/bin/mpv /tmp/a.mkv"},
+        {"pid": 303, "ppid": 100, "cpu_percent": 99.0, "memory_percent": 0.0, "rss_mb": 2.0, "elapsed": "0:00", "command": "ps axo pid=,ppid=,%cpu=,%mem=,rss=,etime=,command="},
     ]
     monkeypatch.setattr("pudge.energy_diagnostics.os.getpid", lambda: 100)
     monkeypatch.setattr(EnergyDiagnosticsMonitor, "_process_rows", staticmethod(lambda: rows))

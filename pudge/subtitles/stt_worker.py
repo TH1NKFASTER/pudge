@@ -14,8 +14,11 @@ def main(argv: list[str] | None = None) -> int:
             print("mlx-whisper is not installed; STT fallback remains disabled", file=sys.stderr)
             return 3
         return 0
+    word_timestamps = bool(args and args[0] == "--words")
+    if word_timestamps:
+        args = args[1:]
     if len(args) != 3:
-        print("usage: stt_worker AUDIO OUTPUT MODEL", file=sys.stderr)
+        print("usage: stt_worker [--words] AUDIO OUTPUT MODEL", file=sys.stderr)
         return 2
     audio, output, model = Path(args[0]), Path(args[1]), args[2]
     try:
@@ -28,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
             str(audio),
             path_or_hf_repo=model,
             language="ja",
-            word_timestamps=False,
+            word_timestamps=word_timestamps,
             verbose=False,
         )
     except Exception as exc:

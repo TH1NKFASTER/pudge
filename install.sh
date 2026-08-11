@@ -391,6 +391,37 @@ launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
 
 printf '%s\n' "$EXPECTED_VERSION" > "$DATA_DIR/installed-version.txt"
 
+# Let the in-app updater distinguish a packaged release from a development
+# checkout. A dirty checkout is never replaced by a release archive or pulled
+# automatically; the updater will ask the developer to handle it manually.
+INSTALL_CHANNEL="release"
+INSTALL_SOURCE=""
+INSTALL_REVISION=""
+if [[ -e "$PROJECT_DIR/.git" ]]; then
+  INSTALL_CHANNEL="development"
+  INSTALL_SOURCE="$PROJECT_DIR"
+  INSTALL_REVISION="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || true)"
+fi
+INSTALL_CHANNEL="$INSTALL_CHANNEL" INSTALL_SOURCE="$INSTALL_SOURCE" INSTALL_REVISION="$INSTALL_REVISION" DATA_DIR="$DATA_DIR" \
+  python3.12 - <<'PYINSTALLSOURCE'
+import json
+import os
+from pathlib import Path
+
+target = Path(os.environ["DATA_DIR"]) / "install-source.json"
+target.write_text(
+    json.dumps(
+        {
+            "channel": os.environ["INSTALL_CHANNEL"],
+            "source_path": os.environ["INSTALL_SOURCE"],
+            "source_revision": os.environ["INSTALL_REVISION"],
+        },
+        ensure_ascii=False,
+    ),
+    encoding="utf-8",
+)
+PYINSTALLSOURCE
+
 "$LSREGISTER" -f "$APP_PATH" >/dev/null 2>&1 || true
 
 # Keep old Dock pins functional after a visible rename. The compatibility app

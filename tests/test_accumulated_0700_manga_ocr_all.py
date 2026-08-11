@@ -21,11 +21,24 @@ def test_manga_ocr_cache_status_and_cached_page_identity(tmp_path: Path) -> None
         )
     service = MangaService(db, cache_dir=tmp_path / "cache", python="/bin/false")
     status = service.ocr_cache_status(book_id)
-    assert status == {"book_id": book_id, "cached_pages": 1, "total_pages": 3, "complete": False}
+    # Legacy whole-page text is still readable, but it is not a selectable
+    # bubble overlay and must not make volume preparation look complete.
+    assert status == {"book_id": book_id, "cached_pages": 0, "total_pages": 3, "complete": False}
     result = service.ocr_page(book_id, 1)
     assert result["page_index"] == 1
     assert result["text"] == "second page"
     assert result["cache"] == "hit"
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
+            "VALUES(?,1,'mokuro-regions-v4','[]',?)",
+            (book_id, now),
+        )
+    assert service.ocr_cache_status(book_id)["cached_pages"] == 1
+    service.invalidate_region_cache(book_id)
+    assert service.ocr_cache_status(book_id)["cached_pages"] == 0
+    assert service.ocr_page(book_id, 1)["text"] == "second page"
 
 
 def test_manga_ui_guards_page_identity_and_supports_whole_book_ocr() -> None:

@@ -143,7 +143,7 @@ def test_frontend_uses_one_manga_renderer_and_cover_only_ln_anilist_click() -> N
     assert "if (!window.PudgeMangaReaderV2?.renderLibrary) renderManga();" in media
     assert "showMangaAniListSearch" in media
     assert "book.series_key || normalizedSeriesKey(title)" in manga
-    assert 'data-manga-v2-action="anilist-search"' in manga
+    assert 'data-manga-context-action="anilist-search"' in manga
 
     # AniList click target belongs to the cover, while the gray card body keeps
     # the article's read action.

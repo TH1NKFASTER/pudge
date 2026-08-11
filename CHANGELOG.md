@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Added a manual in-app updater with app-bundle rollback: release installs download the matching GitHub Release ZIP and verify SHA-256, while development checkouts allow only clean fast-forward updates from the official origin.
+- Enriched finished Planning cards with lazily loaded Jiten length, difficulty and, when a Jiten API key is configured, known-word coverage.
+- Expanded the AniList character glossary with unambiguous Japanese first/last-name variants so selection translation preserves short character references more reliably.
+- Clicking a linked manga cover now opens its AniList page while the rest of the series card continues to open the reader.
+- Added cached Japanese STT alignment for linked Light Novels and audiobooks, including real chapter boundaries, word-level reader highlighting and synchronized seek/speed controls in the reader tray.
+- EPUB reindexing now removes copyright, colophon and short author-metadata sections that are not reading chapters.
+- Expanded manga text-region detection for vertical/stylized text and fixed empty hover stickers remaining after the pointer leaves.
+
+## v0.7.2
+
+- Reworked manga preparation into bubble-sized Apple Vision regions followed by MangaOCR crops, with persistent overlays and background Jiten/JPDB parsing.
+- Stabilized bubble overlays across every page, close-on-leave behavior, zoomed-page scrolling and cached background preparation; manga actions and volume OCR now share the standard context menu.
+- Added manga and Light Novel scoring from the cover context menu, plus AniList-backed Planning search suggestions.
+- Expanded audiobooks with a scrubber, bookmarks, sleep timers, persisted speed, smart rewind, completion controls and lower-frequency position writes.
+- Added chapter-aligned Light Novel/audiobook paired reading with audio playback, proportional passage highlighting and optional auto-scroll.
+- AniList character names now form a cached translation glossary for online translation and the optional local LLM.
+- Fixed context menus on Continue Watching cards while playback is starting/already open, and removed duplicate manga reader event registration.
+- Re-selecting the active Light Novels or Manga tab no longer reloads and flashes the page.
+- Added replaceable metadata caches for ffprobe and AniList lookups plus the isolated VN reader architecture for the 0.8 series.
+
+## v0.7.1
+
 - Split subtitle preparation into explicit discovery, normalization, alignment, validation and selection stages with persisted worker progress and leases.
 - Subtitle upgrades now compare final validated alignment quality; container chapters help anchor opening/transition edits, and cached tiny Japanese STT is available only as a last resort.
 - Local LLM subtitle checks are off by default. Backups redact credentials and retain current secrets during restore.

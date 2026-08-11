@@ -22,6 +22,7 @@ from rapidfuzz import fuzz
 
 from .branding import APP_SLUG
 from .llm import build_chat_payload
+from .metadata_cache import MetadataCache
 from .providers.nyaa import NyaaClient, NyaaRelease
 from .providers.qbittorrent import QBittorrentClient
 
@@ -284,6 +285,8 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             if structural and len(chapter_text) < 120 and archive_path not in nav_titles:
                 continue
             chapter_title = nav_titles.get(archive_path) or f"Chapter {len(chapters) + 1}"
+            if _is_technical_epub_section(chapter_title, chapter_text, lower_hint):
+                continue
             chapters.append((chapter_title, chapter_text))
 
         if not chapters:
@@ -307,6 +310,50 @@ def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes,
             except KeyError:
                 pass
         return title or path.stem, chapters, cover
+
+
+def _is_technical_epub_section(title: str, text: str, hint: str = "") -> bool:
+    normalized_title = unicodedata.normalize("NFKC", str(title or "")).casefold().strip()
+    normalized_hint = unicodedata.normalize("NFKC", str(hint or "")).casefold()
+    normalized_text = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    if any(
+        marker in normalized_hint
+        for marker in ("colophon", "copyright", "imprint", "titlepage", "title-page")
+    ):
+        return True
+    if normalized_title in {
+        "奥付",
+        "著者紹介",
+        "作者紹介",
+        "copyright",
+        "colophon",
+        "imprint",
+        "about the author",
+    }:
+        return True
+    rights_markers = sum(
+        marker in normalized_text
+        for marker in (
+            "著作権",
+            "無断転載",
+            "複製・転載",
+            "正当な権利を有する",
+            "all rights reserved",
+            "isbn",
+        )
+    )
+    if rights_markers >= 2:
+        return True
+    if (
+        len(normalized_text) < 1500
+        and normalized_title
+        and normalized_title in normalized_text
+        and any(marker in normalized_text for marker in ("著者", "作者", "プロフィール", "略歴"))
+    ):
+        return True
+    if "author" in normalized_hint and len(normalized_text) < 2000:
+        return True
+    return False
 
 def _txt_metadata(path: Path) -> tuple[str, list[tuple[str, str]]]:
     raw = path.read_bytes()
@@ -358,7 +405,7 @@ class LightNovelSettings:
 
 
 class LightNovelService:
-    CONTENT_SCHEMA = 3
+    CONTENT_SCHEMA = 4
     JITEN_BASE = "https://api.jiten.moe/api"
     JPDB_BASE = "https://jpdb.io"
 
@@ -379,6 +426,12 @@ class LightNovelService:
         self._prefetch_lock = threading.Lock()
         self._prefetch_generation = 0
         self._reader_generation = 0
+        self._character_cache = MetadataCache(
+            Path(config.paths.cache_dir), "anilist-characters", schema="v2"
+        )
+        self._jiten_media_cache = MetadataCache(
+            Path(config.paths.cache_dir), "jiten-media-stats", schema="v1"
+        )
         self._ensure_schema()
 
     def _log(self, message: str, *args: Any) -> None:
@@ -408,6 +461,7 @@ class LightNovelService:
                     anilist_status TEXT NOT NULL DEFAULT '',
                     anilist_progress_volumes INTEGER NOT NULL DEFAULT 0,
                     anilist_total_volumes INTEGER,
+                    anilist_user_score REAL,
                     cover_url TEXT NOT NULL DEFAULT '',
                     current_chapter INTEGER NOT NULL DEFAULT 0,
                     current_offset REAL NOT NULL DEFAULT 0,
@@ -450,6 +504,8 @@ class LightNovelService:
             columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_books)")}
             if "content_schema" not in columns:
                 conn.execute("ALTER TABLE ln_books ADD COLUMN content_schema INTEGER NOT NULL DEFAULT 1")
+            if "anilist_user_score" not in columns:
+                conn.execute("ALTER TABLE ln_books ADD COLUMN anilist_user_score REAL")
 
     def settings(self) -> LightNovelSettings:
         values: dict[str, str] = {}
@@ -564,9 +620,11 @@ class LightNovelService:
                 return False
             conn.execute(
                 """UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,
-                   anilist_total_volumes=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?""",
+                   anilist_total_volumes=?,anilist_user_score=?,
+                   cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?""",
                 (match["anilist_id"], match["anilist_status"], match["anilist_progress_volumes"],
-                 match["anilist_total_volumes"], match["cover_url"], time.time(), int(book_id)),
+                 match["anilist_total_volumes"], match["anilist_user_score"], match["cover_url"],
+                 time.time(), int(book_id)),
             )
         self._log("LN inherited AniList series link book=%s media=%s", book_id, match["anilist_id"])
         return True
@@ -585,9 +643,11 @@ class LightNovelService:
                     continue
                 conn.execute(
                     """UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,
-                       anilist_total_volumes=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?""",
+                       anilist_total_volumes=?,anilist_user_score=?,
+                       cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?""",
                     (media_id, book.get("anilist_status") or "", int(book.get("anilist_progress_volumes") or 0),
-                     book.get("anilist_total_volumes"), book.get("cover_url") or "", time.time(), int(row["id"])),
+                     book.get("anilist_total_volumes"), book.get("anilist_user_score"),
+                     book.get("cover_url") or "", time.time(), int(row["id"])),
                 )
                 changed += 1
         return changed
@@ -816,6 +876,181 @@ class LightNovelService:
                 last = exc
                 break
         raise LightNovelError(f"Jiten request failed: {last}")
+
+    def _jiten_get(self, action: str, params: dict[str, Any] | None = None) -> Any:
+        token = self.settings().jiten_api_key
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": APP_SLUG,
+        }
+        if token:
+            headers["Authorization"] = f"ApiKey {token}"
+        url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
+        last: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = httpx.get(
+                    url,
+                    headers=headers,
+                    params=params or {},
+                    timeout=20,
+                    follow_redirects=True,
+                )
+                if response.status_code == 429 or response.status_code >= 500:
+                    if attempt < 2:
+                        time.sleep(0.5 * (2**attempt))
+                        continue
+                response.raise_for_status()
+                return response.json() if response.content else {}
+            except (httpx.HTTPError, ValueError) as exc:
+                last = exc
+                if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)) and attempt < 2:
+                    time.sleep(0.5 * (2**attempt))
+                    continue
+                break
+        raise LightNovelError(f"Jiten request failed: {last}")
+
+    @staticmethod
+    def _jiten_title_key(value: str) -> str:
+        value = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).casefold()
+        return re.sub(r"[^0-9a-zぁ-ゟ゠-ヿ一-鿿]+", "", value)
+
+    @staticmethod
+    def _jiten_media_type(media_kind: str, media_format: str) -> int:
+        kind = str(media_kind or "").casefold()
+        media_format = str(media_format or "").upper()
+        if kind == "novel":
+            return 4
+        if kind == "manga":
+            return 9
+        if media_format == "MOVIE":
+            return 3
+        return 1
+
+    @staticmethod
+    def _jiten_anilist_match(candidate: dict[str, Any], media_id: int) -> bool:
+        for link in candidate.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            try:
+                link_type = int(link.get("linkType") or 0)
+            except (TypeError, ValueError):
+                continue
+            if link_type != 4:
+                continue
+            url = str(link.get("url") or "")
+            match = re.search(r"anilist\.co/(?:anime|manga)/(\d+)", url, re.IGNORECASE)
+            if match and int(match.group(1)) == int(media_id):
+                return True
+        return False
+
+    def jiten_media_stats(
+        self,
+        media_id: int,
+        media_kind: str,
+        media_format: str,
+        titles: list[str],
+    ) -> dict[str, Any]:
+        clean_titles = list(
+            dict.fromkeys(str(value or "").strip() for value in titles if str(value or "").strip())
+        )[:6]
+        authenticated = bool(self.settings().jiten_api_key)
+        cache_key = {
+            "anilist_id": int(media_id),
+            "kind": str(media_kind or "anime").casefold(),
+            "format": str(media_format or "").upper(),
+            "authenticated": authenticated,
+        }
+        cached = self._jiten_media_cache.get(cache_key, ttl_seconds=7 * 24 * 3600)
+        if isinstance(cached, dict):
+            return dict(cached)
+        if not clean_titles:
+            return {"available": False}
+
+        media_type = self._jiten_media_type(media_kind, media_format)
+        candidates: dict[int, dict[str, Any]] = {}
+        for title in clean_titles[:3]:
+            payload = self._jiten_get(
+                "media-deck/get-media-decks",
+                {"titleFilter": title, "mediaType": media_type, "offset": 0},
+            )
+            values = payload.get("data") if isinstance(payload, dict) else []
+            for candidate in values or []:
+                if not isinstance(candidate, dict):
+                    continue
+                try:
+                    candidates[int(candidate.get("deckId"))] = candidate
+                except (TypeError, ValueError):
+                    continue
+            if any(self._jiten_anilist_match(item, int(media_id)) for item in candidates.values()):
+                break
+
+        selected = next(
+            (item for item in candidates.values() if self._jiten_anilist_match(item, int(media_id))),
+            None,
+        )
+        if selected is None and candidates:
+            source_keys = [self._jiten_title_key(value) for value in clean_titles]
+
+            def score(item: dict[str, Any]) -> float:
+                names = [
+                    item.get("originalTitle"),
+                    item.get("romajiTitle"),
+                    item.get("englishTitle"),
+                    *(item.get("aliases") or []),
+                ]
+                target_keys = [self._jiten_title_key(str(value or "")) for value in names]
+                return max(
+                    (
+                        float(fuzz.ratio(source, target))
+                        for source in source_keys
+                        for target in target_keys
+                        if source and target
+                    ),
+                    default=0.0,
+                )
+
+            ranked = sorted(((score(item), item) for item in candidates.values()), reverse=True, key=lambda x: x[0])
+            best_score, best = ranked[0]
+            margin = best_score - (ranked[1][0] if len(ranked) > 1 else 0.0)
+            if best_score >= 94.0 and (len(ranked) == 1 or margin >= 3.0):
+                selected = best
+
+        if selected is None:
+            result = {"available": False}
+        else:
+            deck_id = int(selected.get("deckId"))
+            try:
+                detail_payload = self._jiten_get(f"media-deck/{deck_id}/detail")
+                detail = (
+                    detail_payload.get("data")
+                    if isinstance(detail_payload, dict)
+                    and isinstance(detail_payload.get("data"), dict)
+                    else detail_payload
+                )
+                if isinstance(detail, dict):
+                    selected = {**selected, **detail}
+            except Exception as exc:
+                self._log("Jiten deck detail unavailable for %s: %s", deck_id, exc)
+            coverage = float(selected.get("coverage") or 0.0)
+            learning = float(selected.get("youngCoverage") or 0.0)
+            result = {
+                "available": True,
+                "deck_id": deck_id,
+                "url": f"https://jiten.moe/decks/media/{deck_id}/detail",
+                "character_count": int(selected.get("characterCount") or 0),
+                "word_count": int(selected.get("wordCount") or 0),
+                "unique_word_count": int(selected.get("uniqueWordCount") or 0),
+                "difficulty": int(selected.get("difficulty") if selected.get("difficulty") is not None else -1),
+                "difficulty_raw": float(selected.get("difficultyRaw") or 0.0),
+                "speech_duration_ms": int(selected.get("speechDuration") or 0),
+                "coverage_available": authenticated and selected.get("coverage") is not None,
+                "known_coverage": max(0.0, min(100.0, coverage)),
+                "learning_coverage": max(0.0, min(100.0, learning)),
+            }
+        self._jiten_media_cache.put(cache_key, result)
+        self._jiten_media_cache.prune(older_than_seconds=60 * 24 * 3600, max_entries=1000)
+        return result
 
     def _jpdb_request(self, action: str, payload: dict[str, Any] | None = None) -> Any:
         token = self.settings().jpdb_api_token
@@ -1118,7 +1353,13 @@ class LightNovelService:
             raise LightNovelError("Online translation returned no text")
         return translated
 
-    def _translate_local_llm(self, text: str, context: str, target_language: str) -> str:
+    def _translate_local_llm(
+        self,
+        text: str,
+        context: str,
+        target_language: str,
+        glossary: list[dict[str, str]],
+    ) -> str:
         cfg = self.config.llm
         if not cfg.enabled or not str(cfg.model or "").strip():
             raise LightNovelError("Online translation is unavailable and local LLM is disabled")
@@ -1127,9 +1368,16 @@ class LightNovelService:
             "You translate Japanese text from reading material such as light novels and manga. Translate only the selected passage into "
             f"{language_name}. Use the preceding context only to resolve pronouns, omitted subjects, names, "
             "and ambiguity; never translate or repeat the context itself. Preserve tone and paragraph meaning. "
+            "Use the supplied character glossary exactly and do not translate character names. "
             "Return strict JSON with one string field named translation."
         )
-        user = f"PRECEDING CONTEXT (up to 200 chars):\\n{context[-200:]}\\n\\nSELECTED TEXT:\\n{text}"
+        glossary_text = "\n".join(
+            f"- {item['source']} = {item['preferred']}" for item in glossary[:60]
+        )
+        user = (
+            f"CHARACTER GLOSSARY:\n{glossary_text or '(none)'}\n\n"
+            f"PRECEDING CONTEXT (up to 200 chars):\n{context[-200:]}\n\nSELECTED TEXT:\n{text}"
+        )
         payload = build_chat_payload(cfg, system, user)
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
         response = httpx.post(
@@ -1150,9 +1398,101 @@ class LightNovelService:
             raise LightNovelError("Local LLM returned no translation")
         return translated
 
-    def translate_selection(self, text: str, context: str = "", target_language: str | None = None) -> dict[str, Any]:
-        selected = re.sub(r"\\s+", " ", str(text or "")).strip()[:450]
-        preceding = re.sub(r"\\s+", " ", str(context or "")).strip()[-200:]
+    def character_glossary(self, media_id: int | None) -> list[dict[str, str]]:
+        if not media_id or not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return []
+        key = {"media_id": int(media_id)}
+        cached = self._character_cache.get(key, ttl_seconds=30 * 24 * 3600)
+        if isinstance(cached, list):
+            return [dict(item) for item in cached if isinstance(item, dict)]
+        query = """
+        query($id:Int!){Media(id:$id){characters(page:1,perPage:50,sort:[ROLE,RELEVANCE,ID]){edges{role node{name{first middle last full native alternative}}}}}}
+        """
+        try:
+            data = self._anilist_post(query, {"id": int(media_id)})
+        except Exception as exc:
+            self._log("AniList character glossary unavailable for %s: %s", media_id, exc)
+            return []
+        candidates: dict[str, set[str]] = {}
+
+        def add(source: Any, preferred: Any) -> None:
+            source_text = str(source or "").strip()
+            preferred_text = str(preferred or "").strip()
+            if (
+                len(source_text) < 2
+                or not preferred_text
+                or not re.search(r"[ぁ-ゟ゠-ヿ一-鿿]", source_text)
+            ):
+                return
+            candidates.setdefault(source_text, set()).add(preferred_text)
+
+        for edge in ((data.get("Media") or {}).get("characters") or {}).get("edges") or []:
+            names = ((edge or {}).get("node") or {}).get("name") or {}
+            preferred = str(names.get("full") or "").strip()
+            native = str(names.get("native") or "").strip()
+            add(native, preferred)
+            native_parts = [part for part in re.split(r"[\s・･=＝]+", native) if part]
+            latin_parts = [
+                str(names.get(key) or "").strip()
+                for key in ("first", "middle", "last")
+                if str(names.get(key) or "").strip()
+            ]
+            if len(native_parts) == len(latin_parts) and len(native_parts) > 1:
+                mapped_parts = list(latin_parts)
+                if len(native_parts) == 2 and re.search(r"[一-鿿]", native):
+                    mapped_parts.reverse()
+                for source, target in zip(native_parts, mapped_parts):
+                    add(source, target)
+            for alias in names.get("alternative") or []:
+                add(alias, preferred)
+
+        rows = [
+            {"source": source, "preferred": next(iter(preferred))}
+            for source, preferred in candidates.items()
+            if len(preferred) == 1
+        ]
+        rows.sort(key=lambda item: len(item["source"]), reverse=True)
+        self._character_cache.put(key, rows)
+        self._character_cache.prune(
+            older_than_seconds=180 * 24 * 3600,
+            max_entries=500,
+        )
+        return rows
+
+    @staticmethod
+    def _protect_character_names(
+        text: str, glossary: list[dict[str, str]]
+    ) -> tuple[str, dict[str, str]]:
+        protected = text
+        replacements: dict[str, str] = {}
+        for index, item in enumerate(glossary):
+            source = str(item.get("source") or "")
+            preferred = str(item.get("preferred") or "")
+            if not source or source not in protected:
+                continue
+            marker = f"PUDGEZXQ{index}ZXQ"
+            protected = protected.replace(source, marker)
+            replacements[marker] = preferred
+        return protected, replacements
+
+    @staticmethod
+    def _restore_character_names(text: str, replacements: dict[str, str]) -> str:
+        restored = text
+        for marker, preferred in replacements.items():
+            restored = restored.replace(marker, preferred)
+            flexible = r"[\s_-]*".join(re.escape(char) for char in marker)
+            restored = re.sub(flexible, preferred, restored, flags=re.IGNORECASE)
+        return restored
+
+    def translate_selection(
+        self,
+        text: str,
+        context: str = "",
+        target_language: str | None = None,
+        media_id: int | None = None,
+    ) -> dict[str, Any]:
+        selected = re.sub(r"\s+", " ", str(text or "")).strip()[:450]
+        preceding = re.sub(r"\s+", " ", str(context or "")).strip()[-200:]
         # target_language is retained only for API compatibility with older
         # clients. The app language is authoritative.
         target = (
@@ -1162,19 +1502,26 @@ class LightNovelService:
         )
         if not selected:
             raise LightNovelError("Select Japanese text to translate")
-        cache_key = hashlib.sha256(f"{target}\\0{preceding}\\0{selected}".encode("utf-8")).hexdigest()
+        glossary = self.character_glossary(media_id)
+        glossary_key = json.dumps(glossary, ensure_ascii=False, sort_keys=True)
+        cache_key = hashlib.sha256(
+            f"{target}\0{preceding}\0{selected}\0{glossary_key}".encode("utf-8")
+        ).hexdigest()
         with self._connect() as conn:
             row = conn.execute("SELECT translation,provider FROM ln_translation_cache WHERE cache_key=?", (cache_key,)).fetchone()
         if row is not None:
             return {"translation": str(row["translation"]), "target_language": target, "cached": True}
         provider = "google"
         try:
-            translated = self._translate_online(selected, target)
+            protected, replacements = self._protect_character_names(selected, glossary)
+            translated = self._restore_character_names(
+                self._translate_online(protected, target), replacements
+            )
         except Exception as online_exc:
             self._log("LN online translation failed; using local LLM: %s", online_exc)
             provider = "local_llm"
             try:
-                translated = self._translate_local_llm(selected, preceding, target)
+                translated = self._translate_local_llm(selected, preceding, target, glossary)
             except Exception as local_exc:
                 raise LightNovelError(f"Translation failed: {local_exc}") from local_exc
         with self._connect() as conn:
@@ -1247,7 +1594,7 @@ class LightNovelService:
         if not uid:
             return []
         collection_query = """
-        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes media{id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl}}}}}
+        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl}}}}}
         """
         collection = self._anilist_post(collection_query, {"userId": int(uid)}).get("MediaListCollection") or {}
         items: list[dict[str, Any]] = []
@@ -1265,6 +1612,7 @@ class LightNovelService:
                     "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0,
                     "chapters": media.get("chapters"), "volumes": media.get("volumes"), "media_status": media.get("status"),
                     "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                    "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
                 })
         self._anilist_cache = (time.monotonic(), [dict(item) for item in items])
         return items
@@ -1296,7 +1644,7 @@ class LightNovelService:
         if not cleaned:
             return []
         gql = """
-        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes}}}}
+        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self._anilist_post(gql, {"search": cleaned, "perPage": max(1, min(25, int(limit)))})
         out: list[dict[str, Any]] = []
@@ -1309,18 +1657,19 @@ class LightNovelService:
                 "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0,
                 "progress_volumes": entry.get("progressVolumes") or 0, "chapters": media.get("chapters"), "volumes": media.get("volumes"),
                 "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
             })
         return out
 
     def _anilist_novel_by_id(self, media_id: int) -> dict[str, Any]:
         gql = """
-        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes}}}
+        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}
         """
         media = self._anilist_post(gql, {"id": int(media_id)}).get("Media") or {}
         if str(media.get("format") or "").upper() != "NOVEL":
             raise LightNovelError("Selected AniList entry is not a light novel")
         titles = media.get("title") or {}; entry = media.get("mediaListEntry") or {}
-        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or ""}
+        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "", "user_score": float(entry.get("score")) if entry.get("score") is not None else None}
 
     @staticmethod
     def _match_title(value: str) -> str:
@@ -1365,9 +1714,17 @@ class LightNovelService:
         if int(item.get("media_id") or 0) != int(media_id):
             item = self._anilist_novel_by_id(int(media_id))
         with self._connect() as conn:
-            conn.execute("UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,anilist_total_volumes=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?", (int(media_id), str(item.get("status") or ""), int(item.get("progress_volumes") or 0), item.get("volumes"), str(item.get("cover") or ""), time.time(), int(book_id)))
+            conn.execute("UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,anilist_total_volumes=?,anilist_user_score=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?", (int(media_id), str(item.get("status") or ""), int(item.get("progress_volumes") or 0), item.get("volumes"), item.get("user_score"), str(item.get("cover") or ""), time.time(), int(book_id)))
         self._propagate_series_anilist(int(book_id))
         return self.book(book_id)
+
+    def set_score(self, book_id: int, score: float) -> dict[str, Any]:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ln_books SET anilist_user_score=?,updated_at=? WHERE id=?",
+                (float(score), time.time(), int(book_id)),
+            )
+        return self.book(int(book_id))
 
     def _save_anilist_volume(self, media_id: int, progress_volumes: int, status: str | None = None) -> dict[str, Any]:
         mutation = """

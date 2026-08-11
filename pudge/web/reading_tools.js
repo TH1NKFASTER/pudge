@@ -11,8 +11,6 @@
   let tokenSequence = 0;
   let activeToken = null;
   let translationRequest = 0;
-  let hoverStudyTimer = null;
-  let hoverStudyWord = null;
 
   function ensureUi() {
     let card = document.getElementById('pudgeStudyCard');
@@ -87,9 +85,9 @@
     return API().light_novel_study_action(payload);
   }
 
-  async function apiTranslate(text, context, targetLanguage) {
-    if (API()?.translate_text) return API().translate_text(text, context, targetLanguage);
-    return API().light_novel_translate(text, context, targetLanguage);
+  async function apiTranslate(text, context, targetLanguage, mediaId = null) {
+    if (API()?.translate_text) return API().translate_text(text, context, targetLanguage, mediaId);
+    return API().light_novel_translate(text, context, targetLanguage, mediaId);
   }
 
   async function openStudyCard({token, target, backend = 'jiten', sentence = ''}) {
@@ -193,7 +191,8 @@
     position(pop, range.getBoundingClientRect());
     try {
       const language = String(targetLanguage || (ru() ? 'ru' : 'en')).toLowerCase();
-      const result = await apiTranslate(text, context, language);
+      const mediaId = Number(root.dataset.pudgeMediaId || 0) || null;
+      const result = await apiTranslate(text, context, language, mediaId);
       if (id !== translationRequest) return true;
       pop.textContent = result?.translation || '';
       pop.classList.remove('loading');
@@ -278,25 +277,14 @@
     }, 180);
   }, true);
 
-
-  document.addEventListener('pointerover', event => {
-    const word = event.target.closest?.('[data-pudge-study-hover="1"] [data-pudge-study-token]');
-    if (!word || word === hoverStudyWord) return;
-    if (hoverStudyTimer) clearTimeout(hoverStudyTimer);
-    hoverStudyWord = word;
-    hoverStudyTimer = setTimeout(() => {
-      hoverStudyTimer = null;
-      if (hoverStudyWord !== word || !word.isConnected) return;
-      const token = registry.get(word.dataset.pudgeStudyToken);
-      if (token) void openStudyCard({token,target:word,backend:token.backend||'jiten',sentence:token.sentence||''});
-    }, 260);
-  }, true);
-
   document.addEventListener('pointerout', event => {
-    const word = event.target.closest?.('[data-pudge-study-hover="1"] [data-pudge-study-token]');
+    const word = event.target.closest?.('[data-pudge-study-token]');
     if (!word || word.contains(event.relatedTarget)) return;
-    if (hoverStudyWord === word) hoverStudyWord = null;
-    if (hoverStudyTimer) { clearTimeout(hoverStudyTimer); hoverStudyTimer = null; }
+    if (studyHoverKey === String(word.dataset.pudgeStudyToken || '')) studyHoverKey = '';
+    if (studyHoverTimer) {
+      clearTimeout(studyHoverTimer);
+      studyHoverTimer = null;
+    }
   }, true);
 
   document.addEventListener('click', async event => {

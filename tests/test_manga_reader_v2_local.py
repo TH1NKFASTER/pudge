@@ -15,8 +15,8 @@ def test_manga_reader_v2_assets_are_wired() -> None:
     js = (package / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
     css = (package / "web" / "manga_reader_v2.css").read_text(encoding="utf-8")
     assert "transition_bridge" not in js
-    assert "ocrWholeBook" in js
-    assert "manga_ocr_page" in js
+    assert "recognizeWholeBook" in js
+    assert "manga_text_regions" in js
     assert "data-manga-setting=\"mode\"" in js
     assert "value=\"double\"" in js
     assert "value=\"vertical\"" in js
@@ -42,7 +42,21 @@ def test_manga_volume_grouping_and_cover_preference_are_present() -> None:
 def test_reader_ocr_is_page_specific_and_has_progress() -> None:
     package = _package()
     js = (package / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
-    assert "manga_ocr_page(Number(currentBook.id), index)" in js
+    assert "manga_text_regions" in js
     assert "OCR volume" in js
     assert "mangaV2OcrProgress" in js
-    assert "generation !== ocrGeneration" in js
+    assert "generation !== textGeneration" in js
+    assert "cachedOnly: true" in js
+    assert "refreshVisibleTextRegions" in js
+
+
+def test_reader_overlay_closes_and_zoomed_page_can_scroll_to_top() -> None:
+    package = _package()
+    js = (package / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
+    css = (package / "web" / "manga_reader_v2.css").read_text(encoding="utf-8")
+
+    assert "function deactivateTextRegion" in js
+    assert "hasActiveSelectionInside(target)" not in js
+    assert "if (region && !region.contains(event.relatedTarget)) deactivateTextRegion(region)" in js
+    assert ".manga-v2-viewport{position:relative;min-height:0;overflow:auto;display:block" in css
+    assert "width:max-content;min-width:100%;min-height:100%;margin:auto" in css

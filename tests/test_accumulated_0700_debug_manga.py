@@ -72,7 +72,7 @@ def test_accumulated_ui_contract() -> None:
     debug = Path("pudge/web/debug.js").read_text(encoding="utf-8")
     web_app = Path("pudge/web_app.py").read_text(encoding="utf-8")
     assert 'id="s_ln_translation_language"' not in html
-    assert "light_novel_translate(text,context)" in html
+    assert "light_novel_translate(text,context,ui.lang||'',Number(ui.lnBook?.anilist_id||0)||null)" in html
     assert 'data-context-action="debug"' in html
     assert "mediaInHomeSection('caught_up',a.media_id)?'':" in html
     assert 'src="debug.js"' in html and 'href="debug.css"' in html

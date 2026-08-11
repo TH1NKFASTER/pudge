@@ -69,24 +69,29 @@ jobs:
         run: |
           archive=$(find dist -maxdepth 1 -name 'pudge-macos-v*.zip' -print -quit)
           test -n "$archive"
+          test -f "$archive.sha256"
           echo "path=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: pudge-macos
-          path: ${{ steps.archive.outputs.path }}
+          path: |
+            ${{ steps.archive.outputs.path }}
+            ${{ steps.archive.outputs.checksum }}
 
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           ARCHIVE: ${{ steps.archive.outputs.path }}
+          CHECKSUM: ${{ steps.archive.outputs.checksum }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber
+            gh release upload "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" --clobber
           else
-            gh release create "$RELEASE_TAG" "$ARCHIVE" \
+            gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" \
               --title "Pudge $RELEASE_TAG" \
               --generate-notes
           fi

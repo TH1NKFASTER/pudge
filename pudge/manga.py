@@ -23,6 +23,7 @@ from .runtime import python_executable
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+_REGION_CACHE_KEY = "mokuro-regions-v4"
 
 
 def _natural_key(value: str) -> list[object]:
@@ -79,6 +80,130 @@ def _manga_series_key(value: str) -> str:
     text = _manga_series_title(value)
     text = re.sub(r"[\s\[\](){}._・･:：!！?？'\"“”‘’—–-]+", "", text)
     return text.casefold()
+
+
+def _boxes_near(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_x1 = float(left["x"])
+    left_y1 = float(left["y"])
+    left_x2 = left_x1 + float(left["width"])
+    left_y2 = left_y1 + float(left["height"])
+    right_x1 = float(right["x"])
+    right_y1 = float(right["y"])
+    right_x2 = right_x1 + float(right["width"])
+    right_y2 = right_y1 + float(right["height"])
+    horizontal_gap = max(0.0, max(left_x1, right_x1) - min(left_x2, right_x2))
+    vertical_gap = max(0.0, max(left_y1, right_y1) - min(left_y2, right_y2))
+    vertical_overlap = max(0.0, min(left_y2, right_y2) - max(left_y1, right_y1))
+    horizontal_overlap = max(0.0, min(left_x2, right_x2) - max(left_x1, right_x1))
+    # Vertical Japanese lines belonging to one bubble sit next to each other;
+    # horizontal lines usually stack. Keep the threshold conservative so two
+    # neighbouring bubbles do not become one giant OCR crop.
+    vertical_lines = float(left["height"]) > float(left["width"]) * 1.05 or float(
+        right["height"]
+    ) > float(right["width"]) * 1.05
+    if vertical_lines:
+        # Vision often returns a vertical bubble as several narrow columns, or
+        # splits one column into two stacked observations. The old 2.2% page
+        # gap only joined almost-touching glyph boxes and left most Japanese
+        # bubbles as tiny, hard-to-hit strips.
+        neighbouring_columns = (
+            horizontal_gap <= 0.065
+            and vertical_overlap
+            >= min(float(left["height"]), float(right["height"])) * 0.12
+        )
+        split_column = (
+            vertical_gap <= 0.045
+            and horizontal_overlap
+            >= min(float(left["width"]), float(right["width"])) * 0.18
+        )
+        return neighbouring_columns or split_column
+    # A detector fallback can return one almost-square box per glyph.  Those
+    # boxes are still a vertical line when they stack on the same x coordinate.
+    vertical_glyph_stack = (
+        vertical_gap <= 0.032
+        and horizontal_overlap
+        >= min(float(left["width"]), float(right["width"])) * 0.35
+    )
+    horizontal_line = (
+        horizontal_gap <= 0.020
+        and vertical_overlap
+        >= min(float(left["height"]), float(right["height"])) * 0.35
+    )
+    return vertical_glyph_stack or horizontal_line
+
+
+def _box_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
+    """Intersection divided by the smaller box, useful for detector dedupe."""
+
+    left_x1, left_y1 = float(left["x"]), float(left["y"])
+    right_x1, right_y1 = float(right["x"]), float(right["y"])
+    left_x2 = left_x1 + float(left["width"])
+    left_y2 = left_y1 + float(left["height"])
+    right_x2 = right_x1 + float(right["width"])
+    right_y2 = right_y1 + float(right["height"])
+    width = max(0.0, min(left_x2, right_x2) - max(left_x1, right_x1))
+    height = max(0.0, min(left_y2, right_y2) - max(left_y1, right_y1))
+    intersection = width * height
+    smaller = min(
+        float(left["width"]) * float(left["height"]),
+        float(right["width"]) * float(right["height"]),
+    )
+    return intersection / max(smaller, 1e-9)
+
+
+def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: list[list[dict[str, Any]]] = []
+    for region in regions:
+        matches = [index for index, group in enumerate(groups) if any(_boxes_near(region, item) for item in group)]
+        if not matches:
+            groups.append([region])
+            continue
+        target = groups[matches[0]]
+        target.append(region)
+        for index in reversed(matches[1:]):
+            target.extend(groups.pop(index))
+
+    merged: list[dict[str, Any]] = []
+    for group in groups:
+        x1 = min(float(item["x"]) for item in group)
+        y1 = min(float(item["y"]) for item in group)
+        x2 = max(float(item["x"]) + float(item["width"]) for item in group)
+        y2 = max(float(item["y"]) + float(item["height"]) for item in group)
+        vertical = (
+            sum(
+                float(item["height"]) > float(item["width"]) * 1.05
+                for item in group
+            )
+            >= len(group) / 2
+        ) or (y2 - y1) > (x2 - x1) * 1.15
+        ordered = sorted(
+            group,
+            key=(lambda item: (-float(item["x"]), -float(item["y"])))
+            if vertical
+            else (lambda item: (-float(item["y"]), float(item["x"]))),
+        )
+        text = "".join(str(item.get("text") or "") for item in ordered) if vertical else " ".join(
+            str(item.get("text") or "") for item in ordered
+        )
+        merged.append(
+            {
+                "text": text.strip(),
+                "orientation": "vertical" if vertical else "horizontal",
+                "x": round(max(0.0, x1 - 0.006), 6),
+                "y": round(max(0.0, y1 - 0.006), 6),
+                "width": round(min(1.0 - max(0.0, x1 - 0.006), x2 - x1 + 0.012), 6),
+                "height": round(min(1.0 - max(0.0, y1 - 0.006), y2 - y1 + 0.012), 6),
+            }
+        )
+    vertical_page = bool(merged) and sum(
+        item.get("orientation") == "vertical" for item in merged
+    ) >= len(merged) / 2
+    merged.sort(
+        key=(lambda item: (-float(item["x"]), -float(item["y"])))
+        if vertical_page
+        else (lambda item: (-float(item["y"]), float(item["x"]))),
+    )
+    return merged
 
 
 class MangaService:
@@ -161,8 +286,16 @@ class MangaService:
             if match is None:
                 return False
             conn.execute(
-                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,updated_at=? WHERE id=?",
-                (match["anilist_id"], match["cover_url"], match["site_url"], time.time(), int(book_id)),
+                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    match["anilist_id"],
+                    match["cover_url"],
+                    match["site_url"],
+                    match["user_score"],
+                    time.time(),
+                    int(book_id),
+                ),
             )
         return True
 
@@ -179,10 +312,63 @@ class MangaService:
                 if sibling_key != key:
                     continue
                 conn.execute(
-                    "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,updated_at=? WHERE id=?",
-                    (row["anilist_id"], row["cover_url"], row["site_url"], time.time(), int(sibling["id"])),
+                    "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                    "WHERE id=?",
+                    (
+                        row["anilist_id"],
+                        row["cover_url"],
+                        row["site_url"],
+                        row["user_score"],
+                        time.time(),
+                        int(sibling["id"]),
+                    ),
                 )
                 changed += 1
+        return changed
+
+    def _reconcile_series_anilist(self) -> int:
+        """Repair legacy unlinked volumes when their series has one clear link."""
+
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM manga_books ORDER BY updated_at DESC,id DESC"
+            ).fetchall()
+            groups: dict[str, list[Any]] = {}
+            for row in rows:
+                key = _manga_series_key(
+                    str(row["title"] or Path(str(row["path"] or "")).stem)
+                )
+                if key:
+                    groups.setdefault(key, []).append(row)
+
+            changed = 0
+            now = time.time()
+            for siblings in groups.values():
+                linked_ids = {
+                    int(row["anilist_id"])
+                    for row in siblings
+                    if row["anilist_id"] is not None
+                }
+                # Never guess between conflicting manual links.
+                if len(linked_ids) != 1:
+                    continue
+                donor = next(row for row in siblings if row["anilist_id"] is not None)
+                for sibling in siblings:
+                    if sibling["anilist_id"] is not None:
+                        continue
+                    conn.execute(
+                        "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,"
+                        "user_score=?,updated_at=? WHERE id=?",
+                        (
+                            donor["anilist_id"],
+                            donor["cover_url"],
+                            donor["site_url"],
+                            donor["user_score"],
+                            now,
+                            int(sibling["id"]),
+                        ),
+                    )
+                    changed += 1
         return changed
 
     def import_file(self, path: Path) -> dict[str, Any]:
@@ -190,18 +376,25 @@ class MangaService:
         pages = self._pages(path)
         if not pages:
             raise ValueError("The archive contains no readable image pages")
+        stat = path.stat()
+        fingerprint = hashlib.sha1(
+            f"manga-v2:{path}:{stat.st_size}:{stat.st_mtime_ns}:{'|'.join(pages)}".encode("utf-8")
+        ).hexdigest()[:24]
         now = time.time()
         with self.db.connect() as conn:
+            previous = conn.execute("SELECT id,source_fingerprint FROM manga_books WHERE path=?", (str(path),)).fetchone()
             conn.execute(
                 """
-                INSERT INTO manga_books(path,title,page_count,position,reading_direction,created_at,updated_at)
-                VALUES(?,?,?,?,?,?,?)
+                INSERT INTO manga_books(path,title,page_count,position,reading_direction,source_fingerprint,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)
                 ON CONFLICT(path) DO UPDATE SET title=excluded.title,page_count=excluded.page_count,
-                    updated_at=excluded.updated_at
+                    source_fingerprint=excluded.source_fingerprint,updated_at=excluded.updated_at
                 """,
-                (str(path), path.stem, len(pages), 0, "rtl", now, now),
+                (str(path), path.stem, len(pages), 0, "rtl", fingerprint, now, now),
             )
             row = conn.execute("SELECT * FROM manga_books WHERE path=?", (str(path),)).fetchone()
+            if previous is not None and str(previous["source_fingerprint"] or "") != fingerprint:
+                conn.execute("DELETE FROM manga_ocr_cache WHERE book_id=?", (int(previous["id"]),))
         assert row is not None
         self._inherit_series_anilist(int(row["id"]))
         return self._payload(self._book(int(row["id"])))
@@ -247,6 +440,7 @@ class MangaService:
             "reading_direction": str(row["reading_direction"] or "rtl"),
             "anilist_id": int(row["anilist_id"]) if row["anilist_id"] is not None else None,
             "site_url": str(row["site_url"] or ""),
+            "user_score": float(row["user_score"]) if row["user_score"] is not None else None,
             "cover_url": remote_cover or self._local_cover_data_uri(row),
             "cover_source": "anilist" if remote_cover else "first_page",
             "updated_at": float(row["updated_at"] or 0),
@@ -259,16 +453,63 @@ class MangaService:
         *,
         cover_url: str = "",
         site_url: str = "",
+        user_score: float | None = None,
     ) -> dict[str, Any]:
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,updated_at=? WHERE id=?",
-                (int(media_id), str(cover_url or ""), str(site_url or ""), time.time(), int(book_id)),
+                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    int(media_id),
+                    str(cover_url or ""),
+                    str(site_url or ""),
+                    user_score,
+                    time.time(),
+                    int(book_id),
+                ),
             )
             row = conn.execute("SELECT * FROM manga_books WHERE id=?", (int(book_id),)).fetchone()
         if row is None:
             raise KeyError(f"Unknown manga id={book_id}")
         self._propagate_series_anilist(int(book_id))
+        return self._payload(self._book(int(book_id)))
+
+    def unbind_anilist(self, book_id: int) -> dict[str, Any]:
+        """Remove AniList metadata from every local volume in this series."""
+
+        row = self._book(int(book_id))
+        key = _manga_series_key(
+            str(row["title"] or Path(str(row["path"] or "")).stem)
+        )
+        with self.db.connect() as conn:
+            siblings = conn.execute("SELECT * FROM manga_books").fetchall()
+            ids = [
+                int(sibling["id"])
+                for sibling in siblings
+                if _manga_series_key(
+                    str(
+                        sibling["title"]
+                        or Path(str(sibling["path"] or "")).stem
+                    )
+                )
+                == key
+            ]
+            if not ids:
+                ids = [int(book_id)]
+            now = time.time()
+            conn.executemany(
+                "UPDATE manga_books SET anilist_id=NULL,cover_url='',site_url='',"
+                "user_score=NULL,updated_at=? WHERE id=?",
+                [(now, sibling_id) for sibling_id in ids],
+            )
+        return self._payload(self._book(int(book_id)))
+
+    def set_score(self, book_id: int, score: float) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE manga_books SET user_score=?,updated_at=? WHERE id=?",
+                (float(score), time.time(), int(book_id)),
+            )
         return self._payload(self._book(int(book_id)))
 
     def ocr_cache_status(self, book_id: int) -> dict[str, Any]:
@@ -277,8 +518,9 @@ class MangaService:
         with self.db.connect() as conn:
             cached = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM manga_ocr_cache WHERE book_id=? AND region_key='full'",
-                    (int(book_id),),
+                    "SELECT COUNT(DISTINCT page_index) FROM manga_ocr_cache "
+                    "WHERE book_id=? AND region_key=?",
+                    (int(book_id), _REGION_CACHE_KEY),
                 ).fetchone()[0]
             )
         cached = max(0, min(cached, total))
@@ -290,6 +532,7 @@ class MangaService:
         }
 
     def state(self) -> dict[str, Any]:
+        self._reconcile_series_anilist()
         with self.db.connect() as conn:
             rows = conn.execute("SELECT * FROM manga_books ORDER BY updated_at DESC,id DESC").fetchall()
         books: list[dict[str, Any]] = []
@@ -356,7 +599,13 @@ class MangaService:
             request.setRecognitionLanguages_(["ja-JP"])
             request.setUsesLanguageCorrection_(True)
             if hasattr(request, "setMinimumTextHeight_"):
-                request.setMinimumTextHeight_(0.007)
+                request.setMinimumTextHeight_(0.004)
+            detector = None
+            detector_class = getattr(Vision, "VNDetectTextRectanglesRequest", None)
+            if detector_class is not None:
+                detector = detector_class.alloc().init()
+                if hasattr(detector, "setReportCharacterBoxes_"):
+                    detector.setReportCharacterBoxes_(True)
             handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
                 NSURL.fileURLWithPath_(str(input_path)), None
             )
@@ -369,7 +618,11 @@ class MangaService:
                 if not candidates:
                     continue
                 text = str(candidates[0].string()).strip()
-                if not text or not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text):
+                # Vision is used primarily for geometry. Stylized Japanese is
+                # sometimes misread as Latin here, while MangaOCR still reads
+                # the crop correctly, so do not discard a usable box based on
+                # Vision's provisional transcription.
+                if not text:
                     continue
                 box = observation.boundingBox()
                 width = max(0.0, min(1.0, float(box.size.width)))
@@ -387,21 +640,74 @@ class MangaService:
                         "height": round(height, 6),
                     }
                 )
+            # VNRecognizeTextRequest is good at transcription but frequently
+            # omits stylised or vertical manga columns.  The older rectangle
+            # detector is geometry-only and catches many of those.  MangaOCR
+            # fills their text later, so keep detector-only boxes with an empty
+            # provisional transcription and deduplicate boxes already covered
+            # by the recognizer.
+            detector_results: list[Any] = []
+            if detector is not None:
+                try:
+                    detector_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                        NSURL.fileURLWithPath_(str(input_path)), None
+                    )
+                    detected, _detector_error = detector_handler.performRequests_error_(
+                        [detector], None
+                    )
+                    if detected:
+                        detector_results = list(detector.results() or [])
+                except Exception:
+                    detector_results = []
+            for observation in detector_results:
+                box = observation.boundingBox()
+                width = max(0.0, min(1.0, float(box.size.width)))
+                height = max(0.0, min(1.0, float(box.size.height)))
+                x = max(0.0, min(1.0 - width, float(box.origin.x)))
+                y = max(0.0, min(1.0 - height, float(box.origin.y)))
+                if width <= 0.001 or height <= 0.001:
+                    continue
+                candidate = {
+                    "text": "",
+                    "x": round(x, 6),
+                    "y": round(y, 6),
+                    "width": round(width, 6),
+                    "height": round(height, 6),
+                }
+                if any(_box_overlap(candidate, existing) >= 0.72 for existing in regions):
+                    continue
+                regions.append(candidate)
             vertical = sum(1 for item in regions if float(item["height"]) > float(item["width"]) * 1.25) > len(regions) / 2
             if vertical:
                 regions.sort(key=lambda item: (-float(item["x"]), -float(item["y"])))
             else:
                 regions.sort(key=lambda item: (-float(item["y"]), float(item["x"])))
-            return regions
+            return _merge_text_regions(regions)
         finally:
             if input_path is not None:
                 input_path.unlink(missing_ok=True)
 
-    def text_regions(self, book_id: int, page_index: int, *, refresh: bool = False) -> dict[str, Any]:
+    def invalidate_region_cache(self, book_id: int) -> None:
+        """Discard selectable bubble overlays without touching legacy full-page OCR text."""
+
+        with self.db.connect() as conn:
+            conn.execute(
+                "DELETE FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                (int(book_id), _REGION_CACHE_KEY),
+            )
+
+    def text_regions(
+        self,
+        book_id: int,
+        page_index: int,
+        *,
+        refresh: bool = False,
+        cached_only: bool = False,
+    ) -> dict[str, Any]:
         row = self._book(int(book_id))
         pages = self._pages(Path(str(row["path"])))
         index = max(0, min(int(page_index), max(0, len(pages) - 1)))
-        region_key = "vision-regions-v1"
+        region_key = _REGION_CACHE_KEY
         if not refresh:
             with self.db.connect() as conn:
                 cached = conn.execute(
@@ -422,6 +728,15 @@ class MangaService:
                         "cached": True,
                     }
 
+        if cached_only:
+            return {
+                "book_id": int(book_id),
+                "page_index": index,
+                "regions": [],
+                "available": sys.platform == "darwin",
+                "cached": False,
+            }
+
         if sys.platform != "darwin":
             return {
                 "book_id": int(book_id),
@@ -435,6 +750,9 @@ class MangaService:
             image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
         try:
             regions = self._vision_text_regions(image)
+            if regions and self.ocr_available():
+                regions = self._ocr_regions(image, regions)
+            regions = [item for item in regions if str(item.get("text") or "").strip()]
         except Exception:
             regions = []
         with self.db.connect() as conn:
@@ -449,6 +767,47 @@ class MangaService:
             "available": True,
             "cached": False,
         }
+
+    def _ocr_regions(self, image: Image.Image, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        work_dir = self.cache_dir / "manga-ocr" / "regions"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        with self._ocr_lock:
+            input_path: Path | None = None
+            manifest_path: Path | None = None
+            output_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", dir=work_dir, delete=False) as handle:
+                    input_path = Path(handle.name)
+                manifest_path = input_path.with_suffix(".regions.json")
+                output_path = input_path.with_suffix(".result.json")
+                image.save(input_path, format="PNG")
+                manifest_path.write_text(
+                    json.dumps({"regions": regions}, ensure_ascii=False), encoding="utf-8"
+                )
+                completed = subprocess.run(
+                    [
+                        self.python,
+                        "-m",
+                        "pudge.manga_ocr_worker",
+                        "--regions",
+                        str(input_path),
+                        str(manifest_path),
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=240,
+                )
+                if completed.returncode != 0 or output_path is None or not output_path.is_file():
+                    return regions
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+                recognized = payload.get("regions") if isinstance(payload, dict) else None
+                return [dict(item) for item in recognized or [] if isinstance(item, dict)] or regions
+            finally:
+                for path in (input_path, manifest_path, output_path):
+                    if path is not None:
+                        path.unlink(missing_ok=True)
 
     def cached_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         row = self._book(int(book_id))
@@ -469,7 +828,64 @@ class MangaService:
             "text": str(cached["text"]) if cached is not None else "",
         }
 
+    def cached_region_texts(self, book_id: int) -> list[tuple[int, str]]:
+        """Return recognized bubbles in reading order for background study parsing."""
+
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT page_index,text FROM manga_ocr_cache "
+                "WHERE book_id=? AND region_key=? ORDER BY page_index",
+                (int(book_id), _REGION_CACHE_KEY),
+            ).fetchall()
+        result: list[tuple[int, str]] = []
+        for row in rows:
+            try:
+                regions = json.loads(str(row["text"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for region in regions if isinstance(regions, list) else []:
+                if not isinstance(region, dict):
+                    continue
+                text = str(region.get("text") or "").strip()
+                if text:
+                    result.append((int(row["page_index"]), text))
+        return result
+
     def ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            legacy = conn.execute(
+                "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? "
+                "AND region_key='full' AND NOT EXISTS ("
+                "SELECT 1 FROM manga_ocr_cache newer WHERE newer.book_id=manga_ocr_cache.book_id "
+                "AND newer.page_index=manga_ocr_cache.page_index AND newer.region_key=?"
+                ")",
+                (int(book_id), int(page_index), _REGION_CACHE_KEY),
+            ).fetchone()
+        if legacy is not None:
+            return {
+                "book_id": int(book_id),
+                "page_index": int(page_index),
+                "text": str(legacy["text"]),
+                "cache": "hit",
+                "available": True,
+            }
+        region_result = self.text_regions(int(book_id), int(page_index))
+        if region_result.get("regions"):
+            text = "\n".join(str(item.get("text") or "") for item in region_result["regions"]).strip()
+            with self.db.connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
+                    "VALUES(?,?,'full',?,?)",
+                    (int(book_id), int(region_result["page_index"]), text, time.time()),
+                )
+            return {
+                "book_id": int(book_id),
+                "page_index": int(region_result["page_index"]),
+                "text": text,
+                "regions": region_result["regions"],
+                "cache": "hit" if region_result.get("cached") else "miss",
+                "available": True,
+            }
         with self.db.connect() as conn:
             cached = conn.execute(
                 "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? AND region_key='full'",
@@ -574,8 +990,8 @@ class MangaService:
         total = len(pages)
         with self.db.connect() as conn:
             cached_rows = conn.execute(
-                "SELECT page_index FROM manga_ocr_cache WHERE book_id=? AND region_key='full'",
-                (int(book_id),),
+                "SELECT page_index FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                (int(book_id), _REGION_CACHE_KEY),
             ).fetchall()
         cached = {int(item["page_index"]) for item in cached_rows}
         missing = [index for index in range(total) if index not in cached]
@@ -591,12 +1007,17 @@ class MangaService:
         manifest_path = job_dir / f"{token}.manifest.json"
         output_path = job_dir / f"{token}.results.jsonl"
         progress_path = job_dir / f"{token}.progress.json"
+        page_regions: dict[int, list[dict[str, Any]]] = {}
+        with zipfile.ZipFile(archive_path) as archive:
+            for index in missing:
+                image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
+                page_regions[index] = self._vision_text_regions(image)
         manifest_path.write_text(
             json.dumps(
                 {
                     "archive": str(archive_path),
                     "pages": [
-                        {"page_index": index, "name": pages[index]}
+                        {"page_index": index, "name": pages[index], "regions": page_regions[index]}
                         for index in missing
                     ],
                 },
@@ -655,6 +1076,18 @@ class MangaService:
                             "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
                             "VALUES(?,?,'full',?,?)",
                             (int(book_id), page_index_value, str(item.get("text") or ""), time.time()),
+                        )
+                        regions = item.get("regions") if isinstance(item, dict) else []
+                        conn.execute(
+                            "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
+                            "VALUES(?,?,?,?,?)",
+                            (
+                                int(book_id),
+                                page_index_value,
+                                _REGION_CACHE_KEY,
+                                json.dumps(regions if isinstance(regions, list) else [], ensure_ascii=False),
+                                time.time(),
+                            ),
                         )
             status = self.ocr_cache_status(int(book_id))
             if progress is not None:

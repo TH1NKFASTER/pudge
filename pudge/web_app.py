@@ -38,6 +38,8 @@ from .light_novels import LightNovelService, LightNovelError
 from .manga import MangaService
 from .audiobooks import AudiobookService
 from .debug_snapshot import DebugSnapshotService
+from .metadata_cache import MetadataCache
+from .updater import AppUpdater
 
 
 class WebAppApi:
@@ -63,7 +65,15 @@ class WebAppApi:
             ffprobe=self.config.tools.ffprobe,
             mpv=self.config.tools.mpv,
             cache_dir=self.config.paths.cache_dir,
+            python=python_executable(),
+            stt_model=self.config.sync.japanese_stt_model,
         )
+        self._planning_search_cache = MetadataCache(
+            self.config.paths.cache_dir,
+            "anilist-planning-search",
+            schema="v2",
+        )
+        self.app_updater = AppUpdater(logger=self.logger)
         self.debug_snapshots = DebugSnapshotService(
             self.manager,
             cache_dir=self.config.paths.cache_dir,
@@ -91,6 +101,7 @@ class WebAppApi:
             "finished_at": 0.0,
         }
         self._manga_book_ocr_lock = threading.Lock()
+        self._manga_ocr_run_lock = threading.Lock()
         self._manga_book_ocr_threads: dict[int, threading.Thread] = {}
         self._manga_book_ocr_state: dict[int, dict[str, Any]] = {}
         self._startup_anilist_sync_done = False
@@ -1662,7 +1673,10 @@ class WebAppApi:
             self._download_poll_lock.release()
 
     def light_novel_state(self) -> dict[str, Any]:
-        return self.light_novels.state()
+        state = self.light_novels.state()
+        for book in state.get("books", []):
+            book["paired_audio"] = self.audiobooks.link_for_light_novel(int(book["id"]))
+        return state
 
     def manga_state(self) -> dict[str, Any]:
         return self.manga.state()
@@ -1680,7 +1694,7 @@ class WebAppApi:
         if not cleaned:
             return []
         gql = """
-        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes}}}}
+        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self.light_novels._anilist_post(gql, {"search": cleaned})
         rows: list[dict[str, Any]] = []
@@ -1700,6 +1714,7 @@ class WebAppApi:
                     "media_status": media.get("status") or "",
                     "list_status": entry.get("status") or "",
                     "progress": entry.get("progress") or 0,
+                    "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
                     "cover": (media.get("coverImage") or {}).get("large") or "",
                     "site_url": media.get("siteUrl") or f"https://anilist.co/manga/{int(media.get('id'))}",
                 }
@@ -1718,7 +1733,12 @@ class WebAppApi:
             int(media_id),
             cover_url=str(item.get("cover") or ""),
             site_url=str(item.get("site_url") or f"https://anilist.co/manga/{int(media_id)}"),
+            user_score=item.get("user_score"),
         )
+        return {"book": book, "state": self.manga.state()}
+
+    def manga_unbind_anilist(self, book_id: int) -> dict[str, Any]:
+        book = self.manga.unbind_anilist(int(book_id))
         return {"book": book, "state": self.manga.state()}
 
     def _manga_ocr_log_path(self) -> Path:
@@ -1861,11 +1881,35 @@ class WebAppApi:
 
         try:
             result = self.manga.ocr_book(book_id, progress=on_progress)
+            region_texts = self.manga.cached_region_texts(book_id)
+            parse_errors: list[str] = []
+            parsed_count = 0
+            for page_index, text in region_texts:
+                with self._manga_book_ocr_lock:
+                    self._manga_book_ocr_state[book_id] = {
+                        **result,
+                        "state": "parsing",
+                        "running": True,
+                        "parsed_regions": parsed_count,
+                        "total_regions": len(region_texts),
+                        "page_index": page_index,
+                        "errors": parse_errors,
+                    }
+                try:
+                    self.light_novels.parse_study_text(text)
+                    parsed_count += 1
+                except LightNovelError as exc:
+                    if not parse_errors:
+                        parse_errors.append(str(exc))
+                    break
             with self._manga_book_ocr_lock:
                 self._manga_book_ocr_state[book_id] = {
                     **result,
                     "state": "ready" if result.get("complete") else "partial",
                     "running": False,
+                    "parsed_regions": parsed_count,
+                    "total_regions": len(region_texts),
+                    "errors": [*result.get("errors", []), *parse_errors],
                 }
         except Exception as exc:
             self.logger.exception("FAIL step=manga_ocr.book book_id=%s error=%r", book_id, str(exc))
@@ -1878,15 +1922,29 @@ class WebAppApi:
                     "errors": [str(exc)],
                 }
 
-    def start_manga_ocr_book(self, book_id: int) -> dict[str, Any]:
+    def _run_serialized_manga_book_ocr(self, book_id: int) -> None:
+        # MangaOCR is a large model. Serializing volumes prevents two imports
+        # from holding separate model processes in memory at the same time.
+        with self._manga_ocr_run_lock:
+            self._run_manga_book_ocr(int(book_id))
+
+    def start_manga_ocr_book(self, book_id: int, refresh: bool = False) -> dict[str, Any]:
         book_id = int(book_id)
         if not self.manga.ocr_available():
             raise RuntimeError("MangaOCR is not installed. Install it from Settings → Reading.")
         with self._manga_book_ocr_lock:
             thread = self._manga_book_ocr_threads.get(book_id)
             if thread is None or not thread.is_alive():
+                if bool(refresh):
+                    self.manga.invalidate_region_cache(book_id)
+                self._manga_book_ocr_state[book_id] = {
+                    **self.manga.ocr_cache_status(book_id),
+                    "state": "queued",
+                    "running": True,
+                    "errors": [],
+                }
                 thread = threading.Thread(
-                    target=self._run_manga_book_ocr,
+                    target=self._run_serialized_manga_book_ocr,
                     args=(book_id,),
                     name=f"{APP_SLUG}-manga-ocr-book-{book_id}",
                     daemon=True,
@@ -1915,7 +1973,10 @@ class WebAppApi:
         errors: list[str] = []
         for value in selected:
             try:
-                books.append(self.manga.import_file(Path(str(value))))
+                book = self.manga.import_file(Path(str(value)))
+                books.append(book)
+                if self.manga.ocr_available():
+                    self.start_manga_ocr_book(int(book["id"]))
             except Exception as exc:
                 errors.append(f"{Path(str(value)).name}: {exc}")
         return {"cancelled": False, "books": books, "errors": errors, "state": self.manga.state()}
@@ -1926,8 +1987,19 @@ class WebAppApi:
     def manga_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.ocr_page(int(book_id), int(page_index))
 
-    def manga_text_regions(self, book_id: int, page_index: int, refresh: bool = False) -> dict[str, Any]:
-        return self.manga.text_regions(int(book_id), int(page_index), refresh=bool(refresh))
+    def manga_text_regions(
+        self,
+        book_id: int,
+        page_index: int,
+        refresh: bool = False,
+        cached_only: bool = False,
+    ) -> dict[str, Any]:
+        return self.manga.text_regions(
+            int(book_id),
+            int(page_index),
+            refresh=bool(refresh),
+            cached_only=bool(cached_only),
+        )
 
     def manga_ocr_cached_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.cached_ocr_page(int(book_id), int(page_index))
@@ -1981,16 +2053,85 @@ class WebAppApi:
         return self.audiobooks.play(int(book_id), None if start is None else float(start), float(speed or 1.0))
 
     def audiobook_set_speed(self, book_id: int, speed: float) -> dict[str, Any]:
-        result=self.audiobooks.set_speed(int(book_id),float(speed or 1.0));result["state"]=self.audiobooks.state();return result
+        result = self.audiobooks.set_speed(int(book_id), float(speed or 1.0))
+        result["state"] = self.audiobooks.state()
+        return result
 
     def audiobook_seek(self, book_id: int, seconds: float) -> dict[str, Any]:
-        result=self.audiobooks.seek(int(book_id),float(seconds));result["state"]=self.audiobooks.state();return result
+        result = self.audiobooks.seek(int(book_id), float(seconds))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_seek_to(self, book_id: int, position: float) -> dict[str, Any]:
+        result = self.audiobooks.seek_to(int(book_id), float(position))
+        result["state"] = self.audiobooks.state()
+        return result
 
     def audiobook_stop(self, book_id: int) -> dict[str, Any]:
-        result = self.audiobooks.stop(int(book_id)); result["state"] = self.audiobooks.state(); return result
+        result = self.audiobooks.stop(int(book_id))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_sleep_timer(self, book_id: int, mode: str) -> dict[str, Any]:
+        value = str(mode or "off").strip().lower()
+        if value == "chapter":
+            result = self.audiobooks.set_sleep_timer(int(book_id), end_of_chapter=True)
+        elif value in {"15", "30", "45", "60"}:
+            result = self.audiobooks.set_sleep_timer(int(book_id), seconds=int(value) * 60)
+        else:
+            result = self.audiobooks.set_sleep_timer(int(book_id))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_add_bookmark(self, book_id: int, title: str = "") -> dict[str, Any]:
+        result = self.audiobooks.add_bookmark(int(book_id), str(title or ""))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_delete_bookmark(self, bookmark_id: int) -> dict[str, Any]:
+        result = self.audiobooks.delete_bookmark(int(bookmark_id))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_mark_finished(self, book_id: int, finished: bool = True) -> dict[str, Any]:
+        result = self.audiobooks.mark_finished(int(book_id), bool(finished))
+        result["state"] = self.audiobooks.state()
+        return result
 
     def audiobook_delete(self, book_id: int) -> dict[str, Any]:
-        result = self.audiobooks.delete(int(book_id), delete_files=False); result["state"] = self.audiobooks.state(); return result
+        result = self.audiobooks.delete(int(book_id), delete_files=False)
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def light_novel_link_audiobook(self, book_id: int, audiobook_id: int) -> dict[str, Any]:
+        result = self.audiobooks.link_light_novel(int(book_id), int(audiobook_id))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def light_novel_unlink_audiobook(self, book_id: int) -> dict[str, Any]:
+        return self.audiobooks.unlink_light_novel(int(book_id))
+
+    def light_novel_play_paired(
+        self,
+        book_id: int,
+        chapter_index: int,
+        chapter_progress: float,
+        speed: float | None = None,
+    ) -> dict[str, Any]:
+        return self.audiobooks.play_paired(
+            int(book_id),
+            int(chapter_index),
+            float(chapter_progress),
+            None if speed is None else float(speed),
+        )
+
+    def light_novel_paired_state(self, book_id: int) -> dict[str, Any]:
+        return self.audiobooks.paired_state(int(book_id))
+
+    def light_novel_prepare_audio_alignment(
+        self, book_id: int, force: bool = False
+    ) -> dict[str, Any]:
+        return self.audiobooks.prepare_alignment(int(book_id), force=bool(force))
 
     def light_novel_refresh(self) -> dict[str, Any]:
         return self.light_novels.refresh_state()
@@ -2013,15 +2154,33 @@ class WebAppApi:
             deck_id=payload.get("deck_id"),
         )
 
-    def translate_text(self, text: str, context: str = "", target_language: str = "") -> dict[str, Any]:
+    def translate_text(
+        self,
+        text: str,
+        context: str = "",
+        target_language: str = "",
+        media_id: int | None = None,
+    ) -> dict[str, Any]:
         return self.light_novels.translate_selection(
             str(text or ""),
             str(context or ""),
             str(target_language or "") or None,
+            int(media_id) if media_id else None,
         )
 
-    def light_novel_translate(self, text: str, context: str = "", target_language: str = "") -> dict[str, Any]:
-        return self.light_novels.translate_selection(str(text or ""), str(context or ""), str(target_language or "") or None)
+    def light_novel_translate(
+        self,
+        text: str,
+        context: str = "",
+        target_language: str = "",
+        media_id: int | None = None,
+    ) -> dict[str, Any]:
+        return self.light_novels.translate_selection(
+            str(text or ""),
+            str(context or ""),
+            str(target_language or "") or None,
+            int(media_id) if media_id else None,
+        )
 
     def choose_light_novel_file(self) -> dict[str, Any]:
         if self.window is None:
@@ -2049,7 +2208,9 @@ class WebAppApi:
         return {"cancelled": False, "books": books, "book": books[0] if books else None, "errors": errors, "state": state}
 
     def light_novel_open(self, book_id: int) -> dict[str, Any]:
-        return self.light_novels.open_book(int(book_id))
+        book = self.light_novels.open_book(int(book_id))
+        book["paired_audio"] = self.audiobooks.link_for_light_novel(int(book_id))
+        return book
 
     def light_novel_chapter(self, book_id: int, chapter_index: int) -> dict[str, Any]:
         return self.light_novels.chapter_fast(int(book_id), int(chapter_index))
@@ -2069,8 +2230,9 @@ class WebAppApi:
         return self.light_novels.finish_volume(int(book_id))
 
     def light_novel_delete(self, book_id: int) -> dict[str, Any]:
+        self.audiobooks.unlink_light_novel(int(book_id))
         result = self.light_novels.delete_book(int(book_id), delete_file=False)
-        result["state"] = self.light_novels.state()
+        result["state"] = self.light_novel_state()
         return result
 
     def light_novel_bind_anilist(self, book_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2078,6 +2240,30 @@ class WebAppApi:
 
     def light_novel_search_anilist(self, query: str) -> list[dict[str, Any]]:
         return self.light_novels.search_anilist_novels(str(query or "").strip())
+
+    def set_literature_score(
+        self,
+        kind: str,
+        book_id: int,
+        media_id: int,
+        score: float,
+    ) -> dict[str, Any]:
+        normalized = str(kind or "").strip().lower()
+        if normalized not in {"manga", "novel", "light_novel"}:
+            raise ValueError("Literature kind must be manga or novel")
+        value = max(1.0, min(10.0, float(score)))
+        client = self._anilist_client()
+        try:
+            client.set_score(int(media_id), value)
+        finally:
+            client.close()
+        if normalized == "manga":
+            book = self.manga.set_score(int(book_id), value)
+            return {"ok": True, "book": book, "state": self.manga.state()}
+        if normalized in {"novel", "light_novel"}:
+            book = self.light_novels.set_score(int(book_id), value)
+            return {"ok": True, "book": book, "state": self.light_novel_state()}
+        raise AssertionError("unreachable literature kind")
 
     def light_novel_save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         return self.light_novels.save_settings(values or {})
@@ -2341,6 +2527,7 @@ class WebAppApi:
             values.get("japanese_stt_model", cfg.sync.japanese_stt_model)
         ).strip() or "mlx-community/whisper-tiny"
         write_config(cfg, self.config_path)
+        self.audiobooks.stop_all()
         self.config = load_config(self.config_path)
         self.manager = AnimeManager(self.config, log=self.logger.info)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
@@ -2354,6 +2541,18 @@ class WebAppApi:
             ffprobe=self.config.tools.ffprobe,
             mpv=self.config.tools.mpv,
             cache_dir=self.config.paths.cache_dir,
+            python=python_executable(),
+            stt_model=self.config.sync.japanese_stt_model,
+        )
+        self._planning_search_cache = MetadataCache(
+            self.config.paths.cache_dir,
+            "anilist-planning-search",
+            schema="v2",
+        )
+        self.debug_snapshots = DebugSnapshotService(
+            self.manager,
+            cache_dir=self.config.paths.cache_dir,
+            runtime_log_path=DEFAULT_LOG_PATH,
         )
         self.light_novels.save_settings(ln_values)
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
@@ -2621,6 +2820,127 @@ class WebAppApi:
             "warning": warning,
             "stats": stats,
             "state": self.get_state(),
+        }
+
+    def planning_search_anilist(self, query: str) -> list[dict[str, Any]]:
+        """Search AniList beyond the user's existing Planning collection."""
+
+        cleaned = re.sub(r"\s+", " ", str(query or "")).strip()[:120]
+        if (
+            len(cleaned) < 3
+            or not self.config.anilist.enabled
+            or not self.config.anilist.access_token
+        ):
+            return []
+        cache_key = {
+            "query": cleaned.casefold(),
+            # The token itself is only hashed into the cache filename by
+            # MetadataCache; it is never written to the cache payload.
+            "account": self.config.anilist.access_token,
+        }
+        cached = self._planning_search_cache.get(cache_key, ttl_seconds=24 * 3600)
+        if isinstance(cached, list):
+            return [dict(item) for item in cached if isinstance(item, dict)]
+        gql = """
+        query($search:String!){
+          anime:Page(page:1,perPage:8){media(search:$search,type:ANIME,sort:SEARCH_MATCH){
+            id format status meanScore seasonYear episodes duration genres description(asHtml:false)
+            title{userPreferred romaji english native} coverImage{large} siteUrl
+            studios(isMain:true){nodes{name}}
+            mediaListEntry{status score(format:POINT_10)}
+          }}
+          literature:Page(page:1,perPage:8){media(search:$search,type:MANGA,sort:SEARCH_MATCH){
+            id format status meanScore seasonYear chapters volumes genres description(asHtml:false)
+            title{userPreferred romaji english native} coverImage{large} siteUrl
+            mediaListEntry{status score(format:POINT_10)}
+          }}
+        }
+        """
+        data = self.light_novels._anilist_post(gql, {"search": cleaned})
+        rows: list[dict[str, Any]] = []
+        for bucket in ("anime", "literature"):
+            for media in (data.get(bucket) or {}).get("media") or []:
+                titles = media.get("title") or {}
+                entry = media.get("mediaListEntry") or {}
+                media_format = str(media.get("format") or "").upper()
+                kind = (
+                    "anime"
+                    if bucket == "anime"
+                    else "novel"
+                    if media_format == "NOVEL"
+                    else "manga"
+                )
+                rows.append(
+                    {
+                        "media_id": int(media["id"]),
+                        "media_kind": kind,
+                        "format": media_format,
+                        "title": titles.get("userPreferred")
+                        or titles.get("romaji")
+                        or titles.get("native")
+                        or "",
+                        "native_title": titles.get("native") or "",
+                        "description": media.get("description") or "",
+                        "year": media.get("seasonYear"),
+                        "episodes": media.get("episodes"),
+                        "duration": media.get("duration"),
+                        "chapters": media.get("chapters"),
+                        "volumes": media.get("volumes"),
+                        "genres": list(media.get("genres") or [])[:4],
+                        "studio": next(
+                            (
+                                str(node.get("name") or "")
+                                for node in ((media.get("studios") or {}).get("nodes") or [])
+                                if node.get("name")
+                            ),
+                            "",
+                        ),
+                        "cover": (media.get("coverImage") or {}).get("large") or "",
+                        "site_url": media.get("siteUrl") or "",
+                        "media_status": media.get("status") or "",
+                        "list_status": entry.get("status") or "",
+                        "mean_score": media.get("meanScore"),
+                        "user_score": entry.get("score"),
+                    }
+                )
+        rows.sort(
+            key=lambda item: (
+                bool(item.get("list_status")),
+                -(float(item.get("mean_score") or 0)),
+            )
+        )
+        rows = rows[:12]
+        self._planning_search_cache.put(cache_key, rows)
+        self._planning_search_cache.prune(older_than_seconds=30 * 24 * 3600, max_entries=300)
+        return rows
+
+    def planning_jiten_stats(
+        self,
+        media_id: int,
+        media_kind: str,
+        media_format: str,
+        titles: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.light_novels.jiten_media_stats(
+            int(media_id),
+            str(media_kind or "anime"),
+            str(media_format or ""),
+            [str(value) for value in (titles or []) if str(value or "").strip()],
+        )
+
+    def add_media_to_planning(self, media_id: int, media_kind: str = "anime") -> dict[str, Any]:
+        if str(media_kind or "anime").lower() == "anime":
+            return self.add_to_planning(int(media_id))
+        mutation = """
+        mutation($mediaId:Int!){SaveMediaListEntry(mediaId:$mediaId,status:PLANNING){status}}
+        """
+        entry = self.light_novels._anilist_post(mutation, {"mediaId": int(media_id)}).get(
+            "SaveMediaListEntry"
+        ) or {}
+        return {
+            "ok": True,
+            "entry": entry,
+            "light_novel_state": self.light_novels.refresh_state(),
         }
 
     def remove_from_planning(self, media_id: int) -> dict[str, Any]:
@@ -3071,6 +3391,23 @@ class WebAppApi:
         webbrowser.open(str(url))
         return {"ok": True}
 
+    def app_update_status(self, force: bool = True) -> dict[str, Any]:
+        return self.app_updater.check(force=bool(force))
+
+    def app_update_install(self) -> dict[str, Any]:
+        return self.app_updater.start()
+
+    def app_update_progress(self) -> dict[str, Any]:
+        return self.app_updater.state()
+
+    def reveal_app_update_log(self) -> dict[str, Any]:
+        path = self.app_updater.log_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "darwin":
+            command = ["open", "-R", str(path)] if path.exists() else ["open", str(path.parent)]
+            subprocess.Popen(command)
+        return {"ok": True, "path": str(path), "exists": path.exists()}
+
     def diagnose_episode(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         return self.manager.diagnose_episode(int(media_id), episode)
 
@@ -3333,6 +3670,7 @@ class WebAppApi:
                 database_path=self.config.library.database_path,
                 cache_dir=self.config.paths.cache_dir,
             )
+            self.audiobooks.stop_all()
             self.config = load_config(self.config_path)
             self.manager = AnimeManager(self.config, log=self.logger.info)
             self.light_novels = LightNovelService(self.config, logger=self.logger)
@@ -3346,6 +3684,18 @@ class WebAppApi:
                 ffprobe=self.config.tools.ffprobe,
                 mpv=self.config.tools.mpv,
                 cache_dir=self.config.paths.cache_dir,
+                python=python_executable(),
+                stt_model=self.config.sync.japanese_stt_model,
+            )
+            self._planning_search_cache = MetadataCache(
+                self.config.paths.cache_dir,
+                "anilist-planning-search",
+                schema="v2",
+            )
+            self.debug_snapshots = DebugSnapshotService(
+                self.manager,
+                cache_dir=self.config.paths.cache_dir,
+                runtime_log_path=DEFAULT_LOG_PATH,
             )
             self.logger.info("DONE step=backup.restore path=%r", str(selected))
             return {"ok": True, **restored, "state": self.get_state()}

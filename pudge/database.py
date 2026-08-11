@@ -297,6 +297,8 @@ CREATE TABLE IF NOT EXISTS manga_books (
     anilist_id INTEGER,
     cover_url TEXT NOT NULL DEFAULT '',
     site_url TEXT NOT NULL DEFAULT '',
+    user_score REAL,
+    source_fingerprint TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -318,6 +320,8 @@ CREATE TABLE IF NOT EXISTS audiobooks (
     duration REAL NOT NULL DEFAULT 0,
     position REAL NOT NULL DEFAULT 0,
     finished INTEGER NOT NULL DEFAULT 0,
+    speed REAL NOT NULL DEFAULT 1,
+    last_played_at REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -343,9 +347,30 @@ CREATE TABLE IF NOT EXISTS audiobook_files (
     PRIMARY KEY(book_id,file_index),
     FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS audiobook_bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id INTEGER NOT NULL,
+    position REAL NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_audiobook_bookmarks_book
+ON audiobook_bookmarks(book_id,position);
+
+CREATE TABLE IF NOT EXISTS reading_audio_links (
+    ln_book_id INTEGER PRIMARY KEY,
+    audiobook_id INTEGER NOT NULL,
+    alignment_mode TEXT NOT NULL DEFAULT 'chapter',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(audiobook_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+);
 """
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 class Database:
@@ -365,12 +390,19 @@ class Database:
             conn.execute("PRAGMA user_version=1")
         if version < 2:
             self._migrate_v2(conn)
+            conn.execute("PRAGMA user_version=2")
+        if version < 3:
+            self._migrate_v3(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
-        # Local checkpoint compatibility columns: additive and safe to run on
-        # existing schema-v2 databases without bumping the app/database version.
+        # Keep additive compatibility checks idempotent for databases created by
+        # local 0.7 checkpoints before the numbered v3 migration existed.
         self._ensure_column(conn, "manga_books", "anilist_id", "INTEGER")
         self._ensure_column(conn, "manga_books", "cover_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "manga_books", "site_url", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "manga_books", "user_score", "REAL")
+        self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")
         conn.execute(
             "INSERT OR IGNORE INTO state(key,value,updated_at) VALUES('ui_state_version','0',?)",
             (time.time(),),
@@ -480,6 +512,44 @@ class Database:
                 end REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY(book_id,chapter_index),
                 FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+            );
+            """
+        )
+
+    def _migrate_v3(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "manga_books", "user_score", "REAL")
+        self._ensure_column(
+            conn,
+            "manga_books",
+            "source_fingerprint",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
+        self._ensure_column(
+            conn,
+            "audiobooks",
+            "last_played_at",
+            "REAL NOT NULL DEFAULT 0",
+        )
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS audiobook_bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id INTEGER NOT NULL,
+                position REAL NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_audiobook_bookmarks_book
+            ON audiobook_bookmarks(book_id,position);
+            CREATE TABLE IF NOT EXISTS reading_audio_links (
+                ln_book_id INTEGER PRIMARY KEY,
+                audiobook_id INTEGER NOT NULL,
+                alignment_mode TEXT NOT NULL DEFAULT 'chapter',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(audiobook_id) REFERENCES audiobooks(id) ON DELETE CASCADE
             );
             """
         )

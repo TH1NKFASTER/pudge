@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import httpx
@@ -24,7 +25,10 @@ def _cfg(tmp_path: Path) -> AppConfig:
 
 
 def test_v0672_version() -> None:
-    assert __version__ == "0.7.1"
+    root = Path(__file__).parents[1]
+    expected = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    assert __version__ == expected
+    assert f"Current version: **{expected}**." in (root / "README.md").read_text(encoding="utf-8")
 
 
 def test_alignment_generation_uses_history_when_old_sync_source_was_pruned(

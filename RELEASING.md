@@ -43,7 +43,7 @@ GitHub Actions will then:
 1. verify that the tag matches `pudge.__version__`;
 2. run the full test suite in four macOS batches;
 3. build `pudge-macos-v0.6.69.zip`;
-4. create a GitHub Release and attach the ZIP.
+4. create a GitHub Release and attach the ZIP plus its `.sha256` checksum.
 
 If any test batch fails, the release ZIP is not published.
 

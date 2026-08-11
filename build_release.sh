@@ -33,4 +33,7 @@ chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh"
   zip -qr "../${APP_SLUG}-macos-v${VERSION}.zip" "$APP_SLUG"
 )
 
-echo "$PROJECT_DIR/dist/${APP_SLUG}-macos-v${VERSION}.zip"
+ARCHIVE="$PROJECT_DIR/dist/${APP_SLUG}-macos-v${VERSION}.zip"
+shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+
+echo "$ARCHIVE"

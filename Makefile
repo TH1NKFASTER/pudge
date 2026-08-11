@@ -22,9 +22,11 @@ bump:
 
 lint:
 	$(PYTHON) -m ruff check --select E9,F63,F7 pudge tests scripts
-	$(PYTHON) -m ruff check --select E9,F pudge/audiobooks.py pudge/manga.py pudge/subtitles pudge/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
+	$(PYTHON) -m ruff check --select E9,F pudge/audiobooks.py pudge/database.py pudge/light_novels.py pudge/manga.py pudge/manga_ocr_worker.py pudge/metadata_cache.py pudge/reading_audio_alignment.py pudge/web_app.py pudge/subtitles pudge/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py tests/test_v072_reading_experience.py
 	node --check pudge/web/settings.js
 	node --check pudge/web/media.js
+	node --check pudge/web/reading_tools.js
+	node --check pudge/web/manga_reader_v2.js
 
 release:
 	./build_release.sh

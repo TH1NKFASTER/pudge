@@ -83,12 +83,9 @@ def test_anime_context_menu_has_dom_fallback_for_watching_cards() -> None:
     assert "animeFromId(id)||{media_id:id" in html
     assert "fallback.siteUrl||`https://anilist.co/anime/${id}`" in html
     assert "function openAnimeContextFromPointer(e)" in html
-    assert "function isSecondaryAnimeActivation(e)" in html
-    assert "e.button===2||(e.ctrlKey&&e.button===0)" in html
-    assert "document.addEventListener('pointerdown'" in html
-    assert "document.addEventListener('mousedown'" in html
-    assert "document.addEventListener('auxclick'" in html
     assert "document.addEventListener('contextmenu'" in html
+    assert "function isSecondaryAnimeActivation(e)" not in html
+    assert "document.addEventListener('auxclick'" not in html
     assert "showAnimeMenu(card.dataset.mediaId" in html
 
 
@@ -98,9 +95,10 @@ def test_continue_watching_has_explicit_resume_and_context_metadata() -> None:
     assert 'data-continue-card="1"' in html
     assert 'data-continue-card="1" data-media-id=' in html
     assert 'data-action="resume" data-path=' not in html
-    assert "let suppressContinueClickUntil=0" in html
-    assert "performance.now()+700" in html
-    assert "performance.now()<suppressContinueClickUntil" in html
+    assert "document.addEventListener('pointerup',async e=>" in html
+    assert "if(e.button!==0||e.ctrlKey||e.defaultPrevented)return" in html
+    assert "suppressContinueClickUntil" not in html
+    assert ".airing-card.play-starting,.airing-card.play-running { cursor:context-menu; }" in html
     assert "e.stopImmediatePropagation()" in html
     assert "await startPlay(card.dataset.path,true)" in html
     assert '"site_url": anime.site_url if anime is not None else ""' in app

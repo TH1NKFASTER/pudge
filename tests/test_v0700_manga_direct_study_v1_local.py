@@ -42,11 +42,14 @@ def test_manga_text_regions_are_page_specific_and_cached(tmp_path: Path, monkeyp
 
     second = service.text_regions(book["id"], 1)
     second_again = service.text_regions(book["id"], 1)
+    uncached = service.text_regions(book["id"], 0, cached_only=True)
     first = service.text_regions(book["id"], 0)
 
     assert second["page_index"] == 1
     assert second["regions"][0]["text"].startswith("頁")
     assert second_again["cached"] is True
+    assert uncached["cached"] is False
+    assert uncached["regions"] == []
     assert first["page_index"] == 0
     assert len(calls) == 2
     assert calls[0] != calls[1]
@@ -74,7 +77,8 @@ def test_manga_reader_uses_in_place_bubble_text_and_monotonic_zoom() -> None:
     assert "transform:scale(var(--manga-zoom))" not in css
 
     assert "data-pudge-study-hover" in shared
-    assert "hoverStudyTimer" in shared
+    assert "studyHoverTimer" in shared
+    assert shared.count("document.addEventListener('pointerover'") == 1
     assert "openStudyCard" in shared
 
 
@@ -88,7 +92,9 @@ def test_manga_fullscreen_and_library_clicks_match_ln_style() -> None:
     assert "native_window.toggleFullScreen_(None)" in app
     assert "Полный экран" in js
 
-    # Whole gray card opens the reader. Linked cover overrides that action and
-    # opens AniList, same interaction model as Light Novels.
-    assert 'data-series="${esc(group.key)}" data-manga-v2-action="read"' in js
-    assert 'data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}"' in js
+    # Whole gray card opens the reader; secondary actions live in the same
+    # right-click menu model used by Light Novels.
+    assert 'data-manga-v2-action="read" data-id="${Number(continueBook.id)}"' in js
+    assert 'data-manga-context-action="anilist"' in js
+    assert 'data-manga-context-action="score"' in js
+    assert 'data-manga-context-action="ocr-book"' in js

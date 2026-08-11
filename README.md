@@ -2,7 +2,7 @@
 
 Pudge is a macOS media companion focused on anime with Japanese subtitles. It combines a local library, AniList progress, Nyaa downloads, qBittorrent/aria2, mpv playback, subtitle discovery and automatic timing repair in one native window.
 
-Current version: **0.7.1**.
+Current version: **0.7.2**.
 
 ## What it does
 
@@ -29,12 +29,18 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.1.zip
+unzip pudge-macos-v0.7.2.zip
 cd pudge
 ./install.sh
 ```
 
-The first STT fallback may download a small MLX Whisper model. Transcription only runs after deterministic alignment methods fail, and its result is cached by video fingerprint.
+After installation, Settings → Application updates can check GitHub manually.
+Release installs verify the published SHA-256 checksum before reinstalling;
+development checkouts update only from the official origin when the current
+branch is clean and can be fast-forwarded. The previous app bundle is restored
+automatically if installation fails.
+
+The first STT fallback may download a small MLX Whisper model. Subtitle transcription only runs after deterministic alignment methods fail. Light Novel/audiobook transcription starts explicitly from the paired-reading tray. Both results are content-addressed and cached.
 
 Manga reading works without OCR. To enable on-demand [MangaOCR](https://github.com/kha-white/manga-ocr) in an installed release:
 
