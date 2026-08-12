@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.12
+
+- Fixed app updates leaving the previous Pudge window running after the new version opened.
+
+
 ## v0.7.11
 
 - Fixed automatic updates launched from the macOS app failing to find an existing Homebrew installation.

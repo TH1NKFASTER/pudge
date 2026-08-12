@@ -3,12 +3,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_installer_stops_execed_managed_app_process() -> None:
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'pkill -f "pudge.app_entry"' in installer
+def test_release_updater_hard_kills_all_managed_app_instances() -> None:
+    updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
+    assert "/usr/bin/pkill -9 -f '[p]udge[.]app_entry'" in updater
+    assert "old Pudge process is still running after SIGKILL" in updater
 
 
-def test_updater_stops_execed_managed_app_before_install() -> None:
+def test_release_updater_verifies_shutdown_before_install_and_reopen() -> None:
     updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
 
     hard_kill = updater.index("/usr/bin/pkill -9 -f '[p]udge[.]app_entry'")

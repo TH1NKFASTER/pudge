@@ -12,14 +12,13 @@ def test_release_download_retries_transport_failures() -> None:
 
 def test_updater_waits_for_old_managed_app_before_install() -> None:
     updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
-    capture = updater.index("PUDGE_OLD_PIDS=")
-    term = updater.index("/bin/kill -TERM")
-    wait = updater.index("/bin/kill -0")
-    force = updater.index("/bin/kill -KILL")
-    install = updater.index("/bin/zsh ./install.sh --update")
-    reopen = updater.index("/usr/bin/open -n")
-    assert capture < term < wait < force < install < reopen
 
+    hard_kill = updater.index("/usr/bin/pkill -9 -f '[p]udge[.]app_entry'")
+    verify = updater.index("/usr/bin/pgrep -f '[p]udge[.]app_entry'")
+    installer = updater.index("/bin/zsh ./install.sh --update")
+    reopen = updater.index("/usr/bin/open -n")
+
+    assert hard_kill < verify < installer < reopen
 
 def test_update_install_does_not_use_native_webview_confirm() -> None:
     html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
