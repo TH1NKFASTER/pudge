@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.11
+
+- Fixed automatic updates launched from the macOS app failing to find an existing Homebrew installation.
+
+
 ## v0.7.10
 
 - Made app updates retry transient download failures automatically instead of requiring repeated manual attempts.

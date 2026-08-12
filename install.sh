@@ -36,10 +36,25 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-if ! command -v brew >/dev/null 2>&1; then
+BREW_BIN=""
+for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+  if [[ -x "$candidate" ]]; then
+    BREW_BIN="$candidate"
+    break
+  fi
+done
+if [[ -z "$BREW_BIN" ]] && command -v brew >/dev/null 2>&1; then
+  BREW_BIN="$(command -v brew)"
+fi
+if [[ -z "$BREW_BIN" ]]; then
   echo "Homebrew is required: https://brew.sh" >&2
   exit 1
 fi
+
+# GUI-launched apps do not inherit the user's login-shell PATH on macOS.
+# Put the discovered Homebrew prefix first so brew-provided python/tools below
+# resolve the same way whether install.sh is launched from Terminal or Pudge.
+export PATH="${BREW_BIN:h}:$PATH"
 
 for formula in mpv ffmpeg alass sevenzip aria2 python@3.12 python-tk@3.12; do
   if ! brew list --versions "$formula" >/dev/null 2>&1; then
