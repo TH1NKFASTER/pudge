@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.7
+
+- Fixed in-app updates for the native managed-environment launcher so the running Pudge process is stopped correctly and the updated app can reopen automatically.
+
+
 ## v0.7.6
 
 - Replaced the frozen PyInstaller application runtime with a lightweight native macOS launcher that always executes the managed Pudge environment, so in-app updates immediately run the newly installed package.

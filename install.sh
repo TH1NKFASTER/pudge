@@ -516,6 +516,7 @@ fi
 
 # Replacement is complete before the working app is touched.
 pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
+pkill -f "pudge.app_entry" >/dev/null 2>&1 || true
 for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
   [[ -z "$app_name" ]] && continue
   pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
