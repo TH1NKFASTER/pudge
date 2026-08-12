@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.13
+
+- Release validation update for the improved in-app restart flow.
+
+
 ## v0.7.12
 
 - Fixed app updates leaving the previous Pudge window running after the new version opened.
