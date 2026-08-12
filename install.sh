@@ -405,6 +405,12 @@ int main(int argc, char *argv[]) {
         setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);
         setenv("PUDGE_ARIA2C", __ARIA2_BIN__, 1);
 
+        NSString *icon_path =
+            [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
+        if (icon_path != nil) {
+            setenv("PUDGE_APP_ICON", [icon_path fileSystemRepresentation], 1);
+        }
+
         char **child_argv =
             calloc((size_t)argc + 4, sizeof(char *));
         if (child_argv == NULL) {

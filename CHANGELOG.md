@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.9
+
+- Fixed the macOS application icon when Pudge runs through the managed Python environment, avoiding the default Python launcher icon during application startup.
+
+
 ## v0.7.8
 
 - Fixed release updates so extracted installers do not depend on executable file permissions.
