@@ -35,9 +35,14 @@ def test_app_bundle_is_built_before_the_working_bundle_is_replaced() -> None:
 
 def test_updater_uses_fast_installer_with_sanitized_environment() -> None:
     updater = (ROOT / "pudge/updater.py").read_text(encoding="utf-8")
+
     assert '"if ! /bin/zsh ./install.sh --update; then"' in updater
     assert '"unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE"' in updater
+
     rollback = updater.index("/usr/bin/ditto")
-    stop = updater.index("/usr/bin/pkill", rollback)
-    install = updater.index("./install.sh --update", stop)
-    assert rollback < stop < install
+    stop = updater.index("/bin/kill -9 {source_pid}", rollback)
+    verify = updater.index("/bin/kill -0 {source_pid}", stop)
+    install = updater.index("/bin/zsh ./install.sh --update")
+    reopen = updater.index("/usr/bin/open -n")
+
+    assert rollback < stop < verify < install < reopen

@@ -406,6 +406,7 @@ class AppUpdater:
         script = project.parent / "run-pudge-update.zsh"
         app_path = Path.home() / "Applications" / (APP_NAME + ".app")
         rollback_path = self.update_root / "rollback" / (APP_NAME + ".app.before-update")
+        source_pid = os.getpid()
         prefix_line = " ".join(shlex.quote(value) for value in prefix)
         commands = [
             "#!/bin/zsh",
@@ -422,14 +423,14 @@ class AppUpdater:
                 f"cd {shlex.quote(str(project))}",
                 f"rm -rf {shlex.quote(str(rollback_path))}",
                 f"if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/ditto {shlex.quote(str(app_path))} {shlex.quote(str(rollback_path))}; fi",
-                f"/usr/bin/pkill -9 -f {shlex.quote(str(app_path / 'Contents' / 'MacOS' / APP_NAME))} >/dev/null 2>&1 || true",
-                "/usr/bin/pkill -9 -f '[p]udge[.]app_entry' >/dev/null 2>&1 || true",
+                f"echo 'Updater: stopping source Pudge PID {source_pid}'",
+                f"/bin/kill -9 {source_pid} >/dev/null 2>&1 || true",
                 "for attempt in {1..50}; do",
-                "  if ! /usr/bin/pgrep -f '[p]udge[.]app_entry' >/dev/null 2>&1; then break; fi",
+                f"  if ! /bin/kill -0 {source_pid} >/dev/null 2>&1; then break; fi",
                 "  /bin/sleep 0.1",
                 "done",
-                "if /usr/bin/pgrep -f '[p]udge[.]app_entry' >/dev/null 2>&1; then",
-                "  echo 'Updater error: old Pudge process is still running after SIGKILL.' >&2",
+                f"if /bin/kill -0 {source_pid} >/dev/null 2>&1; then",
+                f"  echo 'Updater error: source Pudge PID {source_pid} is still running after SIGKILL.' >&2",
                 "  exit 1",
                 "fi",
                 "if ! /bin/zsh ./install.sh --update; then",
