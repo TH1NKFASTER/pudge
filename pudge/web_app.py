@@ -1284,7 +1284,12 @@ class WebAppApi:
             anime = anime_by_id.get(int(media_id)) if media_id is not None else None
             if self._is_future_unreleased(anime):
                 continue
-            sections["completed_ready"].append(item)
+            section = (
+                "new_ready"
+                if anime is not None and anime.media_status == "RELEASING"
+                else "completed_ready"
+            )
+            sections[section].append(item)
 
         # A fully downloaded Planning/removed title used to disappear from the
         # home page until subtitle preparation finished. Keep it visible in the

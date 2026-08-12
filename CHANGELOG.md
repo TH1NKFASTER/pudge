@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.7.5
+
+- Reworked in-app updates to preserve the existing runtime environment, safely roll back failed package/app changes, sanitize inherited Python/Tcl/Tk environment variables and reuse a versioned native launcher runtime.
+- Made repeat updates much faster by replacing the Pudge wheel without rebuilding the native PyInstaller runtime or reinstalling heavy dependencies such as MangaOCR and Torch when the launcher runtime has not changed.
+- Fixed ready RELEASING anime so available episodes appear under New episodes ready rather than Completed and ready, including titles outside the AniList CURRENT list.
+
 ## v0.7.4
 
 - Added batch-first anime download selection, stricter episode/season identity checks, saturated seeder scoring and short qBittorrent candidate races for fresher, safer release selection.

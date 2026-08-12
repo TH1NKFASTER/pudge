@@ -396,6 +396,7 @@ class AppUpdater:
             f"mkdir -p {shlex.quote(str(self.log_path.parent))}",
             f"mkdir -p {shlex.quote(str(rollback_path.parent))}",
             f"exec >> {shlex.quote(str(self.log_path))} 2>&1",
+            "unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE",
         ]
         if prefix_line:
             commands.append(prefix_line)
@@ -404,7 +405,9 @@ class AppUpdater:
                 f"cd {shlex.quote(str(project))}",
                 f"rm -rf {shlex.quote(str(rollback_path))}",
                 f"if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/ditto {shlex.quote(str(app_path))} {shlex.quote(str(rollback_path))}; fi",
-                "if ! ./install.sh; then",
+                f"/usr/bin/pkill -f {shlex.quote(str(app_path / 'Contents' / 'MacOS' / APP_NAME))} >/dev/null 2>&1 || true",
+                "/bin/sleep 1",
+                "if ! ./install.sh --update; then",
                 f"  rm -rf {shlex.quote(str(app_path))}",
                 f"  if [[ -d {shlex.quote(str(rollback_path))} ]]; then /bin/mv {shlex.quote(str(rollback_path))} {shlex.quote(str(app_path))}; fi",
                 f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))}; fi",

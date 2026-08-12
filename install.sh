@@ -19,6 +19,17 @@ CONFIG_PATH="$HOME/.config/$APP_SLUG/config.toml"
 LOG_DIR="$HOME/Library/Logs"
 LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
 AGENT_PLIST="$LAUNCH_AGENTS/$APP_AGENT_LABEL.plist"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+UPDATE_MODE=0
+if [[ "${1:-}" == "--update" ]]; then
+  UPDATE_MODE=1
+  shift
+fi
+if (( $# > 0 )); then
+  echo "Unknown installer argument: $1" >&2
+  exit 2
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This installer is for macOS." >&2
@@ -67,6 +78,41 @@ fi
 
 mkdir -p "$DATA_DIR" "$BIN_DIR" "$APP_DIR" "$LOG_DIR" "$LAUNCH_AGENTS"
 
+FAST_UPDATE=0
+if (( UPDATE_MODE )) && [[ -x "$VENV_DIR/bin/python" ]]; then
+  FAST_UPDATE=1
+  echo "Fast update: preserving the existing runtime environment."
+fi
+
+UPDATE_PACKAGE_BACKUP="$DATA_DIR/update-package-backup"
+UPDATE_SITE_PACKAGES=""
+WHEEL_BUILD_DIR=""
+APP_SWAP_BACKUP=""
+cleanup_install() {
+  local exit_code=$?
+  if (( exit_code != 0 && FAST_UPDATE )) && [[ -n "$UPDATE_SITE_PACKAGES" && -d "$UPDATE_PACKAGE_BACKUP" ]]; then
+    echo "Update failed; restoring the previous Pudge package..."
+    rm -rf "$UPDATE_SITE_PACKAGES/pudge" "$UPDATE_SITE_PACKAGES"/pudge-*.dist-info(N)
+    if [[ -d "$UPDATE_PACKAGE_BACKUP/pudge" ]]; then
+      /usr/bin/ditto "$UPDATE_PACKAGE_BACKUP/pudge" "$UPDATE_SITE_PACKAGES/pudge"
+    fi
+    for info in "$UPDATE_PACKAGE_BACKUP"/pudge-*.dist-info(N); do
+      /usr/bin/ditto "$info" "$UPDATE_SITE_PACKAGES/${info:t}"
+    done
+  fi
+  if (( exit_code != 0 )) && [[ -n "${APP_SWAP_BACKUP:-}" && -d "$APP_SWAP_BACKUP" ]]; then
+    echo "Install failed; restoring the previous app bundle..."
+    rm -rf "$APP_PATH"
+    /bin/mv "$APP_SWAP_BACKUP" "$APP_PATH"
+  elif (( exit_code == 0 )) && [[ -n "${APP_SWAP_BACKUP:-}" ]]; then
+    rm -rf "$APP_SWAP_BACKUP"
+  fi
+  [[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"
+  rm -rf "$UPDATE_PACKAGE_BACKUP"
+  return "$exit_code"
+}
+trap cleanup_install EXIT
+
 # Preserve the optional MangaOCR capability across updates. The installer
 # recreates the runtime venv, so remember whether OCR was available before
 # deleting it. A surviving model-ready marker also counts: in that case the
@@ -96,17 +142,30 @@ PYMANGAOLD
   fi
 fi
 
-rm -rf "$VENV_DIR"
-python3.12 -m venv "$VENV_DIR"
-"$VENV_DIR/bin/python" -m pip install --upgrade pip
-
-WHEEL_BUILD_DIR=""
+if (( FAST_UPDATE )); then
+  UPDATE_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITE'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PYSITE
+)"
+  rm -rf "$UPDATE_PACKAGE_BACKUP"
+  mkdir -p "$UPDATE_PACKAGE_BACKUP"
+  if [[ -d "$UPDATE_SITE_PACKAGES/pudge" ]]; then
+    /usr/bin/ditto "$UPDATE_SITE_PACKAGES/pudge" "$UPDATE_PACKAGE_BACKUP/pudge"
+  fi
+  for info in "$UPDATE_SITE_PACKAGES"/pudge-*.dist-info(N); do
+    /usr/bin/ditto "$info" "$UPDATE_PACKAGE_BACKUP/${info:t}"
+  done
+else
+  rm -rf "$VENV_DIR"
+  python3.12 -m venv "$VENV_DIR"
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip
+fi
 if [[ -d "$PROJECT_DIR/.git" ]]; then
   # Development checkout: always build the wheel from the current working tree.
   # This prevents a stale wheel from a previous version from being installed
   # after applying a source patch. Keep build artifacts out of the repository.
   WHEEL_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_SLUG}-wheel.XXXXXX")"
-  trap '[[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"' EXIT
   "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
   "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
     --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
@@ -127,7 +186,7 @@ WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 "$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
 "$VENV_DIR/bin/python" -m pip install --force-reinstall --no-deps "$WHEEL_PATH"
 
-if (( MANGA_OCR_WAS_INSTALLED )); then
+if (( MANGA_OCR_WAS_INSTALLED && ! FAST_UPDATE )); then
   echo "Restoring MangaOCR..."
   "$VENV_DIR/bin/python" -m pip install --upgrade "manga-ocr>=0.1.14,<1"
   "$VENV_DIR/bin/python" - <<'PYMANGANEW'
@@ -201,12 +260,22 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -Fq 'export PATH="$HOME/.local/bi
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
 fi
 
-# Build a real native app bundle. An AppleScript wrapper launches a detached
-# Homebrew Python process, which macOS labels as "Python" in Dock and Cmd+Tab.
-# PyInstaller gives the Cocoa process an actual pudge bundle/executable.
-"$VENV_DIR/bin/python" -m pip install --upgrade "pyinstaller>=6.10,<7"
+# The native bridge bundle owns one internally consistent frozen Python runtime
+# and dependency set. Only the Pudge package itself is loaded from the managed
+# venv. Normal updates therefore replace the Pudge wheel without rebuilding
+# PyInstaller or mixing two Python standard libraries.
+LAUNCHER_RUNTIME_VERSION="1"
+LAUNCHER_RUNTIME_MARKER="$APP_PATH/Contents/Resources/pudge-launcher-runtime-v${LAUNCHER_RUNTIME_VERSION}"
+REBUILD_APP=1
+if (( FAST_UPDATE )) && [[ -f "$LAUNCHER_RUNTIME_MARKER" ]]; then
+  REBUILD_APP=0
+  echo "Fast update: reusing native launcher runtime v${LAUNCHER_RUNTIME_VERSION}."
+fi
 
 BUILD_DIR="$DATA_DIR/app-build"
+
+if (( REBUILD_APP )); then
+"$VENV_DIR/bin/python" -m pip install --upgrade "pyinstaller>=6.10,<7"
 PACKAGE_DIR="$("$VENV_DIR/bin/python" - <<'PYPACKAGE'
 from pathlib import Path
 import pudge
@@ -246,20 +315,37 @@ if [[ -f "$ICON_SOURCE" ]]; then
   iconutil -c icns "$ICONSET" -o "$ICNS_PATH"
 fi
 
-APP_ENTRY="$APP_ENTRY" VENV_PYTHON="$VENV_DIR/bin/python" CONFIG_PATH="$CONFIG_PATH" SEVENZIP_BIN="$SEVENZIP_BIN" ARIA2_BIN="$ARIA2_BIN" \
+VENV_PUDGE_DIR="$("$VENV_DIR/bin/python" - <<'PYPUDGEDIR'
+from pathlib import Path
+import pudge
+print(Path(pudge.__file__).resolve().parent)
+PYPUDGEDIR
+)"
+APP_ENTRY="$APP_ENTRY" VENV_PYTHON="$VENV_DIR/bin/python" VENV_PUDGE_DIR="$VENV_PUDGE_DIR" CONFIG_PATH="$CONFIG_PATH" SEVENZIP_BIN="$SEVENZIP_BIN" ARIA2_BIN="$ARIA2_BIN" \
   "$VENV_DIR/bin/python" - <<'PYAPP'
 import os
 from pathlib import Path
 
 entry = Path(os.environ["APP_ENTRY"])
 python_path = os.environ["VENV_PYTHON"]
+pudge_dir = os.environ["VENV_PUDGE_DIR"]
 config_path = os.environ["CONFIG_PATH"]
 sevenzip_path = os.environ["SEVENZIP_BIN"]
 aria2_path = os.environ["ARIA2_BIN"]
 entry.write_text(
+    "import importlib.util\n"
     "import os\n"
     "import sys\n"
     "from pathlib import Path\n"
+    f"_pudge_dir = Path({pudge_dir!r})\n"
+    "_pudge_spec = importlib.util.spec_from_file_location(\n"
+    "    'pudge', _pudge_dir / '__init__.py', submodule_search_locations=[str(_pudge_dir)]\n"
+    ")\n"
+    "if _pudge_spec is None or _pudge_spec.loader is None:\n"
+    "    raise RuntimeError('Could not load managed Pudge package')\n"
+    "_pudge = importlib.util.module_from_spec(_pudge_spec)\n"
+    "sys.modules['pudge'] = _pudge\n"
+    "_pudge_spec.loader.exec_module(_pudge)\n"
     f"os.environ['PUDGE_PYTHON'] = {python_path!r}\n"
     f"os.environ['PUDGE_CONFIG'] = {config_path!r}\n"
     f"os.environ['PUDGE_7ZIP'] = {sevenzip_path!r}\n"
@@ -297,7 +383,7 @@ for legacy_bundle in "${LEGACY_BUNDLE_IDS[@]}"; do
   launchctl bootout "gui/$(id -u)" "$legacy_agent_plist" >/dev/null 2>&1 || true
   rm -f "$legacy_agent_plist"
 done
-rm -rf "$APP_PATH" "$OLD_SETTINGS_APP"
+rm -rf "$OLD_SETTINGS_APP"
 
 PYINSTALLER_ARGS=(
   --noconfirm
@@ -318,8 +404,38 @@ PYINSTALLER_ARGS=(
 if [[ -f "$ICNS_PATH" ]]; then
   PYINSTALLER_ARGS+=(--icon "$ICNS_PATH")
 fi
+# A frozen app may export Tcl/Tk/Python paths that point inside its own bundle.
+# Never let those stale paths leak into the replacement PyInstaller build.
+unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE
+
 "$VENV_DIR/bin/python" -m PyInstaller "${PYINSTALLER_ARGS[@]}" "$APP_ENTRY"
-mv "$BUILD_DIR/dist/$APP_NAME.app" "$APP_PATH"
+NEW_APP="$BUILD_DIR/dist/$APP_NAME.app"
+if [[ ! -d "$NEW_APP" ]]; then
+  echo "Installer error: PyInstaller did not produce $APP_NAME.app." >&2
+  exit 1
+fi
+
+# Replacement is ready. Only now stop the running app and swap bundles.
+pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
+for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
+  [[ -z "$app_name" ]] && continue
+  pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
+done
+sleep 1
+
+APP_SWAP_BACKUP="$BUILD_DIR/$APP_NAME.app.before-swap"
+rm -rf "$APP_SWAP_BACKUP"
+if [[ -d "$APP_PATH" ]]; then
+  /bin/mv "$APP_PATH" "$APP_SWAP_BACKUP"
+fi
+if ! /bin/mv "$NEW_APP" "$APP_PATH"; then
+  rm -rf "$APP_PATH"
+  if [[ -d "$APP_SWAP_BACKUP" ]]; then
+    /bin/mv "$APP_SWAP_BACKUP" "$APP_PATH"
+  fi
+  echo "Installer error: could not replace $APP_NAME.app." >&2
+  exit 1
+fi
 
 PLIST="$APP_PATH/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $APP_NAME" "$PLIST" >/dev/null 2>&1 || \
@@ -353,7 +469,10 @@ for ext in mkv mp4 m4v avi mov webm ts m2ts mts wmv flv ogv mpg mpeg; do
   idx=$((idx + 1))
 done
 
+mkdir -p "$APP_PATH/Contents/Resources"
+: > "$LAUNCHER_RUNTIME_MARKER"
 codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1 || true
+fi
 
 cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
