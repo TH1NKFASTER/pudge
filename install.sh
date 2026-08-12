@@ -203,7 +203,7 @@ fi
 WHEEL_NAME="${WHEEL_PATH:t}"
 EXPECTED_VERSION="${WHEEL_NAME#pudge-}"
 EXPECTED_VERSION="${EXPECTED_VERSION%%-*}"
-EXPECTED_VERSION="$EXPECTED_VERSION" "$VENV_DIR/bin/python" - <<'PYVERIFY'
+EXPECTED_VERSION="$EXPECTED_VERSION" "$VENV_DIR/bin/python" -I - <<'PYVERIFY'
 import os
 from importlib.metadata import version as distribution_version
 

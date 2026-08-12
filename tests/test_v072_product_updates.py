@@ -173,7 +173,7 @@ def test_update_installer_script_keeps_a_rollback_bundle(
     script = (tmp_path / "run-pudge-update.zsh").read_text(encoding="utf-8")
     assert ".app.before-update" in script
     assert "/usr/bin/ditto" in script
-    assert "if ! ./install.sh --update; then" in script
+    assert "if ! /bin/zsh ./install.sh --update; then" in script
     assert "/bin/mv" in script
 
 

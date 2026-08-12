@@ -408,7 +408,7 @@ class AppUpdater:
                 f"/usr/bin/pkill -f {shlex.quote(str(app_path / 'Contents' / 'MacOS' / APP_NAME))} >/dev/null 2>&1 || true",
                 "/usr/bin/pkill -f 'pudge.app_entry' >/dev/null 2>&1 || true",
                 "/bin/sleep 1",
-                "if ! ./install.sh --update; then",
+                "if ! /bin/zsh ./install.sh --update; then",
                 f"  rm -rf {shlex.quote(str(app_path))}",
                 f"  if [[ -d {shlex.quote(str(rollback_path))} ]]; then /bin/mv {shlex.quote(str(rollback_path))} {shlex.quote(str(app_path))}; fi",
                 f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))}; fi",

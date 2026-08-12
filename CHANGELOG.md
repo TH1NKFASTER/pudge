@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.7.8
+
+- Fixed release updates so extracted installers do not depend on executable file permissions.
+- Isolated post-install package verification from the current working directory and Python environment, preventing valid updates from being mistaken for stale installations.
+
+
 ## v0.7.7
 
 - Fixed in-app updates for the native managed-environment launcher so the running Pudge process is stopped correctly and the updated app can reopen automatically.
