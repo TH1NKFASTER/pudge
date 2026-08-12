@@ -184,10 +184,12 @@ def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
     for control in (
         'lnrFont', 'lnrFontSize', 'lnrTheme', 'lnrTextColor', 'lnrBgColor',
         'lnrWidth', 'lnrLineHeight', 'lnrIndent', 'lnrVertical', 'lnrMode',
-        'lnrFurigana', 'lnrWordTheme', 'lnrWordNew', 'lnrWordLearning',
+        'lnUnknownFuriganaToggle', 'lnStudyStateMenu',
+        'lnrWordTheme', 'lnrWordNew', 'lnrWordLearning',
         'lnrWordDue', 'lnrWordKnown', 'lnrWordBlacklisted', 'lnrCustomCss',
     ):
         assert control in html
+    assert 'id="lnrFurigana"' not in html
     settings_block = html[html.index("function renderSettings(){"):html.index("function fillSettings")]
     assert 's_ln_reader_font' not in settings_block
 

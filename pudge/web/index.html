@@ -395,6 +395,22 @@ html.ui-inactive *::before,
 html.ui-inactive *::after { animation-play-state:paused !important; }
 @media (max-width:900px) { #app { grid-template-columns:176px 1fr; } .sidebar { min-width:176px; } .anime-card { grid-template-columns:5px 72px minmax(0,1fr); } .anime-card.planned-with-relations { grid-template-columns:5px 72px minmax(0,1fr); } .relation-stage { flex-basis:98px; min-width:98px; } .list-cover-shell { width:72px;height:102px; } .card-actions { grid-column:3; display:flex; flex-wrap:wrap; } .form-grid { grid-template-columns:1fr; gap:6px; } .logo span { display:none; } }
 
+.ln-native-reader-toggle.active{border-color:#6f8cff;background:#20375a;color:#f4f7ff;box-shadow:inset 0 0 0 1px rgba(111,140,255,.28)}
+.ln-reader.word-marks-underline .ln-word{color:inherit!important;text-decoration-line:none!important}.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled{text-decoration-line:underline!important;text-decoration-thickness:2px;text-underline-offset:.16em;text-decoration-skip-ink:auto}
+.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled.state-new{text-decoration-color:var(--pudge-study-new,#f3f6fb)}
+.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled.state-learning{text-decoration-color:var(--pudge-study-learning,#f4bd63)}
+.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled.state-due{text-decoration-color:var(--pudge-study-due,#ff7d8c)}
+.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled.state-known{text-decoration-color:var(--pudge-study-known,#57d38c)}
+.ln-reader.word-marks-underline .ln-word.ln-study-mark-enabled.state-blacklisted{text-decoration-color:var(--pudge-study-blacklisted,#7d8795)}
+.ln-reader.word-marks-color .ln-word{text-decoration:none!important}
+.ln-reader.word-marks-color .ln-word.state-new{color:var(--pudge-study-new,#f3f6fb)!important}
+.ln-reader.word-marks-color .ln-word.state-learning{color:var(--pudge-study-learning,#f4bd63)!important}
+.ln-reader.word-marks-color .ln-word.state-due{color:var(--pudge-study-due,#ff7d8c)!important}
+.ln-reader.word-marks-color .ln-word.state-known{color:var(--pudge-study-known,#57d38c)!important}
+.ln-reader.word-marks-color .ln-word.state-blacklisted{color:var(--pudge-study-blacklisted,#7d8795)!important}
+.ln-study-state-menu{z-index:9300;min-width:190px;padding:7px}.ln-study-state-menu-title{padding:4px 7px 7px;color:#8798ad;font-size:11px}.ln-study-state-option{display:flex;align-items:center;gap:8px;padding:6px 7px;border-radius:6px;cursor:pointer}.ln-study-state-option:hover{background:rgba(111,140,255,.12)}.ln-study-state-option input{margin:0}
+.ln-study-trigger-list{display:flex;gap:6px;flex-wrap:wrap;align-items:center}.ln-study-trigger-chip{display:inline-flex;gap:5px;align-items:center;padding:4px 7px;border:1px solid #435a76;border-radius:999px;background:#152439;font-size:11px}.ln-study-trigger-chip button{padding:0 3px;min-width:0;border:0;background:transparent}.ln-study-trigger-capture.active{border-color:#6f8cff}
+
 .activity-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
 .activity-panel,.diagnostic-panel { border:1px solid var(--line); border-radius:12px; background:var(--panel); padding:14px; }
 .activity-panel h3,.diagnostic-panel h3 { margin:0 0 10px; font-size:15px; }
@@ -446,7 +462,7 @@ html.ui-inactive *::after { animation-play-state:paused !important; }
 .ln-reader p{text-indent:var(--ln-indent,1em)}
 .ln-reader.vertical{writing-mode:vertical-rl;text-orientation:mixed;max-width:none;min-height:calc(100vh - 150px)}
 .ln-reader-scroll.pages{overflow-x:auto;overflow-y:hidden;padding-bottom:24px}.ln-reader-scroll.pages .ln-reader{height:calc(100vh - 145px);max-width:none;column-width:var(--ln-content-width,900px);column-gap:72px;column-fill:auto}.ln-reader-scroll.pages .ln-reader:not(.vertical){width:max-content;min-width:100%}.ln-reader-scroll.pages .ln-reader.vertical{column-width:auto;column-height:var(--ln-content-width,900px)}
-.ln-reader-appearance{position:absolute;z-index:9050;top:58px;right:14px;width:min(420px,calc(100vw - 28px));max-height:calc(100vh - 80px);overflow:auto;padding:14px;border:1px solid #455f7d;border-radius:10px;background:#0c1725;box-shadow:0 18px 52px rgba(0,0,0,.55);display:none}.ln-reader-appearance.open{display:block}.ln-reader-appearance h3{margin:0 0 10px}.ln-reader-appearance .form-grid{grid-template-columns:minmax(140px,1fr) minmax(150px,1fr)}.ln-reader-appearance textarea{min-height:100px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ln-reader-toolbar .icon-button{min-width:36px;font-size:18px;padding:6px 8px}.ln-translate-pop{position:fixed;z-index:9200;width:min(390px,calc(100vw - 24px));max-height:min(360px,calc(100vh - 24px));overflow:auto;padding:11px 12px;border:1px solid #526c8c;border-radius:10px;background:#091321;color:#e7edf6;box-shadow:0 16px 48px rgba(0,0,0,.55);display:none;white-space:pre-wrap;line-height:1.45}.ln-translate-pop.open{display:block}.ln-translate-pop.loading{color:#aebfd4}.ln-reader-shell .ln-reader rt{user-select:none}
+.ln-reader-appearance{position:absolute;z-index:9050;top:58px;right:14px;width:min(420px,calc(100vw - 28px));max-height:calc(100vh - 80px);overflow:auto;padding:14px;border:1px solid #455f7d;border-radius:10px;background:#0c1725;box-shadow:0 18px 52px rgba(0,0,0,.55);display:none}.ln-reader-appearance.open{display:block}.ln-reader-appearance h3{margin:0 0 10px}.ln-reader-appearance .form-grid{grid-template-columns:minmax(140px,1fr) minmax(150px,1fr)}.ln-reader-appearance textarea{min-height:100px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ln-reader-toolbar .icon-button{min-width:36px;font-size:18px;padding:6px 8px}.ln-translate-pop{position:fixed;z-index:9200;width:min(390px,calc(100vw - 24px));max-height:min(360px,calc(100vh - 24px));overflow:auto;padding:11px 12px;border:1px solid #526c8c;border-radius:10px;background:#091321;color:#e7edf6;box-shadow:0 16px 48px rgba(0,0,0,.55);display:none;white-space:pre-wrap;line-height:1.45}.ln-translate-pop.open{display:block}.ln-translate-pop.loading{color:#aebfd4}.ln-reader-shell .ln-reader rt,.ln-reader-shell .ln-reader rp{user-select:none;-webkit-user-select:none}
 .ln-word-color-picker{display:grid;grid-template-columns:48px minmax(0,1fr);align-items:center;gap:9px;min-width:0}.form-grid .ln-word-color-picker input[type="color"]{appearance:none;-webkit-appearance:none;width:48px;height:34px;padding:3px;border-radius:7px;background:#0f1b2a;cursor:pointer}.ln-word-color-picker input[type="color"]::-webkit-color-swatch-wrapper{padding:0}.ln-word-color-picker input[type="color"]::-webkit-color-swatch{border:0;border-radius:4px}.ln-word-color-picker output{font:12px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--text);text-transform:uppercase;overflow:hidden;text-overflow:ellipsis}
 .planned-card-download{align-self:flex-start;margin-top:8px;padding:7px 9px;font-size:11px}.anime-card.planned-with-relations .planned-card-download{grid-column:auto}
 .ln-parse-indicator{position:sticky;top:0;z-index:3;padding:6px 9px;border-radius:7px;background:rgba(13,27,44,.9);color:var(--muted);font-size:11px;margin-bottom:10px;width:max-content}
@@ -521,7 +537,7 @@ html.ui-inactive *::after { animation-play-state:paused !important; }
     </div>
   </main>
 </div>
-<div id="lnReaderShell" class="ln-reader-shell"><div class="ln-reader-toolbar"><button id="lnReaderClose">← Light Novels</button><strong id="lnReaderTitle"></strong><select id="lnChapterSelect"></select><span class="spacer"></span><button id="lnReaderAppearanceToggle" class="icon-button" title="Reader appearance">⚙</button><button id="lnFinishVolume">Finish volume</button></div><div id="lnReaderAppearance" class="ln-reader-appearance"><h3 data-i18n="settings.lnReader">Reader appearance</h3><div class="form-grid"><label for="lnrFont" data-i18n="settings.lnFont">Font</label><select id="lnrFont"><option value="gothic">System Gothic</option><option value="mincho">System Mincho</option><option value="hiragino-sans">Hiragino Sans</option><option value="hiragino-mincho">Hiragino Mincho</option><option value="hiragino-maru">Hiragino Maru Gothic</option><option value="yu-gothic">Yu Gothic</option><option value="yu-mincho">Yu Mincho</option><option value="toppan-mincho">Toppan Bunkyu Mincho</option><option value="toppan-gothic">Toppan Bunkyu Gothic</option><option value="klee">Klee</option><option value="osaka">Osaka</option><option value="osaka-mono">Osaka Mono</option><option value="meiryo">Meiryo</option><option value="ms-gothic">MS Gothic</option><option value="ms-mincho">MS Mincho</option><option value="biz-gothic">BIZ UD Gothic</option><option value="biz-mincho">BIZ UD Mincho</option><option value="ud-kyokasho">UD Digi Kyokasho</option><option value="noto-sans">Noto Sans JP</option><option value="noto-serif">Noto Serif JP</option><option value="ipa-mincho">IPA Mincho</option></select><label for="lnrFontSize" data-i18n="settings.lnFontSize">Font size, px</label><input id="lnrFontSize" type="number" min="12" max="72"><label for="lnrTheme" data-i18n="settings.lnTheme">Theme preset</label><select id="lnrTheme"><option value="night">Night</option><option value="washi">Washi</option><option value="sepia">Sepia</option><option value="paper">Paper</option><option value="sumi">Sumi OLED</option><option value="ai">Indigo</option><option value="moss">Moss</option><option value="contrast">High contrast</option><option value="custom">Custom</option></select><label for="lnrTextColor" data-i18n="settings.lnTextColor">Text color</label><input id="lnrTextColor" type="color"><label for="lnrBgColor" data-i18n="settings.lnBackgroundColor">Background color</label><input id="lnrBgColor" type="color"><label for="lnrWidth" data-i18n="settings.lnWidth">Text width, px</label><input id="lnrWidth" type="number" min="360" max="2400"><label for="lnrLineHeight" data-i18n="settings.lnLineHeight">Line height</label><input id="lnrLineHeight" type="number" min="1" max="3.5" step="0.1"><label for="lnrIndent" data-i18n="settings.lnIndent">Paragraph indent, em</label><input id="lnrIndent" type="number" min="0" max="5" step="0.1"><span></span><label class="check"><input id="lnrVertical" type="checkbox"><span data-i18n="settings.lnVertical">Vertical Japanese text</span></label><label for="lnrMode" data-i18n="settings.lnReaderMode">Reading mode</label><select id="lnrMode"><option value="scroll" data-i18n="settings.lnScroll">Continuous scroll</option><option value="pages" data-i18n="settings.lnPages">Pages / columns</option></select><span></span><label class="check"><input id="lnrFurigana" type="checkbox"><span data-i18n="settings.lnFurigana">Show furigana</span></label><span></span><label class="check"><input id="lnrPitchAccent" type="checkbox"><span data-i18n="settings.lnPitchAccent">Show inline pitch accent</span></label><label for="lnrCustomCss" data-i18n="settings.lnCustomCss">Custom reader CSS</label><textarea id="lnrCustomCss" spellcheck="false" placeholder=".ln-reader .state-due { color:#ff6b7d; }"></textarea></div></div><div id="lnReaderScroll" class="ln-reader-scroll"><article id="lnReader" class="ln-reader"></article></div></div><div id="lnStudyPop" class="ln-study-pop"></div><div id="lnTranslatePop" class="ln-translate-pop"></div><style id="lnCustomStyle"></style>
+<div id="lnReaderShell" class="ln-reader-shell"><div class="ln-reader-toolbar"><button id="lnReaderClose">← Light Novels</button><strong id="lnReaderTitle"></strong><select id="lnChapterSelect"></select><span class="spacer"></span><button id="lnWordMarksToggle" class="icon-button ln-native-reader-toggle" type="button" title="Underline vocabulary">U̲</button><button id="lnUnknownFuriganaToggle" class="icon-button ln-native-reader-toggle" type="button" title="Furigana for unknown words">振</button><button id="lnReaderAppearanceToggle" class="icon-button" title="Reader appearance">⚙</button><button id="lnFinishVolume">Finish volume</button></div><div id="lnReaderAppearance" class="ln-reader-appearance"><h3 data-i18n="settings.lnReader">Reader appearance</h3><div class="form-grid"><label for="lnrFont" data-i18n="settings.lnFont">Font</label><select id="lnrFont"><option value="gothic">System Gothic</option><option value="mincho">System Mincho</option><option value="hiragino-sans">Hiragino Sans</option><option value="hiragino-mincho">Hiragino Mincho</option><option value="hiragino-maru">Hiragino Maru Gothic</option><option value="yu-gothic">Yu Gothic</option><option value="yu-mincho">Yu Mincho</option><option value="toppan-mincho">Toppan Bunkyu Mincho</option><option value="toppan-gothic">Toppan Bunkyu Gothic</option><option value="klee">Klee</option><option value="osaka">Osaka</option><option value="osaka-mono">Osaka Mono</option><option value="meiryo">Meiryo</option><option value="ms-gothic">MS Gothic</option><option value="ms-mincho">MS Mincho</option><option value="biz-gothic">BIZ UD Gothic</option><option value="biz-mincho">BIZ UD Mincho</option><option value="ud-kyokasho">UD Digi Kyokasho</option><option value="noto-sans">Noto Sans JP</option><option value="noto-serif">Noto Serif JP</option><option value="ipa-mincho">IPA Mincho</option></select><label for="lnrFontSize" data-i18n="settings.lnFontSize">Font size, px</label><input id="lnrFontSize" type="number" min="12" max="72"><label for="lnrTheme" data-i18n="settings.lnTheme">Theme preset</label><select id="lnrTheme"><option value="night">Night</option><option value="washi">Washi</option><option value="sepia">Sepia</option><option value="paper">Paper</option><option value="sumi">Sumi OLED</option><option value="ai">Indigo</option><option value="moss">Moss</option><option value="contrast">High contrast</option><option value="custom">Custom</option></select><label for="lnrTextColor" data-i18n="settings.lnTextColor">Text color</label><input id="lnrTextColor" type="color"><label for="lnrBgColor" data-i18n="settings.lnBackgroundColor">Background color</label><input id="lnrBgColor" type="color"><label for="lnrWidth" data-i18n="settings.lnWidth">Text width, px</label><input id="lnrWidth" type="number" min="360" max="2400"><label for="lnrLineHeight" data-i18n="settings.lnLineHeight">Line height</label><input id="lnrLineHeight" type="number" min="1" max="3.5" step="0.1"><label for="lnrIndent" data-i18n="settings.lnIndent">Paragraph indent, em</label><input id="lnrIndent" type="number" min="0" max="5" step="0.1"><span></span><label class="check"><input id="lnrVertical" type="checkbox"><span data-i18n="settings.lnVertical">Vertical Japanese text</span></label><label for="lnrMode" data-i18n="settings.lnReaderMode">Reading mode</label><select id="lnrMode"><option value="scroll" data-i18n="settings.lnScroll">Continuous scroll</option><option value="pages" data-i18n="settings.lnPages">Pages / columns</option></select><span></span><label class="check"><input id="lnrPitchAccent" type="checkbox"><span data-i18n="settings.lnPitchAccent">Show inline pitch accent</span></label><label for="lnrCustomCss" data-i18n="settings.lnCustomCss">Custom reader CSS</label><textarea id="lnrCustomCss" spellcheck="false" placeholder="CSS or describe the style you want…"></textarea><span></span><button id="lnrGenerateCss" type="button">LLM → CSS</button></div></div><div id="lnReaderScroll" class="ln-reader-scroll"><article id="lnReader" class="ln-reader"></article></div></div><div id="lnStudyPop" class="ln-study-pop"></div><div id="lnTranslatePop" class="ln-translate-pop"></div><style id="lnCustomStyle"></style>
 <div id="modalBackdrop" class="modal-backdrop"><div class="modal"><div class="modal-head"><h2 id="modalTitle">Nyaa releases</h2><span class="spacer"></span><button id="modalClose">Close</button></div><div id="modalBody"></div></div></div>
 
 <div id="onboardingBackdrop" class="onboarding-backdrop">
@@ -1046,7 +1062,7 @@ function animeCard(a,planned=false){
   const progress=unreleased?'':`<div class="meta">${t('label.watched')}: ${a.progress} / ${total}${score}${status}</div>`;
   const studio=planned&&a.studio?`<div class="meta planned-studio">${t('label.studio',{studio:escapeHtml(a.studio)})}</div>`:'';
   const jiten=planned?planningJitenShell(a):'';
-  const episodeCount=planningReleasedEpisodeCountForAnime(a),episodeDownload=planned&&episodeCount>0&&String(a.format||'').toUpperCase()!=='MOVIE'&&!unreleased?`<button class="planned-card-download primary" data-action="planning-episodes-auto-card" data-id="${Number(a.media_id)}">${ui.lang==='ru'?'Автоскачать серии':'Auto-download episodes'}</button>`:'';
+  const episodeCount=planningReleasedEpisodeCountForAnime(a),episodeDownload=planned&&episodeCount>0&&String(a.format||'').toUpperCase()!=='MOVIE'&&!unreleased&&!a.planning_download_hidden?`<button class="planned-card-download primary" data-action="planning-episodes-auto-card" data-id="${Number(a.media_id)}">${ui.lang==='ru'?'Автоскачать серии':'Auto-download episodes'}</button>`:'';
   const relationDiagram=planned?planningRelationDiagram(a):'';
   const attrs=`data-media-id="${a.media_id}" data-site-url="${escapeHtml(a.site_url||`https://anilist.co/anime/${a.media_id}`)}" data-title="${escapeHtml(a.title)}" ${planned?'data-planned="1" data-action="open-watch-order"':''}`;
   const coverHtml=cover(a,'list-cover',false,planned?(a.site_url||`https://anilist.co/anime/${a.media_id}`):'');
@@ -1404,37 +1420,91 @@ function renderCharacterGlossary(rows){$('modalBody').innerHTML=`<div class="for
 window.showCharacterGlossaryEditor=showCharacterGlossaryEditor;
 
 function lnVocabMap(payload){const map=new Map();for(const item of payload.vocabulary||[]){map.set(`${item.wordId}:${item.readingIndex}`,item);}return map;}
+function lnStudyNormalizedState(card={}){
+  const explicit=String(card.normalizedState||'').toLowerCase();if(explicit)return explicit;
+  const states=(card.cardState||card.states||[]).map(x=>String(x).toLowerCase());
+  if(states.includes('due')||states.includes('failed'))return 'due';
+  if(states.some(x=>['known','mastered','never-forget'].includes(x)))return 'known';
+  if(states.some(x=>['learning','young','mature'].includes(x)))return 'learning';
+  if(states.includes('blacklisted'))return 'blacklisted';
+  return 'new';
+}
+function lnKanaForRuby(value){return String(value||'').normalize('NFKC').replace(/[ァ-ヶ]/g,ch=>String.fromCharCode(ch.charCodeAt(0)-0x60));}
+function lnFallbackTokenReading(surface,token,card={}){
+  const tokenReading=String(token?.reading||'').replace(/[^\u3040-\u30ffー]/g,'');
+  if(tokenReading)return tokenReading;
+  const spelling=String(card?.spelling||''),dictionaryReading=String(card?.reading||'').replace(/[^\u3040-\u30ffー]/g,'');
+  return spelling&&String(surface||'')===spelling?dictionaryReading:'';
+}
+function lnRubyFromInflectedReading(surface,reading){
+  const source=[...String(surface||'')],read=[...String(reading||'')],readNorm=[...lnKanaForRuby(read.join(''))];
+  if(!source.length||!read.length||!source.some(ch=>/[\u3400-\u9fff々〆ヵヶ]/.test(ch)))return '';
+  const isKanji=ch=>/[\u3400-\u9fff々〆ヵヶ]/.test(ch),norm=value=>[...lnKanaForRuby(value)];
+  let i=0,r=0,out='';
+  while(i<source.length){
+    if(!isKanji(source[i])){
+      const literal=source[i],literalNorm=norm(literal);
+      if(literalNorm.length&&readNorm.slice(r,r+literalNorm.length).join('')!==literalNorm.join(''))return '';
+      r+=literalNorm.length;out+=escapeHtml(literal);i+=1;continue;
+    }
+    let kanjiEnd=i+1;while(kanjiEnd<source.length&&isKanji(source[kanjiEnd]))kanjiEnd+=1;
+    let anchorEnd=kanjiEnd;while(anchorEnd<source.length&&!isKanji(source[anchorEnd]))anchorEnd+=1;
+    const anchor=source.slice(kanjiEnd,anchorEnd).join(''),anchorNorm=norm(anchor).join('');
+    let rubyEnd=readNorm.length;
+    if(anchorNorm){const rest=readNorm.slice(r).join(''),offset=rest.indexOf(anchorNorm);if(offset<0)return '';rubyEnd=r+offset;}
+    if(rubyEnd<=r)return '';
+    const ruby=read.slice(r,rubyEnd).join('');
+    out+=`<ruby>${escapeHtml(source.slice(i,kanjiEnd).join(''))}<rt>${escapeHtml(ruby)}</rt></ruby>`;
+    r=rubyEnd;i=kanjiEnd;
+  }
+  return r===readNorm.length?out:'';
+}
+function lnDictionaryInflectionRuby(surface,card={}){
+  const source=String(surface||''),spelling=String(card?.spelling||''),reading=String(card?.reading||'').replace(/[^\u3040-\u30ffー]/g,'');
+  if(!source||!spelling||!reading||source===spelling||spelling==='来る')return '';
+  const sourceChars=[...source],spellingChars=[...spelling];
+  let common=0;while(common<sourceChars.length&&common<spellingChars.length&&sourceChars[common]===spellingChars[common])common+=1;
+  if(common<1)return '';
+  const prefix=spellingChars.slice(0,common).join(''),suffix=spellingChars.slice(common).join('');
+  if(!/[\u3400-\u9fff々〆ヵヶ]/.test(prefix)||/[\u3400-\u9fff々〆ヵヶ]/.test(suffix))return '';
+  const readingChars=[...reading],suffixNorm=[...lnKanaForRuby(suffix)];
+  if(suffixNorm.length){const tail=[...lnKanaForRuby(reading)].slice(-suffixNorm.length);if(tail.join('')!==suffixNorm.join(''))return '';}
+  const prefixReading=readingChars.slice(0,readingChars.length-suffixNorm.length).join('');
+  if(!prefixReading)return '';
+  const ruby=lnRubyFromInflectedReading(prefix,prefixReading);
+  return ruby?ruby+escapeHtml(sourceChars.slice(common).join('')):'';
+}
 function renderLnTokenBody(surface,token,card){
+  const settings=ui.lnChapter?.settings||ui.lnState?.settings||{},state=lnStudyNormalizedState(card),unknown=!['known','blacklisted'].includes(state);
+  const unknownOnly=true,wantsFurigana=(ui.lnFuriganaEnabled??settings.show_furigana)!==false&&lnCardMatchesStates(card,ui.lnFuriganaStates??settings.furigana_states??LN_DEFAULT_FURIGANA_STATES);
+  if(wantsFurigana&&unknownOnly)return renderLnRubySurface(surface,token,card);
   const pitchCard=globalThis.PudgeReadingTools?.study?.inflectedPitchCard?.(surface,token,card)||card;
   const surfacePitch=globalThis.PudgeReadingTools?.study?.inlinePitchOnSurface?.(surface,pitchCard)||'';
   if(surfacePitch)return `<span class="ln-inline-pitch-surface">${surfacePitch}</span><span class="ln-inline-pitch-fallback">${escapeHtml(surface)}</span>`;
   const inlinePitch=globalThis.PudgeReadingTools?.study?.inlinePitch?.(pitchCard)||'';
   if(inlinePitch)return `<ruby class="ln-pitch-ruby"><span class="ln-pitch-surface">${escapeHtml(surface)}</span><rt>${inlinePitch}</rt></ruby>`;
-  // Match Jiten Reader semantics: ruby offsets are absolute within the parsed
-  // paragraph/token coordinate space. Treating them as sometimes-relative can
-  // duplicate the base text when a token starts after position zero.
-  const rubies=Array.isArray(token?.rubies)?token.rubies:[];
-  if(!rubies.length)return escapeHtml(surface);
-  const tokenStart=Number(token.start||0),ranges=[];
+  if(unknownOnly)return escapeHtml(surface);
+  return renderLnRubySurface(surface,token,card);
+}
+function renderLnRubySurface(surface,token,card={}){
+  const rubies=Array.isArray(token?.rubies)?token.rubies:[],tokenStart=Number(token?.start||0),ranges=[];
   for(const ruby of rubies){
-    const rawStart=Number(ruby?.start),rawEnd=Number(ruby?.end??(Number.isFinite(rawStart)?rawStart+Number(ruby?.length||0):NaN));
-    const reading=String(ruby?.text||'');
+    const rawStart=Number(ruby?.start),rawEnd=Number(ruby?.end??(Number.isFinite(rawStart)?rawStart+Number(ruby?.length||0):NaN)),reading=String(ruby?.text||'');
     if(!Number.isFinite(rawStart)||!Number.isFinite(rawEnd)||!reading)continue;
     const start=rawStart-tokenStart,end=rawEnd-tokenStart;
     if(start<0||end<=start||start>=surface.length)continue;
     ranges.push({start,end:Math.min(surface.length,end),reading});
   }
   ranges.sort((a,b)=>a.start-b.start||a.end-b.end);
-  let pos=0,out='';
-  for(const ruby of ranges){
-    if(ruby.start<pos)continue;
-    out+=escapeHtml(surface.slice(pos,ruby.start));
-    const base=surface.slice(ruby.start,ruby.end);
-    if(base)out+=`<ruby>${escapeHtml(base)}<rt>${escapeHtml(ruby.reading)}</rt></ruby>`;
-    pos=ruby.end;
+  if(ranges.length){
+    let pos=0,out='';
+    for(const ruby of ranges){if(ruby.start<pos)continue;out+=escapeHtml(surface.slice(pos,ruby.start));const base=surface.slice(ruby.start,ruby.end);if(base)out+=`<ruby>${escapeHtml(base)}<rt>${escapeHtml(ruby.reading)}</rt></ruby>`;pos=ruby.end;}
+    out+=escapeHtml(surface.slice(pos));return out;
   }
-  out+=escapeHtml(surface.slice(pos));
-  return out;
+  const reading=lnFallbackTokenReading(surface,token,card);
+  if(reading&&/[\u3400-\u9fff々〆ヵヶ]/.test(surface)){const aligned=lnRubyFromInflectedReading(surface,reading);if(aligned)return aligned;}
+  const inflected=lnDictionaryInflectionRuby(surface,card);if(inflected)return inflected;
+  return escapeHtml(surface);
 }
 function lnAudioTextLength(value){return [...String(value||'').normalize('NFKC').toLocaleLowerCase().replace(/[\s\p{P}\p{Z}]/gu,'')].length;}
 function renderLnParagraph(text,tokens,pIndex,vocab,audioBase=0){
@@ -1443,12 +1513,18 @@ function renderLnParagraph(text,tokens,pIndex,vocab,audioBase=0){
     const token=ordered[i],rawStart=Number(token.start||0),rawEnd=Number(token.end??(rawStart+Number(token.length||0)));
     if(!Number.isFinite(rawStart)||!Number.isFinite(rawEnd)||rawEnd<=rawStart||rawStart<pos||rawStart>text.length)continue;
     const start=rawStart,end=Math.min(text.length,rawEnd);out+=escapeHtml(text.slice(pos,start));const surface=text.slice(start,end);if(!surface){continue;}
-    const card=token.card||vocab.get(`${token.wordId}:${token.readingIndex}`)||{};const states=(card.cardState||card.states||[]).map(x=>String(x));const normalized=card.normalizedState||((states.includes('due')||states.includes('failed'))?'due':(states.includes('known')||states.includes('mastered')||states.includes('never-forget'))?'known':(states.includes('learning')||states.includes('young')||states.includes('mature'))?'learning':states.includes('blacklisted')?'blacklisted':'new');const key=`${pIndex}:${i}`;ui.lnTokenMap.set(key,{...token,card,surface,sentence:text});const raw=states.map(x=>`state-${String(x).toLowerCase().replace(/[^a-z0-9-]/g,'-')}`).join(' ');const body=renderLnTokenBody(surface,token,card),audioStart=audioBase+lnAudioTextLength(text.slice(0,start)),audioEnd=audioBase+lnAudioTextLength(text.slice(0,end));out+=`<span class="ln-word state-${escapeHtml(normalized)} ${raw}" data-ln-token="${key}" data-ln-audio-start="${audioStart}" data-ln-audio-end="${audioEnd}">${body}</span>`;pos=end;
+    const card=token.card||vocab.get(`${token.wordId}:${token.readingIndex}`)||{};const states=(card.cardState||card.states||[]).map(x=>String(x));const normalized=card.normalizedState||((states.includes('due')||states.includes('failed'))?'due':(states.includes('known')||states.includes('mastered')||states.includes('never-forget'))?'known':(states.includes('learning')||states.includes('young')||states.includes('mature'))?'learning':states.includes('blacklisted')?'blacklisted':'new');const key=`${pIndex}:${i}`;ui.lnTokenMap.set(key,{...token,card,surface,sentence:text});const raw=states.map(x=>`state-${String(x).toLowerCase().replace(/[^a-z0-9-]/g,'-')}`).join(' ');const markEnabled=lnCardMatchesStates(card,ui.lnUnderlineStates??ui.lnState?.settings?.underline_states??LN_DEFAULT_UNDERLINE_STATES);const body=renderLnTokenBody(surface,token,card),audioStart=audioBase+lnAudioTextLength(text.slice(0,start)),audioEnd=audioBase+lnAudioTextLength(text.slice(0,end));out+=`<span class="ln-word ${markEnabled?'ln-study-mark-enabled ':''}state-${escapeHtml(normalized)} ${raw}" data-ln-token="${key}" data-ln-audio-start="${audioStart}" data-ln-audio-end="${audioEnd}">${body}</span>`;pos=end;
   }
   out+=escapeHtml(text.slice(pos));const audioEnd=audioBase+lnAudioTextLength(text);return `<p data-ln-paragraph="${Number(pIndex)}" data-ln-audio-start="${audioBase}" data-ln-audio-end="${audioEnd}">${out}</p>`;
 }
 function lnFontStack(id){const map={gothic:'"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic","Noto Sans JP",sans-serif',mincho:'"Hiragino Mincho ProN","Yu Mincho","Noto Serif JP",serif','hiragino-sans':'"Hiragino Sans","Hiragino Kaku Gothic ProN",sans-serif','hiragino-mincho':'"Hiragino Mincho ProN","Hiragino Mincho Pro",serif','hiragino-maru':'"Hiragino Maru Gothic ProN","Hiragino Maru Gothic Pro",sans-serif','yu-gothic':'"YuGothic","Yu Gothic",sans-serif','yu-mincho':'"YuMincho","Yu Mincho",serif','toppan-mincho':'"Toppan Bunkyu Mincho","Toppan Bunkyu Midashi Mincho",serif','toppan-gothic':'"Toppan Bunkyu Gothic",sans-serif',klee:'"Klee One","Klee","Klee Medium",cursive',osaka:'"Osaka",sans-serif','osaka-mono':'"Osaka-Mono",monospace',meiryo:'"Meiryo","Meiryo UI",sans-serif','ms-gothic':'"MS Gothic","MS PGothic",monospace','ms-mincho':'"MS Mincho","MS PMincho",serif','biz-gothic':'"BIZ UDGothic","BIZ UDPGothic",sans-serif','biz-mincho':'"BIZ UDMincho","BIZ UDPMincho",serif','ud-kyokasho':'"UD Digi Kyokasho N-R","UD Digi Kyokasho NK-R",sans-serif','noto-sans':'"Noto Sans JP","Noto Sans CJK JP",sans-serif','noto-serif':'"Noto Serif JP","Noto Serif CJK JP",serif','ipa-mincho':'"IPAMincho","IPAexMincho",serif'};return map[id]||map.mincho;}
-function applyLnReaderSettings(st={}){const root=$('lnReader'),scroll=$('lnReaderScroll');if(!root||!scroll)return;globalThis.PudgeReadingTools?.study?.applyAppearance?.(st);$('lnCustomStyle').textContent=st.custom_css||'';root.style.setProperty('--ln-font-family',lnFontStack(st.reader_font||'mincho'));root.style.setProperty('--ln-font-size',`${Number(st.reader_font_size||22)}px`);root.style.setProperty('--ln-reader-fg',st.reader_text_color||'#dce7f6');root.style.setProperty('--ln-reader-bg',st.reader_background_color||'#0b1420');root.style.setProperty('--ln-content-width',`${Number(st.reader_width||900)}px`);root.style.setProperty('--ln-line-height',String(st.reader_line_height||1.9));root.style.setProperty('--ln-indent',`${Number(st.reader_indent??1)}em`);scroll.style.setProperty('--ln-reader-bg',st.reader_background_color||'#0b1420');scroll.classList.toggle('pages',(st.reader_mode||'scroll')==='pages');root.classList.toggle('vertical',!!st.reader_vertical);root.classList.toggle('hide-furigana',st.show_furigana===false);root.classList.toggle('hide-pitch-accent',!!st.reader_vertical||st.show_pitch_accent===false);syncLnReaderControlAvailability();}
+function applyLnReaderSettings(st={}){
+  const root=$('lnReader'),scroll=$('lnReaderScroll');if(!root||!scroll)return;
+  globalThis.PudgeReadingTools?.study?.applyAppearance?.(st);$('lnCustomStyle').textContent=st.custom_css||'';
+  root.style.setProperty('--ln-font-family',lnFontStack(st.reader_font||'mincho'));root.style.setProperty('--ln-font-size',`${Number(st.reader_font_size||22)}px`);root.style.setProperty('--ln-reader-fg',st.reader_text_color||'#dce7f6');root.style.setProperty('--ln-reader-bg',st.reader_background_color||'#0b1420');root.style.setProperty('--ln-content-width',`${Number(st.reader_width||900)}px`);root.style.setProperty('--ln-line-height',String(st.reader_line_height||1.9));root.style.setProperty('--ln-indent',`${Number(st.reader_indent??1)}em`);scroll.style.setProperty('--ln-reader-bg',st.reader_background_color||'#0b1420');
+  scroll.classList.toggle('pages',(st.reader_mode||'scroll')==='pages');root.classList.toggle('vertical',!!st.reader_vertical);root.classList.toggle('hide-furigana',st.show_furigana===false);root.classList.toggle('hide-pitch-accent',!!st.reader_vertical||st.show_pitch_accent===false);
+  const rawMarkStyle=String(st.word_mark_style||'underline'),markStyle=rawMarkStyle==='none'?'color':rawMarkStyle;root.classList.toggle('word-marks-underline',markStyle==='underline');root.classList.toggle('word-marks-color',markStyle==='color');syncLnNativeReaderButtons(st);syncLnReaderControlAvailability();
+}
 function syncLnFinishButton(book=ui.lnBook){const button=$('lnFinishVolume');if(!button)return;ui.lnFinishArmedUntil=0;button.classList.remove('danger-action');button.disabled=!!book?.finished;button.textContent=book?.finished?(ui.lang==='ru'?'Том завершён':'Volume finished'):(ui.lang==='ru'?'Завершить том':'Finish volume');}
 function renderLnChapterPayload(payload){ui.lnChapter=payload;ui.lnTokenMap.clear();const vocab=lnVocabMap(payload),paragraphs=payload.paragraphs||[],tokens=payload.tokens||[];let audioCursor=0;applyLnReaderSettings(payload.settings||ui.lnState?.settings||{});$('lnReader').innerHTML=paragraphs.map((p,i)=>{const html=renderLnParagraph(p,tokens[i]||[],i,vocab,audioCursor);audioCursor+=lnAudioTextLength(p);return html;}).join('');}
 function stopLnParsePoll(){if(ui.lnParsePollTimer){clearTimeout(ui.lnParsePollTimer);ui.lnParsePollTimer=null;}}
@@ -1662,14 +1738,98 @@ function fillSettings(s){const ln=s.light_novels||{};const values={s_language:s.
 const LN_THEME_PRESETS={night:['#cfcdc8','#16181c'],washi:['#2b2a27','#faf7f0'],sepia:['#4a3a29','#f3e7d0'],paper:['#1a1a1a','#ffffff'],sumi:['#c9c7c2','#000000'],ai:['#cfdae3','#14202b'],moss:['#e2e6d8','#1c221b'],contrast:['#ffffff','#000000']};
 const LN_WORD_COLOR_PRESETS={balanced:['#f3f6fb','#f4bd63','#ff7d8c','#57d38c','#7d8795'],jiten:['#a566ef','#e8a020','#ff5940','#70c000','#969696'],jpdb:['#4b8dff','#55b87a','#e03030','#8acb88','#888888'],focus:['#4b8dff','#f4bd63','#ff7d8c','#57d38c','#7d8795'],underline:['#4b8dff','#e8a020','#e03030','#57d38c','#7d8795'],none:['#f3f6fb','#f4bd63','#ff7d8c','#57d38c','#7d8795']};
 function ensureLnWordColorControls(){const grid=$('lnReaderAppearance')?.querySelector('.form-grid'),anchor=$('lnrCustomCss')?.previousElementSibling;if(!grid||!anchor||$('lnrWordTheme'))return;const picker=(id,label)=>`<label for="${id}">${label}</label><div class="ln-word-color-picker"><input id="${id}" type="color"><output data-ln-word-color-value="${id}"></output></div>`;anchor.insertAdjacentHTML('beforebegin',`<label for="lnrWordTheme">${t('settings.lnWordTheme')}</label><select id="lnrWordTheme"><option value="balanced">${t('settings.lnWordBalanced')}</option><option value="jiten">Jiten</option><option value="jpdb">JPDB</option><option value="focus">${t('settings.lnWordFocus')}</option><option value="underline">${t('settings.lnWordUnderline')}</option><option value="none">${t('settings.lnWordNone')}</option><option value="custom">${t('settings.lnWordCustom')}</option></select>${picker('lnrWordNew',t('settings.lnWordNew'))}${picker('lnrWordLearning',t('settings.lnWordLearning'))}${picker('lnrWordDue',t('settings.lnWordDue'))}${picker('lnrWordKnown',t('settings.lnWordKnown'))}${picker('lnrWordBlacklisted',t('settings.lnWordBlacklisted'))}${picker('lnrPitchColor',ui.lang==='ru'?'Цвет pitch accent':'Pitch accent color')}`);}
+function ensureLnStudyControls(){
+  const cssLabel=document.querySelector('label[for="lnrCustomCss"]');if(!cssLabel||$('lnrStudyMode'))return;
+  cssLabel.insertAdjacentHTML('beforebegin',`<label for="lnrStudyMode">${ui.lang==='ru'?'Jiten-карточка':'Jiten card'}</label><select id="lnrStudyMode"><option value="button">${ui.lang==='ru'?'По кнопке':'By trigger'}</option><option value="hover">${ui.lang==='ru'?'При наведении':'On hover'}</option></select><label>${ui.lang==='ru'?'Триггеры Jiten':'Jiten triggers'}</label><div><div id="lnrStudyTriggerList" class="ln-study-trigger-list"></div><button id="lnrAddStudyTrigger" class="ln-study-trigger-capture" type="button">${ui.lang==='ru'?'Добавить кнопку…':'Add trigger…'}</button></div>`);
+}
+function lnStudyTriggerCodes(){
+  const raw=ui.lnStudyTriggers instanceof Set?[...ui.lnStudyTriggers]:Array.isArray(ui.lnState?.settings?.study_card_triggers)?ui.lnState.settings.study_card_triggers:['MouseLeft'];
+  return raw.map(x=>String(x||'')).filter(Boolean);
+}
+function lnStudyTriggerEnabled(code){return lnStudyTriggerCodes().includes(String(code||''));}
+function lnStudyMode(){return String($('lnrStudyMode')?.value||ui.lnState?.settings?.study_card_mode||'button');}
+function lnStudyTriggerLabel(code){const labels={MouseLeft:ui.lang==='ru'?'ЛКМ':'Left click',MouseMiddle:ui.lang==='ru'?'СКМ':'Middle click',MouseRight:ui.lang==='ru'?'ПКМ':'Right click',ShiftLeft:'Left Shift',ShiftRight:'Right Shift'};return labels[code]||code;}
+function renderLnStudyTriggers(){
+  const box=$('lnrStudyTriggerList');if(!box)return;const values=lnStudyTriggerCodes();
+  box.innerHTML=values.map(code=>`<span class="ln-study-trigger-chip">${escapeHtml(lnStudyTriggerLabel(code))}<button type="button" data-ln-study-trigger-remove="${escapeHtml(code)}" aria-label="Remove">×</button></span>`).join('');
+  const add=$('lnrAddStudyTrigger'),buttonMode=lnStudyMode()==='button';if(add)add.disabled=!buttonMode;box.style.opacity=buttonMode?'1':'.45';
+}
+function finishLnStudyTriggerCapture(code=''){
+  const button=$('lnrAddStudyTrigger');ui.lnStudyTriggerCapturing=false;if(button){button.classList.remove('active');button.textContent=ui.lang==='ru'?'Добавить кнопку…':'Add trigger…';}
+  if(code){const next=new Set(lnStudyTriggerCodes());next.add(String(code));ui.lnStudyTriggers=next;renderLnStudyTriggers();applyLnReaderAppearanceFromControls(true);}
+}
+const LN_JITEN_RAW_STATES=['new','learning','young','mature','due','failed','known','mastered','never-forget','blacklisted'];
+const LN_DEFAULT_FURIGANA_STATES=['new','learning','young','mature','due','failed'];
+const LN_DEFAULT_UNDERLINE_STATES=[...LN_JITEN_RAW_STATES];
+function lnStateArray(value,fallback){
+  const raw=Array.isArray(value)?value:String(value||'').split(/[,;\n]+/);
+  const result=[];for(const item of raw){const state=String(item||'').trim().toLowerCase();if(LN_JITEN_RAW_STATES.includes(state)&&!result.includes(state))result.push(state);}
+  return result.length?result:[...fallback];
+}
+function lnCardRawStates(card={}){
+  const raw=(card.cardState||card.states||[]).map(value=>String(value||'').trim().toLowerCase()).filter(value=>LN_JITEN_RAW_STATES.includes(value));
+  if(raw.length)return [...new Set(raw)];
+  const normalized=lnStudyNormalizedState(card);return LN_JITEN_RAW_STATES.includes(normalized)?[normalized]:['new'];
+}
+function lnCardMatchesStates(card,states){
+  const selected=new Set(lnStateArray(states,[]));return lnCardRawStates(card).some(state=>selected.has(state));
+}
+function ensureLnStudyStateMenu(){
+  let menu=$('lnStudyStateMenu');if(menu)return menu;
+  menu=document.createElement('div');menu.id='lnStudyStateMenu';menu.className='context-menu ln-study-state-menu';document.body.appendChild(menu);return menu;
+}
+function hideLnStudyStateMenu(){const menu=$('lnStudyStateMenu');if(menu){menu.classList.remove('open');menu.innerHTML='';delete menu.dataset.kind;}}
+function showLnStudyStateMenu(kind,x,y){
+  const menu=ensureLnStudyStateMenu(),furigana=kind==='furigana',selected=new Set(furigana?lnStateArray(ui.lnFuriganaStates,LN_DEFAULT_FURIGANA_STATES):lnStateArray(ui.lnUnderlineStates,LN_DEFAULT_UNDERLINE_STATES));
+  menu.dataset.kind=kind;
+  menu.innerHTML=`<div class="ln-study-state-menu-title">${furigana?(ui.lang==='ru'?'Фуригана для':'Furigana for'):(ui.lang==='ru'?'Подчёркивать':'Underline')}</div>`+LN_JITEN_RAW_STATES.map(state=>`<label class="ln-study-state-option"><input type="checkbox" data-ln-study-state="${escapeHtml(state)}" ${selected.has(state)?'checked':''}><span>${escapeHtml(state)}</span></label>`).join('');
+  positionContextMenu(menu,Number(x||0),Number(y||0));
+  menu.classList.add('open');
+}
+function applyLnStudyStateMenu(){
+  const menu=$('lnStudyStateMenu');if(!menu?.classList.contains('open'))return;
+  const values=[...menu.querySelectorAll('[data-ln-study-state]:checked')].map(input=>String(input.dataset.lnStudyState||''));
+  if(menu.dataset.kind==='furigana')ui.lnFuriganaStates=values;
+  else ui.lnUnderlineStates=values;
+  applyLnReaderAppearanceFromControls(true);
+  if(ui.lnChapter)renderLnChapterPayload(ui.lnChapter);
+}
+
+function syncLnNativeReaderButtons(st=ui.lnState?.settings||{}){
+  const marks=$('lnWordMarksToggle'),furigana=$('lnUnknownFuriganaToggle');
+  if(marks){
+    const raw=String(st.word_mark_style||ui.lnWordMarkStyle||'underline'),mode=raw==='none'?'color':raw,underline=mode==='underline';
+    marks.classList.add('active');marks.setAttribute('aria-pressed','true');marks.textContent=underline?'U̲':'色';
+    marks.title=underline
+      ?(ui.lang==='ru'?'Сейчас: цветные подчёркивания. Нажмите для окрашивания слов':'Now: colored underlines. Click to color words')
+      :(ui.lang==='ru'?'Сейчас: цветные слова. Нажмите для подчёркиваний':'Now: colored words. Click for underlines');
+  }
+  if(furigana){const on=(ui.lnFuriganaEnabled??st.show_furigana)!==false;furigana.classList.toggle('active',on);furigana.setAttribute('aria-pressed',String(on));furigana.title=ui.lang==='ru'?'Фуригана у неизвестных слов':'Furigana for unknown words';}
+}
+function looksLikeLnCss(value){const text=String(value||'').trim();return !text||(text.includes('{')&&text.includes('}'));}
+
 function syncLnWordColorOutputs(){for(const output of document.querySelectorAll('[data-ln-word-color-value]')){const input=$(output.dataset.lnWordColorValue);output.value=String(input?.value||'').toUpperCase();output.textContent=output.value;}}
 const LN_COLOR_CSS_FIELDS=[['lnrWordNew','--pudge-study-new','state-new'],['lnrWordLearning','--pudge-study-learning','state-learning'],['lnrWordDue','--pudge-study-due','state-due'],['lnrWordKnown','--pudge-study-known','state-known'],['lnrWordBlacklisted','--pudge-study-blacklisted','state-blacklisted'],['lnrPitchColor','--pudge-pitch-color','pudge-inline-pitch']];
 function lnColorFromCss(css,variable,className){const escaped=variable.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),variableMatch=String(css||'').match(new RegExp(escaped+'\\s*:\\s*(#[0-9a-f]{6})','i'));if(variableMatch)return variableMatch[1].toLowerCase();for(const block of String(css||'').matchAll(/([^{}]+)\{([^{}]*)\}/g)){if(!block[1].includes('.'+className))continue;const color=block[2].match(/(?:^|;)\s*color\s*:\s*(#[0-9a-f]{6})/i);if(color)return color[1].toLowerCase();}return '';}
 function syncLnColorPickersFromCss(){const css=$('lnrCustomCss')?.value||'';let wordChanged=false;for(const [id,variable,className] of LN_COLOR_CSS_FIELDS){const color=lnColorFromCss(css,variable,className),input=$(id);if(!color||!input)continue;input.value=color;if(id!=='lnrPitchColor')wordChanged=true;}if(wordChanged&&$('lnrWordTheme'))$('lnrWordTheme').value='custom';syncLnWordColorOutputs();}
 function writeLnManagedColorCss(){const textarea=$('lnrCustomCss');if(!textarea)return;const start='/* Pudge colors */',end='/* /Pudge colors */',pattern=/\/\* Pudge colors \*\/[\s\S]*?\/\* \/Pudge colors \*\//g;const declarations=LN_COLOR_CSS_FIELDS.map(([id,variable])=>`  ${variable}: ${$(id)?.value||'#000000'};`).join('\n'),block=`${start}\n:root {\n${declarations}\n}\n${end}`;textarea.value=(String(textarea.value||'').replace(pattern,'').trimEnd()+'\n\n'+block).trimStart();}
-function syncLnReaderControlAvailability(){const hasJiten=!!String(ui.lnState?.settings?.jiten_api_key||'').trim(),vertical=!!$('lnrVertical')?.checked,pitch=$('lnrPitchAccent');setStandaloneSettingAvailability($('lnrFurigana'),hasJiten);setStandaloneSettingAvailability(pitch,hasJiten&&!vertical);for(const id of ['lnrWordTheme',...LN_WORD_COLOR_CONTROL_IDS,'lnrPitchColor'])setStandaloneSettingAvailability($(id),hasJiten);if(pitch){const row=pitch.closest('.check');row&&(row.title=!hasJiten?(ui.lang==='ru'?'Сначала подключите Jiten':'Connect Jiten first'):(vertical?(ui.lang==='ru'?'Pitch accent доступен только в горизонтальном режиме':'Pitch accent is available in horizontal mode only'):''));}}
-function populateLnReaderAppearance(st={}){ensureLnWordColorControls();const set=(id,v,check=false)=>{const el=$(id);if(!el)return;if(check)el.checked=!!v;else el.value=v??'';};set('lnrFont',st.reader_font||'mincho');set('lnrFontSize',st.reader_font_size||22);set('lnrTheme',st.reader_theme||'night');set('lnrTextColor',st.reader_text_color||'#dce7f6');set('lnrBgColor',st.reader_background_color||'#0b1420');set('lnrWidth',st.reader_width||900);set('lnrLineHeight',st.reader_line_height||1.9);set('lnrIndent',st.reader_indent??1);set('lnrVertical',!!st.reader_vertical,true);set('lnrMode',st.reader_mode||'scroll');set('lnrFurigana',st.show_furigana!==false,true);set('lnrPitchAccent',st.show_pitch_accent!==false,true);set('lnrWordTheme',st.word_color_theme||'balanced');set('lnrWordNew',st.word_color_new||'#f3f6fb');set('lnrWordLearning',st.word_color_learning||'#f4bd63');set('lnrWordDue',st.word_color_due||'#ff7d8c');set('lnrWordKnown',st.word_color_known||'#57d38c');set('lnrWordBlacklisted',st.word_color_blacklisted||'#7d8795');set('lnrPitchColor',st.pitch_accent_color||'#9ec5ff');set('lnrCustomCss',st.custom_css||'');syncLnColorPickersFromCss();syncLnWordColorOutputs();syncLnReaderControlAvailability();}
-function collectLnReaderAppearance(){const v=id=>$(id)?.value??'',c=id=>!!$(id)?.checked;return {reader_font:v('lnrFont'),reader_font_size:Number(v('lnrFontSize')),reader_theme:v('lnrTheme'),reader_text_color:v('lnrTextColor'),reader_background_color:v('lnrBgColor'),reader_width:Number(v('lnrWidth')),reader_line_height:Number(v('lnrLineHeight')),reader_indent:Number(v('lnrIndent')),reader_vertical:c('lnrVertical'),reader_mode:v('lnrMode'),show_furigana:c('lnrFurigana'),show_pitch_accent:c('lnrPitchAccent'),word_color_theme:v('lnrWordTheme'),word_color_new:v('lnrWordNew'),word_color_learning:v('lnrWordLearning'),word_color_due:v('lnrWordDue'),word_color_known:v('lnrWordKnown'),word_color_blacklisted:v('lnrWordBlacklisted'),pitch_accent_color:v('lnrPitchColor'),custom_css:v('lnrCustomCss')};}
+function syncLnReaderControlAvailability(){
+  const hasJiten=!!String(ui.lnState?.settings?.jiten_api_key||'').trim(),vertical=!!$('lnrVertical')?.checked,pitch=$('lnrPitchAccent');
+  setStandaloneSettingAvailability(pitch,hasJiten&&!vertical);
+  for(const id of ['lnrWordTheme',...LN_WORD_COLOR_CONTROL_IDS,'lnrPitchColor','lnrStudyMode'])setStandaloneSettingAvailability($(id),hasJiten);
+  const addTrigger=$('lnrAddStudyTrigger');if(addTrigger)setStandaloneSettingAvailability(addTrigger,hasJiten&&lnStudyMode()==='button');
+  if(pitch){const row=pitch.closest('.check');row&&(row.title=!hasJiten?(ui.lang==='ru'?'Сначала подключите Jiten':'Connect Jiten first'):(vertical?(ui.lang==='ru'?'Pitch accent доступен только в горизонтальном режиме':'Pitch accent is available in horizontal mode only'):''));}
+  renderLnStudyTriggers();
+}
+function populateLnReaderAppearance(st={}){
+  ensureLnWordColorControls();ensureLnStudyControls();const set=(id,v,check=false)=>{const el=$(id);if(!el)return;if(check)el.checked=!!v;else el.value=v??'';};
+  set('lnrFont',st.reader_font||'mincho');set('lnrFontSize',st.reader_font_size||22);set('lnrTheme',st.reader_theme||'night');set('lnrTextColor',st.reader_text_color||'#dce7f6');set('lnrBgColor',st.reader_background_color||'#0b1420');set('lnrWidth',st.reader_width||900);set('lnrLineHeight',st.reader_line_height||1.9);set('lnrIndent',st.reader_indent??1);set('lnrVertical',!!st.reader_vertical,true);set('lnrMode',st.reader_mode||'scroll');set(st.show_furigana!==false,true);set('lnrPitchAccent',st.show_pitch_accent!==false,true);set('lnrWordTheme',st.word_color_theme||'balanced');set('lnrWordNew',st.word_color_new||'#f3f6fb');set('lnrWordLearning',st.word_color_learning||'#f4bd63');set('lnrWordDue',st.word_color_due||'#ff7d8c');set('lnrWordKnown',st.word_color_known||'#57d38c');set('lnrWordBlacklisted',st.word_color_blacklisted||'#7d8795');set('lnrPitchColor',st.pitch_accent_color||'#9ec5ff');set('lnrCustomCss',st.custom_css||'');set('lnrStudyMode',st.study_card_mode||'button');
+  ui.lnWordMarkStyle=String(st.word_mark_style||'underline')==='none'?'color':String(st.word_mark_style||'underline');ui.lnFuriganaEnabled=st.show_furigana!==false;ui.lnFuriganaStates=lnStateArray(st.furigana_states,LN_DEFAULT_FURIGANA_STATES);ui.lnUnderlineStates=lnStateArray(st.underline_states,LN_DEFAULT_UNDERLINE_STATES);ui.lnFuriganaUnknownOnly=st.furigana_unknown_only!==false;ui.lnStudyTriggers=new Set(Array.isArray(st.study_card_triggers)&&st.study_card_triggers.length?st.study_card_triggers:['MouseLeft']);syncLnColorPickersFromCss();syncLnWordColorOutputs();renderLnStudyTriggers();syncLnNativeReaderButtons(st);syncLnReaderControlAvailability();
+}
+function collectLnReaderAppearance(){
+  const v=id=>$(id)?.value??'',c=id=>!!$(id)?.checked;
+  return {reader_font:v('lnrFont'),reader_font_size:Number(v('lnrFontSize')),reader_theme:v('lnrTheme'),reader_text_color:v('lnrTextColor'),reader_background_color:v('lnrBgColor'),reader_width:Number(v('lnrWidth')),reader_line_height:Number(v('lnrLineHeight')),reader_indent:Number(v('lnrIndent')),reader_vertical:c('lnrVertical'),reader_mode:v('lnrMode'),show_furigana:ui.lnFuriganaEnabled!==false,furigana_states:lnStateArray(ui.lnFuriganaStates,LN_DEFAULT_FURIGANA_STATES),underline_states:lnStateArray(ui.lnUnderlineStates,LN_DEFAULT_UNDERLINE_STATES),show_pitch_accent:c('lnrPitchAccent'),furigana_unknown_only:ui.lnFuriganaUnknownOnly!==false,word_mark_style:String(ui.lnWordMarkStyle||'underline'),study_card_mode:lnStudyMode(),study_card_triggers:lnStudyTriggerCodes(),word_color_theme:v('lnrWordTheme'),word_color_new:v('lnrWordNew'),word_color_learning:v('lnrWordLearning'),word_color_due:v('lnrWordDue'),word_color_known:v('lnrWordKnown'),word_color_blacklisted:v('lnrWordBlacklisted'),pitch_accent_color:v('lnrPitchColor'),custom_css:v('lnrCustomCss')};
+}
 function applyLnReaderThemePreset(){const colors=LN_THEME_PRESETS[$('lnrTheme')?.value||'custom'];if(!colors)return;if($('lnrTextColor'))$('lnrTextColor').value=colors[0];if($('lnrBgColor'))$('lnrBgColor').value=colors[1];}
 function applyLnWordThemePreset(){const colors=LN_WORD_COLOR_PRESETS[$('lnrWordTheme')?.value||'custom'];if(!colors)return;['lnrWordNew','lnrWordLearning','lnrWordDue','lnrWordKnown','lnrWordBlacklisted'].forEach((id,index)=>{if($(id))$(id).value=colors[index];});syncLnWordColorOutputs();}
 function applyLnReaderAppearanceFromControls(save=true){const patch=collectLnReaderAppearance(),base={...(ui.lnState?.settings||{}),...patch};if(ui.lnState)ui.lnState.settings=base;applyLnReaderSettings(base);if(ui.lnChapter)ui.lnChapter.settings=base;if(!save)return;if(ui.lnReaderSettingsSaveTimer)clearTimeout(ui.lnReaderSettingsSaveTimer);ui.lnReaderSettingsSaveTimer=setTimeout(async()=>{try{const saved=await pywebview.api.light_novel_save_settings(patch);if(ui.lnState)ui.lnState.settings={...(ui.lnState.settings||{}),...(saved||{})};}catch(e){console.error(e);}},250);}
@@ -2434,11 +2594,20 @@ document.addEventListener('pointerout',event=>{
 function editableShortcutTarget(target){return !!target?.closest?.('input,textarea,select,[contenteditable="true"]');}
 document.addEventListener('click',event=>{const recorder=event.target.closest?.('.shortcut-recorder');if(recorder){event.preventDefault();event.stopPropagation();startShortcutCapture(recorder);return;}if(ui.shortcutCaptureTarget)stopShortcutCapture();},true);
 document.addEventListener('keydown',event=>{
+  if(ui.lnStudyTriggerCapturing){
+    event.preventDefault();event.stopImmediatePropagation();
+    if(event.key==='Escape'){finishLnStudyTriggerCapture('');return;}
+    if(!event.repeat)finishLnStudyTriggerCapture(String(event.code||event.key||''));
+    return;
+  }
   if(ui.shortcutCaptureTarget){
     event.preventDefault();event.stopPropagation();
     if(event.key==='Escape'){stopShortcutCapture();return;}
     if(event.key==='Backspace'||event.key==='Delete'){const el=ui.shortcutCaptureTarget;el.dataset.shortcutValue='';ui.shortcutCaptureTarget=null;setShortcutRecorder(el,'');return;}
     const value=capturedShortcut(event);if(!value)return;const el=ui.shortcutCaptureTarget;el.dataset.shortcutValue=value;ui.shortcutCaptureTarget=null;setShortcutRecorder(el,value);return;
+  }
+  if($('lnReaderShell')?.classList.contains('open')&&lnStudyMode()==='button'&&lnStudyHoveredWord&&lnStudyTriggerEnabled(event.code)&&!editableShortcutTarget(event.target)){
+    event.preventDefault();event.stopPropagation();if(!event.repeat)void showLnPopup(lnStudyHoveredWord.dataset.lnToken,lnStudyHoveredWord);return;
   }
   const lnSeekSeconds={ArrowLeft:-5,ArrowRight:5,ArrowUp:15,ArrowDown:-15};
   if($('lnReaderShell')?.classList.contains('open')&&ui.lnPairedExpanded&&ui.lnPairedState?.alignment?.ready&&!event.metaKey&&!event.ctrlKey&&!event.altKey&&!event.shiftKey&&!event.target.closest?.('input,textarea,select,button,[contenteditable="true"]')&&Object.prototype.hasOwnProperty.call(lnSeekSeconds,event.key)){event.preventDefault();event.stopPropagation();if(!event.repeat)void seekLnPairedRelative(lnSeekSeconds[event.key]);return;}
@@ -2475,7 +2644,7 @@ document.addEventListener('click',async e=>{
     if(target.id==='lnPairedAudio'){if(!ui.lnBook?.paired_audio||!ui.lnChapter)return;invalidateLnPairedPoll();const state=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));if(!state.alignment?.ready){const force=state.alignment?.status==='error';await pywebview.api.light_novel_prepare_audio_alignment(Number(ui.lnBook.id),force);pollLnPaired();return;}ui.lnPairedExpanded=true;if(state.playing){await pywebview.api.audiobook_stop(Number(state.audiobook_id));stopLnPairedPoll();syncLnPairedTray({...state,playing:false});}else{const started=await pywebview.api.light_novel_play_paired(Number(ui.lnBook.id),Number(ui.lnChapter.chapter_index),lnReaderAudioProgress(),Number($('lnPairedSpeed')?.value||state.speed||1));syncLnPairedTray(started||{...state,playing:true});await applyLnPairedPosition(started||{...state,playing:true});pollLnPaired();}return;}
     if(target.id==='lnReaderAppearanceToggle'){$('lnReaderAppearance').classList.toggle('open');return;}
     if(target.id==='lnFinishVolume'){if(!ui.lnBook||ui.lnBook.finished)return;const now=Date.now();if(Number(ui.lnFinishArmedUntil||0)<now){ui.lnFinishArmedUntil=now+5000;target.textContent=ui.lang==='ru'?'Нажмите ещё раз':'Click again to finish';target.classList.add('danger-action');setTimeout(()=>{if(Number(ui.lnFinishArmedUntil||0)<=Date.now())syncLnFinishButton(ui.lnBook);},5100);return;}ui.lnBook=await pywebview.api.light_novel_finish_volume(Number(ui.lnBook.id));syncLnFinishButton(ui.lnBook);await loadLightNovels(true);toast(ui.lang==='ru'?'Том завершён':'Volume completed');return;}
-    if(target.dataset.lnToken){const sel=window.getSelection();if(sel&&!sel.isCollapsed)return;await showLnPopup(target.dataset.lnToken,target);return;}
+    if(target.dataset.lnToken){if(lnStudyMode()!=='button'||!lnStudyTriggerEnabled('MouseLeft'))return;const sel=window.getSelection();if(sel&&!sel.isCollapsed)return;await showLnPopup(target.dataset.lnToken,target);return;}
     if(target.dataset.lnReview){const token=ui.lnPopupToken;if(!token)return;await pywebview.api.light_novel_study_action({backend:ui.lnState?.settings?.study_backend||'jiten',action:'review',word_id:token.wordId,reading_index:token.readingIndex,grade:target.dataset.lnReview,sentence:token.sentence||''});toast('Review saved');$('lnStudyPop').classList.remove('open');return;}
     if(target.id==='lnAddCard'){const token=ui.lnPopupToken;if(!token)return;const deck=$('lnDeckSelect')?.value||'';await pywebview.api.light_novel_study_action({backend:ui.lnState?.settings?.study_backend||'jiten',action:'add',word_id:token.wordId,reading_index:token.readingIndex,deck_id:deck,sentence:token.sentence||''});toast('Card added');return;}
     if(target.id==='lnPlayFromWord'&&ui.lnPopupAudioOffset!=null){await seekLnPairedToOffset(Number(ui.lnPopupAudioOffset));$('lnStudyPop').classList.remove('open');return;}
@@ -2489,16 +2658,67 @@ document.addEventListener('click',async e=>{
     if(action==='test-study'){await pywebview.api.light_novel_test_study(target.dataset.backend);toast(`${target.dataset.backend} OK`);return;}
   }catch(err){toast(t('error.generic',{error:err.message||err}));}
 });
+
+let lnStudyHoverTimer=null,lnStudyHoveredWord=null;
+document.addEventListener('pointerover',event=>{const word=event.target.closest?.('[data-ln-token]');if(!word||!$('lnReader')?.contains(word))return;lnStudyHoveredWord=word;if(lnStudyMode()!=='hover')return;if(lnStudyHoverTimer)clearTimeout(lnStudyHoverTimer);lnStudyHoverTimer=setTimeout(()=>{const selection=window.getSelection();if(selection&&!selection.isCollapsed)return;if(word.isConnected)void showLnPopup(word.dataset.lnToken,word);},180);},true);
+document.addEventListener('pointerout',event=>{const word=event.target.closest?.('[data-ln-token]');if(!word||word.contains(event.relatedTarget))return;if(lnStudyHoveredWord===word)lnStudyHoveredWord=null;if(lnStudyHoverTimer){clearTimeout(lnStudyHoverTimer);lnStudyHoverTimer=null;}},true);
+document.addEventListener('contextmenu',event=>{const word=event.target.closest?.('[data-ln-token]');if(!word||lnStudyMode()!=='button'||!lnStudyTriggerEnabled('MouseRight'))return;event.preventDefault();const selection=window.getSelection();if(!selection||selection.isCollapsed)void showLnPopup(word.dataset.lnToken,word);},true);
+function openLnNativeStateMenuFromPointer(event){
+  const button=event.target.closest?.('#lnUnknownFuriganaToggle,#lnWordMarksToggle');if(!button)return false;
+  if(button.id==='lnWordMarksToggle'&&String(ui.lnWordMarkStyle||ui.lnState?.settings?.word_mark_style||'underline')!=='underline')return false;
+  event.preventDefault();event.stopPropagation();
+  showLnStudyStateMenu(button.id==='lnUnknownFuriganaToggle'?'furigana':'underline',event.clientX,event.clientY);
+  return true;
+}
+document.addEventListener('contextmenu',event=>{openLnNativeStateMenuFromPointer(event);},true);
+document.addEventListener('mousedown',event=>{
+  if(event.button!==2)return;
+  openLnNativeStateMenuFromPointer(event);
+},true);
+document.addEventListener('mouseup',event=>{
+  if(event.button!==2)return;
+  openLnNativeStateMenuFromPointer(event);
+},true);
+document.addEventListener('pointerup',event=>{
+  if(event.button!==2)return;
+  openLnNativeStateMenuFromPointer(event);
+},true);
+document.addEventListener('click',event=>{
+  if(!event.ctrlKey||event.button!==0)return;
+  if(openLnNativeStateMenuFromPointer(event))event.stopImmediatePropagation();
+},true);
+document.addEventListener('dblclick',event=>{
+  const button=event.target.closest?.('#lnUnknownFuriganaToggle,#lnWordMarksToggle');if(!button)return;
+  openLnNativeStateMenuFromPointer(event);
+},true);
+
+document.addEventListener('click',event=>{
+  const button=event.target.closest?.('#lnUnknownFuriganaToggle,#lnWordMarksToggle'),menu=$('lnStudyStateMenu');
+  if(!button||!menu?.classList.contains('open'))return;
+  event.preventDefault();event.stopImmediatePropagation();hideLnStudyStateMenu();
+},true);
+document.addEventListener('change',event=>{if(event.target?.matches?.('#lnStudyStateMenu [data-ln-study-state]'))applyLnStudyStateMenu();},true);
+document.addEventListener('pointerdown',event=>{if(!event.target.closest?.('#lnStudyStateMenu,#lnUnknownFuriganaToggle,#lnWordMarksToggle'))hideLnStudyStateMenu();},true);
+document.addEventListener('pointerup',event=>{const word=event.target.closest?.('[data-ln-token]');if(!word||event.button!==1||lnStudyMode()!=='button'||!lnStudyTriggerEnabled('MouseMiddle'))return;event.preventDefault();void showLnPopup(word.dataset.lnToken,word);},true);
+document.addEventListener('pointerdown',event=>{if(!ui.lnStudyTriggerCapturing)return;const code={0:'MouseLeft',1:'MouseMiddle',2:'MouseRight'}[Number(event.button)];if(!code)return;event.preventDefault();event.stopImmediatePropagation();finishLnStudyTriggerCapture(code);},true);
+document.addEventListener('click',event=>{const add=event.target.closest?.('#lnrAddStudyTrigger'),remove=event.target.closest?.('[data-ln-study-trigger-remove]');if(add){event.preventDefault();ui.lnStudyTriggerCapturing=true;add.classList.add('active');add.textContent=ui.lang==='ru'?'Нажмите кнопку…':'Press a key/button…';return;}if(remove){event.preventDefault();const next=new Set(lnStudyTriggerCodes());next.delete(String(remove.dataset.lnStudyTriggerRemove||''));if(!next.size)next.add('MouseLeft');ui.lnStudyTriggers=next;renderLnStudyTriggers();applyLnReaderAppearanceFromControls(true);}},true);
+document.addEventListener('click',event=>{void(async()=>{const button=event.target.closest?.('#lnWordMarksToggle,#lnUnknownFuriganaToggle,#lnrGenerateCss');if(!button)return;if(button.id==='lnWordMarksToggle'){ui.lnWordMarkStyle=String(ui.lnWordMarkStyle||'underline')==='underline'?'color':'underline';applyLnReaderAppearanceFromControls(true);return;}if(button.id==='lnUnknownFuriganaToggle'){ui.lnFuriganaEnabled=ui.lnFuriganaEnabled===false;applyLnReaderAppearanceFromControls(true);if(ui.lnChapter)renderLnChapterPayload(ui.lnChapter);return;}if(button.id==='lnrGenerateCss'){const textarea=$('lnrCustomCss'),request=String(textarea?.value||'').trim();if(!request)return;button.disabled=true;const old=button.textContent;button.textContent=ui.lang==='ru'?'Генерирую…':'Generating…';try{const result=await pywebview.api.light_novel_generate_reader_css(request,String(ui.lnState?.settings?.custom_css||''));textarea.value=String(result?.css||'');syncLnColorPickersFromCss();handleLnReaderControl(textarea);toast(ui.lang==='ru'?'CSS создан локальной LLM':'CSS generated by local LLM');}catch(error){toast(t('error.generic',{error:error.message||error}));}finally{button.disabled=false;button.textContent=old;}}})()});
 $('lnChapterSelect').addEventListener('change',e=>{void (async()=>{await saveLnReaderPositionNow();await loadLightNovelChapter(Number(e.target.value),0);})();});
 $('lnReaderShell').addEventListener('input',e=>{if(e.target.id!=='lnPairedScrubber')return;ui.lnPairedScrubbing=true;const duration=Number(e.target.max||0);if($('lnPairedTime'))$('lnPairedTime').textContent=`${lnPairedClock(Number(e.target.value||0))} / ${lnPairedClock(duration)}`;});
 $('lnReaderShell').addEventListener('change',e=>{void (async()=>{if(!ui.lnBook?.paired_audio)return;invalidateLnPairedPoll();const state=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));if(e.target.id==='lnPairedSpeed'){await pywebview.api.audiobook_set_speed(Number(state.audiobook_id),Number(e.target.value||1));}else if(e.target.id==='lnPairedScrubber'){await pywebview.api.audiobook_seek_to(Number(state.audiobook_id),Number(e.target.value||0));ui.lnPairedScrubbing=false;}else{return;}const updated=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));syncLnPairedTray(updated);await applyLnPairedPosition(updated);if(updated.playing)pollLnPaired();})().catch(err=>toast(t('error.generic',{error:err.message||err})));});
 $('lnReaderScroll').addEventListener('scroll',()=>{if(!ui.lnBook||!ui.lnChapter)return;if(ui.lnSaveTimer)clearTimeout(ui.lnSaveTimer);ui.lnSaveTimer=setTimeout(()=>{void saveLnReaderPositionNow();},500);});
 const LN_WORD_COLOR_CONTROL_IDS=['lnrWordNew','lnrWordLearning','lnrWordDue','lnrWordKnown','lnrWordBlacklisted'];
 const LN_READER_COLOR_CONTROL_IDS=[...LN_WORD_COLOR_CONTROL_IDS,'lnrPitchColor'];
-const LN_READER_CONTROL_IDS=new Set(['lnrFont','lnrFontSize','lnrTheme','lnrTextColor','lnrBgColor','lnrWidth','lnrLineHeight','lnrIndent','lnrVertical','lnrMode','lnrFurigana','lnrPitchAccent','lnrWordTheme',...LN_READER_COLOR_CONTROL_IDS,'lnrCustomCss']);
-function handleLnReaderControl(target){if(target.id==='lnrTheme')applyLnReaderThemePreset();else if(target.id==='lnrWordTheme'){applyLnWordThemePreset();writeLnManagedColorCss();}else if(target.id==='lnrCustomCss')syncLnColorPickersFromCss();else if(['lnrTextColor','lnrBgColor'].includes(target.id)&&$('lnrTheme'))$('lnrTheme').value='custom';else if(LN_READER_COLOR_CONTROL_IDS.includes(target.id)){if(LN_WORD_COLOR_CONTROL_IDS.includes(target.id)&&$('lnrWordTheme'))$('lnrWordTheme').value='custom';writeLnManagedColorCss();}syncLnReaderControlAvailability();syncLnWordColorOutputs();applyLnReaderAppearanceFromControls(true);}
+const LN_READER_CONTROL_IDS=new Set(['lnrFont','lnrFontSize','lnrTheme','lnrTextColor','lnrBgColor','lnrWidth','lnrLineHeight','lnrIndent','lnrVertical','lnrMode','lnrPitchAccent','lnrWordTheme','lnrStudyMode',...LN_READER_COLOR_CONTROL_IDS,'lnrCustomCss']);
+function handleLnReaderControl(target){if(target.id==='lnrCustomCss'&&!looksLikeLnCss(target.value))return;const rerenderFurigana=false;if(target.id==='lnrTheme')applyLnReaderThemePreset();else if(target.id==='lnrWordTheme'){applyLnWordThemePreset();writeLnManagedColorCss();}else if(target.id==='lnrCustomCss')syncLnColorPickersFromCss();else if(['lnrTextColor','lnrBgColor'].includes(target.id)&&$('lnrTheme'))$('lnrTheme').value='custom';else if(LN_READER_COLOR_CONTROL_IDS.includes(target.id)){if(LN_WORD_COLOR_CONTROL_IDS.includes(target.id)&&$('lnrWordTheme'))$('lnrWordTheme').value='custom';writeLnManagedColorCss();}syncLnReaderControlAvailability();syncLnWordColorOutputs();applyLnReaderAppearanceFromControls(true);if(rerenderFurigana&&ui.lnChapter)renderLnChapterPayload(ui.lnChapter);}
 document.addEventListener('input',e=>{if(LN_READER_CONTROL_IDS.has(e.target.id))handleLnReaderControl(e.target);});
 document.addEventListener('change',e=>{if(LN_READER_CONTROL_IDS.has(e.target.id))handleLnReaderControl(e.target);});
+$('lnReader').addEventListener('copy',event=>{
+  const selection=window.getSelection();if(!selection||selection.isCollapsed||!selection.rangeCount)return;
+  const range=selection.getRangeAt(0),reader=$('lnReader');if(!reader||!reader.contains(range.commonAncestorContainer))return;
+  const text=lnTextWithoutRuby(range.cloneContents()).replace(/\u00a0/g,' ').trim();if(!text)return;
+  event.preventDefault();event.clipboardData?.setData('text/plain',text);
+});
 $('lnReader').addEventListener('mouseup',()=>setTimeout(handleLnSelectionTranslation,0));
 
 document.addEventListener('click',event=>{void (async()=>{

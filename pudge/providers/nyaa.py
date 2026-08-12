@@ -33,6 +33,7 @@ EPISODE_PATTERNS = (
 BATCH_RE = re.compile(
     r"(?i)\b(batch|complete|全集|全話|season\s*pack|\d{1,3}\s*[-~]\s*\d{1,3})\b"
 )
+VOLUME_MARKER_RE = re.compile(r"(?i)\bvol(?:ume)?[ ._-]*0*\d{1,3}\b")
 EPISODE_RANGE_PATTERNS = (
     re.compile(
         r"(?i)\bS\d{1,2}E(?P<start>\d{1,3})\s*[-~]\s*(?:S\d{1,2}E)?(?P<end>\d{1,3})\b"
@@ -221,6 +222,7 @@ def _release_episode_match(title: str) -> tuple[int | None, bool]:
     title (for example ``86``).
     """
     clean = re.sub(r"\[[^\]]*\]", " ", title)
+    clean = VOLUME_MARKER_RE.sub(" ", clean)
     for index, pattern in enumerate(EPISODE_PATTERNS):
         matches = list(pattern.finditer(clean))
         if not matches:
@@ -270,6 +272,10 @@ def _release_is_eligible_for_episode(
     Unnumbered releases remain visible for manual inspection, but the automatic
     download guard rejects them later.
     """
+    # S00 is conventionally specials/extras, never the numbered TV season.
+    # Reject it before scoring so S00E02 cannot masquerade as normal episode 2.
+    if anime is not None and _season_number(title) == 0:
+        return False
     episode_range = release_episode_range(title)
     if episode_range is not None and not (anime and _season_episode_pair_range(title, anime, requested_episode)):
         return False
@@ -596,6 +602,29 @@ def _freshness_score(published: str, *, batch: bool) -> tuple[float, list[str]]:
     return points * scale, [f"age={age:.0f}d"]
 
 
+def _seed_availability_bonus(seeders: int) -> float:
+    """Reward healthy availability, then saturate once a torrent is well seeded."""
+    count = max(0, int(seeders))
+    if count <= 0:
+        return 0.0
+    if count <= 20:
+        # 6 seeds is usable but clearly weaker than 15-20. After 20, popularity
+        # should barely matter compared with source/codec/release correctness.
+        return 30.0 * (count / 20.0) ** 0.8
+    return 30.0 + min(4.0, math.log2(count / 20.0) * 1.5)
+
+
+def _leecher_activity_bonus(leechers: int, seeders: int) -> float:
+    """Small swarm-activity bonus; never lets leechers rescue a seedless torrent."""
+    peers = max(0, int(leechers))
+    seeds = max(0, int(seeders))
+    if seeds <= 0 or peers <= 0:
+        return 0.0
+    if peers <= 10:
+        return 6.0 * (peers / 10.0) ** 0.7
+    return 6.0 + min(2.0, math.log2(peers / 10.0) * 0.75)
+
+
 def _quality_score(title: str, preferred_resolution: str) -> tuple[float, list[str]]:
     match = RESOLUTION_RE.search(title)
     if not match:
@@ -686,9 +715,8 @@ def _episode_size_quality_score(size_bytes: int, anime: LibraryAnime) -> tuple[f
     ratio = size_bytes / max(1, floor)
     size_mib = size_bytes / 1024**2
     reasons = [f"size={size_mib:.0f}MiB", floor_reason]
-    if ratio >= 1.50:
-        return 12.0, reasons + ["high-bitrate-size"]
     if ratio >= 1.0:
+        # Large files are not inherently better for a single-episode search.
         return 5.0, reasons + ["size-floor-ok"]
     if ratio >= 0.80:
         return -32.0, reasons + ["below-size-floor"]
@@ -732,8 +760,8 @@ def _video_policy_score(
         "x264": r"\b(?:AVC|x264|H[ ._-]?264)\b",
     }
     source_patterns = {
-        "bluray": r"\b(?:BluRay|BDRip|BDMV|REMUX)\b",
-        "bdrip": r"\b(?:BluRay|BDRip|BDMV|REMUX)\b",
+        "bluray": r"\b(?:BluRay|BDRip|BDMV|REMUX|BD)\b",
+        "bdrip": r"\b(?:BluRay|BDRip|BDMV|REMUX|BD)\b",
         "web-dl": r"\bWEB[ ._-]?DL\b",
         "webdl": r"\bWEB[ ._-]?DL\b",
         "webrip": r"\bWEBRip\b",
@@ -804,7 +832,7 @@ def score_release(
         else:
             score -= 34
             reasons.append("season-not-specified")
-    elif release_season is not None and release_season > 1:
+    elif release_season is not None and release_season != 1:
         score -= 110
         reasons.append(f"wrong-season={release_season}")
 
@@ -825,7 +853,7 @@ def score_release(
         )
 
         if release.is_batch:
-            score += 42
+            score += 18
             reasons.append("batch")
         elif likely_pack:
             score += 18
@@ -838,7 +866,7 @@ def score_release(
             start, end = episode_range
             reasons.append(f"range={start}-{end}")
             if anime.episodes and start <= 1 and end >= anime.episodes:
-                score += 115
+                score += 24
                 reasons.append("full-series-range")
             elif anime.episodes:
                 coverage = min(1.0, range_count / max(1, anime.episodes))
@@ -920,7 +948,7 @@ def score_release(
     if re.search(r"(?i)\b(WEB[- .]?DL|WEBRip)\b", release.title):
         score += 6
         reasons.append("WEB")
-    if re.search(r"(?i)\b(BluRay|BDRip|BDMV|REMUX)\b", release.title):
+    if re.search(r"(?i)\b(BluRay|BDRip|BDMV|REMUX|BD)\b", release.title):
         score += 7
         reasons.append("BD")
     if re.search(r"(?i)\b(HEVC|x265|AV1|10bit|10-bit)\b", release.title):
@@ -959,9 +987,13 @@ def score_release(
         score -= 48
         reasons.append("few-seeders")
     if not official_subsplease:
-        seed_bonus = min(46.0, math.log2(max(1, release.seeders + 1)) * 6.0)
+        seed_bonus = _seed_availability_bonus(release.seeders)
         score += seed_bonus
         reasons.append(f"seeds={release.seeders}")
+        leecher_bonus = _leecher_activity_bonus(release.leechers, release.seeders)
+        score += leecher_bonus
+        if release.leechers > 0:
+            reasons.append(f"leechers={release.leechers}")
     score += min(10.0, math.log10(max(1, release.downloads + 1)) * 2.5)
 
     freshness, freshness_reasons = _freshness_score(release.published, batch=batch)

@@ -64,8 +64,11 @@ def find_7zip() -> str | None:
 
 _EPISODE_RANGE_PATTERNS = (
     re.compile(r"(?i)\bS\d{1,2}E(?P<start>\d{1,3})\s*[-–—~]\s*(?:E)?(?P<end>\d{1,3})\b"),
+    re.compile(r"(?i)\bEP?(?P<start>\d{1,3})\s*[-–—~]\s*(?:EP?)?(?P<end>\d{1,3})\b"),
     re.compile(
-        r"(?<!\d)(?P<start>\d{1,3})\s*[-–—~]\s*(?P<end>\d{1,3})"
+        # Do not start a generic episode range inside season/volume markers
+        # such as "S3 - 13" or "V2 - 05".
+        r"(?<![A-Za-z0-9])(?P<start>\d{1,3})\s*[-–—~]\s*(?P<end>\d{1,3})"
         r"(?=$|[\s._\[\](){}])"
     ),
 )

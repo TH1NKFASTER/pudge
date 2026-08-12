@@ -156,7 +156,9 @@ def test_reader_ui_owns_appearance_and_selection_translation() -> None:
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     settings_block = html[html.index("function renderSettings(){"):html.index("function fillSettings")]
     assert 'id="lnReaderAppearance"' in html
-    assert 'id="lnrFont"' in html and 'id="lnrFurigana"' in html and 'id="lnrCustomCss"' in html
+    assert 'id="lnrFont"' in html and 'id="lnUnknownFuriganaToggle"' in html and 'id="lnrCustomCss"' in html
+    assert 'id="lnrFurigana"' not in html
+    assert "lnStudyStateMenu" in html
     assert 'id="s_ln_reader_font"' not in settings_block
     assert 'id="s_ln_furigana"' not in settings_block
     assert 'id="s_ln_custom_css"' not in settings_block

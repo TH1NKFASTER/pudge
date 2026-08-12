@@ -373,6 +373,11 @@ class QBittorrentClient:
                 return dict(item)
         return None
 
+    def torrent_status(self, info_hash: str) -> dict[str, Any] | None:
+        """Return fresh qBittorrent stats for one torrent hash."""
+        self.login()
+        return self._torrent_by_hash(info_hash)
+
     def _set_category_and_tags(
         self,
         torrent_hash: str,

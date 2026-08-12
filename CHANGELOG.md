@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v0.7.4
+
+- Added batch-first anime download selection, stricter episode/season identity checks, saturated seeder scoring and short qBittorrent candidate races for fresher, safer release selection.
+- Hardened Jimaku subtitle identity matching so explicit AniList mismatches and season markers such as `S3 - 13` cannot be mistaken for the requested episode, while preserving exact-title special overrides.
+- Expanded the Light Novel reader with native Jiten study controls, persisted deck selection, configurable study triggers, state-filtered furigana/underlines, word-color vs underline modes and local-LLM reader CSS generation.
+- Improved Light Novel furigana handling for inflected words and kept ruby annotations out of selection translation and copied text.
+- Fixed Light Novel reader UI regressions around inline JavaScript parsing, state-menu visibility/stacking, trackpad secondary-click handling, menu dismissal and filtered underline rendering.
+- Hid redundant Planning download actions once an episode is complete or already downloading, while keeping stalled/error states retryable.
+
 ## v0.7.3
 
 - Added Jiten filters and sorts to Planning; enriched compact and full Light Novel cards with progress, AniList and Jiten facts; and restored wide audiobook playback cards with linked covers.

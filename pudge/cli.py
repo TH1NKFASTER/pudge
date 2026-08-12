@@ -735,6 +735,20 @@ def _anilist_episode(identity: VideoIdentity, anime: AniListAnime) -> int | None
     return None
 
 
+def _jimaku_entry_anilist_conflicts(
+    entry: JimakuEntry,
+    anime: AniListAnime | None,
+) -> bool:
+    # Both IDs are authoritative. A different linked AniList work/season must
+    # never become a timing/quality fallback for the requested anime.
+    if anime is None or entry.anilist_id is None:
+        return False
+    try:
+        return int(entry.anilist_id) != int(anime.id)
+    except (TypeError, ValueError):
+        return False
+
+
 def _jimaku_episode_aliases(
     anime: AniListAnime | None,
     requested_episode: int | None,
@@ -1005,6 +1019,20 @@ def _find_online_subtitles(
                 "CANDIDATE step=jimaku.entry video=%s entry_id=%s anilist_id=%s name=%r",
                 video.name, entry.id, entry.anilist_id, entry.name,
             )
+            if (
+                _jimaku_entry_anilist_conflicts(entry, anime)
+                and not identity_exact_entry(entry)
+            ):
+                logger.info(
+                    "REJECT step=jimaku.entry video=%s entry_id=%s reason=explicit_anilist_mismatch "
+                    "entry_anilist_id=%s requested_anilist_id=%s name=%r",
+                    video.name,
+                    entry.id,
+                    entry.anilist_id,
+                    anime.id if anime else None,
+                    entry.name,
+                )
+                continue
             if verbose:
                 print(f"  Jimaku entry candidate: {entry.name} (id={entry.id})")
             entry_files = (

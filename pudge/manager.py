@@ -44,6 +44,7 @@ from .providers.nyaa import (
     search_ranked,
     search_subsplease_ranked,
     _season_number,
+    _expected_season,
 )
 from .providers.qbittorrent import QBittorrentClient, QBittorrentError
 from .providers.aria2 import Aria2Client
@@ -2053,6 +2054,292 @@ class AnimeManager:
             client.close()
         return removed
 
+    @staticmethod
+    def _torrent_race_is_alive(snapshot: dict[str, Any] | None) -> bool:
+        if not snapshot:
+            return False
+        try:
+            speed = int(snapshot.get("dlspeed") or 0)
+            downloaded = int(snapshot.get("downloaded") or 0)
+            progress = float(snapshot.get("progress") or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return bool(speed > 0 or downloaded >= 256 * 1024 or progress > 0.0)
+
+    def _race_add_candidates(
+        self,
+        media_id: int,
+        candidates: list[NyaaRelease],
+        *,
+        episode: int | None,
+        batch: bool,
+        fast_seconds: float = 10.0,
+        total_seconds: float = 120.0,
+        poll_seconds: float = 2.0,
+    ) -> NyaaRelease | None:
+        """Race up to three qBittorrent candidates and keep the best one that moves."""
+        pool = list(candidates[:3])
+        if not pool:
+            return None
+        if not self.config.qbittorrent.enabled or len(pool) == 1 or self.torrent_paused_on_add():
+            self.add_release(media_id, pool[0], episode=episode, batch=batch)
+            return pool[0]
+
+        anime = self.db.get_anime(media_id)
+        if anime is None:
+            raise ManagerError(f"AniList id={media_id} отсутствует в базе")
+
+        target = self.config.library.root_dir / self._safe_dir_name(anime.title)
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            (target / ".anilist.id").write_text(str(anime.media_id), encoding="utf-8")
+        except OSError as exc:
+            self.logger.warning(
+                "WARN step=torrent.race_sidecar media_id=%s path=%r error=%r",
+                media_id, str(target), str(exc),
+            )
+
+        race_id = f"{media_id}-{episode if episode is not None else 'batch'}-{int(time.time() * 1000)}"
+        race_root = self.config.paths.cache_dir / "torrent-race" / race_id
+        race_root.mkdir(parents=True, exist_ok=True)
+        race_tag = f"race: {race_id}"
+        final_tags = [
+            APP_SLUG,
+            f"anime: {self._safe_qbt_tag(anime.title)}",
+            f"anilist: {anime.media_id}",
+        ]
+        if episode is not None:
+            final_tags.append(f"episode: {episode}")
+        if batch:
+            final_tags.append("series pack")
+
+        client = self.qbt_client()
+        entries: list[tuple[NyaaRelease, str, Path]] = []
+        live_hashes: set[str] = set()
+        stale_existing_hash = ""
+        started_at = time.monotonic()
+
+        def add_one(index: int, release: NyaaRelease) -> bool:
+            # Never hijack/delete a torrent that was already present before this race.
+            if release.info_hash:
+                existing = client.torrent_status(release.info_hash)
+                if existing is not None:
+                    self.logger.info(
+                        "SKIP step=torrent.race_add reason=already_present hash=%s title=%r",
+                        release.info_hash, release.title,
+                    )
+                    return False
+            slot = race_root / f"candidate-{index + 1}"
+            torrent_hash = client.add_release(
+                release,
+                save_path=slot,
+                category=self.config.qbittorrent.category,
+                tags=[APP_SLUG, race_tag],
+                paused=False,
+            )
+            if not torrent_hash:
+                return False
+            client.start(torrent_hash)
+            entries.append((release, str(torrent_hash), slot))
+            self.logger.info(
+                "START step=torrent.race candidate=%s/%s hash=%s score=%.1f seeds=%s leechers=%s title=%r",
+                index + 1, len(pool), torrent_hash, release.score,
+                release.seeders, release.leechers, release.title,
+            )
+            return True
+
+        def observe() -> None:
+            for release, torrent_hash, _slot in entries:
+                snapshot = client.torrent_status(torrent_hash)
+                if snapshot is None:
+                    continue
+                if self._torrent_race_is_alive(snapshot):
+                    live_hashes.add(torrent_hash.casefold())
+                self.logger.info(
+                    "POLL step=torrent.race hash=%s live=%s speed=%s downloaded=%s progress=%s seeds=%s peers=%s score=%.1f",
+                    torrent_hash,
+                    torrent_hash.casefold() in live_hashes,
+                    snapshot.get("dlspeed"), snapshot.get("downloaded"), snapshot.get("progress"),
+                    snapshot.get("num_seeds"), snapshot.get("num_leechs"), release.score,
+                )
+
+        def remove_entry(entry: tuple[NyaaRelease, str, Path]) -> None:
+            _release, torrent_hash, _slot = entry
+            try:
+                client.delete(torrent_hash, delete_files=True)
+            except QBittorrentError as exc:
+                self.logger.warning(
+                    "WARN step=torrent.race_delete hash=%s error=%r", torrent_hash, str(exc)
+                )
+
+        def cleanup_empty_dirs() -> None:
+            for _release, _torrent_hash, slot in reversed(entries):
+                try:
+                    slot.rmdir()
+                except OSError:
+                    pass
+            try:
+                race_root.rmdir()
+            except OSError:
+                pass
+
+        def finalize(winner_entry: tuple[NyaaRelease, str, Path]) -> NyaaRelease:
+            winner, winner_hash, _winner_slot = winner_entry
+            for entry in entries:
+                if entry[1] != winner_hash:
+                    remove_entry(entry)
+            if stale_existing_hash and stale_existing_hash.casefold() != winner_hash.casefold():
+                try:
+                    client.delete(stale_existing_hash, delete_files=True)
+                    delete_records = getattr(self.db, "delete_torrent_records", None)
+                    if callable(delete_records):
+                        delete_records(stale_existing_hash)
+                    self.logger.info(
+                        "DONE step=torrent.race_replace_stalled old_hash=%s winner_hash=%s",
+                        stale_existing_hash, winner_hash,
+                    )
+                except QBittorrentError as exc:
+                    self.logger.warning(
+                        "WARN step=torrent.race_replace_stalled old_hash=%s error=%r",
+                        stale_existing_hash, str(exc),
+                    )
+            client.set_location(winner_hash, target)
+            remover = getattr(client, "remove_tags", None)
+            if callable(remover):
+                remover(winner_hash, {race_tag})
+            client.set_metadata(
+                winner_hash,
+                category=self.config.qbittorrent.category,
+                tags=final_tags,
+            )
+            client.start(winner_hash)
+            try:
+                for item in client.torrents(category=""):
+                    hashes = {
+                        str(item.torrent_hash or "").casefold(),
+                        str(item.raw.get("infohash_v1") or "").casefold(),
+                        str(item.raw.get("infohash_v2") or "").casefold(),
+                    }
+                    if winner_hash.casefold() in hashes:
+                        self._resolve_download_media(item)
+                        self.db.upsert_download(item)
+                        break
+            except QBittorrentError as exc:
+                self.logger.warning(
+                    "WARN step=torrent.race_db_sync hash=%s error=%r", winner_hash, str(exc)
+                )
+            self.db.record_release(
+                winner.info_hash or hashlib.sha1(winner.magnet.encode()).hexdigest(),
+                media_id,
+                episode,
+                winner.title,
+                winner.score,
+            )
+            cleaner = getattr(client, "delete_tags", None)
+            if callable(cleaner):
+                try:
+                    cleaner({race_tag})
+                except QBittorrentError:
+                    pass
+            cleanup_empty_dirs()
+            self.log(
+                f"qBittorrent: выбран живой релиз {winner.title} "
+                f"(score={winner.score:.1f}, seeds={winner.seeders}, leechers={winner.leechers})"
+            )
+            return winner
+
+        try:
+            existing_request = self._existing_download_for_request(
+                client, anime, episode=episode, batch=batch
+            )
+            if existing_request is not None:
+                snapshot = client.torrent_status(existing_request.torrent_hash)
+                if self._torrent_race_is_alive(snapshot):
+                    matched = next(
+                        (
+                            release
+                            for release in pool
+                            if release.info_hash
+                            and release.info_hash.casefold() == existing_request.torrent_hash.casefold()
+                        ),
+                        pool[0],
+                    )
+                    self.logger.info(
+                        "DONE step=torrent.race_existing_live hash=%s title=%r",
+                        existing_request.torrent_hash, existing_request.name,
+                    )
+                    return matched
+                if float(existing_request.progress or 0.0) < 0.01:
+                    stale_existing_hash = existing_request.torrent_hash
+
+            first_added = False
+            try:
+                first_added = add_one(0, pool[0])
+            except QBittorrentError as exc:
+                self.logger.warning(
+                    "FALLBACK step=torrent.race_first_add title=%r error=%r",
+                    pool[0].title, str(exc),
+                )
+
+            # Fast path: a healthy top-ranked release gets ten seconds alone.
+            if first_added:
+                fast_deadline = started_at + max(0.0, fast_seconds)
+                while time.monotonic() < fast_deadline:
+                    observe()
+                    first_hash = entries[0][1].casefold()
+                    if first_hash in live_hashes:
+                        self.logger.info(
+                            "DONE step=torrent.race_fast hash=%s elapsed=%.1f",
+                            entries[0][1], time.monotonic() - started_at,
+                        )
+                        return finalize(entries[0])
+                    remaining = fast_deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(max(0.05, poll_seconds), remaining))
+                observe()
+                if entries and entries[0][1].casefold() in live_hashes:
+                    return finalize(entries[0])
+
+            # Top-1 did not move. Start at most two alternatives in parallel.
+            for index, release in enumerate(pool[1:], start=1):
+                try:
+                    add_one(index, release)
+                except QBittorrentError as exc:
+                    self.logger.warning(
+                        "WARN step=torrent.race_add candidate=%s title=%r error=%r",
+                        index + 1, release.title, str(exc),
+                    )
+
+            if not entries:
+                cleanup_empty_dirs()
+                return None
+
+            race_deadline = started_at + max(float(total_seconds), float(fast_seconds))
+            while time.monotonic() < race_deadline:
+                observe()
+                remaining = race_deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(max(0.05, poll_seconds), remaining))
+            observe()
+
+            # `pool` is already ranked. Keep the highest-score release that actually moved.
+            winner_entry = next(
+                (entry for entry in entries if entry[1].casefold() in live_hashes),
+                None,
+            )
+            if winner_entry is None:
+                for entry in entries:
+                    remove_entry(entry)
+                cleanup_empty_dirs()
+                self.logger.warning(
+                    "FALLBACK step=torrent.race_none_live media_id=%s episode=%s batch=%s candidates=%s",
+                    media_id, episode, batch, len(entries),
+                )
+                return None
+            return finalize(winner_entry)
+        finally:
+            client.close()
+
     def search_and_add_best(
         self,
         media_id: int,
@@ -2061,6 +2348,7 @@ class AnimeManager:
         batch: bool,
         require_score: float | None = None,
         automatic: bool = False,
+        require_explicit_batch: bool = False,
     ) -> NyaaRelease | None:
         releases = self.search_releases(
             media_id,
@@ -2069,14 +2357,21 @@ class AnimeManager:
             automatic=bool(automatic),
         )
         threshold = self.config.nyaa.min_release_score if require_score is None else require_score
-        best = next(
-            (
-                item
-                for item in releases
-                if item.score >= threshold and self._release_seed_requirement_met(item)
-            ),
-            None,
-        )
+        eligible = [
+            item
+            for item in releases
+            if item.score >= threshold and self._release_seed_requirement_met(item)
+            and (
+                not require_explicit_batch
+                or self._release_is_safe_batch_candidate(media_id, item)
+            )
+            and (
+                batch
+                or episode is None
+                or self._release_has_safe_episode_identity(item)
+            )
+        ]
+        best = eligible[0] if eligible else None
         record_video_selection_debug(
             self.config.paths.cache_dir,
             media_id=media_id,
@@ -2088,6 +2383,14 @@ class AnimeManager:
         )
         if best is None:
             return None
+        if (
+            self.config.qbittorrent.enabled
+            and not self.torrent_paused_on_add()
+            and len(eligible) > 1
+        ):
+            return self._race_add_candidates(
+                media_id, eligible, episode=episode, batch=batch
+            )
         self.add_release(media_id, best, episode=episode, batch=batch)
         return best
 
@@ -2143,10 +2446,10 @@ class AnimeManager:
                     releases = self.search_releases(
                         anime.media_id, episode=episode, batch=False, automatic=True
                     )
-                    best = next(
-                        (item for item in releases if self._release_is_allowed_for_auto(item)),
-                        None,
-                    )
+                    eligible = [
+                        item for item in releases if self._release_is_allowed_for_auto(item)
+                    ]
+                    best = eligible[0] if eligible else None
                     record_video_selection_debug(
                         self.config.paths.cache_dir,
                         media_id=anime.media_id,
@@ -2157,9 +2460,21 @@ class AnimeManager:
                         threshold=float(self.config.nyaa.min_release_score),
                     )
                     if best is not None:
-                        self.add_release(
-                            anime.media_id, best, episode=episode, batch=False
-                        )
+                        if (
+                            self.config.qbittorrent.enabled
+                            and not self.torrent_paused_on_add()
+                            and len(eligible) > 1
+                        ):
+                            best = self._race_add_candidates(
+                                anime.media_id,
+                                eligible,
+                                episode=episode,
+                                batch=False,
+                            )
+                        else:
+                            self.add_release(
+                                anime.media_id, best, episode=episode, batch=False
+                            )
                 except (NyaaError, QBittorrentError, ManagerError) as exc:
                     self.log(f"{anime.title} #{episode}: {exc}")
                     continue
@@ -2206,6 +2521,70 @@ class AnimeManager:
             any(reason.startswith("absolute-ep=") for reason in reasons)
             and any(reason.startswith("relative-ep=") for reason in reasons)
         )
+
+    def _release_is_safe_batch_candidate(
+        self,
+        media_id: int,
+        item: NyaaRelease,
+    ) -> bool:
+        """Accept a complete season pack even when its title omits 'Batch'."""
+        reasons = {str(reason) for reason in item.reasons}
+        if any(reason.startswith("wrong-season=") for reason in reasons):
+            return False
+        if "single-episode" in reasons or any(
+            reason.startswith("single-episode=") for reason in reasons
+        ):
+            return False
+
+        # A batch-first download must cover the whole requested AniList entry.
+        # Never treat a partial explicit range as if every episode was queued.
+        has_range = any(reason.startswith("range=") for reason in reasons)
+        if has_range and "full-series-range" not in reasons:
+            return False
+
+        title = item.title
+        if re.search(r"(?i)\b(?:movie|film|special|ova|oad|ona)\b", title):
+            return False
+
+        anime = self.db.get_anime(int(media_id))
+        expected_season = _expected_season(anime) if anime is not None else 1
+        season_markers = {
+            int(value)
+            for value in re.findall(
+                r"(?i)\bS(?:eason)?[ ._-]*0*(\d{1,2})\b",
+                title,
+            )
+        }
+        if any(value != expected_season for value in season_markers):
+            return False
+        release_season = _season_number(title)
+        if release_season is not None and release_season != expected_season:
+            return False
+
+        if item.is_batch:
+            return True
+        return bool(
+            "large-pack-candidate" in reasons
+            and "exact-title-phrase" in reasons
+        )
+
+    def _release_has_safe_episode_identity(self, item: NyaaRelease) -> bool:
+        """Require structural evidence before a release can be selected as an episode."""
+        blocked_reasons = {
+            "wrong-episode",
+            "episode-not-specified",
+            "episode-pack",
+            "ambiguous-episode-mismatch",
+        }
+        if blocked_reasons.intersection(item.reasons):
+            return False
+
+        absolute_alias = self._release_uses_absolute_episode_alias(item)
+        season_mismatch = (
+            "season-not-specified" in item.reasons
+            or any(str(reason).startswith("wrong-season=") for reason in item.reasons)
+        )
+        return not season_mismatch or absolute_alias
 
     def _release_is_strong_exact_untrusted_candidate(self, item: NyaaRelease) -> bool:
         """Allow an exceptionally clear Nyaa match even if the uploader is not trusted.

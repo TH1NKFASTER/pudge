@@ -17,6 +17,27 @@
   let activeToken = null;
   let translationRequest = 0;
 
+  const selectedDeckByBackend = new Map();
+
+  function rememberedStudyDeck(backend) {
+    const key = String(backend || 'jiten').toLowerCase();
+    if (selectedDeckByBackend.has(key)) return selectedDeckByBackend.get(key) || '';
+    try {
+      const value = localStorage.getItem(`pudge.studyDeck.${key}`) || '';
+      selectedDeckByBackend.set(key, value);
+      return value;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function rememberStudyDeck(backend, deckId) {
+    const key = String(backend || 'jiten').toLowerCase();
+    const value = String(deckId || '');
+    selectedDeckByBackend.set(key, value);
+    try { localStorage.setItem(`pudge.studyDeck.${key}`, value); } catch (_) {}
+  }
+
   function ensureUi() {
     let card = document.getElementById('pudgeStudyCard');
     if (!card) {
@@ -307,6 +328,10 @@
       if (select) {
         select.innerHTML = `<option value="">${ru() ? 'Колода…' : 'Study deck…'}</option>` +
           (decks || []).map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('');
+        const remembered = rememberedStudyDeck(activeToken.backend);
+        if (remembered && [...select.options].some(option => option.value === remembered)) {
+          select.value = remembered;
+        }
       }
       position(pop, anchorRect);
     } catch (error) {
@@ -461,6 +486,11 @@
       clearTimeout(studyHoverTimer);
       studyHoverTimer = null;
     }
+  }, true);
+
+  document.addEventListener('change', event => {
+    if (event.target?.id !== 'pudgeStudyDeck' || !activeToken) return;
+    rememberStudyDeck(activeToken.backend, event.target.value || '');
   }, true);
 
   document.addEventListener('click', async event => {

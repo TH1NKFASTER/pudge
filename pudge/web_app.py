@@ -484,6 +484,52 @@ class WebAppApi:
                 return item
         return None
 
+    def _planning_download_button_hidden(
+        self,
+        anime: LibraryAnime,
+        *,
+        downloads: list[Any] | None = None,
+    ) -> bool:
+        # Hide Planning auto-download once this title is already local or managed.
+        job = getattr(self, "_planning_episode_download_state", {}) or {}
+        if bool(job.get("running")) and int(job.get("media_id") or 0) == int(anime.media_id):
+            return True
+
+        invalid_states = {"", "error", "missingfiles", "unknown", "stalleddl"}
+        rows = downloads if downloads is not None else self.manager.db.downloads()
+        for item in rows:
+            if item.media_id is None or int(item.media_id) != int(anime.media_id):
+                continue
+            if float(item.progress or 0.0) >= 0.999:
+                return True
+            state = str(item.state or "").strip().casefold()
+            if state not in invalid_states:
+                return True
+
+        if str(anime.format or "").upper() == "MOVIE":
+            return False
+        if str(anime.media_status or "").upper() == "NOT_YET_RELEASED":
+            return False
+
+        if str(anime.media_status or "").upper() == "FINISHED":
+            target = int(anime.episodes or 0)
+        else:
+            target = int(anime.released_episodes or 0)
+        if target < 1:
+            return False
+
+        incomplete = self.manager.incomplete_download_paths()
+        local_numbers: set[int] = set()
+        for item in self.manager.db.episodes(anime.media_id):
+            if not item.video_path.is_file():
+                continue
+            if self.manager._path_within(item.video_path, incomplete):
+                continue
+            display_episode = self._display_episode_number(anime, item.episode)
+            if display_episode is not None and 1 <= int(display_episode) <= target:
+                local_numbers.add(int(display_episode))
+        return all(number in local_numbers for number in range(1, target + 1))
+
     def _anime_payload(self, anime: LibraryAnime) -> dict[str, Any]:
         released = anime.released_episodes
         outdated = bool(released and released > anime.progress)
@@ -1398,8 +1444,16 @@ class WebAppApi:
         current_anime = self.manager.db.anime_list(("CURRENT",))
         planned_anime = self.manager.db.anime_list(("PLANNING",))
         anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
+        download_rows = self.manager.db.downloads()
         current = [self._anime_payload(a) for a in current_anime]
-        planned = [self._anime_payload(a) for a in planned_anime]
+        planned = []
+        for anime in planned_anime:
+            payload = self._anime_payload(anime)
+            payload["planning_download_hidden"] = self._planning_download_button_hidden(
+                anime,
+                downloads=download_rows,
+            )
+            planned.append(payload)
         episodes = [
             {
                 "media_id": item.media_id,
@@ -1421,7 +1475,7 @@ class WebAppApi:
             for item in self.manager.db.episodes()
         ]
         downloads = []
-        for item in self.manager.db.downloads():
+        for item in download_rows:
             anime = anime_by_id.get(int(item.media_id)) if item.media_id is not None else None
             downloads.append({
                 "torrent_hash": item.torrent_hash,
@@ -2722,6 +2776,13 @@ class WebAppApi:
 
     def light_novel_save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         return self.light_novels.save_settings(values or {})
+
+    def light_novel_generate_reader_css(
+        self,
+        request: str,
+        current_css: str = "",
+    ) -> dict[str, str]:
+        return self.light_novels.generate_reader_css(str(request or ""), str(current_css or ""))
 
     def light_novel_test_study(self, backend: str) -> dict[str, Any]:
         return self.light_novels.test_study(str(backend or "jiten"))
@@ -4453,6 +4514,62 @@ class WebAppApi:
             local_episodes = set(
                 self._planning_local_episodes(anime, total, manager=manager)
             )
+            missing_episodes = [
+                episode for episode in range(1, total + 1)
+                if episode not in local_episodes
+            ]
+
+            # Prefer one real season pack over N independent episode searches.
+            # Size alone is deliberately not enough evidence for this path.
+            if len(missing_episodes) >= 2:
+                cancel_event = getattr(self, "_planning_episode_cancel_event", None)
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                else:
+                    try:
+                        batch_release = manager.search_and_add_best(
+                            media_id,
+                            episode=None,
+                            batch=True,
+                            automatic=False,
+                            require_explicit_batch=True,
+                        )
+                    except Exception as exc:
+                        batch_release = None
+                        self.logger.warning(
+                            "FALLBACK step=planning_episode.batch_first "
+                            "media_id=%s error=%r",
+                            media_id,
+                            str(exc),
+                        )
+                    if batch_release is not None:
+                        results = [
+                            {
+                                "episode": episode,
+                                "status": "local" if episode in local_episodes else "added",
+                                "source": "" if episode in local_episodes else "batch",
+                                "release": "" if episode in local_episodes else batch_release.title,
+                                "error": "",
+                            }
+                            for episode in range(1, total + 1)
+                        ]
+                        with self._planning_episode_download_lock:
+                            self._planning_episode_download_state["current"] = total
+                            self._planning_episode_download_state["episodes"] = [
+                                dict(item) for item in results
+                            ]
+                        job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
+                        if job_id and getattr(self, "job_center", None) is not None:
+                            self.job_center.update(
+                                job_id,
+                                state="running",
+                                current=total,
+                                total=total,
+                                message="Series pack added",
+                            )
+                        status = "done"
+                        return
+
             for episode in range(1, total + 1):
                 cancel_event = getattr(self, "_planning_episode_cancel_event", None)
                 if cancel_event is not None and cancel_event.is_set():

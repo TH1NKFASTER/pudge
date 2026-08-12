@@ -35,6 +35,22 @@ _ALASS_SHIFT_RE = re.compile(r"shifted block .*? by\s+([+-]?\d+:\d{2}:\d{2}(?:\.
 _TEXT_REFERENCE_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt", "mov_text", "text"}
 
 
+def _candidate_explicit_anilist_mismatch(candidate: SubtitleCandidate) -> bool:
+    details = candidate.details if isinstance(candidate.details, dict) else {}
+    # Narrow stale-parent exception: a separately linked special/movie may use
+    # another AniList ID when its entry title exactly matches the opened video.
+    if bool(details.get("entry_identity_exact_title_match")):
+        return False
+    entry_id = details.get("entry_anilist_id")
+    requested_id = details.get("requested_anilist_id")
+    if entry_id in {None, ""} or requested_id in {None, ""}:
+        return False
+    try:
+        return int(entry_id) != int(requested_id)
+    except (TypeError, ValueError):
+        return False
+
+
 def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = "ffsubsync") -> str:
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
@@ -6734,15 +6750,52 @@ def optimize_candidates(
     validate_embedded_reference_with_llm: bool = False,
 ) -> tuple[SubtitleCandidate | None, Path | None, dict[str, object]]:
     """Score every candidate with one shared audio analysis, then optimize the winner."""
-    candidate_list = list(candidates)
+    all_candidates = list(candidates)
+    identity_rejected = [
+        candidate for candidate in all_candidates
+        if _candidate_explicit_anilist_mismatch(candidate)
+    ]
+    candidate_list = [
+        candidate for candidate in all_candidates
+        if not _candidate_explicit_anilist_mismatch(candidate)
+    ]
+    if not candidate_list:
+        reason = (
+            "explicit_anilist_identity_mismatch"
+            if identity_rejected
+            else "no_candidates"
+        )
+        return None, None, _result(
+            reason,
+            sync_was_successful=False,
+            identity_rejected=[
+                {
+                    "name": candidate.name,
+                    "source": candidate.source,
+                    "entry_anilist_id": candidate.details.get("entry_anilist_id"),
+                    "requested_anilist_id": candidate.details.get("requested_anilist_id"),
+                }
+                for candidate in identity_rejected
+            ],
+        )
+    if identity_rejected:
+        configure_logging().info(
+            "REJECT step=subtitle.optimize reason=explicit_anilist_mismatch count=%s candidates=%s",
+            len(identity_rejected),
+            [
+                (
+                    candidate.name,
+                    candidate.details.get("entry_anilist_id"),
+                    candidate.details.get("requested_anilist_id"),
+                )
+                for candidate in identity_rejected
+            ],
+        )
     container_edit_points = (
         probe_container_edit_points(video, ffprobe_path)
         if config.use_container_chapters
         else []
     )
-    if not candidate_list:
-        return None, None, _result("no_candidates", sync_was_successful=False)
-
     # Prefer a subtitle clock before extracting audio. Container chapters make
     # the deterministic exact-episode consensus and local cut repair useful even
     # when semantic LLM checks are disabled (the default). Only ambiguous

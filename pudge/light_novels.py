@@ -390,6 +390,12 @@ class LightNovelSettings:
     study_backend: str = "jiten"
     show_furigana: bool = True
     show_pitch_accent: bool = True
+    furigana_unknown_only: bool = True
+    word_mark_style: str = "underline"
+    study_card_mode: str = "button"
+    study_card_triggers: str = "MouseLeft"
+    furigana_states: str = "new,learning,young,mature,due,failed"
+    underline_states: str = "new,learning,young,mature,due,failed,known,mastered,never-forget,blacklisted"
     custom_css: str = ""
     parse_ahead: str = "next"
     auto_download_nyaa: bool = False
@@ -422,10 +428,61 @@ class LightNovelService:
         "balanced", "jiten", "jpdb", "focus", "underline", "none", "custom"
     }
 
+    JITEN_STUDY_STATES = (
+        "new", "learning", "young", "mature", "due", "failed",
+        "known", "mastered", "never-forget", "blacklisted",
+    )
+    DEFAULT_FURIGANA_STATES = "new,learning,young,mature,due,failed"
+    DEFAULT_UNDERLINE_STATES = "new,learning,young,mature,due,failed,known,mastered,never-forget,blacklisted"
+
+    @classmethod
+    def _jiten_state_csv(cls, value: Any, default: str) -> str:
+        if isinstance(value, (list, tuple, set)):
+            raw = [str(item or "").strip().lower() for item in value]
+        else:
+            raw = [
+                part.strip().lower()
+                for part in re.split(r"[,;\n]+", str(value or ""))
+            ]
+        allowed = set(cls.JITEN_STUDY_STATES)
+        result = []
+        for state in raw:
+            if state in allowed and state not in result:
+                result.append(state)
+        if not result:
+            result = [part for part in default.split(",") if part]
+        return ",".join(result)
+
     @staticmethod
     def _word_color(value: Any, fallback: str) -> str:
         candidate = str(value or "").strip().lower()
         return candidate if re.fullmatch(r"#[0-9a-f]{6}", candidate) else fallback
+
+    @staticmethod
+    def _study_trigger_codes(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple, set)):
+            raw = [str(item or "").strip() for item in value]
+        else:
+            raw = [part.strip() for part in re.split(r"[,;\n]+", str(value or ""))]
+        aliases = {
+            "left": "MouseLeft", "lmb": "MouseLeft", "mouse1": "MouseLeft",
+            "middle": "MouseMiddle", "mmb": "MouseMiddle", "mouse2": "MouseMiddle",
+            "right": "MouseRight", "rmb": "MouseRight", "mouse3": "MouseRight",
+        }
+        result: list[str] = []
+        for item in raw:
+            if not item:
+                continue
+            code = aliases.get(item.casefold(), item)
+            if code not in {"MouseLeft", "MouseMiddle", "MouseRight"} and not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9]{1,31}", code
+            ):
+                continue
+            if code not in result:
+                result.append(code)
+            if len(result) >= 8:
+                break
+        return result or ["MouseLeft"]
 
     def __init__(self, config: Any, *, logger: Any = None) -> None:
         self.config = config
@@ -553,7 +610,31 @@ class LightNovelService:
             jpdb_api_token=values.get("jpdb_api_token", ""),
             study_backend=values.get("study_backend", "jiten") if values.get("study_backend", "jiten") in {"jiten", "jpdb"} else "jiten",
             show_furigana=values.get("show_furigana", "1") != "0",
+            furigana_states=self._jiten_state_csv(
+                values.get("furigana_states"), self.DEFAULT_FURIGANA_STATES
+            ),
+            underline_states=self._jiten_state_csv(
+                values.get("underline_states"), self.DEFAULT_UNDERLINE_STATES
+            ),
             show_pitch_accent=values.get("show_pitch_accent", "1") != "0",
+            furigana_unknown_only=values.get("furigana_unknown_only", "1") != "0",
+            word_mark_style=(
+                "color"
+                if values.get("word_mark_style", "underline") == "none"
+                else (
+                    values.get("word_mark_style", "underline")
+                    if values.get("word_mark_style", "underline") in {"underline", "color"}
+                    else "underline"
+                )
+            ),
+            study_card_mode=(
+                values.get("study_card_mode", "button")
+                if values.get("study_card_mode", "button") in {"button", "hover"}
+                else "button"
+            ),
+            study_card_triggers=",".join(
+                self._study_trigger_codes(values.get("study_card_triggers", "MouseLeft"))
+            ),
             custom_css=values.get("custom_css", ""),
             parse_ahead=values.get("parse_ahead", "next") if values.get("parse_ahead", "next") in {"current", "next", "book"} else "next",
             auto_download_nyaa=values.get("auto_download_nyaa", "0") == "1",
@@ -595,7 +676,9 @@ class LightNovelService:
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {
             "jiten_api_key", "jpdb_api_token", "study_backend", "show_furigana",
-            "show_pitch_accent",
+            "show_pitch_accent", "furigana_unknown_only", "word_mark_style",
+            "furigana_states", "underline_states",
+            "study_card_mode", "study_card_triggers",
             "custom_css", "parse_ahead", "auto_download_nyaa", "nyaa_category",
             "reader_font", "reader_theme", "reader_font_size", "reader_text_color", "reader_background_color",
             "reader_width", "reader_line_height", "reader_indent", "reader_vertical", "reader_mode",
@@ -611,6 +694,22 @@ class LightNovelService:
             "show_furigana": "1" if bool(values.get("show_furigana", current.show_furigana)) else "0",
             "show_pitch_accent": (
                 "1" if bool(values.get("show_pitch_accent", current.show_pitch_accent)) else "0"
+            ),
+            "furigana_states": self._jiten_state_csv(
+                values.get("furigana_states", current.furigana_states),
+                self.DEFAULT_FURIGANA_STATES,
+            ),
+            "underline_states": self._jiten_state_csv(
+                values.get("underline_states", current.underline_states),
+                self.DEFAULT_UNDERLINE_STATES,
+            ),
+            "furigana_unknown_only": (
+                "1" if bool(values.get("furigana_unknown_only", current.furigana_unknown_only)) else "0"
+            ),
+            "word_mark_style": str(values.get("word_mark_style", current.word_mark_style)).strip().lower(),
+            "study_card_mode": str(values.get("study_card_mode", current.study_card_mode)).strip().lower(),
+            "study_card_triggers": ",".join(
+                self._study_trigger_codes(values.get("study_card_triggers", current.study_card_triggers))
             ),
             "custom_css": str(values.get("custom_css", current.custom_css)),
             "parse_ahead": str(values.get("parse_ahead", current.parse_ahead)).strip().lower(),
@@ -658,6 +757,12 @@ class LightNovelService:
             payload["parse_ahead"] = "next"
         if payload["reader_mode"] not in {"scroll", "pages"}:
             payload["reader_mode"] = "scroll"
+        if payload["word_mark_style"] == "none":
+            payload["word_mark_style"] = "color"
+        if payload["word_mark_style"] not in {"underline", "color"}:
+            payload["word_mark_style"] = "underline"
+        if payload["study_card_mode"] not in {"button", "hover"}:
+            payload["study_card_mode"] = "button"
         if payload["word_color_theme"] not in self.WORD_COLOR_THEMES:
             payload["word_color_theme"] = "balanced"
         with self._connect() as conn:
@@ -673,7 +778,13 @@ class LightNovelService:
             "jpdb_api_token": s.jpdb_api_token,
             "study_backend": s.study_backend,
             "show_furigana": s.show_furigana,
+            "furigana_states": s.furigana_states.split(","),
+            "underline_states": s.underline_states.split(","),
             "show_pitch_accent": s.show_pitch_accent,
+            "furigana_unknown_only": s.furigana_unknown_only,
+            "word_mark_style": s.word_mark_style,
+            "study_card_mode": s.study_card_mode,
+            "study_card_triggers": self._study_trigger_codes(s.study_card_triggers),
             "custom_css": s.custom_css,
             "parse_ahead": s.parse_ahead,
             "auto_download_nyaa": s.auto_download_nyaa,
@@ -1448,6 +1559,117 @@ class LightNovelService:
         if not translated:
             raise LightNovelError("Online translation returned no text")
         return translated
+
+    @staticmethod
+    def _validate_reader_css(value: str) -> str:
+        css = str(value or "").strip()
+        if not css:
+            raise LightNovelError("Local LLM returned empty CSS")
+        if len(css) > 12000:
+            raise LightNovelError("Generated CSS is too large")
+        forbidden = (
+            r"@(?:import|font-face|namespace|supports|media|keyframes)\b",
+            r"url\s*\(",
+            r"expression\s*\(",
+            r"javascript\s*:",
+            r"-moz-binding\s*:",
+            r"\bbehavior\s*:",
+            r"</?style\b",
+            r"\bcontent\s*:",
+            r"\bposition\s*:\s*(?:fixed|sticky)\b",
+            r"\bz-index\s*:",
+            r"\bpointer-events\s*:\s*none\b",
+            r"\buser-select\s*:\s*none\b",
+            r"\bdisplay\s*:\s*none\b",
+            r"\bvisibility\s*:\s*hidden\b",
+        )
+        for pattern in forbidden:
+            if re.search(pattern, css, re.IGNORECASE):
+                raise LightNovelError("Generated CSS contains a forbidden construct")
+        clean = re.sub(r"/\*[\s\S]*?\*/", "", css)
+        if clean.count("{") != clean.count("}") or not re.search(r"\{[^{}]*\}", clean):
+            raise LightNovelError("Generated CSS is malformed")
+        residual = re.sub(r"[^{}]+\{[^{}]*\}", "", clean).strip()
+        if residual:
+            raise LightNovelError("Generated CSS must contain only flat CSS rules")
+        selector_root = re.compile(
+            r"^(?:#lnReader(?:\b|[.#:[>+~ ])|#lnReaderScroll(?:\b|[.#:[>+~ ])|"
+            r"\.ln-reader(?:\b|[.#:[>+~ ])|\.ln-reader-scroll(?:\b|[.#:[>+~ ]))"
+        )
+        blocked_selector = re.compile(
+            r"(?:\bbutton\b|\binput\b|\bselect\b|\btextarea\b|"
+            r"\.ln-reader-toolbar\b|\.ln-reader-appearance\b|#lnReaderAppearance\b)",
+            re.IGNORECASE,
+        )
+        blocks = list(re.finditer(r"([^{}]+)\{([^{}]*)\}", clean))
+        if len(blocks) > 80:
+            raise LightNovelError("Generated CSS has too many rules")
+        for block in blocks:
+            selectors = [part.strip() for part in block.group(1).split(",") if part.strip()]
+            declarations = block.group(2)
+            if not selectors:
+                raise LightNovelError("Generated CSS has an empty selector")
+            for selector in selectors:
+                if selector == ":root":
+                    for declaration in declarations.split(";"):
+                        declaration = declaration.strip()
+                        if not declaration:
+                            continue
+                        if not re.match(r"--(?:ln|pudge)-[a-z0-9_-]+\s*:", declaration, re.I):
+                            raise LightNovelError(":root may only define --ln-* or --pudge-* variables")
+                    continue
+                if blocked_selector.search(selector) or not selector_root.match(selector):
+                    raise LightNovelError("Generated CSS may style reader content only")
+        return css
+
+    def generate_reader_css(self, request: str, current_css: str = "") -> dict[str, str]:
+        instruction = re.sub(r"\s+", " ", str(request or "")).strip()[:3000]
+        if not instruction:
+            raise LightNovelError("Describe how the reader should look")
+        cfg = self.config.llm
+        if not cfg.enabled or not str(cfg.model or "").strip():
+            raise LightNovelError("Enable the local LLM in Settings first")
+        system = (
+            "You generate CSS only for Pudge's Light Novel reader. "
+            "Return strict JSON with exactly one string field named css. "
+            "Rules: selectors may target only #lnReader, .ln-reader, #lnReaderScroll, "
+            ".ln-reader-scroll and their descendants; :root is allowed only for --ln-* "
+            "and --pudge-* custom properties. Never target toolbar, buttons, inputs, "
+            "selects, textareas, app pages, html, or body. No @-rules, imports, external "
+            "fonts/assets, url(), JavaScript, content, fixed/sticky positioning, z-index, "
+            "pointer-events:none, user-select:none, display:none, or visibility:hidden. "
+            "Never break word clicking, text selection, ruby/furigana, vertical text, "
+            "page/scroll modes, or hide reading content. Prefer existing CSS variables. "
+            "Implement only the requested visual change; if unsafe, choose the closest safe CSS."
+        )
+        user = (
+            "CURRENT SAVED CSS (context only):\n"
+            f"{str(current_css or '')[:6000] or '(none)'}\n\nUSER REQUEST:\n{instruction}"
+        )
+        payload = build_chat_payload(cfg, system, user)
+        headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
+        try:
+            response = httpx.post(
+                f"{cfg.base_url.rstrip('/')}/api/chat",
+                headers=headers,
+                json=payload,
+                timeout=cfg.timeout_seconds,
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            content = str((response.json().get("message") or {}).get("content") or "").strip()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise LightNovelError(f"Local LLM CSS generation failed: {exc}") from exc
+        css = ""
+        try:
+            decoded = json.loads(content)
+            if isinstance(decoded, dict):
+                css = str(decoded.get("css") or "").strip()
+        except json.JSONDecodeError:
+            css = content
+        css = re.sub(r"^```(?:css|json)?\s*", "", css, flags=re.IGNORECASE)
+        css = re.sub(r"\s*```$", "", css).strip()
+        return {"css": self._validate_reader_css(css)}
 
     def _translate_local_llm(
         self,
