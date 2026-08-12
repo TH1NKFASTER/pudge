@@ -10,10 +10,11 @@ def test_installer_stops_execed_managed_app_process() -> None:
 
 def test_updater_stops_execed_managed_app_before_install() -> None:
     updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
-    assert "/usr/bin/pkill -f 'pudge.app_entry'" in updater
 
-    old_bundle_kill = updater.index("Contents' / 'MacOS' / APP_NAME")
-    managed_kill = updater.index("/usr/bin/pkill -f 'pudge.app_entry'")
-    installer = updater.index("./install.sh --update")
+    capture = updater.index("PUDGE_OLD_PIDS=")
+    term = updater.index("/bin/kill -TERM")
+    wait = updater.index("/bin/kill -0")
+    force = updater.index("/bin/kill -KILL")
+    installer = updater.index("/bin/zsh ./install.sh --update")
 
-    assert old_bundle_kill < managed_kill < installer
+    assert capture < term < wait < force < installer

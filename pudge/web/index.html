@@ -1726,7 +1726,6 @@ async function pollAppUpdate(){
   if(ui.appUpdate?.running||['preparing','downloading','installing'].includes(ui.appUpdate?.state))ui.appUpdatePollTimer=setTimeout(pollAppUpdate,750);
 }
 async function installAppUpdate(){
-  if(!confirm(t('confirm.installAppUpdate')))return;
   try{ui.appUpdate=await pywebview.api.app_update_install();renderAppUpdateState(ui.appUpdate);await pollAppUpdate();}
   catch(error){ui.appUpdate={state:'failed',detail:error?.message||String(error)};renderAppUpdateState(ui.appUpdate);}
 }

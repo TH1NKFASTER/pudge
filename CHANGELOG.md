@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.7.10
+
+- Made app updates retry transient download failures automatically instead of requiring repeated manual attempts.
+- Made update restarts wait for the previous Pudge process to exit before reopening the updated app, preventing duplicate windows.
+- Removed the native WebView update confirmation dialog that appeared with the Python host icon.
+
+
 ## v0.7.9
 
 - Fixed the macOS application icon when Pudge runs through the managed Python environment, avoiding the default Python launcher icon during application startup.

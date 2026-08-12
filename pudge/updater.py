@@ -304,16 +304,33 @@ class AppUpdater:
         )
 
     def _download(self, url: str, target: Path) -> str:
-        digest = hashlib.sha256()
-        with httpx.stream(
-            "GET", url, headers=self._github_headers(), timeout=120, follow_redirects=True
-        ) as response:
-            response.raise_for_status()
-            with target.open("wb") as handle:
-                for chunk in response.iter_bytes():
-                    handle.write(chunk)
-                    digest.update(chunk)
-        return digest.hexdigest()
+        delays = (1.0, 2.0, 4.0, 8.0, 12.0)
+        for attempt in range(len(delays) + 1):
+            digest = hashlib.sha256()
+            try:
+                with httpx.stream(
+                    "GET", url, headers=self._github_headers(), timeout=120, follow_redirects=True
+                ) as response:
+                    response.raise_for_status()
+                    with target.open("wb") as handle:
+                        for chunk in response.iter_bytes():
+                            handle.write(chunk)
+                            digest.update(chunk)
+                return digest.hexdigest()
+            except httpx.TransportError as exc:
+                target.unlink(missing_ok=True)
+                if attempt >= len(delays):
+                    raise
+                delay = delays[attempt]
+                self._log(
+                    "APP update download retry %s/%s in %.0fs after: %s",
+                    attempt + 1,
+                    len(delays),
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        raise UpdateError("Update download failed")
 
     def _expected_digest(self, release: dict[str, Any], asset: dict[str, Any], archive_name: str) -> str:
         digest = str(asset.get("digest") or "")
@@ -406,8 +423,15 @@ class AppUpdater:
                 f"rm -rf {shlex.quote(str(rollback_path))}",
                 f"if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/ditto {shlex.quote(str(app_path))} {shlex.quote(str(rollback_path))}; fi",
                 f"/usr/bin/pkill -f {shlex.quote(str(app_path / 'Contents' / 'MacOS' / APP_NAME))} >/dev/null 2>&1 || true",
-                "/usr/bin/pkill -f 'pudge.app_entry' >/dev/null 2>&1 || true",
-                "/bin/sleep 1",
+                "PUDGE_OLD_PIDS=(\"${(@f)$(/usr/bin/pgrep -f 'pudge.app_entry' 2>/dev/null || true)}\")",
+                "for pid in ${PUDGE_OLD_PIDS[@]}; do [[ -n \"$pid\" ]] && /bin/kill -TERM \"$pid\" >/dev/null 2>&1 || true; done",
+                "for attempt in {1..50}; do",
+                "  alive=0",
+                "  for pid in ${PUDGE_OLD_PIDS[@]}; do if [[ -n \"$pid\" ]] && /bin/kill -0 \"$pid\" >/dev/null 2>&1; then alive=1; break; fi; done",
+                "  (( alive == 0 )) && break",
+                "  /bin/sleep 0.1",
+                "done",
+                "for pid in ${PUDGE_OLD_PIDS[@]}; do if [[ -n \"$pid\" ]] && /bin/kill -0 \"$pid\" >/dev/null 2>&1; then /bin/kill -KILL \"$pid\" >/dev/null 2>&1 || true; fi; done",
                 "if ! /bin/zsh ./install.sh --update; then",
                 f"  rm -rf {shlex.quote(str(app_path))}",
                 f"  if [[ -d {shlex.quote(str(rollback_path))} ]]; then /bin/mv {shlex.quote(str(rollback_path))} {shlex.quote(str(app_path))}; fi",
