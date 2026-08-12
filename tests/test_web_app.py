@@ -457,9 +457,9 @@ def test_macos_runtime_identity_sets_process_name_in_source() -> None:
 
 def test_installer_sets_bundle_display_name() -> None:
     source = Path(__file__).parents[1].joinpath("install.sh").read_text(encoding="utf-8")
-    assert "CFBundleDisplayName $APP_NAME" in source
-    assert "CFBundleIdentifier $APP_BUNDLE_ID" in source
-    assert "CFBundleExecutable $APP_NAME" in source
+    assert "<key>CFBundleDisplayName</key><string>$APP_NAME</string>" in source
+    assert "<key>CFBundleIdentifier</key><string>$APP_BUNDLE_ID</string>" in source
+    assert "<key>CFBundleExecutable</key><string>$APP_NAME</string>" in source
 
 
 def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, monkeypatch) -> None:
@@ -599,10 +599,12 @@ def test_play_monitor_refreshes_cards_when_episode_is_counted() -> None:
 
 def test_installer_builds_real_native_named_app_bundle() -> None:
     source = Path(__file__).parents[1].joinpath("install.sh").read_text(encoding="utf-8")
-    assert '"$VENV_DIR/bin/python" -m PyInstaller' in source
-    assert '--name "$APP_NAME"' in source
-    assert 'CFBundleExecutable $APP_NAME' in source
-    assert 'PUDGE_PYTHON' in source
+    assert "/usr/bin/clang" in source
+    assert "execv(python, child_argv)" in source
+    assert 'child_argv[out++] = "pudge.app_entry";' in source
+    assert "<key>CFBundleExecutable</key><string>$APP_NAME</string>" in source
+    assert "PUDGE_PYTHON" in source
+    assert "PyInstaller" not in source
     assert "osacompile" not in source
 
 

@@ -1,10 +1,23 @@
 from pathlib import Path
 
 
-def test_pyinstaller_uses_webrtcvad_wheels_compatibility_hook() -> None:
-    script = Path(__file__).resolve().parents[1] / "install.sh"
-    text = script.read_text(encoding="utf-8")
+def test_app_bundle_uses_native_launcher_and_managed_venv() -> None:
+    text = (
+        Path(__file__).resolve().parents[1] / "install.sh"
+    ).read_text(encoding="utf-8")
 
-    assert 'hook-webrtcvad.py' in text
-    assert 'copy_metadata("webrtcvad-wheels")' in text
-    assert '--additional-hooks-dir "$HOOK_DIR"' in text
+    assert "/usr/bin/clang" in text
+    assert "execv(python, child_argv)" in text
+    assert 'child_argv[out++] = "pudge.app_entry";' in text
+    assert "PyInstaller" not in text
+    assert "--collect-all pudge" not in text
+
+
+def test_native_launcher_keeps_pudge_notification_identity() -> None:
+    text = (
+        Path(__file__).resolve().parents[1] / "install.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "--pudge-native-notification" in text
+    assert "UNUserNotificationCenter" in text
+    assert "PudgeNotificationDelegate" in text

@@ -116,9 +116,14 @@ def test_test_notification_api_requests_permission_and_sends(tmp_path: Path, mon
 
 def test_installer_routes_helper_mode_through_app_bundle() -> None:
     install = Path("install.sh").read_text(encoding="utf-8")
-    assert "maybe_handle_notification_helper(sys.argv[1:])" in install
-    assert "--hidden-import UserNotifications" in install
-    assert "PUDGE_NOTIFICATION_HELPER" in install
+    assert 'strcmp(argv[1], "--pudge-native-notification")' in install
+    assert "return send_notification(argv[2], argv[3]);" in install
+    assert "UNUserNotificationCenter" in install
+    assert "execv(python, child_argv)" in install
+    assert (
+        install.index('strcmp(argv[1], "--pudge-native-notification")')
+        < install.index("execv(python, child_argv)")
+    )
 
 
 def test_settings_does_not_contain_notification_test_button() -> None:

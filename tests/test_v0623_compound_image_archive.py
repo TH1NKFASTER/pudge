@@ -81,4 +81,5 @@ def test_installer_injects_sevenzip_into_app_and_agent() -> None:
     installer = Path("install.sh").read_text(encoding="utf-8")
     assert 'SEVENZIP_BIN="$(brew --prefix sevenzip)/bin/7zz"' in installer
     assert "PUDGE_7ZIP" in installer
-    assert "sevenzip_path = os.environ[\"SEVENZIP_BIN\"]" in installer
+    assert 'setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);' in installer
+    assert '<key>PUDGE_7ZIP</key><string>$SEVENZIP_BIN</string>' in installer

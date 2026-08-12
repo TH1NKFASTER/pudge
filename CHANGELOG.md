@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.7.6
+
+- Replaced the frozen PyInstaller application runtime with a lightweight native macOS launcher that always executes the managed Pudge environment, so in-app updates immediately run the newly installed package.
+- Preserved fast updates without reinstalling MangaOCR, Torch or other heavy dependencies and kept package/app rollback on failed updates.
+- Added native notification handling directly to the macOS launcher so notification identity remains Pudge while the main application continues to run from the managed Python environment.
+- Removed the duplicated bundled Pudge runtime, reducing the installed app bundle to a lightweight launcher while keeping the full application and dependencies in the managed environment.
+
 ## v0.7.5
 
 - Reworked in-app updates to preserve the existing runtime environment, safely roll back failed package/app changes, sanitize inherited Python/Tcl/Tk environment variables and reuse a versioned native launcher runtime.

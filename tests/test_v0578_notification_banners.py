@@ -90,4 +90,5 @@ def test_permission_is_requested_when_regular_app_opens(monkeypatch, tmp_path: P
 
 def test_installer_keeps_usernotifications_framework_and_new_version() -> None:
     install = Path("install.sh").read_text(encoding="utf-8")
-    assert "--hidden-import UserNotifications" in install
+    assert "-framework UserNotifications" in install
+    assert "UNUserNotificationCenter" in install

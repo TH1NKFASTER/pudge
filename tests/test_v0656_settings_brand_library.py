@@ -115,7 +115,7 @@ def test_branding_is_centralized_for_install_and_runtime() -> None:
     assert 'APP_NAME="pudge"' in brand
     assert 'source "$PROJECT_DIR/pudge/brand.env"' in installer
     assert 'APP_PATH="$APP_DIR/$APP_NAME.app"' in installer
-    assert '--osx-bundle-identifier "$APP_BUNDLE_ID"' in installer
+    assert '<key>CFBundleIdentifier</key><string>$APP_BUNDLE_ID</string>' in installer
     assert 'STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"' in release
     assert "ui.state?.branding?.name||document.getElementById('appBrandName')?.textContent||'__APP_NAME__'" in html
     assert (ROOT / "rename_brand.py").is_file()

@@ -260,48 +260,242 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -Fq 'export PATH="$HOME/.local/bi
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
 fi
 
-# The native bridge bundle owns one internally consistent frozen Python runtime
-# and dependency set. Only the Pudge package itself is loaded from the managed
-# venv. Normal updates therefore replace the Pudge wheel without rebuilding
-# PyInstaller or mixing two Python standard libraries.
-LAUNCHER_RUNTIME_VERSION="1"
-LAUNCHER_RUNTIME_MARKER="$APP_PATH/Contents/Resources/pudge-launcher-runtime-v${LAUNCHER_RUNTIME_VERSION}"
-REBUILD_APP=1
-if (( FAST_UPDATE )) && [[ -f "$LAUNCHER_RUNTIME_MARKER" ]]; then
-  REBUILD_APP=0
-  echo "Fast update: reusing native launcher runtime v${LAUNCHER_RUNTIME_VERSION}."
-fi
-
+# Build a tiny native app bundle that always runs the managed venv package.
+# The .app contains no frozen copy of Pudge, Python stdlib, or third-party
+# packages; after an update, the newly installed wheel is the code the GUI runs.
 BUILD_DIR="$DATA_DIR/app-build"
-
-if (( REBUILD_APP )); then
-"$VENV_DIR/bin/python" -m pip install --upgrade "pyinstaller>=6.10,<7"
-PACKAGE_DIR="$("$VENV_DIR/bin/python" - <<'PYPACKAGE'
-from pathlib import Path
-import pudge
-print(Path(pudge.__file__).resolve().parent)
-PYPACKAGE
-)"
-ICON_SOURCE="$PACKAGE_DIR/assets/app-icon.png"
-ICONSET="$BUILD_DIR/AnimeMPV.iconset"
-ICNS_PATH="$BUILD_DIR/AnimeMPV.icns"
-APP_ENTRY="$BUILD_DIR/pudge_app.py"
-HOOK_DIR="$BUILD_DIR/hooks"
 rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR" "$ICONSET" "$HOOK_DIR"
+mkdir -p "$BUILD_DIR/dist"
 
-# ffsubsync depends on the importable module `webrtcvad`, but modern Python
-# installs it from the distribution `webrtcvad-wheels`. PyInstaller's stock
-# hook still requests metadata for the old distribution name and aborts the
-# whole app build. Override only that hook and copy the metadata that is
-# actually installed.
-cat > "$HOOK_DIR/hook-webrtcvad.py" <<'PYHOOK'
-from PyInstaller.utils.hooks import copy_metadata
+NEW_APP="$BUILD_DIR/dist/$APP_NAME.app"
+NEW_CONTENTS="$NEW_APP/Contents"
+NEW_MACOS="$NEW_CONTENTS/MacOS"
+NEW_RESOURCES="$NEW_CONTENTS/Resources"
+mkdir -p "$NEW_MACOS" "$NEW_RESOURCES"
 
-datas = copy_metadata("webrtcvad-wheels")
-PYHOOK
+APP_LAUNCHER="$NEW_MACOS/$APP_NAME"
+LAUNCHER_SOURCE="$BUILD_DIR/pudge-launcher.m"
 
+LAUNCHER_SOURCE="$LAUNCHER_SOURCE" \
+VENV_PYTHON="$VENV_DIR/bin/python" \
+CONFIG_PATH="$CONFIG_PATH" \
+SEVENZIP_BIN="$SEVENZIP_BIN" \
+ARIA2_BIN="$ARIA2_BIN" \
+APP_NAME="$APP_NAME" \
+python3.12 - <<'PYNATIVELAUNCHER'
+import json
+import os
+from pathlib import Path
+
+source = Path(os.environ["LAUNCHER_SOURCE"])
+app_name = json.dumps(os.environ["APP_NAME"])
+venv_python = json.dumps(os.environ["VENV_PYTHON"])
+config_path = json.dumps(os.environ["CONFIG_PATH"])
+sevenzip_bin = json.dumps(os.environ["SEVENZIP_BIN"])
+aria2_bin = json.dumps(os.environ["ARIA2_BIN"])
+
+template = r"""#import <Foundation/Foundation.h>
+#import <UserNotifications/UserNotifications.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+@interface PudgeNotificationDelegate : NSObject <UNUserNotificationCenterDelegate>
+@end
+
+@implementation PudgeNotificationDelegate
+- (void)userNotificationCenter:(UNUserNotificationCenter *)center
+       willPresentNotification:(UNNotification *)notification
+         withCompletionHandler:(void (^)(UNNotificationPresentationOptions options))completionHandler {
+    UNNotificationPresentationOptions options =
+        UNNotificationPresentationOptionSound |
+        UNNotificationPresentationOptionBanner |
+        UNNotificationPresentationOptionList;
+    completionHandler(options);
+}
+@end
+
+static int send_notification(const char *subtitle_arg, const char *message_arg) {
+    @autoreleasepool {
+        NSString *subtitle = [NSString stringWithUTF8String:subtitle_arg ?: ""];
+        NSString *message = [NSString stringWithUTF8String:message_arg ?: ""];
+
+        UNUserNotificationCenter *center =
+            [UNUserNotificationCenter currentNotificationCenter];
+        PudgeNotificationDelegate *delegate =
+            [[PudgeNotificationDelegate alloc] init];
+        center.delegate = delegate;
+
+        dispatch_semaphore_t settings_sem = dispatch_semaphore_create(0);
+        __block BOOL authorized = NO;
+        [center getNotificationSettingsWithCompletionHandler:
+            ^(UNNotificationSettings *settings) {
+                UNAuthorizationStatus status = settings.authorizationStatus;
+                authorized =
+                    status == UNAuthorizationStatusAuthorized ||
+                    status == UNAuthorizationStatusProvisional;
+                dispatch_semaphore_signal(settings_sem);
+            }];
+
+        if (dispatch_semaphore_wait(
+                settings_sem,
+                dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0 ||
+            !authorized) {
+            return 1;
+        }
+
+        UNMutableNotificationContent *content =
+            [[UNMutableNotificationContent alloc] init];
+        content.title = @__APP_NAME__;
+        content.subtitle = subtitle;
+        content.body = message;
+        content.sound = [UNNotificationSound defaultSound];
+
+        UNNotificationRequest *request =
+            [UNNotificationRequest requestWithIdentifier:[[NSUUID UUID] UUIDString]
+                                                 content:content
+                                                 trigger:nil];
+
+        dispatch_semaphore_t delivery_sem = dispatch_semaphore_create(0);
+        __block BOOL delivered = NO;
+        [center addNotificationRequest:request
+                 withCompletionHandler:^(NSError *error) {
+                     delivered = error == nil;
+                     dispatch_semaphore_signal(delivery_sem);
+                 }];
+
+        if (dispatch_semaphore_wait(
+                delivery_sem,
+                dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0 ||
+            !delivered) {
+            return 1;
+        }
+
+        [[NSRunLoop currentRunLoop]
+            runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+        (void)delegate;
+        return 0;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    @autoreleasepool {
+        if (argc >= 2 &&
+            strcmp(argv[1], "--pudge-native-notification") == 0) {
+            if (argc < 4) {
+                return 2;
+            }
+            return send_notification(argv[2], argv[3]);
+        }
+
+        unsetenv("TCL_LIBRARY");
+        unsetenv("TK_LIBRARY");
+        unsetenv("TCLLIBPATH");
+        unsetenv("PYTHONHOME");
+        unsetenv("PYTHONPATH");
+        unsetenv("PYTHONEXECUTABLE");
+        unsetenv("_PYI_ARCHIVE_FILE");
+        unsetenv("_PYI_PARENT_PROCESS_LEVEL");
+        unsetenv("_PYI_APPLICATION_HOME_DIR");
+
+        const char *python = __VENV_PYTHON__;
+        setenv("PUDGE_PYTHON", python, 1);
+        setenv("PUDGE_CONFIG", __CONFIG_PATH__, 1);
+        setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);
+        setenv("PUDGE_ARIA2C", __ARIA2_BIN__, 1);
+
+        char **child_argv =
+            calloc((size_t)argc + 4, sizeof(char *));
+        if (child_argv == NULL) {
+            return 70;
+        }
+
+        int out = 0;
+        child_argv[out++] = (char *)python;
+        child_argv[out++] = "-m";
+        child_argv[out++] = "pudge.app_entry";
+        for (int i = 1; i < argc; ++i) {
+            child_argv[out++] = argv[i];
+        }
+        child_argv[out] = NULL;
+
+        execv(python, child_argv);
+        int saved_errno = errno;
+        free(child_argv);
+        return saved_errno == 0 ? 70 : saved_errno;
+    }
+}
+"""
+
+template = (
+    template
+    .replace("__APP_NAME__", app_name)
+    .replace("__VENV_PYTHON__", venv_python)
+    .replace("__CONFIG_PATH__", config_path)
+    .replace("__SEVENZIP_BIN__", sevenzip_bin)
+    .replace("__ARIA2_BIN__", aria2_bin)
+)
+source.write_text(template, encoding="utf-8")
+PYNATIVELAUNCHER
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -framework Foundation \
+  -framework UserNotifications \
+  "$LAUNCHER_SOURCE" \
+  -o "$APP_LAUNCHER"
+
+chmod 755 "$APP_LAUNCHER"
+
+PLIST="$NEW_CONTENTS/Info.plist"
+cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>$APP_NAME</string>
+  <key>CFBundleIdentifier</key><string>$APP_BUNDLE_ID</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>$APP_NAME</string>
+  <key>CFBundleDisplayName</key><string>$APP_NAME</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>$EXPECTED_VERSION</string>
+  <key>CFBundleVersion</key><string>$EXPECTED_VERSION</string>
+  <key>LSMultipleInstancesProhibited</key><true/>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSDownloadsFolderUsageDescription</key><string>$APP_NAME accesses Downloads only when you select it as the external subtitle folder.</string>
+  <key>NSDocumentsFolderUsageDescription</key><string>$APP_NAME needs access to the folders selected for the anime library.</string>
+  <key>NSDesktopFolderUsageDescription</key><string>$APP_NAME accesses Desktop only when you explicitly select a folder there.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Video</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>mkv</string><string>mp4</string><string>m4v</string>
+        <string>avi</string><string>mov</string><string>webm</string>
+        <string>ts</string><string>m2ts</string><string>mts</string>
+        <string>wmv</string><string>flv</string><string>ogv</string>
+        <string>mpg</string><string>mpeg</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>
+PLIST
+
+ICON_SOURCE="$PROJECT_DIR/pudge/web/app-logo.png"
+ICONSET="$BUILD_DIR/AppIcon.iconset"
+ICNS_PATH="$NEW_RESOURCES/AppIcon.icns"
 if [[ -f "$ICON_SOURCE" ]]; then
+  rm -rf "$ICONSET"
+  mkdir -p "$ICONSET"
+  icon_ok=1
   for spec in \
     "16 icon_16x16.png" "32 icon_16x16@2x.png" \
     "32 icon_32x32.png" "64 icon_32x32@2x.png" \
@@ -310,63 +504,24 @@ if [[ -f "$ICON_SOURCE" ]]; then
     "512 icon_512x512.png" "1024 icon_512x512@2x.png"; do
     size="${spec%% *}"
     name="${spec#* }"
-    sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICONSET/$name" >/dev/null
+    if ! sips -z "$size" "$size" "$ICON_SOURCE" --out "$ICONSET/$name" >/dev/null 2>&1; then
+      icon_ok=0
+      break
+    fi
   done
-  iconutil -c icns "$ICONSET" -o "$ICNS_PATH"
+  if (( icon_ok )) && iconutil -c icns "$ICONSET" -o "$ICNS_PATH" >/dev/null 2>&1; then
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon.icns" "$PLIST" >/dev/null 2>&1 || true
+  fi
 fi
 
-VENV_PUDGE_DIR="$("$VENV_DIR/bin/python" - <<'PYPUDGEDIR'
-from pathlib import Path
-import pudge
-print(Path(pudge.__file__).resolve().parent)
-PYPUDGEDIR
-)"
-APP_ENTRY="$APP_ENTRY" VENV_PYTHON="$VENV_DIR/bin/python" VENV_PUDGE_DIR="$VENV_PUDGE_DIR" CONFIG_PATH="$CONFIG_PATH" SEVENZIP_BIN="$SEVENZIP_BIN" ARIA2_BIN="$ARIA2_BIN" \
-  "$VENV_DIR/bin/python" - <<'PYAPP'
-import os
-from pathlib import Path
-
-entry = Path(os.environ["APP_ENTRY"])
-python_path = os.environ["VENV_PYTHON"]
-pudge_dir = os.environ["VENV_PUDGE_DIR"]
-config_path = os.environ["CONFIG_PATH"]
-sevenzip_path = os.environ["SEVENZIP_BIN"]
-aria2_path = os.environ["ARIA2_BIN"]
-entry.write_text(
-    "import importlib.util\n"
-    "import os\n"
-    "import sys\n"
-    "from pathlib import Path\n"
-    f"_pudge_dir = Path({pudge_dir!r})\n"
-    "_pudge_spec = importlib.util.spec_from_file_location(\n"
-    "    'pudge', _pudge_dir / '__init__.py', submodule_search_locations=[str(_pudge_dir)]\n"
-    ")\n"
-    "if _pudge_spec is None or _pudge_spec.loader is None:\n"
-    "    raise RuntimeError('Could not load managed Pudge package')\n"
-    "_pudge = importlib.util.module_from_spec(_pudge_spec)\n"
-    "sys.modules['pudge'] = _pudge\n"
-    "_pudge_spec.loader.exec_module(_pudge)\n"
-    f"os.environ['PUDGE_PYTHON'] = {python_path!r}\n"
-    f"os.environ['PUDGE_CONFIG'] = {config_path!r}\n"
-    f"os.environ['PUDGE_7ZIP'] = {sevenzip_path!r}\n"
-    f"os.environ['PUDGE_ARIA2C'] = {aria2_path!r}\n"
-    "from pudge.notifications import maybe_handle_notification_helper\n"
-    "notification_result = maybe_handle_notification_helper(sys.argv[1:])\n"
-    "if notification_result is not None:\n"
-    "    raise SystemExit(notification_result)\n"
-    "from pudge.app_ui import launch_app\n"
-    "raise SystemExit(launch_app(Path(os.environ['PUDGE_CONFIG'])))\n",
-    encoding="utf-8",
-)
-PYAPP
-
+# Replacement is complete before the working app is touched.
 pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
 for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
   [[ -z "$app_name" ]] && continue
   pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
 done
 sleep 1
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
 for legacy_name in "${LEGACY_NAMES[@]}"; do
   [[ -z "$legacy_name" || "$legacy_name" == "$APP_NAME" ]] && continue
   legacy_app="$APP_DIR/$legacy_name.app"
@@ -385,44 +540,6 @@ for legacy_bundle in "${LEGACY_BUNDLE_IDS[@]}"; do
 done
 rm -rf "$OLD_SETTINGS_APP"
 
-PYINSTALLER_ARGS=(
-  --noconfirm
-  --clean
-  --windowed
-  --name "$APP_NAME"
-  --osx-bundle-identifier "$APP_BUNDLE_ID"
-  --distpath "$BUILD_DIR/dist"
-  --workpath "$BUILD_DIR/work"
-  --specpath "$BUILD_DIR/spec"
-  --collect-all pudge
-  --collect-all webview
-  --hidden-import webview.platforms.cocoa
-  --hidden-import UserNotifications
-  --additional-hooks-dir "$HOOK_DIR"
-  --exclude-module webview.platforms.android
-)
-if [[ -f "$ICNS_PATH" ]]; then
-  PYINSTALLER_ARGS+=(--icon "$ICNS_PATH")
-fi
-# A frozen app may export Tcl/Tk/Python paths that point inside its own bundle.
-# Never let those stale paths leak into the replacement PyInstaller build.
-unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE
-
-"$VENV_DIR/bin/python" -m PyInstaller "${PYINSTALLER_ARGS[@]}" "$APP_ENTRY"
-NEW_APP="$BUILD_DIR/dist/$APP_NAME.app"
-if [[ ! -d "$NEW_APP" ]]; then
-  echo "Installer error: PyInstaller did not produce $APP_NAME.app." >&2
-  exit 1
-fi
-
-# Replacement is ready. Only now stop the running app and swap bundles.
-pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
-for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
-  [[ -z "$app_name" ]] && continue
-  pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
-done
-sleep 1
-
 APP_SWAP_BACKUP="$BUILD_DIR/$APP_NAME.app.before-swap"
 rm -rf "$APP_SWAP_BACKUP"
 if [[ -d "$APP_PATH" ]]; then
@@ -437,42 +554,7 @@ if ! /bin/mv "$NEW_APP" "$APP_PATH"; then
   exit 1
 fi
 
-PLIST="$APP_PATH/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $APP_NAME" "$PLIST" >/dev/null 2>&1 || \
-  /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $APP_NAME" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_NAME" "$PLIST" >/dev/null 2>&1 || \
-  /usr/libexec/PlistBuddy -c "Add :CFBundleName string $APP_NAME" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_NAME" "$PLIST" >/dev/null 2>&1 || \
-  /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string $APP_NAME" "$PLIST"
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_BUNDLE_ID" "$PLIST" >/dev/null 2>&1 || \
-  /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $APP_BUNDLE_ID" "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :LSMultipleInstancesProhibited" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :LSMultipleInstancesProhibited bool true" "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :NSHighResolutionCapable" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :NSDownloadsFolderUsageDescription" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :NSDownloadsFolderUsageDescription string $APP_NAME accesses Downloads only when you select it as the external subtitle folder." "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :NSDocumentsFolderUsageDescription" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :NSDocumentsFolderUsageDescription string $APP_NAME needs access to the folders selected for the anime library." "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :NSDesktopFolderUsageDescription" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :NSDesktopFolderUsageDescription string $APP_NAME accesses Desktop only when you explicitly select a folder there." "$PLIST"
-/usr/libexec/PlistBuddy -c "Delete :CFBundleDocumentTypes" "$PLIST" >/dev/null 2>&1 || true
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0 dict" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string Video" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions array" "$PLIST"
-idx=0
-for ext in mkv mp4 m4v avi mov webm ts m2ts mts wmv flv ogv mpg mpeg; do
-  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions:$idx string $ext" "$PLIST"
-  idx=$((idx + 1))
-done
-
-mkdir -p "$APP_PATH/Contents/Resources"
-: > "$LAUNCHER_RUNTIME_MARKER"
 codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1 || true
-fi
 
 cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
