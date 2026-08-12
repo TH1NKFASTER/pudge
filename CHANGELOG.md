@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.7.15
+
+- Release validation update for the exact-process in-app restart fix.
+
+
 ## v0.7.14
 
 - Fixed update restarts to terminate the exact running Pudge process before installing and reopening the app.
