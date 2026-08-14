@@ -34,9 +34,12 @@ def _ln_cfg(tmp_path: Path) -> AppConfig:
     return config
 
 
-def test_manga_one_piece_volumes_share_series_and_inherit_link(tmp_path: Path) -> None:
+def test_manga_one_piece_volumes_share_series_and_inherit_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = Database(tmp_path / "db.sqlite3")
     service = MangaService(db, cache_dir=tmp_path / "cache", python="/bin/false")
+    monkeypatch.setattr(service, "_cache_remote_cover", lambda _url: None)
     first_path = tmp_path / "One Piece Vol. 107.cbz"
     second_path = tmp_path / "One Piece - 108.cbz"
     _cbz(first_path)
@@ -57,12 +60,16 @@ def test_manga_one_piece_volumes_share_series_and_inherit_link(tmp_path: Path) -
     assert linked["volume"] == 107
     assert second["volume"] == 108
     assert second["anilist_id"] == 30013
-    assert second["cover_url"] == "https://img.example/one-piece.jpg"
+    assert second["remote_cover_url"] == "https://img.example/one-piece.jpg"
+    assert second["cover_url"].startswith("data:image/jpeg;base64,")
 
 
-def test_manga_manual_link_repairs_mislinked_sibling_volume(tmp_path: Path) -> None:
+def test_manga_manual_link_repairs_mislinked_sibling_volume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = Database(tmp_path / "db.sqlite3")
     service = MangaService(db, cache_dir=tmp_path / "cache", python="/bin/false")
+    monkeypatch.setattr(service, "_cache_remote_cover", lambda _url: None)
     first_path = tmp_path / "One Piece 107.cbz"
     second_path = tmp_path / "One Piece 108.cbz"
     _cbz(first_path)
@@ -76,7 +83,10 @@ def test_manga_manual_link_repairs_mislinked_sibling_volume(tmp_path: Path) -> N
 
     assert {book["anilist_id"] for book in books} == {30013}
     assert {book["series_key"] for book in books} == {"onepiece"}
-    assert {book["cover_url"] for book in books} == {"https://img.example/right.jpg"}
+    assert {book["remote_cover_url"] for book in books} == {
+        "https://img.example/right.jpg"
+    }
+    assert all(book["cover_url"].startswith("data:image/jpeg;base64,") for book in books)
 
 
 def test_ln_existing_cover_is_sticky_across_anilist_binding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -410,6 +410,7 @@ class LightNovelSettings:
     reader_indent: float = 1.0
     reader_vertical: bool = False
     reader_mode: str = "scroll"
+    auto_bookmarks: bool = True
     word_color_theme: str = "balanced"
     word_color_new: str = "#f3f6fb"
     word_color_learning: str = "#f4bd63"
@@ -565,6 +566,14 @@ class LightNovelService:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ln_bookmarks (
+                    book_id INTEGER PRIMARY KEY,
+                    chapter_index INTEGER NOT NULL DEFAULT 0,
+                    offset REAL NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(book_id) REFERENCES ln_books(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS ln_translation_cache (
                     cache_key TEXT PRIMARY KEY,
                     target_language TEXT NOT NULL,
@@ -649,6 +658,7 @@ class LightNovelService:
             reader_indent=max(0.0, min(5.0, float(values.get("reader_indent", "1.0") or 1.0))),
             reader_vertical=values.get("reader_vertical", "0") == "1",
             reader_mode=values.get("reader_mode", "scroll") if values.get("reader_mode", "scroll") in {"scroll", "pages"} else "scroll",
+            auto_bookmarks=values.get("auto_bookmarks", "1") != "0",
             word_color_theme=(
                 values.get("word_color_theme", "balanced")
                 if values.get("word_color_theme", "balanced") in self.WORD_COLOR_THEMES
@@ -682,6 +692,7 @@ class LightNovelService:
             "custom_css", "parse_ahead", "auto_download_nyaa", "nyaa_category",
             "reader_font", "reader_theme", "reader_font_size", "reader_text_color", "reader_background_color",
             "reader_width", "reader_line_height", "reader_indent", "reader_vertical", "reader_mode",
+            "auto_bookmarks",
             "word_color_theme", "word_color_new", "word_color_learning", "word_color_due",
             "word_color_known", "word_color_blacklisted",
             "pitch_accent_color",
@@ -725,6 +736,7 @@ class LightNovelService:
             "reader_indent": str(max(0.0, min(5.0, float(values.get("reader_indent", current.reader_indent) or 1.0)))),
             "reader_vertical": "1" if bool(values.get("reader_vertical", current.reader_vertical)) else "0",
             "reader_mode": str(values.get("reader_mode", current.reader_mode)).strip().lower(),
+            "auto_bookmarks": "1" if bool(values.get("auto_bookmarks", current.auto_bookmarks)) else "0",
             "word_color_theme": str(
                 values.get("word_color_theme", current.word_color_theme)
             ).strip().lower(),
@@ -799,6 +811,7 @@ class LightNovelService:
             "reader_indent": s.reader_indent,
             "reader_vertical": s.reader_vertical,
             "reader_mode": s.reader_mode,
+            "auto_bookmarks": s.auto_bookmarks,
             "word_color_theme": s.word_color_theme,
             "word_color_new": s.word_color_new,
             "word_color_learning": s.word_color_learning,
@@ -979,9 +992,12 @@ class LightNovelService:
         self._repair_missing_volumes()
         with self._connect() as conn:
             rows = conn.execute(
-                """SELECT b.*,COUNT(c.id) AS chapter_count,
+                """SELECT b.*,bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
+                          COUNT(c.id) AS chapter_count,
                           COALESCE(SUM(LENGTH(c.text)),0) AS character_count FROM ln_books b
-                   LEFT JOIN ln_chapters c ON c.book_id=b.id GROUP BY b.id ORDER BY b.updated_at DESC,b.title COLLATE NOCASE"""
+                   LEFT JOIN ln_bookmarks bm ON bm.book_id=b.id
+                   LEFT JOIN ln_chapters c ON c.book_id=b.id GROUP BY b.id
+                   ORDER BY b.updated_at DESC,b.title COLLATE NOCASE"""
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -999,7 +1015,13 @@ class LightNovelService:
 
     def book(self, book_id: int) -> dict[str, Any]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM ln_books WHERE id=?", (int(book_id),)).fetchone()
+            row = conn.execute(
+                """SELECT b.*,bm.source AS bookmark_source,
+                          bm.updated_at AS bookmark_updated_at
+                   FROM ln_books b LEFT JOIN ln_bookmarks bm ON bm.book_id=b.id
+                   WHERE b.id=?""",
+                (int(book_id),),
+            ).fetchone()
             if row is None:
                 raise LightNovelError("Light novel not found")
             chapters = [dict(x) for x in conn.execute("SELECT id,chapter_index,title,text_hash FROM ln_chapters WHERE book_id=? ORDER BY chapter_index", (int(book_id),))]
@@ -1354,7 +1376,7 @@ class LightNovelService:
             out[pair] = states
         return out
 
-    def _chapter_row(self, book_id: int, chapter_index: int, *, touch: bool = True) -> sqlite3.Row:
+    def _chapter_row(self, book_id: int, chapter_index: int, *, touch: bool = False) -> sqlite3.Row:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM ln_chapters WHERE book_id=? AND chapter_index=?", (int(book_id), int(chapter_index))).fetchone()
             if row is None:
@@ -1694,7 +1716,7 @@ class LightNovelService:
         )
         user = (
             f"CHARACTER GLOSSARY:\n{glossary_text or '(none)'}\n\n"
-            f"PRECEDING CONTEXT (up to 200 chars):\n{context[-200:]}\n\nSELECTED TEXT:\n{text}"
+            f"PRECEDING CONTEXT (up to 4000 chars):\n{context[-4000:]}\n\nSELECTED TEXT:\n{text}"
         )
         payload = build_chat_payload(cfg, system, user)
         headers = {"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {}
@@ -1847,7 +1869,11 @@ class LightNovelService:
         media_id: int | None = None,
     ) -> dict[str, Any]:
         selected = re.sub(r"\s+", " ", str(text or "")).strip()[:450]
-        preceding = re.sub(r"\s+", " ", str(context or "")).strip()[-200:]
+        preceding = "\n".join(
+            re.sub(r"\s+", " ", line).strip()
+            for line in str(context or "").splitlines()
+            if line.strip()
+        )[-4000:]
         # target_language is retained only for API compatibility with older
         # clients. The app language is authoritative.
         target = (
@@ -1865,26 +1891,46 @@ class LightNovelService:
         with self._connect() as conn:
             row = conn.execute("SELECT translation,provider FROM ln_translation_cache WHERE cache_key=?", (cache_key,)).fetchone()
         if row is not None:
-            return {"translation": str(row["translation"]), "target_language": target, "cached": True}
-        provider = "google"
+            return {
+                "translation": str(row["translation"]),
+                "target_language": target,
+                "provider": str(row["provider"] or ""),
+                "cached": True,
+            }
+        provider = "local_llm" if preceding and self.config.llm.enabled else "google"
         try:
-            protected, replacements = self._protect_character_names(selected, glossary)
-            translated = self._restore_character_names(
-                self._translate_online(protected, target), replacements
-            )
-        except Exception as online_exc:
-            self._log("LN online translation failed; using local LLM: %s", online_exc)
-            provider = "local_llm"
-            try:
+            if provider == "local_llm":
                 translated = self._translate_local_llm(selected, preceding, target, glossary)
-            except Exception as local_exc:
-                raise LightNovelError(f"Translation failed: {local_exc}") from local_exc
+            else:
+                protected, replacements = self._protect_character_names(selected, glossary)
+                translated = self._restore_character_names(
+                    self._translate_online(protected, target), replacements
+                )
+        except Exception as primary_exc:
+            self._log("LN primary translation failed; using fallback: %s", primary_exc)
+            try:
+                if provider == "local_llm":
+                    provider = "google"
+                    protected, replacements = self._protect_character_names(selected, glossary)
+                    translated = self._restore_character_names(
+                        self._translate_online(protected, target), replacements
+                    )
+                else:
+                    provider = "local_llm"
+                    translated = self._translate_local_llm(selected, preceding, target, glossary)
+            except Exception as fallback_exc:
+                raise LightNovelError(f"Translation failed: {fallback_exc}") from fallback_exc
         with self._connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO ln_translation_cache(cache_key,target_language,source_text,context_text,translation,provider,created_at) VALUES(?,?,?,?,?,?,?)",
                 (cache_key, target, selected, preceding, translated, provider, time.time()),
             )
-        return {"translation": translated, "target_language": target, "cached": False}
+        return {
+            "translation": translated,
+            "target_language": target,
+            "provider": provider,
+            "cached": False,
+        }
 
     def cancel_reader_background(self) -> None:
         # Running HTTP calls cannot be force-killed safely, but invalidating both
@@ -1893,9 +1939,63 @@ class LightNovelService:
             self._reader_generation += 1
             self._prefetch_generation += 1
 
-    def update_position(self, book_id: int, chapter_index: int, offset: float) -> None:
+    def save_bookmark(
+        self,
+        book_id: int,
+        chapter_index: int,
+        offset: float,
+        *,
+        source: str = "manual",
+    ) -> dict[str, Any]:
+        chapter = max(0, int(chapter_index))
+        position = max(0.0, min(1.0, float(offset)))
+        kind = "auto" if str(source).casefold() == "auto" else "manual"
+        now = time.time()
         with self._connect() as conn:
-            conn.execute("UPDATE ln_books SET current_chapter=?,current_offset=?,updated_at=? WHERE id=?", (int(chapter_index), max(0.0, min(1.0, float(offset))), time.time(), int(book_id)))
+            exists = conn.execute(
+                "SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)
+            ).fetchone()
+            if exists is None:
+                raise LightNovelError("Light novel not found")
+            conn.execute(
+                "UPDATE ln_books SET current_chapter=?,current_offset=?,updated_at=? WHERE id=?",
+                (chapter, position, now, int(book_id)),
+            )
+            conn.execute(
+                """INSERT INTO ln_bookmarks(book_id,chapter_index,offset,source,updated_at)
+                   VALUES(?,?,?,?,?) ON CONFLICT(book_id) DO UPDATE SET
+                   chapter_index=excluded.chapter_index,offset=excluded.offset,
+                   source=excluded.source,updated_at=excluded.updated_at""",
+                (int(book_id), chapter, position, kind, now),
+            )
+        return {
+            "book_id": int(book_id),
+            "chapter_index": chapter,
+            "offset": position,
+            "source": kind,
+            "updated_at": now,
+        }
+
+    def reset_position(self, book_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)
+            ).fetchone()
+            if exists is None:
+                raise LightNovelError("Light novel not found")
+            conn.execute("DELETE FROM ln_bookmarks WHERE book_id=?", (int(book_id),))
+            conn.execute(
+                "UPDATE ln_books SET current_chapter=0,current_offset=0,updated_at=? WHERE id=?",
+                (time.time(), int(book_id)),
+            )
+        return self.book(int(book_id))
+
+    def update_position(self, book_id: int, chapter_index: int, offset: float) -> None:
+        # Compatibility with older WebViews. New readers call save_bookmark and
+        # distinguish deliberate/manual bookmarks from dwell-based ones.
+        self.save_bookmark(
+            int(book_id), int(chapter_index), float(offset), source="auto"
+        )
 
     def study_action(self, backend: str, action: str, word_id: int, reading_index: int, *, grade: str = "good", sentence: str = "", deck_id: str | int | None = None) -> dict[str, Any]:
         backend = backend.casefold()

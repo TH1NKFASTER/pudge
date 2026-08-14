@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Fixed large cold-open timing edits by applying a validated local subtitle
+  offset only before the opening gap, while preserving the stable main-episode
+  timeline; affected cached selections are re-prepared once.
+- Stopped aria2 verification progress from publishing incomplete video as ready,
+  and made stalled reconnects verification-aware with a 15-minute progress
+  window and 30-minute cooldown instead of interrupting the task every 5 minutes.
+- Normalized base32 SubsPlease magnet hashes to canonical hex so aria2 additions
+  can be verified and found immediately after JSON-RPC accepts them.
+- Added per-episode Anime Debug for multi-episode titles.
+- Fixed exact Jimaku candidates being rejected when several independent
+  Japanese releases share one clock but the embedded English reference is noisy.
+- Kept up to sixteen preceding Japanese subtitle lines as translation context,
+  with secondary English text used only as supporting context; removed the old
+  separate subtitle-study window.
+- Made qBittorrent and aria2 coexist safely, with backend-aware actions and one
+  button to stop all Pudge torrent downloading and seeding.
+- Broadened jpdb-mpv-plugin discovery to standard macOS/Linux mpv directories
+  and versioned installer layouts.
+- Reduced background heat by skipping incomplete torrent video and backing off
+  deterministic subtitle-validation retries for six hours.
+- Added a mutually exclusive JitenMPV / jpdb-mpv-plugin selector; the official
+  jpdb plugin is selectable as soon as its installed script is detected because
+  it manages its own authorization.
+- Added direct translation of the visible subtitle inside mpv.
+- Added automatic and manual aria2 reconnect for downloads with no live peers,
+  without deleting verified partial data.
+- Added low-priority contextual translation prewarming for prepared SRT cues
+  while an episode is playing, backed by the normal translation cache.
+- Avoided aria2's default RPC upload limit for large torrent metadata, reduced
+  resume rechecking heat, and isolated installer test output from runtime logs.
+
 ## v0.7.15
 
 - Release validation update for the exact-process in-app restart fix.

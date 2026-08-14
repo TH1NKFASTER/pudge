@@ -24,3 +24,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+## Optional external applications
+
+Pudge does not bundle mpv, FFmpeg, JitenMPV or jpdb-mpv-plugin binaries. During first
+experience, the user may explicitly ask Pudge to install missing mpv/FFmpeg
+Homebrew formulae and the official JitenMPV release. They remain separate
+programs installed into the user's normal per-user/system package locations.
+
+- mpv: GPL-2.0-or-later, <https://github.com/mpv-player/mpv>
+- FFmpeg: primarily LGPL-2.1-or-later; the exact license can depend on the
+  options used by the separately installed build, <https://ffmpeg.org/legal.html>
+- JitenMPV: Apache-2.0, <https://github.com/Sirush/JitenMPV>
+- jpdb-mpv-plugin: optional user-installed integration,
+  <https://github.com/Sahil811/jpdb-mpv-plugin>
+
+The JitenMPV onboarding action downloads a pinned copy of its official Unix
+installer. That installer verifies the checksum published with the selected
+JitenMPV release before installing it. Pudge only writes the API key supplied
+by the user to JitenMPV's own per-user configuration file.
+
+Pudge can detect and configure an existing jpdb-mpv-plugin installation but
+does not download or redistribute it. The upstream repository does not
+currently publish a license file, and its server must be built locally with Go.

@@ -10,7 +10,7 @@ from pathlib import Path
 from ..subtitle_formats import parse_srt, write_srt
 
 
-_ALGORITHM_VERSION = "timeline-v5.6-monotonic-boundaries"
+_ALGORITHM_VERSION = "timeline-v5.8-layered-reference-gate"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -1340,9 +1340,11 @@ def _cold_start_refinement(
 ) -> tuple[list[dict[str, object]], list[float], list[dict[str, object]], dict[str, object]]:
     """Refine a tiny pre-opening dialogue block without moving the full first segment.
 
-    This is intentionally conservative: only 1-4 cues before an early long pause
-    are eligible, the first-edge hint must stay close to the stable first offset,
-    and it must measurably improve nearest-onset error for those early cues.
+    This is intentionally conservative: only a short cue block before an early
+    long pause is eligible, and the first-edge hint must measurably improve
+    nearest-onset error for those early cues. Large local edit differences are
+    allowed because a broadcast cut may insert ten seconds before the opening;
+    the long-gap and onset checks keep that correction out of the main episode.
     """
     diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
     if not segments or len(source_cues) < 2 or not source_onsets or not reference_onsets:
@@ -1358,21 +1360,23 @@ def _cold_start_refinement(
             "delta_seconds": round(delta, 3),
         }
     )
-    if abs(delta) < 0.45 or abs(delta) > 2.50:
+    if abs(delta) < 0.45 or abs(delta) > 15.0:
         diagnostics["reason"] = "edge_hint_not_local"
         return segments, boundaries, boundary_payload, diagnostics
 
     gap_candidate: tuple[int, float, float] | None = None
     # Search only the very beginning. A regular mid-episode silence must never
     # manufacture a special segment.
-    for index in range(min(4, len(source_cues) - 1)):
+    max_cold_cues = 40
+    minimum_gap = 45.0 if abs(delta) > 2.50 else 12.0
+    for index in range(min(max_cold_cues, len(source_cues) - 1)):
         left_end = float(source_cues[index][1])
         right_start = float(source_cues[index + 1][0])
         gap = right_start - left_end
         cue_count = index + 1
         if left_end > 180.0:
             break
-        if gap >= 12.0 and 1 <= cue_count <= 4:
+        if gap >= minimum_gap and 1 <= cue_count <= max_cold_cues:
             gap_candidate = (cue_count, left_end, right_start)
             break
     if gap_candidate is None:
@@ -1386,7 +1390,7 @@ def _cold_start_refinement(
         return segments, boundaries, boundary_payload, diagnostics
 
     early_onsets = [value for value in source_onsets if value < boundary][:cue_count]
-    if not early_onsets or len(early_onsets) > 4:
+    if not early_onsets or len(early_onsets) > max_cold_cues:
         diagnostics["reason"] = "cold_start_cue_count_invalid"
         return segments, boundaries, boundary_payload, diagnostics
 
@@ -1456,7 +1460,11 @@ def _global_onset_metrics(
     tolerance: float = 1.5,
 ) -> dict[str, object]:
     if not source_onsets or not reference_onsets:
-        return {"matched": 0, "coverage": 0.0, "f1": 0.0}
+        return {
+            "matched": 0, "coverage": 0.0, "f1": 0.0,
+            "source_count": len(source_onsets),
+            "reference_count": len(reference_onsets),
+        }
     mapped = (
         [value + offsets[index] for index, value in enumerate(source_onsets)]
         if offsets is not None
@@ -1482,6 +1490,8 @@ def _global_onset_metrics(
         "matched": matched,
         "coverage": matched / minimum,
         "f1": (2.0 * matched) / (len(mapped) + len(reference_onsets)),
+        "source_count": len(mapped),
+        "reference_count": len(reference_onsets),
         "mean_error_seconds": statistics.fmean(errors) if errors else None,
         "p95_error_seconds": (
             sorted(errors)[min(len(errors) - 1, int(math.ceil(0.95 * len(errors))) - 1)]
@@ -1819,7 +1829,7 @@ def align_subtitle_timelines(
     holdout_p90 = holdout.get("p90_abs_residual_seconds")
     holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
 
-    accepted = bool(
+    regular_acceptance = bool(
         int(after_metrics.get("matched") or 0) >= 12
         and after_coverage >= 0.46
         and after_f1 >= 0.42
@@ -1834,6 +1844,39 @@ def align_subtitle_timelines(
             )
         )
     )
+
+    # Some embedded ASS tracks contain thousands of layered/sign cues while the
+    # dialogue SRT has only a few hundred. Raw onset F1 then becomes tiny even
+    # when almost every source onset matches and the activity clock is nearly
+    # identical. Accept only with several independent strong confirmations.
+    source_count = max(1, int(after_metrics.get("source_count") or 0))
+    reference_count = max(1, int(after_metrics.get("reference_count") or 0))
+    onset_count_ratio = max(source_count, reference_count) / min(
+        source_count, reference_count
+    )
+    after_mean_error = after_metrics.get("mean_error_seconds")
+    after_p95_error = after_metrics.get("p95_error_seconds")
+    segment_support_total = sum(max(0, int(segment["support"])) for segment in segments)
+    dominant_support_ratio = (
+        max(max(0, int(segment["support"])) for segment in segments)
+        / max(1, segment_support_total)
+    )
+    layered_reference_acceptance = bool(
+        onset_count_ratio >= 3.0
+        and int(after_metrics.get("matched") or 0) >= 30
+        and after_coverage >= 0.80
+        and activity_f1 >= 0.88
+        and after_mean_error is not None
+        and float(after_mean_error) <= 0.45
+        and after_p95_error is not None
+        and float(after_p95_error) <= 1.35
+        and holdout_count >= 5
+        and holdout_p90 is not None
+        and float(holdout_p90) <= 0.75
+        and holdout_coverage >= 0.80
+        and dominant_support_ratio >= 0.75
+    )
+    accepted = regular_acceptance or layered_reference_acceptance
     if not accepted:
         return source, _result(
             "timeline_validation_failed",
@@ -1844,6 +1887,9 @@ def align_subtitle_timelines(
             after=after_metrics,
             activity_f1=round(activity_f1, 4),
             holdout=holdout,
+            layered_reference_acceptance=layered_reference_acceptance,
+            onset_count_ratio=round(onset_count_ratio, 3),
+            dominant_support_ratio=round(dominant_support_ratio, 3),
             path=[item.as_dict() for item in path],
             segments=[
                 {
@@ -1961,6 +2007,9 @@ def align_subtitle_timelines(
             "after": after_metrics,
             "activity_f1": round(activity_f1, 4),
             "holdout": holdout,
+            "layered_reference_acceptance": layered_reference_acceptance,
+            "onset_count_ratio": round(onset_count_ratio, 3),
+            "dominant_support_ratio": round(dominant_support_ratio, 3),
             "mean_path_score": round(path_mean_score, 4),
             "mean_path_coverage": round(path_mean_coverage, 4),
         },

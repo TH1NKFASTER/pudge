@@ -1177,6 +1177,7 @@ def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, mon
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
+    cfg.paths.cache_dir = tmp_path / "cache"
     cfg.library.root_dir = tmp_path / "library"
     manager = AnimeManager(cfg, log=lambda _message: None)
     video = tmp_path / "Otome Kaijuu Carameliser - 05.mkv"
@@ -1312,6 +1313,7 @@ def test_failed_subtitle_validation_clears_stale_prepared_path(
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
+    cfg.paths.cache_dir = tmp_path / "cache"
     cfg.library.root_dir = tmp_path / "library"
     manager = AnimeManager(cfg, log=lambda _message: None)
 
@@ -1662,6 +1664,19 @@ def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeyp
     )
     manager._notify_ready_episode(video=first, media_id=77, episode=1)
     assert calls == [("Episode ready", "Example — episode 1 is ready with subtitles.")]
+
+    # Episode 2 becomes the nearest unwatched episode only after episode 1 is
+    # counted. Ready episodes further ahead must stay silent.
+    manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=77,
+            title="Example",
+            status="CURRENT",
+            progress=1,
+            episodes=2,
+            format="TV",
+        )
+    )
 
     second = tmp_path / "Example - 02.mkv"
     second.write_bytes(b"video")

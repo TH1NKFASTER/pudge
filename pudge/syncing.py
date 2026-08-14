@@ -39,7 +39,11 @@ def _candidate_explicit_anilist_mismatch(candidate: SubtitleCandidate) -> bool:
     details = candidate.details if isinstance(candidate.details, dict) else {}
     # Narrow stale-parent exception: a separately linked special/movie may use
     # another AniList ID when its entry title exactly matches the opened video.
-    if bool(details.get("entry_identity_exact_title_match")):
+    if bool(details.get("entry_identity_exact_title_match")) and (
+        details.get("requested_episode") in {None, ""}
+        or bool(details.get("single_special_exact_entry"))
+        or bool(details.get("exact_anilist_movie_entry"))
+    ):
         return False
     entry_id = details.get("entry_anilist_id")
     requested_id = details.get("requested_anilist_id")
@@ -55,7 +59,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.37-timeline-monotonic-boundaries-sparse-cold-open:{tag}:"
+        f"syncing-v0.3.38-timeline-monotonic-boundaries-large-cold-open:{tag}:"
         f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
@@ -6711,13 +6715,32 @@ def _exact_jimaku_timing_consensus(
 
     median_score = statistics.median(scores)
     best_score = max(scores)
+    # A noisy embedded English reference can depress every independent Jimaku
+    # score in exactly the same way (signs/accessibility cues are the common
+    # culprit).  In that case compare the already aligned Japanese candidates
+    # to each other.  Three complete exact-episode releases which share one
+    # clock are stronger evidence than a noisy cross-language activity sample.
+    mutual_scores: list[float] = []
+    for index, (_score, left) in enumerate(qualified):
+        for _other_score, right in qualified[index + 1 :]:
+            mutual = compare_timing_activity(left[2], right[2])
+            if mutual.get("available"):
+                try:
+                    mutual_scores.append(float(mutual.get("weighted") or 0.0))
+                except (TypeError, ValueError):
+                    pass
+    mutual_median = statistics.median(mutual_scores) if mutual_scores else 0.0
     payload.update(
         {
             "median_activity": round(median_score, 4),
             "best_activity": round(best_score, 4),
+            "mutual_activity_scores": [round(score, 4) for score in mutual_scores],
+            "mutual_activity_median": round(mutual_median, 4),
         }
     )
-    if median_score < 0.88 or best_score < 0.91:
+    reference_consensus = median_score >= 0.88 and best_score >= 0.91
+    mutual_clock_consensus = len(mutual_scores) >= 3 and mutual_median >= 0.90
+    if not reference_consensus and not mutual_clock_consensus:
         payload["reason"] = "exact_timing_consensus_too_weak"
         return None, payload
 
@@ -6725,11 +6748,72 @@ def _exact_jimaku_timing_consensus(
     payload.update(
         {
             "accepted": True,
-            "reason": "exact_jimaku_timing_consensus",
+            "reason": (
+                "exact_jimaku_timing_consensus"
+                if reference_consensus
+                else "exact_jimaku_mutual_clock_consensus"
+            ),
             "selected": selected[1].name,
         }
     )
     return selected, payload
+
+
+def _exact_jimaku_audio_clock_consensus(
+    items: list[tuple[SubtitleCandidate, Path, dict[str, object]]],
+    *,
+    prefer_srt: bool = True,
+) -> tuple[tuple[SubtitleCandidate, Path, dict[str, object]] | None, dict[str, object]]:
+    """Trust three exact releases when independent audio offsets agree tightly."""
+    qualified: list[tuple[float, SubtitleCandidate, Path, dict[str, object]]] = []
+    for candidate, output, result in items:
+        details = candidate.details
+        try:
+            offset = float(result.get("offset_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if not (
+            bool(result.get("sync_was_successful"))
+            and abs(offset) <= 2.0
+            and candidate.source == "jimaku"
+            and details.get("episode_match") == "exact"
+            and bool(details.get("entry_anilist_match"))
+            and float(candidate.score) >= 75.0
+        ):
+            continue
+        qualified.append((offset, candidate, output, result))
+
+    offsets = sorted(offset for offset, *_rest in qualified)
+    payload: dict[str, object] = {
+        "accepted": False,
+        "reason": "insufficient_exact_audio_clock_consensus",
+        "qualified_candidates": len(qualified),
+        "offsets_seconds": [round(value, 4) for value in offsets],
+    }
+    if len(qualified) < 3:
+        return None, payload
+    spread = max(offsets) - min(offsets)
+    payload["offset_spread_seconds"] = round(spread, 4)
+    if spread > 0.50:
+        payload["reason"] = "exact_audio_clock_consensus_too_wide"
+        return None, payload
+
+    selected = max(
+        qualified,
+        key=lambda item: (
+            int(prefer_srt and item[1].path.suffix.casefold() == ".srt"),
+            float(item[1].score),
+            -abs(item[0]),
+        ),
+    )
+    payload.update(
+        {
+            "accepted": True,
+            "reason": "exact_jimaku_audio_clock_consensus",
+            "selected": selected[1].name,
+        }
+    )
+    return (selected[1], selected[2], selected[3]), payload
 
 
 def optimize_candidates(
@@ -6967,12 +7051,19 @@ def optimize_candidates(
                         )
                         or (
                             isinstance(item[3].get("timeline_validation"), dict)
-                            and float(
-                                item[3]["timeline_validation"]
-                                .get("after", {})
-                                .get("f1", 0.0)
-                                or 0.0
-                            ) >= 0.72
+                            and (
+                                float(
+                                    item[3]["timeline_validation"]
+                                    .get("after", {})
+                                    .get("f1", 0.0)
+                                    or 0.0
+                                ) >= 0.72
+                                or bool(
+                                    item[3]["timeline_validation"].get(
+                                        "layered_reference_acceptance"
+                                    )
+                                )
+                            )
                             and float(
                                 item[3]["timeline_validation"].get("activity_f1", 0.0)
                                 or 0.0
@@ -7266,6 +7357,34 @@ def optimize_candidates(
     successful_evaluated = [
         item for item in evaluated if bool(item[2].get("sync_was_successful"))
     ]
+    audio_consensus_item, audio_consensus = _exact_jimaku_audio_clock_consensus(
+        evaluated, prefer_srt=prefer_srt
+    )
+    if audio_consensus_item is not None:
+        candidate, output, evaluation_result = audio_consensus_item
+        final_result = dict(evaluation_result)
+        final_result.update(
+            {
+                "reason": "applied",
+                "sync_was_successful": True,
+                "engine": "ffsubsync+trusted-exact-jimaku-clock",
+                "output": str(output),
+                "selection_reason": "exact_jimaku_audio_clock_consensus",
+                "candidate_selection": {
+                    "mode": "exact_jimaku_audio_clock_consensus",
+                    "candidate_count": len(candidate_list),
+                    "consensus": audio_consensus,
+                },
+                "reference_alignment_reliable": True,
+            }
+        )
+        configure_logging().info(
+            "ACCEPT step=subtitle.audio_clock_consensus video=%s candidate=%r offsets=%s spread=%s",
+            video.name, candidate.name,
+            audio_consensus.get("offsets_seconds"),
+            audio_consensus.get("offset_spread_seconds"),
+        )
+        return candidate, output, final_result
     selection_pool = successful_evaluated or evaluated
 
     def alignment_value(item: tuple[SubtitleCandidate, Path, dict[str, object]]) -> float:

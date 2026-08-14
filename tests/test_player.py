@@ -50,6 +50,22 @@ def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path):
     ]
 
 
+def test_build_mpv_command_keeps_tracker_with_an_explicit_plugin(tmp_path: Path):
+    tracker = tmp_path / "pudge_anilist.lua"
+    plugin = tmp_path / "jpdb" / "main.lua"
+    command = build_mpv_command(
+        "mpv",
+        Path("episode.mkv"),
+        None,
+        None,
+        ["--load-scripts=no", f"--script={plugin}"],
+        script=tracker,
+    )
+
+    assert f"--script={plugin}" in command
+    assert f"--script={tracker}" in command
+
+
 def test_build_mpv_command_respects_explicit_sub_fix_timing():
     command = build_mpv_command(
         "mpv",

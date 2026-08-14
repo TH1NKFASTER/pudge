@@ -2,14 +2,14 @@
 
 Pudge is a macOS media companion focused on anime with Japanese subtitles. It combines a local library, AniList progress, Nyaa downloads, qBittorrent/aria2, mpv playback, subtitle discovery and automatic timing repair in one native window.
 
-Current version: **0.7.15**.
+Current version: **0.7.16**.
 
 ## What it does
 
 - prepares Japanese subtitles automatically and rejects low-confidence timing instead of asking the viewer to edit them;
 - uses embedded subtitle clocks and container chapters around openings/transitions, with cached tiny Japanese STT as a last resort;
 - keeps anime lists and watched progress in sync with AniList;
-- finds releases through Nyaa and manages downloads with qBittorrent or the bundled aria2 fallback;
+- finds releases through Nyaa and downloads them with its built-in downloader; qBittorrent remains an optional advanced backend;
 - reads EPUB/TXT light novels, CBZ/ZIP manga, and M4B/MP3/Opus/FLAC audiobooks;
 - keeps Activity out of the primary navigation while surfacing only genuine user-action blockers on Home.
 
@@ -21,9 +21,17 @@ See the [user guide](docs/USER_GUIDE.md) for end-to-end scenarios and [algorithm
 
 - macOS 14 or newer, preferably Apple Silicon;
 - [Homebrew](https://brew.sh/);
-- accounts/tokens only for the integrations you enable (Jimaku, AniList, qBittorrent, Jiten or JPDB).
+- accounts/tokens only for the integrations you enable (Jimaku, AniList or Jiten);
+  the official jpdb-mpv-plugin manages its own authorization.
 
 The installer adds mpv, ffmpeg/ffprobe, ALASS, 7-Zip, aria2 and Python 3.12 through Homebrew.
+First experience also checks mpv and ffmpeg and can repair a missing Homebrew
+installation of either component. It can optionally install the separate
+[JitenMPV](https://github.com/Sirush/JitenMPV) plugin for interactive subtitle
+words inside mpv and reuse the Jiten API key entered in Pudge settings.
+Automatic downloads need no torrent-client setup: Pudge starts its private local aria2 process when needed.
+qBittorrent can still be selected in Settings as an advanced alternative. Versions below 5.2 use
+the Web UI username and password; API-key authentication requires qBittorrent 5.2 or newer.
 
 ## Install a release
 
@@ -31,7 +39,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.15.zip
+unzip pudge-macos-v0.7.16.zip
 cd pudge
 ./install.sh
 ```
@@ -58,8 +66,8 @@ Official release builds may include a shared Jimaku key for the first 48 hours. 
 
 1. Sign in to AniList and open [Developer settings](https://anilist.co/settings/developer).
 2. Choose **Create New Client**. Set the name to `Pudge` and the redirect URL to `https://anilist.co/api/v2/oauth/pin`, then save.
-3. Copy the numeric Client ID into **Settings → AniList → Client ID** in Pudge.
-4. Choose **Get access token** in Pudge, authorize the application on AniList, and copy the issued token into **AniList access token**.
+3. Copy only the numeric Client ID into **Settings → AniList → Client ID** in Pudge.
+4. Pudge then reveals **Get key**. Open it, authorize the application on AniList, and copy the issued token into the newly shown field.
 5. Save Pudge settings. Pudge updates AniList data automatically after the credentials change.
 
 The token grants access to your AniList account and should be treated like a password. The flow follows AniList's [implicit-grant authentication guide](https://docs.anilist.co/guide/auth/).

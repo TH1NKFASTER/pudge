@@ -7,12 +7,16 @@ install-dev:
 	$(PYTHON) -m pip install -e ".[dev,sync]"
 
 test:
-	$(PYTHON) -m pytest -q
+	@runtime=$$(mktemp -d "$${TMPDIR:-/tmp}/pudge-pytest-runtime.XXXXXX"); \
+	trap 'rm -rf "$$runtime"' EXIT; \
+	PUDGE_HOME="$$runtime/home" PUDGE_RUNTIME_LOG_PATH="$$runtime/runtime.log" $(PYTHON) -m pytest -q
 
 test-batches:
-	@i=0; while [ $$i -lt $(BATCHES) ]; do \
+	@runtime=$$(mktemp -d "$${TMPDIR:-/tmp}/pudge-pytest-runtime.XXXXXX"); \
+	trap 'rm -rf "$$runtime"' EXIT; \
+	i=0; while [ $$i -lt $(BATCHES) ]; do \
 		echo "== Test batch $$((i+1))/$(BATCHES) =="; \
-		$(PYTHON) scripts/run_test_batch.py --batch $$i --batches $(BATCHES) || exit $$?; \
+		PUDGE_HOME="$$runtime/home" PUDGE_RUNTIME_LOG_PATH="$$runtime/runtime.log" $(PYTHON) scripts/run_test_batch.py --batch $$i --batches $(BATCHES) || exit $$?; \
 		i=$$((i+1)); \
 	done
 

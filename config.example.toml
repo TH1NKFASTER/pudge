@@ -102,6 +102,7 @@ ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 alass = "alass"
 mpv_extra_args = []
+mpv_study_plugin = "auto"
 
 [jimaku]
 api_key = ""

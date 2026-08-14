@@ -88,7 +88,7 @@ def test_online_selection_translation_is_cached(tmp_path: Path, monkeypatch: pyt
     assert calls == [("https://translate.googleapis.com/translate_a/single", "ru")]
 
 
-def test_local_llm_is_translation_fallback_with_200_chars_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_llm_translation_uses_extended_preceding_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     c = cfg(tmp_path)
     c.llm.enabled = True
     c.llm.base_url = "http://127.0.0.1:11434"
@@ -117,9 +117,9 @@ def test_local_llm_is_translation_fallback_with_200_chars_context(tmp_path: Path
     assert result["translation"] == "context-aware result"
     assert seen["url"] == "http://127.0.0.1:11434/api/chat"
     user = seen["payload"]["messages"][1]["content"]
-    # The fallback gets at most the requested preceding 200 characters.
+    # Anime/LN translation now keeps the extended preceding context.
     before = user.split("SELECTED TEXT:", 1)[0]
-    assert before.count("前") == 200
+    assert before.count("前") == 260
 
 
 def test_light_novel_state_refresh_is_background_and_deduplicated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -258,6 +258,14 @@ def scan_library(
             and existing is not None
             and existing_download.media_id == existing.media_id
         )
+        release_number = identity.episode
+        media_number = (
+            existing_download.media_episode
+            if existing_has_managed_download and existing_download is not None
+            else existing.media_episode
+            if existing is not None
+            else identity.episode
+        )
         if (
             not require_anime_match
             and anime is None
@@ -383,7 +391,9 @@ def scan_library(
         item = LibraryEpisode(
             media_id=anime.media_id if anime else None,
             title=anime.title if anime else identity.title,
-            episode=identity.episode,
+            episode=media_number,
+            media_episode=media_number,
+            release_episode=release_number,
             video_path=resolved,
             subtitle_path=subtitle,
             embedded_subtitle_id=embedded_subtitle_id,

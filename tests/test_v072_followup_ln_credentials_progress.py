@@ -39,8 +39,7 @@ def test_names_editor_is_in_ln_context_menu_and_credential_guides_are_available(
     assert "https://jimaku.cc/api/docs" not in html
     assert "https://anilist.co/api/v2/oauth/pin" in html
     assert "response_type=token" in html
-    assert "id=\"anilistAuthorize\"" in html
-    assert "id=\"onboardingAniListAuthorize\"" in html
+    assert "settings?'anilistAuthorize':'onboardingAniListAuthorize'" in html
     assert "## Jimaku and AniList credentials" in readme
 
 

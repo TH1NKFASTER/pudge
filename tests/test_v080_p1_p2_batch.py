@@ -22,7 +22,7 @@ def test_v4_schema_has_shared_identity_and_name_overrides(tmp_path: Path) -> Non
     with sqlite3.connect(path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert LATEST_SCHEMA_VERSION == version == 4
+    assert LATEST_SCHEMA_VERSION == version == 5
     assert {"character_name_overrides", "media_identities"} <= tables
 
 

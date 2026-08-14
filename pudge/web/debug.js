@@ -5,16 +5,17 @@
   const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
   let currentAnime = null;
   let currentData = null;
+  let currentEpisode = null;
   let activeTab = 'summary';
 
   const labels = () => ru() ? {
-    title:'Debug аниме', close:'Закрыть', refresh:'Обновить', copy:'Копировать JSON',
+    title:'Debug аниме', close:'Закрыть', refresh:'Обновить', downloads:'Загрузки', copy:'Копировать JSON',
     export:'Экспорт JSON', summary:'Сводка', video:'Видеофайл', subtitles:'Субтитры',
     pipeline:'Pipeline', performance:'Производительность', raw:'Raw JSON',
     copied:'Debug JSON скопирован', exported:'Debug JSON сохранён',
     fresh:'Удалить текущие и подобрать заново', freshConfirm:'Удалить текущий выбор субтитров и запустить полностью свежий поиск/синхронизацию?',
   } : {
-    title:'Anime Debug', close:'Close', refresh:'Refresh', copy:'Copy JSON',
+    title:'Anime Debug', close:'Close', refresh:'Refresh', downloads:'Downloads', copy:'Copy JSON',
     export:'Export JSON', summary:'Summary', video:'Video file', subtitles:'Subtitles',
     pipeline:'Pipeline', performance:'Performance', raw:'Raw JSON',
     copied:'Debug JSON copied', exported:'Debug JSON exported',
@@ -27,7 +28,7 @@
     root = document.createElement('section');
     root.id = 'pudgeDebugOverlay';
     root.className = 'pudge-debug-overlay';
-    root.innerHTML = '<div class="pudge-debug-head"><button data-debug-action="close"></button><h2 id="pudgeDebugTitle"></h2><span id="pudgeDebugEpisode" class="pudge-debug-badge"></span><span class="spacer"></span><button data-debug-action="refresh"></button><button data-debug-action="copy"></button><button data-debug-action="export"></button></div><div id="pudgeDebugTabs" class="pudge-debug-tabs"></div><div id="pudgeDebugBody" class="pudge-debug-body"></div>';
+    root.innerHTML = '<div class="pudge-debug-head"><button data-debug-action="close"></button><h2 id="pudgeDebugTitle"></h2><select id="pudgeDebugEpisodeSelect" aria-label="Episode"></select><span class="spacer"></span><button data-debug-action="downloads"></button><button data-debug-action="refresh"></button><button data-debug-action="copy"></button><button data-debug-action="export"></button></div><div id="pudgeDebugTabs" class="pudge-debug-tabs"></div><div id="pudgeDebugBody" class="pudge-debug-body"></div>';
     document.body.append(root);
     root.addEventListener('click', event => {
       const tab = event.target.closest('[data-debug-tab]')?.dataset.debugTab;
@@ -40,10 +41,15 @@
       const action = event.target.closest('[data-debug-action]')?.dataset.debugAction;
       if (!action) return;
       if (action === 'close') close();
+      if (action === 'downloads') { close(); void window.openDownloadCenter?.(currentAnime?.media_id); }
       if (action === 'refresh') void load();
       if (action === 'copy') void copy();
       if (action === 'export') void exportJson();
       if (action === 'fresh-subtitles') void freshSubtitles();
+    });
+    root.querySelector('#pudgeDebugEpisodeSelect').addEventListener('change', event => {
+      currentEpisode = Number(event.target.value);
+      void load();
     });
     return root;
   };
@@ -89,11 +95,15 @@
   const render = () => {
     const root = ensure(), l = labels(), body = root.querySelector('#pudgeDebugBody');
     root.querySelector('[data-debug-action="close"]').textContent = l.close;
+    root.querySelector('[data-debug-action="downloads"]').textContent = l.downloads;
     root.querySelector('[data-debug-action="refresh"]').textContent = l.refresh;
     root.querySelector('[data-debug-action="copy"]').textContent = l.copy;
     root.querySelector('[data-debug-action="export"]').textContent = l.export;
     root.querySelector('#pudgeDebugTitle').textContent = `${l.title}: ${currentAnime?.title || currentData?.anime?.title || ''}`;
-    root.querySelector('#pudgeDebugEpisode').textContent = currentData?.selected_episode == null ? '' : `#${currentData.selected_episode}`;
+    const episodeSelect=root.querySelector('#pudgeDebugEpisodeSelect'),episodes=currentData?.available_episodes||[];
+    episodeSelect.innerHTML=episodes.map(item=>`<option value="${Number(item.episode)}">${ru()?'Серия':'Episode'} ${Number(item.episode)} · ${esc(item.state||'—')}</option>`).join('');
+    episodeSelect.hidden=episodes.length<2;
+    if(currentData?.selected_episode!=null)episodeSelect.value=String(currentData.selected_episode);
     const tabs = [['summary',l.summary],['video',l.video],['subtitles',l.subtitles],['pipeline',l.pipeline],['performance',l.performance],['raw',l.raw]];
     root.querySelector('#pudgeDebugTabs').innerHTML = tabs.map(([key,label]) => `<button data-debug-tab="${key}" class="${activeTab===key?'active':''}">${label}</button>`).join('');
     if (!currentData) { body.innerHTML = '<div class="empty">Loading…</div>'; return; }
@@ -110,7 +120,7 @@
   const load = async (showLoading=true) => {
     if (!currentAnime?.media_id) return;
     if (showLoading) { currentData = null; render(); }
-    try { currentData = await pywebview.api.anime_debug_snapshot(Number(currentAnime.media_id), null); }
+    try { currentData = await pywebview.api.anime_debug_snapshot(Number(currentAnime.media_id), currentEpisode); currentEpisode=currentData?.selected_episode??currentEpisode; }
     catch (error) { currentData = {anime: currentAnime, summary:{diagnosis:{error:String(error?.message||error)}}}; }
     render();
   };
@@ -126,7 +136,7 @@
   };
 
   const open = async anime => {
-    currentAnime = anime; activeTab = 'summary';
+    currentAnime = anime; currentEpisode = null; activeTab = 'summary';
     ensure().classList.add('open');
     await load();
   };
@@ -138,7 +148,7 @@
   };
   const exportJson = async () => {
     if (!currentAnime?.media_id) return;
-    const result = await pywebview.api.export_anime_debug_snapshot(Number(currentAnime.media_id), null);
+    const result = await pywebview.api.export_anime_debug_snapshot(Number(currentAnime.media_id), currentEpisode);
     window.toast?.(`${labels().exported}: ${result.path||''}`);
   };
 

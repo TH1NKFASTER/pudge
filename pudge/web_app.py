@@ -1,47 +1,54 @@
 from __future__ import annotations
 
-import http.server
 import html
+import http.server
 import json
+import platform
+import re
 import shutil
 import subprocess
 import sys
-import platform
-import re
-import unicodedata
 import threading
 import time
+import unicodedata
 import webbrowser
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote
 from typing import Any
+from urllib.parse import quote
 
 from . import __version__
+from .audiobooks import AudiobookService
+from .backup import create_backup, restore_backup
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
 from .config import load_config, write_config
+from .debug_snapshot import DebugSnapshotService
+from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
+from .first_experience import (
+    configure_mpv_study_keys,
+    dependency_status,
+    install_jiten_mpv,
+    install_media_tools,
+    mpv_study_status,
+)
 from .jimaku_trial import apply_jimaku_trial
 from .job_center import JobCenter
+from .language import IMAGE_SUBTITLE_EXTENSIONS
+from .light_novels import LightNovelError, LightNovelService
+from .logging_utils import DEFAULT_LOG_PATH, configure_logging, tail_log, timed_step
+from .maintenance_lock import maintenance_lock
 from .manager import AnimeManager
-from .providers.qbittorrent import QBittorrentClient
+from .manager_models import LibraryAnime, NyaaRelease
+from .manga import MangaService
+from .metadata_cache import MetadataCache
+from .notifications import send_native_notification
+from .permissions import request_folder_access, request_notification_permission
+from .providers.anilist import AniListClient
 from .providers.aria2 import Aria2Client
 from .providers.nyaa import NyaaClient
-from .providers.anilist import AniListClient
-from .manager_models import LibraryAnime, NyaaRelease
-from .language import IMAGE_SUBTITLE_EXTENSIONS
-from .logging_utils import DEFAULT_LOG_PATH, configure_logging, tail_log, timed_step
+from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
-from .permissions import request_folder_access, request_notification_permission
-from .notifications import send_native_notification
-from .maintenance_lock import maintenance_lock
-from .backup import create_backup, restore_backup
-from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
-from .light_novels import LightNovelService, LightNovelError
-from .manga import MangaService
-from .audiobooks import AudiobookService
-from .debug_snapshot import DebugSnapshotService
-from .metadata_cache import MetadataCache
 from .updater import AppUpdater
 from .visual_novels import VisualNovelService
 
@@ -500,7 +507,7 @@ class WebAppApi:
         for item in rows:
             if item.media_id is None or int(item.media_id) != int(anime.media_id):
                 continue
-            if float(item.progress or 0.0) >= 0.999:
+            if AnimeManager._download_is_complete(item):
                 return True
             state = str(item.state or "").strip().casefold()
             if state not in invalid_states:
@@ -1351,6 +1358,12 @@ class WebAppApi:
     def _settings_payload(self) -> dict[str, Any]:
         apply_jimaku_trial(self.config)
         cfg = self.config
+        ln_settings = self.light_novels.settings() if hasattr(self, "light_novels") else None
+        study_plugins = mpv_study_status(
+            jiten_api_key=str(getattr(ln_settings, "jiten_api_key", "") or ""),
+            jpdb_api_token=str(getattr(ln_settings, "jpdb_api_token", "") or ""),
+            selected_plugin=cfg.tools.mpv_study_plugin,
+        )
         return {
             "version": __version__,
             "language": cfg.ui.language,
@@ -1397,6 +1410,12 @@ class WebAppApi:
             "aria2_enabled": cfg.aria2.enabled,
             "aria2_binary": cfg.aria2.binary,
             "aria2_rpc_port": cfg.aria2.rpc_port,
+            "aria2_seed_mode": cfg.aria2.seed_mode,
+            "aria2_seed_ratio": cfg.aria2.seed_ratio,
+            "aria2_seed_time_minutes": cfg.aria2.seed_time_minutes,
+            "aria2_upload_limit_kib": cfg.aria2.upload_limit_kib,
+            "aria2_vpn_interface": cfg.aria2.vpn_interface,
+            "aria2_vpn_kill_switch": cfg.aria2.vpn_kill_switch,
             "torrent_backend": (self.manager.torrent_backend_name() if callable(getattr(self.manager, "torrent_backend_name", None)) else ("qBittorrent" if cfg.qbittorrent.enabled else "aria2")) if self._downloads_enabled() else "disabled",
             "download_hook": cfg.qbittorrent.pre_download_command,
             "agent_enabled": cfg.agent.enabled,
@@ -1434,6 +1453,9 @@ class WebAppApi:
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
             "shortcut_mpv_open_anilist": cfg.shortcuts.mpv_open_anilist,
             "shortcut_mpv_correct_match": cfg.shortcuts.mpv_correct_match,
+            "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
+            "mpv_study_plugin": cfg.tools.mpv_study_plugin,
+            "mpv_study_plugins": study_plugins,
             "energy_monitoring_enabled": cfg.diagnostics.energy_monitoring_enabled,
             "energy_sample_seconds": cfg.diagnostics.energy_sample_seconds,
             "energy_log_path": str(ENERGY_LOG_PATH),
@@ -1445,15 +1467,120 @@ class WebAppApi:
             self._last_storage_status = self.manager.storage_status()
         return dict(self._last_storage_status)
 
+    @staticmethod
+    def _download_number(raw: dict[str, Any], *keys: str) -> int:
+        for key in keys:
+            try:
+                value = int(float(raw.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+            if value:
+                return max(0, value)
+        return 0
+
+    def _download_payload(
+        self,
+        item: Any,
+        anime_by_id: dict[int, Any],
+    ) -> dict[str, Any]:
+        raw = dict(getattr(item, "raw", {}) or {})
+        anime = (
+            anime_by_id.get(int(item.media_id))
+            if item.media_id is not None
+            else None
+        )
+        total = self._download_number(raw, "total_size", "size", "totalLength")
+        downloaded = self._download_number(
+            raw, "downloaded", "completed_length", "completedLength"
+        )
+        if total and not downloaded:
+            downloaded = min(total, round(total * float(item.progress or 0)))
+        speed = self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed")
+        upload_speed = self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed")
+        eta = self._download_number(raw, "eta")
+        if eta >= 8_640_000:
+            eta = 0
+        if not eta and speed > 0 and total > downloaded:
+            eta = max(1, round((total - downloaded) / speed))
+        seeders = self._download_number(raw, "num_seeds", "num_seeders", "numSeeders")
+        listed_seeders = self._download_number(raw, "listed_seeders")
+        listed_leechers = self._download_number(raw, "listed_leechers")
+        leechers = self._download_number(raw, "num_leechs", "num_leechers")
+        connections = self._download_number(
+            raw, "num_connections", "connections", "num_incomplete"
+        )
+        peers = max(leechers, max(0, connections - seeders))
+        backends = [
+            str(value) for value in raw.get("_backends", []) if str(value).strip()
+        ]
+        primary_backend = str(raw.get("backend") or self.manager.torrent_backend_name())
+        return {
+            "hash": item.torrent_hash,
+            "torrent_hash": item.torrent_hash,
+            "name": item.name,
+            "anime_title": str(anime.title) if anime is not None else "",
+            "state": item.state,
+            "progress": item.progress,
+            "media_id": item.media_id,
+            "episode": item.episode,
+            "is_batch": item.is_batch,
+            "backend": " + ".join(backends) if len(backends) > 1 else primary_backend,
+            "backend_id": primary_backend,
+            "backends": backends or [primary_backend],
+            "total_bytes": total,
+            "downloaded_bytes": downloaded,
+            "download_speed": speed,
+            "upload_speed": upload_speed,
+            "seeders": seeders,
+            "peers": peers,
+            "listed_seeders": listed_seeders,
+            "listed_peers": listed_leechers,
+            "eta_seconds": eta,
+            "ratio": float(raw.get("ratio") or 0),
+            "save_path": item.save_path,
+            "added_on": item.added_on,
+            "completed_on": item.completed_on,
+            "error": str(raw.get("error_message") or raw.get("error") or ""),
+        }
+
     def _get_state(self, *, refresh_storage: bool) -> dict[str, Any]:
         current_anime = self.manager.db.anime_list(("CURRENT",))
         planned_anime = self.manager.db.anime_list(("PLANNING",))
         anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
         download_rows = self.manager.db.downloads()
+        downloads = [
+            self._download_payload(item, anime_by_id) for item in download_rows
+        ]
+        download_by_media: dict[int, dict[str, Any]] = {}
+        for download in downloads:
+            media_id = download.get("media_id")
+            if media_id is None:
+                continue
+            key = int(media_id)
+            previous = download_by_media.get(key)
+            # Prefer live work over old completed rows, then the newest row.
+            rank = (
+                0 if str(download.get("state") or "").casefold() in {"active", "waiting", "paused"} else 1,
+                -float(download.get("added_on") or 0),
+            )
+            previous_rank = (
+                0 if previous and str(previous.get("state") or "").casefold() in {"active", "waiting", "paused"} else 1,
+                -float(previous.get("added_on") or 0) if previous else 0,
+            )
+            if previous is None or rank < previous_rank:
+                download_by_media[key] = download
+
         current = [self._anime_payload(a) for a in current_anime]
+        for payload in current:
+            download = download_by_media.get(int(payload["media_id"]))
+            if download is not None:
+                payload["download"] = download
         planned = []
         for anime in planned_anime:
             payload = self._anime_payload(anime)
+            download = download_by_media.get(int(anime.media_id))
+            if download is not None:
+                payload["download"] = download
             payload["planning_download_hidden"] = self._planning_download_button_hidden(
                 anime,
                 downloads=download_rows,
@@ -1479,19 +1606,44 @@ class WebAppApi:
             }
             for item in self.manager.db.episodes()
         ]
-        downloads = []
-        for item in download_rows:
-            anime = anime_by_id.get(int(item.media_id)) if item.media_id is not None else None
-            downloads.append({
-                "torrent_hash": item.torrent_hash,
-                "name": item.name,
-                "anime_title": str(anime.title) if anime is not None else "",
-                "state": item.state,
-                "progress": item.progress,
-                "media_id": item.media_id,
-                "episode": item.episode,
-                "is_batch": item.is_batch,
-            })
+        home = self._home_sections(current_anime, anime_by_id)
+
+        def _attach_download(card: dict[str, Any]) -> None:
+            if card.get("kind") == "watch_sequence":
+                for child in card.get("items") or []:
+                    if isinstance(child, dict):
+                        _attach_download(child)
+                return
+            media_id = card.get("media_id")
+            if media_id is not None and int(media_id) in download_by_media:
+                card["download"] = download_by_media[int(media_id)]
+
+        represented: set[int] = set()
+        for cards in home.values():
+            if not isinstance(cards, list):
+                continue
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                _attach_download(card)
+                children = card.get("items") if card.get("kind") == "watch_sequence" else [card]
+                for child in children or []:
+                    if isinstance(child, dict) and child.get("media_id") is not None:
+                        represented.add(int(child["media_id"]))
+
+        # A Planning batch has no local episode yet, so historically it vanished
+        # from Home until the entire batch finished. Surface it immediately in
+        # Waiting for preparation and keep the live torrent status attached.
+        for media_id, download in download_by_media.items():
+            anime = anime_by_id.get(media_id)
+            if anime is None or media_id in represented:
+                continue
+            if str(anime.status or "").upper() not in {"CURRENT", "PLANNING"}:
+                continue
+            card = self._anime_payload(anime)
+            card["download"] = download
+            home.setdefault("waiting", []).append(card)
+            represented.add(media_id)
         episode_title_by_path = {
             str(item.video_path): str(item.title or "") for item in self.manager.db.episodes()
         }
@@ -1529,7 +1681,7 @@ class WebAppApi:
             "current": current,
             "planned": planned,
             "downloaded": self._downloaded_payloads(anime_by_id),
-            "home": self._home_sections(current_anime, anime_by_id),
+            "home": home,
             "episodes": episodes,
             "library": self._library_payloads(anime_by_id),
             "downloads": downloads,
@@ -1568,6 +1720,139 @@ class WebAppApi:
         most recent full state and is refreshed when maintenance finishes.
         """
         return self._get_state(refresh_storage=False)
+
+    def torrent_downloads(
+        self,
+        media_id: int | None = None,
+        refresh: bool = True,
+    ) -> dict[str, Any]:
+        warning = ""
+        if refresh and self._downloads_enabled():
+            try:
+                self.manager.sync_downloads()
+            except Exception as exc:
+                warning = str(exc)
+        anime_by_id = {
+            anime.media_id: anime for anime in self.manager.db.anime_list()
+        }
+        rows = self.manager.db.downloads()
+        if media_id is not None:
+            rows = [
+                item
+                for item in rows
+                if item.media_id is not None and int(item.media_id) == int(media_id)
+            ]
+        network_guard: dict[str, Any] = {}
+        if self.config.aria2.enabled:
+            for backend, client in self.manager.torrent_clients():
+                try:
+                    if backend == "aria2" and isinstance(client, Aria2Client):
+                        network_guard = client.network_guard_status()
+                        break
+                finally:
+                    client.close()
+        return {
+            "backend": (
+                self.manager.torrent_backend_name()
+                if self._downloads_enabled()
+                else "disabled"
+            ),
+            "downloads": [
+                self._download_payload(item, anime_by_id) for item in rows
+            ],
+            "storage": self._storage_payload(refresh=False),
+            "network_guard": network_guard,
+            "warning": warning,
+        }
+
+    def torrent_download_action(
+        self,
+        torrent_hash: str,
+        action: str,
+        delete_files: bool = False,
+        backend: str = "",
+    ) -> dict[str, Any]:
+        value = str(torrent_hash or "").strip()
+        command = str(action or "").strip().casefold()
+        backend_hint = str(backend or "").strip().casefold()
+        if command == "stop-all":
+            stopped = 0
+            errors: list[str] = []
+            for backend_name, client in self.manager.torrent_clients():
+                try:
+                    rows = client.torrents(
+                        category=(self.config.qbittorrent.category if backend_name == "qbittorrent" else "")
+                    )
+                    for item in rows:
+                        try:
+                            client.pause(item.torrent_hash)
+                            stopped += 1
+                        except Exception as exc:
+                            errors.append(f"{backend_name}: {exc}")
+                finally:
+                    client.close()
+            result = self.torrent_downloads(refresh=True)
+            result["stopped"] = stopped
+            if errors:
+                result["warning"] = "; ".join(errors)
+            return result
+        known = next(
+            (
+                item
+                for item in self.manager.db.downloads()
+                if item.torrent_hash.casefold() == value.casefold()
+            ),
+            None,
+        )
+        if known is None:
+            raise ValueError("Download is not managed by Pudge")
+        if command not in {"pause", "resume", "reconnect", "remove"}:
+            raise ValueError("Unknown download action")
+        known_backends = [
+            str(name).casefold()
+            for name in (known.raw or {}).get("_backends", [])
+            if str(name).strip()
+        ]
+        if len(known_backends) > 1:
+            backend_hint = ""
+        elif not backend_hint:
+            backend_hint = str((known.raw or {}).get("backend") or "").casefold()
+        clients = self.manager.torrent_clients()
+        selected = [
+            (name, client) for name, client in clients
+            if (
+                (known_backends and name in known_backends)
+                or (not known_backends and (not backend_hint or name == backend_hint))
+            )
+        ]
+        if not selected:
+            for _name, client in clients:
+                client.close()
+            raise ValueError("Torrent backend is no longer enabled")
+        try:
+            for name, client in selected:
+                if command == "pause":
+                    client.pause(value)
+                elif command == "resume":
+                    client.start(value)
+                elif command == "reconnect":
+                    reconnect = getattr(client, "reconnect", None)
+                    if not callable(reconnect):
+                        raise ValueError("Reconnect is available for the built-in torrent client")
+                    reconnect(value)
+                else:
+                    client.delete(value, delete_files=bool(delete_files))
+        finally:
+            for _name, client in clients:
+                client.close()
+        if command == "remove":
+            self.manager.db.delete_torrent_records(value)
+        else:
+            try:
+                self.manager.sync_downloads()
+            except Exception:
+                pass
+        return self.torrent_downloads(refresh=False)
 
     def _sync_anilist(self) -> dict[str, Any]:
         with self._anilist_sync_lock:
@@ -2674,6 +2959,32 @@ class WebAppApi:
         self.light_novels.update_position(int(book_id), int(chapter_index), float(offset))
         return {"ok": True}
 
+    def light_novel_bookmark(
+        self,
+        book_id: int,
+        chapter_index: int,
+        offset: float,
+        source: str = "manual",
+    ) -> dict[str, Any]:
+        bookmark = self.light_novels.save_bookmark(
+            int(book_id),
+            int(chapter_index),
+            float(offset),
+            source=str(source or "manual"),
+        )
+        return {
+            "ok": True,
+            "bookmark": bookmark,
+            "current_chapter": bookmark["chapter_index"],
+            "current_offset": bookmark["offset"],
+            "bookmark_source": bookmark["source"],
+            "bookmark_updated_at": bookmark["updated_at"],
+        }
+
+    def light_novel_reset_position(self, book_id: int) -> dict[str, Any]:
+        book = self.light_novels.reset_position(int(book_id))
+        return {"ok": True, "book": book, "state": self.light_novel_state()}
+
     def light_novel_finish_volume(self, book_id: int) -> dict[str, Any]:
         return self.light_novels.finish_volume(int(book_id))
 
@@ -2877,6 +3188,9 @@ class WebAppApi:
             "reader_indent": values.get("ln_reader_indent", ln_current.reader_indent),
             "reader_vertical": values.get("ln_reader_vertical", ln_current.reader_vertical),
             "reader_mode": values.get("ln_reader_mode", ln_current.reader_mode),
+            "auto_bookmarks": values.get(
+                "ln_auto_bookmarks", ln_current.auto_bookmarks
+            ),
         }
         old_ocr_enabled = bool(cfg.matching.ocr_image_subtitles)
         old_jimaku_key = str(cfg.jimaku.api_key or "")
@@ -3005,6 +3319,13 @@ class WebAppApi:
         cfg.aria2.enabled = bool(values.get("aria2_enabled", cfg.aria2.enabled))
         cfg.aria2.binary = str(values.get("aria2_binary", cfg.aria2.binary)).strip() or "aria2c"
         cfg.aria2.rpc_port = max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.aria2.rpc_port))))
+        seed_mode = str(values.get("aria2_seed_mode", cfg.aria2.seed_mode)).strip().casefold()
+        cfg.aria2.seed_mode = seed_mode if seed_mode in {"off", "ratio", "ratio_or_time", "unlimited"} else "off"
+        cfg.aria2.seed_ratio = max(0.0, float(values.get("aria2_seed_ratio", cfg.aria2.seed_ratio)))
+        cfg.aria2.seed_time_minutes = max(0.0, float(values.get("aria2_seed_time_minutes", cfg.aria2.seed_time_minutes)))
+        cfg.aria2.upload_limit_kib = max(0, int(values.get("aria2_upload_limit_kib", cfg.aria2.upload_limit_kib)))
+        cfg.aria2.vpn_interface = str(values.get("aria2_vpn_interface", cfg.aria2.vpn_interface)).strip()
+        cfg.aria2.vpn_kill_switch = bool(values.get("aria2_vpn_kill_switch", cfg.aria2.vpn_kill_switch))
         cfg.agent.enabled = bool(values.get("agent_enabled", cfg.agent.enabled))
         cfg.agent.poll_minutes = max(5, int(values.get("agent_poll", cfg.agent.poll_minutes)))
         cfg.agent.anilist_refresh_minutes = max(5, int(values.get("anilist_refresh_poll", cfg.agent.anilist_refresh_minutes)))
@@ -3026,6 +3347,15 @@ class WebAppApi:
         cfg.shortcuts.mpv_mark_watched = str(values.get("shortcut_mpv_mark_watched", cfg.shortcuts.mpv_mark_watched)).strip()
         cfg.shortcuts.mpv_open_anilist = str(values.get("shortcut_mpv_open_anilist", cfg.shortcuts.mpv_open_anilist)).strip()
         cfg.shortcuts.mpv_correct_match = str(values.get("shortcut_mpv_correct_match", cfg.shortcuts.mpv_correct_match)).strip()
+        cfg.shortcuts.mpv_translate_subtitle = str(values.get("shortcut_mpv_translate_subtitle", cfg.shortcuts.mpv_translate_subtitle)).strip()
+        requested_study_plugin = str(
+            values.get("mpv_study_plugin", cfg.tools.mpv_study_plugin)
+        ).strip().casefold()
+        cfg.tools.mpv_study_plugin = (
+            requested_study_plugin
+            if requested_study_plugin in {"auto", "jiten", "jpdb"}
+            else "auto"
+        )
         cfg.diagnostics.energy_monitoring_enabled = bool(
             values.get("energy_monitoring_enabled", cfg.diagnostics.energy_monitoring_enabled)
         )
@@ -3122,6 +3452,10 @@ class WebAppApi:
             runtime_log_path=DEFAULT_LOG_PATH,
         )
         self.light_novels.save_settings(ln_values)
+        configure_mpv_study_keys(
+            jiten_api_key=str(ln_values.get("jiten_api_key") or ""),
+            jpdb_api_token=str(ln_values.get("jpdb_api_token") or ""),
+        )
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
         if self.config.diagnostics.energy_monitoring_enabled:
             self.energy_monitor.start()
@@ -3204,6 +3538,82 @@ class WebAppApi:
         result["settings"] = self._settings_payload()
         self.logger.info("EVENT onboarding.completed")
         return result
+
+    def first_experience_dependencies(self) -> dict[str, Any]:
+        ln = self.light_novels.settings()
+        return dependency_status(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+            jiten_api_key=ln.jiten_api_key,
+            jpdb_api_token=ln.jpdb_api_token,
+            selected_plugin=self.config.tools.mpv_study_plugin,
+        )
+
+    def install_first_experience_dependencies(
+        self, values: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        options = values or {}
+        status = install_media_tools(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+        )
+        self.config.tools.mpv = str(status["mpv"]["path"])
+        self.config.tools.ffmpeg = str(status["ffmpeg"]["path"])
+        ffprobe = shutil.which("ffprobe")
+        ffmpeg_path = Path(self.config.tools.ffmpeg)
+        sibling_ffprobe = ffmpeg_path.with_name("ffprobe")
+        if sibling_ffprobe.is_file():
+            ffprobe = str(sibling_ffprobe)
+        if ffprobe:
+            self.config.tools.ffprobe = str(ffprobe)
+        key = str(
+            options.get("jiten_api_key")
+            or self.light_novels.settings().jiten_api_key
+            or ""
+        ).strip()
+        jpdb_key = str(
+            options.get("jpdb_api_token")
+            or self.light_novels.settings().jpdb_api_token
+            or ""
+        ).strip()
+        if bool(options.get("install_jiten_mpv")):
+            status = install_jiten_mpv(
+                key,
+                mpv=self.config.tools.mpv,
+                ffmpeg=self.config.tools.ffmpeg,
+            )
+        if key:
+            self.light_novels.save_settings({"jiten_api_key": key})
+        if jpdb_key:
+            self.light_novels.save_settings({"jpdb_api_token": jpdb_key})
+        selected_plugin = str(
+            options.get("mpv_study_plugin") or self.config.tools.mpv_study_plugin
+        ).strip().casefold()
+        if selected_plugin in {"auto", "jiten", "jpdb"}:
+            self.config.tools.mpv_study_plugin = selected_plugin
+        configure_mpv_study_keys(jiten_api_key=key, jpdb_api_token=jpdb_key)
+        status = dependency_status(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+            jiten_api_key=key,
+            jpdb_api_token=jpdb_key,
+            selected_plugin=self.config.tools.mpv_study_plugin,
+        )
+        write_config(self.config, self.config_path)
+        for service, name, value in (
+            (self.audiobooks, "mpv", self.config.tools.mpv),
+            (self.audiobooks, "ffmpeg", self.config.tools.ffmpeg),
+            (self.audiobooks, "ffprobe", self.config.tools.ffprobe),
+        ):
+            if hasattr(service, name):
+                setattr(service, name, value)
+        self.logger.info(
+            "EVENT onboarding.dependencies mpv=%s ffmpeg=%s jiten_mpv=%s",
+            status["mpv"]["installed"],
+            status["ffmpeg"]["installed"],
+            status["jiten_mpv"]["installed"],
+        )
+        return status
 
     def skip_onboarding(self) -> dict[str, Any]:
         self.config.ui.onboarding_completed = True
@@ -3599,10 +4009,16 @@ class WebAppApi:
             rpc_port=max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.rpc_port)))),
             pre_download_command=str(values.get("download_hook", self.config.qbittorrent.pre_download_command)).strip(),
             auto_start=True,
+            seed_mode=str(values.get("aria2_seed_mode", cfg.seed_mode)),
+            seed_ratio=float(values.get("aria2_seed_ratio", cfg.seed_ratio)),
+            seed_time_minutes=float(values.get("aria2_seed_time_minutes", cfg.seed_time_minutes)),
+            upload_limit_kib=int(values.get("aria2_upload_limit_kib", cfg.upload_limit_kib)),
+            vpn_interface=str(values.get("aria2_vpn_interface", cfg.vpn_interface)).strip(),
+            vpn_kill_switch=bool(values.get("aria2_vpn_kill_switch", cfg.vpn_kill_switch)),
         )
         try:
             version = client.version()
-            return {"ok": True, "version": version, "url": client.base_url, "backend": "aria2"}
+            return {"ok": True, "version": version, "url": client.base_url, "backend": "aria2", "network_guard": client.network_guard_status()}
         finally:
             client.close()
 
@@ -3750,7 +4166,9 @@ class WebAppApi:
                 {
                     "episode_state": episode.state,
                     "watched": episode.state == "watched",
-                    "episode": episode.episode,
+                    "episode": episode.media_episode,
+                    "media_episode": episode.media_episode,
+                    "release_episode": episode.release_episode,
                     "media_id": episode.media_id,
                 }
             )
@@ -3763,9 +4181,10 @@ class WebAppApi:
                     result["site_url"] = anime.site_url
                     result["user_score"] = anime.user_score
                     numbered_final = bool(
-                        episode.episode is not None
+                        episode.media_episode is not None
                         and anime.episodes is not None
-                        and episode.episode >= anime.episodes
+                        and int(episode.media_episode) == int(anime.episodes)
+                        and anime.progress >= anime.episodes
                     )
                     single_entry_final = bool(
                         episode.episode is None
@@ -3777,8 +4196,8 @@ class WebAppApi:
                     )
                     result["final_episode"] = numbered_final or single_entry_final
                     rating_episode = (
-                        int(episode.episode)
-                        if episode.episode is not None
+                        int(anime.episodes)
+                        if numbered_final and anime.episodes is not None
                         else (1 if single_entry_final else None)
                     )
                     result["rating_episode"] = rating_episode

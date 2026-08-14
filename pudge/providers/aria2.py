@@ -1,19 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
-from ..manager_models import DownloadItem, NyaaRelease
 from ..branding import APP_SLUG, DATA_DIR
+from ..manager_models import DownloadItem, NyaaRelease
 from .qbittorrent import QBittorrentError
 
 
@@ -28,6 +31,9 @@ class Aria2Client:
     independently running aria2 instance out of pudge's library cleanup.
     """
 
+    _RUNTIME_PROFILE = "v3-low-heat-no-resume-recheck"
+    _SAFE_RPC_TORRENT_BYTES = 1_250_000
+
     def __init__(
         self,
         *,
@@ -38,6 +44,14 @@ class Aria2Client:
         pre_download_command: str = "",
         paused_on_add: bool = False,
         auto_start: bool = True,
+        source_proxy_mode: str = "direct_then_proxy",
+        source_proxy_url: str = "",
+        seed_mode: str = "off",
+        seed_ratio: float = 1.0,
+        seed_time_minutes: float = 120.0,
+        upload_limit_kib: int = 0,
+        vpn_interface: str = "",
+        vpn_kill_switch: bool = False,
         timeout: float = 10.0,
     ) -> None:
         self.enabled = bool(enabled)
@@ -47,6 +61,17 @@ class Aria2Client:
         self.pre_download_command = pre_download_command.strip()
         self.paused_on_add = bool(paused_on_add)
         self.auto_start = bool(auto_start)
+        self.source_proxy_mode = str(source_proxy_mode or "direct_then_proxy").casefold()
+        self.source_proxy_url = str(source_proxy_url or "").strip()
+        normalized_seed_mode = str(seed_mode or "off").strip().casefold()
+        self.seed_mode = normalized_seed_mode if normalized_seed_mode in {
+            "off", "ratio", "ratio_or_time", "unlimited"
+        } else "off"
+        self.seed_ratio = max(0.0, float(seed_ratio))
+        self.seed_time_minutes = max(0.0, float(seed_time_minutes))
+        self.upload_limit_kib = max(0, int(upload_limit_kib))
+        self.vpn_interface = str(vpn_interface or "").strip()
+        self.vpn_kill_switch = bool(vpn_kill_switch)
         self.timeout = timeout
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._secret = self._load_secret()
@@ -97,6 +122,9 @@ class Aria2Client:
     def _metadata_path(self) -> Path:
         return self.state_dir / "metadata.json"
 
+    def _runtime_profile_path(self) -> Path:
+        return self.state_dir / "runtime-profile"
+
     def _load_metadata(self) -> dict[str, dict[str, Any]]:
         try:
             raw = json.loads(self._metadata_path().read_text(encoding="utf-8"))
@@ -136,6 +164,10 @@ class Aria2Client:
             response = self._http.post(self._rpc_url, json=payload)
             response.raise_for_status()
             body = response.json()
+        except httpx.HTTPStatusError as exc:
+            detail = str(exc.response.text or "").strip().replace("\n", " ")[:500]
+            suffix = f"; aria2 response: {detail}" if detail else ""
+            raise Aria2Error(f"aria2 RPC недоступен: {exc}{suffix}") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise Aria2Error(f"aria2 RPC недоступен: {exc}") from exc
         if isinstance(body, dict) and body.get("error"):
@@ -151,9 +183,92 @@ class Aria2Client:
         except Aria2Error:
             return False
 
+    def _interface_names(self) -> set[str]:
+        try:
+            return {str(name) for _index, name in socket.if_nameindex()}
+        except OSError:
+            return set()
+
+    def _validate_network_guard(self) -> None:
+        if self.vpn_kill_switch and not self.vpn_interface:
+            raise Aria2Error(
+                "Kill switch включён, но VPN interface не указан. "
+                "Укажи активный интерфейс VPN (обычно utun…)"
+            )
+        if self.vpn_interface and self.vpn_interface not in self._interface_names():
+            raise Aria2Error(
+                f"VPN interface {self.vpn_interface!r} сейчас недоступен; "
+                "torrent traffic заблокирован"
+            )
+
+    def network_guard_status(self) -> dict[str, Any]:
+        active = bool(self.vpn_interface and self.vpn_interface in self._interface_names())
+        return {
+            "interface": self.vpn_interface,
+            "active": active,
+            "bound": bool(self.vpn_interface),
+            "kill_switch": self.vpn_kill_switch,
+            "protected": bool(self.vpn_interface and active),
+            "seed_mode": self.seed_mode,
+            "upload_limit_kib": self.upload_limit_kib,
+        }
+
+    def _seed_options(self) -> dict[str, str]:
+        if self.seed_mode == "off":
+            return {"seed-time": "0"}
+        if self.seed_mode == "ratio":
+            return {"seed-ratio": str(self.seed_ratio), "seed-time": "5256000"}
+        if self.seed_mode == "ratio_or_time":
+            return {
+                "seed-ratio": str(self.seed_ratio),
+                "seed-time": str(self.seed_time_minutes),
+            }
+        return {"seed-ratio": "0.0", "seed-time": "5256000"}
+
+    def _runtime_options(self) -> dict[str, str]:
+        return {
+            **self._seed_options(),
+            "max-upload-limit": (
+                f"{self.upload_limit_kib}K" if self.upload_limit_kib else "0"
+            ),
+        }
+
+    def _apply_runtime_options(self) -> None:
+        options = self._runtime_options()
+        try:
+            current_global = self._rpc_raw("aria2.getGlobalOption") or {}
+        except Aria2Error:
+            current_global = {}
+        global_delta = {
+            key: value
+            for key, value in options.items()
+            if str(current_global.get(key, "")) != str(value)
+        }
+        if global_delta:
+            try:
+                self._rpc_raw("aria2.changeGlobalOption", [global_delta])
+            except Aria2Error:
+                pass
+
+        # Never rewrite per-download options during ordinary polling. aria2 can
+        # restart an active task when changeOption() touches mutable options, and
+        # a recovery task intentionally needs check-integrity=true until its hash
+        # pass is finished. New downloads already receive the current options at
+        # add time, so global changes are sufficient here.
+
+    def _launch_options(self) -> list[str]:
+        values = ["--no-conf=true"]
+        values.extend(f"--{key}={value}" for key, value in self._seed_options().items())
+        if self.upload_limit_kib:
+            values.append(f"--max-upload-limit={self.upload_limit_kib}K")
+        if self.vpn_interface:
+            values.append(f"--interface={self.vpn_interface}")
+        return values
+
     def _start(self) -> None:
         if not self.enabled:
             raise Aria2Error("Встроенный aria2 backend отключён")
+        self._validate_network_guard()
         binary = self._binary_path()
         session = self.state_dir / "session.txt"
         session.touch(exist_ok=True)
@@ -164,15 +279,19 @@ class Aria2Client:
             "--rpc-listen-all=false",
             f"--rpc-listen-port={self.rpc_port}",
             f"--rpc-secret={self._secret}",
+            "--rpc-max-request-size=16M",
             "--rpc-save-upload-metadata=true",
             "--continue=true",
-            "--check-integrity=true",
+            # BitTorrent verifies every downloaded piece already. Rechecking a
+            # large partial batch on every sidecar restart can keep one CPU core
+            # busy for hours without adding safety.
+            "--check-integrity=false",
             "--auto-file-renaming=false",
             "--max-concurrent-downloads=3",
             "--bt-save-metadata=true",
             "--bt-load-saved-metadata=true",
             "--bt-prioritize-piece=head=16M,tail=4M",
-            "--seed-time=0",
+            *self._launch_options(),
             f"--input-file={session}",
             f"--save-session={session}",
             "--save-session-interval=30",
@@ -195,12 +314,57 @@ class Aria2Client:
         for delay in (0.15, 0.25, 0.4, 0.7, 1.0, 1.5):
             time.sleep(delay)
             if self._probe():
+                self._apply_runtime_options()
+                try:
+                    self._runtime_profile_path().write_text(
+                        self._RUNTIME_PROFILE + "\n", encoding="utf-8"
+                    )
+                except OSError:
+                    pass
                 return
         raise Aria2Error(f"aria2c запущен, но RPC не ответил на порту {self.rpc_port}")
 
     def ensure_running(self) -> None:
         with self._lock:
+            self._validate_network_guard()
             if self._probe():
+                try:
+                    runtime_profile = self._runtime_profile_path().read_text(
+                        encoding="utf-8"
+                    ).strip()
+                except OSError:
+                    runtime_profile = ""
+                if runtime_profile != self._RUNTIME_PROFILE:
+                    # A managed sidecar started by an older Pudge needs the
+                    # larger RPC limit and low-heat resume profile. Save its
+                    # session, stop it cleanly and let aria2 resume every piece.
+                    try:
+                        self._rpc_raw("aria2.saveSession")
+                        self._rpc_raw("aria2.forceShutdown")
+                    except Aria2Error:
+                        pass
+                    for delay in (0.1, 0.2, 0.4, 0.8, 1.2):
+                        time.sleep(delay)
+                        if not self._probe():
+                            break
+                    self._start()
+                    return
+                try:
+                    current = self._rpc_raw("aria2.getGlobalOption")
+                except Aria2Error:
+                    current = None
+                if isinstance(current, dict):
+                    running_interface = str(current.get("interface") or "").strip()
+                    if running_interface != self.vpn_interface:
+                        try:
+                            self._rpc_raw("aria2.saveSession")
+                            self._rpc_raw("aria2.forceShutdown")
+                        except Aria2Error:
+                            pass
+                        time.sleep(0.2)
+                        self._start()
+                        return
+                self._apply_runtime_options()
                 return
             if not self.auto_start:
                 raise Aria2Error("aria2 RPC не запущен")
@@ -222,8 +386,9 @@ class Aria2Client:
         self.ensure_running()
         keys = [
             "gid", "status", "totalLength", "completedLength", "downloadSpeed",
+            "uploadSpeed", "connections", "numSeeders", "seeder",
             "dir", "files", "bittorrent", "infoHash", "errorCode", "errorMessage",
-            "followedBy", "following",
+            "followedBy", "following", "verifiedLength", "verifyIntegrityPending",
         ]
         result: list[dict[str, Any]] = []
         for method, params in (
@@ -250,6 +415,68 @@ class Aria2Client:
             if wanted in {gid.lower(), str(meta.get("info_hash") or "").lower()}:
                 return gid
         return str(torrent_hash or "").strip()
+
+    def _source_proxies(self) -> list[str | None]:
+        mode = self.source_proxy_mode
+        proxy = self.source_proxy_url or None
+        if mode == "proxy_only":
+            attempts = [proxy] if proxy else []
+        elif mode == "proxy_then_direct":
+            attempts = [proxy, None]
+        elif mode == "direct":
+            attempts = [None]
+        else:
+            attempts = [None, proxy]
+        return list(dict.fromkeys(attempts))
+
+    def _torrent_payload(self, url: str) -> bytes | None:
+        source = str(url or "").strip()
+        if not source.casefold().startswith(("http://", "https://")):
+            return None
+        for proxy in self._source_proxies():
+            try:
+                with httpx.Client(
+                    timeout=min(float(self.timeout), 8.0),
+                    follow_redirects=True,
+                    proxy=proxy,
+                    headers={"User-Agent": APP_SLUG},
+                ) as client:
+                    response = client.get(source)
+                    response.raise_for_status()
+                    payload = bytes(response.content)
+            except (ImportError, httpx.HTTPError, ValueError):
+                continue
+            # A bencoded torrent is a dictionary. Refuse HTML/error pages and
+            # unexpectedly large responses before sending anything to aria2.
+            if 0 < len(payload) <= 10 * 1024 * 1024 and payload.startswith(b"d"):
+                return payload
+        return None
+
+    def _add_source(
+        self,
+        release: NyaaRelease,
+        options: dict[str, str],
+        *,
+        torrent_payload: bytes | None = None,
+    ) -> str:
+        payload = torrent_payload
+        if payload is None:
+            payload = self._torrent_payload(release.torrent_url)
+        if payload and len(payload) <= self._SAFE_RPC_TORRENT_BYTES:
+            encoded = base64.b64encode(payload).decode("ascii")
+            try:
+                returned = self._rpc_raw("aria2.addTorrent", [encoded, [], options])
+                return str(returned or options["gid"])
+            except Aria2Error as exc:
+                if "GID" in str(exc).upper() or "duplicate" in str(exc).lower():
+                    raise
+                # If the source host was reachable but aria2 rejected the file,
+                # retain the old magnet path as a safe compatibility fallback.
+        source = str(release.magnet or release.torrent_url or "").strip()
+        if not source:
+            raise Aria2Error("Релиз не содержит ни magnet-ссылки, ни torrent URL")
+        returned = self._rpc_raw("aria2.addUri", [[source], options])
+        return str(returned or options["gid"])
 
     def add_release(
         self,
@@ -281,10 +508,11 @@ class Aria2Client:
             "gid": gid,
             "bt-save-metadata": "true",
             "bt-load-saved-metadata": "true",
-            "seed-time": "0",
+            "check-integrity": "false",
+            **self._seed_options(),
         }
         try:
-            returned_gid = str(self._rpc_raw("aria2.addUri", [[release.magnet], options]) or gid)
+            returned_gid = self._add_source(release, options)
         except Aria2Error as exc:
             if "GID" not in str(exc).upper() and "duplicate" not in str(exc).lower():
                 raise
@@ -324,6 +552,10 @@ class Aria2Client:
             "is_batch": bool(is_batch),
             "anime_title": anime_title,
             "release_score": float(score),
+            "source_url": str(release.torrent_url or release.link or ""),
+            "magnet": str(release.magnet or ""),
+            "listed_seeders": max(0, int(release.seeders or 0)),
+            "listed_leechers": max(0, int(release.leechers or 0)),
             "added_on": int(time.time()),
             "completed_on": 0,
         }
@@ -331,11 +563,226 @@ class Aria2Client:
 
     def start(self, torrent_hash: str) -> None:
         self.ensure_running()
-        self._rpc_raw("aria2.unpause", [self._resolve_gid(torrent_hash)])
+        gid = self._resolve_gid(torrent_hash)
+        status = self._rpc_raw("aria2.tellStatus", [gid, ["status"]]) or {}
+        if str(status.get("status") or "").casefold() != "paused":
+            return
+        self._rpc_raw("aria2.unpause", [gid])
 
     def pause(self, torrent_hash: str) -> None:
         self.ensure_running()
-        self._rpc_raw("aria2.pause", [self._resolve_gid(torrent_hash)])
+        gid = self._resolve_gid(torrent_hash)
+        status = self._rpc_raw("aria2.tellStatus", [gid, ["status"]]) or {}
+        if str(status.get("status") or "").casefold() not in {"active", "waiting"}:
+            return
+        self._rpc_raw("aria2.pause", [gid])
+
+    @staticmethod
+    def _missing_control_file_error(status: dict[str, Any]) -> bool:
+        return bool(
+            str(status.get("errorCode") or "") == "13"
+            and ".aria2" in str(status.get("errorMessage") or "").casefold()
+        )
+
+    def _recover_missing_control_file(
+        self,
+        gid: str,
+        status: dict[str, Any],
+        *,
+        torrent_payload: bytes | None = None,
+    ) -> bool:
+        """Rebuild BitTorrent piece state after a lost ``*.aria2`` file.
+
+        ``allow-overwrite`` is deliberately never used: aria2 documents that it
+        starts from scratch. A torrent hash-check can reconstruct the piece map
+        safely from the existing files instead.
+        """
+
+        if not self._missing_control_file_error(status):
+            return False
+        metadata = self._load_metadata()
+        meta = dict(metadata.get(gid) or {})
+        if not meta:
+            return False
+        payload = torrent_payload
+        if payload is None:
+            payload = self._torrent_payload(str(meta.get("source_url") or ""))
+        magnet = str(meta.get("magnet") or "").strip()
+        if not magnet:
+            # Older Pudge metadata predates the persisted magnet field. The
+            # BitTorrent info hash is sufficient to ask DHT/trackers for the
+            # torrent metadata again, after which check-integrity reconstructs
+            # the piece map from the existing files.
+            info_hash = str(meta.get("info_hash") or "").strip()
+            if (
+                len(info_hash) in {32, 40}
+                and info_hash.isalnum()
+            ):
+                title = str(meta.get("title") or "").strip()
+                magnet = f"magnet:?xt=urn:btih:{info_hash}"
+                if title:
+                    magnet += f"&dn={quote(title)}"
+        if not payload and not magnet:
+            return False
+
+        options = {
+            "dir": str(meta.get("save_path") or status.get("dir") or self.state_dir),
+            "pause": "false",
+            "gid": gid,
+            "bt-save-metadata": "true",
+            "bt-load-saved-metadata": "true",
+            "check-integrity": "true",
+            **self._seed_options(),
+        }
+        try:
+            self._rpc_raw("aria2.removeDownloadResult", [gid])
+        except Aria2Error:
+            try:
+                self._rpc_raw("aria2.forceRemove", [gid])
+            except Aria2Error:
+                pass
+            try:
+                self._rpc_raw("aria2.removeDownloadResult", [gid])
+            except Aria2Error:
+                pass
+
+        if payload:
+            encoded = base64.b64encode(payload).decode("ascii")
+            returned_gid = str(
+                self._rpc_raw("aria2.addTorrent", [encoded, [], options]) or gid
+            )
+        else:
+            returned_gid = str(
+                self._rpc_raw("aria2.addUri", [[magnet], options]) or gid
+            )
+        metadata.pop(gid, None)
+        meta["recovery_started_at"] = int(time.time())
+        metadata[returned_gid] = meta
+        self._save_metadata(metadata)
+        try:
+            self._rpc_raw("aria2.saveSession")
+        except Aria2Error:
+            pass
+        return True
+
+    def reconnect(self, torrent_hash: str) -> bool:
+        """Reannounce a stall or safely reconstruct a lost BitTorrent control file."""
+
+        self.ensure_running()
+        gid = self._resolve_gid(torrent_hash)
+        status = self._rpc_raw(
+            "aria2.tellStatus",
+            [
+                gid,
+                [
+                    "status",
+                    "totalLength",
+                    "completedLength",
+                    "errorCode",
+                    "errorMessage",
+                    "dir",
+                ],
+            ],
+        ) or {}
+        state = str(status.get("status") or "").casefold()
+        if state == "error":
+            return self._recover_missing_control_file(gid, status)
+        if state in {"complete", "removed"}:
+            return False
+        if state in {"active", "waiting"}:
+            # aria2 has no force-reannounce RPC. A force-pause/unpause cycle is
+            # its safe equivalent and preserves the .aria2 control file and all
+            # verified pieces.
+            self._rpc_raw("aria2.forcePause", [gid])
+        last_error: Aria2Error | None = None
+        for delay in (0.0, 0.05, 0.15):
+            if delay:
+                time.sleep(delay)
+            try:
+                self._rpc_raw("aria2.unpause", [gid])
+                return True
+            except Aria2Error as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        return False
+
+    def repair_stalled_release(self, torrent_hash: str, release: NyaaRelease) -> bool:
+        """Replace a metadata-only magnet with Nyaa's tracker-rich torrent."""
+
+        payload = self._torrent_payload(release.torrent_url)
+        if not payload:
+            return False
+        self.ensure_running()
+        gid = self._resolve_gid(torrent_hash)
+        status = self._rpc_raw(
+            "aria2.tellStatus",
+            [
+                gid,
+                [
+                    "status",
+                    "totalLength",
+                    "completedLength",
+                    "files",
+                    "errorCode",
+                    "errorMessage",
+                    "dir",
+                ],
+            ],
+        ) or {}
+        if self._missing_control_file_error(status):
+            return self._recover_missing_control_file(
+                gid, status, torrent_payload=payload
+            )
+        files = status.get("files") if isinstance(status.get("files"), list) else []
+        has_data = any(
+            int(entry.get("length") or 0) > 0
+            for entry in files
+            if isinstance(entry, dict)
+        )
+        if (
+            str(status.get("status") or "").casefold() not in {"active", "waiting", "paused"}
+            or int(status.get("totalLength") or 0) > 0
+            or int(status.get("completedLength") or 0) > 0
+            or has_data
+        ):
+            return False
+
+        metadata = self._load_metadata()
+        meta = dict(metadata.get(gid) or {})
+        options = {
+            "dir": str(meta.get("save_path") or self.state_dir),
+            "pause": (
+                "true"
+                if str(status.get("status") or "").casefold() == "paused"
+                else "false"
+            ),
+            "gid": gid,
+            "bt-save-metadata": "true",
+            "bt-load-saved-metadata": "true",
+            "check-integrity": "false",
+            **self._seed_options(),
+        }
+        self._rpc_raw("aria2.forceRemove", [gid])
+        try:
+            self._rpc_raw("aria2.removeDownloadResult", [gid])
+        except Aria2Error:
+            pass
+        returned_gid = self._add_source(release, options, torrent_payload=payload)
+        metadata.pop(gid, None)
+        meta.update(
+            {
+                "info_hash": str(release.info_hash or meta.get("info_hash") or "").lower(),
+                "title": release.title or str(meta.get("title") or ""),
+                "source_url": str(release.torrent_url or release.link or ""),
+                "magnet": str(release.magnet or meta.get("magnet") or ""),
+                "listed_seeders": max(0, int(release.seeders or 0)),
+                "listed_leechers": max(0, int(release.leechers or 0)),
+            }
+        )
+        metadata[returned_gid] = meta
+        self._save_metadata(metadata)
+        return True
 
     @staticmethod
     def _content_path(item: dict[str, Any], meta: dict[str, Any]) -> str:
@@ -384,7 +831,51 @@ class Aria2Client:
             completed = int(item.get("completedLength") or 0)
             progress = (completed / total) if total > 0 else 0.0
             status = str(item.get("status") or "unknown")
-            if status == "complete" and not int(meta.get("completed_on") or 0):
+            verified = max(0, int(item.get("verifiedLength") or 0))
+            verifying = (
+                str(item.get("verifyIntegrityPending") or "false").casefold() == "true"
+                or (
+                    status in {"active", "waiting"}
+                    and total > 0
+                    and completed >= total
+                    and 0 < verified < total
+                )
+            )
+            # Downloads created by older Pudge builds may still carry a long
+            # per-task seed-time even after the user switched seeding off. Do
+            # not changeOption() here: aria2 restarts active downloads for most
+            # option changes. Once all pieces are present, pausing the seeder is
+            # enough to guarantee zero torrent upload without touching files.
+            legacy_seeding_stopped = False
+            if (
+                self.seed_mode == "off"
+                and status == "active"
+                and total > 0
+                and completed >= total
+                and not verifying
+            ):
+                try:
+                    self._rpc_raw("aria2.forcePause", [gid])
+                    status = "paused"
+                    legacy_seeding_stopped = True
+                except Aria2Error:
+                    pass
+
+            completed_without_seeding = bool(
+                self.seed_mode == "off"
+                and status == "paused"
+                and total > 0
+                and completed >= total
+                and not verifying
+            )
+            public_status = (
+                "verifying"
+                if verifying and status in {"active", "waiting"}
+                else "complete"
+                if completed_without_seeding
+                else status
+            )
+            if public_status == "complete" and not int(meta.get("completed_on") or 0):
                 meta["completed_on"] = int(time.time())
                 metadata[gid] = meta
                 changed = True
@@ -394,9 +885,25 @@ class Aria2Client:
                 "backend": "aria2",
                 "gid": gid,
                 "infohash_v1": info_hash,
+                "total_size": total,
+                "downloaded": completed,
                 "download_speed": int(item.get("downloadSpeed") or 0),
+                "upload_speed": int(item.get("uploadSpeed") or 0),
+                "num_seeders": int(item.get("numSeeders") or 0),
+                "num_connections": int(item.get("connections") or 0),
+                "listed_seeders": max(0, int(meta.get("listed_seeders") or 0)),
+                "listed_leechers": max(0, int(meta.get("listed_leechers") or 0)),
+                "seeder": str(item.get("seeder") or "false").casefold() == "true",
                 "error_code": str(item.get("errorCode") or ""),
                 "error_message": str(item.get("errorMessage") or ""),
+                "recoverable_missing_control": self._missing_control_file_error(item),
+                "legacy_seeding_stopped": legacy_seeding_stopped,
+                "aria2_status": status,
+                "verifying": verifying,
+                "verified": verified,
+                "verification_progress": (
+                    max(0.0, min(1.0, verified / total)) if total > 0 else 0.0
+                ),
                 "_media_id_source": "aria2_metadata",
                 "_release_score_tag": float(meta.get("release_score") or 0.0),
                 "_anime_title_tag": str(meta.get("anime_title") or ""),
@@ -405,7 +912,7 @@ class Aria2Client:
                 DownloadItem(
                     torrent_hash=public_hash,
                     name=str((((item.get("bittorrent") or {}).get("info") or {}).get("name")) or meta.get("title") or public_hash),
-                    state=status,
+                    state=public_status,
                     progress=max(0.0, min(1.0, progress)),
                     save_path=str(item.get("dir") or meta.get("save_path") or ""),
                     content_path=self._content_path(item, meta),

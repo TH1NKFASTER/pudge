@@ -30,9 +30,10 @@ def test_v0673_ln_reader_width_state_and_position_frontend() -> None:
     assert "function lnRubyReading" in html
     assert "State: ${escapeHtml(states)}" not in html
     assert "Number(book.current_offset||0)" in html
-    assert "function saveLnReaderPositionNow" in html
+    assert "function saveLnBookmark" in html
+    assert "function scheduleLnAutoBookmark" in html
     assert "function restoreLnReaderOffset" in html
-    assert "await saveLnReaderPositionNow();stopLnParsePoll()" in html
+    assert "cancelLnAutoBookmark();stopLnParsePoll()" in html
 
 
 def test_v0673_reader_width_accepts_wide_displays(tmp_path: Path) -> None:

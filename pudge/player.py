@@ -33,7 +33,9 @@ def build_mpv_command(
         command.append("--secondary-sub-visibility=no")
     if ipc_socket is not None and not any(arg.startswith("--input-ipc-server=") for arg in extra_args):
         command.append(f"--input-ipc-server={ipc_socket}")
-    if script is not None and not any(arg.startswith("--script=") for arg in extra_args):
+    if script is not None and f"--script={script}" not in extra_args:
+        # Other explicitly selected scripts (for example JitenMPV) must not
+        # suppress Pudge's playback/tracking script.
         command.append(f"--script={script}")
     if subtitle is not None:
         command.append(f"--sub-file={subtitle}")

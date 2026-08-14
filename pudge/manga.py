@@ -16,6 +16,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 from PIL import Image
 
 from .database import Database
@@ -221,6 +222,8 @@ class MangaService:
         self.python = str(python or python_executable())
         self._ocr_lock = threading.Lock()
         self._ocr_available_cache: tuple[float, bool] | None = None
+        self._cover_cache_lock = threading.Lock()
+        self._cover_cache_inflight: set[str] = set()
 
     def invalidate_ocr_availability(self) -> None:
         self._ocr_available_cache = None
@@ -422,12 +425,64 @@ class MangaService:
         except (OSError, ValueError, zipfile.BadZipFile):
             return ""
 
+    def _remote_cover_target(self, url: str) -> Path:
+        digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:24]
+        return self.cache_dir / "manga-covers" / f"anilist-{digest}.jpg"
+
+    @staticmethod
+    def _cover_data_uri(path: Path) -> str:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return ""
+        if not data:
+            return ""
+        return f"data:image/jpeg;base64,{base64.b64encode(data).decode('ascii')}"
+
+    def _cache_remote_cover(self, url: str) -> None:
+        target = self._remote_cover_target(url)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            response = httpx.get(str(url), timeout=15, follow_redirects=True)
+            response.raise_for_status()
+            image = Image.open(io.BytesIO(response.content)).convert("RGB")
+            image.thumbnail((480, 720))
+            temporary = target.with_suffix(".tmp.jpg")
+            image.save(temporary, format="JPEG", quality=86, optimize=True)
+            temporary.replace(target)
+        except (OSError, ValueError, httpx.HTTPError):
+            pass
+        finally:
+            with self._cover_cache_lock:
+                self._cover_cache_inflight.discard(str(url))
+
+    def _cached_remote_cover_data_uri(self, url: str) -> str:
+        if not url:
+            return ""
+        target = self._remote_cover_target(url)
+        cached = self._cover_data_uri(target)
+        if cached:
+            return cached
+        with self._cover_cache_lock:
+            if url in self._cover_cache_inflight:
+                return ""
+            self._cover_cache_inflight.add(url)
+        threading.Thread(
+            target=self._cache_remote_cover,
+            args=(url,),
+            name="manga-cover-cache",
+            daemon=True,
+        ).start()
+        return ""
+
     def _payload(self, row: Any) -> dict[str, Any]:
         remote_cover = str(row["cover_url"] or "")
         title = str(row["title"] or "")
         path = str(row["path"] or "")
         metadata_source = f"{title} {Path(path).stem}"
         series_title = _manga_series_title(title or Path(path).stem) or title or Path(path).stem
+        cached_remote = self._cached_remote_cover_data_uri(remote_cover)
+        local_cover = self._local_cover_data_uri(row)
         return {
             "id": int(row["id"]),
             "path": path,
@@ -441,8 +496,9 @@ class MangaService:
             "anilist_id": int(row["anilist_id"]) if row["anilist_id"] is not None else None,
             "site_url": str(row["site_url"] or ""),
             "user_score": float(row["user_score"]) if row["user_score"] is not None else None,
-            "cover_url": remote_cover or self._local_cover_data_uri(row),
-            "cover_source": "anilist" if remote_cover else "first_page",
+            "cover_url": cached_remote or local_cover,
+            "remote_cover_url": remote_cover,
+            "cover_source": "anilist_cache" if cached_remote else "first_page",
             "updated_at": float(row["updated_at"] or 0),
         }
 

@@ -223,12 +223,17 @@ def launch_settings(config_path: Path) -> int:
     entry_row(jimaku_tab, 3, "AniList GraphQL URL", anilist_url_var)
     ttk.Separator(jimaku_tab).grid(row=4, column=0, columnspan=3, sticky="ew", pady=10)
     entry_row(jimaku_tab, 5, "AniList client ID", anilist_client_id_var)
+    ttk.Button(
+        jimaku_tab,
+        text="Создать Client ID",
+        command=lambda: webbrowser.open("https://anilist.co/settings/developer"),
+    ).grid(row=5, column=2, padx=(8, 0))
     entry_row(jimaku_tab, 6, "AniList access token", anilist_token_var, show="•")
 
     def open_anilist_auth() -> None:
         client_id = anilist_client_id_var.get().strip()
-        if not client_id:
-            messagebox.showerror("AniList", "Сначала укажите client ID приложения AniList")
+        if not client_id.isdigit():
+            messagebox.showerror("AniList", "Сначала укажите числовой Client ID приложения AniList")
             return
         query = urllib.parse.urlencode({"client_id": client_id, "response_type": "token"})
         webbrowser.open(f"https://anilist.co/api/v2/oauth/authorize?{query}")
@@ -267,6 +272,15 @@ def launch_settings(config_path: Path) -> int:
     ttk.Label(jimaku_tab, textvariable=anilist_status_var, foreground="#666666", wraplength=650).grid(
         row=8, column=0, columnspan=3, sticky="w", pady=(0, 8)
     )
+
+    def update_anilist_token_step(*_args) -> None:
+        ready = anilist_client_id_var.get().strip().isdigit()
+        for widget in jimaku_tab.grid_slaves(row=6):
+            (widget.grid if ready else widget.grid_remove)()
+        (auth_buttons.grid if ready else auth_buttons.grid_remove)()
+
+    anilist_client_id_var.trace_add("write", update_anilist_token_step)
+    update_anilist_token_step()
     ttk.Checkbutton(
         jimaku_tab,
         text="Автоматически засчитывать просмотренную серию в AniList",

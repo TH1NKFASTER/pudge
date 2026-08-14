@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 
@@ -46,11 +47,13 @@ LEGACY_AGENT_CLIS = _legacy_values("APP_LEGACY_AGENT_CLIS")
 APP_BUNDLE_NAME = f"{APP_NAME}.app"
 APP_EXECUTABLE_NAME = APP_NAME
 
-CONFIG_DIR = Path.home() / ".config" / APP_SLUG
-CACHE_DIR = Path.home() / "Library" / "Caches" / APP_SLUG
-DATA_DIR = Path.home() / ".local" / "share" / APP_SLUG
-LOG_DIR = Path.home() / "Library" / "Logs"
-DEFAULT_LIBRARY_DIR = Path.home() / "Movies" / APP_NAME
+_HOME_OVERRIDE = os.getenv(f"{APP_ENV_PREFIX}_HOME", "").strip()
+APP_HOME = Path(_HOME_OVERRIDE).expanduser() if _HOME_OVERRIDE else Path.home()
+CONFIG_DIR = APP_HOME / ".config" / APP_SLUG
+CACHE_DIR = APP_HOME / "Library" / "Caches" / APP_SLUG
+DATA_DIR = APP_HOME / ".local" / "share" / APP_SLUG
+LOG_DIR = APP_HOME / "Library" / "Logs"
+DEFAULT_LIBRARY_DIR = APP_HOME / "Movies" / APP_NAME
 DEFAULT_DATABASE_PATH = DATA_DIR / "library.sqlite3"
 DEFAULT_ENERGY_LOG_PATH = LOG_DIR / f"{APP_SLUG}-energy.jsonl"
 DEFAULT_RUNTIME_LOG_PATH = LOG_DIR / f"{APP_SLUG}-runtime.log"

@@ -187,9 +187,10 @@ def test_ln_cards_and_settings_match_v0672_ui() -> None:
     assert "await pywebview.api.open_url(target.dataset.lnAnilistUrl)" in html
 
     assert 'data-ln-action="nyaa"' not in html
-    assert 'id="lnAutoNyaa"' in html
+    assert 'id="lnAutoNyaa"' not in html
+    assert "Run auto Nyaa" not in html
     assert 'id="s_ln_auto_download"' in html
-    assert 'id="s_ln_nyaa_category"' in html
+    assert 'id="s_ln_nyaa_category"' not in html
 
     settings_block = html.split('<input id="s_anilist_enabled"', 1)[1].split(
         '<div class="setting-block"><h3>${t(\'settings.lightNovels\')}</h3>', 1

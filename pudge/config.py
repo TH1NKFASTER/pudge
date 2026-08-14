@@ -114,6 +114,12 @@ class Aria2Config:
     rpc_port: int = 6801
     auto_start: bool = True
     paused_on_add: bool = False
+    seed_mode: str = "off"
+    seed_ratio: float = 1.0
+    seed_time_minutes: float = 120.0
+    upload_limit_kib: int = 0
+    vpn_interface: str = ""
+    vpn_kill_switch: bool = False
 
 
 @dataclass(slots=True)
@@ -144,6 +150,7 @@ class ShortcutsConfig:
     mpv_mark_watched: str = "Ctrl+a"
     mpv_open_anilist: str = "Ctrl+b"
     mpv_correct_match: str = "c"
+    mpv_translate_subtitle: str = "Ctrl+t"
 
 
 @dataclass(slots=True)
@@ -159,6 +166,10 @@ class ToolsConfig:
     ffprobe: str = "ffprobe"
     alass: str = "alass"
     mpv_extra_args: list[str] = field(default_factory=list)
+    # Only one interactive subtitle integration is loaded for Pudge playback.
+    # ``auto`` keeps existing installs working by choosing the first available
+    # integration without enabling an unconfigured plugin.
+    mpv_study_plugin: str = "auto"
 
 
 @dataclass(slots=True)
@@ -437,6 +448,12 @@ def load_config(path: Path | None = None) -> AppConfig:
             rpc_port=max(1024, min(65535, int(aria2.get("rpc_port", 6801)))),
             auto_start=bool(aria2.get("auto_start", True)),
             paused_on_add=bool(aria2.get("paused_on_add", False)),
+            seed_mode=str(aria2.get("seed_mode", "off")).strip().casefold(),
+            seed_ratio=max(0.0, float(aria2.get("seed_ratio", 1.0))),
+            seed_time_minutes=max(0.0, float(aria2.get("seed_time_minutes", 120.0))),
+            upload_limit_kib=max(0, int(aria2.get("upload_limit_kib", 0))),
+            vpn_interface=str(aria2.get("vpn_interface", "")).strip(),
+            vpn_kill_switch=bool(aria2.get("vpn_kill_switch", False)),
         ),
         agent=AgentConfig(
             enabled=bool(agent.get("enabled", True)),
@@ -459,6 +476,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             mpv_mark_watched=str(shortcuts.get("mpv_mark_watched", "Ctrl+a")).strip(),
             mpv_open_anilist=str(shortcuts.get("mpv_open_anilist", "Ctrl+b")).strip(),
             mpv_correct_match=str(shortcuts.get("mpv_correct_match", "c")).strip(),
+            mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
         ),
         diagnostics=DiagnosticsConfig(
             energy_monitoring_enabled=bool(diagnostics.get("energy_monitoring_enabled", False)),
@@ -470,6 +488,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             ffprobe=str(tools.get("ffprobe", "ffprobe")),
             alass=str(tools.get("alass", "alass")),
             mpv_extra_args=[str(x) for x in tools.get("mpv_extra_args", [])],
+            mpv_study_plugin=str(tools.get("mpv_study_plugin", "auto")).strip().casefold(),
         ),
         jimaku=JimakuConfig(
             api_key=os.getenv("JIMAKU_API_KEY", str(jimaku.get("api_key", ""))).strip(),
@@ -659,6 +678,12 @@ binary = {_toml_string(config.aria2.binary)}
 rpc_port = {config.aria2.rpc_port}
 auto_start = {_toml_bool(config.aria2.auto_start)}
 paused_on_add = {_toml_bool(config.aria2.paused_on_add)}
+seed_mode = {_toml_string(config.aria2.seed_mode)}
+seed_ratio = {config.aria2.seed_ratio}
+seed_time_minutes = {config.aria2.seed_time_minutes}
+upload_limit_kib = {config.aria2.upload_limit_kib}
+vpn_interface = {_toml_string(config.aria2.vpn_interface)}
+vpn_kill_switch = {_toml_bool(config.aria2.vpn_kill_switch)}
 
 [agent]
 enabled = {_toml_bool(config.agent.enabled)}
@@ -678,6 +703,7 @@ save_interval_seconds = {config.playback.save_interval_seconds}
 mpv_mark_watched = {_toml_string(config.shortcuts.mpv_mark_watched)}
 mpv_open_anilist = {_toml_string(config.shortcuts.mpv_open_anilist)}
 mpv_correct_match = {_toml_string(config.shortcuts.mpv_correct_match)}
+mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 
 [diagnostics]
 energy_monitoring_enabled = {_toml_bool(config.diagnostics.energy_monitoring_enabled)}
@@ -689,6 +715,7 @@ ffmpeg = {_toml_string(config.tools.ffmpeg)}
 ffprobe = {_toml_string(config.tools.ffprobe)}
 alass = {_toml_string(config.tools.alass)}
 mpv_extra_args = {_toml_string_list(config.tools.mpv_extra_args)}
+mpv_study_plugin = {_toml_string(config.tools.mpv_study_plugin)}
 
 [jimaku]
 api_key = {_toml_string(persisted_jimaku_api_key(config.jimaku))}

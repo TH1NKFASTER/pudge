@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     media_id INTEGER,
     title TEXT NOT NULL,
     episode INTEGER,
+    media_episode INTEGER,
+    release_episode INTEGER,
     video_path TEXT NOT NULL UNIQUE,
     subtitle_path TEXT,
     embedded_subtitle_id INTEGER,
@@ -76,6 +78,8 @@ CREATE TABLE IF NOT EXISTS downloads (
     content_path TEXT NOT NULL DEFAULT '',
     media_id INTEGER,
     episode INTEGER,
+    media_episode INTEGER,
+    release_episode INTEGER,
     is_batch INTEGER NOT NULL DEFAULT 0,
     added_on INTEGER NOT NULL DEFAULT 0,
     completed_on INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +142,8 @@ CREATE TABLE IF NOT EXISTS release_history (
     info_hash TEXT PRIMARY KEY,
     media_id INTEGER,
     episode INTEGER,
+    media_episode INTEGER,
+    release_episode INTEGER,
     title TEXT NOT NULL,
     score REAL NOT NULL DEFAULT 0,
     selected_at REAL NOT NULL,
@@ -423,7 +429,7 @@ CREATE TABLE IF NOT EXISTS media_identities (
 );
 """
 
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
 
 
 class Database:
@@ -449,6 +455,9 @@ class Database:
             conn.execute("PRAGMA user_version=3")
         if version < 4:
             self._migrate_v4(conn)
+            conn.execute("PRAGMA user_version=4")
+        if version < 5:
+            self._migrate_v5(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -651,6 +660,55 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                 (key, value, time.time()),
             )
+
+    def _migrate_v5(self, conn: sqlite3.Connection) -> None:
+        """Separate AniList-local progress from release filename numbering."""
+        for table in ("episodes", "downloads", "release_history"):
+            self._ensure_column(conn, table, "media_episode", "INTEGER")
+            self._ensure_column(conn, table, "release_episode", "INTEGER")
+            conn.execute(
+                f"UPDATE {table} SET media_episode=episode "
+                "WHERE media_episode IS NULL AND episode IS NOT NULL"
+            )
+            conn.execute(
+                f"UPDATE {table} SET release_episode=episode "
+                "WHERE release_episode IS NULL AND episode IS NOT NULL"
+            )
+        # Managed single-episode torrents already carried the season-local
+        # request in downloads. Use that durable link to repair episode rows
+        # written by versions that stored an absolute filename number there.
+        conn.execute(
+            """
+            UPDATE episodes
+            SET media_episode=(
+                    SELECT COALESCE(downloads.media_episode,downloads.episode)
+                    FROM downloads
+                    WHERE downloads.torrent_hash=episodes.torrent_hash
+                      AND downloads.media_id=episodes.media_id
+                ),
+                episode=(
+                    SELECT COALESCE(downloads.media_episode,downloads.episode)
+                    FROM downloads
+                    WHERE downloads.torrent_hash=episodes.torrent_hash
+                      AND downloads.media_id=episodes.media_id
+                )
+            WHERE torrent_hash!=''
+              AND EXISTS(
+                    SELECT 1 FROM downloads
+                    WHERE downloads.torrent_hash=episodes.torrent_hash
+                      AND downloads.media_id=episodes.media_id
+                      AND COALESCE(downloads.media_episode,downloads.episode) IS NOT NULL
+                )
+            """
+        )
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_episodes_media_identity
+            ON episodes(media_id,media_episode);
+            CREATE INDEX IF NOT EXISTS idx_episodes_release_identity
+            ON episodes(media_id,release_episode);
+            """
+        )
 
     def get_state(self, key: str, default: str = "") -> str:
         with self.connect() as conn:
@@ -979,12 +1037,15 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO episodes(
-                    media_id,title,episode,video_path,subtitle_path,embedded_subtitle_id,subtitle_origin,state,torrent_hash,
+                    media_id,title,episode,media_episode,release_episode,video_path,subtitle_path,embedded_subtitle_id,subtitle_origin,state,torrent_hash,
                     downloaded_at,watched_at,delete_after,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,episodes.media_id),
-                    title=excluded.title,episode=COALESCE(excluded.episode,episodes.episode),
+                    title=excluded.title,
+                    episode=COALESCE(excluded.media_episode,episodes.episode),
+                    media_episode=COALESCE(excluded.media_episode,episodes.media_episode,episodes.episode),
+                    release_episode=COALESCE(excluded.release_episode,episodes.release_episode),
                     subtitle_path=CASE
                         WHEN excluded.subtitle_path IS NOT NULL THEN excluded.subtitle_path
                         WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
@@ -1013,7 +1074,9 @@ class Database:
                 (
                     episode.media_id,
                     episode.title,
-                    episode.episode,
+                    episode.media_episode,
+                    episode.media_episode,
+                    episode.release_episode,
                     str(episode.video_path),
                     str(episode.subtitle_path) if episode.subtitle_path else None,
                     episode.embedded_subtitle_id,
@@ -1067,7 +1130,7 @@ class Database:
         if media_id is not None:
             sql += " WHERE media_id=?"
             params = (media_id,)
-        sql += " ORDER BY title COLLATE NOCASE, episode, video_path"
+        sql += " ORDER BY title COLLATE NOCASE, COALESCE(media_episode,episode), video_path"
         with self.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._episode_from_row(row) for row in rows]
@@ -1083,9 +1146,9 @@ class Database:
         sql = "SELECT * FROM episodes WHERE media_id=? AND state IN ('ready','local','watched','waiting_subtitles','waiting_text_subtitles')"
         params: list[object] = [media_id]
         if episode is not None:
-            sql += " AND episode=?"
+            sql += " AND COALESCE(media_episode,episode)=?"
             params.append(episode)
-        sql += " ORDER BY CASE WHEN episode IS NULL THEN 1 ELSE 0 END, episode LIMIT 1"
+        sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode) IS NULL THEN 1 ELSE 0 END, COALESCE(media_episode,episode) LIMIT 1"
         with self.connect() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
         return self._episode_from_row(row) if row else None
@@ -1095,7 +1158,27 @@ class Database:
         return LibraryEpisode(
             media_id=int(row["media_id"]) if row["media_id"] is not None else None,
             title=str(row["title"]),
-            episode=int(row["episode"]) if row["episode"] is not None else None,
+            episode=(
+                int(row["media_episode"])
+                if "media_episode" in row.keys() and row["media_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
+            media_episode=(
+                int(row["media_episode"])
+                if "media_episode" in row.keys() and row["media_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
+            release_episode=(
+                int(row["release_episode"])
+                if "release_episode" in row.keys() and row["release_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
             video_path=Path(str(row["video_path"])),
             subtitle_path=Path(str(row["subtitle_path"])) if row["subtitle_path"] else None,
             embedded_subtitle_id=(
@@ -1226,13 +1309,13 @@ class Database:
     def has_episode(self, media_id: int, episode: int) -> bool:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM episodes WHERE media_id=? AND episode=? LIMIT 1",
+                "SELECT 1 FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? LIMIT 1",
                 (media_id, episode),
             ).fetchone()
             if row:
                 return True
             row = conn.execute(
-                "SELECT 1 FROM downloads WHERE media_id=? AND episode=? AND state NOT IN ('error','missing') LIMIT 1",
+                "SELECT 1 FROM downloads WHERE media_id=? AND COALESCE(media_episode,episode)=? AND state NOT IN ('error','missing') LIMIT 1",
                 (media_id, episode),
             ).fetchone()
         return bool(row)
@@ -1778,14 +1861,16 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO downloads(
-                    torrent_hash,name,state,progress,save_path,content_path,media_id,episode,
+                    torrent_hash,name,state,progress,save_path,content_path,media_id,episode,media_episode,release_episode,
                     is_batch,added_on,completed_on,raw_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(torrent_hash) DO UPDATE SET
                     name=excluded.name,state=excluded.state,progress=excluded.progress,
                     save_path=excluded.save_path,content_path=excluded.content_path,
                     media_id=COALESCE(downloads.media_id,excluded.media_id),
-                    episode=COALESCE(downloads.episode,excluded.episode),
+                    episode=COALESCE(downloads.media_episode,excluded.media_episode,downloads.episode,excluded.episode),
+                    media_episode=COALESCE(downloads.media_episode,excluded.media_episode,downloads.episode,excluded.episode),
+                    release_episode=COALESCE(downloads.release_episode,excluded.release_episode),
                     is_batch=MAX(downloads.is_batch,excluded.is_batch),added_on=excluded.added_on,
                     completed_on=excluded.completed_on,raw_json=excluded.raw_json,
                     updated_at=excluded.updated_at
@@ -1798,7 +1883,9 @@ class Database:
                     item.save_path,
                     item.content_path,
                     item.media_id,
-                    item.episode,
+                    item.media_episode,
+                    item.media_episode,
+                    item.release_episode,
                     1 if item.is_batch else 0,
                     item.added_on,
                     item.completed_on,
@@ -1821,7 +1908,9 @@ class Database:
                     save_path=str(row["save_path"]),
                     content_path=str(row["content_path"]),
                     media_id=int(row["media_id"]) if row["media_id"] is not None else None,
-                    episode=int(row["episode"]) if row["episode"] is not None else None,
+                    episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+                    media_episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+                    release_episode=(int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
                     is_batch=bool(row["is_batch"]),
                     added_on=int(row["added_on"] or 0),
                     completed_on=int(row["completed_on"] or 0),
@@ -1848,12 +1937,19 @@ class Database:
             conn.execute("DELETE FROM downloads WHERE torrent_hash=?", (torrent_hash,))
 
     def attach_download_metadata(
-        self, torrent_hash: str, media_id: int, episode: int | None, is_batch: bool
+        self,
+        torrent_hash: str,
+        media_id: int,
+        episode: int | None,
+        is_batch: bool,
+        *,
+        release_episode: int | None = None,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
-                "UPDATE downloads SET media_id=?,episode=?,is_batch=?,updated_at=? WHERE torrent_hash=?",
-                (media_id, episode, int(is_batch), time.time(), torrent_hash),
+                "UPDATE downloads SET media_id=?,episode=?,media_episode=?,"
+                "release_episode=COALESCE(?,release_episode),is_batch=?,updated_at=? WHERE torrent_hash=?",
+                (media_id, episode, episode, release_episode, int(is_batch), time.time(), torrent_hash),
             )
 
     def set_episode_torrent_hash(self, video_path: Path, torrent_hash: str) -> int:
@@ -1868,29 +1964,46 @@ class Database:
             )
         return max(0, int(cursor.rowcount or 0))
 
-    def record_release(self, info_hash: str, media_id: int, episode: int | None, title: str, score: float) -> None:
+    def record_release(
+        self,
+        info_hash: str,
+        media_id: int,
+        episode: int | None,
+        title: str,
+        score: float,
+        *,
+        release_episode: int | None = None,
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO release_history(info_hash,media_id,episode,title,score,selected_at) VALUES(?,?,?,?,?,?)",
-                (info_hash.lower(), media_id, episode, title, score, time.time()),
+                "INSERT OR REPLACE INTO release_history("
+                "info_hash,media_id,episode,media_episode,release_episode,title,score,selected_at"
+                ") VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    info_hash.lower(), media_id, episode, episode,
+                    release_episode if release_episode is not None else episode,
+                    title, score, time.time(),
+                ),
             )
 
     def release_metadata_by_hash(
         self, torrent_hash: str
-    ) -> tuple[int, int | None, float] | None:
+    ) -> tuple[int, int | None, int | None, float] | None:
         value = torrent_hash.strip().lower()
         if not value:
             return None
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT media_id,episode,score FROM release_history WHERE info_hash=?",
+                "SELECT media_id,episode,media_episode,release_episode,score "
+                "FROM release_history WHERE info_hash=?",
                 (value,),
             ).fetchone()
         if row is None or row["media_id"] is None:
             return None
         return (
             int(row["media_id"]),
-            int(row["episode"]) if row["episode"] is not None else None,
+            int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None,
+            int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None,
             float(row["score"]),
         )
 
@@ -1902,7 +2015,7 @@ class Database:
     ) -> float | None:
         with self.connect() as conn:
             row = None
-            episode_clause = "episode IS NULL" if episode is None else "episode=?"
+            episode_clause = "COALESCE(media_episode,episode) IS NULL" if episode is None else "COALESCE(media_episode,episode)=?"
             episode_args: tuple[object, ...] = () if episode is None else (episode,)
             if torrent_hash:
                 row = conn.execute(
@@ -1922,7 +2035,7 @@ class Database:
     ) -> LibraryEpisode | None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM episodes WHERE media_id=? AND episode=? AND torrent_hash=? "
+                "SELECT * FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? AND torrent_hash=? "
                 "ORDER BY updated_at DESC LIMIT 1",
                 (media_id, episode, torrent_hash),
             ).fetchone()
@@ -1951,7 +2064,9 @@ class Database:
             save_path=str(row["save_path"]),
             content_path=str(row["content_path"]),
             media_id=int(row["media_id"]) if row["media_id"] is not None else None,
-            episode=int(row["episode"]) if row["episode"] is not None else None,
+            episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+            media_episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+            release_episode=(int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
             is_batch=bool(row["is_batch"]),
             added_on=int(row["added_on"] or 0),
             completed_on=int(row["completed_on"] or 0),
@@ -2302,7 +2417,7 @@ class Database:
         selected_path: str | None = None
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT media_id,episode,video_path FROM episodes WHERE video_path=?",
+                "SELECT media_id,episode,media_episode,video_path FROM episodes WHERE video_path=?",
                 (str(requested),),
             ).fetchone()
             if row is not None:
@@ -2313,7 +2428,7 @@ class Database:
                 except OSError:
                     wanted_resolved = requested.absolute()
                 candidates = conn.execute(
-                    "SELECT media_id,episode,video_path FROM episodes"
+                    "SELECT media_id,episode,media_episode,video_path FROM episodes"
                 ).fetchall()
                 resolved_matches: list[sqlite3.Row] = []
                 for candidate in candidates:
@@ -2329,14 +2444,14 @@ class Database:
                 elif media_id is not None:
                     if episode is None:
                         fallback_rows = conn.execute(
-                            "SELECT media_id,episode,video_path FROM episodes "
-                            "WHERE media_id=? AND episode IS NULL",
+                            "SELECT media_id,episode,media_episode,video_path FROM episodes "
+                            "WHERE media_id=? AND COALESCE(media_episode,episode) IS NULL",
                             (int(media_id),),
                         ).fetchall()
                     else:
                         fallback_rows = conn.execute(
-                            "SELECT media_id,episode,video_path FROM episodes "
-                            "WHERE media_id=? AND episode=?",
+                            "SELECT media_id,episode,media_episode,video_path FROM episodes "
+                            "WHERE media_id=? AND COALESCE(media_episode,episode)=?",
                             (int(media_id), int(episode)),
                         ).fetchall()
                     if len(fallback_rows) == 1:
@@ -2357,7 +2472,16 @@ class Database:
                 # Movies and specials are stored with episode=NULL locally,
                 # while AniList still represents a completed one-part entry as
                 # progress=1. Keep the local card in sync immediately.
-                local_progress = int(row["episode"]) if row["episode"] is not None else 1
+                same_media = media_id is None or int(media_id) == int(row["media_id"])
+                local_progress = (
+                    int(episode)
+                    if same_media and episode is not None
+                    else int(row["media_episode"])
+                    if row["media_episode"] is not None
+                    else int(row["episode"])
+                    if row["episode"] is not None
+                    else 1
+                )
                 conn.execute(
                     "UPDATE anime SET progress=MAX(progress,?),"
                     "status=CASE WHEN ?!='' THEN ? ELSE status END,updated_at=? "

@@ -1,4 +1,5 @@
 local mp = require 'mp'
+local utils = require 'mp.utils'
 
 local tracking_file = os.getenv('PUDGE_ANILIST_TRACKING_FILE') or ''
 local python = os.getenv('PUDGE_PYTHON') or 'python3'
@@ -12,9 +13,11 @@ local auto_update = (os.getenv('PUDGE_ANILIST_AUTO_UPDATE') or '0') == '1'
 local shortcut_mark_watched = os.getenv('PUDGE_SHORTCUT_MARK_WATCHED') or 'Ctrl+a'
 local shortcut_open_anilist = os.getenv('PUDGE_SHORTCUT_OPEN_ANILIST') or 'Ctrl+b'
 local shortcut_correct_match = os.getenv('PUDGE_SHORTCUT_CORRECT_MATCH') or 'c'
+local shortcut_translate_subtitle = os.getenv('PUDGE_SHORTCUT_TRANSLATE_SUBTITLE') or 'Ctrl+t'
 local ui_language = (os.getenv('PUDGE_UI_LANGUAGE') or 'en'):lower()
 local app_name = os.getenv('PUDGE_APP_NAME') or 'pudge'
 local app_cli = os.getenv('PUDGE_APP_CLI') or 'pudge'
+local subtitle_path = os.getenv('PUDGE_SUBTITLE_PATH') or ''
 
 local function tr(english, russian)
     if ui_language == 'ru' then return russian end
@@ -53,6 +56,77 @@ local subtitle_refresh_arm_timer = nil
 local subtitle_refresh_end_timer = nil
 local first_subtitle_text = nil
 local first_subtitle_end = nil
+local study_current_subtitle = ''
+local study_subtitle_history = {}
+local translation_overlay = mp.create_osd_overlay and mp.create_osd_overlay('ass-events') or nil
+local translation_timer = nil
+local translation_request = 0
+local translation_prewarm_timer = nil
+local translation_prewarm_started = false
+
+local function translation_context()
+    local parts = {}
+    if #study_subtitle_history > 0 then
+        table.insert(parts, 'Previous Japanese subtitles:')
+        table.insert(parts, table.concat(study_subtitle_history, '\n'))
+    end
+    local english = mp.get_property('secondary-sub-text', '') or ''
+    if english:match('%S') then
+        table.insert(parts, 'Corresponding English subtitle (supporting context only):')
+        table.insert(parts, english)
+    end
+    return table.concat(parts, '\n')
+end
+
+local function ass_escape(value)
+    value = tostring(value or '')
+    value = value:gsub('\\', '\\h')
+    value = value:gsub('{', '\\{'):gsub('}', '\\}')
+    value = value:gsub('\r?\n', '\\N')
+    return value
+end
+
+local function clear_translation(invalidate)
+    if invalidate then translation_request = translation_request + 1 end
+    if translation_timer then
+        translation_timer:kill()
+        translation_timer = nil
+    end
+    if translation_overlay then
+        translation_overlay.data = ''
+        translation_overlay:update()
+    end
+end
+
+local function show_translation(value, seconds)
+    local text = tostring(value or '')
+    if text == '' then return end
+    if not translation_overlay then
+        mp.osd_message(text, seconds or 12)
+        return
+    end
+    local dimensions = mp.get_property_native('osd-dimensions') or {}
+    local width = tonumber(dimensions.w) or 1280
+    local height = tonumber(dimensions.h) or 720
+    translation_overlay.res_x = width
+    translation_overlay.res_y = height
+    local font_size = math.max(24, math.min(42, math.floor(height * 0.038)))
+    local y = math.floor(height * 0.78)
+    translation_overlay.data = string.format(
+        '{\\an2\\pos(%d,%d)\\q1\\fs%d\\bord3\\shad1\\c&HFFFFFF&\\3c&H101722&}%s',
+        math.floor(width / 2), y, font_size, ass_escape(text)
+    )
+    translation_overlay:update()
+    if translation_timer then translation_timer:kill() end
+    translation_timer = mp.add_timeout(seconds or 12, function()
+        translation_timer = nil
+        if translation_overlay then
+            translation_overlay.data = ''
+            translation_overlay:update()
+        end
+    end)
+end
+
 
 local function disable_secondary_subtitles()
     mp.set_property('secondary-sid', 'no')
@@ -152,6 +226,14 @@ local function schedule_first_subtitle_cleanup()
 end
 
 local function on_subtitle_text(_, value)
+    if type(value) == 'string' and value:match('%S') and value ~= study_current_subtitle then
+        clear_translation(true)
+        if study_current_subtitle:match('%S') then
+            table.insert(study_subtitle_history, study_current_subtitle)
+            while #study_subtitle_history > 16 do table.remove(study_subtitle_history, 1) end
+        end
+        study_current_subtitle = value
+    end
     if not subtitle_refresh_armed or subtitle_refresh_done or subtitle_refresh_busy then return end
     if type(value) ~= 'string' or not value:match('%S') then
         -- Fallback for malformed subtitles with no usable end timestamp.
@@ -172,6 +254,97 @@ local function on_subtitle_text(_, value)
     if value ~= first_subtitle_text and not subtitle_refresh_end_timer then
         refresh_after_first_subtitle('text-changed')
     end
+end
+
+
+local function translate_visible_subtitle()
+    local text = mp.get_property('sub-text', '') or ''
+    if not text:match('%S') then
+        mp.osd_message(tr(
+            'No text subtitle is visible',
+            'Сейчас нет текстовых субтитров для перевода'
+        ), 3)
+        return
+    end
+    mp.set_property_bool('pause', true)
+    translation_request = translation_request + 1
+    local request_id = translation_request
+    show_translation(tr('Translating…', 'Перевожу…'), 30)
+    local args = {
+        python, '-m', 'pudge.cli',
+        '--subtitle-translate',
+        '--subtitle-study-text', text,
+        '--subtitle-study-context', translation_context(),
+    }
+    if media_id ~= '' then
+        table.insert(args, '--subtitle-study-media-id')
+        table.insert(args, media_id)
+    end
+    if config_path ~= '' then
+        table.insert(args, '--config')
+        table.insert(args, config_path)
+    end
+    mp.command_native_async({
+        name = 'subprocess',
+        args = args,
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = false,
+    }, function(success, result)
+        if request_id ~= translation_request then return end
+        local payload = nil
+        if success and result and result.status == 0 and result.stdout then
+            for line in result.stdout:gmatch('[^\r\n]+') do
+                local encoded = line:match('^PUDGE_TRANSLATION_JSON=(.+)$')
+                if encoded then
+                    payload = utils.parse_json(encoded)
+                    break
+                end
+            end
+        end
+        if payload and payload.translation and payload.translation ~= '' then
+            show_translation(payload.translation, 18)
+        else
+            show_translation(tr(
+                'Could not translate this subtitle',
+                'Не удалось перевести этот субтитр'
+            ), 5)
+            if result and result.stderr and result.stderr ~= '' then
+                mp.msg.error(result.stderr)
+            end
+        end
+    end)
+end
+
+local function start_translation_prewarm()
+    if translation_prewarm_started or subtitle_path == '' then return end
+    translation_prewarm_started = true
+    local args = {
+        python, '-m', 'pudge.cli',
+        '--subtitle-prewarm-file', subtitle_path,
+        '--subtitle-prewarm-from', tostring(mp.get_property_number('time-pos', 0) or 0),
+    }
+    if media_id ~= '' then
+        table.insert(args, '--subtitle-study-media-id')
+        table.insert(args, media_id)
+    end
+    if config_path ~= '' then
+        table.insert(args, '--config')
+        table.insert(args, config_path)
+    end
+    mp.command_native_async({
+        name = 'subprocess',
+        args = args,
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = true,
+    }, function(success, result)
+        if success and result and result.status == 0 then
+            mp.msg.info(app_name .. ' subtitle translation cache prewarm finished')
+        elseif result and result.stderr and result.stderr ~= '' then
+            mp.msg.warn(app_name .. ' subtitle translation cache prewarm: ' .. result.stderr)
+        end
+    end)
 end
 
 local function osd_from_result(result, fallback)
@@ -401,6 +574,7 @@ local function on_pause(_, value)
 end
 
 mp.register_event('file-loaded', function()
+    clear_translation(true)
     triggered = false
     paused = mp.get_property_bool('pause', false)
     active_since_save = 0.0
@@ -411,6 +585,13 @@ mp.register_event('file-loaded', function()
     subtitle_refresh_busy = false
     first_subtitle_text = nil
     first_subtitle_end = nil
+    study_current_subtitle = ''
+    study_subtitle_history = {}
+    translation_prewarm_started = false
+    if translation_prewarm_timer then
+        translation_prewarm_timer:kill()
+        translation_prewarm_timer = nil
+    end
     disable_secondary_subtitles()
     cancel_subtitle_refresh_timers()
     if subtitle_refresh_enabled then
@@ -420,6 +601,15 @@ mp.register_event('file-loaded', function()
             -- The first cue may already be active by the time file-loaded is
             -- delivered, so inspect the current text once after arming.
             on_subtitle_text(nil, mp.get_property('sub-text', ''))
+        end)
+    end
+    if subtitle_path ~= '' then
+        -- Low-priority Python work starts after mpv has settled. It walks from
+        -- the resume position, writes only the normal translation cache and is
+        -- killed automatically with playback.
+        translation_prewarm_timer = mp.add_timeout(2.0, function()
+            translation_prewarm_timer = nil
+            start_translation_prewarm()
         end)
     end
 
@@ -460,6 +650,11 @@ mp.register_event('file-loaded', function()
 end)
 
 mp.register_event('end-file', function()
+    clear_translation(true)
+    if translation_prewarm_timer then
+        translation_prewarm_timer:kill()
+        translation_prewarm_timer = nil
+    end
     cancel_subtitle_refresh_timers()
     save_playback(true)
     if active_timer then active_timer:stop() end
@@ -490,4 +685,8 @@ if shortcut_open_anilist ~= '' then
 end
 if shortcut_correct_match ~= '' then
     mp.add_key_binding(shortcut_correct_match, 'pudge_anilist_correct', correct_anilist)
+end
+
+if shortcut_translate_subtitle ~= '' then
+    add_reliable_binding(shortcut_translate_subtitle, 'pudge_subtitle_translate', translate_visible_subtitle)
 end

@@ -40,6 +40,7 @@ class QBittorrentClient:
         self.timeout = timeout
         self.client = self._new_client(self.base_url)
         self._authenticated = bool(self.api_key)
+        self._version: str | None = None
 
     @staticmethod
     def _normalize_url(value: str) -> str:
@@ -74,6 +75,7 @@ class QBittorrentClient:
         self.base_url = base_url
         self.client = self._new_client(base_url)
         self._authenticated = bool(self.api_key)
+        self._version = None
 
     def close(self) -> None:
         self.client.close()
@@ -223,6 +225,8 @@ class QBittorrentClient:
         self._authenticated = True
 
     def version(self) -> str:
+        if self._version is not None:
+            return self._version
         self.login()
         try:
             response = self.client.get("/api/v2/app/version")
@@ -246,7 +250,24 @@ class QBittorrentClient:
             raise QBittorrentError(
                 f"Не удалось получить версию qBittorrent: HTTP {response.status_code}"
             ) from exc
-        return response.text.strip()
+        self._version = response.text.strip()
+        return self._version
+
+    @staticmethod
+    def _version_at_least(value: str, minimum: tuple[int, int]) -> bool:
+        numbers = [int(part) for part in re.findall(r"\d+", value)[:2]]
+        if len(numbers) < 2:
+            return False
+        return (numbers[0], numbers[1]) >= minimum
+
+    def _add_state_payload(self, *, paused: bool, stop_at_metadata: bool) -> dict[str, str]:
+        # An API key can only be configured in qBittorrent 5.2+, so it also
+        # tells us which add-torrent parameter names the server expects.
+        modern = bool(self.api_key) or self._version_at_least(self.version(), (5, 2))
+        stopped = paused and not stop_at_metadata
+        if modern:
+            return {"stopped": str(stopped).lower(), "contentLayout": "Original"}
+        return {"paused": str(stopped).lower()}
 
     def categories(self) -> dict[str, dict[str, Any]]:
         self.login()
@@ -512,16 +533,13 @@ class QBittorrentClient:
             self._set_category_and_tags(torrent_hash, category=category, tags=tags)
             return torrent_hash
 
-        # API 2.11 / qBittorrent 5.2 renamed `paused` to `stopped` and
-        # `root_folder` to `contentLayout`. URL/magnet additions do not require
-        # multipart upload, so use a regular form request.
+        # qBittorrent 5.2 renamed `paused` to `stopped` and `root_folder` to
+        # `contentLayout`. URL/magnet additions do not require multipart upload,
+        # so use a regular form request with version-compatible field names.
         payload = {
             "urls": release.magnet,
             "savepath": str(target),
-            # MetadataReceived lets a magnet fetch its file list and then stops it
-            # before payload files begin downloading.
-            "stopped": "true" if paused and not stop_at_metadata else "false",
-            "contentLayout": "Original",
+            **self._add_state_payload(paused=paused, stop_at_metadata=stop_at_metadata),
         }
         if stop_at_metadata:
             payload["stopCondition"] = "MetadataReceived"
@@ -608,6 +626,21 @@ class QBittorrentClient:
         except httpx.HTTPError as exc:
             raise QBittorrentError(f"Не удалось запустить торрент: {exc}") from exc
 
+    def pause(self, torrent_hash: str) -> None:
+        """Stop downloading and seeding while retaining the torrent and files."""
+        value = str(torrent_hash or "").strip()
+        if not value:
+            return
+        self.login()
+        payload = {"hashes": value}
+        try:
+            response = self.client.post("/api/v2/torrents/stop", data=payload)
+            if response.status_code in {404, 405}:
+                response = self.client.post("/api/v2/torrents/pause", data=payload)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise QBittorrentError(f"Не удалось остановить торрент: {exc}") from exc
+
     def torrents(self, *, category: str = "") -> list[DownloadItem]:
         self.login()
         params = {"category": category} if category else None
@@ -653,6 +686,7 @@ class QBittorrentClient:
                     except ValueError:
                         pass
             raw = dict(item)
+            raw["backend"] = "qbittorrent"
             if anime_title_tag:
                 raw["_anime_title_tag"] = anime_title_tag
             if media_id is not None:

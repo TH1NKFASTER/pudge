@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pudge.cli import _jimaku_entry_anilist_conflicts
-from pudge.models import AniListAnime, JimakuEntry, SubtitleCandidate
+from pudge.cli import _find_online_subtitles, _jimaku_entry_anilist_conflicts
+from pudge.config import AppConfig
+from pudge.models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
 from pudge.providers.jimaku import explicit_episode_range
 from pudge.syncing import _candidate_explicit_anilist_mismatch
 
@@ -82,9 +83,85 @@ def test_optimizer_allows_exact_identity_title_stale_parent_override(tmp_path: P
             "entry_anilist_id": 209961,
             "requested_anilist_id": 180746,
             "entry_identity_exact_title_match": True,
+            "requested_episode": None,
         },
     )
     assert _candidate_explicit_anilist_mismatch(special) is False
+
+
+def test_optimizer_rejects_cross_season_even_when_base_title_matches(tmp_path: Path) -> None:
+    candidate = SubtitleCandidate(
+        path=tmp_path / "wrong-s01e12.srt",
+        source="jimaku",
+        score=59.925,
+        name="Re Life in a different world from zero.S01E12.WEBRip.ja[cc].srt",
+        details={
+            "entry_anilist_id": 21355,
+            "requested_anilist_id": 189046,
+            "entry_anilist_match": False,
+            "entry_identity_exact_title_match": True,
+            "single_special_exact_entry": False,
+            "exact_anilist_movie_entry": False,
+            "media_format": "TV",
+            "requested_episode": 78,
+        },
+    )
+    assert _candidate_explicit_anilist_mismatch(candidate) is True
+
+
+def test_rezero_s4_absolute_episode_rejects_exact_title_s1_entry(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cfg = AppConfig()
+    cfg.jimaku.api_key = "token"
+    cfg.paths.cache_dir = tmp_path / "cache"
+    video = tmp_path / "[SubsPlease] Re Zero kara Hajimeru Isekai Seikatsu - 78.mkv"
+    video.write_bytes(b"video")
+    wrong_first_season = JimakuEntry(
+        id=332,
+        name="Re:Zero kara Hajimeru Isekai Seikatsu",
+        english_name="Re:ZERO -Starting Life in Another World-",
+        japanese_name=None,
+        anilist_id=21355,
+        flags={},
+    )
+    requested_entries: list[int] = []
+
+    class FakeJimaku:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def search_entries(self, *, anilist_id=None, query=None):
+            if anilist_id is not None:
+                assert anilist_id == 189046
+                return []
+            return [wrong_first_season]
+
+        def rank_entries(self, entries, _identity, _anilist_id):
+            return list(entries)
+
+        def files_for_episode(self, entry_id, _episode, alternative_episodes=()):
+            requested_entries.append(entry_id)
+            raise AssertionError("cross-season Jimaku entry must be rejected before file lookup")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
+    monkeypatch.setattr("pudge.cli._jimaku_episode_aliases", lambda *_args: (12,))
+
+    result = _find_online_subtitles(
+        video,
+        VideoIdentity(title="Re:Zero kara Hajimeru Isekai Seikatsu", episode=78),
+        cfg,
+        None,
+        False,
+        anime_hint=_anime(189046),
+        skip_airing_lookup=True,
+    )
+
+    assert result == []
+    assert requested_entries == []
 
 
 def test_optimizer_keeps_exact_or_unlinked_identity(tmp_path: Path) -> None:

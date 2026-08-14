@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -14,9 +15,16 @@ DEFAULT_LOG_PATH = DEFAULT_RUNTIME_LOG_PATH
 _LOGGER_NAME = "pudge"
 
 
+def _selected_log_path(log_path: Path | None = None) -> Path:
+    if log_path is not None:
+        return log_path.expanduser()
+    override = os.getenv("PUDGE_RUNTIME_LOG_PATH", "").strip()
+    return Path(override).expanduser() if override else DEFAULT_LOG_PATH.expanduser()
+
+
 def configure_logging(log_path: Path | None = None, *, level: int = logging.INFO) -> logging.Logger:
     """Configure one rotating runtime log shared by the app, CLI and agent."""
-    path = (log_path or DEFAULT_LOG_PATH).expanduser()
+    path = _selected_log_path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger(_LOGGER_NAME)
@@ -71,7 +79,7 @@ def timed_step(logger: logging.Logger | logging.LoggerAdapter, step: str, **fiel
 
 
 def tail_log(log_path: Path | None = None, *, limit: int = 300) -> list[str]:
-    path = (log_path or DEFAULT_LOG_PATH).expanduser()
+    path = _selected_log_path(log_path)
     if not path.is_file():
         return []
     # Runtime logs are capped at 5 MiB, so reading once is bounded and keeps this simple.

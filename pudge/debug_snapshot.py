@@ -250,6 +250,19 @@ class DebugSnapshotService:
         if anime is None:
             raise ValueError(f"AniList id={media_id} is not in the local database")
         selected = self._selected_episode(media_id, episode)
+        available_episodes = sorted(
+            (
+                {
+                    "episode": int(item.episode),
+                    "state": str(item.state or ""),
+                    "video_path": str(item.video_path),
+                    "has_subtitles": bool(item.subtitle_path or item.embedded_subtitle_id is not None),
+                }
+                for item in self.manager.db.episodes(media_id)
+                if item.episode is not None
+            ),
+            key=lambda item: int(item["episode"]),
+        )
         selected_episode = int(selected.episode) if selected is not None and selected.episode is not None else episode
         try:
             diagnosis = self.manager.diagnose_episode(media_id, selected_episode)
@@ -346,6 +359,7 @@ class DebugSnapshotService:
             "anime": _jsonable(anime),
             "requested_episode": episode,
             "selected_episode": selected_episode,
+            "available_episodes": available_episodes,
             "selected_local_episode": _jsonable(selected),
             "summary": {
                 "diagnosis": diagnosis,

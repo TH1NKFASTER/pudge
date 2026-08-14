@@ -45,6 +45,7 @@ from .providers.nyaa import (
     search_subsplease_ranked,
     _season_number,
     _expected_season,
+    release_episode as parsed_release_episode,
 )
 from .providers.qbittorrent import QBittorrentClient, QBittorrentError
 from .providers.aria2 import Aria2Client
@@ -132,6 +133,21 @@ def _subtitle_retry_delay_seconds(
 ) -> float:
     """Use the configured interval unless this is a network/service failure."""
     configured = max(1.0, float(poll_minutes) * 60.0)
+    deterministic_validation = any(
+        marker in str(detail or "").casefold()
+        for marker in (
+            "all subtitle candidates failed synchronization/validation",
+            "too_many_large_jumps",
+            "full_range_oscillation",
+            "no_stable_offset_cluster",
+            "timeline_validation_failed",
+            "timeline_segment_support_too_low",
+            "timeline_unstable_segments",
+            "timeline_weak_path",
+        )
+    )
+    if deterministic_validation:
+        return max(configured, 6 * 3600.0)
     if _subtitle_retry_is_rate_limit(detail):
         return configured
     if not _subtitle_retry_is_network_error(detail):
@@ -267,6 +283,17 @@ class AnimeManager:
             return
 
         anime = self.db.get_anime(media_id) if media_id is not None else None
+        if anime is not None and episode is not None:
+            next_episode = int(anime.next_episode)
+            if int(episode) != next_episode:
+                self.logger.info(
+                    "SKIP step=notification.ready media_id=%s episode=%s "
+                    "reason=not_next_unwatched next_episode=%s",
+                    media_id,
+                    episode,
+                    next_episode,
+                )
+                return
         full_ready = bool(anime is not None and self._anime_is_fully_ready(anime))
         full_key = (
             f"ready_notification:anime:{anime.media_id}:{anime.episodes or anime.format or 'unknown'}"
@@ -757,10 +784,35 @@ class AnimeManager:
             return (Path(save_path).expanduser() / name).resolve()
         return None
 
+    @staticmethod
+    def _download_is_complete(item: DownloadItem) -> bool:
+        """Treat fully downloaded aria2 payloads as usable once verification is done.
+
+        aria2 keeps a BitTorrent task ``active`` while it is seeding, so requiring
+        state=complete strands a fully downloaded video until seeding stops. At
+        the same time a hash check may temporarily report completedLength equal
+        to totalLength, therefore the explicit verifier/error flags remain the
+        safety gate.
+        """
+        if float(item.progress or 0.0) < 0.999:
+            return False
+        raw = getattr(item, "raw", {}) or {}
+        if str(raw.get("backend") or "").casefold() != "aria2":
+            return True
+        if bool(raw.get("verifying")):
+            return False
+        if str(raw.get("error_code") or "").strip():
+            return False
+        total = max(0, int(raw.get("total_size") or 0))
+        downloaded = max(0, int(raw.get("downloaded") or 0))
+        if total > 0:
+            return downloaded >= total
+        return str(item.state or "").casefold() == "complete"
+
     def incomplete_download_paths(self) -> tuple[Path, ...]:
         paths: list[Path] = []
         for item in self.db.downloads():
-            if float(item.progress or 0.0) >= 0.999:
+            if self._download_is_complete(item):
                 continue
             path = self._download_content_path(item)
             if path is not None:
@@ -1093,6 +1145,8 @@ class AnimeManager:
         return bool(self.config.qbittorrent.enabled or self.config.aria2.enabled)
 
     def torrent_backend_name(self) -> str:
+        if self.config.qbittorrent.enabled and self.config.aria2.enabled:
+            return "qBittorrent + aria2"
         return "qBittorrent" if self.config.qbittorrent.enabled else "aria2"
 
     def torrent_paused_on_add(self) -> bool:
@@ -1124,8 +1178,48 @@ class AnimeManager:
                 pre_download_command=self.config.qbittorrent.pre_download_command,
                 paused_on_add=aria.paused_on_add,
                 auto_start=aria.auto_start,
+                source_proxy_mode=self.config.nyaa.proxy_mode,
+                source_proxy_url=self.config.nyaa.proxy_url,
+                seed_mode=aria.seed_mode,
+                seed_ratio=aria.seed_ratio,
+                seed_time_minutes=aria.seed_time_minutes,
+                upload_limit_kib=aria.upload_limit_kib,
+                vpn_interface=aria.vpn_interface,
+                vpn_kill_switch=aria.vpn_kill_switch,
             )
         raise ManagerError("Все torrent backend отключены")
+
+    def torrent_clients(self) -> list[tuple[str, QBittorrentClient | Aria2Client]]:
+        """Return every enabled backend; qBittorrent remains the add preference."""
+        if self.config.qbittorrent.enabled != self.config.aria2.enabled:
+            return [(
+                "qbittorrent" if self.config.qbittorrent.enabled else "aria2",
+                self.qbt_client(),
+            )]
+        result: list[tuple[str, QBittorrentClient | Aria2Client]] = []
+        if self.config.qbittorrent.enabled:
+            qbt = self.config.qbittorrent
+            result.append(("qbittorrent", QBittorrentClient(
+                qbt.base_url, qbt.username, qbt.password, qbt.api_key,
+                verify_tls=qbt.verify_tls,
+                pre_download_command=qbt.pre_download_command,
+                auto_start_app=qbt.auto_start_app,
+            )))
+        if self.config.aria2.enabled:
+            aria = self.config.aria2
+            result.append(("aria2", Aria2Client(
+                enabled=aria.enabled, binary=aria.binary, rpc_port=aria.rpc_port,
+                pre_download_command=self.config.qbittorrent.pre_download_command,
+                paused_on_add=aria.paused_on_add, auto_start=aria.auto_start,
+                source_proxy_mode=self.config.nyaa.proxy_mode,
+                source_proxy_url=self.config.nyaa.proxy_url,
+                seed_mode=aria.seed_mode, seed_ratio=aria.seed_ratio,
+                seed_time_minutes=aria.seed_time_minutes,
+                upload_limit_kib=aria.upload_limit_kib,
+                vpn_interface=aria.vpn_interface,
+                vpn_kill_switch=aria.vpn_kill_switch,
+            )))
+        return result
 
     def _release_episode_context_from_graph(
         self,
@@ -1225,6 +1319,46 @@ class AnimeManager:
             anime.media_id, episode, total, total - episode,
         )
         return (total,), titles
+
+    def _media_episode_from_release(
+        self,
+        anime: LibraryAnime | None,
+        release_episode: int | None,
+        *,
+        requested_media_episode: int | None = None,
+    ) -> int | None:
+        """Map a release filename number to this AniList entry's local number.
+
+        Single-episode downloads carry the requested local number explicitly.
+        Batch files are mapped with the cached relation graph, without a network
+        request from the download worker.
+        """
+        if requested_media_episode is not None:
+            return int(requested_media_episode)
+        if release_episode is None:
+            return None
+        value = int(release_episode)
+        if anime is None:
+            return value
+        total = int(anime.episodes or 0)
+        if value >= 1 and (not total or value <= total):
+            return value
+        try:
+            aliases, _titles = self._release_episode_context_from_graph(anime, 1)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            aliases = ()
+        if aliases:
+            offset = int(aliases[0]) - 1
+            local = value - offset
+            if local >= 1 and (not total or local <= total):
+                return local
+        self.logger.warning(
+            "WARN step=episode_identity media_id=%s release_episode=%s "
+            "reason=no_safe_media_mapping",
+            anime.media_id,
+            value,
+        )
+        return None
 
     def _release_episode_context(
         self,
@@ -1531,6 +1665,19 @@ class AnimeManager:
         anime = self.db.get_anime(media_id)
         if anime is None:
             raise ManagerError(f"AniList id={media_id} отсутствует в базе")
+        selected_release_episode = None
+        if not batch:
+            for reason in release.reasons:
+                if str(reason).startswith("absolute-ep="):
+                    try:
+                        selected_release_episode = int(str(reason).split("=", 1)[1])
+                    except ValueError:
+                        pass
+                    break
+            if selected_release_episode is None:
+                selected_release_episode = parsed_release_episode(release.title)
+            if selected_release_episode is None:
+                selected_release_episode = episode
         target = self.config.library.root_dir / self._safe_dir_name(anime.title)
         target.mkdir(parents=True, exist_ok=True)
         # Persist the AniList identity next to downloads as a filesystem-level
@@ -1551,15 +1698,78 @@ class AnimeManager:
         ]
         if episode is not None:
             tags.append(f"episode: {episode}")
+        if selected_release_episode is not None and selected_release_episode != episode:
+            tags.append(f"release episode: {selected_release_episode}")
         if batch:
             tags.append("series pack")
+
+        # Do not add the same request to the preferred client when it already
+        # exists in the other enabled backend. This also covers users migrating
+        # gradually from qBittorrent to aria2 (or the other way around).
+        for backend_name, candidate_client in self.torrent_clients():
+            try:
+                existing_any = self._existing_download_for_request(
+                    candidate_client, anime, episode=episode, batch=batch,
+                    release_hash=release.info_hash,
+                )
+                if existing_any is None:
+                    continue
+                existing_any.media_episode = episode
+                existing_any.episode = episode
+                existing_any.release_episode = selected_release_episode
+                existing_any.raw["backend"] = backend_name
+                self.db.upsert_download(existing_any)
+                paused_on_add = (
+                    self.config.qbittorrent.paused_on_add
+                    if backend_name == "qbittorrent"
+                    else self.config.aria2.paused_on_add
+                )
+                if (
+                    not paused_on_add
+                    and str(existing_any.state or "").casefold().startswith(("paused", "stopped"))
+                ):
+                    candidate_client.start(existing_any.torrent_hash)
+                self.log(
+                    f"{backend_name}: {anime.title} уже скачивается — {existing_any.name}"
+                )
+                return False
+            finally:
+                candidate_client.close()
         client = self.qbt_client()
+        add_backend = str(getattr(client, "backend_name", "qbittorrent") or "qbittorrent")
         try:
             existing = self._existing_download_for_request(
                 client, anime, episode=episode, batch=batch,
                 release_hash=release.info_hash,
             )
             if existing is not None:
+                existing.media_episode = episode
+                existing.episode = episode
+                existing.release_episode = selected_release_episode
+                repaired = False
+                repair = getattr(client, "repair_stalled_release", None)
+                if callable(repair):
+                    try:
+                        repaired = bool(repair(existing.torrent_hash, release))
+                    except QBittorrentError as exc:
+                        self.logger.warning(
+                            "FALLBACK step=aria2.metadata_source hash=%s error=%r",
+                            existing.torrent_hash, str(exc),
+                        )
+                    if repaired:
+                        self.logger.info(
+                            "REPAIR step=aria2.metadata_source hash=%s media_id=%s episode=%s",
+                            existing.torrent_hash, media_id, episode,
+                        )
+                        refreshed = self._existing_download_for_request(
+                            client, anime, episode=episode, batch=batch,
+                            release_hash=release.info_hash,
+                        )
+                        if refreshed is not None:
+                            existing = refreshed
+                existing.media_episode = episode
+                existing.episode = episode
+                existing.release_episode = selected_release_episode
                 self.db.upsert_download(existing)
                 state = str(existing.state or "").casefold()
                 if (
@@ -1569,8 +1779,9 @@ class AnimeManager:
                 ):
                     client.start(existing.torrent_hash)
                     self.logger.info(
-                        "REPAIR step=qbittorrent.start_existing hash=%s state=%s media_id=%s episode=%s",
-                        existing.torrent_hash, existing.state, media_id, episode,
+                        "REPAIR step=%s.start_existing hash=%s state=%s media_id=%s episode=%s",
+                        add_backend, existing.torrent_hash, existing.state,
+                        media_id, episode,
                     )
                 self.log(
                     f"{self.torrent_backend_name()}: {anime.title} уже скачивается — {existing.name}"
@@ -1578,7 +1789,7 @@ class AnimeManager:
                 return False
             with timed_step(
                 self.logger,
-                "qbittorrent.add",
+                f"{add_backend}.add",
                 media_id=media_id,
                 episode=episode,
                 batch=batch,
@@ -1604,21 +1815,25 @@ class AnimeManager:
                         break
                 if verified is None:
                     self.logger.error(
-                        "ERROR step=qbittorrent.add_verify media_id=%s episode=%s batch=%s "
+                        "ERROR step=%s.add_verify media_id=%s episode=%s batch=%s "
                         "hash=%s title=%r reason=not_visible_after_add",
-                        media_id, episode, batch, release.info_hash, release.title,
+                        add_backend, media_id, episode, batch,
+                        release.info_hash, release.title,
                     )
                     raise ManagerError(
-                        "qBittorrent принял запрос, но торрент не появился в списке загрузок. "
+                        f"{add_backend} принял запрос, но торрент не появился в списке загрузок. "
                         "Повтори попытку; если ошибка сохранится, открой Diagnostics — там будет "
-                        "причина проверки qBittorrent."
+                        f"причина проверки {add_backend}."
                     )
+                verified.media_episode = episode
+                verified.episode = episode
+                verified.release_episode = selected_release_episode
                 self.db.upsert_download(verified)
                 if not self.torrent_paused_on_add() and hasattr(client, "start"):
                     client.start(verified.torrent_hash)
                     self.logger.info(
-                        "DONE step=qbittorrent.start_after_add hash=%s media_id=%s episode=%s",
-                        verified.torrent_hash, media_id, episode,
+                        "DONE step=%s.start_after_add hash=%s media_id=%s episode=%s",
+                        add_backend, verified.torrent_hash, media_id, episode,
                     )
         finally:
             client.close()
@@ -1628,6 +1843,7 @@ class AnimeManager:
             episode,
             release.title,
             release.score,
+            release_episode=selected_release_episode,
         )
         self.log(
             f"{self.torrent_backend_name()}: добавлен {release.title} "
@@ -1650,14 +1866,26 @@ class AnimeManager:
         return "".join(char for char in value.casefold() if char.isalnum())
 
     def _resolve_download_media(self, item: DownloadItem) -> None:
+        persisted = self.db.download_by_hash(item.torrent_hash)
+        if persisted is not None:
+            if item.media_id is None:
+                item.media_id = persisted.media_id
+            if persisted.media_episode is not None:
+                item.media_episode = persisted.media_episode
+                item.episode = persisted.media_episode
+            if persisted.release_episode is not None:
+                item.release_episode = persisted.release_episode
         history = self.db.release_metadata_by_hash(item.torrent_hash)
         if history is not None:
-            history_media_id, history_episode, history_score = history
+            history_media_id, history_media_episode, history_release_episode, history_score = history
             if item.media_id is None:
                 item.media_id = history_media_id
                 item.raw["_media_id_source"] = "history"
-            if item.episode is None and history_episode is not None:
-                item.episode = history_episode
+            if item.media_episode is None and history_media_episode is not None:
+                item.media_episode = history_media_episode
+                item.episode = history_media_episode
+            if history_release_episode is not None:
+                item.release_episode = history_release_episode
             item.raw["_release_score_history"] = history_score
         if item.media_id is not None:
             item.raw.setdefault("_media_id_source", "tag")
@@ -1724,7 +1952,11 @@ class AnimeManager:
                 anime.media_id, item.torrent_hash, item.media_id, source, item.state,
                 float(item.progress or 0.0), item.episode, item.is_batch, same_hash, item.name,
             )
-            if state in invalid_states:
+            recoverable_aria2_error = bool(
+                state == "error"
+                and (item.raw or {}).get("recoverable_missing_control")
+            )
+            if state in invalid_states and not recoverable_aria2_error:
                 self.logger.info(
                     "SKIP step=qbittorrent.duplicate_check torrent=%s reason=invalid_state state=%s",
                     item.torrent_hash, item.state,
@@ -1862,7 +2094,7 @@ class AnimeManager:
     def _choose_duplicate_winner(
         self, items: list[DownloadItem]
     ) -> tuple[DownloadItem | None, list[DownloadItem]]:
-        completed = [item for item in items if item.progress >= 0.999]
+        completed = [item for item in items if self._download_is_complete(item)]
         if completed:
             # Completed data is immutable from automatic duplicate cleanup.
             # Keep every completed copy and only remove incomplete duplicates.
@@ -1874,7 +2106,7 @@ class AnimeManager:
                     item.added_on,
                 ),
             )
-            return winner, [item for item in items if item.progress < 0.999]
+            return winner, [item for item in items if not self._download_is_complete(item)]
 
         if len(items) < 2:
             return None, []
@@ -1942,7 +2174,7 @@ class AnimeManager:
         loser: DownloadItem,
         preserved: list[DownloadItem],
     ) -> bool:
-        if loser.progress >= 0.999 or not loser.content_path.strip():
+        if self._download_is_complete(loser) or not loser.content_path.strip():
             return False
         return all(
             not self._paths_overlap(loser.content_path, item.content_path)
@@ -2021,11 +2253,11 @@ class AnimeManager:
                 self.db.upsert_download(winner)
 
                 completed_copies = [
-                    item for item in duplicates if item.progress >= 0.999
+                    item for item in duplicates if self._download_is_complete(item)
                 ]
                 preserved = completed_copies or [winner]
                 for loser in losers:
-                    if loser.progress >= 0.999:
+                    if self._download_is_complete(loser):
                         continue
                     delete_files = self._can_delete_duplicate_files(loser, preserved)
                     try:
@@ -2228,13 +2460,22 @@ class AnimeManager:
                 self.logger.warning(
                     "WARN step=torrent.race_db_sync hash=%s error=%r", winner_hash, str(exc)
                 )
-            self.db.record_release(
-                winner.info_hash or hashlib.sha1(winner.magnet.encode()).hexdigest(),
-                media_id,
-                episode,
-                winner.title,
-                winner.score,
-            )
+            release_hash = winner.info_hash or hashlib.sha1(winner.magnet.encode()).hexdigest()
+            try:
+                self.db.record_release(
+                    release_hash,
+                    media_id,
+                    episode,
+                    winner.title,
+                    winner.score,
+                    release_episode=parsed_release_episode(winner.title),
+                )
+            except TypeError:
+                # Compatibility for small third-party/fake DB adapters that
+                # still implement the pre-v5 positional surface.
+                self.db.record_release(
+                    release_hash, media_id, episode, winner.title, winner.score
+                )
             cleaner = getattr(client, "delete_tags", None)
             if callable(cleaner):
                 try:
@@ -3155,65 +3396,111 @@ class AnimeManager:
         if not self.downloads_enabled():
             self._last_completed_video_paths = ()
             return 0
-        client = self.qbt_client()
-        try:
-            if self.config.qbittorrent.enabled:
-                accepted_categories = {
-                    self.config.qbittorrent.category,
-                    *LEGACY_APP_SLUGS,
-                }
-                all_items = client.torrents(category="")
-                repaired_paths = self._repair_legacy_qbittorrent_paths(client, all_items)
-                if repaired_paths:
+        items: list[DownloadItem] = []
+        backend_errors: list[str] = []
+        for backend, client in self.torrent_clients():
+            try:
+                if backend == "qbittorrent":
+                    accepted_categories = {
+                        self.config.qbittorrent.category,
+                        *LEGACY_APP_SLUGS,
+                    }
                     all_items = client.torrents(category="")
-                items = [
-                    item
-                    for item in all_items
-                    if str(item.raw.get("category") or "") in accepted_categories
-                ]
-                # A product rename should not strand already-running torrents in
-                # the previous qBittorrent category *or* leave the legacy app tag.
-                # set_metadata is the real provider API (v0.6.57 accidentally
-                # checked for a non-existent attach_metadata method).
-                ensure_category = getattr(client, "ensure_category", None)
-                set_metadata = getattr(client, "set_metadata", None)
-                if callable(ensure_category) and callable(set_metadata):
-                    migrated_category = False
-                    legacy_names = {value.casefold() for value in LEGACY_APP_SLUGS}
-                    for item in items:
-                        old_category = str(item.raw.get("category") or "").strip()
-                        raw_tags = self._torrent_tags(item)
-                        legacy_brand_tags = {
-                            tag for tag in raw_tags if tag.casefold() in legacy_names
-                        }
-                        has_current_brand = any(
-                            tag.casefold() == APP_SLUG.casefold() for tag in raw_tags
-                        )
-                        needs_category = old_category in LEGACY_APP_SLUGS
-                        needs_tags = bool(legacy_brand_tags or not has_current_brand)
-                        if not needs_category and not needs_tags:
-                            continue
-                        if not migrated_category:
-                            ensure_category(
-                                self.config.qbittorrent.category,
-                                self.config.library.root_dir,
+                    repaired_paths = self._repair_legacy_qbittorrent_paths(client, all_items)
+                    if repaired_paths:
+                        all_items = client.torrents(category="")
+                    backend_items = [
+                        item
+                        for item in all_items
+                        if str(item.raw.get("category") or "") in accepted_categories
+                    ]
+                    # A product rename should not strand already-running torrents in
+                    # the previous qBittorrent category or leave the legacy app tag.
+                    ensure_category = getattr(client, "ensure_category", None)
+                    set_metadata = getattr(client, "set_metadata", None)
+                    if callable(ensure_category) and callable(set_metadata):
+                        migrated_category = False
+                        legacy_names = {value.casefold() for value in LEGACY_APP_SLUGS}
+                        for item in backend_items:
+                            old_category = str(item.raw.get("category") or "").strip()
+                            raw_tags = self._torrent_tags(item)
+                            legacy_brand_tags = {
+                                tag for tag in raw_tags if tag.casefold() in legacy_names
+                            }
+                            has_current_brand = any(
+                                tag.casefold() == APP_SLUG.casefold() for tag in raw_tags
                             )
-                            migrated_category = True
-                        desired_tags = sorted(
-                            (raw_tags - legacy_brand_tags) | {APP_SLUG},
-                            key=str.casefold,
+                            needs_category = old_category in LEGACY_APP_SLUGS
+                            needs_tags = bool(legacy_brand_tags or not has_current_brand)
+                            if not needs_category and not needs_tags:
+                                continue
+                            if not migrated_category:
+                                ensure_category(
+                                    self.config.qbittorrent.category,
+                                    self.config.library.root_dir,
+                                )
+                                migrated_category = True
+                            desired_tags = sorted(
+                                (raw_tags - legacy_brand_tags) | {APP_SLUG},
+                                key=str.casefold,
+                            )
+                            set_metadata(
+                                item.torrent_hash,
+                                category=self.config.qbittorrent.category,
+                                tags=desired_tags,
+                            )
+                            item.raw["category"] = self.config.qbittorrent.category
+                            item.raw["_tag_set"] = desired_tags
+                else:
+                    backend_items = client.torrents(category=self.config.qbittorrent.category)
+                    recovered_aria2 = self._recover_stalled_aria2_downloads(
+                        client, backend_items
+                    )
+                    if recovered_aria2:
+                        # Recovery registers a fresh hash-check task. Refresh now
+                        # so DB/UI and the subsequent auto-search see that task
+                        # instead of the stale error row and never add a duplicate.
+                        backend_items = client.torrents(
+                            category=self.config.qbittorrent.category
                         )
-                        set_metadata(
-                            item.torrent_hash,
-                            category=self.config.qbittorrent.category,
-                            tags=desired_tags,
-                        )
-                        item.raw["category"] = self.config.qbittorrent.category
-                        item.raw["_tag_set"] = desired_tags
-            else:
-                items = client.torrents(category=self.config.qbittorrent.category)
-        finally:
-            client.close()
+                for item in backend_items:
+                    item.raw["backend"] = backend
+                items.extend(backend_items)
+            except Exception as exc:
+                backend_errors.append(f"{backend}: {exc}")
+                self.logger.warning(
+                    "FAIL step=torrent.sync_backend backend=%s error=%r", backend, str(exc)
+                )
+            finally:
+                client.close()
+        if backend_errors and not items:
+            raise ManagerError("; ".join(backend_errors))
+
+        # A torrent may exist in both clients. Keep a single database/UI row,
+        # preferring the copy that has made more progress (then the active one).
+        deduplicated: dict[str, DownloadItem] = {}
+        for item in items:
+            key = item.torrent_hash.casefold()
+            previous = deduplicated.get(key)
+            item.raw["_backends"] = [str(item.raw.get("backend") or "")]
+            rank = (float(item.progress), int(item.raw.get("download_speed") or item.raw.get("dlspeed") or 0))
+            previous_rank = (-1.0, -1) if previous is None else (
+                float(previous.progress),
+                int(previous.raw.get("download_speed") or previous.raw.get("dlspeed") or 0),
+            )
+            if previous is None or rank > previous_rank:
+                if previous is not None:
+                    item.raw["_backends"] = list(dict.fromkeys([
+                        *previous.raw.get("_backends", []),
+                        *item.raw.get("_backends", []),
+                    ]))
+                deduplicated[key] = item
+            elif previous is not None:
+                previous.raw["_backends"] = list(dict.fromkeys([
+                    *previous.raw.get("_backends", []),
+                    *item.raw.get("_backends", []),
+                ]))
+        items = list(deduplicated.values())
         completed = 0
         active_hashes = {item.torrent_hash for item in items if item.torrent_hash}
         self._last_missing_episode_rows = self._remove_missing_episode_rows(active_hashes)
@@ -3230,14 +3517,15 @@ class AnimeManager:
                     self.db.record_release(
                         item.torrent_hash,
                         int(item.media_id),
-                        int(item.episode) if item.episode is not None else None,
+                        int(item.media_episode) if item.media_episode is not None else None,
                         item.name,
                         float(score_tag),
+                        release_episode=parsed_release_episode(item.name),
                     )
                 except (TypeError, ValueError):
                     pass
             self.db.upsert_download(item)
-            if item.progress < 0.999:
+            if not self._download_is_complete(item):
                 continue
             completed += self._register_completed_download(
                 item,
@@ -3246,6 +3534,116 @@ class AnimeManager:
         self._last_completed_video_paths = tuple(dict.fromkeys(completed_paths))
         self.db.set_state("downloads_synced_at", str(time.time()))
         return completed
+
+    def _recover_stalled_aria2_downloads(
+        self, client: Any, items: list[DownloadItem], *, now: float | None = None
+    ) -> int:
+        """Reannounce an aria2 task that stopped moving while still active."""
+
+        reconnect = getattr(client, "reconnect", None)
+        if not callable(reconnect):
+            return 0
+        current = float(now if now is not None else time.time())
+        recovered = 0
+        for item in items:
+            raw = item.raw or {}
+            key = f"aria2_stall:{item.torrent_hash.casefold()}"
+            state = str(item.state or "").casefold()
+            downloaded = max(0, int(raw.get("downloaded") or 0))
+            total = max(0, int(raw.get("total_size") or 0))
+            speed = max(0, int(raw.get("download_speed") or 0))
+            connections = max(0, int(raw.get("num_connections") or 0))
+            recoverable_missing_control = bool(
+                state == "error" and raw.get("recoverable_missing_control")
+            )
+            stalled_candidate = (
+                state in {"active", "waiting"}
+                and not bool(raw.get("verifying"))
+                and 0 <= downloaded < total
+                and speed == 0
+                and connections == 0
+            )
+            if not stalled_candidate and not recoverable_missing_control:
+                if self.db.get_state(key, ""):
+                    self.db.set_state(key, "")
+                continue
+            try:
+                marker = json.loads(self.db.get_state(key, "") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                marker = {}
+            previous = max(0, int(marker.get("downloaded") or 0))
+            if previous != downloaded:
+                marker = {
+                    "downloaded": downloaded,
+                    "stalled_since": current,
+                    "last_reconnect": float(marker.get("last_reconnect") or 0),
+                }
+            else:
+                marker.setdefault("stalled_since", current)
+                marker.setdefault("last_reconnect", 0.0)
+            stalled_for = current - float(marker["stalled_since"] or current)
+            since_reconnect = current - float(marker["last_reconnect"] or 0)
+
+            if recoverable_missing_control:
+                # Missing-control recovery may need to fetch torrent metadata.
+                # Retry failed attempts quickly, but never write the success
+                # cooldown before reconnect() actually registered a hash-check.
+                # Older builds did exactly that and left errorCode=13 stuck for
+                # 30 minutes after a failed Nyaa .torrent fetch.
+                last_control_attempt = float(marker.get("last_control_attempt") or 0)
+                if current - last_control_attempt >= 2 * 60:
+                    marker["last_control_attempt"] = current
+                    try:
+                        if reconnect(item.torrent_hash):
+                            recovered += 1
+                            marker["last_control_recovery"] = current
+                            marker["stalled_since"] = current
+                            self.logger.info(
+                                "REPAIR step=aria2.missing_control hash=%s "
+                                "mode=hash_check total=%s",
+                                item.torrent_hash,
+                                total,
+                            )
+                        else:
+                            self.logger.info(
+                                "RETRY step=aria2.missing_control hash=%s "
+                                "reason=no_recovery_source delay_s=120",
+                                item.torrent_hash,
+                            )
+                    except QBittorrentError as exc:
+                        self.logger.warning(
+                            "RETRY step=aria2.missing_control hash=%s "
+                            "delay_s=120 error=%r",
+                            item.torrent_hash,
+                            str(exc),
+                        )
+                self.db.set_state(key, json.dumps(marker, separators=(",", ":")))
+                continue
+
+            # aria2 retries trackers and peers itself. A pause/unpause cycle is
+            # reserved for a genuinely long stall: doing it every few minutes
+            # interrupts piece verification and tracker announce backoff.
+            if stalled_for >= 15 * 60 and since_reconnect >= 30 * 60:
+                try:
+                    if reconnect(item.torrent_hash):
+                        recovered += 1
+                        marker["last_reconnect"] = current
+                        marker["stalled_since"] = current
+                        self.logger.info(
+                            "REPAIR step=aria2.reconnect hash=%s progress=%.3f downloaded=%s listed_seeders=%s",
+                            item.torrent_hash,
+                            float(item.progress or 0.0),
+                            downloaded,
+                            int(raw.get("listed_seeders") or 0),
+                        )
+                except QBittorrentError as exc:
+                    self.logger.warning(
+                        "RETRY step=aria2.reconnect hash=%s error=%r",
+                        item.torrent_hash,
+                        str(exc),
+                    )
+            self.db.set_state(key, json.dumps(marker, separators=(",", ":")))
+        return recovered
 
     def _register_completed_download(
         self,
@@ -3275,7 +3673,12 @@ class AnimeManager:
                 or existing.torrent_hash.casefold() != item.torrent_hash.casefold()
             )
             identity = parse_anime_filename(path)
-            episode = identity.episode or item.episode
+            release_number = identity.episode or item.release_episode
+            media_number = self._media_episode_from_release(
+                anime,
+                release_number,
+                requested_media_episode=(item.media_episode if not item.is_batch else None),
+            )
             subtitle_source, subtitle_path = japanese_subtitle_source(
                 path,
                 ffprobe=self.config.tools.ffprobe,
@@ -3291,7 +3694,9 @@ class AnimeManager:
             library_episode = LibraryEpisode(
                 media_id=item.media_id,
                 title=anime.title if anime else identity.title,
-                episode=episode,
+                episode=media_number,
+                media_episode=media_number,
+                release_episode=release_number,
                 video_path=resolved,
                 subtitle_path=subtitle_path,
                 embedded_subtitle_id=embedded_subtitle_id,
@@ -3318,17 +3723,17 @@ class AnimeManager:
                     self.db.queue_subtitle_job(
                         resolved,
                         item.media_id,
-                        episode,
+                        media_number,
                         priority=100,
                         error="New completed download",
                     )
                 else:
-                    self.db.ensure_subtitle_job(resolved, item.media_id, episode)
+                    self.db.ensure_subtitle_job(resolved, item.media_id, media_number)
             if subtitle_source in {"external", "embedded"}:
                 self._notify_ready_episode(
                     video=resolved,
                     media_id=(int(item.media_id) if item.media_id is not None else None),
-                    episode=(int(episode) if episode is not None else None),
+                    episode=(int(media_number) if media_number is not None else None),
                 )
             if is_new_completion:
                 count += 1
@@ -3869,6 +4274,42 @@ class AnimeManager:
                 )
                 self.db.postpone_subtitle_job(video, "Видео ещё недоступно", 15 * 60)
                 continue
+            incomplete_roots = self.incomplete_download_paths()
+            if any(
+                video.resolve() == root or root in video.resolve().parents
+                for root in incomplete_roots
+            ):
+                self.db.postpone_subtitle_job(
+                    video, "Torrent is still writing this video", 15 * 60
+                )
+                self.logger.info(
+                    "RETRY step=subtitle.prepare reason=download_incomplete media_id=%s episode=%s video=%s delay_s=%s",
+                    job["media_id"], job["episode"], video.name, 15 * 60,
+                )
+                continue
+            probe = None
+            if video.stat().st_size >= 1024 * 1024:
+                try:
+                    probe = subprocess.run(
+                        [
+                            self.config.tools.ffprobe,
+                            "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=noprint_wrappers=1:nokey=1", str(video),
+                        ],
+                        check=False, capture_output=True, text=True, timeout=15,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    probe = None
+            if probe is not None and probe.returncode != 0:
+                self.db.postpone_subtitle_job(
+                    video, "Video container is not readable yet", 60 * 60
+                )
+                self.logger.info(
+                    "RETRY step=subtitle.prepare reason=video_container_unreadable media_id=%s episode=%s video=%s delay_s=%s error=%r",
+                    job["media_id"], job["episode"], video.name, 60 * 60,
+                    (probe.stderr or "")[-500:],
+                )
+                continue
             command = [
                 python_executable(),
                 "-m",
@@ -4304,7 +4745,14 @@ class AnimeManager:
                 # stricter: a cache file can still exist while the current run
                 # explicitly rejects it.
                 self.db.clear_subtitle_selection(video)
-                detail = completed.stderr.strip() or completed.stdout.strip()[-1000:]
+                # ffsubsync writes ordinary INFO lines to stderr. Using stderr
+                # alone hid the actual deterministic validation failure printed
+                # to stdout and reduced a 6h backoff to the normal 10m retry.
+                stdout_detail = completed.stdout.strip()[-5000:]
+                stderr_detail = completed.stderr.strip()[-1500:]
+                detail = "\n".join(
+                    part for part in (stdout_detail, stderr_detail) if part
+                )
                 rate_limited = _subtitle_retry_is_rate_limit(detail)
                 attempts = int(job["attempts"] or 0) + (0 if rate_limited else 1)
                 delay = _subtitle_retry_delay_seconds(
@@ -4545,7 +4993,9 @@ class AnimeManager:
         due = self.db.due_cleanup()
         if not due:
             return 0
-        downloads = [item for item in self.db.downloads() if item.progress >= 0.999]
+        downloads = [
+            item for item in self.db.downloads() if self._download_is_complete(item)
+        ]
         repaired = 0
         for row in due:
             if str(row["torrent_hash"] or "").strip():
@@ -4858,6 +5308,58 @@ class AnimeManager:
             self.log(f"Субтитры: повторно проверяю ранее подготовленных файлов — {queued}")
         return queued
 
+    def _requeue_large_cold_open_subtitles(self) -> int:
+        """Rebuild only subtitles rejected by the former 2.5s cold-open limit."""
+
+        generation = "1"
+        key = "subtitle_large_cold_open_generation"
+        if self.db.get_state(key, "") == generation:
+            return 0
+        queued = 0
+        for item in self.db.episodes():
+            subtitle = item.subtitle_path
+            if subtitle is None:
+                continue
+            latest = self.db.latest_selected_subtitle(item.video_path)
+            if not latest or str(latest.get("source") or "").casefold() == "manual":
+                continue
+            details = (
+                latest.get("details")
+                if isinstance(latest.get("details"), dict)
+                else {}
+            )
+            alignment = (
+                details.get("alignment")
+                if isinstance(details.get("alignment"), dict)
+                else {}
+            )
+            cold_start = (
+                alignment.get("timeline_cold_start")
+                if isinstance(alignment.get("timeline_cold_start"), dict)
+                else {}
+            )
+            try:
+                cold_delta = abs(float(cold_start.get("delta_seconds") or 0.0))
+            except (TypeError, ValueError):
+                cold_delta = 0.0
+            if not (
+                str(cold_start.get("reason") or "") == "edge_hint_not_local"
+                and 2.5 < cold_delta <= 15.0
+            ):
+                continue
+            invalidate_final_pipeline_result(item.video_path, self.config)
+            self.db.invalidate_subtitle(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                "Повторная подготовка после исправления cold-open синхронизации",
+            )
+            queued += 1
+        self.db.set_state(key, generation)
+        if queued:
+            self.log(f"Субтитры: исправляю синхронизацию до опенинга — {queued}")
+        return queued
+
     def _requeue_after_resolver_upgrade(self) -> int:
         generation = "9"
         key = "subtitle_resolver_generation"
@@ -5042,6 +5544,7 @@ class AnimeManager:
                 if not self.config.matching.ocr_image_subtitles:
                     self.invalidate_disabled_ocr_subtitles()
                 self._requeue_legacy_generated_subtitles()
+                self._requeue_large_cold_open_subtitles()
                 self._requeue_after_resolver_upgrade()
             self._sync_downloads_for_stats(stats)
             with timed_step(self.logger, "qbittorrent.duplicate_cleanup"):

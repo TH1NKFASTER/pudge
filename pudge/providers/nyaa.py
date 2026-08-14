@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import binascii
+
 import math
 import re
 import subprocess
@@ -96,7 +99,19 @@ def _magnet_info_hash(value: str) -> str:
     for xt in params.get("xt", []):
         prefix = "urn:btih:"
         if xt.casefold().startswith(prefix):
-            return xt[len(prefix):].strip().lower()
+            info_hash = xt[len(prefix):].strip().lower()
+            # BEP 9 permits btih values as either 40 hexadecimal characters or
+            # 32 base32 characters. aria2/qBittorrent expose the canonical hex
+            # form through their APIs, so normalize the RSS value before it is
+            # used for add verification and duplicate detection.
+            if re.fullmatch(r"[0-9a-f]{40}", info_hash):
+                return info_hash
+            if re.fullmatch(r"[a-z2-7]{32}", info_hash):
+                try:
+                    return base64.b32decode(info_hash.upper()).hex()
+                except (binascii.Error, ValueError):
+                    pass
+            return info_hash
     return ""
 
 

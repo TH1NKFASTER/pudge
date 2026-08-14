@@ -83,6 +83,8 @@ class LibraryEpisode:
     title: str
     episode: int | None
     video_path: Path
+    media_episode: int | None = None
+    release_episode: int | None = None
     subtitle_path: Path | None = None
     embedded_subtitle_id: int | None = None
     state: str = "local"
@@ -95,6 +97,15 @@ class LibraryEpisode:
     playback_active_seconds: float = 0.0
     subtitle_origin: str = ""
 
+    def __post_init__(self) -> None:
+        # ``episode`` remains the backwards-compatible season-local alias.
+        # Release filenames may use absolute numbering, so that identity must
+        # never leak into AniList progress.
+        if self.media_episode is None:
+            self.media_episode = self.episode
+        self.episode = self.media_episode
+        if self.release_episode is None:
+            self.release_episode = self.media_episode
 
 @dataclass(slots=True)
 class DownloadItem:
@@ -106,7 +117,16 @@ class DownloadItem:
     content_path: str
     media_id: int | None = None
     episode: int | None = None
+    media_episode: int | None = None
+    release_episode: int | None = None
     is_batch: bool = False
     added_on: int = 0
     completed_on: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.media_episode is None:
+            self.media_episode = self.episode
+        self.episode = self.media_episode
+        if self.release_episode is None:
+            self.release_episode = self.media_episode

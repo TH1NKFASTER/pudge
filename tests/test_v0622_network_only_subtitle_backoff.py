@@ -17,6 +17,7 @@ def _config(tmp_path: Path) -> AppConfig:
     config = AppConfig()
     config.config_path = tmp_path / "config.toml"
     config.library.database_path = tmp_path / "library.sqlite3"
+    config.paths.cache_dir = tmp_path / "cache"
     config.library.root_dir = tmp_path / "library"
     config.agent.subtitle_poll_minutes = 10
     return config

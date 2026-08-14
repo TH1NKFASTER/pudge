@@ -33,7 +33,7 @@ from .llm import OllamaClient
 from .local_search import find_local_subtitles
 from .logging_utils import StageTimer, configure_logging, timed_step
 from .media import MediaProbeError, TEXT_CODECS, find_embedded_japanese_subtitles
-from .models import AniListAnime, SubtitleCandidate, VideoIdentity
+from .models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
 from .ocr import OCRConversionError, OCRUnavailableError, image_subtitle_to_srt
 from .foreground import clear_foreground, mark_foreground
 from .pipeline_cache import (
@@ -115,6 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--playback-active-seconds", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--start-at", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--fullscreen", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-translate", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-prewarm-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-prewarm-from", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-text", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-context", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-media-id", type=int, help=argparse.SUPPRESS)
     return parser
 
 
@@ -952,6 +958,18 @@ def _find_online_subtitles(
                 or (anime.format or "").upper() in {"OVA", "ONA", "SPECIAL", "TV_SHORT"}
             )
         )
+
+        def identity_title_overrides_anilist_conflict(entry: JimakuEntry) -> bool:
+            # An exact local title may legitimately point at a separately linked
+            # movie/special whose parent AniList ID was inherited by the download.
+            # For an ordinary numbered TV episode, however, explicit AniList IDs
+            # are the season boundary: a generic franchise title such as Re:Zero
+            # must not let S01E12 satisfy S04E12/absolute episode 78.
+            return bool(
+                identity_exact_entry(entry)
+                and (requested_episode is None or is_movie or single_work)
+            )
+
         entries_by_name = []
         # Newly created one-episode specials are often present on Jimaku before
         # their AniList ID is attached to the entry. Always perform a title lookup
@@ -980,7 +998,11 @@ def _find_online_subtitles(
         identity_exact_entries = [
             entry for entry in deduplicated.values() if identity_exact_entry(entry)
         ]
-        if identity_exact_entries and exact_id_entries and not id_matches_identity:
+        if (
+            any(identity_title_overrides_anilist_conflict(entry) for entry in identity_exact_entries)
+            and exact_id_entries
+            and not id_matches_identity
+        ):
             # The authoritative local identity can be more specific than stale or
             # incorrectly inherited download metadata (for example a sequel movie
             # resolving to its parent TV entry). An exact Jimaku title result wins
@@ -1021,7 +1043,7 @@ def _find_online_subtitles(
             )
             if (
                 _jimaku_entry_anilist_conflicts(entry, anime)
-                and not identity_exact_entry(entry)
+                and not identity_title_overrides_anilist_conflict(entry)
             ):
                 logger.info(
                     "REJECT step=jimaku.entry video=%s entry_id=%s reason=explicit_anilist_mismatch "
@@ -1629,6 +1651,10 @@ def process_video(
             )
         except MediaProbeError as exc:
             print(exc)
+            if args.prepare_only:
+                print("PREPARE_STATUS=waiting_video")
+                print(f"Video container is not readable yet: {exc}", file=sys.stderr)
+                return 4
             embedded_candidates = []
 
         embedded_text = next(
@@ -2142,6 +2168,8 @@ def process_video(
         "PUDGE_SHORTCUT_MARK_WATCHED": config.shortcuts.mpv_mark_watched,
         "PUDGE_SHORTCUT_OPEN_ANILIST": config.shortcuts.mpv_open_anilist,
         "PUDGE_SHORTCUT_CORRECT_MATCH": config.shortcuts.mpv_correct_match,
+        "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE": config.shortcuts.mpv_translate_subtitle,
+        "PUDGE_SUBTITLE_PATH": str(subtitle or ""),
     }
     if tracking_anime is not None and tracking_episode is not None and config.anilist.access_token:
         threshold = max(0.1, min(0.99, config.anilist.watched_threshold))
@@ -2170,6 +2198,27 @@ def process_video(
         })
 
     mpv_extra_args = list(config.tools.mpv_extra_args)
+    try:
+        from .first_experience import mpv_study_script_plan
+        from .light_novels import LightNovelService
+
+        study_settings = LightNovelService(config).settings()
+        study_plan = mpv_study_script_plan(
+            config.tools.mpv_study_plugin,
+            jiten_api_key=study_settings.jiten_api_key,
+            jpdb_api_token=study_settings.jpdb_api_token,
+        )
+        if study_plan["exclusive"]:
+            # Explicit loading keeps all ordinary user scripts while ensuring
+            # JitenMPV and jpdb-mpv-plugin never run together in Pudge's mpv.
+            mpv_extra_args.append("--load-scripts=no")
+            mpv_extra_args.extend(
+                f"--script={path}" for path in study_plan["scripts"]
+            )
+    except (OSError, ValueError):
+        # Playback remains available if a third-party plugin is being changed
+        # on disk while the command is constructed.
+        pass
     if args.start_at and args.start_at > 0:
         mpv_extra_args.append(f"--start={max(0.0, float(args.start_at)):.3f}")
     if args.fullscreen and not any(arg in {"--fs", "--fullscreen"} or arg.startswith("--fs=") for arg in mpv_extra_args):
@@ -2184,7 +2233,9 @@ def process_video(
         script=tracker_script,
     )
     pipeline_timer.mark("ready_to_launch", subtitle=subtitle or "", embedded_sid=subtitle_id)
-    clear_foreground(config.paths.cache_dir, pid=os.getpid())
+    # Keep the foreground marker alive for the full mpv lifetime. Background
+    # subtitle workers use it as a preemption signal; clearing it here allowed
+    # the scheduled agent to start ffmpeg/ffsubsync while the user was watching.
     configure_logging().info(
         "EVENT mpv.launch video=%s subtitle=%s embedded_sid=%s sub_fix_timing=%s",
         video,
@@ -2316,6 +2367,38 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = load_config(args.config)
+    if args.subtitle_prewarm_file:
+        from .mpv_study import SubtitleStudyApi
+
+        try:
+            if hasattr(os, "nice"):
+                try:
+                    os.nice(10)
+                except OSError:
+                    pass
+            result = SubtitleStudyApi(
+                config, media_id=args.subtitle_study_media_id
+            ).prewarm_file(
+                args.subtitle_prewarm_file,
+                start_seconds=args.subtitle_prewarm_from,
+            )
+        except Exception as exc:
+            print(f"Subtitle translation prewarm failed: {exc}", file=sys.stderr)
+            return 1
+        print("PUDGE_TRANSLATION_PREWARM_JSON=" + json.dumps(result, ensure_ascii=False))
+        return 0
+    if args.subtitle_translate:
+        from .mpv_study import SubtitleStudyApi
+
+        try:
+            result = SubtitleStudyApi(
+                config, media_id=args.subtitle_study_media_id
+            ).translate(args.subtitle_study_text, args.subtitle_study_context)
+        except Exception as exc:
+            print(f"Subtitle translation failed: {exc}", file=sys.stderr)
+            return 1
+        print("PUDGE_TRANSLATION_JSON=" + json.dumps(result, ensure_ascii=False))
+        return 0
     if args.playback_save:
         return _run_playback_save(args, config)
     if args.app:
