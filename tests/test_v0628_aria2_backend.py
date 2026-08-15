@@ -451,7 +451,7 @@ def test_aria2_delete_removes_owned_metadata(tmp_path: Path, monkeypatch) -> Non
             return []
         if method == "aria2.tellStatus":
             return {"status": "paused", "files": [], "dir": str(tmp_path)}
-        if method in {"aria2.forceRemove", "aria2.removeDownloadResult"}:
+        if method in {"aria2.forceRemove", "aria2.removeDownloadResult", "aria2.saveSession"}:
             return "OK"
         raise AssertionError(method)
 

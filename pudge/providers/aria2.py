@@ -31,7 +31,7 @@ class Aria2Client:
     independently running aria2 instance out of pudge's library cleanup.
     """
 
-    _RUNTIME_PROFILE = "v3-low-heat-no-resume-recheck"
+    _RUNTIME_PROFILE = "v4-detach-seed-only"
     _SAFE_RPC_TORRENT_BYTES = 1_250_000
 
     def __init__(
@@ -228,6 +228,7 @@ class Aria2Client:
     def _runtime_options(self) -> dict[str, str]:
         return {
             **self._seed_options(),
+            "bt-detach-seed-only": "true",
             "max-upload-limit": (
                 f"{self.upload_limit_kib}K" if self.upload_limit_kib else "0"
             ),
@@ -257,7 +258,7 @@ class Aria2Client:
         # add time, so global changes are sufficient here.
 
     def _launch_options(self) -> list[str]:
-        values = ["--no-conf=true"]
+        values = ["--no-conf=true", "--bt-detach-seed-only=true"]
         values.extend(f"--{key}={value}" for key, value in self._seed_options().items())
         if self.upload_limit_kib:
             values.append(f"--max-upload-limit={self.upload_limit_kib}K")
@@ -452,6 +453,30 @@ class Aria2Client:
                 return payload
         return None
 
+    @staticmethod
+    def _richest_magnet(*sources: str) -> str:
+        magnets = [
+            str(source or "").strip()
+            for source in sources
+            if str(source or "").strip().casefold().startswith("magnet:?")
+        ]
+        if not magnets:
+            return ""
+        return max(
+            magnets,
+            key=lambda value: (
+                value.casefold().count("&tr="),
+                len(value),
+            ),
+        )
+
+    @classmethod
+    def _preferred_release_source(cls, release: NyaaRelease) -> str:
+        richest = cls._richest_magnet(release.magnet, release.torrent_url)
+        if richest:
+            return richest
+        return str(release.magnet or release.torrent_url or "").strip()
+
     def _add_source(
         self,
         release: NyaaRelease,
@@ -472,7 +497,7 @@ class Aria2Client:
                     raise
                 # If the source host was reachable but aria2 rejected the file,
                 # retain the old magnet path as a safe compatibility fallback.
-        source = str(release.magnet or release.torrent_url or "").strip()
+        source = self._preferred_release_source(release)
         if not source:
             raise Aria2Error("Релиз не содержит ни magnet-ссылки, ни torrent URL")
         returned = self._rpc_raw("aria2.addUri", [[source], options])
@@ -553,7 +578,7 @@ class Aria2Client:
             "anime_title": anime_title,
             "release_score": float(score),
             "source_url": str(release.torrent_url or release.link or ""),
-            "magnet": str(release.magnet or ""),
+            "magnet": self._richest_magnet(release.magnet, release.torrent_url),
             "listed_seeders": max(0, int(release.seeders or 0)),
             "listed_leechers": max(0, int(release.leechers or 0)),
             "added_on": int(time.time()),
@@ -607,7 +632,10 @@ class Aria2Client:
         payload = torrent_payload
         if payload is None:
             payload = self._torrent_payload(str(meta.get("source_url") or ""))
-        magnet = str(meta.get("magnet") or "").strip()
+        magnet = self._richest_magnet(
+            str(meta.get("magnet") or ""),
+            str(meta.get("source_url") or ""),
+        )
         if not magnet:
             # Older Pudge metadata predates the persisted magnet field. The
             # BitTorrent info hash is sufficient to ask DHT/trackers for the
@@ -665,6 +693,68 @@ class Aria2Client:
             pass
         return True
 
+    def _upgrade_metadata_only_source(
+        self,
+        gid: str,
+        status: dict[str, Any],
+    ) -> bool:
+        state = str(status.get("status") or "").casefold()
+        if state not in {"active", "waiting", "paused"}:
+            return False
+        if int(status.get("totalLength") or 0) > 0:
+            return False
+        if int(status.get("completedLength") or 0) > 0:
+            return False
+
+        metadata = self._load_metadata()
+        meta = dict(metadata.get(gid) or {})
+        if not meta:
+            return False
+
+        current = str(meta.get("magnet") or "").strip()
+        replacement = self._richest_magnet(
+            current,
+            str(meta.get("source_url") or ""),
+        )
+        if not replacement:
+            return False
+        if replacement == current:
+            return False
+        if replacement.casefold().count("&tr=") <= current.casefold().count("&tr="):
+            return False
+
+        options = {
+            "dir": str(meta.get("save_path") or status.get("dir") or self.state_dir),
+            "pause": "false",
+            "gid": gid,
+            "bt-save-metadata": "true",
+            "bt-load-saved-metadata": "true",
+            "check-integrity": "false",
+            **self._seed_options(),
+        }
+        try:
+            self._rpc_raw("aria2.forceRemove", [gid])
+        except Aria2Error:
+            pass
+        try:
+            self._rpc_raw("aria2.removeDownloadResult", [gid])
+        except Aria2Error:
+            pass
+
+        returned_gid = str(
+            self._rpc_raw("aria2.addUri", [[replacement], options]) or gid
+        )
+        metadata.pop(gid, None)
+        meta["magnet"] = replacement
+        meta["recovery_started_at"] = int(time.time())
+        metadata[returned_gid] = meta
+        self._save_metadata(metadata)
+        try:
+            self._rpc_raw("aria2.saveSession")
+        except Aria2Error:
+            pass
+        return True
+
     def reconnect(self, torrent_hash: str) -> bool:
         """Reannounce a stall or safely reconstruct a lost BitTorrent control file."""
 
@@ -685,6 +775,8 @@ class Aria2Client:
             ],
         ) or {}
         state = str(status.get("status") or "").casefold()
+        if self._upgrade_metadata_only_source(gid, status):
+            return True
         if state == "error":
             return self._recover_missing_control_file(gid, status)
         if state in {"complete", "removed"}:
@@ -711,7 +803,7 @@ class Aria2Client:
         """Replace a metadata-only magnet with Nyaa's tracker-rich torrent."""
 
         payload = self._torrent_payload(release.torrent_url)
-        if not payload:
+        if not payload and not self._preferred_release_source(release):
             return False
         self.ensure_running()
         gid = self._resolve_gid(torrent_hash)
@@ -899,6 +991,7 @@ class Aria2Client:
                 "recoverable_missing_control": self._missing_control_file_error(item),
                 "legacy_seeding_stopped": legacy_seeding_stopped,
                 "aria2_status": status,
+                "recovery_started_at": int(meta.get("recovery_started_at") or 0),
                 "verifying": verifying,
                 "verified": verified,
                 "verification_progress": (
@@ -957,7 +1050,8 @@ class Aria2Client:
         try:
             self._rpc_raw("aria2.forceRemove", [gid])
         except Aria2Error as exc:
-            if "not found" not in str(exc).lower():
+            detail = str(exc).casefold()
+            if "not found" not in detail and "invalid gid" not in detail:
                 raise
         try:
             self._rpc_raw("aria2.removeDownloadResult", [gid])
@@ -966,6 +1060,10 @@ class Aria2Client:
         metadata = self._load_metadata()
         metadata.pop(gid, None)
         self._save_metadata(metadata)
+        try:
+            self._rpc_raw("aria2.saveSession")
+        except Aria2Error:
+            pass
         if delete_files:
             for entry in status.get("files") or []:
                 path = Path(str(entry.get("path") or "")).expanduser()

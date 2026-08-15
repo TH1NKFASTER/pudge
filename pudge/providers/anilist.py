@@ -1056,7 +1056,8 @@ class AniListClient:
         if relative_episode < 1:
             return relative_episode, [start]
 
-        valid_formats = {"TV", "TV_SHORT", "ONA"}
+        counted_formats = {"TV", "TV_SHORT", "ONA"}
+        bridge_formats = {"OVA", "SPECIAL", "MOVIE"}
 
         def relation_rank(source: AniListAnime, candidate: AniListAnime) -> tuple[float, float, int]:
             source_names = [*source.titles, *source.synonyms]
@@ -1074,15 +1075,17 @@ class AniListClient:
         visited = {start.id}
         for _ in range(max_hops):
             _, relations = self.get_anime_with_relations(current.id)
-            prequels = [
-                anime
-                for relation_type, anime in relations
-                if relation_type == "PREQUEL"
-                and anime.id not in visited
-                and (anime.format or "").upper() in valid_formats
-                and anime.episodes is not None
-                and anime.episodes > 0
-            ]
+            prequels = []
+            for relation_type, anime in relations:
+                if relation_type != "PREQUEL" or anime.id in visited:
+                    continue
+                candidate_format = (anime.format or "").upper()
+                if candidate_format in counted_formats:
+                    if anime.episodes is None or anime.episodes <= 0:
+                        continue
+                elif candidate_format not in bridge_formats:
+                    continue
+                prequels.append(anime)
             if not prequels:
                 break
             candidate = max(prequels, key=lambda anime: relation_rank(current, anime))
@@ -1092,9 +1095,13 @@ class AniListClient:
             # chains are typically bounded entries, while e.g. original BLEACH
             # (366 episodes) must not be added to Thousand-Year Blood War.
             episode_cap = max(100, int(start.episodes or 0) * 4)
-            if continuity < 35.0 or int(candidate.episodes or 0) > episode_cap:
+            counted = (candidate.format or "").upper() in counted_formats
+            if continuity < 35.0 or (
+                counted and int(candidate.episodes or 0) > episode_cap
+            ):
                 break
-            total += int(candidate.episodes or 0)
+            if counted:
+                total += int(candidate.episodes or 0)
             visited.add(candidate.id)
             chain.insert(0, candidate)
             current = candidate

@@ -3453,6 +3453,13 @@ class AnimeManager:
                             item.raw["_tag_set"] = desired_tags
                 else:
                     backend_items = client.torrents(category=self.config.qbittorrent.category)
+                    discarded_recovery = self._discard_completed_aria2_recovery_tasks(
+                        client, backend_items
+                    )
+                    if discarded_recovery:
+                        backend_items = client.torrents(
+                            category=self.config.qbittorrent.category
+                        )
                     recovered_aria2 = self._recover_stalled_aria2_downloads(
                         client, backend_items
                     )
@@ -3535,6 +3542,61 @@ class AnimeManager:
         self.db.set_state("downloads_synced_at", str(time.time()))
         return completed
 
+    def _discard_completed_aria2_recovery_tasks(
+        self, client: Any, items: list[DownloadItem]
+    ) -> int:
+        """Drop metadata-only recovery tasks after the exact torrent is already local."""
+
+        delete = getattr(client, "delete", None)
+        if not callable(delete):
+            return 0
+        local_hashes = {
+            str(episode.torrent_hash or "").strip().casefold()
+            for episode in self.db.episodes()
+            if str(episode.torrent_hash or "").strip()
+            and episode.video_path.is_file()
+        }
+        if not local_hashes:
+            return 0
+
+        removed = 0
+        for item in items:
+            raw = item.raw or {}
+            torrent_hash = str(item.torrent_hash or "").strip().casefold()
+            if not torrent_hash or torrent_hash not in local_hashes:
+                continue
+            if not int(raw.get("recovery_started_at") or 0):
+                continue
+            state = str(item.state or "").casefold()
+            total = max(0, int(raw.get("total_size") or 0))
+            downloaded = max(0, int(raw.get("downloaded") or 0))
+            if (
+                state not in {"active", "waiting", "paused"}
+                or total > 0
+                or downloaded > 0
+            ):
+                continue
+            try:
+                # The exact torrent already produced a Library file. This is only
+                # the metadata-only magnet/hash-check shell created after a lost
+                # .aria2 control file, so never touch the downloaded video.
+                delete(item.torrent_hash, delete_files=False)
+            except QBittorrentError as exc:
+                self.logger.warning(
+                    "RETRY step=aria2.recovery_shell_cleanup hash=%s error=%r",
+                    item.torrent_hash,
+                    str(exc),
+                )
+                continue
+            self.db.set_state(f"aria2_stall:{torrent_hash}", "")
+            self.logger.info(
+                "REPAIR step=aria2.recovery_shell_cleanup hash=%s "
+                "reason=exact_library_file_exists delete_files=false",
+                item.torrent_hash,
+            )
+            removed += 1
+        return removed
+
     def _recover_stalled_aria2_downloads(
         self, client: Any, items: list[DownloadItem], *, now: float | None = None
     ) -> int:
@@ -3559,7 +3621,10 @@ class AnimeManager:
             stalled_candidate = (
                 state in {"active", "waiting"}
                 and not bool(raw.get("verifying"))
-                and 0 <= downloaded < total
+                and (
+                    (total > 0 and 0 <= downloaded < total)
+                    or (total == 0 and downloaded == 0)
+                )
                 and speed == 0
                 and connections == 0
             )
@@ -3581,6 +3646,11 @@ class AnimeManager:
             else:
                 marker.setdefault("stalled_since", current)
                 marker.setdefault("last_reconnect", 0.0)
+            if total == 0 and int(item.added_on or 0) > 0:
+                marker["stalled_since"] = min(
+                    float(marker["stalled_since"] or current),
+                    float(item.added_on),
+                )
             stalled_for = current - float(marker["stalled_since"] or current)
             since_reconnect = current - float(marker["last_reconnect"] or 0)
 
@@ -4559,6 +4629,21 @@ class AnimeManager:
                     except (TypeError, ValueError, json.JSONDecodeError):
                         parsed_meta = {}
                     subtitle_meta = parsed_meta if isinstance(parsed_meta, dict) else {}
+            meta_final_path = str(subtitle_meta.get("final_path") or "").strip()
+            if meta_final_path:
+                prepared_from_meta = Path(meta_final_path).expanduser()
+                if prepared_from_meta.is_file():
+                    if subtitle is None or subtitle != prepared_from_meta:
+                        self.logger.info(
+                            "REPAIR step=subtitle.prepare_result_path media_id=%s "
+                            "episode=%s video=%s old=%r new=%r source=meta_final_path",
+                            job["media_id"],
+                            job["episode"],
+                            video.name,
+                            str(subtitle) if subtitle is not None else "",
+                            str(prepared_from_meta),
+                        )
+                    subtitle = prepared_from_meta
             write_prepare_debug_result(
                 debug_paths["result"],
                 command=command,

@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from pudge.config import AppConfig
 from pudge.manager import AnimeManager
+from pudge.manager_models import LibraryEpisode
 from pudge.providers.aria2 import Aria2Client
 
 
@@ -285,3 +287,128 @@ def test_manager_does_not_publish_aria2_while_verifying_or_on_error() -> None:
 
     assert AnimeManager._download_is_complete(verifying) is False
     assert AnimeManager._download_is_complete(failed) is False
+
+
+def test_aria2_exposes_recovery_marker_on_metadata_only_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = Aria2Client(state_dir=tmp_path, seed_mode="off")
+    gid = "feb989d6d59f9869"
+    info_hash = "feb989d6d59f98698b918c1f96061a0d3e638c74"
+    client._save_metadata(
+        {
+            gid: {
+                "info_hash": info_hash,
+                "title": "episode.mkv",
+                "save_path": str(tmp_path / "downloads"),
+                "media_id": 182205,
+                "episode": 18,
+                "recovery_started_at": 123,
+                "added_on": 1,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        client,
+        "_all_statuses",
+        lambda: [
+            {
+                "gid": gid,
+                "status": "waiting",
+                "totalLength": "0",
+                "completedLength": "0",
+                "downloadSpeed": "0",
+                "uploadSpeed": "0",
+                "connections": "0",
+                "numSeeders": "0",
+                "seeder": "false",
+                "dir": str(tmp_path / "downloads"),
+                "files": [],
+                "bittorrent": {},
+                "infoHash": "",
+                "errorCode": "",
+                "errorMessage": "",
+                "verifiedLength": "0",
+                "verifyIntegrityPending": "false",
+            }
+        ],
+    )
+    try:
+        rows = client.torrents()
+    finally:
+        client.close()
+
+    assert len(rows) == 1
+    assert rows[0].torrent_hash == info_hash
+    assert rows[0].state == "waiting"
+    assert rows[0].raw["recovery_started_at"] == 123
+
+
+def test_manager_discards_zero_length_recovery_shell_when_exact_file_is_local(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig()
+    config.config_path = tmp_path / "config.toml"
+    config.library.database_path = tmp_path / "library.sqlite3"
+    config.library.root_dir = tmp_path / "library"
+    config.paths.cache_dir = tmp_path / "cache"
+    manager = AnimeManager(config, log=lambda _message: None)
+    info_hash = "feb989d6d59f98698b918c1f96061a0d3e638c74"
+    video = tmp_path / "library" / "Slime" / "Slime S04E18.mkv"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"complete video")
+    manager.db.upsert_episode(
+        LibraryEpisode(
+            media_id=182205,
+            title="Slime",
+            episode=18,
+            video_path=video.resolve(),
+            state="waiting_subtitles",
+            torrent_hash=info_hash,
+        )
+    )
+
+    item = SimpleNamespace(
+        torrent_hash=info_hash,
+        state="waiting",
+        raw={
+            "backend": "aria2",
+            "total_size": 0,
+            "downloaded": 0,
+            "recovery_started_at": 123,
+        },
+    )
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, bool]] = []
+
+        def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
+            self.calls.append((torrent_hash, delete_files))
+
+    client = Client()
+    assert manager._discard_completed_aria2_recovery_tasks(client, [item]) == 1
+    assert client.calls == [(info_hash, False)]
+    assert video.is_file()
+
+
+def test_manager_keeps_zero_length_recovery_without_exact_local_file(
+    tmp_path: Path,
+) -> None:
+    config = AppConfig()
+    config.config_path = tmp_path / "config.toml"
+    config.library.database_path = tmp_path / "library.sqlite3"
+    config.library.root_dir = tmp_path / "library"
+    config.paths.cache_dir = tmp_path / "cache"
+    manager = AnimeManager(config, log=lambda _message: None)
+    item = SimpleNamespace(
+        torrent_hash="a" * 40,
+        state="waiting",
+        raw={"total_size": 0, "downloaded": 0, "recovery_started_at": 123},
+    )
+
+    class Client:
+        def delete(self, *_args, **_kwargs) -> None:
+            raise AssertionError("must not delete an unresolved recovery")
+
+    assert manager._discard_completed_aria2_recovery_tasks(Client(), [item]) == 0

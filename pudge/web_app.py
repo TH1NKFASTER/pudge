@@ -1121,6 +1121,43 @@ class WebAppApi:
             return ("media", int(media_id))
         return ("title", str(item.get("title") or "").strip().casefold())
 
+    @staticmethod
+    def _download_shadowed_by_local(
+        card: dict[str, Any], download: dict[str, Any]
+    ) -> bool:
+        # A completed local episode wins over stale transport metadata.
+        if bool(download.get("is_batch")):
+            return False
+        local = card.get("local")
+        if not isinstance(local, dict):
+            return False
+        video_path = str(local.get("video_path") or "").strip()
+        if not video_path or not Path(video_path).is_file():
+            return False
+        local_episode = local.get("episode")
+        download_episode = download.get("episode")
+        if local_episode is None or download_episode is None:
+            return local_episode is None and download_episode is None
+        try:
+            return int(local_episode) == int(download_episode)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _pending_local_action(
+        local: dict[str, Any],
+        action_job: Any | None,
+        *,
+        ocr_enabled: bool,
+    ) -> tuple[str, str] | None:
+        del local, ocr_enabled
+        if action_job is None:
+            return None
+        return (
+            str(action_job["action_code"] or ""),
+            str(action_job["last_error"] or ""),
+        )
+
     @classmethod
     def _deduplicate_home_sections(
         cls,
@@ -1202,7 +1239,10 @@ class WebAppApi:
         needs_action_by_path = {
             str(row["video_path"]): row
             for row in self.manager.db.subtitle_jobs()
-            if str(row["state"] or "") == "needs_action"
+            if (
+                str(row["state"] or "") == "needs_action"
+                or str(row["action_code"] or "") == "enable_subtitle_ocr"
+            )
         }
         ready_by_media = {
             int(item["media_id"]): item
@@ -1308,9 +1348,13 @@ class WebAppApi:
                 continue
             local = item.get("local") if isinstance(item.get("local"), dict) else {}
             action_job = needs_action_by_path.get(str(local.get("video_path") or ""))
-            if action_job is not None:
-                item["action_code"] = str(action_job["action_code"] or "")
-                item["action_error"] = str(action_job["last_error"] or "")
+            action = self._pending_local_action(
+                local,
+                action_job,
+                ocr_enabled=bool(self.config.matching.ocr_image_subtitles),
+            )
+            if action is not None:
+                item["action_code"], item["action_error"] = action
                 sections["needs_action"].append(item)
             else:
                 sections["waiting"].append(item)
@@ -1573,13 +1617,19 @@ class WebAppApi:
         current = [self._anime_payload(a) for a in current_anime]
         for payload in current:
             download = download_by_media.get(int(payload["media_id"]))
-            if download is not None:
+            if (
+                download is not None
+                and not self._download_shadowed_by_local(payload, download)
+            ):
                 payload["download"] = download
         planned = []
         for anime in planned_anime:
             payload = self._anime_payload(anime)
             download = download_by_media.get(int(anime.media_id))
-            if download is not None:
+            if (
+                download is not None
+                and not self._download_shadowed_by_local(payload, download)
+            ):
                 payload["download"] = download
             payload["planning_download_hidden"] = self._planning_download_button_hidden(
                 anime,
@@ -1616,7 +1666,9 @@ class WebAppApi:
                 return
             media_id = card.get("media_id")
             if media_id is not None and int(media_id) in download_by_media:
-                card["download"] = download_by_media[int(media_id)]
+                download = download_by_media[int(media_id)]
+                if not self._download_shadowed_by_local(card, download):
+                    card["download"] = download
 
         represented: set[int] = set()
         for cards in home.values():
