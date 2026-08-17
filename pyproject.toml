@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.18"
+version = "0.7.19"
 description = "macOS anime library manager with AniList, Nyaa, qBittorrent, mpv and Japanese subtitles"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,7 +15,7 @@ dependencies = [
   "charset-normalizer>=3.3,<4",
   "pillow>=10,<13",
   "socksio>=1.0,<2",
-  "pywebview>=5.4,<7",
+  "pywebview>=6.2,<7",
   "pyobjc-core>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",

@@ -2,7 +2,7 @@
 
 Pudge is a macOS media companion focused on anime with Japanese subtitles. It combines a local library, AniList progress, Nyaa downloads, qBittorrent/aria2, mpv playback, subtitle discovery and automatic timing repair in one native window.
 
-Current version: **0.7.18**.
+Current version: **0.7.19**.
 
 ## What it does
 

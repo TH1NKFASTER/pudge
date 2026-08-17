@@ -445,7 +445,9 @@ def test_web_ui_exposes_timing_diagnostics() -> None:
 def test_runtime_icon_is_applied_to_cocoa_process() -> None:
     source = (Path(__file__).parents[1] / "pudge" / "web_app.py").read_text(encoding="utf-8")
     assert "setApplicationIconImage_" in source
-    assert "webview.start(on_started" in source
+    assert "webview.start(" in source
+    assert "on_started," in source
+    assert "icon=str(runtime_icon) if runtime_icon.is_file() else None" in source
     assert 'assets" / "app-icon.png"' in source
 
 

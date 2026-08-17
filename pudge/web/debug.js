@@ -131,7 +131,7 @@
     if(running)livePollTimer=setTimeout(()=>void pollFreshRun(),800);else livePollTimer=null;
   };
   const freshSubtitles = async () => {
-    const path=currentData?.selected_local_episode?.video_path;if(!path||!confirm(labels().freshConfirm))return;
+    const path=currentData?.selected_local_episode?.video_path;if(!path||!await pudgeConfirm(labels().freshConfirm))return;
     stopLivePoll();await pywebview.api.debug_reselect_subtitles(path);activeTab='subtitles';livePollTimer=setTimeout(()=>void pollFreshRun(),250);
   };
 

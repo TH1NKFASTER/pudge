@@ -2090,6 +2090,15 @@ def process_video(
             jiten_api_key=study_settings.jiten_api_key,
             jpdb_api_token=study_settings.jpdb_api_token,
         )
+        if (
+            sys.platform == "darwin"
+            and study_plan.get("selected") == "jiten"
+            and not config.ui.jiten_developer_tools_confirmed
+        ):
+            configure_logging().warning(
+                "ACTION_REQUIRED step=jiten.developer_tools "
+                "detail='Enable both Pudge and mpv in Privacy & Security > Developer Tools'"
+            )
         if study_plan["exclusive"]:
             # Explicit loading keeps all ordinary user scripts while ensuring
             # JitenMPV and jpdb-mpv-plugin never run together in Pudge's mpv.

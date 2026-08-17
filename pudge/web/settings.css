@@ -6,3 +6,5 @@
 .needs-action-button{width:100%;margin-top:auto;padding:5px 6px;border-color:var(--danger);font-size:9px;line-height:1.15}
 button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[role=button]:focus-visible{outline:2px solid #9eb2ff;outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+
+.jiten-devtools-callout{grid-column:1/-1}

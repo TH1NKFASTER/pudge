@@ -24,6 +24,7 @@ class UIConfig:
     escape_exits_fullscreen: bool = True
     notifications_enabled: bool = True
     permissions_requested: bool = False
+    jiten_developer_tools_confirmed: bool = False
 
 
 @dataclass(slots=True)
@@ -359,6 +360,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             escape_exits_fullscreen=bool(ui.get("escape_exits_fullscreen", True)),
             notifications_enabled=bool(ui.get("notifications_enabled", True)),
             permissions_requested=bool(ui.get("permissions_requested", False)),
+            jiten_developer_tools_confirmed=bool(ui.get("jiten_developer_tools_confirmed", False)),
         ),
         paths=PathsConfig(
             download_dirs=_load_watched_media_dirs(paths),
@@ -615,6 +617,7 @@ onboarding_completed = {_toml_bool(config.ui.onboarding_completed)}
 escape_exits_fullscreen = {_toml_bool(config.ui.escape_exits_fullscreen)}
 notifications_enabled = {_toml_bool(config.ui.notifications_enabled)}
 permissions_requested = {_toml_bool(config.ui.permissions_requested)}
+jiten_developer_tools_confirmed = {_toml_bool(config.ui.jiten_developer_tools_confirmed)}
 
 [paths]
 watched_media_dirs = {_toml_string_list(config.paths.download_dirs)}

@@ -193,6 +193,24 @@ class WebAppApi:
         subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
         return {"ok": True}
 
+    def open_developer_tools_settings(self) -> dict[str, Any]:
+        if sys.platform != "darwin":
+            return {"ok": False, "supported": False}
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTool",
+        ])
+        mpv = dependency_status(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+        ).get("mpv", {})
+        return {
+            "ok": True,
+            "supported": True,
+            "pudge_app": str(Path.home() / "Applications" / f"{APP_SLUG}.app"),
+            "mpv": str(mpv.get("path") or self.config.tools.mpv),
+        }
+
     def set_window(self, window: Any) -> None:
         self.window = window
 
@@ -1433,6 +1451,7 @@ class WebAppApi:
             "escape_exits_fullscreen": cfg.ui.escape_exits_fullscreen,
             "notifications_enabled": cfg.ui.notifications_enabled,
             "permissions_requested": cfg.ui.permissions_requested,
+            "jiten_developer_tools_confirmed": cfg.ui.jiten_developer_tools_confirmed,
             "library_root": str(cfg.library.root_dir),
             "watched_folders": "\n".join(str(path) for path in cfg.paths.download_dirs),
             "subtitle_folders": "\n".join(str(path) for path in cfg.paths.subtitle_dirs),
@@ -3278,6 +3297,12 @@ class WebAppApi:
         )
         cfg.ui.notifications_enabled = bool(
             values.get("notifications_enabled", cfg.ui.notifications_enabled)
+        )
+        cfg.ui.jiten_developer_tools_confirmed = bool(
+            values.get(
+                "jiten_developer_tools_confirmed",
+                cfg.ui.jiten_developer_tools_confirmed,
+            )
         )
         cfg.library.root_dir = Path(str(values.get("library_root", cfg.library.root_dir))).expanduser()
         def _folder_list(value: object) -> list[Path]:
@@ -5333,7 +5358,13 @@ def launch_web_app(config_path: Path) -> int:
 
     try:
         with timed_step(api.logger, "app.webview_lifetime"):
-            webview.start(on_started, gui="cocoa", debug=False)
+            runtime_icon = Path(__file__).resolve().parent / "assets" / "app-icon.png"
+            webview.start(
+                on_started,
+                gui="cocoa",
+                debug=False,
+                icon=str(runtime_icon) if runtime_icon.is_file() else None,
+            )
     finally:
         api.close()
         api.logger.info("APP session_stop")
