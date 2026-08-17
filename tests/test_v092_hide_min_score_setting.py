@@ -10,10 +10,17 @@ def test_min_score_is_not_exposed_in_settings_ui() -> None:
     assert "min_score:Number(ui.state.settings?.min_score??72)" in source
 
 
-def test_release_version_is_0717() -> None:
-    assert pudge.__version__ == "0.7.17"
+def test_release_version_matches_project() -> None:
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    expected = tomllib.loads(
+        (root / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]["version"]
+    assert pudge.__version__ == expected
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
-    assert 'version = "0.7.17"' in pyproject
-    assert "Current version: **0.7.17**." in readme
+    assert f'version = "{expected}"' in pyproject
+    assert f"Current version: **{expected}**." in readme
     assert "pudge-macos-v0.7.17.zip" in readme
