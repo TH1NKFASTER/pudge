@@ -1125,9 +1125,11 @@ def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -
 
 
 def test_library_external_subtitle_has_filename_tooltip_and_reveal_action() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'data-action="reveal-subtitle"' in html
-    assert "e.subtitle_filename||revealPath" in html
+    web_dir = Path(__file__).parents[1] / "pudge" / "web"
+    html = (web_dir / "index.html").read_text(encoding="utf-8")
+    library = (web_dir / "library.js").read_text(encoding="utf-8")
+    assert 'data-action="reveal-subtitle"' in library
+    assert "e.subtitle_filename||revealPath" in library
     assert "pywebview.api.reveal_subtitle_file(target.dataset.path)" in html
     assert ".library-subtitle.external-link" in html
 

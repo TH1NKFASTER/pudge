@@ -59,7 +59,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.38-timeline-monotonic-boundaries-large-cold-open:{tag}:"
+        f"syncing-v0.3.39-early-edit-speech-verification:{tag}:"
         f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
@@ -75,6 +75,11 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
 
 def _result(reason: str, **values: object) -> dict[str, object]:
     return {"reason": reason, **values}
+
+
+def _timeline_needs_audio_verification(result: dict[str, object]) -> bool:
+    risk = result.get("timeline_early_edit_audio_verification")
+    return isinstance(risk, dict) and bool(risk.get("required"))
 
 
 def _record_timeline_debug_attempt(
@@ -4129,7 +4134,6 @@ def repair_with_embedded_reference_piecewise(
         for start, end in transition_regions
         if end > start + 15.0
     }
-    early_keys = cold_keys | transition_keys
     for region_start, region_end in regions:
         if region_end <= region_start + 15.0:
             continue
@@ -4171,7 +4175,6 @@ def repair_with_embedded_reference_piecewise(
     # windows as a continuity reference and replace only opening estimates that
     # disagree in sign or jump implausibly far from that local trend.
     broad_records = [record for record in raw_anchor_records if record[2] == "broad"]
-    cold_records = [record for record in raw_anchor_records if record[2] == "cold"]
 
     # A subtitle track with SDH/music/SFX captions can be much denser than a
     # normal embedded translation. In that case activity correlation may align
@@ -5307,6 +5310,596 @@ def synchronize_pgs_with_embedded_reference(
     return output, result
 
 
+
+def _stt_alass_transition_safety(
+    source: Path,
+    aligned: Path,
+) -> dict[str, object]:
+    """Describe whether large ALASS clock jumps sit on real subtitle gaps."""
+    try:
+        source_cues = parse_srt(source)
+        aligned_cues = parse_srt(aligned)
+    except OSError as exc:
+        return {
+            "available": False,
+            "accepted": False,
+            "reason": "read_error",
+            "error": str(exc),
+        }
+    if not source_cues or len(source_cues) != len(aligned_cues):
+        return {
+            "available": False,
+            "accepted": False,
+            "reason": "structure_mismatch",
+            "source_cues": len(source_cues),
+            "aligned_cues": len(aligned_cues),
+        }
+
+    shifts = [
+        float(aligned_start) - float(source_start)
+        for (source_start, _source_end, _text), (aligned_start, _aligned_end, _aligned_text)
+        in zip(source_cues, aligned_cues)
+    ]
+    transitions: list[dict[str, object]] = []
+
+    def nearby_gap(index: int) -> tuple[float, float]:
+        best_gap = 0.0
+        best_time = 0.0
+        lo = max(1, index - 4)
+        hi = min(len(source_cues), index + 5)
+        for cue_index in range(lo, hi):
+            previous_end = float(source_cues[cue_index - 1][1])
+            current_start = float(source_cues[cue_index][0])
+            gap = max(0.0, current_start - previous_end)
+            if gap > best_gap:
+                best_gap = gap
+                best_time = (previous_end + current_start) / 2.0
+        return best_gap, best_time
+
+    for index in range(1, len(shifts)):
+        jump = float(shifts[index] - shifts[index - 1])
+        if abs(jump) < 4.0:
+            continue
+        gap, gap_time = nearby_gap(index)
+        transitions.append(
+            {
+                "cue_index": index,
+                "source_time": round(float(source_cues[index][0]), 3),
+                "jump_seconds": round(jump, 3),
+                "nearby_gap_seconds": round(gap, 3),
+                "nearby_gap_time": round(gap_time, 3),
+                "gap_supported": gap >= 30.0,
+            }
+        )
+
+    unsupported = [row for row in transitions if not bool(row["gap_supported"])]
+    return {
+        "available": True,
+        "accepted": not unsupported,
+        "reason": "ok" if not unsupported else "large_transition_without_real_gap",
+        "large_transition_count": len(transitions),
+        "unsupported_transition_count": len(unsupported),
+        "transitions": transitions,
+    }
+
+
+def _stt_alass_map_safe(
+    result: dict[str, object],
+    transition_safety: dict[str, object],
+) -> tuple[bool, str]:
+    try:
+        blocks = int(result.get("alass_blocks") or 0)
+        spread = abs(float(result.get("alass_shift_spread_seconds") or 0.0))
+    except (TypeError, ValueError):
+        return False, "stt_alass_metrics_unavailable"
+
+    # A large insert/remove around an OP should normally produce one clock jump
+    # (two plateaus). Three or more ALASS blocks with a huge spread is a classic
+    # false attachment: dialogue from after the OP gets pulled into the OP.
+    if blocks >= 3 and spread >= 20.0:
+        return False, "stt_alass_fragmented_large_edit"
+
+    if spread >= 20.0 and not bool(transition_safety.get("accepted")):
+        return False, str(
+            transition_safety.get("reason")
+            or "stt_alass_large_edit_without_gap_support"
+        )
+
+    return True, "ok"
+
+
+def _nearest_reference_error(
+    timestamp: float,
+    reference_starts: list[float],
+) -> float:
+    if not reference_starts:
+        return float("inf")
+    best = float("inf")
+    for value in reference_starts:
+        error = abs(value - timestamp)
+        if error < best:
+            best = error
+        if value > timestamp and error > best:
+            break
+    return best
+
+
+def _local_speech_shift_estimate(
+    starts: list[float],
+    reference_starts: list[float],
+    *,
+    max_shift_seconds: float = 8.0,
+) -> dict[str, object]:
+    if len(starts) < 4 or len(reference_starts) < 4:
+        return {
+            "accepted": False,
+            "reason": "too_few_onsets",
+            "shift_seconds": 0.0,
+        }
+
+    ordered_starts = sorted(float(value) for value in starts)
+    ordered_reference = sorted(float(value) for value in reference_starts)
+
+    def evaluate(shift: float) -> dict[str, float | int]:
+        shifted = [value + shift for value in ordered_starts]
+        # Sequence alignment instead of independent nearest-neighbour matching.
+        # A Whisper segment can explain at most one subtitle cue and cue order
+        # must be preserved, which prevents dense speech from manufacturing a
+        # convincing but wrong cold-open offset.
+        previous: list[tuple[int, float]] = [
+            (0, 0.0) for _ in range(len(ordered_reference) + 1)
+        ]
+        for source_time in shifted:
+            current: list[tuple[int, float]] = [(0, 0.0)]
+            for ref_index, reference_time in enumerate(ordered_reference, start=1):
+                best = previous[ref_index]
+                if current[ref_index - 1] > best:
+                    best = current[ref_index - 1]
+                error = abs(source_time - reference_time)
+                if error <= 0.90:
+                    matched, neg_error = previous[ref_index - 1]
+                    candidate = (matched + 1, neg_error - error)
+                    if candidate > best:
+                        best = candidate
+                current.append(best)
+            previous = current
+
+        matched, neg_error = previous[-1]
+        mean_error = (-neg_error / matched) if matched else float("inf")
+        return {
+            "matched": matched,
+            "coverage": matched / max(1, len(ordered_starts)),
+            "mean_error": mean_error,
+        }
+
+    baseline = evaluate(0.0)
+    candidates: list[tuple[tuple[float, ...], float, dict[str, float | int]]] = []
+    steps = int(round(max_shift_seconds * 10.0))
+    for step in range(-steps, steps + 1):
+        shift = step / 10.0
+        metrics = evaluate(shift)
+        matched = int(metrics["matched"])
+        coverage = float(metrics["coverage"])
+        mean_error = float(metrics["mean_error"])
+        rank = (
+            float(matched),
+            coverage,
+            -mean_error if math.isfinite(mean_error) else -999.0,
+            -abs(shift),
+        )
+        candidates.append((rank, shift, metrics))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _rank, best_shift, best = candidates[0]
+
+    baseline_matched = int(baseline["matched"])
+    best_matched = int(best["matched"])
+    baseline_error = float(baseline["mean_error"])
+    best_error = float(best["mean_error"])
+    matched_gain = best_matched - baseline_matched
+    error_gain = (
+        baseline_error - best_error
+        if math.isfinite(baseline_error) and math.isfinite(best_error)
+        else 0.0
+    )
+
+    accepted = bool(
+        abs(best_shift) >= 0.20
+        and float(best["coverage"]) >= 0.45
+        and (
+            matched_gain >= 2
+            or (
+                best_matched >= max(4, baseline_matched - 1)
+                and error_gain >= 0.12
+            )
+        )
+    )
+    return {
+        "accepted": accepted,
+        "reason": "improved" if accepted else "no_clear_improvement",
+        "shift_seconds": round(float(best_shift), 3) if accepted else 0.0,
+        "baseline": {
+            "matched": baseline_matched,
+            "coverage": round(float(baseline["coverage"]), 4),
+            "mean_error_seconds": (
+                round(baseline_error, 4) if math.isfinite(baseline_error) else None
+            ),
+        },
+        "best": {
+            "matched": best_matched,
+            "coverage": round(float(best["coverage"]), 4),
+            "mean_error_seconds": (
+                round(best_error, 4) if math.isfinite(best_error) else None
+            ),
+        },
+        "matched_gain": matched_gain,
+        "mean_error_gain_seconds": round(error_gain, 4),
+        "matching": "monotonic_one_to_one",
+    }
+
+
+
+def _restore_embedded_opening_clock_scaffold(
+    aligned: Path,
+    embedded_result: dict[str, object],
+    speech_result: dict[str, object],
+    cache_dir: Path,
+) -> tuple[Path, dict[str, object]]:
+    if aligned.parent.name == "embedded-opening-scaffold":
+        return aligned, _result(
+            "already_applied",
+            applied=False,
+            idempotent=True,
+            output=str(aligned),
+        )
+
+    segments = embedded_result.get("timeline_segments")
+    risk = embedded_result.get("timeline_early_edit_audio_verification")
+    if not isinstance(segments, list) or len(segments) < 2:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="not_piecewise",
+        )
+    if not isinstance(risk, dict) or not bool(risk.get("required")):
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="timeline_not_risky",
+        )
+
+    stable = [
+        row for row in segments
+        if isinstance(row, dict)
+        and str(row.get("kind") or "stable") == "stable"
+    ]
+    if len(stable) < 2:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="too_few_stable_segments",
+        )
+
+    first = stable[0]
+    post = max(
+        stable[1:],
+        key=lambda row: max(0, int(row.get("support") or 0)),
+    )
+    try:
+        first_offset = float(first.get("offset_seconds") or 0.0)
+        post_offset = float(post.get("offset_seconds") or 0.0)
+        first_support = max(0, int(first.get("support") or 0))
+        post_support = max(0, int(post.get("support") or 0))
+        speech_offset = float(speech_result.get("offset_seconds"))
+    except (TypeError, ValueError):
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="clock_metrics_unavailable",
+        )
+
+    target_relative_clock = first_offset - post_offset
+
+    plateau = speech_result.get("stt_opening_plateau_refinement")
+    pre_refinement = 0.0
+    post_refinement = 0.0
+    if isinstance(plateau, dict) and bool(plateau.get("applied")):
+        try:
+            pre_refinement = float(plateau.get("pre_shift_seconds") or 0.0)
+            post_refinement = float(plateau.get("post_shift_seconds") or 0.0)
+        except (TypeError, ValueError):
+            pre_refinement = 0.0
+            post_refinement = 0.0
+
+    existing_relative_clock = pre_refinement - post_refinement
+    correction = target_relative_clock - existing_relative_clock
+    if not (4.0 <= abs(correction) <= 20.0):
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="clock_delta_out_of_range",
+            correction_seconds=round(correction, 3),
+        )
+    if first_support < 2 or post_support < 6:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="insufficient_segment_support",
+            first_support=first_support,
+            post_support=post_support,
+        )
+    if abs(speech_offset - post_offset) > 2.5:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="speech_clock_disagrees_with_post_plateau",
+            speech_offset_seconds=round(speech_offset, 3),
+            post_offset_seconds=round(post_offset, 3),
+        )
+
+    try:
+        cues = parse_srt(aligned)
+    except OSError as exc:
+        return aligned, _result(
+            "opening_scaffold_read_error",
+            applied=False,
+            error=str(exc),
+        )
+    if len(cues) < 8:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="too_few_cues",
+        )
+
+    gaps = []
+    timeline_origin = float(cues[0][0])
+    for index in range(1, len(cues)):
+        previous_end = float(cues[index - 1][1])
+        current_start = float(cues[index][0])
+        gap = current_start - previous_end
+        midpoint = (previous_end + current_start) / 2.0
+        if gap >= 45.0 and midpoint - timeline_origin <= 240.0:
+            gaps.append((gap, index, midpoint))
+    if not gaps:
+        return aligned, _result(
+            "opening_scaffold_unavailable",
+            applied=False,
+            reason_detail="opening_gap_not_found",
+        )
+
+    gap_seconds, split_index, gap_midpoint = max(gaps)
+    repaired = []
+    for index, (start, end, cue_text) in enumerate(cues):
+        shift = correction if index < split_index else 0.0
+        repaired.append(
+            (
+                max(0.0, float(start) + shift),
+                max(0.05, float(end) + shift),
+                cue_text,
+            )
+        )
+
+    stat = aligned.stat()
+    digest = hashlib.sha1(
+        (
+            f"embedded-opening-scaffold-v1:"
+            f"{aligned.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
+            f"{first_offset:.3f}:{post_offset:.3f}:{speech_offset:.3f}:"
+            f"{split_index}:{correction:.3f}"
+        ).encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "embedded-opening-scaffold"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+    if not output.exists() or output.stat().st_size <= 0:
+        write_srt(repaired, output, preserve_order=True)
+
+    return output, _result(
+        "applied",
+        applied=True,
+        output=str(output),
+        correction_seconds=round(correction, 3),
+        target_relative_clock_seconds=round(target_relative_clock, 3),
+        existing_relative_clock_seconds=round(existing_relative_clock, 3),
+        pre_refinement_seconds=round(pre_refinement, 3),
+        post_refinement_seconds=round(post_refinement, 3),
+        first_offset_seconds=round(first_offset, 3),
+        post_offset_seconds=round(post_offset, 3),
+        speech_offset_seconds=round(speech_offset, 3),
+        first_support=first_support,
+        post_support=post_support,
+        gap_seconds=round(gap_seconds, 3),
+        gap_midpoint_seconds=round(gap_midpoint, 3),
+        split_cue_index=split_index,
+    )
+
+def _refine_stt_opening_plateaus(
+    source: Path,
+    aligned: Path,
+    reference: Path,
+    cache_dir: Path,
+) -> tuple[Path, dict[str, object]]:
+    """Micro-align the dialogue plateaus on either side of a long early OP gap."""
+    try:
+        source_cues = parse_srt(source)
+        aligned_cues = parse_srt(aligned)
+        reference_cues = parse_srt(reference)
+    except OSError as exc:
+        return aligned, _result(
+            "stt_plateau_read_error",
+            applied=False,
+            error=str(exc),
+        )
+    if (
+        len(source_cues) < 10
+        or len(source_cues) != len(aligned_cues)
+        or len(reference_cues) < 10
+    ):
+        return aligned, _result(
+            "stt_plateau_structure_unavailable",
+            applied=False,
+            source_cues=len(source_cues),
+            aligned_cues=len(aligned_cues),
+            reference_cues=len(reference_cues),
+        )
+
+    gaps: list[tuple[float, int, float]] = []
+    source_origin = float(source_cues[0][0])
+    for index in range(1, len(source_cues)):
+        previous_end = float(source_cues[index - 1][1])
+        current_start = float(source_cues[index][0])
+        gap = current_start - previous_end
+        midpoint = (previous_end + current_start) / 2.0
+        if gap >= 45.0 and midpoint - source_origin <= 240.0:
+            gaps.append((gap, index, midpoint))
+    if not gaps:
+        return aligned, _result(
+            "stt_plateau_opening_gap_not_found",
+            applied=False,
+        )
+
+    gap_seconds, split_index, source_gap_midpoint = max(gaps)
+    aligned_gap_midpoint = (
+        float(aligned_cues[split_index - 1][1])
+        + float(aligned_cues[split_index][0])
+    ) / 2.0
+
+    reference_starts = sorted(
+        float(start)
+        for start, _end, text in reference_cues
+        if str(text or "").strip()
+    )
+    pre_starts = [
+        float(start)
+        for start, _end, text in aligned_cues[:split_index]
+        if str(text or "").strip()
+    ][-24:]
+    post_limit = aligned_gap_midpoint + 240.0
+    post_starts = [
+        float(start)
+        for start, _end, text in aligned_cues[split_index:]
+        if str(text or "").strip() and float(start) <= post_limit
+    ][:48]
+
+    # Cold-open dialogue must only match speech that occurs before the OP.
+    # Previously we searched all Whisper segments in the episode, so dense
+    # dialogue/music later in the file could create a false +1s optimum.
+    pre_reference_start = (min(pre_starts) - 8.0) if pre_starts else 0.0
+    pre_reference_end = (
+        float(aligned_cues[split_index - 1][1]) + 8.0
+        if split_index > 0
+        else aligned_gap_midpoint
+    )
+    pre_reference_starts = [
+        value
+        for value in reference_starts
+        if pre_reference_start <= value <= pre_reference_end
+    ]
+
+    post_reference_start = (
+        (min(post_starts) - 3.0) if post_starts else aligned_gap_midpoint
+    )
+    post_reference_end = (
+        (max(post_starts) + 3.0) if post_starts else post_limit
+    )
+    post_reference_starts = [
+        value
+        for value in reference_starts
+        if post_reference_start <= value <= post_reference_end
+    ]
+
+    pre_estimate = _local_speech_shift_estimate(
+        pre_starts,
+        pre_reference_starts,
+        max_shift_seconds=8.0,
+    )
+    post_estimate = _local_speech_shift_estimate(
+        post_starts,
+        post_reference_starts,
+        max_shift_seconds=3.0,
+    )
+    pre_shift = (
+        float(pre_estimate.get("shift_seconds") or 0.0)
+        if bool(pre_estimate.get("accepted"))
+        else 0.0
+    )
+    post_shift = (
+        float(post_estimate.get("shift_seconds") or 0.0)
+        if bool(post_estimate.get("accepted"))
+        else 0.0
+    )
+    if abs(pre_shift) < 0.20 and abs(post_shift) < 0.20:
+        return aligned, _result(
+            "stt_plateau_no_refinement",
+            applied=False,
+            gap_seconds=round(gap_seconds, 3),
+            source_gap_midpoint=round(source_gap_midpoint, 3),
+            aligned_gap_midpoint=round(aligned_gap_midpoint, 3),
+            pre=pre_estimate,
+            post=post_estimate,
+        )
+
+    repaired: list[tuple[float, float, str]] = []
+    for index, (start, end, text) in enumerate(aligned_cues):
+        shift = pre_shift if index < split_index else post_shift
+        repaired.append(
+            (
+                max(0.0, float(start) + shift),
+                max(0.05, float(end) + shift),
+                text,
+            )
+        )
+
+    stat = aligned.stat()
+    ref_stat = reference.stat()
+    digest = hashlib.sha1(
+        (
+            f"stt-opening-plateau-v1:"
+            f"{aligned.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
+            f"{reference.resolve()}:{ref_stat.st_size}:{ref_stat.st_mtime_ns}:"
+            f"{split_index}:{pre_shift:.3f}:{post_shift:.3f}"
+        ).encode()
+    ).hexdigest()[:20]
+    output_dir = cache_dir / "stt-opening-plateau"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f"{digest}.srt"
+    if not output.exists() or output.stat().st_size <= 0:
+        write_srt(repaired, output, preserve_order=True)
+
+    before_activity = compare_timing_activity(aligned, reference)
+    after_activity = compare_timing_activity(output, reference)
+    try:
+        before_weighted = float(before_activity.get("weighted") or 0.0)
+        after_weighted = float(after_activity.get("weighted") or 0.0)
+        before_start = float(before_activity.get("start") or 0.0)
+        after_start = float(after_activity.get("start") or 0.0)
+    except (TypeError, ValueError):
+        before_weighted = after_weighted = before_start = after_start = 0.0
+
+    accepted = bool(
+        after_weighted + 0.008 >= before_weighted
+        and after_start + 0.003 >= before_start
+    )
+    diagnostics = _result(
+        "applied" if accepted else "stt_plateau_activity_degraded",
+        applied=accepted,
+        output=str(output) if accepted else str(aligned),
+        gap_seconds=round(gap_seconds, 3),
+        source_gap_midpoint=round(source_gap_midpoint, 3),
+        aligned_gap_midpoint=round(aligned_gap_midpoint, 3),
+        pre_shift_seconds=round(pre_shift, 3),
+        post_shift_seconds=round(post_shift, 3),
+        pre=pre_estimate,
+        post=post_estimate,
+        before_activity=before_activity,
+        after_activity=after_activity,
+    )
+    if not accepted:
+        output.unlink(missing_ok=True)
+        return aligned, diagnostics
+    return output, diagnostics
+
 def _try_japanese_stt_fallback(
     video: Path,
     subtitle: Path,
@@ -5320,6 +5913,7 @@ def _try_japanese_stt_fallback(
 ) -> tuple[Path | None, dict[str, object]]:
     if not config.japanese_stt_fallback:
         return None, _result("stt_disabled", sync_was_successful=False)
+
     reference, stt = prepare_japanese_stt_reference(
         video,
         cache_dir,
@@ -5331,52 +5925,159 @@ def _try_japanese_stt_fallback(
         force=False,
     )
     if reference is None:
-        return None, _result("stt_reference_unavailable", sync_was_successful=False, stt=stt)
-    aligned, result = synchronize_with_alass(
-        reference,
-        subtitle,
-        cache_dir,
-        config,
-        alass_path=alass_path,
-        ffmpeg_path=ffmpeg_path,
-        ffprobe_path=ffprobe_path,
-        force=False,
-        verbose=verbose,
+        return None, _result(
+            "stt_reference_unavailable",
+            sync_was_successful=False,
+            stt=stt,
+        )
+
+    source = subtitle
+    if source.suffix.casefold() in {".ass", ".ssa"}:
+        source, conversion = convert_to_plain_srt(
+            source,
+            cache_dir,
+            ffmpeg_path=ffmpeg_path,
+            force=False,
+            verbose=verbose,
+        )
+        if source.suffix.casefold() != ".srt":
+            return None, _result(
+                "stt_source_conversion_failed",
+                sync_was_successful=False,
+                stt=stt,
+                source_conversion=conversion,
+            )
+
+    penalties: list[float] = []
+    for value in (
+        float(config.alass_split_penalty),
+        max(18.0, float(config.alass_split_penalty)),
+        max(35.0, float(config.alass_split_penalty)),
+    ):
+        if not any(abs(value - existing) < 1e-6 for existing in penalties):
+            penalties.append(value)
+
+    attempts: list[dict[str, object]] = []
+    last_result: dict[str, object] = _result(
+        "stt_alass_no_safe_map",
+        sync_was_successful=False,
+        stt=stt,
     )
-    if not bool(result.get("sync_was_successful")):
+
+    for split_penalty in penalties:
+        attempt_config = replace(
+            config,
+            alass_split_penalty=float(split_penalty),
+        )
+        aligned, result = synchronize_with_alass(
+            reference,
+            source,
+            cache_dir,
+            attempt_config,
+            alass_path=alass_path,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            force=False,
+            verbose=verbose,
+        )
+        result = dict(result)
+        result["stt_alass_split_penalty"] = float(split_penalty)
+
+        if not bool(result.get("sync_was_successful")):
+            attempts.append(
+                {
+                    "split_penalty": float(split_penalty),
+                    "accepted": False,
+                    "reason": result.get("reason"),
+                }
+            )
+            last_result = result
+            continue
+
+        activity = compare_timing_activity(aligned, reference)
+        try:
+            score = float(activity.get("weighted") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+
+        transition_safety = _stt_alass_transition_safety(source, aligned)
+        map_safe, map_reason = _stt_alass_map_safe(result, transition_safety)
+        activity_safe = bool(activity.get("available")) and score >= config.japanese_stt_min_activity
+        accepted = bool(map_safe and activity_safe)
+
+        attempt_payload = {
+            "split_penalty": float(split_penalty),
+            "accepted": accepted,
+            "reason": (
+                "ok"
+                if accepted
+                else (
+                    map_reason
+                    if not map_safe
+                    else "stt_activity_gate_failed"
+                )
+            ),
+            "blocks": result.get("alass_blocks"),
+            "distinct_shifts": result.get("alass_distinct_shifts"),
+            "shift_spread_seconds": result.get("alass_shift_spread_seconds"),
+            "activity": round(score, 4),
+            "transition_safety": transition_safety,
+        }
+        attempts.append(attempt_payload)
+
         result["stt"] = stt
-        result["reason"] = "stt_alass_failed"
-        return None, result
-    activity = compare_timing_activity(aligned, reference)
-    try:
-        score = float(activity.get("weighted") or 0.0)
-    except (TypeError, ValueError):
-        score = 0.0
-    if not bool(activity.get("available")) or score < config.japanese_stt_min_activity:
+        result["reference_activity"] = activity
+        result["stt_alass_transition_safety"] = transition_safety
+        result["stt_alass_map_reason"] = map_reason
+        result["stt_alass_attempts"] = list(attempts)
+        last_result = result
+
+        if not accepted:
+            continue
+
+        refined, plateau_refinement = _refine_stt_opening_plateaus(
+            source,
+            aligned,
+            reference,
+            cache_dir,
+        )
+        if plateau_refinement.get("applied"):
+            aligned = refined
+            activity = compare_timing_activity(aligned, reference)
+            try:
+                score = float(activity.get("weighted") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+
         result.update(
             {
-                "sync_was_successful": False,
-                "reason": "stt_activity_gate_failed",
-                "stt": stt,
+                "engine": (
+                    "japanese-stt+alass+opening-plateau"
+                    if plateau_refinement.get("applied")
+                    else "japanese-stt+alass"
+                ),
+                "reason": "applied",
+                "selection_reason": "last_resort_cached_stt",
+                "timing_reference": str(reference),
+                "timing_reference_language": "ja",
                 "reference_activity": activity,
+                "reference_activity_score": score,
+                "reference_alignment_reliable": True,
+                "stt_opening_plateau_refinement": plateau_refinement,
+                "output": str(aligned),
             }
         )
-        return None, result
-    result.update(
+        return aligned, result
+
+    last_result.update(
         {
-            "engine": "japanese-stt+alass",
-            "reason": "applied",
-            "selection_reason": "last_resort_cached_stt",
-            "timing_reference": str(reference),
-            "timing_reference_language": "ja",
-            "reference_activity": activity,
-            "reference_activity_score": score,
-            "reference_alignment_reliable": True,
+            "sync_was_successful": False,
+            "reason": "stt_alass_no_safe_map",
             "stt": stt,
+            "stt_alass_attempts": attempts,
         }
     )
-    return aligned, result
-
+    return None, last_result
 
 def optimize_subtitle(
     video: Path,
@@ -7036,11 +7737,50 @@ def optimize_candidates(
                         "  Разница activity находится в пределах шума; "
                         f"выбран SRT: {embedded_rank_meta.get('selected')}"
                     )
+            risky_timeline_item = next(
+                (
+                    item
+                    for item in sorted_prealigned
+                    if bool(item[3].get("timeline_alignment_reliable"))
+                    and _timeline_needs_audio_verification(item[3])
+                    and isinstance(item[5], dict)
+                    and item[5].get("reason") == "ok"
+                    and (
+                        (
+                            item[1].source == "jimaku"
+                            and item[1].details.get("episode_match") == "exact"
+                            and bool(item[1].details.get("entry_anilist_match"))
+                        )
+                        or (
+                            isinstance(item[3].get("timeline_validation"), dict)
+                            and (
+                                float(
+                                    item[3]["timeline_validation"]
+                                    .get("after", {})
+                                    .get("f1", 0.0)
+                                    or 0.0
+                                ) >= 0.72
+                                or bool(
+                                    item[3]["timeline_validation"].get(
+                                        "layered_reference_acceptance"
+                                    )
+                                )
+                            )
+                            and float(
+                                item[3]["timeline_validation"].get("activity_f1", 0.0)
+                                or 0.0
+                            ) >= 0.72
+                        )
+                    )
+                ),
+                None,
+            )
             deterministic_timeline_item = next(
                 (
                     item
                     for item in sorted_prealigned
                     if bool(item[3].get("timeline_alignment_reliable"))
+                    and not _timeline_needs_audio_verification(item[3])
                     and isinstance(item[5], dict)
                     and item[5].get("reason") == "ok"
                     and (
@@ -7113,8 +7853,95 @@ def optimize_candidates(
                     )
                 return candidate, aligned, final_result
 
+            if risky_timeline_item is not None:
+                (
+                    _risk_rank,
+                    risky_candidate,
+                    _embedded_aligned,
+                    risky_timeline_result,
+                    _risk_activity,
+                    _risk_structure,
+                ) = risky_timeline_item
+                risk_payload = risky_timeline_result.get(
+                    "timeline_early_edit_audio_verification"
+                )
+                configure_logging().info(
+                    "VERIFY step=subtitle.early_edit_speech video=%s candidate=%r risk=%s",
+                    video.name,
+                    risky_candidate.name,
+                    risk_payload,
+                )
+                speech_aligned, speech_result = _try_japanese_stt_fallback(
+                    video,
+                    risky_candidate.path,
+                    cache_dir,
+                    config,
+                    ffmpeg_path=ffmpeg_path,
+                    ffprobe_path=ffprobe_path,
+                    alass_path=alass_path,
+                    verbose=verbose,
+                )
+                if (
+                    speech_aligned is not None
+                    and bool(speech_result.get("sync_was_successful"))
+                    and bool(speech_result.get("reference_alignment_reliable"))
+                ):
+                    speech_aligned, opening_scaffold = (
+                        _restore_embedded_opening_clock_scaffold(
+                            speech_aligned,
+                            risky_timeline_result,
+                            speech_result,
+                            cache_dir,
+                        )
+                    )
+                    final_result = dict(speech_result)
+                    if opening_scaffold.get("applied"):
+                        final_result["engine"] = (
+                            f"{final_result.get('engine') or 'japanese-stt+alass'}"
+                            "+embedded-opening-scaffold"
+                        )
+                    final_result.update(
+                        {
+                            "reason": "applied",
+                            "sync_was_successful": True,
+                            "output": str(speech_aligned),
+                            "selection_reason": "early_edit_japanese_speech_verification",
+                            "embedded_timeline_attempt": dict(risky_timeline_result),
+                            "timeline_early_edit_audio_verification": risk_payload,
+                            "embedded_opening_clock_scaffold": opening_scaffold,
+                            "candidate_selection": {
+                                "mode": "early_edit_japanese_speech_verification",
+                                "candidate_count": len(candidate_list),
+                                "prealigned_count": len(prealigned),
+                                "prefer_srt": prefer_srt,
+                                "embedded_reference_ranking": embedded_rank_meta,
+                            },
+                        }
+                    )
+                    configure_logging().info(
+                        "ACCEPT step=subtitle.early_edit_speech video=%s candidate=%r engine=%s activity=%s",
+                        video.name,
+                        risky_candidate.name,
+                        final_result.get("engine"),
+                        (final_result.get("reference_activity") or {}).get("weighted")
+                        if isinstance(final_result.get("reference_activity"), dict)
+                        else None,
+                    )
+                    return risky_candidate, speech_aligned, final_result
+                configure_logging().warning(
+                    "FALLBACK step=subtitle.early_edit_speech video=%s candidate=%r reason=%s",
+                    video.name,
+                    risky_candidate.name,
+                    speech_result.get("reason"),
+                )
+
+            embedded_consensus_pool = [
+                item
+                for item in sorted_prealigned
+                if not _timeline_needs_audio_verification(item[3])
+            ]
             consensus_item, consensus = _exact_jimaku_timing_consensus(
-                sorted_prealigned
+                embedded_consensus_pool
             )
             if consensus_item is not None:
                 _rank, candidate, aligned, alass_result, activity, structure = consensus_item
@@ -7212,7 +8039,11 @@ def optimize_candidates(
                 return candidate, aligned, final_result
 
             semantic_candidates = (
-                sorted_prealigned[:5]
+                [
+                    item
+                    for item in sorted_prealigned
+                    if not _timeline_needs_audio_verification(item[3])
+                ][:5]
                 if validate_embedded_reference_with_llm and llm is not None
                 else []
             )

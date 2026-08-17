@@ -79,11 +79,12 @@ def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Pat
 
 def test_waiting_card_never_prints_episode_null() -> None:
     html = HTML.read_text(encoding="utf-8")
+    home = (HTML.parent / "home_status.js").read_text(encoding="utf-8")
     assert "validEpisodeNumber" in html
-    assert "episode!==null?t('label.episodeNotReady'" in html
-    assert "t('label.notReady')" in html
-    waiting_source = html[html.index('function waitingHomeCard'):html.index('function downloadAvailableHomeCard')]
-    assert "episode:a.next_episode" not in waiting_source
+    assert "episode!==null?t('label.episodeNotReady'" in home
+    assert "t('label.notReady')" in home
+    assert "episode:a.next_episode" not in home
+    assert "episodePresentationStatus(a,episode)+finalSuffix" in html
 
 
 def test_exact_title_single_special_is_accepted_without_jimaku_anilist_id(

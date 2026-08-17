@@ -50,17 +50,15 @@ jobs:
           cache: pip
       - name: Install lint dependencies
         run: python -m pip install -e ".[dev]"
-      - name: Check fatal Python errors
-        run: python -m ruff check --select E9,F63,F7 pudge tests scripts
-      - name: Lint new pipeline and media modules
-        run: python -m ruff check --select E9,F pudge/audiobooks.py pudge/manga.py pudge/subtitles pudge/backup.py tests/test_p0_p1_features.py tests/test_ui_integration.py
+      - name: Check Python
+        run: |
+          python -m ruff check --select E9,F pudge scripts
+          python -m ruff check --select E9,F63,F7 tests
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
       - name: Check JavaScript modules
-        run: |
-          node --check pudge/web/settings.js
-          node --check pudge/web/media.js
+        run: find pudge/web -type f -name '*.js' -print0 | xargs -0 -n1 node --check
 
   macos-smoke:
     name: macOS smoke

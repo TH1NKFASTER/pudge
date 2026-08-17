@@ -132,8 +132,9 @@ def test_library_uses_relative_episode_number_and_singular_label(tmp_path: Path)
     assert payload["local"]["state"] == "waiting_subtitles"
 
     html = HTML.read_text(encoding="utf-8")
+    library_js = (HTML.parent / "library.js").read_text(encoding="utf-8")
     assert "label.libraryRangeSingle':'Episode: {episode}'" in html
-    assert "numbered.length===1?t('label.libraryRangeSingle'" in html
+    assert "numbered.length===1?t('label.libraryRangeSingle'" in library_js
 
 
 def test_highest_resolution_prefers_higher_standard_resolution() -> None:

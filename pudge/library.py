@@ -11,7 +11,13 @@ from .database import Database
 from .filename import parse_anime_filename, title_similarity
 from .manager_models import LibraryAnime, LibraryEpisode
 from .models import VideoIdentity
-from .language import IMAGE_SUBTITLE_EXTENSIONS
+from .language import (
+    IMAGE_SUBTITLE_EXTENSIONS,
+    TEXT_SUBTITLE_EXTENSIONS,
+    has_japanese_marker,
+    has_negative_language_marker,
+    is_japanese_subtitle,
+)
 from .pipeline_cache import load_final_pipeline_result
 from .media import (
     TEXT_CODECS,
@@ -94,19 +100,40 @@ def parent_folder_anime(video_path: Path, root: Path, anime_list: list[LibraryAn
 
 
 def sidecar_subtitle(video: Path) -> Path | None:
-    for ext in SUB_EXTENSIONS:
-        candidate = video.with_suffix(ext)
-        if candidate.is_file():
-            return candidate
-    # Prepared files may live in a sibling `subs` directory.
-    subs_dir = video.parent / "subs"
-    if subs_dir.is_dir():
-        for ext in SUB_EXTENSIONS:
-            candidates = sorted(subs_dir.glob(f"{video.stem}*{ext}"))
-            if candidates:
-                return candidates[0]
-    return None
+    """Choose a local Japanese subtitle without letting English text mark Ready."""
 
+    candidates: list[Path] = []
+    for directory in (video.parent, video.parent / "subs"):
+        if not directory.is_dir():
+            continue
+        for ext in SUB_EXTENSIONS:
+            exact = directory / f"{video.stem}{ext}"
+            if exact.is_file():
+                candidates.append(exact)
+            for candidate in sorted(directory.glob(f"{video.stem}.*{ext}")):
+                if candidate.is_file():
+                    candidates.append(candidate)
+    candidates = list(dict.fromkeys(path.resolve() for path in candidates))
+
+    text_candidates = [
+        path
+        for path in candidates
+        if path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
+        and is_japanese_subtitle(path)
+    ]
+    if text_candidates:
+        return text_candidates[0]
+
+    bitmap_candidates = [
+        path
+        for path in candidates
+        if path.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
+        and not (
+            has_negative_language_marker(path.name)
+            and not has_japanese_marker(path.name)
+        )
+    ]
+    return bitmap_candidates[0] if bitmap_candidates else None
 
 def japanese_subtitle_details(
     video: Path,

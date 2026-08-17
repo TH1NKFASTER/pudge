@@ -25,6 +25,8 @@ from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
 from .config import load_config, write_config
 from .debug_snapshot import DebugSnapshotService
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
+from .episode_numbering import resolve_episode_numbering
+from .presentation_state import derive_episode_presentation
 from .first_experience import (
     configure_mpv_study_keys,
     dependency_status,
@@ -80,6 +82,7 @@ class WebAppApi:
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
             python=python_executable(),
+            work_scheduler=self.manager.work_scheduler,
         )
         self.audiobooks = AudiobookService(
             self.manager.db,
@@ -90,6 +93,7 @@ class WebAppApi:
             python=python_executable(),
             stt_model=self.config.sync.japanese_stt_model,
             job_center=self.job_center,
+            work_scheduler=self.manager.work_scheduler,
         )
         threading.Thread(
             target=self.audiobooks.resume_pending_transcriptions,
@@ -435,26 +439,18 @@ class WebAppApi:
         cached = self._episode_offset_cache.get(int(anime.media_id))
         if cached is not None:
             return cached
-        offset = 0
         try:
-            aliases, _titles = self.manager._release_episode_context_from_graph(anime, 1)
-            if aliases:
-                offset = max(0, int(aliases[0]) - 1)
+            result = resolve_episode_numbering(
+                anime,
+                1,
+                self.config,
+                self.logger,
+                db=self.manager.db,
+                allow_network=False,
+            )
+            offset = max(0, int(result.offset))
         except Exception:
             offset = 0
-        if not offset:
-            cache_path = (
-                self.config.paths.cache_dir
-                / "anilist-release-numbering"
-                / f"{anime.media_id}.json"
-            )
-            try:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                offset = max(0, int(payload.get("offset", 0)))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                offset = 0
-        # Cache positive offsets only. A relation graph can be populated later
-        # during this app session, so a temporary zero must not become sticky.
         if offset:
             self._episode_offset_cache[int(anime.media_id)] = offset
         return offset
@@ -1397,6 +1393,28 @@ class WebAppApi:
         sections["completed_ready"] = self._group_completed_ready(
             sections["completed_ready"], anime_by_id
         )
+        for rows in sections.values():
+            for card in rows:
+                try:
+                    media_id = int(card.get("media_id") or 0)
+                except (TypeError, ValueError):
+                    media_id = 0
+                local = card.get("local") if isinstance(card.get("local"), dict) else None
+                local_for_state = local
+                if local_for_state is None and card.get("video_path"):
+                    local_for_state = {
+                        "state": "ready",
+                        "video_path": card.get("video_path"),
+                    }
+                download = downloads_by_media.get(media_id) if media_id else None
+                action_job = None
+                if local is not None and local.get("video_path"):
+                    action_job = needs_action_by_path.get(str(local.get("video_path")))
+                card["presentation"] = derive_episode_presentation(
+                    local=local_for_state,
+                    download=download,
+                    action_job=action_job,
+                )
         return sections
 
     def _settings_payload(self) -> dict[str, Any]:
@@ -3286,8 +3304,8 @@ class WebAppApi:
         cfg.paths.download_dirs = _folder_list(values.get("watched_folders", current_watched))
         cfg.library.disk_limit_enabled = bool(values.get("disk_limit_enabled", cfg.library.disk_limit_enabled))
         cfg.library.disk_limit_gb = max(0.0, float(values.get("disk_limit_gb", cfg.library.disk_limit_gb)))
-        cfg.playback.enabled = bool(values.get("playback_enabled", cfg.playback.enabled))
-        cfg.playback.rewind_seconds = max(0.0, float(values.get("playback_rewind", cfg.playback.rewind_seconds)))
+        cfg.playback.enabled = True
+        cfg.playback.rewind_seconds = 10.0
         cfg.nyaa.enabled = bool(values.get("nyaa_enabled", cfg.nyaa.enabled))
         cfg.nyaa.auto_download_current = bool(values.get("nyaa_auto", cfg.nyaa.auto_download_current))
         cfg.nyaa.subsplease_rss_enabled = bool(
@@ -3324,8 +3342,8 @@ class WebAppApi:
             ).split(",")
             if part.strip()
         ]
-        cfg.nyaa.require_japanese_audio = bool(values.get("require_japanese_audio", cfg.nyaa.require_japanese_audio))
-        cfg.nyaa.avoid_upscaled = bool(values.get("avoid_upscaled", cfg.nyaa.avoid_upscaled))
+        cfg.nyaa.require_japanese_audio = True
+        cfg.nyaa.avoid_upscaled = True
         cfg.nyaa.only_trusted_groups = bool(
             values.get("only_trusted_groups", cfg.nyaa.only_trusted_groups)
         )
@@ -3353,9 +3371,7 @@ class WebAppApi:
         cfg.nyaa.auto_upgrade_downloaded = bool(
             values.get("auto_upgrade_downloaded", cfg.nyaa.auto_upgrade_downloaded)
         )
-        cfg.nyaa.upgrade_min_score_gain = max(
-            0.0, float(values.get("upgrade_min_score_gain", cfg.nyaa.upgrade_min_score_gain))
-        )
+        cfg.nyaa.upgrade_min_score_gain = 30.0
         cfg.nyaa.upgrade_check_hours = max(
             0.0, float(values.get("upgrade_check_hours", cfg.nyaa.upgrade_check_hours))
         )
@@ -3369,7 +3385,7 @@ class WebAppApi:
         cfg.qbittorrent.api_key = str(values.get("qbt_api_key", cfg.qbittorrent.api_key)).strip()
         cfg.qbittorrent.pre_download_command = str(values.get("download_hook", cfg.qbittorrent.pre_download_command)).strip()
         cfg.aria2.enabled = bool(values.get("aria2_enabled", cfg.aria2.enabled))
-        cfg.aria2.binary = str(values.get("aria2_binary", cfg.aria2.binary)).strip() or "aria2c"
+        cfg.aria2.binary = "aria2c"
         cfg.aria2.rpc_port = max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.aria2.rpc_port))))
         seed_mode = str(values.get("aria2_seed_mode", cfg.aria2.seed_mode)).strip().casefold()
         cfg.aria2.seed_mode = seed_mode if seed_mode in {"off", "ratio", "ratio_or_time", "unlimited"} else "off"
@@ -3388,8 +3404,8 @@ class WebAppApi:
         cfg.anilist.access_token = str(values.get("anilist_token", cfg.anilist.access_token)).strip()
         cfg.anilist.auto_update_progress = bool(values.get("anilist_auto_progress", cfg.anilist.auto_update_progress))
         cfg.anilist.add_if_missing = bool(values.get("anilist_add_if_missing", cfg.anilist.add_if_missing))
-        cfg.anilist.watched_threshold = max(0.01, min(1.0, float(values.get("anilist_threshold", cfg.anilist.watched_threshold * 100.0)) / 100.0))
-        cfg.anilist.watched_max_remaining_minutes = max(0.0, float(values.get("anilist_max_remaining_minutes", cfg.anilist.watched_max_remaining_minutes)))
+        cfg.anilist.watched_threshold = 0.85
+        cfg.anilist.watched_max_remaining_minutes = 10.0
         cfg.anilist.relations_by_release_date = bool(
             values.get(
                 "relations_by_release_date",
@@ -3423,36 +3439,10 @@ class WebAppApi:
         cfg.matching.ocr_image_subtitles = bool(
             values.get("ocr_image_subtitles", cfg.matching.ocr_image_subtitles)
         )
-        cfg.matching.auto_upgrade_subtitles = bool(
-            values.get("auto_upgrade_subtitles", cfg.matching.auto_upgrade_subtitles)
-        )
-        cfg.matching.subtitle_upgrade_min_score_gain = max(
-            0.0,
-            float(
-                values.get(
-                    "subtitle_upgrade_min_score_gain",
-                    cfg.matching.subtitle_upgrade_min_score_gain,
-                )
-            ),
-        )
-        cfg.matching.subtitle_upgrade_check_hours = max(
-            0.0,
-            float(
-                values.get(
-                    "subtitle_upgrade_check_hours",
-                    cfg.matching.subtitle_upgrade_check_hours,
-                )
-            ),
-        )
-        cfg.matching.max_subtitle_upgrade_checks_per_run = max(
-            0,
-            int(
-                values.get(
-                    "max_subtitle_upgrade_checks_per_run",
-                    cfg.matching.max_subtitle_upgrade_checks_per_run,
-                )
-            ),
-        )
+        cfg.matching.auto_upgrade_subtitles = True
+        cfg.matching.subtitle_upgrade_min_score_gain = 25.0
+        cfg.matching.subtitle_upgrade_check_hours = 6.0
+        cfg.matching.max_subtitle_upgrade_checks_per_run = 2
         cfg.llm.enabled = bool(values.get("llm_enabled", cfg.llm.enabled))
         cfg.llm.base_url = str(values.get("llm_url", cfg.llm.base_url)).strip().rstrip("/")
         cfg.llm.api_key = str(values.get("llm_api_key", cfg.llm.api_key)).strip()
@@ -3460,12 +3450,8 @@ class WebAppApi:
         cfg.llm.validate_embedded_reference = bool(
             values.get("subtitle_semantic_checks", cfg.llm.validate_embedded_reference)
         )
-        cfg.sync.use_container_chapters = bool(
-            values.get("use_container_chapters", cfg.sync.use_container_chapters)
-        )
-        cfg.sync.japanese_stt_fallback = bool(
-            values.get("japanese_stt_fallback", cfg.sync.japanese_stt_fallback)
-        )
+        cfg.sync.use_container_chapters = True
+        cfg.sync.japanese_stt_fallback = True
         cfg.sync.japanese_stt_model = str(
             values.get("japanese_stt_model", cfg.sync.japanese_stt_model)
         ).strip() or "mlx-community/whisper-tiny"
@@ -3478,6 +3464,7 @@ class WebAppApi:
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
             python=python_executable(),
+            work_scheduler=self.manager.work_scheduler,
         )
         self.audiobooks = AudiobookService(
             self.manager.db,
@@ -3487,6 +3474,7 @@ class WebAppApi:
             ffmpeg=self.config.tools.ffmpeg,
             python=python_executable(),
             stt_model=self.config.sync.japanese_stt_model,
+            work_scheduler=self.manager.work_scheduler,
         )
         threading.Thread(
             target=self.audiobooks.resume_pending_transcriptions,
@@ -3593,13 +3581,23 @@ class WebAppApi:
 
     def first_experience_dependencies(self) -> dict[str, Any]:
         ln = self.light_novels.settings()
-        return dependency_status(
+        status = dependency_status(
             mpv=self.config.tools.mpv,
             ffmpeg=self.config.tools.ffmpeg,
             jiten_api_key=ln.jiten_api_key,
             jpdb_api_token=ln.jpdb_api_token,
             selected_plugin=self.config.tools.mpv_study_plugin,
         )
+        manga_ocr = dict(self.manga_ocr_status())
+        package_installed = bool(manga_ocr.get("installed"))
+        ready = bool(package_installed and manga_ocr.get("model_ready"))
+        manga_ocr["package_installed"] = package_installed
+        manga_ocr["installed"] = ready
+        manga_ocr["version"] = "Package + model ready" if ready else (
+            "Model not ready" if package_installed else "Not installed"
+        )
+        status["manga_ocr"] = manga_ocr
+        return status
 
     def install_first_experience_dependencies(
         self, values: dict[str, Any] | None = None
@@ -3644,6 +3642,13 @@ class WebAppApi:
         if selected_plugin in {"auto", "jiten", "jpdb"}:
             self.config.tools.mpv_study_plugin = selected_plugin
         configure_mpv_study_keys(jiten_api_key=key, jpdb_api_token=jpdb_key)
+        manga_ocr = self.manga_ocr_status()
+        if not (bool(manga_ocr.get("installed")) and bool(manga_ocr.get("model_ready"))):
+            self._run_manga_ocr_install()
+            manga_ocr = self.manga_ocr_status()
+        if not (bool(manga_ocr.get("installed")) and bool(manga_ocr.get("model_ready"))):
+            raise RuntimeError("MangaOCR installation did not complete")
+
         status = dependency_status(
             mpv=self.config.tools.mpv,
             ffmpeg=self.config.tools.ffmpeg,
@@ -3651,6 +3656,11 @@ class WebAppApi:
             jpdb_api_token=jpdb_key,
             selected_plugin=self.config.tools.mpv_study_plugin,
         )
+        manga_ocr = dict(manga_ocr)
+        manga_ocr["package_installed"] = True
+        manga_ocr["installed"] = True
+        manga_ocr["version"] = "Package + model ready"
+        status["manga_ocr"] = manga_ocr
         write_config(self.config, self.config_path)
         for service, name, value in (
             (self.audiobooks, "mpv", self.config.tools.mpv),
@@ -4752,6 +4762,8 @@ class WebAppApi:
                 ffmpeg=self.config.tools.ffmpeg,
                 python=python_executable(),
                 stt_model=self.config.sync.japanese_stt_model,
+                work_scheduler=self.manager.work_scheduler,
+
             )
             threading.Thread(
                 target=self.audiobooks.resume_pending_transcriptions,

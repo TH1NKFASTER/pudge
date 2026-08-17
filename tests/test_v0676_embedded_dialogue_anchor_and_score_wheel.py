@@ -191,7 +191,7 @@ def test_v0676_wires_direct_reference_before_old_piecewise_and_removes_score_cop
     assert direct < fallback
     assert "reference-dialogue-anchor-v2" in syncing_source
     assert "syncing-v0.3." in syncing_source
-    assert "timeline-monotonic-boundaries" in syncing_source
+    assert "early-edit-speech-verification" in syncing_source
     assert "modal.randomScoreText" not in web_source
 
 

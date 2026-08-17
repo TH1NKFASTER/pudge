@@ -51,8 +51,8 @@ def test_config_round_trip(tmp_path: Path):
     assert loaded.anilist.client_id == "12345"
     assert loaded.anilist.access_token == "token"
     assert loaded.anilist.auto_update_progress is True
-    assert loaded.anilist.watched_threshold == 5 / 6
-    assert loaded.anilist.watched_max_remaining_minutes == 7.5
+    assert loaded.anilist.watched_threshold == 0.85
+    assert loaded.anilist.watched_max_remaining_minutes == 10.0
     assert loaded.llm.enabled is True
     assert loaded.llm.api_key == "secret"
     assert loaded.llm.model == "qwen3.5:9b-q8_0"

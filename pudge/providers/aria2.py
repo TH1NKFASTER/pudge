@@ -799,6 +799,55 @@ class Aria2Client:
             raise last_error
         return False
 
+    def prioritize(self, torrent_hash: str) -> bool:
+        """Move one Pudge download to the front of aria2's waiting queue."""
+        self.ensure_running()
+        gid = self._resolve_gid(torrent_hash)
+        status = self._rpc_raw("aria2.tellStatus", [gid, ["status"]]) or {}
+        state = str(status.get("status") or "").casefold()
+        if state == "waiting":
+            self._rpc_raw("aria2.changePosition", [gid, 0, "POS_SET"])
+            return True
+        if state == "paused":
+            self._rpc_raw("aria2.changePosition", [gid, 0, "POS_SET"])
+            self._rpc_raw("aria2.unpause", [gid])
+            return True
+        return state == "active"
+
+
+    def torrent_status(self, torrent_hash: str) -> dict[str, Any]:
+        """Return the small progress surface used by the common release racer."""
+        self.ensure_running()
+        gid = self._resolve_gid(torrent_hash)
+        item = self._rpc_raw(
+            "aria2.tellStatus",
+            [
+                gid,
+                [
+                    "status",
+                    "totalLength",
+                    "completedLength",
+                    "downloadSpeed",
+                    "connections",
+                    "numSeeders",
+                    "seeder",
+                ],
+            ],
+        ) or {}
+        total = max(0, int(item.get("totalLength") or 0))
+        downloaded = max(0, int(item.get("completedLength") or 0))
+        progress = downloaded / total if total > 0 else 0.0
+        return {
+            "status": str(item.get("status") or ""),
+            "dlspeed": max(0, int(item.get("downloadSpeed") or 0)),
+            "downloaded": downloaded,
+            "progress": max(0.0, min(1.0, progress)),
+            "total_size": total,
+            "connections": max(0, int(item.get("connections") or 0)),
+            "num_seeders": max(0, int(item.get("numSeeders") or 0)),
+            "seeder": str(item.get("seeder") or "false").casefold() == "true",
+        }
+
     def repair_stalled_release(self, torrent_hash: str, release: NyaaRelease) -> bool:
         """Replace a metadata-only magnet with Nyaa's tracker-rich torrent."""
 

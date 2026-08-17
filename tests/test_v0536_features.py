@@ -123,7 +123,7 @@ def test_continue_watching_records_position_and_rewinds_in_web_payload(tmp_path:
     item = api.get_state()["home"]["continue_watching"][0]
     assert item["episode"] == 3
     assert item["position"] == 125
-    assert item["resume_start"] == 110
+    assert item["resume_start"] == 115
 
 
 def test_disk_limit_defaults_to_500_gb_and_reports_usage(tmp_path: Path) -> None:

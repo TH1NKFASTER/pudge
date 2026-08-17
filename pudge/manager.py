@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -28,11 +27,17 @@ from .library import (
     strict_title_similarity,
 )
 from .runtime import python_executable
-from .foreground import foreground_active
+from .download_intents import DownloadIntentStore
+from .episode_numbering import (
+    episode_numbering_from_graph,
+    media_episode_from_release as shared_media_episode_from_release,
+    resolve_episode_numbering,
+)
+from .presentation_state import derive_episode_presentation, download_complete
+from .work_scheduler import WorkScheduler
 from .logging_utils import configure_logging, timed_step
 from .maintenance_lock import maintenance_lock
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
-from .models import AniListAnime
 from .notifications import send_native_notification
 from .pipeline_cache import invalidate_final_pipeline_result
 from .providers.anilist import AniListClient, AniListError, AniListHTTPError
@@ -219,12 +224,23 @@ def _localize_preparation_detail(detail: str, *, language: str) -> str:
     return text
 
 
+def _subtitle_upgrade_backoff_hours(completed_checks: int) -> float:
+    checks = max(0, int(completed_checks))
+    if checks <= 1:
+        return 6.0
+    return min(24.0, 6.0 * (2 ** (checks - 1)))
+
+
 class AnimeManager:
     def __init__(self, config: AppConfig, log: LogFn | None = None) -> None:
         self.config = config
         self.db = Database(config.library.database_path)
         self.logger = configure_logging()
         self.log = log or self.logger.info
+        self.work_scheduler = WorkScheduler(
+            config.paths.cache_dir, logger=self.logger
+        )
+        self.download_intents = DownloadIntentStore(self.db)
         self._last_anilist_warning = ""
         self._last_anilist_used_cache = False
         self._last_missing_episode_rows = 0
@@ -1226,99 +1242,14 @@ class AnimeManager:
         anime: LibraryAnime,
         episode: int,
     ) -> tuple[tuple[int, ...], tuple[str, ...]]:
-        """Resolve split-cour numbering from the already cached relation graph.
-
-        This path is intentionally network-free.  Why-not-ready/manual Nyaa
-        searches must not lose absolute numbering merely because AniList is
-        temporarily unavailable.  Only chronological SEQUEL edges are followed
-        and long-running parents are excluded with the same conservative guard
-        used by the live AniList resolver.
-        """
-        graph_lookup = getattr(self.db, "relation_graph_for_media", None)
-        if graph_lookup is None:
-            return (), ()
-        cached = graph_lookup(anime.media_id)
+        cached = self.db.relation_graph_for_media(anime.media_id)
         graph = cached.get("graph") if isinstance(cached, dict) else None
         if not isinstance(graph, dict):
             return (), ()
-
-        nodes = {
-            int(node["media_id"]): node
-            for node in graph.get("nodes", [])
-            if isinstance(node, dict) and node.get("media_id") is not None
-        }
-        if anime.media_id not in nodes:
+        result = episode_numbering_from_graph(graph, anime, int(episode))
+        if result is None:
             return (), ()
-
-        incoming: dict[int, list[int]] = {}
-        for edge in graph.get("edges", []):
-            if not isinstance(edge, dict) or str(edge.get("relation_type") or "").upper() != "SEQUEL":
-                continue
-            try:
-                source = int(edge.get("source"))
-                target = int(edge.get("target"))
-            except (TypeError, ValueError):
-                continue
-            if source in nodes and target in nodes and source != target:
-                incoming.setdefault(target, []).append(source)
-
-        valid_formats = {"TV", "TV_SHORT", "ONA", ""}
-        episode_cap = max(100, int(anime.episodes or 0) * 4)
-        current_id = int(anime.media_id)
-        visited = {current_id}
-        predecessors: list[dict[str, Any]] = []
-        total = int(episode)
-
-        for _ in range(12):
-            current = nodes[current_id]
-            current_title = str(current.get("title") or anime.title)
-            candidates: list[tuple[float, dict[str, Any]]] = []
-            for source_id in incoming.get(current_id, []):
-                if source_id in visited:
-                    continue
-                candidate = nodes[source_id]
-                candidate_format = str(candidate.get("format") or "").upper()
-                try:
-                    count = int(candidate.get("episodes") or 0)
-                except (TypeError, ValueError):
-                    count = 0
-                if candidate_format not in valid_formats or count < 1 or count > episode_cap:
-                    continue
-                continuity = title_similarity(
-                    current_title, str(candidate.get("title") or "")
-                )
-                if continuity < 35.0:
-                    continue
-                candidates.append((continuity, candidate))
-            if not candidates:
-                break
-            _continuity, candidate = max(
-                candidates,
-                key=lambda item: (
-                    item[0],
-                    str(item[1].get("start_date") or ""),
-                    int(item[1].get("media_id") or 0),
-                ),
-            )
-            total += int(candidate.get("episodes") or 0)
-            current_id = int(candidate["media_id"])
-            visited.add(current_id)
-            predecessors.insert(0, candidate)
-
-        if total <= episode:
-            return (), ()
-        titles = tuple(
-            dict.fromkeys(
-                str(item.get("title") or "").strip()
-                for item in predecessors
-                if str(item.get("title") or "").strip()
-            )
-        )
-        self.logger.info(
-            "RESULT step=nyaa.episode_aliases media_id=%s relative=%s absolute=%s offset=%s source=relation_graph",
-            anime.media_id, episode, total, total - episode,
-        )
-        return (total,), titles
+        return result.aliases, result.prequel_titles
 
     def _media_episode_from_release(
         self,
@@ -1327,145 +1258,32 @@ class AnimeManager:
         *,
         requested_media_episode: int | None = None,
     ) -> int | None:
-        """Map a release filename number to this AniList entry's local number.
-
-        Single-episode downloads carry the requested local number explicitly.
-        Batch files are mapped with the cached relation graph, without a network
-        request from the download worker.
-        """
-        if requested_media_episode is not None:
-            return int(requested_media_episode)
-        if release_episode is None:
-            return None
-        value = int(release_episode)
-        if anime is None:
-            return value
-        total = int(anime.episodes or 0)
-        if value >= 1 and (not total or value <= total):
-            return value
-        try:
-            aliases, _titles = self._release_episode_context_from_graph(anime, 1)
-        except (OSError, RuntimeError, TypeError, ValueError):
-            aliases = ()
-        if aliases:
-            offset = int(aliases[0]) - 1
-            local = value - offset
-            if local >= 1 and (not total or local <= total):
-                return local
-        self.logger.warning(
-            "WARN step=episode_identity media_id=%s release_episode=%s "
-            "reason=no_safe_media_mapping",
-            anime.media_id,
-            value,
+        return shared_media_episode_from_release(
+            anime,
+            release_episode,
+            self.config,
+            self.logger,
+            requested_media_episode=requested_media_episode,
+            db=self.db,
+            allow_network=False,
         )
-        return None
 
     def _release_episode_context(
         self,
         anime: LibraryAnime,
         episode: int | None,
     ) -> tuple[tuple[int, ...], tuple[str, ...]]:
-        """Return safe absolute-number and predecessor-title aliases for releases.
-
-        Split-cour shows are often numbered relative to the AniList entry but
-        absolute across the whole arc by release groups (e.g. BLEACH cour 4
-        episode 3 is published as episode 43). These aliases are supplemental:
-        failures here never block the normal Nyaa search.
-        """
-        if episode is None or episode < 1:
+        if episode is None or int(episode) < 1:
             return (), ()
-        if (anime.format or "").upper() not in {"TV", "TV_SHORT", "ONA", ""}:
-            return (), ()
-
-        cache_path = (
-            self.config.paths.cache_dir
-            / "anilist-release-numbering"
-            / f"{anime.media_id}.json"
+        result = resolve_episode_numbering(
+            anime,
+            int(episode),
+            self.config,
+            self.logger,
+            db=self.db,
+            allow_network=True,
         )
-        try:
-            if cache_path.is_file() and time.time() - cache_path.stat().st_mtime < 7 * 86400:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                offset = max(0, int(payload.get("offset", 0)))
-                titles = tuple(
-                    str(value).strip()
-                    for value in payload.get("prequel_titles", [])
-                    if str(value).strip()
-                )
-                if offset:
-                    absolute = int(episode) + offset
-                    self.logger.info(
-                        "RESULT step=nyaa.episode_aliases media_id=%s relative=%s absolute=%s offset=%s source=cache",
-                        anime.media_id, episode, absolute, offset,
-                    )
-                    return (absolute,), titles
-                return (), ()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pass
-
-        graph_episodes, graph_titles = self._release_episode_context_from_graph(
-            anime, int(episode)
-        )
-        if graph_episodes:
-            return graph_episodes, graph_titles
-
-        if not self.config.anilist.enabled:
-            return (), ()
-
-        start = AniListAnime(
-            id=anime.media_id,
-            titles=list(dict.fromkeys([anime.title, *anime.titles])),
-            synonyms=list(anime.synonyms),
-            season_year=anime.season_year,
-            episodes=anime.episodes,
-            format=anime.format,
-        )
-        client = AniListClient(
-            self.config.anilist.endpoint,
-            access_token=self.config.anilist.access_token,
-        )
-        try:
-            absolute, chain = client.absolute_episode_number(start, int(episode))
-        except (AniListError, OSError, ValueError) as exc:
-            self.logger.info(
-                "SKIP step=nyaa.episode_aliases media_id=%s episode=%s reason=%r",
-                anime.media_id, episode, exc,
-            )
-            return (), ()
-        finally:
-            client.close()
-
-        offset = max(0, int(absolute) - int(episode))
-        if not offset:
-            return (), ()
-
-        predecessor_titles: list[str] = []
-        for item in chain[:-1]:
-            for value in [*item.titles, *item.synonyms]:
-                value = str(value).strip()
-                if value and value not in predecessor_titles:
-                    predecessor_titles.append(value)
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "media_id": anime.media_id,
-                        "offset": offset,
-                        "chain": [item.id for item in chain],
-                        "prequel_titles": predecessor_titles,
-                        "updated_at": time.time(),
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-        self.logger.info(
-            "RESULT step=nyaa.episode_aliases media_id=%s relative=%s absolute=%s offset=%s chain=%s",
-            anime.media_id, episode, absolute, offset, [item.id for item in chain],
-        )
-        return (int(absolute),), tuple(predecessor_titles)
+        return result.aliases, result.prequel_titles
 
     def search_releases(
         self,
@@ -2291,12 +2109,157 @@ class AnimeManager:
         if not snapshot:
             return False
         try:
-            speed = int(snapshot.get("dlspeed") or 0)
+            speed = int(snapshot.get("dlspeed") or snapshot.get("download_speed") or 0)
             downloaded = int(snapshot.get("downloaded") or 0)
             progress = float(snapshot.get("progress") or 0.0)
+            total = int(snapshot.get("total_size") or snapshot.get("totalLength") or 0)
+            connections = int(snapshot.get("connections") or snapshot.get("num_connections") or 0)
         except (TypeError, ValueError):
             return False
-        return bool(speed > 0 or downloaded >= 256 * 1024 or progress > 0.0)
+        return bool(
+            speed > 0
+            or downloaded >= 256 * 1024
+            or progress > 0.001
+            or (total > 0 and connections > 0)
+        )
+
+    def _race_add_candidates_aria2(
+        self,
+        media_id: int,
+        candidates: list[NyaaRelease],
+        *,
+        episode: int | None,
+        batch: bool,
+        fast_seconds: float = 10.0,
+        poll_seconds: float = 1.0,
+    ) -> NyaaRelease | None:
+        """Try aria2 candidates sequentially so they never write the same target concurrently."""
+
+        pool = list(candidates[:3])
+        for index, release in enumerate(pool):
+            self.download_intents.update(
+                media_id,
+                episode,
+                batch,
+                state="trying",
+                selected=release,
+                backend="aria2",
+                detail=f"candidate {index + 1}/{len(pool)}",
+            )
+            try:
+                self.add_release(media_id, release, episode=episode, batch=batch)
+            except (QBittorrentError, ManagerError) as exc:
+                self.logger.warning(
+                    "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                    "candidate=%s error=%r",
+                    media_id,
+                    episode,
+                    index + 1,
+                    str(exc),
+                )
+                continue
+
+            if not release.info_hash:
+                self.download_intents.update(
+                    media_id,
+                    episode,
+                    batch,
+                    state="downloading",
+                    selected=release,
+                    backend="aria2",
+                )
+                return release
+
+            client = self.qbt_client()
+            try:
+                prioritize = getattr(client, "prioritize", None)
+                if callable(prioritize):
+                    try:
+                        prioritize(release.info_hash)
+                    except QBittorrentError:
+                        pass
+
+                deadline = time.monotonic() + max(1.0, float(fast_seconds))
+                snapshot: dict[str, Any] | None = None
+                while time.monotonic() < deadline:
+                    try:
+                        snapshot = client.torrent_status(release.info_hash)
+                    except QBittorrentError:
+                        snapshot = None
+                    if snapshot and self._torrent_race_is_alive(snapshot):
+                        self.download_intents.update(
+                            media_id,
+                            episode,
+                            batch,
+                            state="downloading",
+                            selected=release,
+                            backend="aria2",
+                        )
+                        self.logger.info(
+                            "DONE step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                            "winner=%r candidate=%s fast=true",
+                            media_id,
+                            episode,
+                            release.title,
+                            index + 1,
+                        )
+                        return release
+                    time.sleep(max(0.1, float(poll_seconds)))
+
+                try:
+                    snapshot = client.torrent_status(release.info_hash)
+                except QBittorrentError:
+                    snapshot = snapshot or None
+                if snapshot and self._torrent_race_is_alive(snapshot):
+                    self.download_intents.update(
+                        media_id,
+                        episode,
+                        batch,
+                        state="downloading",
+                        selected=release,
+                        backend="aria2",
+                    )
+                    return release
+
+                downloaded = int((snapshot or {}).get("downloaded") or 0)
+                progress = float((snapshot or {}).get("progress") or 0.0)
+                if downloaded > 0 or progress > 0:
+                    # Once bytes exist, never destructively switch releases.
+                    self.download_intents.update(
+                        media_id,
+                        episode,
+                        batch,
+                        state="downloading",
+                        selected=release,
+                        backend="aria2",
+                        detail="candidate has partial data",
+                    )
+                    return release
+
+                try:
+                    client.delete(release.info_hash, delete_files=False)
+                except QBittorrentError:
+                    pass
+                self.db.delete_torrent_records(release.info_hash)
+                self.logger.info(
+                    "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s "
+                    "candidate=%s reason=no_progress",
+                    media_id,
+                    episode,
+                    index + 1,
+                )
+            finally:
+                client.close()
+
+        self.download_intents.update(
+            media_id,
+            episode,
+            batch,
+            state="waiting",
+            backend="aria2",
+            detail="No candidate started downloading",
+        )
+        return None
 
     def _race_add_candidates(
         self,
@@ -2313,8 +2276,27 @@ class AnimeManager:
         pool = list(candidates[:3])
         if not pool:
             return None
+        if not hasattr(self, "download_intents"):
+            self.download_intents = DownloadIntentStore(self.db)
+        backend = "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
+        self.download_intents.begin(
+            media_id, episode, batch, pool, backend=backend
+        )
+        if self.config.aria2.enabled and not self.config.qbittorrent.enabled:
+            return self._race_add_candidates_aria2(
+                media_id,
+                pool,
+                episode=episode,
+                batch=batch,
+                fast_seconds=fast_seconds,
+                poll_seconds=poll_seconds,
+            )
         if not self.config.qbittorrent.enabled or len(pool) == 1 or self.torrent_paused_on_add():
             self.add_release(media_id, pool[0], episode=episode, batch=batch)
+            self.download_intents.update(
+                media_id, episode, batch, state="downloading",
+                selected=pool[0], backend=backend,
+            )
             return pool[0]
 
         anime = self.db.get_anime(media_id)
@@ -2483,6 +2465,10 @@ class AnimeManager:
                 except QBittorrentError:
                     pass
             cleanup_empty_dirs()
+            self.download_intents.update(
+                media_id, episode, batch, state="downloading",
+                selected=winner, backend="qbittorrent",
+            )
             self.log(
                 f"qBittorrent: выбран живой релиз {winner.title} "
                 f"(score={winner.score:.1f}, seeds={winner.seeders}, leechers={winner.leechers})"
@@ -2508,6 +2494,10 @@ class AnimeManager:
                     self.logger.info(
                         "DONE step=torrent.race_existing_live hash=%s title=%r",
                         existing_request.torrent_hash, existing_request.name,
+                    )
+                    self.download_intents.update(
+                        media_id, episode, batch, state="downloading",
+                        selected=matched, backend="qbittorrent",
                     )
                     return matched
                 if float(existing_request.progress or 0.0) < 0.01:
@@ -2553,6 +2543,10 @@ class AnimeManager:
 
             if not entries:
                 cleanup_empty_dirs()
+                self.download_intents.update(
+                    media_id, episode, batch, state="waiting",
+                    backend="qbittorrent", detail="No candidate could be added",
+                )
                 return None
 
             race_deadline = started_at + max(float(total_seconds), float(fast_seconds))
@@ -2575,6 +2569,10 @@ class AnimeManager:
                 self.logger.warning(
                     "FALLBACK step=torrent.race_none_live media_id=%s episode=%s batch=%s candidates=%s",
                     media_id, episode, batch, len(entries),
+                )
+                self.download_intents.update(
+                    media_id, episode, batch, state="waiting",
+                    backend="qbittorrent", detail="No candidate started downloading",
                 )
                 return None
             return finalize(winner_entry)
@@ -2625,14 +2623,22 @@ class AnimeManager:
         if best is None:
             return None
         if (
-            self.config.qbittorrent.enabled
+            self.downloads_enabled()
             and not self.torrent_paused_on_add()
             and len(eligible) > 1
         ):
             return self._race_add_candidates(
                 media_id, eligible, episode=episode, batch=batch
             )
+        single_backend = "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
+        self.download_intents.begin(
+            media_id, episode, batch, [best], backend=single_backend
+        )
         self.add_release(media_id, best, episode=episode, batch=batch)
+        self.download_intents.update(
+            media_id, episode, batch, state="downloading",
+            selected=best, backend=single_backend,
+        )
         return best
 
     def auto_search_current(self) -> int:
@@ -2702,7 +2708,7 @@ class AnimeManager:
                     )
                     if best is not None:
                         if (
-                            self.config.qbittorrent.enabled
+                            self.downloads_enabled()
                             and not self.torrent_paused_on_add()
                             and len(eligible) > 1
                         ):
@@ -2713,8 +2719,19 @@ class AnimeManager:
                                 batch=False,
                             )
                         else:
+                            single_backend = (
+                                "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
+                            )
+                            self.download_intents.begin(
+                                anime.media_id, episode, False, [best],
+                                backend=single_backend,
+                            )
                             self.add_release(
                                 anime.media_id, best, episode=episode, batch=False
+                            )
+                            self.download_intents.update(
+                                anime.media_id, episode, False, state="downloading",
+                                selected=best, backend=single_backend,
                             )
                 except (NyaaError, QBittorrentError, ManagerError) as exc:
                     self.log(f"{anime.title} #{episode}: {exc}")
@@ -3828,6 +3845,12 @@ class AnimeManager:
             str(video.resolve()).encode("utf-8")
         ).hexdigest()
 
+    @staticmethod
+    def _subtitle_upgrade_attempts_key(video: Path) -> str:
+        return "subtitle_upgrade_checks:" + hashlib.sha1(
+            str(video.resolve()).encode("utf-8")
+        ).hexdigest()
+
     def _is_legacy_ocr_prepared_subtitle(self, item: LibraryEpisode) -> bool:
         """Recognize OCR results created before subtitle provenance was stored in DB."""
         if str(item.subtitle_origin or "").casefold() == "ocr":
@@ -3983,7 +4006,6 @@ class AnimeManager:
         if checks_left <= 0:
             return 0
         now = time.time()
-        cooldown = max(0.0, float(self.config.matching.subtitle_upgrade_check_hours)) * 3600.0
         scheduled = 0
         episodes = sorted(
             self.db.episodes(),
@@ -4003,11 +4025,17 @@ class AnimeManager:
             if latest and str(latest.get("source") or "").casefold() == "manual":
                 continue
             checked_key = self._subtitle_upgrade_checked_key(item.video_path)
+            attempts_key = self._subtitle_upgrade_attempts_key(item.video_path)
             try:
                 last_checked = float(self.db.get_state(checked_key, "0") or 0)
             except ValueError:
                 last_checked = 0.0
-            if not force and cooldown and now - last_checked < cooldown:
+            try:
+                completed_checks = max(0, int(self.db.get_state(attempts_key, "0") or 0))
+            except ValueError:
+                completed_checks = 0
+            cooldown = _subtitle_upgrade_backoff_hours(completed_checks) * 3600.0
+            if not force and last_checked and now - last_checked < cooldown:
                 continue
             request = {
                 "previous_subtitle_path": str(item.subtitle_path or ""),
@@ -4026,6 +4054,8 @@ class AnimeManager:
             }
             self.db.set_state(upgrade_key, json.dumps(request, ensure_ascii=False))
             self.db.set_state(checked_key, str(now))
+            if not force:
+                self.db.set_state(attempts_key, str(completed_checks + 1))
             self.db.queue_subtitle_job(
                 item.video_path,
                 item.media_id,
@@ -4159,41 +4189,99 @@ class AnimeManager:
         if episode is not None:
             selected = next((item for item in local_items if item.episode == int(episode)), None)
         if selected is None and local_items:
-            selected = next((item for item in local_items if item.state not in {"watched", "ready"}), local_items[0])
+            selected = next(
+                (item for item in local_items if item.state not in {"watched", "ready"}),
+                local_items[0],
+            )
         downloads = [
-            item for item in self.db.downloads()
-            if item.media_id == int(media_id) and (episode is None or item.episode in {None, int(episode)} or item.is_batch)
+            item
+            for item in self.db.downloads()
+            if item.media_id == int(media_id)
+            and (
+                episode is None
+                or item.episode in {None, int(episode)}
+                or item.is_batch
+            )
         ]
         jobs = [
-            row for row in self.db.subtitle_jobs()
-            if (selected is not None and str(row["video_path"]) == str(selected.video_path))
-            or (row["media_id"] is not None and int(row["media_id"]) == int(media_id)
-                and (episode is None or row["episode"] is None or int(row["episode"]) == int(episode)))
+            row
+            for row in self.db.subtitle_jobs()
+            if (
+                selected is not None
+                and str(row["video_path"]) == str(selected.video_path)
+            )
+            or (
+                row["media_id"] is not None
+                and int(row["media_id"]) == int(media_id)
+                and (
+                    episode is None
+                    or row["episode"] is None
+                    or int(row["episode"]) == int(episode)
+                )
+            )
         ]
         ru = self.config.ui.language == "ru"
         labels = {
             "anilist": "AniList сопоставлен" if ru else "AniList matched",
-            "download": "Видео скачано" if ru else "Video downloaded",
+            "downloaded": "Видео скачано" if ru else "Video downloaded",
+            "downloading": "Видео скачивается" if ru else "Video downloading",
             "file": "Видеофайл существует" if ru else "Video file exists",
             "subtitle": "Японские субтитры подготовлены" if ru else "Japanese subtitles prepared",
             "job": "Задание подготовки" if ru else "Preparation job",
             "none": "Субтитры не найдены" if ru else "No subtitles found",
-            "image": "Найдены только субтитры-картинки; ожидается текст или OCR" if ru else "Only image subtitles found; waiting for text/OCR",
-            "no_video": "Нет локального файла или активного торрента" if ru else "No local file or active torrent",
+            "image": (
+                "Найдены только субтитры-картинки; ожидается текст или OCR"
+                if ru
+                else "Only image subtitles found; waiting for text/OCR"
+            ),
+            "no_video": (
+                "Нет локального файла или активного торрента"
+                if ru
+                else "No local file or active torrent"
+            ),
             "no_row": "Нет записи о серии" if ru else "No episode row",
             "missing_job": "Задание потеряно" if ru else "Missing job",
             "completed": "Завершено" if ru else "Completed",
         }
-        checks: list[dict[str, Any]] = []
-        checks.append({"key": "anilist", "ok": True, "label": labels["anilist"], "detail": f"id={anime.media_id}"})
-        checks.append({
-            "key": "download",
-            "ok": bool(selected or downloads),
-            "label": labels["download"],
-            "detail": (str(selected.video_path) if selected else (downloads[0].state if downloads else labels["no_video"])),
-        })
+        action_job = jobs[0] if jobs else None
+        primary_download = downloads[0] if downloads else None
+        presentation = derive_episode_presentation(
+            local=selected,
+            download=primary_download,
+            action_job=action_job,
+        )
+
         video_exists = bool(selected and selected.video_path.is_file())
-        checks.append({"key": "file", "ok": video_exists, "label": labels["file"], "detail": str(selected.video_path) if selected else labels["no_row"]})
+        downloaded = bool(video_exists or any(download_complete(item) for item in downloads))
+        download_detail = labels["no_video"]
+        if video_exists and selected is not None:
+            download_detail = str(selected.video_path)
+        elif primary_download is not None:
+            download_detail = (
+                f"{primary_download.state} · {int(round(float(primary_download.progress or 0.0) * 100))}%"
+            )
+
+        checks: list[dict[str, Any]] = [
+            {
+                "key": "anilist",
+                "ok": True,
+                "label": labels["anilist"],
+                "detail": f"id={anime.media_id}",
+            },
+            {
+                "key": "download",
+                "ok": downloaded,
+                "label": labels["downloaded"] if downloaded else labels["downloading"],
+                "detail": download_detail,
+            },
+            {
+                "key": "file",
+                "ok": video_exists,
+                "label": labels["file"],
+                "detail": str(selected.video_path) if selected else labels["no_row"],
+            },
+        ]
+
         subtitle_ready = bool(selected and selected.state in {"ready", "watched"})
         subtitle_detail = labels["none"]
         if selected is not None:
@@ -4203,7 +4291,15 @@ class AnimeManager:
                 subtitle_detail = f"Embedded subtitle sid={selected.embedded_subtitle_id}"
             elif selected.state == "waiting_text_subtitles":
                 subtitle_detail = labels["image"]
-        checks.append({"key": "subtitle", "ok": subtitle_ready, "label": labels["subtitle"], "detail": subtitle_detail})
+        checks.append(
+            {
+                "key": "subtitle",
+                "ok": subtitle_ready,
+                "label": labels["subtitle"],
+                "detail": subtitle_detail,
+            }
+        )
+
         last_error = (
             _localize_preparation_detail(
                 str(jobs[0]["last_error"] or ""),
@@ -4212,26 +4308,51 @@ class AnimeManager:
             if jobs
             else ""
         )
-        checks.append({
-            "key": "job",
-            "ok": subtitle_ready or bool(jobs),
-            "label": labels["job"],
-            "detail": (f"{jobs[0]['state']}; attempts={jobs[0]['attempts']}; {last_error}" if jobs else (labels["completed"] if subtitle_ready else labels["missing_job"])),
-        })
+        checks.append(
+            {
+                "key": "job",
+                "ok": subtitle_ready or bool(jobs),
+                "label": labels["job"],
+                "detail": (
+                    f"{jobs[0]['state']}; attempts={jobs[0]['attempts']}; {last_error}"
+                    if jobs
+                    else (labels["completed"] if subtitle_ready else labels["missing_job"])
+                ),
+            }
+        )
         return {
-            "media_id": anime.media_id, "title": anime.title, "episode": episode,
+            "media_id": anime.media_id,
+            "title": anime.title,
+            "episode": episode,
             "ready": subtitle_ready,
             "video_path": str(selected.video_path) if selected else "",
             "state": selected.state if selected else "missing",
+            "presentation": presentation,
             "checks": checks,
             "downloads": [
-                {"name": item.name, "state": item.state, "progress": item.progress, "torrent_hash": item.torrent_hash}
+                {
+                    "name": item.name,
+                    "state": item.state,
+                    "progress": item.progress,
+                    "torrent_hash": item.torrent_hash,
+                }
                 for item in downloads[:5]
             ],
-            "job": ({
-                "state": str(jobs[0]["state"]), "attempts": int(jobs[0]["attempts"] or 0),
-                "next_check": float(jobs[0]["next_check"] or 0), "error": last_error,
-            } if jobs else None),
+            "download_intent": self.download_intents.get(
+                int(media_id),
+                int(episode) if episode is not None else None,
+                False,
+            ),
+            "job": (
+                {
+                    "state": str(jobs[0]["state"]),
+                    "attempts": int(jobs[0]["attempts"] or 0),
+                    "next_check": float(jobs[0]["next_check"] or 0),
+                    "error": last_error,
+                }
+                if jobs
+                else None
+            ),
         }
 
     def repair_library_integrity(self, *, automatic: bool = False, scan: bool = True) -> dict[str, int]:
@@ -4280,7 +4401,7 @@ class AnimeManager:
         preferred_paths: tuple[Path, ...] | list[Path] | None = None,
     ) -> int:
         apply_jimaku_trial(self.config)
-        if foreground_active(self.config.paths.cache_dir):
+        if not self.work_scheduler.background_allowed():
             self.logger.info(
                 "SKIP step=subtitle.process reason=foreground_active limit=%s", limit
             )
@@ -4329,7 +4450,7 @@ class AnimeManager:
 
         for job_index, job in enumerate(jobs):
             video = Path(str(job["video_path"]))
-            if foreground_active(self.config.paths.cache_dir):
+            if not self.work_scheduler.background_allowed():
                 self.db.postpone_subtitle_job(video, "Foreground playback requested", 60)
                 self.logger.info(
                     "RETRY step=subtitle.prepare reason=foreground_active media_id=%s episode=%s video=%s delay_s=60",
@@ -4512,6 +4633,17 @@ class AnimeManager:
                     },
                 },
             )
+            heavy_lease = self.work_scheduler.acquire_heavy(
+                "subtitle-prepare",
+                blocking=False,
+                foreground_sensitive=True,
+            )
+            if heavy_lease is None:
+                self.db.postpone_subtitle_job(
+                    video, "Heavy media work is busy", 60
+                )
+                requeue_unstarted(job_index + 1)
+                break
             try:
                 with timed_step(
                     self.logger,
@@ -4555,7 +4687,7 @@ class AnimeManager:
                                     },
                                 )
                                 last_report_stage = report_stage
-                        if foreground_active(self.config.paths.cache_dir):
+                        if not self.work_scheduler.background_allowed():
                             cancelled_for_foreground = True
                             process.terminate()
                             try:
@@ -4608,6 +4740,7 @@ class AnimeManager:
                     )
                 continue
             finally:
+                heavy_lease.release()
                 status_path.unlink(missing_ok=True)
             subtitle: Path | None = None
             embedded_subtitle_id: int | None = None

@@ -27,7 +27,13 @@ from .anilist_tracking import (
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config, write_default_config
 from .branding import APP_CLI, APP_NAME
 from .database import Database
-from .filename import fold_search_title, normalize_title, parse_anime_filename, title_similarity
+from .filename import fold_search_title, normalize_title, parse_anime_filename
+from .episode_numbering import (
+    aliases_from_offset,
+    episode_aliases_for_hint,
+    media_episode_from_release as shared_media_episode_from_release,
+    resolve_episode_numbering,
+)
 from .language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_japanese_subtitle
 from .llm import OllamaClient
 from .local_search import find_local_subtitles
@@ -591,93 +597,13 @@ def _correct_anilist_mapping(
 def _cached_relative_tracking_episode(
     anime: AniListAnime, absolute_episode: int, config: AppConfig
 ) -> int | None:
-    """Convert a release absolute number to this AniList cour without network."""
-    total = int(anime.episodes or 0)
-    absolute_episode = int(absolute_episode)
-    if absolute_episode < 1:
-        return None
-    if not total or absolute_episode <= total:
-        return absolute_episode
-
-    for folder in ("anilist-episode-offset", "anilist-release-numbering"):
-        path = config.paths.cache_dir / folder / f"{anime.id}.json"
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            offset = max(0, int(payload.get("offset", 0)))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
-        relative = absolute_episode - offset
-        if offset and 1 <= relative <= total:
-            return relative
-
-    try:
-        cached = Database(config.library.database_path).relation_graph_for_media(anime.id)
-    except Exception:
-        cached = None
-    graph = cached.get("graph") if isinstance(cached, dict) else None
-    if not isinstance(graph, dict):
-        return None
-
-    nodes = {
-        int(node["media_id"]): node
-        for node in graph.get("nodes", [])
-        if isinstance(node, dict) and node.get("media_id") is not None
-    }
-    if anime.id not in nodes:
-        return None
-    incoming: dict[int, list[int]] = {}
-    for edge in graph.get("edges", []):
-        if not isinstance(edge, dict) or str(edge.get("relation_type") or "").upper() != "SEQUEL":
-            continue
-        try:
-            source, target = int(edge.get("source")), int(edge.get("target"))
-        except (TypeError, ValueError):
-            continue
-        if source in nodes and target in nodes and source != target:
-            incoming.setdefault(target, []).append(source)
-
-    valid_formats = {"TV", "TV_SHORT", "ONA", ""}
-    episode_cap = max(100, total * 4)
-    current_id = int(anime.id)
-    visited = {current_id}
-    offset = 0
-    for _ in range(12):
-        current = nodes[current_id]
-        current_title = str(current.get("title") or (anime.titles[0] if anime.titles else ""))
-        candidates: list[tuple[float, dict[str, object]]] = []
-        for source_id in incoming.get(current_id, []):
-            if source_id in visited:
-                continue
-            candidate = nodes[source_id]
-            try:
-                count = int(candidate.get("episodes") or 0)
-            except (TypeError, ValueError):
-                count = 0
-            if str(candidate.get("format") or "").upper() not in valid_formats:
-                continue
-            if count < 1 or count > episode_cap:
-                continue
-            continuity = title_similarity(current_title, str(candidate.get("title") or ""))
-            if continuity < 35.0:
-                continue
-            candidates.append((continuity, candidate))
-        if not candidates:
-            break
-        _score, candidate = max(
-            candidates,
-            key=lambda item: (
-                item[0],
-                str(item[1].get("start_date") or ""),
-                int(item[1].get("media_id") or 0),
-            ),
-        )
-        offset += int(candidate.get("episodes") or 0)
-        current_id = int(candidate["media_id"])
-        visited.add(current_id)
-
-    relative = absolute_episode - offset
-    return relative if offset and 1 <= relative <= total else None
-
+    return shared_media_episode_from_release(
+        anime,
+        int(absolute_episode),
+        config,
+        None,
+        allow_network=False,
+    )
 
 def _tracking_episode_from_hint(
     anime: AniListAnime, episode_hint: int, config: AppConfig, logger
@@ -695,7 +621,13 @@ def _tracking_episode_from_hint(
     if not total or episode_hint <= total:
         return anime, episode_hint
 
-    relative = _cached_relative_tracking_episode(anime, episode_hint, config)
+    relative = shared_media_episode_from_release(
+        anime,
+        episode_hint,
+        config,
+        logger,
+        allow_network=False,
+    )
     if relative is not None:
         logger.info(
             "RESULT step=anilist.tracking_episode media_id=%s absolute=%s relative=%s source=cache",
@@ -760,106 +692,18 @@ def _cached_relation_graph_episode_offset(
     config: AppConfig,
 ) -> int | None:
     try:
-        cached = Database(
-            config.library.database_path
-        ).relation_graph_for_media(anime.id)
+        db = Database(config.library.database_path)
+        result = resolve_episode_numbering(
+            anime,
+            1,
+            config,
+            None,
+            db=db,
+            allow_network=False,
+        )
     except Exception:
         return None
-
-    graph = cached.get("graph") if isinstance(cached, dict) else None
-    if not isinstance(graph, dict):
-        return None
-
-    nodes = {
-        int(node["media_id"]): node
-        for node in graph.get("nodes", [])
-        if isinstance(node, dict) and node.get("media_id") is not None
-    }
-    if anime.id not in nodes:
-        return None
-
-    incoming: dict[int, list[int]] = {}
-    for edge in graph.get("edges", []):
-        if (
-            not isinstance(edge, dict)
-            or str(edge.get("relation_type") or "").upper() != "SEQUEL"
-        ):
-            continue
-        try:
-            source = int(edge.get("source"))
-            target = int(edge.get("target"))
-        except (TypeError, ValueError):
-            continue
-        if source in nodes and target in nodes and source != target:
-            incoming.setdefault(target, []).append(source)
-
-    counted_formats = {"TV", "TV_SHORT", "ONA", ""}
-    bridge_formats = {"OVA", "SPECIAL", "MOVIE"}
-    episode_cap = max(100, int(anime.episodes or 0) * 4)
-    current_id = int(anime.id)
-    visited = {current_id}
-    offset = 0
-
-    for _ in range(20):
-        current = nodes[current_id]
-        current_title = str(
-            current.get("title")
-            or (anime.titles[0] if anime.titles else "")
-        )
-        candidates = []
-
-        for source_id in incoming.get(current_id, []):
-            if source_id in visited:
-                continue
-            candidate = nodes[source_id]
-            candidate_format = str(
-                candidate.get("format") or ""
-            ).upper()
-
-            try:
-                count = int(candidate.get("episodes") or 0)
-            except (TypeError, ValueError):
-                count = 0
-
-            if candidate_format in counted_formats:
-                if count < 1 or count > episode_cap:
-                    continue
-                counted = count
-            elif candidate_format in bridge_formats:
-                counted = 0
-            else:
-                continue
-
-            continuity = title_similarity(
-                current_title,
-                str(candidate.get("title") or ""),
-            )
-            if continuity < 35.0:
-                continue
-
-            candidates.append(
-                (continuity, counted, candidate)
-            )
-
-        if not candidates:
-            break
-
-        _score, counted, candidate = max(
-            candidates,
-            key=lambda item: (
-                item[0],
-                item[1] > 0,
-                str(item[2].get("start_date") or ""),
-                int(item[2].get("media_id") or 0),
-            ),
-        )
-
-        offset += counted
-        current_id = int(candidate["media_id"])
-        visited.add(current_id)
-
-    return offset or None
-
+    return int(result.offset) if result.offset else None
 
 def _jimaku_episode_aliases(
     anime: AniListAnime | None,
@@ -869,167 +713,26 @@ def _jimaku_episode_aliases(
 ) -> tuple[int, ...]:
     if anime is None or requested_episode is None or requested_episode < 1:
         return ()
-    if (anime.format or "").upper() not in {"TV", "TV_SHORT", "ONA", ""}:
-        return ()
-
-    cache_path = config.paths.cache_dir / "anilist-episode-offset" / f"{anime.id}.json"
-    release_cache_path = (
-        config.paths.cache_dir
-        / "anilist-release-numbering"
-        / f"{anime.id}.json"
-    )
-
-    offset_candidates: list[tuple[int, str]] = []
-    resolver_v2_cached = False
-
-    for local_cache in (release_cache_path, cache_path):
-        try:
-            if (
-                local_cache.is_file()
-                and time.time() - local_cache.stat().st_mtime < 7 * 86400
-            ):
-                payload = json.loads(local_cache.read_text(encoding="utf-8"))
-                candidate_offset = int(payload.get("offset", 0))
-                if candidate_offset >= 0:
-                    offset_candidates.append(
-                        (candidate_offset, local_cache.parent.name)
-                    )
-                if (
-                    local_cache == cache_path
-                    and int(payload.get("resolver_version", 0)) >= 2
-                ):
-                    resolver_v2_cached = True
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            continue
-
-    graph_offset = None
-    graph_resolver = globals().get("_cached_relation_graph_episode_offset")
-    if callable(graph_resolver):
-        try:
-            graph_offset = graph_resolver(anime, config)
-        except Exception:
-            graph_offset = None
+    graph_offset = _cached_relation_graph_episode_offset(anime, config)
     if graph_offset is not None:
-        offset_candidates.append((int(graph_offset), "relation_graph"))
-
-    need_live_refresh = (
-        graph_offset is None
-        and not resolver_v2_cached
-        and bool(config.anilist.enabled)
-    )
-
-    if need_live_refresh or not offset_candidates:
-        client = AniListClient(
-            config.anilist.endpoint,
-            access_token=config.anilist.access_token,
-        )
-        try:
-            absolute, chain = client.absolute_episode_number(
-                anime,
-                requested_episode,
-            )
-            live_offset = max(
-                0,
-                int(absolute) - int(requested_episode),
-            )
-            offset_candidates.append((live_offset, "anilist-live-v2"))
-
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(
-                json.dumps(
-                    {
-                        "media_id": anime.id,
-                        "offset": live_offset,
-                        "chain": [item.id for item in chain],
-                        "resolver_version": 2,
-                        "updated_at": time.time(),
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            try:
-                release_payload = {}
-                if release_cache_path.is_file():
-                    release_payload = json.loads(
-                        release_cache_path.read_text(encoding="utf-8")
-                    )
-                    if not isinstance(release_payload, dict):
-                        release_payload = {}
-                release_payload.update(
-                    {
-                        "media_id": anime.id,
-                        "offset": live_offset,
-                        "chain": [item.id for item in chain],
-                        "resolver_version": 2,
-                        "updated_at": time.time(),
-                    }
-                )
-                release_cache_path.parent.mkdir(parents=True, exist_ok=True)
-                release_cache_path.write_text(
-                    json.dumps(release_payload, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
-        except (AniListError, OSError, ValueError) as exc:
+        aliases = aliases_from_offset(anime, int(requested_episode), graph_offset)
+        if aliases:
             logger.info(
-                "SKIP step=jimaku.episode_aliases media_id=%s episode=%s reason=%r",
+                "RESULT step=jimaku.episode_aliases media_id=%s episode=%s aliases=%s "
+                "offset=%s source=episode_numbering",
                 anime.id,
                 requested_episode,
-                exc,
+                aliases,
+                graph_offset,
             )
-        finally:
-            client.close()
-
-    if not offset_candidates:
-        return ()
-
-    offset, offset_source = max(
-        offset_candidates,
-        key=lambda item: (
-            item[0],
-            item[1] in {"relation_graph", "anilist-live-v2"},
-        ),
+        return aliases
+    return episode_aliases_for_hint(
+        anime,
+        int(requested_episode),
+        config,
+        logger,
+        allow_network=True,
     )
-    logger.info(
-        "RESULT step=jimaku.episode_offset media_id=%s offset=%s source=%s candidates=%s",
-        anime.id,
-        offset,
-        offset_source,
-        offset_candidates,
-    )
-
-    if not offset:
-        return ()
-
-    episode_count = int(anime.episodes or 0)
-    aliases: list[int] = []
-    if episode_count > 0 and requested_episode > episode_count:
-        relative_episode = requested_episode - offset
-        if 1 <= relative_episode <= episode_count:
-            aliases.append(relative_episode)
-            logger.info(
-                "RESULT step=jimaku.episode_aliases media_id=%s absolute=%s relative=%s offset=%s",
-                anime.id,
-                requested_episode,
-                relative_episode,
-                offset,
-            )
-    else:
-        absolute_episode = requested_episode + offset
-        if absolute_episode != requested_episode:
-            aliases.append(absolute_episode)
-            logger.info(
-                "RESULT step=jimaku.episode_aliases media_id=%s relative=%s absolute=%s offset=%s",
-                anime.id,
-                requested_episode,
-                absolute_episode,
-                offset,
-            )
-
-    return tuple(dict.fromkeys(aliases))
 
 def _find_online_subtitles(
     video: Path,

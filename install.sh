@@ -198,7 +198,11 @@ WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 # Install runtime dependencies from the wheel metadata, including the optional
 # subtitle synchronization stack. Then force-reinstall the exact bundled wheel
 # so a rebuilt ZIP can never leave stale or metadata-only package contents.
-"$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
+if [[ -f "$PROJECT_DIR/release-requirements.txt" && ! -d "$PROJECT_DIR/.git" ]]; then
+  "$VENV_DIR/bin/python" -m pip install --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
+else
+  "$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
+fi
 "$VENV_DIR/bin/python" -m pip install --force-reinstall --no-deps "$WHEEL_PATH"
 
 if (( MANGA_OCR_WAS_INSTALLED && ! FAST_UPDATE )); then

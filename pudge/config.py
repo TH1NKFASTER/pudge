@@ -188,7 +188,7 @@ class AniListConfig:
     client_id: str = ""
     access_token: str = ""
     auto_update_progress: bool = True
-    watched_threshold: float = 5 / 6
+    watched_threshold: float = 0.85
     watched_max_remaining_minutes: float = 10.0
     add_if_missing: bool = False
     update_when_rewatching: bool = True
@@ -232,7 +232,7 @@ class MatchingConfig:
     ocr_image_subtitles: bool = False
     auto_upgrade_subtitles: bool = True
     subtitle_upgrade_min_score_gain: float = 25.0
-    subtitle_upgrade_check_hours: float = 24.0
+    subtitle_upgrade_check_hours: float = 6.0
     max_subtitle_upgrade_checks_per_run: int = 2
 
 
@@ -409,8 +409,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             preferred_sources=[str(x) for x in nyaa.get(
                 "preferred_sources", ["BluRay", "WEB-DL", "WEBRip"]
             )],
-            require_japanese_audio=bool(nyaa.get("require_japanese_audio", True)),
-            avoid_upscaled=bool(nyaa.get("avoid_upscaled", True)),
+            require_japanese_audio=True,
+            avoid_upscaled=True,
             trusted_groups=[str(x) for x in nyaa.get(
                 "trusted_groups", ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
             )],
@@ -422,7 +422,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             episode_max_size_mb=int(nyaa.get("episode_max_size_mb", 3500)),
             max_auto_download_per_anime=int(nyaa.get("max_auto_download_per_anime", 2)),
             auto_upgrade_downloaded=bool(nyaa.get("auto_upgrade_downloaded", True)),
-            upgrade_min_score_gain=float(nyaa.get("upgrade_min_score_gain", 30.0)),
+            upgrade_min_score_gain=30.0,
             upgrade_check_hours=float(nyaa.get("upgrade_check_hours", 24.0)),
             max_upgrade_checks_per_run=int(nyaa.get("max_upgrade_checks_per_run", 2)),
         ),
@@ -444,7 +444,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         aria2=Aria2Config(
             enabled=bool(aria2.get("enabled", False)),
-            binary=str(aria2.get("binary", "aria2c")).strip() or "aria2c",
+            binary="aria2c",
             rpc_port=max(1024, min(65535, int(aria2.get("rpc_port", 6801)))),
             auto_start=bool(aria2.get("auto_start", True)),
             paused_on_add=bool(aria2.get("paused_on_add", False)),
@@ -468,8 +468,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             keep_batch_until_completed=bool(agent.get("keep_batch_until_completed", True)),
         ),
         playback=PlaybackConfig(
-            enabled=bool(playback.get("enabled", True)),
-            rewind_seconds=max(0.0, float(playback.get("rewind_seconds", 15.0))),
+            enabled=True,
+            rewind_seconds=10.0,
             save_interval_seconds=max(10.0, float(playback.get("save_interval_seconds", 30.0))),
         ),
         shortcuts=ShortcutsConfig(
@@ -505,8 +505,8 @@ def load_config(path: Path | None = None) -> AppConfig:
                 "ANILIST_ACCESS_TOKEN", str(anilist.get("access_token", ""))
             ).strip(),
             auto_update_progress=bool(anilist.get("auto_update_progress", True)),
-            watched_threshold=float(anilist.get("watched_threshold", 5 / 6)),
-            watched_max_remaining_minutes=max(0.0, float(anilist.get("watched_max_remaining_minutes", 10.0))),
+            watched_threshold=0.85,
+            watched_max_remaining_minutes=10.0,
             add_if_missing=bool(anilist.get("add_if_missing", False)),
             update_when_rewatching=bool(anilist.get("update_when_rewatching", True)),
             completed_to_rewatching_on_episode_one=bool(
@@ -543,10 +543,10 @@ def load_config(path: Path | None = None) -> AppConfig:
             evaluate_all_jimaku=bool(matching.get("evaluate_all_jimaku", True)),
             max_jimaku_candidates=int(matching.get("max_jimaku_candidates", 0)),
             ocr_image_subtitles=bool(matching.get("ocr_image_subtitles", False)),
-            auto_upgrade_subtitles=bool(matching.get("auto_upgrade_subtitles", True)),
-            subtitle_upgrade_min_score_gain=float(matching.get("subtitle_upgrade_min_score_gain", 25.0)),
-            subtitle_upgrade_check_hours=float(matching.get("subtitle_upgrade_check_hours", 24.0)),
-            max_subtitle_upgrade_checks_per_run=int(matching.get("max_subtitle_upgrade_checks_per_run", 2)),
+            auto_upgrade_subtitles=True,
+            subtitle_upgrade_min_score_gain=25.0,
+            subtitle_upgrade_check_hours=6.0,
+            max_subtitle_upgrade_checks_per_run=2,
         ),
         sync=SyncConfig(
             enabled=bool(sync.get("enabled", True)),
@@ -572,8 +572,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             pgs_onset_pulse_seconds=float(sync.get("pgs_onset_pulse_seconds", 0.4)),
             pgs_onset_tolerance_seconds=float(sync.get("pgs_onset_tolerance_seconds", 0.75)),
             pgs_onset_min_improvement=float(sync.get("pgs_onset_min_improvement", 0.08)),
-            use_container_chapters=bool(sync.get("use_container_chapters", True)),
-            japanese_stt_fallback=bool(sync.get("japanese_stt_fallback", True)),
+            use_container_chapters=True,
+            japanese_stt_fallback=True,
             japanese_stt_model=str(
                 sync.get("japanese_stt_model", "mlx-community/whisper-tiny")
             ).strip() or "mlx-community/whisper-tiny",

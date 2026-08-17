@@ -10,7 +10,7 @@ from pathlib import Path
 from ..subtitle_formats import parse_srt, write_srt
 
 
-_ALGORITHM_VERSION = "timeline-v5.8-layered-reference-gate"
+_ALGORITHM_VERSION = "timeline-v5.9-early-edit-speech-gate"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -59,6 +59,92 @@ class _WindowMatch:
 
 def _result(reason: str, **values: object) -> dict[str, object]:
     return {"reason": reason, **values}
+
+
+def _early_edit_audio_verification_risk(
+    path: list[_WindowMatch],
+    cold_start: dict[str, object],
+    monotonic_refinements: list[dict[str, object]],
+) -> dict[str, object]:
+    """Flag early clock ambiguity that should be verified against Japanese speech.
+
+    Subtitle-to-subtitle matching is still useful for the normal fast path, but
+    openings are where different broadcast masters most often insert/remove
+    material. A suspicious result is not rejected here: it is routed to the
+    cached Japanese STT + ALASS speech clock before Pudge marks it reliable.
+    """
+    reasons: list[str] = []
+    early = [item for item in path if float(item.center) <= 360.0 and item.matched >= 3]
+    smoothed_offsets = _smooth_offsets(early) if early else []
+
+    offset_span = (
+        max(smoothed_offsets) - min(smoothed_offsets)
+        if len(smoothed_offsets) >= 2
+        else 0.0
+    )
+    max_jump = max(
+        (
+            abs(right - left)
+            for left, right in zip(smoothed_offsets, smoothed_offsets[1:])
+        ),
+        default=0.0,
+    )
+    if len(smoothed_offsets) >= 3 and offset_span >= 4.0 and max_jump >= 3.0:
+        reasons.append("early_path_clock_change")
+
+    boundary_groups: dict[int, list[dict[str, object]]] = {}
+    for row in monotonic_refinements:
+        if not isinstance(row, dict) or not bool(row.get("applied")):
+            continue
+        try:
+            index = int(row.get("boundary_index") or 0)
+            old_time = float(row.get("old_source_time") or 0.0)
+            new_time = float(row.get("new_source_time") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if old_time > 360.0 and new_time > 360.0:
+            continue
+        boundary_groups.setdefault(index, []).append(row)
+
+    monotonic_shift = 0.0
+    for rows in boundary_groups.values():
+        try:
+            first_old = float(rows[0].get("old_source_time") or 0.0)
+            last_new = float(rows[-1].get("new_source_time") or first_old)
+        except (TypeError, ValueError):
+            continue
+        monotonic_shift = max(monotonic_shift, max(0.0, last_new - first_old))
+    if monotonic_shift >= 4.0:
+        reasons.append("early_boundary_delayed_for_monotonicity")
+
+    cold_delta = 0.0
+    cold_gap = 0.0
+    cold_boundary = 0.0
+    if isinstance(cold_start, dict):
+        try:
+            cold_delta = abs(float(cold_start.get("delta_seconds") or 0.0))
+            cold_gap = float(cold_start.get("gap_seconds") or 0.0)
+            cold_boundary = float(cold_start.get("boundary_source_time") or 0.0)
+        except (TypeError, ValueError):
+            cold_delta = cold_gap = cold_boundary = 0.0
+    if (
+        cold_gap >= 45.0
+        and 0.0 < cold_boundary <= 240.0
+        and cold_delta >= 1.5
+    ):
+        reasons.append("opening_gap_clock_ambiguity")
+
+    return {
+        "required": bool(reasons),
+        "reasons": reasons,
+        "early_window_count": len(early),
+        "early_offset_span_seconds": round(offset_span, 3),
+        "early_max_jump_seconds": round(max_jump, 3),
+        "monotonic_boundary_delay_seconds": round(monotonic_shift, 3),
+        "cold_start_delta_seconds": round(cold_delta, 3),
+        "cold_start_gap_seconds": round(cold_gap, 3),
+        "cold_start_boundary_seconds": round(cold_boundary, 3),
+    }
 
 
 def _merge_activity(cues: list[tuple[float, float, str]]) -> list[tuple[float, float]]:
@@ -1904,6 +1990,12 @@ def align_subtitle_timelines(
             cold_start=cold_start,
         )
 
+    timeline_early_edit_audio_verification = _early_edit_audio_verification_risk(
+        path,
+        cold_start,
+        monotonic_refinements,
+    )
+
     repaired: list[tuple[float, float, str]] = []
     previous_start = -1.0
     for start, end, text in source_cues:
@@ -2001,6 +2093,7 @@ def align_subtitle_timelines(
         timeline_cold_start=cold_start,
         timeline_transition_refinements=transition_refinements,
         timeline_monotonic_refinements=monotonic_refinements,
+        timeline_early_edit_audio_verification=timeline_early_edit_audio_verification,
         timeline_path=[item.as_dict() for item in path],
         timeline_validation={
             "before": before_metrics,

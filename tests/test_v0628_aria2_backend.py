@@ -35,7 +35,7 @@ def test_aria2_config_round_trip(tmp_path: Path) -> None:
 
     loaded = load_config(path)
     assert loaded.aria2.enabled is True
-    assert loaded.aria2.binary == "/opt/homebrew/bin/aria2c"
+    assert loaded.aria2.binary == "aria2c"
     assert loaded.aria2.rpc_port == 6812
 
 

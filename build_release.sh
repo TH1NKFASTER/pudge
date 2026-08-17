@@ -32,6 +32,9 @@ if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
 fi
 find pudge tests -type d -name __pycache__ -prune -exec rm -rf {} +
 python -m pip wheel . --no-deps --no-build-isolation -w dist
+command -v uv >/dev/null 2>&1 || { echo "uv is required to build a release" >&2; exit 1; }
+uv lock
+uv export --locked --extra sync --no-dev --no-emit-project --format requirements.txt --output-file dist/release-requirements.txt
 
 STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"
 rm -rf "$PROJECT_DIR/dist/release"
@@ -41,6 +44,7 @@ cp -R docs "$STAGE/"
 cp install.sh README.md config.example.toml pyproject.toml build_release.sh rename_brand.py brand_migration.py \
   LICENSE SECURITY.md CONTRIBUTING.md DEVELOPMENT.md RELEASING.md CHANGELOG.md "$STAGE/"
 cp "dist/pudge-${VERSION}-py3-none-any.whl" "$STAGE/"
+cp "dist/release-requirements.txt" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh"
 
 (

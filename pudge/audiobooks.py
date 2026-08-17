@@ -80,6 +80,7 @@ class AudiobookService:
         python: str | None = None,
         stt_model: str = "mlx-community/whisper-tiny",
         job_center: Any | None = None,
+        work_scheduler: Any | None = None,
     ) -> None:
         self.db = database
         self.ffprobe = ffprobe
@@ -89,6 +90,7 @@ class AudiobookService:
         self.stt_model = str(stt_model or "mlx-community/whisper-tiny")
         self.cache_dir = Path(cache_dir)
         self.job_center = job_center
+        self.work_scheduler = work_scheduler
         self._probe_cache = MetadataCache(self.cache_dir, "audiobook-probe", schema="v2")
         self._players: dict[int, subprocess.Popen[Any]] = {}
         self._ipc_paths: dict[int, Path] = {}
@@ -1121,6 +1123,24 @@ class AudiobookService:
             )
 
     def _transcribe_worker(self, audiobook_id: int, output: Path, event: threading.Event) -> None:
+        with self._lock:
+            cancel_event = self._transcription_cancel_events.get(audiobook_id)
+        heavy_lease = None
+        if self.work_scheduler is not None:
+            heavy_lease = self.work_scheduler.acquire_heavy(
+                "audiobook-stt",
+                blocking=True,
+                foreground_sensitive=True,
+                wait_for_foreground=True,
+                cancel_event=cancel_event,
+            )
+            if heavy_lease is None:
+                self._set_transcription_job(
+                    audiobook_id,
+                    {"status": "cancelled", "ready": False, "error": ""},
+                )
+                event.set()
+                return
         output.parent.mkdir(parents=True, exist_ok=True)
         work_dir = Path(tempfile.mkdtemp(prefix=f".{output.stem}-work-", dir=output.parent))
         try:
@@ -1314,6 +1334,8 @@ class AudiobookService:
             shutil.rmtree(work_dir, ignore_errors=True)
             with self._lock:
                 self._transcription_cancel_events.pop(audiobook_id, None)
+            if heavy_lease is not None:
+                heavy_lease.release()
             event.set()
 
     def prepare_transcription(
@@ -1521,6 +1543,7 @@ class AudiobookService:
         audiobook_id: int,
         output: Path,
     ) -> None:
+        heavy_lease = None
         try:
             with self.db.connect() as conn:
                 chapters = [
@@ -1597,6 +1620,9 @@ class AudiobookService:
                 audiobook_id,
                 {"status": "error", "ready": False, "error": str(exc)},
             )
+        finally:
+            if heavy_lease is not None:
+                heavy_lease.release()
 
     def prepare_alignment(self, ln_book_id: int, *, force: bool = False) -> dict[str, Any]:
         link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)

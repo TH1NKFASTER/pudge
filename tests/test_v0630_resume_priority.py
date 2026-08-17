@@ -47,7 +47,7 @@ def test_mid_episode_resume_card_wins_over_ready_section(tmp_path: Path) -> None
     assert [item["media_id"] for item in home["continue_watching"]] == [anime.media_id]
     assert home["new_ready"] == []
     assert home["completed_ready"] == []
-    assert home["continue_watching"][0]["resume_start"] == 419.643
+    assert home["continue_watching"][0]["resume_start"] == 424.643
 
 
 def test_player_exit_refreshes_mid_episode_state() -> None:

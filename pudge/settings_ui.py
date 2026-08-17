@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import __version__
 from .branding import APP_NAME
-from .config import AppConfig, load_config, write_config
+from .config import load_config, write_config
 from .jimaku_trial import apply_jimaku_trial
 from .llm import list_models
 from .providers.anilist import AniListClient, AniListError

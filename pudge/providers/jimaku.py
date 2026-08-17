@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from ..filename import fold_search_title, parse_anime_filename, release_tokens, title_similarity
+from ..filename import parse_anime_filename, release_tokens, title_similarity
 from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, has_japanese_marker, is_japanese_subtitle
 from ..logging_utils import configure_logging, timed_step
 from ..branding import APP_SLUG

@@ -168,6 +168,7 @@ def test_existing_old_torrent_for_same_anime_blocks_second_batch(tmp_path: Path,
 
 def test_download_card_keeps_normal_height_and_hides_button_while_active() -> None:
     html = HTML.read_text(encoding="utf-8")
+    library = (HTML.parent / "library.js").read_text(encoding="utf-8")
 
     assert ".download-available-card .cover-action { display:block; width:100%;" in html
     assert ".download-available-card .airing-meta { height:68px; min-height:68px; }" in html
@@ -175,4 +176,4 @@ def test_download_card_keeps_normal_height_and_hides_button_while_active() -> No
     assert "t('label.downloading'" in html
     assert "t('label.preparingDownload')" in html
     assert "result?.already_downloading" in html
-    assert "const ep=e.episode==null?t('label.movie')" in html
+    assert "const ep=e.episode==null?t('label.movie')" in library

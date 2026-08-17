@@ -18,15 +18,15 @@ def test_startup_uses_same_forced_subtitle_retry_pipeline_as_refresh() -> None:
     assert "background_agent_enabled mode=startup" not in block
 
 
-def test_watch_cap_is_exposed_next_to_percentage_in_web_settings() -> None:
+def test_watch_cap_is_fixed_and_hidden_in_web_settings() -> None:
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
-    threshold = html.index("s_anilist_threshold")
-    cap = html.index("s_anilist_max_remaining")
-    assert threshold < cap
-    assert "Макс. минут до конца" in html
-    assert "Max minutes before end" in html
-    assert "anilist_max_remaining_minutes:Number(v('s_anilist_max_remaining'))" in html
+    assert 'id="s_anilist_threshold"' not in html
+    assert 'id="s_anilist_max_remaining"' not in html
+    assert "anilist_threshold:85,anilist_max_remaining_minutes:10" in html
+    assert "просмотрено не меньше 85%" in html
+    assert "Episode is marked watched once you've viewed at least 85% and 10 minutes or less remain" in html
+    assert "shortcutDisplay(s.shortcut_mpv_mark_watched||'')" in html
 
 
 def test_watch_cap_is_sent_to_mpv_tracker() -> None:

@@ -153,7 +153,7 @@ def test_cached_watch_order_is_hidden_until_complete_first_frame_and_logs_timing
 
 
 def test_library_episode_width_card_link_shortcuts_and_polychrome_restart() -> None:
-    html = HTML.read_text(encoding="utf-8")
+    html = HTML.read_text(encoding="utf-8") + (ROOT / "pudge" / "web" / "library.js").read_text(encoding="utf-8")
     assert "const episodeColumnCh=Math.max(5,...episodeLabels.map" in html
     assert "--episode-column-width:${episodeColumnCh}ch" in html
     assert ".library-episode > strong { white-space:nowrap; }" in html

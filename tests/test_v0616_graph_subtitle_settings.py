@@ -42,9 +42,9 @@ def test_library_subtitle_statuses_are_descriptive() -> None:
 
 
 def test_image_subtitle_click_reveals_external_or_embedded_source() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    assert "const revealPath=e.subtitle_path||(e.subtitle_source==='image'?e.video_path:'')" in html
-    assert "data-path=\"${escapeHtml(revealPath)}\"" in html
+    library = (HTML.parent / "library.js").read_text(encoding="utf-8")
+    assert "const revealPath=e.subtitle_path||(e.subtitle_source==='image'?e.video_path:'')" in library
+    assert "data-path=\"${escapeHtml(revealPath)}\"" in library
 
 
 def test_reveal_subtitle_accepts_pgs_and_embedded_video(tmp_path: Path, monkeypatch) -> None:

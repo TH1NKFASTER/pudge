@@ -229,13 +229,13 @@ def test_upgrade_settings_round_trip(tmp_path: Path) -> None:
 
     loaded = load_config(cfg.config_path)
     assert loaded.nyaa.auto_upgrade_downloaded is False
-    assert loaded.nyaa.upgrade_min_score_gain == 17.5
+    assert loaded.nyaa.upgrade_min_score_gain == 30.0
     assert loaded.nyaa.upgrade_check_hours == 8
     assert loaded.nyaa.max_upgrade_checks_per_run == 7
-    assert loaded.matching.auto_upgrade_subtitles is False
-    assert loaded.matching.subtitle_upgrade_min_score_gain == 12.0
-    assert loaded.matching.subtitle_upgrade_check_hours == 6
-    assert loaded.matching.max_subtitle_upgrade_checks_per_run == 4
+    assert loaded.matching.auto_upgrade_subtitles is True
+    assert loaded.matching.subtitle_upgrade_min_score_gain == 25.0
+    assert loaded.matching.subtitle_upgrade_check_hours == 6.0
+    assert loaded.matching.max_subtitle_upgrade_checks_per_run == 2
 
 
 def test_web_ui_exposes_selected_competitor_features() -> None:

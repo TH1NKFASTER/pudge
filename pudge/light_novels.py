@@ -649,10 +649,10 @@ class LightNovelService:
             auto_download_nyaa=values.get("auto_download_nyaa", "0") == "1",
             nyaa_category=values.get("nyaa_category", "3_3") or "3_3",
             reader_font=values.get("reader_font", "mincho") or "mincho",
-            reader_theme=values.get("reader_theme", "night") or "night",
+            reader_theme=values.get("reader_theme", "sumi") or "night",
             reader_font_size=max(12, min(72, int(float(values.get("reader_font_size", "22") or 22)))),
-            reader_text_color=values.get("reader_text_color", "#dce7f6") or "#dce7f6",
-            reader_background_color=values.get("reader_background_color", "#0b1420") or "#0b1420",
+            reader_text_color=values.get("reader_text_color", "#c9c7c2") or "#dce7f6",
+            reader_background_color=values.get("reader_background_color", "#000000") or "#0b1420",
             reader_width=max(360, min(2400, int(float(values.get("reader_width", "900") or 900)))),
             reader_line_height=max(1.0, min(3.5, float(values.get("reader_line_height", "1.9") or 1.9))),
             reader_indent=max(0.0, min(5.0, float(values.get("reader_indent", "1.0") or 1.0))),
@@ -994,7 +994,16 @@ class LightNovelService:
             rows = conn.execute(
                 """SELECT b.*,bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
                           COUNT(c.id) AS chapter_count,
-                          COALESCE(SUM(LENGTH(c.text)),0) AS character_count FROM ln_books b
+                          COALESCE(SUM(LENGTH(c.text)),0) AS character_count,
+                          COALESCE(SUM(
+                              CASE
+                                  WHEN c.chapter_index < b.current_chapter
+                                      THEN LENGTH(c.text)
+                                  WHEN c.chapter_index = b.current_chapter
+                                      THEN LENGTH(c.text) * b.current_offset
+                                  ELSE 0
+                              END
+                          ),0) AS read_character_count FROM ln_books b
                    LEFT JOIN ln_bookmarks bm ON bm.book_id=b.id
                    LEFT JOIN ln_chapters c ON c.book_id=b.id GROUP BY b.id
                    ORDER BY b.updated_at DESC,b.title COLLATE NOCASE"""
@@ -1010,6 +1019,21 @@ class LightNovelService:
                 else (_series_key(title) or f"book:{int(item['id'])}")
             )
             item["series_title"] = _series_title(title) or title
+            total_characters = max(0, int(item.get("character_count") or 0))
+            read_characters = max(0.0, float(item.get("read_character_count") or 0.0))
+            if bool(item.get("finished")) and total_characters:
+                read_characters = float(total_characters)
+            if total_characters:
+                read_characters = min(float(total_characters), read_characters)
+                reading_progress = read_characters / float(total_characters)
+            else:
+                reading_progress = 1.0 if bool(item.get("finished")) else 0.0
+            item["read_character_count"] = round(read_characters, 3)
+            item["reading_progress"] = max(0.0, min(1.0, reading_progress))
+            item["reading_progress_percent"] = round(
+                item["reading_progress"] * 100.0,
+                2,
+            )
             result.append(item)
         return result
 

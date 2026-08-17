@@ -216,10 +216,12 @@ class MangaService:
         *,
         cache_dir: Path | None = None,
         python: str | None = None,
+        work_scheduler: Any | None = None,
     ) -> None:
         self.db = database
         self.cache_dir = Path(cache_dir or Path.home() / "Library" / "Caches" / "pudge")
         self.python = str(python or python_executable())
+        self.work_scheduler = work_scheduler
         self._ocr_lock = threading.Lock()
         self._ocr_available_cache: tuple[float, bool] | None = None
         self._cover_cache_lock = threading.Lock()
@@ -827,6 +829,13 @@ class MangaService:
     def _ocr_regions(self, image: Image.Image, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         work_dir = self.cache_dir / "manga-ocr" / "regions"
         work_dir.mkdir(parents=True, exist_ok=True)
+        heavy_lease = None
+        if self.work_scheduler is not None:
+            heavy_lease = self.work_scheduler.acquire_heavy(
+                "manga-ocr-region", blocking=False, foreground_sensitive=True
+            )
+            if heavy_lease is None:
+                return regions
         with self._ocr_lock:
             input_path: Path | None = None
             manifest_path: Path | None = None
@@ -864,6 +873,8 @@ class MangaService:
                 for path in (input_path, manifest_path, output_path):
                     if path is not None:
                         path.unlink(missing_ok=True)
+                if heavy_lease is not None:
+                    heavy_lease.release()
 
     def cached_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         row = self._book(int(book_id))
@@ -970,6 +981,19 @@ class MangaService:
         work_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(str(row["path"])) as archive:
             image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
+        heavy_lease = None
+        if self.work_scheduler is not None:
+            heavy_lease = self.work_scheduler.acquire_heavy(
+                "manga-ocr-page", blocking=False, foreground_sensitive=True
+            )
+            if heavy_lease is None:
+                return {
+                    "book_id": int(book_id),
+                    "page_index": index,
+                    "text": "",
+                    "available": True,
+                    "paused": True,
+                }
         with self._ocr_lock:
             input_path: Path | None = None
             output_path: Path | None = None
@@ -1018,6 +1042,8 @@ class MangaService:
                     input_path.unlink(missing_ok=True)
                 if output_path is not None:
                     output_path.unlink(missing_ok=True)
+                if heavy_lease is not None:
+                    heavy_lease.release()
         with self.db.connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
@@ -1064,6 +1090,14 @@ class MangaService:
         manifest_path = job_dir / f"{token}.manifest.json"
         output_path = job_dir / f"{token}.results.jsonl"
         progress_path = job_dir / f"{token}.progress.json"
+        if self.work_scheduler is not None:
+            if not self.work_scheduler.wait_until_background(
+                cancel_check=cancelled, poll_seconds=0.5
+            ):
+                return {
+                    **self.ocr_cache_status(int(book_id)),
+                    "ok": False, "cancelled": True, "errors": [],
+                }
         page_regions: dict[int, list[dict[str, Any]]] = {}
         with zipfile.ZipFile(archive_path) as archive:
             for index in missing:
@@ -1091,6 +1125,22 @@ class MangaService:
         )
         process: subprocess.Popen[str] | None = None
         errors: list[str] = []
+        heavy_lease = None
+        if self.work_scheduler is not None:
+            heavy_lease = self.work_scheduler.acquire_heavy(
+                "manga-ocr-book",
+                blocking=True,
+                foreground_sensitive=True,
+                wait_for_foreground=True,
+                cancel_check=cancelled,
+            )
+            if heavy_lease is None:
+                return {
+                    **self.ocr_cache_status(int(book_id)),
+                    "ok": False,
+                    "cancelled": True,
+                    "errors": [],
+                }
         try:
             process = subprocess.Popen(
                 [
@@ -1175,3 +1225,5 @@ class MangaService:
         finally:
             for path in (manifest_path, output_path, progress_path):
                 path.unlink(missing_ok=True)
+            if heavy_lease is not None:
+                heavy_lease.release()

@@ -31,11 +31,11 @@ def test_standard_app_shortcuts_are_dynamic_and_not_configurable() -> None:
     assert "shortcutPlanningSearch" not in html
 
 
-def test_subtitle_upgrade_conditions_are_hidden_when_upgrade_disabled() -> None:
+def test_subtitle_upgrade_search_is_always_enabled_without_toggle() -> None:
     html = HTML.read_text(encoding="utf-8")
-    assert 'id="s_auto_upgrade_subtitles"' in html
-    assert 'id="settings-subtitle-upgrade-fields" class="conditional-settings"' in html
-    assert "s_auto_upgrade_subtitles:'settings-subtitle-upgrade-fields'" in html
+    assert 'id="s_auto_upgrade_subtitles"' not in html
+    assert "auto_upgrade_subtitles:true" in html
+    assert "s_auto_upgrade_subtitles:'settings-subtitle-upgrade-fields'" not in html
 
 
 def test_qbittorrent_help_does_not_explain_api_key_port() -> None:
@@ -55,8 +55,9 @@ def test_alternative_movie_covers_use_relation_hover_preview() -> None:
 
 def test_library_shows_total_duration() -> None:
     html = HTML.read_text(encoding="utf-8")
+    library = (HTML.parent / "library.js").read_text(encoding="utf-8")
     assert "label.totalDuration':'Duration: {duration}'" in html
-    assert "formatDuration(a.duration_seconds)" in html
+    assert "formatDuration(a.duration_seconds)" in library
 
 
 def test_managed_library_detaches_stale_catmahjong_false_match(monkeypatch, tmp_path: Path) -> None:

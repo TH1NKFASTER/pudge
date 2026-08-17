@@ -2,11 +2,9 @@ from pathlib import Path
 
 
 def _compact_download_status_source() -> str:
-    source = Path("pudge/web/index.html").read_text(encoding="utf-8")
+    source = Path("pudge/web/home_status.js").read_text(encoding="utf-8")
     start = source.index("function compactDownloadStatus(download){")
-    end = source.index("\nfunction animeCard(", start)
-    return source[start:end]
-
+    return source[start:]
 
 def test_compact_download_status_shows_only_progress_and_eta() -> None:
     source = _compact_download_status_source()
