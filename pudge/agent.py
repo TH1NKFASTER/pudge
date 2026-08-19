@@ -5,6 +5,7 @@ import sys
 import time
 
 from .config import DEFAULT_CONFIG_PATH, load_config
+from .app_session import app_session_active
 from .branding import APP_AGENT_CLI, APP_NAME
 from .manager import AnimeManager
 from .logging_utils import configure_logging, timed_step
@@ -18,6 +19,9 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     if not config.agent.enabled:
         print(f"{APP_NAME} Agent отключён")
+        return 0
+    if args.scheduled and not app_session_active():
+        print(f"{APP_NAME} Agent: приложение закрыто, фоновая работа пропущена")
         return 0
     logger = configure_logging()
     manager = AnimeManager(config)

@@ -17,14 +17,21 @@ from pathlib import Path
 from typing import Any, Callable
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 from .database import Database
+from .manga_ocr_artifact import (
+    artifact_page,
+    build_artifact,
+    normalize_page,
+    read_artifact,
+    write_artifact,
+)
 from .runtime import python_executable
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-_REGION_CACHE_KEY = "mokuro-regions-v4"
+_REGION_CACHE_KEY = "pudge-manga-regions-v5"
 
 
 def _natural_key(value: str) -> list[object]:
@@ -152,6 +159,65 @@ def _box_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
     return intersection / max(smaller, 1e-9)
 
 
+def _looks_like_vertical_japanese_region(region: dict[str, Any]) -> bool:
+    """Recover multi-column vertical bubbles merged into a wide rectangle.
+
+    Vision frequently reports each vertical column separately. After merging,
+    the union can be wider than it is tall, so aspect ratio alone incorrectly
+    labels the final selectable overlay as horizontal.
+    """
+
+    text = re.sub(r"\s+", "", str(region.get("text") or region.get("raw_text") or ""))
+    japanese = re.findall(r"[\u3040-\u30ff\u3400-\u9fff々〆ヶ]", text)
+    width = max(0.0, float(region.get("width") or 0.0))
+    height = max(0.0, float(region.get("height") or 0.0))
+    detector = str(region.get("detector") or "")
+    japanese_ratio = len(japanese) / max(1, len(text))
+    # VNDetectTextRectangles gives geometry but only placeholder confidence. In
+    # vertical manga it commonly reports a thin horizontal slice for each
+    # vertical line. Once MangaOCR fills that crop with Japanese text, treating
+    # the slice as horizontal lays every Jiten token left-to-right over a
+    # top-to-bottom speech bubble. Prefer vertical for these low-confidence
+    # rectangle-derived Japanese regions; explicit high-confidence recognition
+    # and true horizontal captions keep their normal orientation.
+    confidence = float(region.get("confidence") or 0.0)
+    if (
+        "vision-rectangles" in str(region.get("detector") or "")
+        and confidence <= 0.35
+        and len(japanese) >= 2
+        and japanese_ratio >= 0.55
+    ):
+        return True
+    if len(japanese) < 6 or japanese_ratio < 0.65:
+        return False
+    # Long horizontal captions are normally one shallow line. A speech bubble
+    # containing several vertical columns has meaningful height even when the
+    # merged union is wider than tall. Rectangle geometry is strong evidence,
+    # but the fallback also covers recognition-only detections.
+    classic_geometry = (
+        height >= 0.065
+        and width <= 0.34
+        and height >= width * 0.34
+    )
+    wide_multicolumn_geometry = (
+        height >= 0.08
+        and width <= 0.48
+        and height >= width * 0.20
+        and "vision-rectangles" in detector
+    )
+    return (classic_geometry or wide_multicolumn_geometry) and (
+        "vision-rectangles" in detector or height >= width * 0.45
+    )
+
+
+def _normalize_region_orientation(region: dict[str, Any]) -> dict[str, Any]:
+    item = dict(region)
+    if str(item.get("orientation") or "") != "vertical" and _looks_like_vertical_japanese_region(item):
+        item["orientation"] = "vertical"
+        item["orientation_reason"] = "japanese-multicolumn-geometry"
+    return item
+
+
 def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: list[list[dict[str, Any]]] = []
     for region in regions:
@@ -194,6 +260,20 @@ def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "y": round(max(0.0, y1 - 0.006), 6),
                 "width": round(min(1.0 - max(0.0, x1 - 0.006), x2 - x1 + 0.012), 6),
                 "height": round(min(1.0 - max(0.0, y1 - 0.006), y2 - y1 + 0.012), 6),
+                "confidence": round(max(float(item.get("confidence") or 0.0) for item in group), 4),
+                "detector": "+".join(sorted({str(item.get("detector") or "vision") for item in group})),
+                "raw_text": text.strip(),
+                "segments": [
+                    {
+                        "text": str(item.get("text") or "").strip(),
+                        "orientation": str(item.get("orientation") or ("vertical" if float(item.get("height") or 0.0) > float(item.get("width") or 0.0) * 1.05 else "horizontal")),
+                        "x": round(float(item.get("x") or 0.0), 6),
+                        "y": round(float(item.get("y") or 0.0), 6),
+                        "width": round(float(item.get("width") or 0.0), 6),
+                        "height": round(float(item.get("height") or 0.0), 6),
+                    }
+                    for item in ordered
+                ],
             }
         )
     vertical_page = bool(merged) and sum(
@@ -208,7 +288,7 @@ def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class MangaService:
-    """Small CBZ reader with an optional, lazy MangaOCR bridge."""
+    """CBZ reader backed exclusively by selectable region OCR artifacts."""
 
     def __init__(
         self,
@@ -226,6 +306,13 @@ class MangaService:
         self._ocr_available_cache: tuple[float, bool] | None = None
         self._cover_cache_lock = threading.Lock()
         self._cover_cache_inflight: set[str] = set()
+        self._purge_legacy_ocr_cache()
+
+    def _purge_legacy_ocr_cache(self) -> None:
+        """Remove obsolete whole-page OCR rows from pre-region builds."""
+
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM manga_ocr_cache WHERE region_key='full'")
 
     def invalidate_ocr_availability(self) -> None:
         self._ocr_available_cache = None
@@ -403,6 +490,73 @@ class MangaService:
         assert row is not None
         self._inherit_series_anilist(int(row["id"]))
         return self._payload(self._book(int(row["id"])))
+
+    def import_images(self, paths: list[Path]) -> dict[str, Any]:
+        images = [Path(path).expanduser().resolve() for path in paths]
+        images = [path for path in images if path.is_file() and path.suffix.casefold() in _IMAGE_EXTENSIONS]
+        if not images:
+            raise ValueError("No readable image files were dropped")
+        images.sort(key=lambda path: _natural_key(path.name))
+        signature_rows: list[str] = []
+        for path in images:
+            stat = path.stat()
+            signature_rows.append(f"{path}:{stat.st_size}:{stat.st_mtime_ns}")
+        digest = hashlib.sha1("|".join(signature_rows).encode("utf-8")).hexdigest()[:20]
+        target_dir = self.cache_dir / "manga-imports"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        title = images[0].parent.name if len(images) > 1 else images[0].stem
+        safe_title = re.sub(r"[^\w .()\[\]-]+", "_", title, flags=re.UNICODE).strip() or "Dropped manga"
+        target = target_dir / f"{safe_title}-{digest}.cbz"
+        if not target.is_file():
+            with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for index, image in enumerate(images, 1):
+                    archive.write(image, arcname=f"{index:04d}{image.suffix.casefold()}")
+        return self.import_file(target)
+
+    def remove_books(self, book_ids: list[int]) -> int:
+        ids = sorted({int(value) for value in book_ids if int(value) > 0})
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"SELECT id,path FROM manga_books WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in rows]
+            if not existing_ids:
+                return 0
+            artifact_paths = {
+                int(row["id"]): self._ocr_artifact_path(int(row["id"])) for row in rows
+            }
+            placeholders = ",".join("?" for _ in existing_ids)
+            conn.execute(f"DELETE FROM manga_ocr_cache WHERE book_id IN ({placeholders})", existing_ids)
+            conn.execute(f"DELETE FROM manga_books WHERE id IN ({placeholders})", existing_ids)
+        generated_root = (self.cache_dir / "manga-imports").resolve()
+        for row in rows:
+            try:
+                source = Path(str(row["path"])).expanduser().resolve()
+                if generated_root in source.parents:
+                    source.unlink(missing_ok=True)
+            except OSError:
+                pass
+            artifact_paths[int(row["id"])].unlink(missing_ok=True)
+        return len(existing_ids)
+
+    def remove_series(self, book_id: int) -> int:
+        selected = self._book(int(book_id))
+        selected_key = _manga_series_key(
+            str(selected["title"] or Path(str(selected["path"] or "")).stem)
+        )
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id,title,path FROM manga_books").fetchall()
+            ids = [
+                int(row["id"])
+                for row in rows
+                if _manga_series_key(
+                    str(row["title"] or Path(str(row["path"] or "")).stem)
+                ) == selected_key
+            ]
+        return self.remove_books(ids or [int(book_id)])
 
     def _local_cover_data_uri(self, row: Any) -> str:
         path = Path(str(row["path"]))
@@ -637,6 +791,13 @@ class MangaService:
             )
 
     def _vision_text_regions(self, image: Image.Image) -> list[dict[str, Any]]:
+        """Detect manga text geometry with several Vision-friendly image passes.
+
+        MangaOCR is a recognizer, not a detector.  Keep detection separate and
+        combine the original page with contrast and inverted passes so stylised
+        vertical bubbles are not lost before recognition even starts.
+        """
+
         if sys.platform != "darwin":
             return []
         try:
@@ -647,112 +808,204 @@ class MangaService:
 
         work_dir = self.cache_dir / "manga-text-regions"
         work_dir.mkdir(parents=True, exist_ok=True)
-        input_path: Path | None = None
+        rgb = image.convert("RGB")
+        grayscale = ImageOps.grayscale(rgb)
+        contrast = ImageEnhance.Contrast(ImageOps.autocontrast(grayscale)).enhance(1.35)
+        variants = [
+            ("vision-original", rgb),
+            ("vision-contrast", contrast.convert("RGB")),
+            ("vision-inverted", ImageOps.invert(contrast).convert("RGB")),
+        ]
+        regions: list[dict[str, Any]] = []
+        temporary_paths: list[Path] = []
+
+        def append_box(
+            observation: Any,
+            *,
+            text: str,
+            confidence: float,
+            detector: str,
+        ) -> None:
+            box = observation.boundingBox()
+            width = max(0.0, min(1.0, float(box.size.width)))
+            height = max(0.0, min(1.0, float(box.size.height)))
+            x = max(0.0, min(1.0 - width, float(box.origin.x)))
+            y = max(0.0, min(1.0 - height, float(box.origin.y)))
+            if width <= 0.001 or height <= 0.001:
+                return
+            candidate = {
+                "text": str(text or "").strip(),
+                "raw_text": str(text or "").strip(),
+                "confidence": round(max(0.0, min(1.0, float(confidence))), 4),
+                "detector": detector,
+                "x": round(x, 6),
+                "y": round(y, 6),
+                "width": round(width, 6),
+                "height": round(height, 6),
+            }
+            overlap = next(
+                (item for item in regions if _box_overlap(candidate, item) >= 0.78),
+                None,
+            )
+            if overlap is None:
+                regions.append(candidate)
+                return
+            if candidate["confidence"] > float(overlap.get("confidence") or 0.0):
+                overlap.update(candidate)
+            elif candidate["text"] and not str(overlap.get("text") or ""):
+                overlap["text"] = candidate["text"]
+                overlap["raw_text"] = candidate["raw_text"]
+            detectors = set(str(overlap.get("detector") or "").split("+"))
+            detectors.add(detector)
+            overlap["detector"] = "+".join(sorted(item for item in detectors if item))
+
         try:
-            with tempfile.NamedTemporaryFile(suffix=".png", dir=work_dir, delete=False) as handle:
-                input_path = Path(handle.name)
-            image.convert("RGB").save(input_path, format="PNG")
-            request = Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-            request.setRecognitionLanguages_(["ja-JP"])
-            request.setUsesLanguageCorrection_(True)
-            if hasattr(request, "setMinimumTextHeight_"):
-                request.setMinimumTextHeight_(0.004)
-            detector = None
+            for detector_name, variant in variants:
+                with tempfile.NamedTemporaryFile(suffix=".png", dir=work_dir, delete=False) as handle:
+                    input_path = Path(handle.name)
+                temporary_paths.append(input_path)
+                variant.save(input_path, format="PNG")
+                request = Vision.VNRecognizeTextRequest.alloc().init()
+                request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+                request.setRecognitionLanguages_(["ja-JP"])
+                request.setUsesLanguageCorrection_(True)
+                if hasattr(request, "setMinimumTextHeight_"):
+                    request.setMinimumTextHeight_(0.003)
+                handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                    NSURL.fileURLWithPath_(str(input_path)), None
+                )
+                success, _error = handler.performRequests_error_([request], None)
+                if not success:
+                    continue
+                for observation in request.results() or []:
+                    candidates = observation.topCandidates_(1)
+                    if not candidates:
+                        continue
+                    candidate = candidates[0]
+                    text = str(candidate.string()).strip()
+                    if not text:
+                        continue
+                    try:
+                        confidence = float(candidate.confidence())
+                    except Exception:
+                        confidence = 0.5
+                    append_box(
+                        observation,
+                        text=text,
+                        confidence=confidence,
+                        detector=detector_name,
+                    )
+
+            # The geometry-only request catches boxes whose provisional text
+            # recognition failed.  Run it once on the original page and let
+            # MangaOCR fill the text from the resulting crops.
             detector_class = getattr(Vision, "VNDetectTextRectanglesRequest", None)
-            if detector_class is not None:
+            if detector_class is not None and temporary_paths:
                 detector = detector_class.alloc().init()
                 if hasattr(detector, "setReportCharacterBoxes_"):
                     detector.setReportCharacterBoxes_(True)
-            handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
-                NSURL.fileURLWithPath_(str(input_path)), None
-            )
-            success, _error = handler.performRequests_error_([request], None)
-            if not success:
-                return []
-            regions: list[dict[str, Any]] = []
-            for observation in request.results() or []:
-                candidates = observation.topCandidates_(1)
-                if not candidates:
-                    continue
-                text = str(candidates[0].string()).strip()
-                # Vision is used primarily for geometry. Stylized Japanese is
-                # sometimes misread as Latin here, while MangaOCR still reads
-                # the crop correctly, so do not discard a usable box based on
-                # Vision's provisional transcription.
-                if not text:
-                    continue
-                box = observation.boundingBox()
-                width = max(0.0, min(1.0, float(box.size.width)))
-                height = max(0.0, min(1.0, float(box.size.height)))
-                x = max(0.0, min(1.0 - width, float(box.origin.x)))
-                y = max(0.0, min(1.0 - height, float(box.origin.y)))
-                if width <= 0.001 or height <= 0.001:
-                    continue
-                regions.append(
-                    {
-                        "text": text,
-                        "x": round(x, 6),
-                        "y": round(y, 6),
-                        "width": round(width, 6),
-                        "height": round(height, 6),
-                    }
+                handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                    NSURL.fileURLWithPath_(str(temporary_paths[0])), None
                 )
-            # VNRecognizeTextRequest is good at transcription but frequently
-            # omits stylised or vertical manga columns.  The older rectangle
-            # detector is geometry-only and catches many of those.  MangaOCR
-            # fills their text later, so keep detector-only boxes with an empty
-            # provisional transcription and deduplicate boxes already covered
-            # by the recognizer.
-            detector_results: list[Any] = []
-            if detector is not None:
-                try:
-                    detector_handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
-                        NSURL.fileURLWithPath_(str(input_path)), None
-                    )
-                    detected, _detector_error = detector_handler.performRequests_error_(
-                        [detector], None
-                    )
-                    if detected:
-                        detector_results = list(detector.results() or [])
-                except Exception:
-                    detector_results = []
-            for observation in detector_results:
-                box = observation.boundingBox()
-                width = max(0.0, min(1.0, float(box.size.width)))
-                height = max(0.0, min(1.0, float(box.size.height)))
-                x = max(0.0, min(1.0 - width, float(box.origin.x)))
-                y = max(0.0, min(1.0 - height, float(box.origin.y)))
-                if width <= 0.001 or height <= 0.001:
-                    continue
-                candidate = {
-                    "text": "",
-                    "x": round(x, 6),
-                    "y": round(y, 6),
-                    "width": round(width, 6),
-                    "height": round(height, 6),
-                }
-                if any(_box_overlap(candidate, existing) >= 0.72 for existing in regions):
-                    continue
-                regions.append(candidate)
-            vertical = sum(1 for item in regions if float(item["height"]) > float(item["width"]) * 1.25) > len(regions) / 2
-            if vertical:
-                regions.sort(key=lambda item: (-float(item["x"]), -float(item["y"])))
-            else:
-                regions.sort(key=lambda item: (-float(item["y"]), float(item["x"])))
-            return _merge_text_regions(regions)
+                success, _error = handler.performRequests_error_([detector], None)
+                if success:
+                    for observation in detector.results() or []:
+                        append_box(
+                            observation,
+                            text="",
+                            confidence=0.25,
+                            detector="vision-rectangles",
+                        )
         finally:
-            if input_path is not None:
-                input_path.unlink(missing_ok=True)
+            for path in temporary_paths:
+                path.unlink(missing_ok=True)
+
+        merged = _merge_text_regions(regions)
+        if merged:
+            return merged
+        # Never turn a detector miss into a completely unusable page.  MangaOCR
+        # supports multi-line input, so a full-page fallback still yields text
+        # and is explicitly marked for later replacement or manual correction.
+        return [
+            {
+                "text": "",
+                "raw_text": "",
+                "orientation": "mixed",
+                "confidence": 0.0,
+                "detector": "full-page-fallback",
+                "fallback": True,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": 1.0,
+            }
+        ]
+
+    def _ocr_artifact_path(self, book_id: int) -> Path:
+        row = self._book(int(book_id))
+        fingerprint = str(row["source_fingerprint"] or f"book-{int(book_id)}")
+        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}.json"
+
+    def _load_ocr_artifact(self, book_id: int) -> dict[str, Any] | None:
+        return read_artifact(self._ocr_artifact_path(int(book_id)))
+
+    def _rebuild_ocr_artifact(self, book_id: int) -> dict[str, Any]:
+        row = self._book(int(book_id))
+        archive_path = Path(str(row["path"]))
+        page_names = self._pages(archive_path)
+        with self.db.connect() as conn:
+            cache_rows = conn.execute(
+                "SELECT page_index,text FROM manga_ocr_cache "
+                "WHERE book_id=? AND region_key=? ORDER BY page_index",
+                (int(book_id), _REGION_CACHE_KEY),
+            ).fetchall()
+        by_index = {int(item["page_index"]): str(item["text"] or "[]") for item in cache_rows}
+        pages: list[dict[str, Any]] = []
+        with zipfile.ZipFile(archive_path) as archive:
+            for page_index, encoded in sorted(by_index.items()):
+                try:
+                    regions = json.loads(encoded)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    regions = []
+                if not isinstance(regions, list) or not 0 <= page_index < len(page_names):
+                    continue
+                try:
+                    with Image.open(io.BytesIO(archive.read(page_names[page_index]))) as source_image:
+                        width, height = source_image.size
+                except (OSError, ValueError, KeyError):
+                    width, height = 0, 0
+                pages.append(
+                    normalize_page(
+                        page_index,
+                        [dict(item) for item in regions if isinstance(item, dict)],
+                        name=page_names[page_index],
+                        width=width,
+                        height=height,
+                    )
+                )
+        artifact = build_artifact(
+            source_fingerprint=str(row["source_fingerprint"] or ""),
+            title=str(row["title"] or ""),
+            page_count=int(row["page_count"] or 0),
+            pages=pages,
+            detector="apple-vision-multipass",
+            recognizer="manga-ocr",
+        )
+        write_artifact(self._ocr_artifact_path(int(book_id)), artifact)
+        return artifact
+
+    def ocr_artifact(self, book_id: int) -> dict[str, Any]:
+        return self._load_ocr_artifact(int(book_id)) or self._rebuild_ocr_artifact(int(book_id))
 
     def invalidate_region_cache(self, book_id: int) -> None:
-        """Discard selectable bubble overlays without touching legacy full-page OCR text."""
+        """Discard all visual OCR for the book before rebuilding the region artifact."""
 
         with self.db.connect() as conn:
             conn.execute(
                 "DELETE FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
                 (int(book_id), _REGION_CACHE_KEY),
             )
+        self._ocr_artifact_path(int(book_id)).unlink(missing_ok=True)
 
     def text_regions(
         self,
@@ -767,6 +1020,20 @@ class MangaService:
         index = max(0, min(int(page_index), max(0, len(pages) - 1)))
         region_key = _REGION_CACHE_KEY
         if not refresh:
+            page = artifact_page(self._load_ocr_artifact(int(book_id)), index)
+            if page is not None:
+                return {
+                    "book_id": int(book_id),
+                    "page_index": index,
+                    "regions": [
+                        _normalize_region_orientation(dict(item))
+                        for item in page.get("regions") or []
+                        if isinstance(item, dict)
+                    ],
+                    "available": True,
+                    "cached": True,
+                    "artifact": True,
+                }
             with self.db.connect() as conn:
                 cached = conn.execute(
                     "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? AND region_key=?",
@@ -781,7 +1048,11 @@ class MangaService:
                     return {
                         "book_id": int(book_id),
                         "page_index": index,
-                        "regions": regions,
+                        "regions": [
+                            _normalize_region_orientation(dict(item))
+                            for item in regions
+                            if isinstance(item, dict)
+                        ],
                         "available": True,
                         "cached": True,
                     }
@@ -810,7 +1081,11 @@ class MangaService:
             regions = self._vision_text_regions(image)
             if regions and self.ocr_available():
                 regions = self._ocr_regions(image, regions)
-            regions = [item for item in regions if str(item.get("text") or "").strip()]
+            regions = [
+                _normalize_region_orientation(item)
+                for item in regions
+                if str(item.get("text") or "").strip()
+            ]
         except Exception:
             regions = []
         with self.db.connect() as conn:
@@ -818,6 +1093,7 @@ class MangaService:
                 "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) VALUES(?,?,?,?,?)",
                 (int(book_id), index, region_key, json.dumps(regions, ensure_ascii=False), time.time()),
             )
+        self._rebuild_ocr_artifact(int(book_id))
         return {
             "book_id": int(book_id),
             "page_index": index,
@@ -876,25 +1152,6 @@ class MangaService:
                 if heavy_lease is not None:
                     heavy_lease.release()
 
-    def cached_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
-        row = self._book(int(book_id))
-        total = int(row["page_count"] or 0)
-        index = max(0, min(int(page_index), max(0, total - 1)))
-        with self.db.connect() as conn:
-            cached = conn.execute(
-                "SELECT text FROM manga_ocr_cache "
-                "WHERE book_id=? AND page_index=? AND region_key='full'",
-                (int(book_id), index),
-            ).fetchone()
-        return {
-            "book_id": int(book_id),
-            "page_index": index,
-            "page_count": total,
-            "cached": cached is not None,
-            "cache": "hit" if cached is not None else "miss",
-            "text": str(cached["text"]) if cached is not None else "",
-        }
-
     def cached_region_texts(self, book_id: int) -> list[tuple[int, str]]:
         """Return recognized bubbles in reading order for background study parsing."""
 
@@ -918,146 +1175,6 @@ class MangaService:
                     result.append((int(row["page_index"]), text))
         return result
 
-    def ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
-        with self.db.connect() as conn:
-            legacy = conn.execute(
-                "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? "
-                "AND region_key='full' AND NOT EXISTS ("
-                "SELECT 1 FROM manga_ocr_cache newer WHERE newer.book_id=manga_ocr_cache.book_id "
-                "AND newer.page_index=manga_ocr_cache.page_index AND newer.region_key=?"
-                ")",
-                (int(book_id), int(page_index), _REGION_CACHE_KEY),
-            ).fetchone()
-        if legacy is not None:
-            return {
-                "book_id": int(book_id),
-                "page_index": int(page_index),
-                "text": str(legacy["text"]),
-                "cache": "hit",
-                "available": True,
-            }
-        region_result = self.text_regions(int(book_id), int(page_index))
-        if region_result.get("regions"):
-            text = "\n".join(str(item.get("text") or "") for item in region_result["regions"]).strip()
-            with self.db.connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-                    "VALUES(?,?,'full',?,?)",
-                    (int(book_id), int(region_result["page_index"]), text, time.time()),
-                )
-            return {
-                "book_id": int(book_id),
-                "page_index": int(region_result["page_index"]),
-                "text": text,
-                "regions": region_result["regions"],
-                "cache": "hit" if region_result.get("cached") else "miss",
-                "available": True,
-            }
-        with self.db.connect() as conn:
-            cached = conn.execute(
-                "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? AND region_key='full'",
-                (int(book_id), int(page_index)),
-            ).fetchone()
-        if cached is not None:
-            return {
-                "book_id": int(book_id),
-                "page_index": int(page_index),
-                "text": str(cached["text"]),
-                "cache": "hit",
-                "available": True,
-            }
-        if not self.ocr_available():
-            return {
-                "book_id": int(book_id),
-                "page_index": int(page_index),
-                "text": "",
-                "available": False,
-                "error": "MangaOCR is not installed. Install it from Settings → Reading.",
-            }
-        row = self._book(book_id)
-        pages = self._pages(Path(str(row["path"])))
-        index = max(0, min(int(page_index), len(pages) - 1))
-        work_dir = self.cache_dir / "manga-ocr" / "work"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(str(row["path"])) as archive:
-            image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
-        heavy_lease = None
-        if self.work_scheduler is not None:
-            heavy_lease = self.work_scheduler.acquire_heavy(
-                "manga-ocr-page", blocking=False, foreground_sensitive=True
-            )
-            if heavy_lease is None:
-                return {
-                    "book_id": int(book_id),
-                    "page_index": index,
-                    "text": "",
-                    "available": True,
-                    "paused": True,
-                }
-        with self._ocr_lock:
-            input_path: Path | None = None
-            output_path: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    suffix=".png", dir=work_dir, delete=False
-                ) as handle:
-                    input_path = Path(handle.name)
-                output_path = input_path.with_suffix(".json")
-                image.save(input_path, format="PNG")
-                completed = subprocess.run(
-                    [
-                        self.python,
-                        "-m",
-                        "pudge.manga_ocr_worker",
-                        str(input_path),
-                        str(output_path),
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=240,
-                )
-                if completed.returncode != 0:
-                    detail = completed.stderr.strip() or completed.stdout.strip()
-                    return {
-                        "book_id": int(book_id),
-                        "page_index": index,
-                        "text": "",
-                        "available": True,
-                        "error": f"MangaOCR failed: {detail[-1000:]}",
-                    }
-                try:
-                    payload = json.loads(output_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    return {
-                        "book_id": int(book_id),
-                        "page_index": index,
-                        "text": "",
-                        "available": True,
-                        "error": f"MangaOCR returned invalid output: {exc}",
-                    }
-                text = str(payload.get("text") or "").strip()
-            finally:
-                if input_path is not None:
-                    input_path.unlink(missing_ok=True)
-                if output_path is not None:
-                    output_path.unlink(missing_ok=True)
-                if heavy_lease is not None:
-                    heavy_lease.release()
-        with self.db.connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-                "VALUES(?,?,'full',?,?)",
-                (int(book_id), index, text, time.time()),
-            )
-        return {
-            "book_id": int(book_id),
-            "page_index": index,
-            "text": text,
-            "cache": "miss",
-            "available": True,
-        }
-
     def ocr_book(
         self,
         book_id: int,
@@ -1066,7 +1183,7 @@ class MangaService:
         cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not self.ocr_available():
-            raise RuntimeError("MangaOCR is not installed. Install it from Settings → Reading.")
+            raise RuntimeError("MangaOCR is not installed. Install it from Settings → Essential.")
         row = self._book(int(book_id))
         archive_path = Path(str(row["path"]))
         pages = self._pages(archive_path)
@@ -1199,11 +1316,6 @@ class MangaService:
                         if error:
                             errors.append(f"page {page_index_value + 1}: {error}")
                             continue
-                        conn.execute(
-                            "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-                            "VALUES(?,?,'full',?,?)",
-                            (int(book_id), page_index_value, str(item.get("text") or ""), time.time()),
-                        )
                         regions = item.get("regions") if isinstance(item, dict) else []
                         conn.execute(
                             "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
@@ -1216,6 +1328,7 @@ class MangaService:
                                 time.time(),
                             ),
                         )
+            self._rebuild_ocr_artifact(int(book_id))
             status = self.ocr_cache_status(int(book_id))
             if progress is not None:
                 progress(int(status["cached_pages"]), total, None)

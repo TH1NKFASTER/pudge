@@ -247,7 +247,7 @@ def test_web_ui_exposes_selected_competitor_features() -> None:
     ).read_text(encoding="utf-8")
     assert "checkReleaseUpgrades" in source
     assert "checkSubtitleUpgrades" in source
-    assert "create_next_episodes_queue" in source
+    assert "create_next_episodes_queue" not in source
     assert "create_franchise_queue" in source
     assert "advance_playlist" in source
     assert "create_full_backup" in source

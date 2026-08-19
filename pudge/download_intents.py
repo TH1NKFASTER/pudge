@@ -129,3 +129,29 @@ class DownloadIntentStore:
 
     def clear(self, media_id: int, episode: int | None, batch: bool) -> None:
         self._delete_state(self.key(media_id, episode, batch))
+
+    def waiting_count(self) -> int:
+        connector = getattr(self.db, "connect", None)
+        if not callable(connector):
+            return sum(
+                1
+                for value in self._memory.values()
+                if isinstance(value, str) and '"state":"waiting"' in value
+            )
+        try:
+            with connector() as conn:
+                rows = conn.execute(
+                    "SELECT value FROM state WHERE key LIKE 'download_intent:%'"
+                ).fetchall()
+        except Exception:
+            return 0
+        count = 0
+        for row in rows:
+            try:
+                raw = row["value"] if hasattr(row, "keys") else row[0]
+                payload = json.loads(str(raw or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if str(payload.get("state") or "").casefold() == "waiting":
+                count += 1
+        return count

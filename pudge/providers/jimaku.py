@@ -17,11 +17,15 @@ from urllib.parse import urljoin
 import httpx
 
 from ..filename import parse_anime_filename, release_tokens, title_similarity
-from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, has_japanese_marker, is_japanese_subtitle
+from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_japanese_subtitle
 from ..logging_utils import configure_logging, timed_step
 from ..branding import APP_SLUG
 from ..models import JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
-from ..subtitle_formats import format_preference_bonus, subtitle_bilingual_cjk_profile
+from ..subtitle_formats import (
+    format_preference_bonus,
+    subtitle_bilingual_cjk_profile,
+    subtitle_filename_language_profile,
+)
 
 
 SUBTITLE_EXTENSIONS = TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS
@@ -579,9 +583,18 @@ class JimakuClient:
             overlap = video_tags & release_tokens(item.name)
             overlap_bonus = min(20, len(overlap) * 5)
             format_bonus = format_preference_bonus(item.name, prefer_srt)
-            japanese_marker = has_japanese_marker(item.name)
+            language_profile = subtitle_filename_language_profile(item.name)
+            japanese_marker = bool(language_profile.get("japanese_marker"))
+            language_purity = str(language_profile.get("purity") or "unknown")
+            language_purity_bonus = {
+                "japanese_only": 35.0,
+                "unknown": 0.0,
+                "mixed_japanese_chinese": -120.0,
+                "chinese_only": -180.0,
+            }.get(language_purity, 0.0)
             score += overlap_bonus
             score += format_bonus
+            score += language_purity_bonus
             if japanese_marker:
                 score += 10
             item.details.update({
@@ -589,6 +602,10 @@ class JimakuClient:
                 "overlap_bonus": overlap_bonus,
                 "format_bonus": format_bonus,
                 "japanese_marker": japanese_marker,
+                "chinese_marker": bool(language_profile.get("chinese_marker")),
+                "language_purity": language_purity,
+                "language_purity_priority": int(language_profile.get("priority") or 0),
+                "language_purity_bonus": language_purity_bonus,
             })
             lowered = item.name.casefold()
             if any(token in lowered for token in ("signs", "songs", "karaoke", "forced")):
@@ -659,13 +676,20 @@ def _archive_member_score(
     parsed = parse_anime_filename(name)
     score = title_similarity(identity.title, parsed.title) * 0.3
     score += format_preference_bonus(name, prefer_srt)
+    language_profile = subtitle_filename_language_profile(name)
+    score += {
+        "japanese_only": 35.0,
+        "unknown": 0.0,
+        "mixed_japanese_chinese": -120.0,
+        "chinese_only": -180.0,
+    }.get(str(language_profile.get("purity") or "unknown"), 0.0)
     if identity.episode is not None:
         if parsed.episode in aliases:
             score += 60
         elif parsed.episode is not None:
             score -= 100
     score += len(release_tokens(video.name) & release_tokens(name)) * 5
-    if has_japanese_marker(name):
+    if language_profile.get("japanese_marker"):
         score += 10
     lowered = name.casefold()
     if any(token in lowered for token in ("signs", "songs", "karaoke", "forced")):
@@ -819,8 +843,14 @@ def materialize_jimaku_files(
             if identity.episode is not None and parsed_episode in aliases
             else parsed_episode
         )
+        filename_language = subtitle_filename_language_profile(display_name)
+        language_purity = str(filename_language.get("purity") or "unknown")
         bilingual_profile = subtitle_bilingual_cjk_profile(path)
-        bilingual_penalty = -85.0 if bilingual_profile.get("suspected_bilingual_cjk") else 0.0
+        filename_bilingual = language_purity == "mixed_japanese_chinese"
+        bilingual_detected = bool(
+            filename_bilingual or bilingual_profile.get("suspected_bilingual_cjk")
+        )
+        bilingual_penalty = -85.0 if bilingual_detected else 0.0
         candidates.append(
             SubtitleCandidate(
                 path=path,
@@ -830,13 +860,16 @@ def materialize_jimaku_files(
                 episode=normalized_episode,
                 verified_japanese=verified,
                 details={
+                    **item.details,
                     "url": item.url,
                     "container": item.name,
                     "source_episode_number": source_episode,
-                    "bilingual_cjk": bool(bilingual_profile.get("suspected_bilingual_cjk")),
+                    "language_purity": language_purity,
+                    "language_purity_priority": int(filename_language.get("priority") or 0),
+                    "filename_bilingual_cjk": filename_bilingual,
+                    "bilingual_cjk": bilingual_detected,
                     "bilingual_penalty": bilingual_penalty,
                     "bilingual_profile": bilingual_profile,
-                    **item.details,
                 },
             )
         )

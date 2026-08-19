@@ -65,7 +65,8 @@ def test_manga_reader_uses_in_place_bubble_text_and_monotonic_zoom() -> None:
     assert "manga-v2-region-content" in js
     assert "parseRegionText" in js
     assert 'id="mangaV2BubbleStudy"' not in js
-    assert 'data-pudge-study-hover="1"' in js
+    assert 'data-pudge-study-hover="1"' not in js
+    assert 'data-pudge-translate-root' in js
     assert '<aside id="mangaV2OcrText"' not in js
 
     # Zoom is calculated from the natural image size and a positive scale.
@@ -94,7 +95,7 @@ def test_manga_fullscreen_and_library_clicks_match_ln_style() -> None:
 
     # Whole gray card opens the reader; secondary actions live in the same
     # right-click menu model used by Light Novels.
-    assert 'data-manga-v2-action="read" data-id="${Number(continueBook.id)}"' in js
+    assert 'data-manga-v2-action="read" data-id="${id}"' in js
     assert 'data-manga-context-action="anilist"' in js
     assert 'data-manga-context-action="score"' in js
     assert 'data-manga-context-action="ocr-book"' in js

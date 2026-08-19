@@ -30,7 +30,7 @@ def test_shared_reading_tools_are_wired_for_ln_and_manga() -> None:
     assert "data-pudge-translate-root" in manga
 
 
-def test_manga_cached_ocr_is_available_without_starting_worker(tmp_path: Path) -> None:
+def test_manga_service_purges_legacy_whole_page_ocr(tmp_path: Path) -> None:
     db = Database(tmp_path / "db.sqlite3")
     with db.connect() as conn:
         conn.execute(
@@ -41,18 +41,18 @@ def test_manga_cached_ocr_is_available_without_starting_worker(tmp_path: Path) -
         book_id = int(conn.execute("SELECT id FROM manga_books").fetchone()[0])
         conn.execute(
             "INSERT INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) VALUES(?,1,'full',?,?)",
-            (book_id, "選べるテキスト", 1.0),
+            (book_id, "obsolete whole page", 1.0),
         )
 
     service = MangaService(db, cache_dir=tmp_path / "cache", python="/bin/false")
-    hit = service.cached_ocr_page(book_id, 1)
-    miss = service.cached_ocr_page(book_id, 2)
 
-    assert hit["cached"] is True
-    assert hit["text"] == "選べるテキスト"
-    assert hit["page_index"] == 1
-    assert miss["cached"] is False
-    assert miss["text"] == ""
+    with db.connect() as conn:
+        legacy_count = int(
+            conn.execute("SELECT COUNT(*) FROM manga_ocr_cache WHERE region_key='full'").fetchone()[0]
+        )
+    assert legacy_count == 0
+    assert not hasattr(service, "cached_ocr_page")
+    assert not hasattr(service, "ocr_page")
 
 
 def test_manga_reader_has_nonblocking_study_parse_zoom_and_toolbar_recovery() -> None:
@@ -60,7 +60,8 @@ def test_manga_reader_has_nonblocking_study_parse_zoom_and_toolbar_recovery() ->
     css = (ROOT / "pudge/web/manga_reader_v2.css").read_text(encoding="utf-8")
 
     assert "manga_ocr_cached_page" not in manga
-    assert "renderRegionContent(target, region, parsed)" in manga
+    assert "manga_ocr_page" not in manga
+    assert "if (target) renderRegionContent(target, region, payload);" in manga
     assert "parseRegionsSequentially" in manga
     assert "gesturestart" in manga
     assert "gesturechange" in manga
@@ -70,7 +71,8 @@ def test_manga_reader_has_nonblocking_study_parse_zoom_and_toolbar_recovery() ->
     assert "setZoom(100)" in manga
     assert "toolbar-peek" in css
     assert "manga-v2-toolbar-reveal" in css
-    assert "user-select:text" in css
+    assert "pointer-events:none" in css
+    assert "user-select:none" in css
 
 
 def test_generic_reading_backend_aliases_reuse_ln_service() -> None:

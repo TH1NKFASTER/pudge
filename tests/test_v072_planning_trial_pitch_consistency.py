@@ -150,7 +150,7 @@ def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path
     }
 
 
-def test_audiobook_stop_pauses_before_reading_final_position(
+def test_audiobook_stop_uses_cached_position_without_blocking_reads(
     tmp_path: Path, monkeypatch
 ) -> None:
     database = Database(tmp_path / "library.sqlite3")
@@ -168,6 +168,7 @@ def test_audiobook_stop_pauses_before_reading_final_position(
         chapters=[],
     )
     events: list[str] = []
+    ipc_commands: list[list[list[object]]] = []
 
     class Process:
         def poll(self):
@@ -185,21 +186,30 @@ def test_audiobook_stop_pauses_before_reading_final_position(
     book_id = int(book["id"])
     service._players[book_id] = Process()
     service._ipc_paths[book_id] = tmp_path / "book.sock"
+    service._last_positions[book_id] = 42.0
+
     monkeypatch.setattr(
         service,
-        "_ipc_command",
-        lambda _path, _command: events.append("pause") or {"error": "success"},
+        "_ipc_commands_no_wait",
+        lambda _path, commands: ipc_commands.append(commands) or True,
     )
     monkeypatch.setattr(
         service,
         "_global_position",
-        lambda _book_id, _path: events.append("position") or 42.0,
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Stop must not perform blocking IPC position reads")
+        ),
     )
 
     result = service.stop(book_id)
 
     assert result["stopped"] is True
-    assert events[:3] == ["pause", "position", "terminate"]
+    assert ipc_commands == [[
+        ["set_property", "mute", True],
+        ["set_property", "pause", True],
+        ["quit"],
+    ]]
+    assert events[:2] == ["terminate", "wait:0.12"]
     assert service.book(book_id)["position"] == 42.0
 
 

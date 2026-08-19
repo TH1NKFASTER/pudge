@@ -1890,3 +1890,91 @@ def test_piecewise_sequence_guard_clamps_start_and_preserves_duration():
     assert repaired is not None
     assert repaired[0][0] == 0.1
     assert repaired[0][1] == 1.1
+
+
+def test_optimize_candidates_never_prefers_mixed_chinese_over_viable_pure_japanese(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from pudge import syncing
+    from pudge.config import SyncConfig
+    from pudge.models import SubtitleCandidate
+    from pudge.syncing import optimize_candidates
+
+    video = tmp_path / "episode.mkv"
+    pure = tmp_path / "pure-ja.srt"
+    mixed = tmp_path / "mixed-chs-jpn.ass"
+    video.write_bytes(b"video")
+    pure.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語\n", encoding="utf-8")
+    mixed.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語\n", encoding="utf-8")
+
+    candidates = [
+        SubtitleCandidate(
+            path=pure,
+            source="jimaku",
+            score=136.0,
+            name=pure.name,
+            details={
+                "episode_match": "absolute",
+                "entry_anilist_match": True,
+                "language_purity": "japanese_only",
+                "bilingual_cjk": False,
+            },
+        ),
+        SubtitleCandidate(
+            path=mixed,
+            source="jimaku",
+            score=-104.0,
+            name=mixed.name,
+            details={
+                "episode_match": "absolute",
+                "entry_anilist_match": True,
+                "language_purity": "mixed_japanese_chinese",
+                "bilingual_cjk": True,
+            },
+        ),
+    ]
+
+    monkeypatch.setattr(
+        syncing,
+        "prepare_speech_reference",
+        lambda *_args, **_kwargs: (None, {"reason": "test"}),
+    )
+
+    def fake_evaluate(_video, subtitle, *_args, **_kwargs):
+        return subtitle, {
+            "sync_was_successful": True,
+            "reason": "applied",
+            "alignment_score": 1000.0 if subtitle == mixed else 900.0,
+            "offset_seconds": 0.0,
+        }
+
+    optimized: list[Path] = []
+
+    def fake_optimize(_video, subtitle, *_args, **_kwargs):
+        optimized.append(subtitle)
+        return subtitle, {
+            "sync_was_successful": True,
+            "reason": "applied",
+            "engine": "test",
+        }
+
+    monkeypatch.setattr(syncing, "synchronize_subtitle", fake_evaluate)
+    monkeypatch.setattr(syncing, "optimize_subtitle", fake_optimize)
+
+    chosen, output, result = optimize_candidates(
+        video,
+        candidates,
+        tmp_path / "cache",
+        SyncConfig(),
+    )
+
+    assert chosen is candidates[0]
+    assert output == pure
+    assert optimized[0] == pure
+    assert result["candidate_selection"]["best_language_priority"] == 2
+    assert result["candidate_selection"]["preferred_language_count"] == 1
+    by_name = {row["name"]: row for row in result["candidate_results"]}
+    assert by_name[pure.name]["language_purity"] == "japanese_only"
+    assert by_name[mixed.name]["language_purity"] == "mixed_japanese_chinese"
+    assert by_name[mixed.name]["bilingual_cjk"] is True

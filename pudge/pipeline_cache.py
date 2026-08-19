@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import AppConfig
 
-_CACHE_SCHEMA = "final-pipeline-v9"
+_CACHE_SCHEMA = "final-pipeline-v10"
 _DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
 

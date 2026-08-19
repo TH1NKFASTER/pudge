@@ -119,10 +119,10 @@ def test_installer_routes_helper_mode_through_app_bundle() -> None:
     assert 'strcmp(argv[1], "--pudge-native-notification")' in install
     assert "return send_notification(argv[2], argv[3]);" in install
     assert "UNUserNotificationCenter" in install
-    assert "execv(python, child_argv)" in install
+    assert "Py_InitializeFromConfig(&config)" in install
     assert (
         install.index('strcmp(argv[1], "--pudge-native-notification")')
-        < install.index("execv(python, child_argv)")
+        < install.index("Py_InitializeFromConfig(&config)")
     )
 
 

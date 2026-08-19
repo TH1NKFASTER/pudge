@@ -48,14 +48,16 @@ def test_tiny_activity_difference_does_not_override_prefer_srt(tmp_path: Path) -
     assert metadata["selected"].endswith(".srt")
 
 
-def test_material_activity_advantage_still_allows_ass_to_win(tmp_path: Path) -> None:
+def test_native_srt_preference_accepts_moderate_activity_gap(tmp_path: Path) -> None:
     srt = _item(tmp_path / "same-release.srt", activity=0.8935, score=107.0)
     ass = _item(tmp_path / "same-release.ass", activity=0.9040, score=101.0)
 
     ranked, metadata = _rank_embedded_reference_candidates([srt, ass], prefer_srt=True)
 
-    assert ranked[0][1].path.suffix == ".ass"
-    assert metadata["format_preference_applied"] is False
+    assert ranked[0][1].path.suffix == ".srt"
+    assert metadata["format_preference_applied"] is True
+    assert metadata["raw_best"].endswith(".ass")
+    assert metadata["selected"].endswith(".srt")
 
 
 def test_invalid_srt_structure_never_wins_tolerance_tie(tmp_path: Path) -> None:

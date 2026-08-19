@@ -227,43 +227,51 @@ class DebugSnapshotService:
         if not rows:
             return None
         if episode is not None:
-            exact = next((item for item in rows if item.episode == int(episode)), None)
-            if exact is not None:
-                return exact
+            return next((item for item in rows if item.episode == int(episode)), None)
         anime = self.manager.db.get_anime(int(media_id))
         if anime is not None:
-            exact = next((item for item in rows if item.episode == int(anime.next_episode)), None)
-            if exact is not None:
-                return exact
-        rows.sort(
-            key=lambda item: (
-                float(item.playback_updated_at or 0.0),
-                int(item.episode or 0),
-            ),
-            reverse=True,
-        )
-        return rows[0]
+            target = int(anime.next_episode)
+            return next((item for item in rows if item.episode == target), None)
+        return None
+
+    def _target_episode(self, media_id: int, episode: int | None) -> int | None:
+        if episode is not None:
+            return int(episode)
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None or str(getattr(anime, "format", "") or "").upper() == "MOVIE":
+            return None
+        return max(1, int(anime.next_episode))
 
     def snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         media_id = int(media_id)
         anime = self.manager.db.get_anime(media_id)
         if anime is None:
             raise ValueError(f"AniList id={media_id} is not in the local database")
-        selected = self._selected_episode(media_id, episode)
-        available_episodes = sorted(
-            (
+        selected_episode = self._target_episode(media_id, episode)
+        selected = self._selected_episode(media_id, selected_episode)
+        available_episodes = [
+            {
+                "episode": int(item.episode),
+                "state": str(item.state or ""),
+                "video_path": str(item.video_path),
+                "has_subtitles": bool(item.subtitle_path or item.embedded_subtitle_id is not None),
+            }
+            for item in self.manager.db.episodes(media_id)
+            if item.episode is not None
+        ]
+        if (
+            selected_episode is not None
+            and not any(int(item["episode"]) == int(selected_episode) for item in available_episodes)
+        ):
+            available_episodes.append(
                 {
-                    "episode": int(item.episode),
-                    "state": str(item.state or ""),
-                    "video_path": str(item.video_path),
-                    "has_subtitles": bool(item.subtitle_path or item.embedded_subtitle_id is not None),
+                    "episode": int(selected_episode),
+                    "state": "missing",
+                    "video_path": "",
+                    "has_subtitles": False,
                 }
-                for item in self.manager.db.episodes(media_id)
-                if item.episode is not None
-            ),
-            key=lambda item: int(item["episode"]),
-        )
-        selected_episode = int(selected.episode) if selected is not None and selected.episode is not None else episode
+            )
+        available_episodes.sort(key=lambda item: int(item["episode"]))
         try:
             diagnosis = self.manager.diagnose_episode(media_id, selected_episode)
         except Exception as exc:

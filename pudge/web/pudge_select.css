@@ -1,0 +1,15 @@
+.pudge-select-native{position:absolute!important;width:1px!important;height:1px!important;opacity:0!important;pointer-events:none!important;margin:0!important;padding:0!important}
+.pudge-select{position:relative;display:inline-flex;min-width:0;max-width:100%;vertical-align:middle}
+.pudge-select-button{width:100%;min-width:0;display:flex;align-items:center;justify-content:space-between;gap:9px;padding:7px 10px;border:1px solid #3b5270;border-radius:8px;background:#122237;color:var(--text);text-align:left;white-space:nowrap}
+.pudge-select-button:hover,.pudge-select.open .pudge-select-button{background:#1b304b;border-color:#607da5}
+.pudge-select-button:disabled{opacity:.55;cursor:default}
+.pudge-select-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pudge-select-chevron{flex:0 0 auto;color:var(--muted);font-size:11px}
+.pudge-select-menu{position:fixed;z-index:12060;display:none;max-height:min(360px,55vh);overflow:auto;padding:5px;border:1px solid #4b6485;border-radius:9px;background:rgba(8,18,31,.985);box-shadow:0 14px 42px rgba(0,0,0,.55)}
+.pudge-select-menu.open{display:grid;gap:3px}
+.pudge-select-option{width:100%;display:flex;align-items:center;min-height:31px;padding:6px 9px;border:0;border-radius:6px;background:transparent;color:var(--text);text-align:left;white-space:normal}
+.pudge-select-option:hover,.pudge-select-option.focused{background:#233d5e}
+.pudge-select-option.selected{background:#29496f;color:#fff;font-weight:700}
+.pudge-select-option:disabled{opacity:.42;cursor:default;background:transparent}
+.form-grid>.pudge-select,.onboarding-form>.pudge-select,.audiobook-speed>.pudge-select{width:100%}
+.audiobook-speed>.pudge-select{min-width:88px}

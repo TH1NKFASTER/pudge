@@ -94,7 +94,10 @@ def test_ln_existing_cover_is_sticky_across_anilist_binding(tmp_path: Path, monk
     source = tmp_path / "Spice and Wolf Volume 04.txt"
     source.write_text("本文", encoding="utf-8")
     book = service.import_file(source)
-    sticky = "data:image/jpeg;base64,already-good"
+    sticky_path = service.cover_cache_dir / "sticky-ln-cover.jpg"
+    sticky_path.parent.mkdir(parents=True, exist_ok=True)
+    sticky_path.write_bytes(b"sticky-cover")
+    sticky = f"covers/{sticky_path.name}"
     with service._connect() as conn:
         conn.execute("UPDATE ln_books SET cover_url=? WHERE id=?", (sticky, int(book["id"])))
 
@@ -150,7 +153,8 @@ def test_frontend_uses_one_manga_renderer_and_cover_only_ln_anilist_click() -> N
     assert "Series are grouped by volumes. AniList artwork is preferred when linked." not in manga
     assert "Серии сгруппированы по томам" not in manga
     assert "https://graphql.anilist.co" not in manga
-    assert "if (!window.PudgeMangaReaderV2?.renderLibrary) renderManga();" in media
+    assert "renderManga" not in media
+    assert "mangaReader" not in media
     assert "showMangaAniListSearch" in media
     assert "book.series_key || normalizedSeriesKey(title)" in manga
     assert 'data-manga-context-action="anilist-search"' in manga

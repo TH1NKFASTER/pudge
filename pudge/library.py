@@ -222,12 +222,24 @@ def scan_library(
     excluded_paths: tuple[Path, ...] = (),
     pipeline_cache_config: AppConfig | None = None,
     anime_resolver: Callable[[VideoIdentity], LibraryAnime | None] | None = None,
+    media_episode_resolver: Callable[[LibraryAnime, int | None], int | None] | None = None,
     require_anime_match: bool = False,
 ) -> list[LibraryEpisode]:
     root = root.expanduser()
     if not root.exists():
         root.mkdir(parents=True, exist_ok=True)
     anime_list = db.anime_list()
+    downloads_by_path = {}
+    for download in db.downloads():
+        raw_path = str(download.content_path or "").strip()
+        if not raw_path and str(download.save_path or "").strip() and str(download.name or "").strip():
+            raw_path = str(Path(download.save_path).expanduser() / download.name)
+        if not raw_path:
+            continue
+        try:
+            downloads_by_path[Path(raw_path).expanduser().resolve()] = download
+        except (OSError, RuntimeError):
+            continue
     iterator = root.rglob("*") if recursive else root.glob("*")
     excluded = tuple(path.expanduser().resolve() for path in excluded_paths)
 
@@ -245,8 +257,18 @@ def scan_library(
         if is_excluded(path):
             continue
         identity = parse_anime_filename(path)
+        resolved = path.resolve()
+        managed_download = downloads_by_path.get(resolved)
+        # Managed torrent metadata is authoritative for identity. A fuzzy parent
+        # folder/title match must never relabel a completed Season 2 download as
+        # Season 1 merely because the release filename uses absolute numbering.
+        managed_anime = (
+            db.get_anime(managed_download.media_id)
+            if managed_download is not None and managed_download.media_id is not None
+            else None
+        )
         sidecar_anilist_id = cached_anilist_id_for_video(path, root)
-        anime = db.get_anime(sidecar_anilist_id) if sidecar_anilist_id else None
+        anime = managed_anime or (db.get_anime(sidecar_anilist_id) if sidecar_anilist_id else None)
         # External watched folders are much more ambiguous than the managed
         # library. Resolve the full filename identity (including Sxx) before the
         # legacy title-only matcher so Season 3 cannot silently attach to Season 1.
@@ -272,23 +294,30 @@ def scan_library(
             anime_list.append(anime)
         if anime is None and require_anime_match:
             continue
-        resolved = path.resolve()
         existing = db.episode_by_path(resolved)
         sidecar = sidecar_subtitle(path)
-        existing_download = (
-            db.download_by_hash(existing.torrent_hash)
-            if existing is not None and existing.torrent_hash
-            else None
-        )
+        existing_download = managed_download
+        if existing_download is None and existing is not None and existing.torrent_hash:
+            existing_download = db.download_by_hash(existing.torrent_hash)
         existing_has_managed_download = bool(
             existing_download is not None
-            and existing is not None
-            and existing_download.media_id == existing.media_id
+            and anime is not None
+            and existing_download.media_id == anime.media_id
         )
         release_number = identity.episode
+        mapped_media_number = None
+        if anime is not None and media_episode_resolver is not None:
+            try:
+                mapped_media_number = media_episode_resolver(anime, release_number)
+            except (TypeError, ValueError):
+                mapped_media_number = None
         media_number = (
             existing_download.media_episode
-            if existing_has_managed_download and existing_download is not None
+            if existing_has_managed_download
+            and existing_download is not None
+            and existing_download.media_episode is not None
+            else mapped_media_number
+            if mapped_media_number is not None
             else existing.media_episode
             if existing is not None
             else identity.episode
@@ -426,6 +455,11 @@ def scan_library(
             embedded_subtitle_id=embedded_subtitle_id,
             state=state,
             subtitle_origin=subtitle_origin,
+            torrent_hash=(
+                existing_download.torrent_hash
+                if existing_has_managed_download and existing_download is not None
+                else existing.torrent_hash if existing is not None else ""
+            ),
         )
         db.upsert_episode(item)
         persisted = db.episode_by_path(resolved) or item

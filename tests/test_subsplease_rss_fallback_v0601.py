@@ -144,10 +144,8 @@ def test_subsplease_setting_round_trips(tmp_path: Path):
     assert "subsplease_rss_enabled = true" in path.read_text()
 
 
-def test_settings_ui_exposes_subsplease_checkbox():
+def test_settings_ui_hides_obsolete_subsplease_checkbox():
     html = Path("pudge/web/index.html").read_text()
 
-    assert "settings.useSubsPleaseRss':'Use SubsPlease RSS fallback'" in html
-    assert "settings.useSubsPleaseRss':'Использовать RSS SubsPlease'" in html
-    assert "checkbox('s_subsplease_rss',t('settings.useSubsPleaseRss'))" in html
-    assert "subsplease_rss_enabled:c('s_subsplease_rss')" in html
+    assert "checkbox('s_subsplease_rss',t('settings.useSubsPleaseRss'))" not in html
+    assert "subsplease_rss_enabled:c('s_subsplease_rss')" not in html

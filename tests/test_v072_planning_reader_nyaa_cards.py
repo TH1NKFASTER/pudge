@@ -212,8 +212,6 @@ def test_planning_reader_cards_and_dependency_frontend_contracts() -> None:
             "lnrPitchColor",
             "writeLnManagedColorCss",
             "syncLnColorPickersFromCss",
-            "Change character names",
-            "name-cues",
             "syncLnReaderControlAvailability",
             'data-ln-card-jiten',
         )

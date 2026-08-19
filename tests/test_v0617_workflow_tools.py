@@ -87,6 +87,22 @@ def test_episode_diagnostics_explain_missing_subtitles(tmp_path: Path) -> None:
     assert "image subtitles" in subtitle_check["detail"]
 
 
+
+
+def test_episode_diagnostics_do_not_expose_missing_internal_row_as_video_status(tmp_path: Path) -> None:
+    manager = make_manager(tmp_path)
+    manager.config.ui.language = "en"
+    manager.db.upsert_anime(LibraryAnime(media_id=13, title="Not Downloaded Yet"))
+
+    result = manager.diagnose_episode(13, 1)
+    file_check = next(item for item in result["checks"] if item["key"] == "file")
+
+    assert file_check["ok"] is False
+    assert file_check["label"] == "Local video"
+    assert file_check["detail"] == "Episode not downloaded yet"
+    assert "No episode row" not in str(result)
+
+
 def test_ocr_quality_gate_flags_weak_results_and_accepts_normal_results() -> None:
     weak = ocr.evaluate_ocr_quality([ocr.OCRCue(0, 1, "ABC")], 20)
     assert weak["accepted"] is False

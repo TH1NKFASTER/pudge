@@ -15,10 +15,14 @@ import time
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-
-from .branding import APP_SLUG
 from typing import Iterable
 
+from .branding import APP_SLUG
+from .cache_management import (
+    cleanup_segment_audio_cache,
+    mark_segment_audio_active,
+    touch_segment_audio,
+)
 from .config import SyncConfig
 from .language import TEXT_SUBTITLE_EXTENSIONS
 from .llm import OllamaClient
@@ -80,6 +84,84 @@ def _result(reason: str, **values: object) -> dict[str, object]:
 def _timeline_needs_audio_verification(result: dict[str, object]) -> bool:
     risk = result.get("timeline_early_edit_audio_verification")
     return isinstance(risk, dict) and bool(risk.get("required"))
+
+
+def _prefer_embedded_timeline_over_conflicting_speech(
+    timeline_result: dict[str, object],
+    speech_result: dict[str, object],
+    opening_scaffold: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    """Prefer a strongly validated same-video timeline when STT lands on another clock.
+
+    This is deliberately conservative: it only fires for the exact failure mode
+    where opening-scaffold repair refused because the Japanese speech clock and
+    the dominant post-edit embedded timeline disagree by a large amount, while
+    independent timeline holdouts are tight.
+    """
+    scaffold_conflict = (
+        str(opening_scaffold.get("reason_detail") or "")
+        == "speech_clock_disagrees_with_post_plateau"
+    )
+    opening_reacquire = timeline_result.get("timeline_opening_gap_reacquire")
+    reacquired_clock = bool(
+        isinstance(opening_reacquire, dict)
+        and opening_reacquire.get("applied")
+        and str(opening_reacquire.get("reason") or "")
+        == "dominant_clock_reacquired_after_opening_gap"
+    )
+    if not scaffold_conflict and not reacquired_clock:
+        return False, {"reason": "no_speech_clock_conflict"}
+
+    segments = timeline_result.get("timeline_segments")
+    validation = timeline_result.get("timeline_validation")
+    if not isinstance(segments, list) or not isinstance(validation, dict):
+        return False, {"reason": "timeline_metrics_unavailable"}
+
+    stable = [
+        row
+        for row in segments
+        if isinstance(row, dict)
+        and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
+    ]
+    if len(stable) < 2:
+        return False, {"reason": "timeline_not_piecewise"}
+    post = max(stable[1:], key=lambda row: max(0, int(row.get("support") or 0)))
+    holdout = validation.get("holdout")
+    after = validation.get("after")
+    if not isinstance(holdout, dict) or not isinstance(after, dict):
+        return False, {"reason": "timeline_validation_incomplete"}
+
+    try:
+        speech_offset = float(speech_result.get("offset_seconds"))
+        post_offset = float(post.get("offset_seconds"))
+        post_support = max(0, int(post.get("support") or 0))
+        after_f1 = float(after.get("f1") or 0.0)
+        activity_f1 = float(validation.get("activity_f1") or 0.0)
+        holdout_p90 = float(holdout.get("p90_abs_residual_seconds"))
+        holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
+    except (TypeError, ValueError):
+        return False, {"reason": "timeline_validation_not_numeric"}
+
+    conflict = abs(speech_offset - post_offset)
+    strong = bool(
+        conflict >= 8.0
+        and post_support >= 8
+        and after_f1 >= 0.82
+        and activity_f1 >= 0.85
+        and holdout_p90 <= 1.0
+        and holdout_coverage >= 0.85
+    )
+    return strong, {
+        "reason": "strong_embedded_timeline" if strong else "embedded_timeline_not_strong_enough",
+        "speech_offset_seconds": round(speech_offset, 3),
+        "post_offset_seconds": round(post_offset, 3),
+        "clock_conflict_seconds": round(conflict, 3),
+        "post_support": post_support,
+        "after_f1": round(after_f1, 4),
+        "activity_f1": round(activity_f1, 4),
+        "holdout_p90_seconds": round(holdout_p90, 4),
+        "holdout_mean_coverage": round(holdout_coverage, 4),
+    }
 
 
 def _record_timeline_debug_attempt(
@@ -1604,16 +1686,22 @@ def _extract_audio_segment(
     digest = hashlib.sha1(
         (
             f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-            f"{start:.3f}:{duration:.3f}:{padding:.3f}:mono-16k-v2"
+            f"{start:.3f}:{duration:.3f}:{padding:.3f}:mono-16k-flac-v3"
         ).encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "segment-audio"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"{digest}.wav"
-    if force:
-        output.unlink(missing_ok=True)
+    output = output_dir / f"{digest}.flac"
+    # This audio is content-addressed by every input that affects its samples.
+    # A forced subtitle resync therefore does not need to re-run ffmpeg here.
+    # Reusing it avoids repeatedly decoding the same episode.
+    cleanup_segment_audio_cache(cache_dir)
     if output.exists() and output.stat().st_size > 0:
+        touch_segment_audio(output)
         return output, None
+    output.unlink(missing_ok=True)
+    temporary = output.with_suffix(".flac.tmp")
+    temporary.unlink(missing_ok=True)
     command = [
         binary,
         "-y",
@@ -1643,7 +1731,10 @@ def _extract_audio_segment(
                 f"{duration + 2 * padding:.3f}",
             ]
         )
-    command.extend(["-c:a", "pcm_s16le", str(output)])
+    # Long local-offset windows are mostly silence. FLAC makes those caches tiny
+    # compared with PCM WAV while remaining lossless for ffsubsync.
+    command.extend(["-c:a", "flac", "-compression_level", "0", "-f", "flac", str(temporary)])
+    mark_segment_audio_active(output, True)
     try:
         completed = subprocess.run(
             command,
@@ -1654,11 +1745,16 @@ def _extract_audio_segment(
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         return None, str(exc)
-    if completed.returncode != 0 or not output.exists() or output.stat().st_size == 0:
-        output.unlink(missing_ok=True)
-        return None, completed.stdout[-1000:]
+    finally:
+        mark_segment_audio_active(output, False)
+    if completed.returncode != 0 or not temporary.exists() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        return None, (completed.stdout or "ffmpeg_audio_extract_failed")[-1000:]
+    temporary.replace(output)
+    touch_segment_audio(output)
+    cleanup_segment_audio_cache(cache_dir)
     return output, None
 
 
@@ -7201,6 +7297,9 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
 
 
 _EMBEDDED_REFERENCE_SRT_ACTIVITY_TOLERANCE = 0.005
+_EMBEDDED_REFERENCE_SRT_MIN_ACTIVITY = 0.80
+_EMBEDDED_REFERENCE_SRT_MAX_ACTIVITY_GAP = 0.12
+_EMBEDDED_REFERENCE_LANGUAGE_MIN_ACTIVITY = 0.65
 
 
 def _rank_embedded_reference_candidates(
@@ -7230,19 +7329,18 @@ def _rank_embedded_reference_candidates(
     ],
     dict[str, object],
 ]:
-    """Rank embedded-reference candidates without overfitting tiny score noise.
+    """Prefer clean Japanese and native SRT without accepting a broken clock.
 
-    Timing-activity scores are estimates, not exact quality measurements. A tiny
-    difference (for example 0.8940 versus 0.8935) must not override an explicit
-    SRT preference. Candidates inside ``activity_tolerance`` of the best valid
-    clock are treated as timing-equivalent; format preference and filename score
-    decide between them. A materially better ASS/SSA candidate still wins.
+    Explicit Japanese-only files outrank unknown files, and mixed Japanese/Chinese
+    files are fallbacks. Inside the best viable language tier, a native SRT wins
+    when its activity is still strong and no more than 0.12 below the best clock.
     """
     if not items:
         return [], {
             "activity_tolerance": max(0.0, float(activity_tolerance)),
             "best_activity": None,
             "format_preference_applied": False,
+            "language_preference_applied": False,
         }
 
     tolerance = max(0.0, float(activity_tolerance))
@@ -7258,42 +7356,92 @@ def _rank_embedded_reference_candidates(
         structure = item[5]
         return isinstance(structure, dict) and structure.get("reason") == "ok"
 
+    def language_purity(item: tuple[object, ...]) -> str:
+        candidate = item[1]
+        details = candidate.details if isinstance(candidate.details, dict) else {}
+        return str(details.get("language_purity") or "unknown")
+
+    def language_priority(item: tuple[object, ...]) -> int:
+        return {
+            "japanese_only": 2,
+            "unknown": 1,
+            "mixed_japanese_chinese": 0,
+            "chinese_only": 0,
+        }.get(language_purity(item), 1)
+
     structurally_valid = [item for item in items if structure_ok(item)]
     activity_pool = structurally_valid or items
     best_activity = max((activity_value(item) for item in activity_pool), default=0.0)
 
+    viable_language_pool = [
+        item
+        for item in structurally_valid
+        if activity_value(item) >= _EMBEDDED_REFERENCE_LANGUAGE_MIN_ACTIVITY
+    ]
+    language_pool = viable_language_pool or structurally_valid or items
+    best_language_priority = max(
+        (language_priority(item) for item in language_pool),
+        default=1,
+    )
+    best_language_purity = max(
+        (language_purity(item) for item in language_pool),
+        key=lambda value: {
+            "japanese_only": 2,
+            "unknown": 1,
+            "mixed_japanese_chinese": 0,
+            "chinese_only": 0,
+        }.get(value, 1),
+        default="unknown",
+    )
+    same_language_pool = [
+        item
+        for item in language_pool
+        if language_priority(item) == best_language_priority
+    ]
+    best_same_language_activity = max(
+        (activity_value(item) for item in same_language_pool),
+        default=best_activity,
+    )
+
     rebuilt = []
     for _old_rank, candidate, aligned, alass_result, activity, structure in items:
-        weighted = activity_value((_old_rank, candidate, aligned, alass_result, activity, structure))
-        valid = structure_ok((_old_rank, candidate, aligned, alass_result, activity, structure))
-        near_best = valid and weighted >= best_activity - tolerance
+        item = (_old_rank, candidate, aligned, alass_result, activity, structure)
+        weighted = activity_value(item)
+        valid = structure_ok(item)
+        purity_priority = language_priority(item)
+        best_purity = purity_priority == best_language_priority
         native_srt = bool(prefer_srt and candidate.path.suffix.casefold() == ".srt")
+        activity_gap = max(0.0, best_same_language_activity - weighted)
+        near_best = valid and best_purity and activity_gap <= tolerance
+        acceptable_srt = bool(
+            native_srt
+            and valid
+            and best_purity
+            and weighted >= _EMBEDDED_REFERENCE_SRT_MIN_ACTIVITY
+            and activity_gap <= _EMBEDDED_REFERENCE_SRT_MAX_ACTIVITY_GAP
+        )
+        format_preferred = bool(native_srt and best_purity and (near_best or acceptable_srt))
 
-        if near_best:
-            # Inside the noise band, honor the user's format preference first.
-            rank = (
-                1.0 if valid else 0.0,
-                1.0,
-                1.0 if native_srt else 0.0,
-                float(candidate.score),
-                weighted,
-            )
-        else:
-            # Outside the tolerance, real timing superiority remains decisive.
-            rank = (
-                1.0 if valid else 0.0,
-                0.0,
-                weighted,
-                1.0 if native_srt else 0.0,
-                float(candidate.score),
-            )
+        rank = (
+            1.0 if valid else 0.0,
+            1.0 if best_purity else 0.0,
+            float(purity_priority),
+            1.0 if format_preferred else 0.0,
+            weighted,
+            float(candidate.score),
+        )
         rebuilt.append((rank, candidate, aligned, alass_result, activity, structure))
 
     ordered = sorted(rebuilt, key=lambda item: item[0], reverse=True)
     selected = ordered[0] if ordered else None
     selected_activity = activity_value(selected) if selected is not None else 0.0
+    selected_purity = language_purity(selected) if selected is not None else "unknown"
+    selected_priority = language_priority(selected) if selected is not None else 1
+    selected_format_preferred = bool(selected and selected[0][3] > 0.0)
     best_raw = max(items, key=activity_value) if items else None
     best_raw_candidate = best_raw[1] if best_raw is not None else None
+    best_raw_purity = language_purity(best_raw) if best_raw is not None else "unknown"
+    best_raw_priority = language_priority(best_raw) if best_raw is not None else 1
     selected_candidate = selected[1] if selected is not None else None
     preference_applied = bool(
         prefer_srt
@@ -7301,13 +7449,21 @@ def _rank_embedded_reference_candidates(
         and selected_candidate.path.suffix.casefold() == ".srt"
         and best_raw_candidate is not None
         and best_raw_candidate.path != selected_candidate.path
-        and best_activity - selected_activity <= tolerance
+        and selected_format_preferred
     )
     return ordered, {
         "activity_tolerance": tolerance,
+        "srt_min_activity": _EMBEDDED_REFERENCE_SRT_MIN_ACTIVITY,
+        "srt_max_activity_gap": _EMBEDDED_REFERENCE_SRT_MAX_ACTIVITY_GAP,
         "best_activity": round(best_activity, 6),
+        "best_same_language_activity": round(best_same_language_activity, 6),
         "selected_activity": round(selected_activity, 6),
+        "selected_activity_gap": round(max(0.0, best_same_language_activity - selected_activity), 6),
+        "best_language_purity": best_language_purity,
+        "selected_language_purity": selected_purity,
+        "raw_best_language_purity": best_raw_purity,
         "format_preference_applied": preference_applied,
+        "language_preference_applied": selected_priority > best_raw_priority,
         "selected": selected_candidate.name if selected_candidate is not None else None,
         "raw_best": best_raw_candidate.name if best_raw_candidate is not None else None,
     }
@@ -7502,6 +7658,8 @@ def _exact_jimaku_audio_clock_consensus(
     selected = max(
         qualified,
         key=lambda item: (
+            int(item[1].details.get("language_purity") == "japanese_only"),
+            int(item[1].details.get("language_purity") != "mixed_japanese_chinese"),
             int(prefer_srt and item[1].path.suffix.casefold() == ".srt"),
             float(item[1].score),
             -abs(item[0]),
@@ -7724,18 +7882,21 @@ def optimize_candidates(
             if embedded_rank_meta.get("format_preference_applied"):
                 configure_logging().info(
                     "SELECT step=subtitle.embedded_reference_format_preference "
-                    "video=%s raw_best=%r selected=%r best_activity=%s selected_activity=%s tolerance=%s",
+                    "video=%s raw_best=%r selected=%r best_activity=%s selected_activity=%s "
+                    "activity_gap=%s max_gap=%s language=%s",
                     video.name,
                     embedded_rank_meta.get("raw_best"),
                     embedded_rank_meta.get("selected"),
                     embedded_rank_meta.get("best_activity"),
                     embedded_rank_meta.get("selected_activity"),
-                    embedded_rank_meta.get("activity_tolerance"),
+                    embedded_rank_meta.get("selected_activity_gap"),
+                    embedded_rank_meta.get("srt_max_activity_gap"),
+                    embedded_rank_meta.get("selected_language_purity"),
                 )
                 if verbose:
                     print(
-                        "  Разница activity находится в пределах шума; "
-                        f"выбран SRT: {embedded_rank_meta.get('selected')}"
+                        "  Выбран чистый SRT с приемлемым качеством тайминга: "
+                        f"{embedded_rank_meta.get('selected')}"
                     )
             risky_timeline_item = next(
                 (
@@ -7894,6 +8055,54 @@ def optimize_candidates(
                             cache_dir,
                         )
                     )
+                    prefer_embedded, conflict_meta = (
+                        _prefer_embedded_timeline_over_conflicting_speech(
+                            risky_timeline_result,
+                            speech_result,
+                            opening_scaffold,
+                        )
+                    )
+                    if prefer_embedded:
+                        final_result = dict(risky_timeline_result)
+                        final_result.update(
+                            {
+                                "reason": "applied",
+                                "sync_was_successful": True,
+                                "engine": "embedded-reference+timeline",
+                                "output": str(_embedded_aligned),
+                                "timing_reference": str(timing_reference),
+                                "timing_reference_language": timing_reference_result.get("language"),
+                                "timing_reference_title": timing_reference_result.get("title"),
+                                "reference_activity": _risk_activity,
+                                "reference_output_structure": _risk_structure,
+                                "reference_alignment_reliable": True,
+                                "selection_reason": "embedded_timeline_over_conflicting_stt",
+                                "speech_clock_conflict": conflict_meta,
+                                "speech_verification": {
+                                    "engine": speech_result.get("engine"),
+                                    "offset_seconds": speech_result.get("offset_seconds"),
+                                    "opening_scaffold": opening_scaffold,
+                                },
+                                "candidate_selection": {
+                                    "mode": "embedded_timeline_over_conflicting_stt",
+                                    "candidate_count": len(candidate_list),
+                                    "prealigned_count": len(prealigned),
+                                    "prefer_srt": prefer_srt,
+                                    "embedded_reference_ranking": embedded_rank_meta,
+                                },
+                            }
+                        )
+                        configure_logging().warning(
+                            "OVERRIDE step=subtitle.stt_clock_conflict video=%s candidate=%r speech_offset=%s timeline_post_offset=%s conflict=%s holdout_p90=%s",
+                            video.name,
+                            risky_candidate.name,
+                            conflict_meta.get("speech_offset_seconds"),
+                            conflict_meta.get("post_offset_seconds"),
+                            conflict_meta.get("clock_conflict_seconds"),
+                            conflict_meta.get("holdout_p90_seconds"),
+                        )
+                        return risky_candidate, _embedded_aligned, final_result
+
                     final_result = dict(speech_result)
                     if opening_scaffold.get("applied"):
                         final_result["engine"] = (
@@ -8225,15 +8434,44 @@ def optimize_candidates(
         except (TypeError, ValueError):
             return float("-inf")
 
-    best_alignment = max((alignment_value(item) for item in selection_pool), default=float("-inf"))
+    def candidate_language_priority(
+        item: tuple[SubtitleCandidate, Path, dict[str, object]],
+    ) -> int:
+        candidate = item[0]
+        details = candidate.details if isinstance(candidate.details, dict) else {}
+        purity = str(details.get("language_purity") or "unknown")
+        return {
+            "japanese_only": 2,
+            "unknown": 1,
+            "mixed_japanese_chinese": 0,
+            "chinese_only": 0,
+        }.get(purity, 1)
+
+    # Language purity is a hard preference tier, not just a filename bonus.
+    # Otherwise a bilingual CHS+JPN file with lots of duplicate cues can win
+    # purely because its raw alignment score is numerically larger.
+    best_language_priority = max(
+        (candidate_language_priority(item) for item in selection_pool),
+        default=1,
+    )
+    preferred_language_pool = [
+        item
+        for item in selection_pool
+        if candidate_language_priority(item) == best_language_priority
+    ] or selection_pool
+
+    best_alignment = max(
+        (alignment_value(item) for item in preferred_language_pool),
+        default=float("-inf"),
+    )
     tolerance = max(
         max(0.0, srt_tolerance_absolute),
         abs(best_alignment) * max(0.0, srt_tolerance_ratio) if best_alignment != float("-inf") else 0.0,
     )
     near_best = [
-        item for item in selection_pool
+        item for item in preferred_language_pool
         if alignment_value(item) >= best_alignment - tolerance
-    ] or selection_pool
+    ] or preferred_language_pool
 
     def candidate_score(item: tuple[SubtitleCandidate, Path, dict[str, object]]) -> tuple[int, float, float]:
         candidate, _, _ = item
@@ -8244,16 +8482,23 @@ def optimize_candidates(
 
     def fallback_score(
         item: tuple[SubtitleCandidate, Path, dict[str, object]],
-    ) -> tuple[int, int, float, int, float]:
+    ) -> tuple[int, int, int, float, int, float]:
         candidate, _, result = item
         exact_identity = int(
             candidate.source == "jimaku"
-            and candidate.details.get("episode_match") in {"exact", "range"}
+            and candidate.details.get("episode_match") in {"exact", "range", "absolute"}
             and bool(candidate.details.get("entry_anilist_match"))
         )
         successful = int(bool(result.get("sync_was_successful")))
         native_srt = int(prefer_srt and candidate.path.suffix.casefold() == ".srt")
-        return exact_identity, successful, alignment_value(item), native_srt, candidate.score
+        return (
+            exact_identity,
+            successful,
+            candidate_language_priority(item),
+            alignment_value(item),
+            native_srt,
+            candidate.score,
+        )
 
     # The old flow optimized exactly one filename winner. If that source had a
     # different broadcast master or a broken caption clock, all other Jimaku
@@ -8275,6 +8520,16 @@ def optimize_candidates(
             "alignment_score": result.get("alignment_score"),
             "offset_seconds": result.get("offset_seconds"),
             "successful": bool(result.get("sync_was_successful")),
+            "language_purity": (
+                candidate.details.get("language_purity")
+                if isinstance(candidate.details, dict)
+                else None
+            ),
+            "bilingual_cjk": bool(
+                candidate.details.get("bilingual_cjk")
+                if isinstance(candidate.details, dict)
+                else False
+            ),
         }
         for candidate, _, result in evaluated
     ]
@@ -8312,6 +8567,8 @@ def optimize_candidates(
             "best_alignment": best_alignment,
             "srt_tolerance": tolerance,
             "near_best_count": len(near_best),
+            "best_language_priority": best_language_priority,
+            "preferred_language_count": len(preferred_language_pool),
             "prefer_srt": prefer_srt,
             "quality_attempt": attempt_index,
             "quality_attempt_limit": min(8, len(ordered_items)),

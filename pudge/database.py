@@ -429,7 +429,7 @@ CREATE TABLE IF NOT EXISTS media_identities (
 );
 """
 
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 
 class Database:
@@ -458,6 +458,9 @@ class Database:
             conn.execute("PRAGMA user_version=4")
         if version < 5:
             self._migrate_v5(conn)
+            conn.execute("PRAGMA user_version=5")
+        if version < 6:
+            self._migrate_v6(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -707,6 +710,76 @@ class Database:
             ON episodes(media_id,media_episode);
             CREATE INDEX IF NOT EXISTS idx_episodes_release_identity
             ON episodes(media_id,release_episode);
+            """
+        )
+
+    def _migrate_v6(self, conn: sqlite3.Connection) -> None:
+        """Add the device-neutral event log used by companion clients."""
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS sync_devices (
+                device_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'unknown',
+                token_hash TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL DEFAULT 0,
+                revoked_at REAL NOT NULL DEFAULT 0
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_devices_token
+            ON sync_devices(token_hash) WHERE token_hash!='';
+
+            CREATE TABLE IF NOT EXISTS sync_pairing_codes (
+                token_hash TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                used_at REAL NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_pairing_expiry
+            ON sync_pairing_codes(expires_at);
+
+            CREATE TABLE IF NOT EXISTS sync_entities (
+                entity_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                local_key TEXT NOT NULL,
+                external_key TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(kind,local_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_entities_external
+            ON sync_entities(kind,external_key);
+
+            CREATE TABLE IF NOT EXISTS sync_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_uuid TEXT NOT NULL UNIQUE,
+                device_id TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                occurred_at REAL NOT NULL,
+                received_at REAL NOT NULL,
+                FOREIGN KEY(device_id) REFERENCES sync_devices(device_id),
+                FOREIGN KEY(entity_id) REFERENCES sync_entities(entity_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_events_cursor ON sync_events(id);
+            CREATE INDEX IF NOT EXISTS idx_sync_events_entity
+            ON sync_events(entity_id,id);
+
+            CREATE TABLE IF NOT EXISTS sync_snapshots (
+                entity_id TEXT PRIMARY KEY,
+                position_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'not_started',
+                source_device_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                occurred_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(entity_id) REFERENCES sync_entities(entity_id) ON DELETE CASCADE,
+                FOREIGN KEY(source_device_id) REFERENCES sync_devices(device_id),
+                FOREIGN KEY(event_id) REFERENCES sync_events(id) ON DELETE CASCADE
+            );
             """
         )
 

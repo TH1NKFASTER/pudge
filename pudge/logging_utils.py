@@ -7,12 +7,48 @@ from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from .branding import DEFAULT_RUNTIME_LOG_PATH
+from .branding import DEBUG_LOG_DIR, DEFAULT_RUNTIME_LOG_PATH
 from typing import Iterator
 
 
 DEFAULT_LOG_PATH = DEFAULT_RUNTIME_LOG_PATH
 _LOGGER_NAME = "pudge"
+
+
+DEBUG_LOG_RETENTION_SECONDS = 2 * 60 * 60
+
+def cleanup_debug_logs(*, now: float | None = None, max_age_seconds: float = DEBUG_LOG_RETENTION_SECONDS) -> int:
+    """Delete exported debug artifacts older than the short troubleshooting window."""
+    root = DEBUG_LOG_DIR.expanduser()
+    if not root.exists():
+        return 0
+    cutoff = float(time.time() if now is None else now) - max(0.0, float(max_age_seconds))
+    removed = 0
+    # Delete children only; keep the stable directory for Cmd+Shift+L exports.
+    for path in list(root.iterdir()):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > cutoff:
+            continue
+        try:
+            if path.is_dir():
+                import shutil
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+def debug_log_dir(*, cleanup: bool = True) -> Path:
+    root = DEBUG_LOG_DIR.expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    if cleanup:
+        cleanup_debug_logs()
+    return root
 
 
 def _selected_log_path(log_path: Path | None = None) -> Path:

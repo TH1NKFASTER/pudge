@@ -68,10 +68,10 @@ def test_priority_job_count_tracks_manual_refresh_until_attempt(tmp_path: Path) 
     assert manager.db.priority_subtitle_job_count(min_priority=200) == 0
 
 
-def test_ui_keeps_refresh_in_checking_state_for_priority_subtitle_jobs() -> None:
+def test_ui_keeps_background_subtitle_status_without_locking_refresh() -> None:
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function prioritySubtitleJobs()" in html
     assert "status.subtitleCheckingBackground" in html
     assert "toast.refreshedSubtitlesQueued" in html
-    assert "ui.startupRunning||ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" in html
+    assert "ui.startupRunning||ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
     assert "foreground.subtitle_manual_refresh" not in html  # backend concern only

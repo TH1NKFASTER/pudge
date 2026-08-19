@@ -3,14 +3,16 @@ from __future__ import annotations
 import base64
 import binascii
 
+import json
 import math
 import re
 import subprocess
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -87,6 +89,79 @@ class NyaaError(RuntimeError):
 
 
 SUBSPLEASE_RSS_BASE = "https://subsplease.org/rss/"
+SHANA_PUBLIC_FEED = "https://www.shanaproject.com/feeds/site/"
+
+
+def _release_history_key(item: NyaaRelease) -> str:
+    return (
+        str(item.info_hash or "").strip().lower()
+        or str(item.torrent_url or "").strip()
+        or str(item.link or "").strip()
+        or f"{item.title}|{item.published}"
+    )
+
+
+def _load_release_history(path: Path | None) -> list[NyaaRelease]:
+    if path is None or not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+    rows = payload.get("releases") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    allowed = set(NyaaRelease.__dataclass_fields__)
+    result: list[NyaaRelease] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            result.append(NyaaRelease(**{key: row[key] for key in allowed if key in row}))
+        except (TypeError, ValueError, KeyError):
+            continue
+    return result
+
+
+def _merge_release_history(
+    path: Path | None,
+    current: list[NyaaRelease],
+    *,
+    source: str,
+    limit: int = 5000,
+) -> list[NyaaRelease]:
+    previous = _load_release_history(path)
+    merged: dict[str, NyaaRelease] = {}
+    for item in [*current, *previous]:
+        key = _release_history_key(item)
+        if key and key not in merged:
+            merged[key] = item
+    rows = list(merged.values())[: max(100, int(limit))]
+    if path is not None:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema": "pudge-release-feed-history-v1",
+                "source": source,
+                "updated_at": time.time(),
+                "releases": [
+                    {
+                        **asdict(item),
+                        "source": source,
+                        "episode": release_episode(item.title),
+                    }
+                    for item in rows
+                ],
+            }
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except OSError:
+            pass
+    return rows
 
 
 def _magnet_info_hash(value: str) -> str:
@@ -167,9 +242,16 @@ def parse_subsplease_rss(xml_text: str) -> list[NyaaRelease]:
 
 
 class SubsPleaseClient:
-    def __init__(self, *, timeout: float = 8.0, cache_ttl: float = 60.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: float = 8.0,
+        cache_ttl: float = 300.0,
+        history_path: Path | None = None,
+    ) -> None:
         self.timeout = timeout
         self.cache_ttl = max(0.0, cache_ttl)
+        self.history_path = history_path
         self._cache: dict[str, tuple[float, list[NyaaRelease]]] = {}
 
     @staticmethod
@@ -201,12 +283,112 @@ class SubsPleaseClient:
             ) as client:
                 response = client.get(url)
                 response.raise_for_status()
-                releases = parse_subsplease_rss(response.text)
+                releases = _merge_release_history(
+                    self.history_path,
+                    parse_subsplease_rss(response.text),
+                    source="subsplease",
+                )
                 self._cache[url] = (time.monotonic(), releases)
                 return list(releases)
         except httpx.HTTPError as exc:
+            cached = _load_release_history(self.history_path)
+            if cached:
+                return cached
             raise NyaaError(f"SubsPlease RSS unavailable: {exc}") from exc
 
+
+
+
+def parse_shana_rss(xml_text: str) -> list[NyaaRelease]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise NyaaError(f"Shana Project returned invalid RSS: {exc}") from exc
+
+    releases: list[NyaaRelease] = []
+    for item in root.findall("./channel/item"):
+        title = _text(item, "title")
+        link = _text(item, "link")
+        guid = _text(item, "guid")
+        enclosure = item.find("enclosure")
+        enclosure_url = (enclosure.attrib.get("url") or "").strip() if enclosure is not None else ""
+        description = _text(item, "description")
+        description_magnet = re.search(r"magnet:\?[^\s<\"]+", description)
+        candidates = [enclosure_url, link, guid, description_magnet.group(0) if description_magnet else ""]
+        download_url = next(
+            (value for value in candidates if value.casefold().startswith("magnet:?")),
+            enclosure_url or link or guid,
+        )
+        if not title or not download_url:
+            continue
+        size_text = ""
+        size_match = re.search(
+            r"(?i)([0-9]+(?:\.[0-9]+)?\s*(?:B|KiB|MiB|GiB|TiB|KB|MB|GB|TB))",
+            description,
+        )
+        if size_match:
+            size_text = size_match.group(1)
+        hash_match = re.search(r"(?i)\bhash:\s*([0-9a-f]{8,40})\b", description)
+        group = release_group(title) or ""
+        releases.append(
+            NyaaRelease(
+                title=title,
+                link=link or guid or download_url,
+                torrent_url=download_url,
+                info_hash=_magnet_info_hash(download_url) or (hash_match.group(1).lower() if hash_match else ""),
+                size_text=size_text,
+                size_bytes=parse_size(size_text),
+                seeders=0,
+                leechers=0,
+                downloads=0,
+                trusted=group.casefold() == "subsplease",
+                remake=False,
+                category_id="shana-rss",
+                published=_text(item, "pubDate"),
+                is_batch=bool(BATCH_RE.search(title)),
+                group=group,
+            )
+        )
+    return releases
+
+
+class ShanaProjectClient:
+    def __init__(
+        self,
+        *,
+        timeout: float = 8.0,
+        cache_ttl: float = 600.0,
+        history_path: Path | None = None,
+    ) -> None:
+        self.timeout = timeout
+        self.cache_ttl = max(0.0, cache_ttl)
+        self.history_path = history_path
+        self._cache: tuple[float, list[NyaaRelease]] | None = None
+
+    def releases(self) -> list[NyaaRelease]:
+        now = time.monotonic()
+        if self._cache is not None and now - self._cache[0] < self.cache_ttl:
+            return list(self._cache[1])
+        try:
+            with httpx.Client(
+                timeout=self.timeout,
+                follow_redirects=True,
+                headers={"User-Agent": APP_SLUG},
+            ) as client:
+                response = client.get(SHANA_PUBLIC_FEED)
+                response.raise_for_status()
+                releases = _merge_release_history(
+                    self.history_path,
+                    parse_shana_rss(response.text),
+                    source="shana",
+                )
+                self._cache = (time.monotonic(), releases)
+                return list(releases)
+        except httpx.HTTPError as exc:
+            cached = _load_release_history(self.history_path)
+            if cached:
+                return cached
+            raise NyaaError(f"Shana Project RSS unavailable: {exc}") from exc
 
 def parse_size(value: str) -> int:
     match = re.search(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)", value)
@@ -1189,6 +1371,59 @@ def search_ranked(
         for release in eligible_releases
     ]
     ranked.sort(key=lambda item: (item.score, item.seeders, item.downloads), reverse=True)
+    return ranked
+
+
+
+def search_shana_ranked(
+    client: ShanaProjectClient,
+    anime: LibraryAnime,
+    *,
+    episode: int | None,
+    batch: bool,
+    trusted_groups: list[str],
+    preferred_groups: list[str],
+    blocked_groups: list[str],
+    preferred_resolution: str,
+    min_seeders: int,
+    target_episode_min_bytes: int,
+    target_episode_max_bytes: int,
+    preferred_video_codecs: list[str] | None = None,
+    preferred_sources: list[str] | None = None,
+    require_japanese_audio: bool = True,
+    avoid_upscaled: bool = True,
+    alternative_episodes: tuple[int, ...] = (),
+    alternative_titles: tuple[str, ...] = (),
+) -> list[NyaaRelease]:
+    ranked = [
+        score_release(
+            release,
+            anime,
+            episode=episode,
+            batch=batch,
+            trusted_groups=trusted_groups,
+            preferred_groups=preferred_groups,
+            blocked_groups=blocked_groups,
+            preferred_resolution=preferred_resolution,
+            min_seeders=min_seeders,
+            target_episode_min_bytes=target_episode_min_bytes,
+            target_episode_max_bytes=target_episode_max_bytes,
+            preferred_video_codecs=preferred_video_codecs,
+            preferred_sources=preferred_sources,
+            require_japanese_audio=require_japanese_audio,
+            avoid_upscaled=avoid_upscaled,
+            alternative_episodes=alternative_episodes,
+            alternative_titles=alternative_titles,
+        )
+        for release in client.releases()
+        if (release.is_batch if batch else not release.is_batch)
+    ]
+    ranked = [
+        item
+        for item in ranked
+        if any(reason.startswith("exact-title") or reason.startswith("alias-title") or reason.startswith("fuzzy-title") for reason in item.reasons)
+    ]
+    ranked.sort(key=lambda item: (item.score, item.published), reverse=True)
     return ranked
 
 def search_subsplease_ranked(

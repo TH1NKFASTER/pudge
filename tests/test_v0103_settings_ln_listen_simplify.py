@@ -81,9 +81,9 @@ def test_listen_together_pauses_without_prepainting_next_word() -> None:
     assert "word=previousWord" in source
     assert "word=null" in source
     assert "&&speechActive)" in source
-    assert "progress>=97" in source
+    assert "until:performance.now()+34" not in source
     assert "ln-paired-word-finishing" not in source
-    assert "renderLnPairedPosition(state,estimatedOffset,{speechActive})" in source
+    assert "renderLnPairedPosition(state,estimatedOffset,{speechActive:true,previewOffset})" in source
     assert "ln-paired-audio-listen" in source
     assert "ln-paired-audio-stop" in source
 

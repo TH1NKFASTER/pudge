@@ -214,13 +214,21 @@ def _cache_paths(config: AppConfig, media_id: int) -> tuple[Any, Any]:
     )
 
 
-def _read_cache(path: Any, *, media_episode: int) -> EpisodeNumbering | None:
+def _read_cache(
+    path: Any, *, media_episode: int, allow_legacy: bool = True
+) -> EpisodeNumbering | None:
     try:
         if not path.is_file() or time.time() - path.stat().st_mtime >= _CACHE_TTL_SECONDS:
             return None
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or int(payload.get("resolver_version", 0)) < 2:
+        if not isinstance(payload, dict) or "offset" not in payload:
             return None
+        version = int(payload.get("resolver_version", 0))
+        if version < 2 and not allow_legacy:
+            return None
+        # v1 caches did not write resolver_version. They are still useful as an
+        # offline basis for absolute -> season-local conversion, but live
+        # relative-number lookups should refresh them to the current resolver.
         offset = max(0, int(payload.get("offset", 0)))
         chain = tuple(int(value) for value in payload.get("chain", []) if int(value) > 0)
         titles = tuple(
@@ -325,8 +333,16 @@ def resolve_episode_numbering(
     cached = [
         item
         for item in (
-            _read_cache(release_path, media_episode=media_episode),
-            _read_cache(jimaku_path, media_episode=media_episode),
+            _read_cache(
+                release_path,
+                media_episode=media_episode,
+                allow_legacy=(not allow_network or media_episode == 1),
+            ),
+            _read_cache(
+                jimaku_path,
+                media_episode=media_episode,
+                allow_legacy=(not allow_network or media_episode == 1),
+            ),
         )
         if item is not None and item.offset > 0
     ]

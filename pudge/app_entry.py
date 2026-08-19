@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .branding import APP_BUNDLE_ID, APP_NAME
 from .notifications import maybe_handle_notification_helper
 
 
@@ -17,11 +18,23 @@ def _set_macos_app_icon() -> None:
         return
 
     try:
-        from AppKit import NSApplication, NSImage
+        from AppKit import NSApplication, NSApplicationActivationPolicyRegular, NSImage
+        from Foundation import NSBundle, NSProcessInfo
 
+        # Set identity before NSApplication is created. Registering Cocoa first
+        # under Homebrew's interpreter name makes Force Quit cache "Python"
+        # and the rocket icon for the lifetime of the process.
+        NSProcessInfo.processInfo().setProcessName_(APP_NAME)
+        bundle_info = NSBundle.mainBundle().infoDictionary()
+        if bundle_info is not None:
+            bundle_info.setObject_forKey_(APP_NAME, "CFBundleName")
+            bundle_info.setObject_forKey_(APP_NAME, "CFBundleDisplayName")
+            bundle_info.setObject_forKey_(APP_BUNDLE_ID, "CFBundleIdentifier")
+        application = NSApplication.sharedApplication()
+        application.setActivationPolicy_(NSApplicationActivationPolicyRegular)
         image = NSImage.alloc().initWithContentsOfFile_(icon_path)
         if image is not None:
-            NSApplication.sharedApplication().setApplicationIconImage_(image)
+            application.setApplicationIconImage_(image)
     except Exception:
         # Icon cosmetics must never prevent Pudge from starting.
         pass

@@ -115,17 +115,15 @@ def test_preference_setting_round_trips(tmp_path: Path):
     assert "subsplease_rss_preferred = true" in path.read_text()
 
 
-def test_settings_ui_exposes_rss_first_checkbox():
+def test_settings_ui_hides_obsolete_rss_first_checkbox():
     html = Path("pudge/web/index.html").read_text()
 
-    assert "settings.preferSubsPleaseRss':'Prefer SubsPlease RSS before Nyaa'" in html
-    assert "settings.preferSubsPleaseRss':'Сначала использовать RSS SubsPlease'" in html
-    assert "checkbox('s_subsplease_preferred',t('settings.preferSubsPleaseRss'))" in html
-    assert "subsplease_rss_preferred:c('s_subsplease_preferred')" in html
-    assert "setStandaloneSettingAvailability(preferred,enabled('s_nyaa_enabled')&&rss.checked)" in html
+    assert "checkbox('s_subsplease_preferred',t('settings.preferSubsPleaseRss'))" not in html
+    assert "subsplease_rss_preferred:c('s_subsplease_preferred')" not in html
+    assert "setStandaloneSettingAvailability(preferred,enabled('s_nyaa_enabled')&&rss.checked)" not in html
 
 
-def test_default_order_keeps_nyaa_first_and_skips_rss_when_nyaa_is_suitable(monkeypatch):
+def test_default_order_uses_subsplease_first_and_skips_nyaa_when_rss_is_suitable(monkeypatch):
     calls: list[str] = []
     nyaa_release = _release("nyaa")
 
@@ -141,11 +139,10 @@ def test_default_order_keeps_nyaa_first_and_skips_rss_when_nyaa_is_suitable(monk
     monkeypatch.setattr("pudge.manager.search_ranked", nyaa)
 
     manager = _manager()
-    manager.config.nyaa.subsplease_rss_preferred = False
     releases = manager.search_releases(135865, episode=5)
 
-    assert calls == ["nyaa"]
-    assert releases == [nyaa_release]
+    assert calls == ["rss"]
+    assert releases[0].category_id == "subsplease-rss"
 
 
 def test_preferred_rss_error_falls_back_to_nyaa(monkeypatch):

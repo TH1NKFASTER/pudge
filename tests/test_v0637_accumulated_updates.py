@@ -191,9 +191,9 @@ def test_web_ui_accumulated_v0637_changes_present():
     assert "Configure only the features you use" not in html
     assert 'id="s_watched_folders"' in html
     assert 'id="s_subtitle_folders"' in html
-    assert "queue_next_count" in html
+    assert "queue_next_count" not in html
     assert "queue_franchise_available" in html
-    assert "!unreleased&&queueCount>0" in html
+    assert "data-context-action=\"queue-next\"" not in html
     assert "const diagnose=!planned" in html
     assert "full-relation-alternatives" in html
     assert "alternativeTypes=new Set(['ALTERNATIVE','SUMMARY','COMPILATION'])" in html

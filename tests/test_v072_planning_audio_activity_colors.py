@@ -39,7 +39,7 @@ def test_fft_activity_is_gated_by_stt_to_reject_music() -> None:
     ]
 
 
-def test_acoustic_clock_holds_text_during_silence_and_seeks_to_next_onset() -> None:
+def test_anchor_clock_is_linear_even_when_fft_reports_silence() -> None:
     alignment = {
         "schema": "reading-audio-v3",
         "chapters": [
@@ -60,18 +60,20 @@ def test_acoustic_clock_holds_text_during_silence_and_seeks_to_next_onset() -> N
         ],
     }
 
-    during_pause = light_novel_position_for_audio(alignment, 14.0)
-    late_pause = light_novel_position_for_audio(alignment, 15.5)
-    speaking_again = light_novel_position_for_audio(alignment, 17.0)
+    middle = light_novel_position_for_audio(alignment, 14.0)
+    late = light_novel_position_for_audio(alignment, 15.5)
+    near_end = light_novel_position_for_audio(alignment, 17.0)
 
-    assert during_pause is not None and during_pause["chapter_char_offset_exact"] == 50.0
-    assert late_pause is not None and late_pause["chapter_char_offset_exact"] == 50.0
-    assert speaking_again is not None and speaking_again["chapter_char_offset_exact"] == 75.0
-    assert during_pause["anchor_window"]["activity"] == alignment["chapters"][0][
+    assert middle is not None
+    assert late is not None
+    assert near_end is not None
+    assert middle["chapter_char_offset_exact"] == 50.0
+    assert late["chapter_char_offset_exact"] == 68.75
+    assert near_end["chapter_char_offset_exact"] == 87.5
+    assert middle["anchor_window"]["activity"] == alignment["chapters"][0][
         "speech_regions"
     ]
-    assert audio_position_for_light_novel_offset(alignment, 0, 50) == 16.0
-
+    assert audio_position_for_light_novel_offset(alignment, 0, 50) == 14.0
 
 def test_planning_primary_download_and_visible_ln_color_contracts() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
@@ -88,4 +90,4 @@ def test_planning_primary_download_and_visible_ln_color_contracts() -> None:
     assert 'input[type="color"]::-webkit-color-swatch' in html
     assert "anchor.activity" in html
     assert '"schema": "reading-audio-v3"' in alignment
-    assert "reading-audio-v3-acoustic" in audiobooks
+    assert "reading-audio-v3-punctuation-clock-v2" in audiobooks

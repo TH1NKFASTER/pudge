@@ -17,10 +17,13 @@ def test_manga_ocr_copy_is_user_facing_and_bubble_is_in_place() -> None:
     assert "Распознать" not in js
     assert "OCR cache" not in js
     assert "OCR из кэша" not in js
-    assert '>OCR</button>' in js
+    assert 'data-manga-v2-action="ocr-page"' not in js
+    assert 'data-manga-v2-action="ocr-book"' in js
     assert "manga-v2-region-content" in js
-    assert "background:rgba(250,248,242,.97)" in css
-    assert "user-select:text" in css
+    assert "background:rgba(250,248,242,.97)" not in css
+    assert "background:transparent" in css
+    assert "pointer-events:none" in css
+    assert "user-select:none" in css
 
 
 def test_audiobook_seek_and_speed_service(tmp_path: Path, monkeypatch) -> None:
@@ -64,8 +67,9 @@ def test_audiobook_ui_has_busy_state_speed_and_skip_controls() -> None:
     css = (ROOT / "pudge/web/media.css").read_text(encoding="utf-8")
     app = (ROOT / "pudge/web_app.py").read_text(encoding="utf-8")
 
-    assert "audioImportBusy='folder'" in media
-    assert "Сканирую папку…" in media
+    assert "audioImportBusy='folder'" not in media
+    assert "audiobookImportFolder" not in media
+    assert 'id="audiobookImport" hidden' in media
     assert "audiobook-import-status" in media
     assert "data-audio-speed" in media
     assert "seek-audio" in media

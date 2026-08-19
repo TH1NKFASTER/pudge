@@ -30,8 +30,10 @@ def _recognize_regions(model: object, image: Image.Image, regions: list[dict[str
     recognized: list[dict[str, object]] = []
     for region in regions:
         item = dict(region)
+        item["raw_text"] = str(region.get("raw_text") or region.get("text") or "").strip()
         try:
             item["text"] = str(model(_crop_region(image, region)) or "").strip()  # type: ignore[operator]
+            item["recognizer"] = "manga-ocr"
         except Exception as exc:
             item["error"] = f"{type(exc).__name__}: {exc}"
             item["text"] = str(region.get("text") or "").strip()

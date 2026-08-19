@@ -53,6 +53,7 @@ CONFIG_DIR = APP_HOME / ".config" / APP_SLUG
 CACHE_DIR = APP_HOME / "Library" / "Caches" / APP_SLUG
 DATA_DIR = APP_HOME / ".local" / "share" / APP_SLUG
 LOG_DIR = APP_HOME / "Library" / "Logs"
+DEBUG_LOG_DIR = LOG_DIR / APP_SLUG / "debug"
 DEFAULT_LIBRARY_DIR = APP_HOME / "Movies" / APP_NAME
 DEFAULT_DATABASE_PATH = DATA_DIR / "library.sqlite3"
 DEFAULT_ENERGY_LOG_PATH = LOG_DIR / f"{APP_SLUG}-energy.jsonl"

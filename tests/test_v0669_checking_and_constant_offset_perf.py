@@ -22,10 +22,12 @@ def _write_srt(path: Path, starts: list[float]) -> None:
 def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active():
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function nextPrioritySubtitleDelay()" in html
-    assert "activeDownloads().length>0||duePrioritySubtitleJobs().length>0" in html
-    assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" in html
-    assert "hasActiveForegroundWork()||prioritySubtitleJobs().length||ui.emptyPolls<2" in html
-    assert "if(duePrioritySubtitleJobs().length)return document.hidden||!ui.windowActive?5000:1000" in html
+    assert "function nextForegroundSubtitleDelay()" in html
+    assert "activeDownloads().length>0||dueForegroundSubtitleJobs().length>0" in html
+    assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
+    assert "hasActiveForegroundWork()||foregroundSubtitleJobs().length||ui.emptyPolls<2" in html
+    assert "if(dueForegroundSubtitleJobs().length)return document.hidden||!ui.windowActive?5000:1000" in html
+    assert "function ensureForegroundPollScheduled()" in html
 
 
 def test_constant_offset_search_is_bounded_and_keeps_small_global_shift(tmp_path: Path, monkeypatch):

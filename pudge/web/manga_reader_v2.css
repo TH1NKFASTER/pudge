@@ -4,7 +4,7 @@
 .manga-v2-series:hover{border-color:#607c9f;box-shadow:0 0 0 1px rgba(133,171,216,.28);background:rgba(31,50,73,.82)}
 .manga-v2-cover-shell{position:relative;width:92px;height:132px;min-width:92px;max-width:92px;overflow:hidden;border-radius:8px;background:#101722}
 .manga-v2-cover-placeholder,.manga-v2-cover{position:absolute;inset:0;width:100%;height:100%;max-width:100%;max-height:100%;object-fit:cover}
-.manga-v2-cover-placeholder{display:grid;place-items:center;font:700 38px/1 "Hiragino Mincho ProN",serif;color:#7e91a8;background:linear-gradient(145deg,#253a58,#111c2d)}
+.manga-v2-cover-placeholder{display:block;object-fit:contain;padding:22px;background:linear-gradient(145deg,#253a58,#111c2d);opacity:.72}
 .manga-v2-cover{opacity:0;transition:opacity .15s ease}.manga-v2-cover.ready{opacity:1}
 .manga-v2-series-body{min-width:0;display:grid;align-content:start;gap:12px}
 .manga-v2-series-top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
@@ -29,11 +29,12 @@
 .manga-v2-page-frame{position:relative;margin:0;display:grid;place-items:center;min-width:0;flex:0 0 auto}
 .manga-v2-page-frame img{display:block;object-fit:contain;max-width:none;max-height:none;box-shadow:0 10px 42px rgba(0,0,0,.45)}
 .manga-v2-text-layer{position:absolute;inset:0;z-index:2;pointer-events:none}
-.manga-v2-text-region{position:absolute;display:block;min-width:22px;min-height:22px;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;pointer-events:auto;cursor:text;overflow:visible;outline:none}
-.manga-v2-text-region:hover,.manga-v2-text-region:focus-visible,.manga-v2-text-region.active{border-color:rgba(120,173,255,.58);background:rgba(77,132,219,.08)}
-.manga-v2-region-content{position:absolute;z-index:6;inset:-4px;min-width:calc(100% + 8px);min-height:calc(100% + 8px);overflow:visible;padding:5px 7px;border:1px solid rgba(143,158,176,.72);border-radius:9px;background:rgba(250,248,242,.97);box-shadow:0 8px 24px rgba(0,0,0,.3);color:#171a1f;font-size:clamp(12px,1.35vw,18px);line-height:1.35;text-align:left;white-space:pre-wrap;user-select:text;-webkit-user-select:text}
-.manga-v2-text-region.vertical-text .manga-v2-region-content{writing-mode:vertical-rl;text-orientation:mixed;line-height:1.4}
-.manga-v2-region-content p{margin:0;white-space:pre-wrap}.manga-v2-region-content .pudge-study-word:hover{background:rgba(64,105,196,.16)}
+.manga-v2-text-region{position:absolute;display:block;min-width:18px;min-height:18px;padding:0;border:0;background:transparent;pointer-events:none;cursor:default;overflow:visible;outline:none;user-select:none;-webkit-user-select:none}
+.manga-v2-region-content{position:absolute;z-index:2;inset:0;overflow:visible;padding:0;border:0;background:transparent;box-shadow:none;font-size:clamp(10px,1.25vw,18px);line-height:1.12;text-align:left;white-space:pre-wrap;pointer-events:none;user-select:none;-webkit-user-select:none;cursor:default}
+.manga-v2-region-content,.manga-v2-region-content *{color:transparent!important;-webkit-text-fill-color:transparent!important;text-shadow:none!important}
+.manga-v2-region-content::selection,.manga-v2-region-content *::selection{background:rgba(94,151,255,.48);color:transparent;-webkit-text-fill-color:transparent}
+.manga-v2-text-region.vertical-text .manga-v2-region-content{writing-mode:vertical-rl;text-orientation:mixed;line-height:1.12}
+.manga-v2-region-content p{margin:0;white-space:pre-wrap}.manga-v2-region-content .pudge-study-word{cursor:pointer}.manga-v2-region-content .pudge-study-word:hover{background:rgba(94,151,255,.18)}
 
 .manga-v2-reader[data-mode="vertical"] .manga-v2-viewport{display:block;padding:18px 18px 40px}
 .manga-v2-reader[data-mode="vertical"] .manga-v2-pages{display:flex;flex-direction:column!important;align-items:center;width:100%;min-width:0;min-height:0;margin:0}
@@ -56,3 +57,6 @@
   .manga-v2-series-top{display:grid}.manga-v2-toolbar strong{display:none}.manga-v2-ocr-progress{display:none}
   .manga-v2-viewport{padding-inline:48px}
 }
+
+.manga-v2-volume.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.42);background:rgba(65,87,145,.24)}
+.manga-v2-series.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.38);background:rgba(65,87,145,.18)}

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import html
+import hashlib
 import http.server
 import json
+import os
 import platform
 import re
 import shutil
@@ -12,6 +15,7 @@ import threading
 import time
 import unicodedata
 import webbrowser
+import zipfile
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -19,7 +23,9 @@ from typing import Any
 from urllib.parse import quote
 
 from . import __version__
-from .audiobooks import AudiobookService
+from .app_session import mark_app_running, mark_app_stopped
+from .cache_management import cleanup_segment_audio_cache
+from .audiobooks import AUDIOBOOK_EXTENSIONS, AudiobookService
 from .backup import create_backup, restore_backup
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
 from .config import load_config, write_config
@@ -38,12 +44,15 @@ from .jimaku_trial import apply_jimaku_trial
 from .job_center import JobCenter
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .light_novels import LightNovelError, LightNovelService
-from .logging_utils import DEFAULT_LOG_PATH, configure_logging, tail_log, timed_step
+from .library import VIDEO_EXTENSIONS
+from .logging_utils import DEFAULT_LOG_PATH, cleanup_debug_logs, configure_logging, debug_log_dir, tail_log, timed_step
 from .maintenance_lock import maintenance_lock
 from .manager import AnimeManager
 from .manager_models import LibraryAnime, NyaaRelease
 from .manga import MangaService
 from .metadata_cache import MetadataCache
+from .mobile_sync import MobileSyncService
+from .mobile_sync_http import start_mobile_sync_server
 from .notifications import send_native_notification
 from .permissions import request_folder_access, request_notification_permission
 from .providers.anilist import AniListClient
@@ -75,7 +84,23 @@ class WebAppApi:
         self.config_path = config_path.expanduser()
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
+        mark_app_running()
+        cleanup_debug_logs()
+        cache_cleanup = cleanup_segment_audio_cache(self.config.paths.cache_dir, force=True)
+        if int(cache_cleanup.get("removed_files") or 0):
+            self.logger.info(
+                "RESULT step=cache.segment_audio_cleanup removed_files=%s removed_mb=%.1f remaining_mb=%.1f",
+                cache_cleanup.get("removed_files", 0),
+                float(cache_cleanup.get("removed_bytes") or 0) / (1024 * 1024),
+                float(cache_cleanup.get("remaining_bytes") or 0) / (1024 * 1024),
+            )
         self.manager = AnimeManager(self.config, log=self.logger.info)
+        self.mobile_sync = MobileSyncService(
+            self.manager.db,
+            pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
+            max_events_per_request=self.config.companion.max_events_per_request,
+        )
+        self.companion_base_url = ""
         self.job_center = JobCenter(self.manager.db)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
@@ -123,8 +148,18 @@ class WebAppApi:
         self._local_refresh_lock = threading.Lock()
         self._startup_maintenance_lock = threading.Lock()
         self._download_poll_lock = threading.Lock()
+        self._torrent_traffic_lock = threading.Lock()
+        self._last_torrent_traffic: dict[str, Any] = {
+            "download_speed": 0,
+            "upload_speed": 0,
+            "active": 0,
+            "waiting": 0,
+        }
         self._fullscreen_exit_lock = threading.Lock()
         self._fullscreen_exit_pending = False
+        self._drop_import_bound = False
+        self._drop_import_element: Any | None = None
+        self._drop_import_handlers: list[Any] = []
         self._manga_ocr_install_lock = threading.Lock()
         self._manga_ocr_install_thread: threading.Thread | None = None
         self._manga_ocr_install_state: dict[str, Any] = {
@@ -168,11 +203,107 @@ class WebAppApi:
         )
         if self.config.diagnostics.energy_monitoring_enabled:
             self.energy_monitor.start()
+        self._start_scheduled_agent()
+
+    @staticmethod
+    def _scheduled_agent_plist() -> Path:
+        label = f"{APP_BUNDLE_ID.removesuffix('.app')}.agent"
+        return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+    def _start_scheduled_agent(self) -> None:
+        if sys.platform != "darwin":
+            return
+        plist = self._scheduled_agent_plist()
+        if not plist.is_file():
+            return
+        try:
+            subprocess.run(
+                ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _stop_scheduled_agent(self) -> None:
+        if sys.platform != "darwin":
+            return
+        plist = self._scheduled_agent_plist()
+        if not plist.is_file():
+            return
+        try:
+            subprocess.run(
+                ["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _shutdown_managed_aria2(self) -> bool:
+        if not self.config.aria2.enabled:
+            return False
+        stopped = False
+        for backend, client in self.manager.torrent_clients():
+            try:
+                if backend == "aria2" and isinstance(client, Aria2Client):
+                    stopped = bool(client.shutdown(save_session=True)) or stopped
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=app.aria2_shutdown error=%r",
+                    str(exc),
+                )
+            finally:
+                client.close()
+        return stopped
 
     def close(self) -> None:
+        # Cmd+Q means Pudge goes fully idle: no scheduled maintenance and no
+        # detached aria2 sidecar continuing to download or seed in the background.
+        mark_app_stopped()
+        self._stop_scheduled_agent()
+        aria2_stopped = self._shutdown_managed_aria2()
+        cache_cleanup = {"removed_files": 0}
+        config = getattr(self, "config", None)
+        cache_dir = getattr(getattr(config, "paths", None), "cache_dir", None)
+        if cache_dir is not None:
+            cache_cleanup = cleanup_segment_audio_cache(cache_dir, force=True)
+        self.logger.info(
+            "EVENT app.background_quiet aria2_stopped=%s cache_removed=%s",
+            aria2_stopped,
+            cache_cleanup.get("removed_files", 0),
+        )
         self.energy_monitor.stop()
         self.audiobooks.stop_all()
         self.visual_novels.stop()
+
+    def companion_status(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.config.companion.enabled),
+            "base_url": str(self.companion_base_url or ""),
+            "bind_host": str(self.config.companion.bind_host),
+            "port": int(self.config.companion.port),
+            "protocol": self.mobile_sync.protocol_info(),
+            "devices": self.mobile_sync.devices(),
+        }
+
+    def companion_start_pairing(self) -> dict[str, Any]:
+        payload = self.mobile_sync.start_pairing()
+        payload["base_url"] = str(self.companion_base_url or "")
+        return payload
+
+    def companion_revoke_device(self, device_id: str) -> dict[str, Any]:
+        return {
+            "ok": self.mobile_sync.revoke_device(str(device_id or "")),
+            "devices": self.mobile_sync.devices(),
+        }
+
+    def companion_library_snapshot(self) -> dict[str, Any]:
+        return self.mobile_sync.library_snapshot()
 
     def visual_novel_windows(self) -> list[dict[str, Any]]:
         return self.visual_novels.windows()
@@ -214,8 +345,95 @@ class WebAppApi:
     def set_window(self, window: Any) -> None:
         self.window = window
 
+    def bind_drop_import(self) -> dict[str, Any]:
+        """Bind Finder drops only after JS reports that the DOM is ready.
+
+        Dragover stays entirely inside WebKit. Crossing every dragover event into
+        Python makes Cocoa visibly stall, while binding during webview.start can
+        attach to a document that is replaced by the real page a moment later.
+        """
+        if self._drop_import_bound:
+            return {"ok": True, "bound": True, "already_bound": True}
+        if self.window is None:
+            return {"ok": False, "bound": False, "error": "window not ready"}
+
+        try:
+            from webview.dom import DOMEventHandler
+
+            element = self.window.dom.get_element("#app")
+            if element is None:
+                return {"ok": False, "bound": False, "error": "#app not ready"}
+
+            def dropped(event: dict[str, Any]) -> None:
+                transfer = event.get("dataTransfer") or event.get("domTransfer") or {}
+                files = transfer.get("files") or []
+                paths = [
+                    str(item.get("pywebviewFullPath") or "")
+                    for item in files
+                    if isinstance(item, dict) and item.get("pywebviewFullPath")
+                ]
+                if not paths:
+                    self.logger.warning("SKIP step=app.drop_import reason=no_absolute_paths")
+                    return
+                self.logger.info("START step=app.drop_import paths=%r", paths)
+
+                def import_drop() -> None:
+                    try:
+                        result = self.import_dropped_paths(paths)
+                    except Exception as exc:
+                        result = {
+                            "ok": False,
+                            "imports": [],
+                            "focus": None,
+                            "errors": [str(exc)],
+                        }
+                    window = self.window
+                    if window is None:
+                        return
+                    try:
+                        payload = json.dumps(result, ensure_ascii=False).replace("</", "<\\/")
+                        script = (
+                            "window.dispatchEvent(new CustomEvent('pudge-files-imported',{detail:"
+                            + payload
+                            + "}));"
+                        )
+                        runner = getattr(window, "run_js", None)
+                        if callable(runner):
+                            runner(script)
+                        else:
+                            window.evaluate_js(script)
+                    except Exception as exc:
+                        self.logger.warning("FAIL step=drop.focus error=%r", str(exc))
+
+                threading.Thread(
+                    target=import_drop,
+                    name=f"{APP_SLUG}-drop-import",
+                    daemon=True,
+                ).start()
+
+            # HTML handles dragenter/dragover locally. Only the single drop event
+            # crosses the JS/Python bridge, which keeps the Cocoa UI responsive.
+            drop_handler = DOMEventHandler(dropped, True, True)
+            element.events.drop += drop_handler
+            self._drop_import_element = element
+            self._drop_import_handlers = [drop_handler]
+            self._drop_import_bound = True
+            self.logger.info("EVENT app.drop_import_bound target=#app timing=pywebviewready")
+            return {"ok": True, "bound": True, "already_bound": False}
+        except Exception as exc:
+            self.logger.warning("FALLBACK step=app.drop_import_bind error=%r", str(exc))
+            return {"ok": False, "bound": False, "error": str(exc)}
+
     def _downloads_enabled(self) -> bool:
         checker = getattr(self.manager, "downloads_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        qbt = bool(getattr(getattr(self.config, "qbittorrent", None), "enabled", False))
+        aria2 = bool(getattr(getattr(self.config, "aria2", None), "enabled", False))
+        return qbt or aria2
+
+    def _downloads_configured(self) -> bool:
+        checker = getattr(self.manager, "downloads_configured", None)
         if callable(checker):
             return bool(checker())
         qbt = bool(getattr(getattr(self.config, "qbittorrent", None), "enabled", False))
@@ -1264,11 +1482,25 @@ class WebAppApi:
             if item.get("media_id") is not None
         }
         handled_media: set[int] = set()
-        downloads_by_media = {}
+        downloads_by_media: dict[int, Any] = {}
+        downloads_by_episode: dict[tuple[int, int], Any] = {}
         for item in self.manager.db.downloads():
-            if item.media_id is not None:
-                # downloads() is newest-first; retain the newest matching job.
-                downloads_by_media.setdefault(int(item.media_id), item)
+            if item.media_id is None:
+                continue
+            media_id = int(item.media_id)
+            # downloads() is newest-first; retain the newest matching job.
+            downloads_by_media.setdefault(media_id, item)
+            item_episode = item.media_episode if item.media_episode is not None else item.episode
+            if item_episode is not None:
+                downloads_by_episode.setdefault((media_id, int(item_episode)), item)
+
+        def home_download(media_id: int, episode: int | None) -> Any | None:
+            if episode is not None:
+                exact = downloads_by_episode.get((int(media_id), int(episode)))
+                if exact is not None:
+                    return exact
+            fallback = downloads_by_media.get(int(media_id))
+            return fallback if fallback is not None and fallback.is_batch else None
         sections: dict[str, list[dict[str, Any]]] = {
             "continue_watching": self._continue_payloads(anime_by_id),
             "needs_action": [],
@@ -1325,7 +1557,7 @@ class WebAppApi:
                 # actionable home card. Offer a full batch download without
                 # changing their AniList list status. Existing qBittorrent work
                 # is attached so the UI cannot offer another duplicate download.
-                download = downloads_by_media.get(anime.media_id)
+                download = home_download(anime.media_id, anime.next_episode)
                 if download is not None:
                     base["download"] = {
                         "torrent_hash": download.torrent_hash,
@@ -1424,7 +1656,10 @@ class WebAppApi:
                         "state": "ready",
                         "video_path": card.get("video_path"),
                     }
-                download = downloads_by_media.get(media_id) if media_id else None
+                target_episode = card.get("next_episode")
+                if local is not None and local.get("episode") is not None:
+                    target_episode = local.get("episode")
+                download = home_download(media_id, target_episode) if media_id else None
                 action_job = None
                 if local is not None and local.get("video_path"):
                     action_job = needs_action_by_path.get(str(local.get("video_path")))
@@ -1463,8 +1698,10 @@ class WebAppApi:
             "playback_rewind": cfg.playback.rewind_seconds,
             "nyaa_enabled": cfg.nyaa.enabled,
             "nyaa_auto": cfg.nyaa.auto_download_current,
-            "subsplease_rss_enabled": cfg.nyaa.subsplease_rss_enabled,
-            "subsplease_rss_preferred": cfg.nyaa.subsplease_rss_preferred,
+            "subsplease_rss_enabled": True,
+            "subsplease_rss_preferred": True,
+            "torrents_enabled": cfg.nyaa.torrents_enabled,
+            "torrents_configured": self._downloads_configured(),
             "nyaa_url": cfg.nyaa.base_url,
             "proxy_mode": cfg.nyaa.proxy_mode,
             "proxy_url": cfg.nyaa.proxy_url,
@@ -1497,7 +1734,7 @@ class WebAppApi:
             "aria2_upload_limit_kib": cfg.aria2.upload_limit_kib,
             "aria2_vpn_interface": cfg.aria2.vpn_interface,
             "aria2_vpn_kill_switch": cfg.aria2.vpn_kill_switch,
-            "torrent_backend": (self.manager.torrent_backend_name() if callable(getattr(self.manager, "torrent_backend_name", None)) else ("qBittorrent" if cfg.qbittorrent.enabled else "aria2")) if self._downloads_enabled() else "disabled",
+            "torrent_backend": self.manager.torrent_backend_name() if callable(getattr(self.manager, "torrent_backend_name", None)) and self._downloads_configured() else "disabled",
             "download_hook": cfg.qbittorrent.pre_download_command,
             "agent_enabled": cfg.agent.enabled,
             "agent_poll": cfg.agent.poll_minutes,
@@ -1604,6 +1841,8 @@ class WebAppApi:
             "progress": item.progress,
             "media_id": item.media_id,
             "episode": item.episode,
+            "media_episode": getattr(item, "media_episode", None),
+            "release_episode": getattr(item, "release_episode", None),
             "is_batch": item.is_batch,
             "backend": " + ".join(backends) if len(backends) > 1 else primary_backend,
             "backend_id": primary_backend,
@@ -1625,6 +1864,11 @@ class WebAppApi:
         }
 
     def _get_state(self, *, refresh_storage: bool) -> dict[str, Any]:
+        # Completed torrent metadata must become a durable episode row before
+        # Home decides whether the next episode is Ready/Waiting. This is local
+        # SQLite/filesystem reconciliation and does not contact torrent clients.
+        self.manager.reconcile_completed_download_rows()
+        self.manager.reconcile_prepared_subtitle_rows()
         current_anime = self.manager.db.anime_list(("CURRENT",))
         planned_anime = self.manager.db.anime_list(("PLANNING",))
         anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
@@ -1633,27 +1877,42 @@ class WebAppApi:
             self._download_payload(item, anime_by_id) for item in download_rows
         ]
         download_by_media: dict[int, dict[str, Any]] = {}
+        download_by_episode: dict[tuple[int, int], dict[str, Any]] = {}
+
+        def download_rank(download: dict[str, Any]) -> tuple[int, float]:
+            return (
+                0 if str(download.get("state") or "").casefold() in {"active", "waiting", "paused"} else 1,
+                -float(download.get("added_on") or 0),
+            )
+
         for download in downloads:
             media_id = download.get("media_id")
             if media_id is None:
                 continue
             key = int(media_id)
             previous = download_by_media.get(key)
-            # Prefer live work over old completed rows, then the newest row.
-            rank = (
-                0 if str(download.get("state") or "").casefold() in {"active", "waiting", "paused"} else 1,
-                -float(download.get("added_on") or 0),
-            )
-            previous_rank = (
-                0 if previous and str(previous.get("state") or "").casefold() in {"active", "waiting", "paused"} else 1,
-                -float(previous.get("added_on") or 0) if previous else 0,
-            )
-            if previous is None or rank < previous_rank:
+            if previous is None or download_rank(download) < download_rank(previous):
                 download_by_media[key] = download
+            raw_episode = download.get("media_episode")
+            if raw_episode is None:
+                raw_episode = download.get("episode")
+            if raw_episode is not None:
+                episode_key = (key, int(raw_episode))
+                previous_episode = download_by_episode.get(episode_key)
+                if previous_episode is None or download_rank(download) < download_rank(previous_episode):
+                    download_by_episode[episode_key] = download
+
+        def download_for_episode(media_id: int, episode: int | None) -> dict[str, Any] | None:
+            if episode is not None:
+                exact = download_by_episode.get((int(media_id), int(episode)))
+                if exact is not None:
+                    return exact
+            fallback = download_by_media.get(int(media_id))
+            return fallback if fallback is not None and bool(fallback.get("is_batch")) else None
 
         current = [self._anime_payload(a) for a in current_anime]
         for payload in current:
-            download = download_by_media.get(int(payload["media_id"]))
+            download = download_for_episode(int(payload["media_id"]), payload.get("next_episode"))
             if (
                 download is not None
                 and not self._download_shadowed_by_local(payload, download)
@@ -1662,7 +1921,7 @@ class WebAppApi:
         planned = []
         for anime in planned_anime:
             payload = self._anime_payload(anime)
-            download = download_by_media.get(int(anime.media_id))
+            download = download_for_episode(int(anime.media_id), payload.get("next_episode"))
             if (
                 download is not None
                 and not self._download_shadowed_by_local(payload, download)
@@ -1702,9 +1961,13 @@ class WebAppApi:
                         _attach_download(child)
                 return
             media_id = card.get("media_id")
-            if media_id is not None and int(media_id) in download_by_media:
-                download = download_by_media[int(media_id)]
-                if not self._download_shadowed_by_local(card, download):
+            if media_id is not None:
+                target_episode = card.get("next_episode")
+                local = card.get("local") if isinstance(card.get("local"), dict) else None
+                if local is not None and local.get("episode") is not None:
+                    target_episode = local.get("episode")
+                download = download_for_episode(int(media_id), target_episode)
+                if download is not None and not self._download_shadowed_by_local(card, download):
                     card["download"] = download
 
         represented: set[int] = set()
@@ -1723,11 +1986,14 @@ class WebAppApi:
         # A Planning batch has no local episode yet, so historically it vanished
         # from Home until the entire batch finished. Surface it immediately in
         # Waiting for preparation and keep the live torrent status attached.
-        for media_id, download in download_by_media.items():
+        for media_id in download_by_media:
             anime = anime_by_id.get(media_id)
             if anime is None or media_id in represented:
                 continue
             if str(anime.status or "").upper() not in {"CURRENT", "PLANNING"}:
+                continue
+            download = download_for_episode(media_id, anime.next_episode)
+            if download is None:
                 continue
             card = self._anime_payload(anime)
             card["download"] = download
@@ -1774,6 +2040,7 @@ class WebAppApi:
             "episodes": episodes,
             "library": self._library_payloads(anime_by_id),
             "downloads": downloads,
+            "torrent_waiting_count": self.manager.download_intents.waiting_count(),
             "subtitle_jobs": jobs,
             "release_upgrades": self.manager.db.upgrade_jobs(limit=50),
             "subtitle_history": self.manager.db.subtitle_history(limit=80),
@@ -1816,7 +2083,7 @@ class WebAppApi:
         refresh: bool = True,
     ) -> dict[str, Any]:
         warning = ""
-        if refresh and self._downloads_enabled():
+        if refresh and self._downloads_configured():
             try:
                 self.manager.sync_downloads()
             except Exception as exc:
@@ -1841,17 +2108,111 @@ class WebAppApi:
                 finally:
                     client.close()
         return {
-            "backend": (
-                self.manager.torrent_backend_name()
-                if self._downloads_enabled()
-                else "disabled"
-            ),
+            "backend": self.manager.torrent_backend_name() if self._downloads_configured() else "disabled",
+            "enabled": self._downloads_enabled(),
+            "configured": self._downloads_configured(),
             "downloads": [
                 self._download_payload(item, anime_by_id) for item in rows
             ],
             "storage": self._storage_payload(refresh=False),
             "network_guard": network_guard,
             "warning": warning,
+        }
+
+    def torrent_traffic_status(self) -> dict[str, Any]:
+        """Return live torrent rates without rebuilding the full application state."""
+        enabled = bool(self.config.nyaa.torrents_enabled and self._downloads_configured())
+        if not enabled:
+            result = {
+                "download_speed": 0,
+                "upload_speed": 0,
+                "active": 0,
+                "waiting": self.manager.download_intents.waiting_count(),
+                "updated_at": time.time(),
+            }
+            self._last_torrent_traffic = result
+            return dict(result)
+
+        if not self._torrent_traffic_lock.acquire(blocking=False):
+            return dict(self._last_torrent_traffic)
+        try:
+            down = 0
+            up = 0
+            active = 0
+            waiting = self.manager.download_intents.waiting_count()
+            for backend, client in self.manager.torrent_clients():
+                try:
+                    if backend == "aria2" and isinstance(client, Aria2Client):
+                        stats = client.traffic_stats()
+                        down += max(0, int(stats.get("download_speed") or 0))
+                        up += max(0, int(stats.get("upload_speed") or 0))
+                        active += max(0, int(stats.get("active") or 0))
+                        waiting = max(waiting, max(0, int(stats.get("waiting") or 0)))
+                        continue
+
+                    rows = client.torrents(category=self.config.qbittorrent.category)
+                    for row in rows:
+                        raw = dict(getattr(row, "raw", {}) or {})
+                        row_down = self._download_number(
+                            raw, "dlspeed", "download_speed", "downloadSpeed"
+                        )
+                        row_up = self._download_number(
+                            raw, "upspeed", "upload_speed", "uploadSpeed"
+                        )
+                        down += row_down
+                        up += row_up
+                        state = str(getattr(row, "state", "") or "").casefold()
+                        if state not in {"paused", "stopped", "complete", "completed"}:
+                            active += 1
+                        if state in {"waiting", "queued", "stalled"}:
+                            waiting += 1
+                except Exception as exc:
+                    self.logger.debug(
+                        "Torrent traffic snapshot skipped backend=%s error=%s",
+                        backend,
+                        exc,
+                    )
+                finally:
+                    client.close()
+            result = {
+                "download_speed": down,
+                "upload_speed": up,
+                "active": active,
+                "waiting": waiting,
+                "updated_at": time.time(),
+            }
+            self._last_torrent_traffic = result
+            return dict(result)
+        finally:
+            self._torrent_traffic_lock.release()
+
+    def set_torrents_enabled(self, enabled: bool) -> dict[str, Any]:
+        self.config.nyaa.torrents_enabled = bool(enabled)
+        started = 0
+        if not enabled and self._downloads_configured():
+            try:
+                for _backend, client in self.manager.torrent_clients():
+                    try:
+                        for row in self.manager.db.downloads():
+                            torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().lower()
+                            if torrent_hash:
+                                client.pause(torrent_hash)
+                    finally:
+                        client.close()
+            except Exception:
+                pass
+        write_config(self.config, self.config.config_path)
+        if enabled and self._downloads_configured():
+            try:
+                started = int(self.manager.auto_search_current() or 0)
+            except Exception as exc:
+                self.logger.warning("RETRY step=torrent.toggle_start error=%r", str(exc))
+        return {
+            "enabled": self.config.nyaa.torrents_enabled,
+            "configured": self._downloads_configured(),
+            "backend": self.manager.torrent_backend_name() if self._downloads_configured() else "disabled",
+            "started": started,
+            "waiting": self.manager.download_intents.waiting_count(),
         }
 
     def torrent_download_action(
@@ -1969,15 +2330,147 @@ class WebAppApi:
     def sync_anilist(self) -> dict[str, Any]:
         return self._sync_anilist()
 
+    def _watched_import_signature(self, paths: list[Path]) -> str:
+        rows: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            rows.append((str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)))
+        return hashlib.sha1(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def _watched_import_changed(self, kind: str, path: Path, signature: str) -> bool:
+        digest = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()
+        return self.manager.db.get_state(f"watched_media:{kind}:{digest}", "") != signature
+
+    def _mark_watched_import(self, kind: str, path: Path, signature: str) -> None:
+        digest = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()
+        self.manager.db.set_state(f"watched_media:{kind}:{digest}", signature)
+
+    def scan_watched_media_folders(self) -> dict[str, int]:
+        """Cheap first-pass import of mixed watched folders before Refresh work."""
+        stats = {"light_novels": 0, "manga": 0, "audiobooks": 0, "files_seen": 0, "light_novels_skipped_non_japanese": 0}
+        roots: list[Path] = []
+        limit = max(1, int(self.config.paths.max_scanned_files or 8000))
+        for configured in self.config.paths.download_dirs:
+            root = Path(configured).expanduser()
+            if not root.is_dir():
+                continue
+            resolved = root.resolve()
+            if any(resolved == old or old in resolved.parents for old in roots):
+                continue
+            roots.append(resolved)
+
+        remaining = limit
+        for root in roots:
+            if remaining <= 0:
+                break
+            candidates: list[Path] = []
+            try:
+                iterator = root.rglob("*") if self.config.library.recursive else root.iterdir()
+                for path in iterator:
+                    if remaining <= 0:
+                        break
+                    if not path.is_file():
+                        continue
+                    candidates.append(path)
+                    remaining -= 1
+            except (OSError, PermissionError):
+                continue
+            stats["files_seen"] += len(candidates)
+
+            for path in candidates:
+                suffix = path.suffix.casefold()
+                if suffix not in {".epub", ".txt", ".cbz", ".zip"}:
+                    continue
+                kind = "light_novels" if suffix in {".epub", ".txt"} else "manga"
+                signature = self._watched_import_signature([path])
+                if not signature or not self._watched_import_changed(kind, path, signature):
+                    continue
+                try:
+                    if kind == "light_novels":
+                        if not self.light_novels.is_probably_japanese_source(path):
+                            self._mark_watched_import(kind, path, signature)
+                            stats["light_novels_skipped_non_japanese"] += 1
+                            continue
+                        self.light_novels.import_file(path, explicit=False)
+                    else:
+                        self.manga.import_file(path)
+                    self._mark_watched_import(kind, path, signature)
+                    stats[kind] += 1
+                except Exception as exc:
+                    self.logger.debug("Watched media import skipped kind=%s path=%s error=%s", kind, path, exc)
+
+            audio_by_parent: dict[Path, list[Path]] = {}
+            for path in candidates:
+                if path.suffix.casefold() in AUDIOBOOK_EXTENSIONS:
+                    audio_by_parent.setdefault(path.parent.resolve(), []).append(path.resolve())
+            for parent, audio_files in audio_by_parent.items():
+                audio_files.sort(key=lambda item: item.name.casefold())
+                grouped = parent != root and len(audio_files) > 1
+                targets = [(parent, audio_files)] if grouped else [(item, [item]) for item in audio_files]
+                for target, files in targets:
+                    signature = self._watched_import_signature(files)
+                    if not signature or not self._watched_import_changed("audiobooks", target, signature):
+                        continue
+                    try:
+                        if grouped:
+                            self.audiobooks.import_folder(target)
+                        else:
+                            self.audiobooks.import_file(target)
+                        self._mark_watched_import("audiobooks", target, signature)
+                        stats["audiobooks"] += 1
+                    except Exception as exc:
+                        self.logger.debug("Watched audiobook import skipped path=%s error=%s", target, exc)
+        return stats
+
     def refresh_local(self) -> dict[str, Any]:
         if not self._local_refresh_lock.acquire(blocking=False):
             return {"skipped": True, "stats": {}, "state": self.get_state()}
         try:
             with timed_step(self.logger, "web.refresh_local"):
+                watched_stats: dict[str, int] = {}
+                try:
+                    with timed_step(self.logger, "watched_media.scan_local", priority="first"):
+                        watched_stats = self.scan_watched_media_folders()
+                except Exception as exc:
+                    self.logger.warning("Watched media scan skipped: %s", exc)
+
+                # Register watched/local anime video before release feeds, torrent
+                # reconciliation and subtitle work. This intentionally happens in
+                # the same cheap-first phase as LN/manga/audiobook discovery.
+                local_video_rows = 0
+                try:
+                    with timed_step(self.logger, "library.scan_local", priority="first"):
+                        local_video_rows = len(self.manager.scan_library())
+                except Exception as exc:
+                    self.logger.warning("Watched video scan skipped: %s", exc)
+
+                # The managed LN directory is also cheap to scan and follows the
+                # mixed watched-folder pass before torrent/subtitle/network work.
+                ln_imported = 0
+                try:
+                    with timed_step(self.logger, "light_novels.scan_local", priority="first"):
+                        ln_imported = int(self.light_novels.scan_downloaded() or 0)
+                except Exception as exc:
+                    self.logger.warning("LN local scan skipped: %s", exc)
+
                 # Manual Refresh must remain interactive even if the launch agent
                 # is currently aligning subtitles. Release discovery runs now;
                 # expensive subtitle preparation is queued separately.
                 stats = self.manager.run_interactive_refresh()
+                reconcile_ready = getattr(self.manager, "reconcile_prepared_subtitle_rows", None)
+                repaired_ready = int(reconcile_ready() or 0) if callable(reconcile_ready) else 0
+                if repaired_ready:
+                    stats["prepared_state_repaired"] = repaired_ready
+                for key, value in watched_stats.items():
+                    if value:
+                        stats[f"watched_{key}"] = int(value)
+                if local_video_rows:
+                    stats["library"] = local_video_rows
+                if ln_imported:
+                    stats["light_novels_imported"] = ln_imported
                 try:
                     ln_added = self.light_novels.auto_download_missing()
                     if ln_added:
@@ -2171,6 +2664,128 @@ class WebAppApi:
         finally:
             self._download_poll_lock.release()
 
+    def import_dropped_paths(self, values: list[str]) -> dict[str, Any]:
+        """Route Finder drops without doing post-import network/audio work inline."""
+        started_at = time.monotonic()
+        paths: list[Path] = []
+        for raw in values or []:
+            try:
+                path = Path(str(raw)).expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if path.exists() and path not in paths:
+                paths.append(path)
+
+        imports: list[dict[str, Any]] = []
+        errors: list[str] = []
+        image_paths: list[Path] = []
+        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+
+        def record(kind: str, page: str, payload: dict[str, Any], source: Path) -> None:
+            row = {"kind": kind, "page": page, "source": str(source), **payload}
+            imports.append(row)
+
+        for path in paths:
+            if path.is_dir():
+                try:
+                    audio_files = [
+                        item for item in path.iterdir()
+                        if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
+                    ]
+                    images = [
+                        item for item in path.iterdir()
+                        if item.is_file() and item.suffix.casefold() in image_extensions
+                    ]
+                except OSError as exc:
+                    errors.append(f"{path.name}: {exc}")
+                    continue
+                if audio_files:
+                    try:
+                        book = self.audiobooks.import_folder(path)
+                        record("audiobook", "audiobooks", {"id": int(book["id"]), "title": str(book.get("title") or path.name), "book": book}, path)
+                    except Exception as exc:
+                        errors.append(f"{path.name}: {exc}")
+                if images:
+                    image_paths.extend(images)
+                continue
+
+            suffix = path.suffix.casefold()
+            try:
+                if suffix in {".epub", ".txt"}:
+                    imported = self.light_novels.import_file(path, explicit=True)
+                    book = self.light_novels.drop_card(int(imported["id"]))
+                    book["paired_audio"] = self.audiobooks.link_for_light_novel(int(book["id"]))
+                    record(
+                        "light_novel",
+                        "lightnovels",
+                        {
+                            "id": int(book["id"]),
+                            "title": str(book.get("title") or path.stem),
+                            "book": book,
+                        },
+                        path,
+                    )
+                    def link_later(book_id: int = int(book["id"])) -> None:
+                        try:
+                            self.audiobooks.auto_link_light_novel(book_id)
+                        except Exception as exc:
+                            self.logger.debug("Dropped LN audio auto-link skipped book_id=%s error=%s", book_id, exc)
+                    timer = threading.Timer(1.5, link_later)
+                    timer.daemon = True
+                    timer.start()
+                elif suffix in {".cbz", ".zip"}:
+                    book = self.manga.import_file(path)
+                    record("manga", "manga", {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book}, path)
+                elif suffix in image_extensions:
+                    image_paths.append(path)
+                elif suffix in AUDIOBOOK_EXTENSIONS:
+                    book = self.audiobooks.import_file(path)
+                    record("audiobook", "audiobooks", {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book}, path)
+                elif suffix in VIDEO_EXTENSIONS:
+                    episode = self.manager.import_local_video(path)
+                    record(
+                        "anime",
+                        "current",
+                        {
+                            "media_id": episode.media_id,
+                            "episode": episode.episode,
+                            "title": episode.title,
+                            "video_path": str(episode.video_path),
+                        },
+                        path,
+                    )
+                else:
+                    errors.append(f"{path.name}: unsupported file type")
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+
+        if image_paths:
+            try:
+                book = self.manga.import_images(image_paths)
+                record(
+                    "manga", "manga",
+                    {"id": int(book["id"]), "title": str(book.get("title") or "Dropped manga"), "book": book},
+                    image_paths[0],
+                )
+            except Exception as exc:
+                errors.append(f"images: {exc}")
+
+        result = {
+            "ok": bool(imports),
+            "imports": imports,
+            "focus": imports[0] if imports else None,
+            "errors": errors,
+        }
+        self.logger.info(
+            "DONE step=app.drop_import duration_ms=%.1f paths=%s imports=%s errors=%s kinds=%s",
+            (time.monotonic() - started_at) * 1000.0,
+            len(paths),
+            len(imports),
+            len(errors),
+            [item.get("kind") for item in imports],
+        )
+        return result
+
     def light_novel_state(self) -> dict[str, Any]:
         state = self.light_novels.state()
         for book in state.get("books", []):
@@ -2179,6 +2794,14 @@ class WebAppApi:
 
     def manga_state(self) -> dict[str, Any]:
         return self.manga.state()
+
+    def manga_remove_series(self, book_id: int) -> dict[str, Any]:
+        removed = self.manga.remove_series(int(book_id))
+        return {"removed": removed}
+
+    def manga_remove_books(self, book_ids: list[int]) -> dict[str, Any]:
+        removed = self.manga.remove_books([int(value) for value in (book_ids or [])])
+        return {"removed": removed}
 
     @staticmethod
     def _manga_anilist_search_text(value: str) -> str:
@@ -2487,7 +3110,7 @@ class WebAppApi:
     ) -> dict[str, Any]:
         book_id = int(book_id)
         if not self.manga.ocr_available():
-            raise RuntimeError("MangaOCR is not installed. Install it from Settings → Reading.")
+            raise RuntimeError("MangaOCR is not installed. Install it from Settings → Essential.")
         with self._manga_book_ocr_lock:
             thread = self._manga_book_ocr_threads.get(book_id)
             if thread is None or not thread.is_alive():
@@ -2582,9 +3205,6 @@ class WebAppApi:
     def manga_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.page(int(book_id), int(page_index))
 
-    def manga_ocr_page(self, book_id: int, page_index: int) -> dict[str, Any]:
-        return self.manga.ocr_page(int(book_id), int(page_index))
-
     def manga_text_regions(
         self,
         book_id: int,
@@ -2599,44 +3219,186 @@ class WebAppApi:
             cached_only=bool(cached_only),
         )
 
-    def manga_ocr_cached_page(self, book_id: int, page_index: int) -> dict[str, Any]:
-        return self.manga.cached_ocr_page(int(book_id), int(page_index))
+    def manga_ocr_artifact(self, book_id: int) -> dict[str, Any]:
+        return self.manga.ocr_artifact(int(book_id))
+
+    def manga_export_ocr_debug(
+        self, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        source = dict(payload) if isinstance(payload, dict) else {}
+        book = source.get("book") if isinstance(source.get("book"), dict) else {}
+        book_id = int(book.get("id") or 0)
+        page_index = int(source.get("page_index") or 0)
+        if book_id <= 0:
+            raise ValueError("Missing manga book id")
+
+        page = self.manga.page(book_id, page_index)
+        backend = self.manga.text_regions(
+            book_id,
+            page_index,
+            refresh=False,
+            cached_only=True,
+        )
+        raw_events = source.get("events")
+        source["events"] = (
+            [dict(item) for item in raw_events[-600:] if isinstance(item, dict)]
+            if isinstance(raw_events, list)
+            else []
+        )
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = int(time.time_ns() % 1_000_000)
+        output_root = debug_log_dir() / f"{stamp}-{suffix:06d}-manga-ocr"
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        data_uri = str(page.get("data_uri") or "")
+        image_name = "page.bin"
+        if data_uri.startswith("data:") and "," in data_uri:
+            header, encoded = data_uri.split(",", 1)
+            mime = header[5:].split(";", 1)[0].lower()
+            extension = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/jpg": ".jpg",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+            }.get(mime, ".bin")
+            image_name = f"page{extension}"
+            image_bytes = (
+                base64.b64decode(encoded)
+                if ";base64" in header
+                else encoded.encode("utf-8")
+            )
+            (output_root / image_name).write_bytes(image_bytes)
+
+        page_meta = {key: value for key, value in page.items() if key != "data_uri"}
+        snapshot = {
+            "schema": 1,
+            "generated_at": time.time(),
+            "pudge_version": __version__,
+            "page": page_meta,
+            "backend_ocr": backend,
+            "frontend": source,
+        }
+        (output_root / "snapshot.json").write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+        backend_regions = [
+            dict(item)
+            for item in backend.get("regions", [])
+            if isinstance(item, dict)
+        ]
+        frames = source.get("frames") if isinstance(source.get("frames"), list) else []
+        current_frame = next(
+            (
+                item
+                for item in frames
+                if isinstance(item, dict)
+                and int(item.get("page_index") or -1) == page_index
+            ),
+            frames[0] if frames and isinstance(frames[0], dict) else {},
+        )
+        frontend_regions = (
+            current_frame.get("overlays")
+            if isinstance(current_frame, dict)
+            and isinstance(current_frame.get("overlays"), list)
+            else []
+        )
+
+        def backend_boxes() -> str:
+            rows: list[str] = []
+            for index, region in enumerate(backend_regions):
+                x = max(0.0, min(1.0, float(region.get("x") or 0.0)))
+                y = max(0.0, min(1.0, float(region.get("y") or 0.0)))
+                width = max(0.0, min(1.0 - x, float(region.get("width") or 0.0)))
+                height = max(0.0, min(1.0 - y, float(region.get("height") or 0.0)))
+                top = max(0.0, 1.0 - y - height)
+                title = html.escape(
+                    f"{index}: {region.get('orientation') or ''} "
+                    f"{region.get('confidence') or ''} {region.get('text') or ''}"
+                )
+                rows.append(
+                    f'<div class="box backend" title="{title}" '
+                    f'style="left:{x * 100:.5f}%;top:{top * 100:.5f}%;'
+                    f'width:{width * 100:.5f}%;height:{height * 100:.5f}%">'
+                    f'<b>B{index}</b></div>'
+                )
+            return "".join(rows)
+
+        def frontend_boxes() -> str:
+            rows: list[str] = []
+            for index, overlay in enumerate(frontend_regions):
+                if not isinstance(overlay, dict):
+                    continue
+                normalized = overlay.get("normalized_to_image")
+                if not isinstance(normalized, dict):
+                    continue
+                left = float(normalized.get("left") or 0.0)
+                top = float(normalized.get("top") or 0.0)
+                width = float(normalized.get("width") or 0.0)
+                height = float(normalized.get("height") or 0.0)
+                title = html.escape(
+                    f"{overlay.get('region_index', index)}: "
+                    f"{overlay.get('parsed_token_count', 0)} tokens "
+                    f"{overlay.get('text') or ''}"
+                )
+                rows.append(
+                    f'<div class="box frontend" title="{title}" '
+                    f'style="left:{left * 100:.5f}%;top:{top * 100:.5f}%;'
+                    f'width:{width * 100:.5f}%;height:{height * 100:.5f}%">'
+                    f'<b>F{overlay.get("region_index", index)}</b></div>'
+                )
+            return "".join(rows)
+
+        image_ref = html.escape(image_name)
+        overlay_html = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Pudge Manga OCR debug</title>
+<style>
+body{{margin:0;padding:20px;background:#10151d;color:#e8eef6;font:14px -apple-system,BlinkMacSystemFont,sans-serif}}
+h1{{font-size:18px}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(320px,1fr));gap:20px}}
+.panel{{min-width:0}}.canvas{{position:relative;display:inline-block;max-width:100%}}
+.canvas img{{display:block;max-width:100%;height:auto}}.box{{position:absolute;box-sizing:border-box;pointer-events:none}}
+.box b{{position:absolute;left:0;top:0;padding:1px 3px;background:#111;color:#fff;font-size:11px}}
+.backend{{border:2px solid #ff5b66;background:rgba(255,91,102,.08)}}
+.frontend{{border:2px solid #57a5ff;background:rgba(87,165,255,.08)}}
+code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}}}
+</style></head><body>
+<h1>Pudge Manga OCR debug</h1>
+<p>Book <code>{book_id}</code>, page <code>{page_index + 1}</code>. Red: backend OCR geometry. Blue: actual browser overlay.</p>
+<div class="grid">
+<section class="panel"><h2>Backend regions</h2><div class="canvas"><img src="{image_ref}">{backend_boxes()}</div></section>
+<section class="panel"><h2>Rendered overlay</h2><div class="canvas"><img src="{image_ref}">{frontend_boxes()}</div></section>
+</div>
+<p>See <code>snapshot.json</code> for reading order, confidence, DOM sizes, selections and click hit-testing.</p>
+</body></html>"""
+        (output_root / "overlay.html").write_text(overlay_html, encoding="utf-8")
+
+        archive = Path(
+            shutil.make_archive(
+                str(output_root),
+                "zip",
+                root_dir=output_root,
+            )
+        )
+        try:
+            subprocess.Popen(["open", "-R", str(archive)])
+        except OSError:
+            pass
+        return {
+            "ok": True,
+            "path": str(archive),
+            "folder": str(output_root),
+            "event_count": len(source["events"]),
+            "backend_region_count": len(backend_regions),
+            "frontend_region_count": len(frontend_regions),
+        }
+
 
     def audiobook_state(self) -> dict[str, Any]:
         return self.audiobooks.state()
 
-    def job_center_state(self) -> dict[str, Any]:
-        jobs = self.job_center.jobs()
-        return {
-            "jobs": jobs,
-            "active_count": sum(1 for job in jobs if job.get("can_cancel")),
-        }
-
-    def job_center_cancel(self, job_id: str) -> dict[str, Any]:
-        job = self.job_center.get(str(job_id))
-        if job is None:
-            raise KeyError(f"Unknown job {job_id}")
-        kind = str(job.get("kind") or "")
-        payload = job.get("payload") or {}
-        requested = self.job_center.request_cancel(str(job_id))
-        if not requested:
-            return self.job_center_state()
-        if kind == "nyaa" and str(job_id) == self._planning_episode_job_id:
-            if self._planning_episode_cancel_event is not None:
-                self._planning_episode_cancel_event.set()
-        elif kind == "ocr":
-            event = self._manga_ocr_cancel_events.get(int(payload.get("book_id") or 0))
-            if event is not None:
-                event.set()
-        elif kind == "stt":
-            self.audiobooks.cancel_transcription(int(payload.get("audiobook_id") or 0))
-        elif kind == "import":
-            event = self._import_cancel_events.get(str(job_id))
-            if event is not None:
-                event.set()
-        if kind == "import" and str(job_id) not in self._import_cancel_events:
-            self.job_center.cancelled(str(job_id))
-        return self.job_center_state()
 
     def _retry_import_worker(
         self,
@@ -2687,51 +3449,6 @@ class WebAppApi:
         finally:
             self._import_cancel_events.pop(job_id, None)
 
-    def job_center_retry(self, job_id: str) -> dict[str, Any]:
-        previous = self.job_center.get(str(job_id))
-        if previous is None:
-            raise KeyError(f"Unknown job {job_id}")
-        if not bool(previous.get("can_retry")):
-            raise ValueError("Only failed or cancelled jobs can be retried")
-        kind = str(previous.get("kind") or "")
-        payload = previous.get("payload") or {}
-        if kind == "nyaa":
-            self.start_planning_episode_download(
-                int(payload.get("media_id") or 0), attempt_of=str(job_id)
-            )
-        elif kind == "ocr":
-            self.start_manga_ocr_book(
-                int(payload.get("book_id") or 0),
-                refresh=True,
-                attempt_of=str(job_id),
-            )
-        elif kind == "stt":
-            self.audiobooks.prepare_transcription(
-                int(payload.get("audiobook_id") or 0),
-                force=True,
-                attempt_of=str(job_id),
-            )
-        elif kind == "import":
-            paths = [str(value) for value in payload.get("paths") or []]
-            media_kind = str(payload.get("media_kind") or "light_novel")
-            retry_id = self.job_center.start(
-                "import",
-                str(previous.get("title") or "Import"),
-                payload={"media_kind": media_kind, "paths": paths},
-                total=len(paths),
-                attempt_of=str(job_id),
-            )
-            event = threading.Event()
-            self._import_cancel_events[retry_id] = event
-            threading.Thread(
-                target=self._retry_import_worker,
-                args=(retry_id, media_kind, paths, event),
-                name=f"{APP_SLUG}-import-retry",
-                daemon=True,
-            ).start()
-        else:
-            raise ValueError(f"Job type {kind} cannot be retried")
-        return self.job_center_state()
 
     def choose_audiobook_file(self) -> dict[str, Any]:
         if self.window is None:
@@ -2849,6 +3566,13 @@ class WebAppApi:
         result["state"] = self.audiobooks.state()
         return result
 
+    def audiobook_set_paused(self, book_id: int, paused: bool) -> dict[str, Any]:
+        # Pause/resume is latency-sensitive. Building the complete audiobook
+        # library state can take more than a second and lets mpv advance while
+        # the reader UI is blocked. The paired-reader poll fetches its focused
+        # state separately.
+        return self.audiobooks.set_paused(int(book_id), bool(paused))
+
     def audiobook_sleep_timer(self, book_id: int, mode: str) -> dict[str, Any]:
         value = str(mode or "off").strip().lower()
         if value == "chapter":
@@ -2923,6 +3647,49 @@ class WebAppApi:
         self, book_id: int, force: bool = False
     ) -> dict[str, Any]:
         return self.audiobooks.prepare_alignment(int(book_id), force=bool(force))
+
+    def light_novel_audio_alignment_report(self, book_id: int) -> dict[str, Any]:
+        return self.audiobooks.alignment_report(int(book_id))
+
+    def light_novel_reprocess_audio_alignment(
+        self, book_id: int, clear_transcription: bool = False
+    ) -> dict[str, Any]:
+        return self.audiobooks.reprocess_alignment(
+            int(book_id),
+            clear_transcription=bool(clear_transcription),
+        )
+
+
+    def light_novel_export_audio_sync_trace(
+        self, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        source = dict(payload) if isinstance(payload, dict) else {}
+        raw_events = source.get("events")
+        events = (
+            [dict(item) for item in raw_events[-3000:] if isinstance(item, dict)]
+            if isinstance(raw_events, list)
+            else []
+        )
+        source["events"] = events
+        output_dir = debug_log_dir()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = int(time.time_ns() % 1_000_000)
+        output = output_dir / f"pudge-ln-audio-sync-{stamp}-{suffix:06d}.json"
+        snapshot = {
+            "schema": 1,
+            "generated_at": time.time(),
+            "pudge_version": __version__,
+            "trace": source,
+        }
+        output.write_text(
+            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        try:
+            subprocess.Popen(["open", "-R", str(output)])
+        except OSError:
+            pass
+        return {"ok": True, "path": str(output), "event_count": len(events)}
 
     def light_novel_refresh(self) -> dict[str, Any]:
         return self.light_novels.refresh_state()
@@ -3040,6 +3807,9 @@ class WebAppApi:
     def light_novel_chapter_parse_status(self, book_id: int, chapter_index: int) -> dict[str, Any]:
         return self.light_novels.chapter_parse_status(int(book_id), int(chapter_index))
 
+    def light_novel_stop_paired(self, book_id: int) -> dict[str, Any]:
+        return self.audiobooks.stop_for_light_novel(int(book_id))
+
     def light_novel_cancel_reader_background(self) -> dict[str, Any]:
         self.light_novels.cancel_reader_background()
         return {"ok": True}
@@ -3081,9 +3851,16 @@ class WebAppApi:
         return self.light_novels.set_finished(int(book_id), bool(finished))
 
     def light_novel_delete(self, book_id: int) -> dict[str, Any]:
-        self.audiobooks.unlink_light_novel(int(book_id))
+        # Keep the bridge call tiny. The frontend removes the card optimistically;
+        # audiobook unlinking is allowed to finish after the durable LN tombstone
+        # and row deletion are committed.
         result = self.light_novels.delete_book(int(book_id), delete_file=False)
-        result["state"] = self.light_novel_state()
+        threading.Thread(
+            target=self.audiobooks.unlink_light_novel,
+            args=(int(book_id),),
+            name=f"ln-unlink-delete-{int(book_id)}",
+            daemon=True,
+        ).start()
         return result
 
     def light_novel_bind_anilist(self, book_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3332,13 +4109,10 @@ class WebAppApi:
         cfg.playback.enabled = True
         cfg.playback.rewind_seconds = 10.0
         cfg.nyaa.enabled = bool(values.get("nyaa_enabled", cfg.nyaa.enabled))
-        cfg.nyaa.auto_download_current = bool(values.get("nyaa_auto", cfg.nyaa.auto_download_current))
-        cfg.nyaa.subsplease_rss_enabled = bool(
-            values.get("subsplease_rss_enabled", cfg.nyaa.subsplease_rss_enabled)
-        )
-        cfg.nyaa.subsplease_rss_preferred = bool(
-            values.get("subsplease_rss_preferred", cfg.nyaa.subsplease_rss_preferred)
-        )
+        cfg.nyaa.auto_download_current = True
+        cfg.nyaa.torrents_enabled = bool(values.get("torrents_enabled", cfg.nyaa.torrents_enabled))
+        cfg.nyaa.subsplease_rss_enabled = True
+        cfg.nyaa.subsplease_rss_preferred = True
         cfg.nyaa.base_url = str(values.get("nyaa_url", cfg.nyaa.base_url)).strip().rstrip("/")
         cfg.nyaa.proxy_mode = str(values.get("proxy_mode", cfg.nyaa.proxy_mode)).strip()
         cfg.nyaa.proxy_url = str(values.get("proxy_url", cfg.nyaa.proxy_url)).strip()
@@ -4324,6 +5098,40 @@ class WebAppApi:
         subprocess.Popen(["open", str(DEFAULT_LOG_PATH.parent)])
         return {"ok": True, "path": str(DEFAULT_LOG_PATH)}
 
+    def export_runtime_debug_bundle(
+        self, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        output_dir = debug_log_dir()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        suffix = int(time.time_ns() % 1_000_000)
+        target = output_dir / f"pudge-runtime-debug-{stamp}-{suffix:06d}.zip"
+        manifest = {
+            "schema": 1,
+            "generated_at": time.time(),
+            "pudge_version": __version__,
+            "platform": platform.platform(),
+            "python": sys.version,
+            "frontend": dict(payload) if isinstance(payload, dict) else {},
+            "files": {
+                "runtime_log": str(DEFAULT_LOG_PATH),
+                "energy_log": str(ENERGY_LOG_PATH),
+            },
+        }
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+            )
+            if DEFAULT_LOG_PATH.is_file():
+                archive.write(DEFAULT_LOG_PATH, "runtime.log")
+            if ENERGY_LOG_PATH.is_file():
+                archive.write(ENERGY_LOG_PATH, "energy.log")
+        try:
+            subprocess.Popen(["open", "-R", str(target)])
+        except OSError:
+            pass
+        return {"ok": True, "path": str(target)}
+
     def open_energy_log(self) -> dict[str, Any]:
         ENERGY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform == "darwin":
@@ -4531,8 +5339,7 @@ class WebAppApi:
 
     def export_anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         payload = self.anime_debug_snapshot(media_id, episode)
-        downloads = Path.home() / "Downloads"
-        downloads.mkdir(parents=True, exist_ok=True)
+        downloads = debug_log_dir()
         episode_part = (
             f"-ep{int(payload.get('selected_episode'))}"
             if payload.get("selected_episode") is not None
@@ -5330,6 +6137,29 @@ def launch_web_app(config_path: Path) -> int:
     with timed_step(api.logger, "app.asset_server"):
         server, base_url = _start_asset_server(api)
     api.asset_base = base_url
+    companion_server = None
+    if api.config.companion.enabled:
+        try:
+            companion_server, _companion_thread = start_mobile_sync_server(
+                api.mobile_sync,
+                host=api.config.companion.bind_host,
+                port=api.config.companion.port,
+                logger=api.logger,
+            )
+            companion_host, companion_port = companion_server.server_address
+            api.companion_base_url = f"http://{companion_host}:{companion_port}"
+            api.logger.info(
+                "EVENT companion.started host=%s port=%s",
+                companion_host,
+                companion_port,
+            )
+        except OSError as exc:
+            api.logger.warning(
+                "FALLBACK step=companion.start host=%s port=%s error=%r",
+                api.config.companion.bind_host,
+                api.config.companion.port,
+                str(exc),
+            )
     window = webview.create_window(
         APP_NAME,
         url=f"{base_url}/index.html",
@@ -5348,6 +6178,12 @@ def launch_web_app(config_path: Path) -> int:
         # so the actual WebKit process has the same icon in Dock and Cmd+Tab.
         icon_set = _set_macos_runtime_identity()
         api.logger.info("EVENT app.webview_started runtime_identity=%s", icon_set)
+
+        # Finder drop binding is intentionally deferred until the page fires
+        # ``pywebviewready``. Binding DOM drag events here used to attach too
+        # early and also routed high-frequency dragover traffic through Python.
+        api.logger.info("EVENT app.drop_import_waiting_for_dom")
+
         permission_thread = threading.Thread(
             target=_request_notification_permission_after_launch,
             args=(api,),
@@ -5370,4 +6206,7 @@ def launch_web_app(config_path: Path) -> int:
         api.logger.info("APP session_stop")
         server.shutdown()
         server.server_close()
+        if companion_server is not None:
+            companion_server.shutdown()
+            companion_server.server_close()
     return 0

@@ -412,3 +412,19 @@ def test_manager_keeps_zero_length_recovery_without_exact_local_file(
             raise AssertionError("must not delete an unresolved recovery")
 
     assert manager._discard_completed_aria2_recovery_tasks(Client(), [item]) == 0
+
+
+def test_manager_trusts_persisted_complete_aria2_over_stale_runtime_metadata() -> None:
+    item = SimpleNamespace(
+        progress=1.0,
+        state="complete",
+        raw={
+            "backend": "aria2",
+            "total_size": 1_400_000_000,
+            "downloaded": 0,
+            "verifying": True,
+            "error_code": "13",
+        },
+    )
+
+    assert AnimeManager._download_is_complete(item) is True

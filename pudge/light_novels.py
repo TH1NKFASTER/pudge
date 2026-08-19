@@ -33,6 +33,32 @@ class LightNovelError(RuntimeError):
     pass
 
 
+def _japanese_text_profile(chapters: list[tuple[str, str]]) -> dict[str, Any]:
+    sample = "".join(text for _title, text in chapters)[:250_000]
+    kana = len(re.findall(r"[\u3040-\u30ffー]", sample))
+    han = len(re.findall(r"[\u3400-\u9fff々〆ヶ]", sample))
+    japanese = kana + han
+    letters = sum(1 for char in sample if char.isalpha())
+    japanese_ratio = japanese / max(1, letters)
+    kana_share = kana / max(1, japanese)
+    accepted = bool(
+        letters >= 160
+        and japanese >= 100
+        and kana >= 30
+        and japanese_ratio >= 0.35
+        and kana_share >= 0.04
+    )
+    return {
+        "accepted": accepted,
+        "sample_chars": len(sample),
+        "letters": letters,
+        "japanese_chars": japanese,
+        "kana_chars": kana,
+        "japanese_ratio": round(japanese_ratio, 4),
+        "kana_share": round(kana_share, 4),
+    }
+
+
 class _TextExtractor(HTMLParser):
     BLOCK_TAGS = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "section", "article"}
     SKIP_TAGS = {"style", "script", "head", "title", "noscript", "template", "rt", "rp"}
@@ -389,6 +415,8 @@ class LightNovelSettings:
     jpdb_api_token: str = ""
     study_backend: str = "jiten"
     show_furigana: bool = True
+    furigana_on_hover: bool = True
+    furigana_on_reading: bool = True
     show_pitch_accent: bool = True
     furigana_unknown_only: bool = True
     word_mark_style: str = "underline"
@@ -490,6 +518,8 @@ class LightNovelService:
         self.db_path = Path(config.library.database_path)
         self.root = Path(config.library.root_dir) / "Light Novels"
         self.root.mkdir(parents=True, exist_ok=True)
+        self.cover_cache_dir = Path(config.library.cover_cache_dir)
+        self.cover_cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logger
         self._parse_lock = threading.Lock()
         self._last_parse_at = 0.0
@@ -502,11 +532,13 @@ class LightNovelService:
         self._prefetch_lock = threading.Lock()
         self._prefetch_generation = 0
         self._reader_generation = 0
+        self._anilist_bind_lock = threading.Lock()
+        self._anilist_bind_inflight: set[int] = set()
         self._character_cache = MetadataCache(
             Path(config.paths.cache_dir), "anilist-characters", schema="v2"
         )
         self._jiten_media_cache = MetadataCache(
-            Path(config.paths.cache_dir), "jiten-media-stats", schema="v1"
+            Path(config.paths.cache_dir), "jiten-media-stats", schema="v2"
         )
         self._ensure_schema()
 
@@ -566,6 +598,16 @@ class LightNovelService:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ln_deleted_sources (
+                    file_path TEXT PRIMARY KEY,
+                    deleted_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ln_scan_rejections (
+                    file_path TEXT PRIMARY KEY,
+                    mtime_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    checked_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS ln_bookmarks (
                     book_id INTEGER PRIMARY KEY,
                     chapter_index INTEGER NOT NULL DEFAULT 0,
@@ -619,6 +661,8 @@ class LightNovelService:
             jpdb_api_token=values.get("jpdb_api_token", ""),
             study_backend=values.get("study_backend", "jiten") if values.get("study_backend", "jiten") in {"jiten", "jpdb"} else "jiten",
             show_furigana=values.get("show_furigana", "1") != "0",
+            furigana_on_hover=values.get("furigana_on_hover", "1") != "0",
+            furigana_on_reading=values.get("furigana_on_reading", "1") != "0",
             furigana_states=self._jiten_state_csv(
                 values.get("furigana_states"), self.DEFAULT_FURIGANA_STATES
             ),
@@ -686,6 +730,7 @@ class LightNovelService:
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = {
             "jiten_api_key", "jpdb_api_token", "study_backend", "show_furigana",
+            "furigana_on_hover", "furigana_on_reading",
             "show_pitch_accent", "furigana_unknown_only", "word_mark_style",
             "furigana_states", "underline_states",
             "study_card_mode", "study_card_triggers",
@@ -703,6 +748,12 @@ class LightNovelService:
             "jpdb_api_token": str(values.get("jpdb_api_token", current.jpdb_api_token)).strip(),
             "study_backend": str(values.get("study_backend", current.study_backend)).strip().lower(),
             "show_furigana": "1" if bool(values.get("show_furigana", current.show_furigana)) else "0",
+            "furigana_on_hover": (
+                "1" if bool(values.get("furigana_on_hover", current.furigana_on_hover)) else "0"
+            ),
+            "furigana_on_reading": (
+                "1" if bool(values.get("furigana_on_reading", current.furigana_on_reading)) else "0"
+            ),
             "show_pitch_accent": (
                 "1" if bool(values.get("show_pitch_accent", current.show_pitch_accent)) else "0"
             ),
@@ -790,6 +841,8 @@ class LightNovelService:
             "jpdb_api_token": s.jpdb_api_token,
             "study_backend": s.study_backend,
             "show_furigana": s.show_furigana,
+            "furigana_on_hover": s.furigana_on_hover,
+            "furigana_on_reading": s.furigana_on_reading,
             "furigana_states": s.furigana_states.split(","),
             "underline_states": s.underline_states.split(","),
             "show_pitch_accent": s.show_pitch_accent,
@@ -870,7 +923,127 @@ class LightNovelService:
                 changed += 1
         return changed
 
-    def import_file(self, source: Path) -> dict[str, Any]:
+    def _deleted_source_paths(self) -> set[str]:
+        with self._connect() as conn:
+            return {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_deleted_sources")}
+
+    def is_deleted_source(self, source: Path) -> bool:
+        try:
+            resolved = str(Path(source).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return False
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM ln_deleted_sources WHERE file_path=?",
+                (resolved,),
+            ).fetchone() is not None
+
+    def _mark_deleted_source(self, source: Path) -> None:
+        try:
+            resolved = str(Path(source).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO ln_deleted_sources(file_path,deleted_at) VALUES(?,?) "
+                "ON CONFLICT(file_path) DO UPDATE SET deleted_at=excluded.deleted_at",
+                (resolved, time.time()),
+            )
+
+    def _clear_deleted_source(self, source: Path) -> None:
+        try:
+            resolved = str(Path(source).expanduser().resolve())
+        except (OSError, RuntimeError):
+            return
+        with self._connect() as conn:
+            conn.execute("DELETE FROM ln_deleted_sources WHERE file_path=?", (resolved,))
+
+    @staticmethod
+    def _cover_suffix(value: str) -> str:
+        mapping = {
+            "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+            "image/webp": ".webp", "image/gif": ".gif",
+        }
+        return mapping.get(str(value or "").casefold(), ".jpg")
+
+    def _store_cover_bytes(self, raw: bytes, suffix: str) -> str:
+        suffix = suffix.casefold() if str(suffix).startswith(".") else f".{suffix.casefold()}"
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            suffix = ".jpg"
+        if suffix == ".jpeg":
+            suffix = ".jpg"
+        digest = hashlib.sha256(raw).hexdigest()[:24]
+        target = self.cover_cache_dir / f"ln-{digest}{suffix}"
+        if not target.is_file() or target.stat().st_size != len(raw):
+            temp = target.with_suffix(target.suffix + ".tmp")
+            temp.write_bytes(raw)
+            temp.replace(target)
+        return f"covers/{target.name}"
+
+    def _migrate_inline_covers(self) -> int:
+        """Move legacy EPUB data URLs out of SQLite/WebKit into the cover cache."""
+        migrated = 0
+        while True:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT id,cover_url FROM ln_books WHERE cover_url LIKE 'data:%;base64,%' LIMIT 1"
+                ).fetchone()
+            if row is None:
+                break
+            book_id = int(row["id"])
+            value = str(row["cover_url"] or "")
+            try:
+                header, payload = value.split(",", 1)
+                media_type = header[5:].split(";", 1)[0]
+                raw = base64.b64decode(payload, validate=False)
+                if not raw:
+                    raise ValueError("empty cover")
+                cover_url = self._store_cover_bytes(raw, self._cover_suffix(media_type))
+            except Exception as exc:
+                self._log("LN inline cover migration skipped book=%s error=%s", book_id, exc)
+                # Corrupt historical inline data must not keep being shipped to
+                # WebKit forever. The AniList/local refresh can repopulate it.
+                cover_url = ""
+            with self._connect() as conn:
+                conn.execute("UPDATE ln_books SET cover_url=?,updated_at=? WHERE id=?", (cover_url, time.time(), book_id))
+            migrated += 1
+        if migrated:
+            self._log("LN migrated inline covers count=%s", migrated)
+        return migrated
+
+    @staticmethod
+    def _book_select_columns(conn: sqlite3.Connection) -> str:
+        columns = [str(row["name"]) for row in conn.execute("PRAGMA table_info(ln_books)")]
+        parts: list[str] = []
+        for name in columns:
+            quoted = '"' + name.replace('"', '""') + '"'
+            if name == "cover_url":
+                parts.append(
+                    "CASE WHEN b.cover_url LIKE 'data:%' THEN '' ELSE b.cover_url END AS cover_url"
+                )
+            else:
+                parts.append(f"b.{quoted}")
+        return ",".join(parts)
+
+    def source_language_profile(self, source: Path) -> dict[str, Any]:
+        source = Path(source).expanduser().resolve()
+        if source.suffix.casefold() == ".epub":
+            _title, chapters, _cover = _epub_metadata(source)
+        elif source.suffix.casefold() == ".txt":
+            _title, chapters = _txt_metadata(source)
+        else:
+            return {"accepted": False, "reason": "unsupported"}
+        profile = _japanese_text_profile(chapters)
+        profile["path"] = str(source)
+        return profile
+
+    def is_probably_japanese_source(self, source: Path) -> bool:
+        try:
+            return bool(self.source_language_profile(source).get("accepted"))
+        except (OSError, LightNovelError, UnicodeError, zipfile.BadZipFile):
+            return False
+
+    def import_file(self, source: Path, *, explicit: bool = True) -> dict[str, Any]:
         source = Path(source).expanduser().resolve()
         cover_blob: tuple[bytes, str] | None = None
         if source.suffix.casefold() == ".epub":
@@ -893,13 +1066,19 @@ class LightNovelService:
             target_dir = self.root / _safe_name(re.sub(r"(?i)\b(?:vol(?:ume)?|v)\s*[._ -]*\d{1,3}\b", "", title).strip() or title)
             target_dir.mkdir(parents=True, exist_ok=True)
             target = target_dir / source.name
-            if source != target:
-                shutil.copy2(source, target)
+        target = target.expanduser().resolve()
+        if not explicit and self.is_deleted_source(target):
+            raise LightNovelError("Source was explicitly removed from Pudge")
+        if source != target:
+            shutil.copy2(source, target)
+        if explicit:
+            self._clear_deleted_source(target)
+            with self._connect() as conn:
+                conn.execute("DELETE FROM ln_scan_rejections WHERE file_path=?", (str(target),))
         cover_url = ""
         if cover_blob is not None:
             raw_cover, cover_suffix = cover_blob
-            media_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(cover_suffix.casefold(), "image/jpeg")
-            cover_url = f"data:{media_type};base64,{base64.b64encode(raw_cover).decode('ascii')}"
+            cover_url = self._store_cover_bytes(raw_cover, cover_suffix)
         now = time.time()
         with self._connect() as conn:
             conn.execute(
@@ -917,7 +1096,9 @@ class LightNovelService:
                     (book_id, index, chapter_title, text, text_hash),
                 )
         self._inherit_series_anilist(book_id)
-        return self.book(book_id)
+        book = self.book(book_id)
+        self.queue_auto_bind_anilist(book_id)
+        return book
 
     def reindex_outdated_sources(self) -> int:
         """Re-extract chapters after EPUB/TXT extraction rules change.
@@ -939,7 +1120,7 @@ class LightNovelService:
             if not path.is_file() or path.suffix.casefold() not in {".epub", ".txt"}:
                 continue
             try:
-                self.import_file(path)
+                self.import_file(path, explicit=False)
                 changed += 1
                 self._log("LN reindexed source path=%s schema=%s", path, self.CONTENT_SCHEMA)
             except Exception as exc:
@@ -949,15 +1130,39 @@ class LightNovelService:
     def scan_downloaded(self) -> int:
         with self._connect() as conn:
             known = {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_books")}
+            deleted = {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_deleted_sources")}
+            rejected = {
+                str(row["file_path"]): (int(row["mtime_ns"]), int(row["size"]))
+                for row in conn.execute("SELECT file_path,mtime_ns,size FROM ln_scan_rejections")
+            }
         added = 0
         for path in self.root.rglob("*"):
             if not path.is_file() or path.suffix.casefold() not in {".epub", ".txt"}:
                 continue
             resolved = str(path.resolve())
-            if resolved in known:
+            if resolved in known or resolved in deleted:
                 continue
             try:
-                self.import_file(path)
+                stat = path.stat()
+            except OSError:
+                continue
+            signature = (int(stat.st_mtime_ns), int(stat.st_size))
+            if rejected.get(resolved) == signature:
+                continue
+            try:
+                if not self.is_probably_japanese_source(path):
+                    with self._connect() as conn:
+                        conn.execute(
+                            "INSERT INTO ln_scan_rejections(file_path,mtime_ns,size,checked_at) VALUES(?,?,?,?) "
+                            "ON CONFLICT(file_path) DO UPDATE SET mtime_ns=excluded.mtime_ns,size=excluded.size,checked_at=excluded.checked_at",
+                            (resolved, signature[0], signature[1], time.time()),
+                        )
+                    rejected[resolved] = signature
+                    self._log("LN auto-import rejected non-Japanese source path=%s", path)
+                    continue
+                self.import_file(path, explicit=False)
+                with self._connect() as conn:
+                    conn.execute("DELETE FROM ln_scan_rejections WHERE file_path=?", (resolved,))
                 known.add(resolved)
                 added += 1
             except Exception as exc:
@@ -991,8 +1196,9 @@ class LightNovelService:
     def books(self) -> list[dict[str, Any]]:
         self._repair_missing_volumes()
         with self._connect() as conn:
+            book_columns = self._book_select_columns(conn)
             rows = conn.execute(
-                """SELECT b.*,bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
+                f"""SELECT {book_columns},bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
                           COUNT(c.id) AS chapter_count,
                           COALESCE(SUM(LENGTH(c.text)),0) AS character_count,
                           COALESCE(SUM(
@@ -1037,10 +1243,67 @@ class LightNovelService:
             result.append(item)
         return result
 
+    def drop_card(self, book_id: int) -> dict[str, Any]:
+        """Small one-book payload for the Finder drop bridge.
+
+        EPUB covers are stored as data URLs for offline rendering and can be
+        several megabytes. Sending one through run_js, then rebuilding every
+        sibling volume, temporarily duplicates that data in Python, JavaScript,
+        DOM attributes, and decoded WebKit images. The drop acknowledgement only
+        needs enough data to paint/focus the new card; the normal library state
+        refresh can fill the cover and AniList decoration later.
+        """
+        with self._connect() as conn:
+            book_columns = self._book_select_columns(conn)
+            row = conn.execute(
+                f"""SELECT {book_columns},bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
+                          COUNT(c.id) AS chapter_count,
+                          COALESCE(SUM(LENGTH(c.text)),0) AS character_count,
+                          COALESCE(SUM(
+                              CASE
+                                  WHEN c.chapter_index < b.current_chapter THEN LENGTH(c.text)
+                                  WHEN c.chapter_index = b.current_chapter THEN LENGTH(c.text) * b.current_offset
+                                  ELSE 0
+                              END
+                          ),0) AS read_character_count
+                   FROM ln_books b
+                   LEFT JOIN ln_bookmarks bm ON bm.book_id=b.id
+                   LEFT JOIN ln_chapters c ON c.book_id=b.id
+                   WHERE b.id=? GROUP BY b.id""",
+                (int(book_id),),
+            ).fetchone()
+        if row is None:
+            raise LightNovelError("Light novel not found")
+        item = dict(row)
+        title = str(item.get("title") or "")
+        media_id = item.get("anilist_id")
+        item["series_key"] = (
+            f"anilist:{int(media_id)}"
+            if media_id
+            else (_series_key(title) or f"book:{int(item['id'])}")
+        )
+        item["series_title"] = _series_title(title) or title
+        total = max(0, int(item.get("character_count") or 0))
+        read = max(0.0, float(item.get("read_character_count") or 0.0))
+        if bool(item.get("finished")) and total:
+            read = float(total)
+        if total:
+            read = min(float(total), read)
+            progress = read / float(total)
+        else:
+            progress = 1.0 if bool(item.get("finished")) else 0.0
+        item["read_character_count"] = round(read, 3)
+        item["reading_progress"] = max(0.0, min(1.0, progress))
+        item["reading_progress_percent"] = round(item["reading_progress"] * 100.0, 2)
+        if str(item.get("cover_url") or "").startswith("data:"):
+            item["cover_url"] = ""
+        return item
+
     def book(self, book_id: int) -> dict[str, Any]:
         with self._connect() as conn:
+            book_columns = self._book_select_columns(conn)
             row = conn.execute(
-                """SELECT b.*,bm.source AS bookmark_source,
+                f"""SELECT {book_columns},bm.source AS bookmark_source,
                           bm.updated_at AS bookmark_updated_at
                    FROM ln_books b LEFT JOIN ln_bookmarks bm ON bm.book_id=b.id
                    WHERE b.id=?""",
@@ -1063,6 +1326,7 @@ class LightNovelService:
     def delete_book(self, book_id: int, *, delete_file: bool = False) -> dict[str, Any]:
         book = self.book(int(book_id))
         path = Path(str(book.get("file_path") or "")).expanduser()
+        self._mark_deleted_source(path)
         with self._connect() as conn:
             conn.execute("DELETE FROM ln_chapters WHERE book_id=?", (int(book_id),))
             conn.execute("DELETE FROM ln_books WHERE id=?", (int(book_id),))
@@ -1196,6 +1460,102 @@ class LightNovelService:
                 return True
         return False
 
+    @staticmethod
+    def _jiten_deck_stats(deck: dict[str, Any], *, url: str) -> dict[str, Any]:
+        coverage = float(deck.get("coverage") or 0.0)
+        learning = float(deck.get("youngCoverage") or 0.0)
+        return {
+            "available": True,
+            "deck_id": int(deck.get("deckId") or 0),
+            "url": url,
+            "character_count": int(deck.get("characterCount") or 0),
+            "word_count": int(deck.get("wordCount") or 0),
+            "unique_word_count": int(deck.get("uniqueWordCount") or 0),
+            "difficulty": int(
+                deck.get("difficulty") if deck.get("difficulty") is not None else -1
+            ),
+            "difficulty_raw": float(deck.get("difficultyRaw") or 0.0),
+            "speech_duration_ms": int(deck.get("speechDuration") or 0),
+            "coverage_available": deck.get("coverage") is not None,
+            "known_coverage": max(0.0, min(100.0, coverage)),
+            "expected_comprehension": max(0.0, min(100.0, coverage)),
+            "learning_coverage": max(0.0, min(100.0, learning)),
+        }
+
+    @staticmethod
+    def _jiten_subdeck_volume(deck: dict[str, Any]) -> int | None:
+        values = [
+            deck.get("originalTitle"),
+            deck.get("romajiTitle"),
+            deck.get("englishTitle"),
+            deck.get("originalFileName"),
+            *(deck.get("aliases") or []),
+        ]
+        patterns = (
+            r"(?i)(?:\bvol(?:ume)?\.?\s*|(?:^|[\s._-])v\s*)0*(\d{1,3})(?:\.\d+)?(?:\b|$)",
+            r"第\s*0*(\d{1,3})(?:\.\d+)?\s*巻",
+            r"(?:^|[\s._-])0*(\d{1,3})(?:\.\d+)?\s*巻(?:$|[\s._-])",
+        )
+        for raw in values:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            if not text:
+                continue
+            for pattern in patterns:
+                match = re.search(pattern, text)
+                if match:
+                    number = int(match.group(1))
+                    if 0 < number <= 500:
+                        return number
+        return None
+
+    def _jiten_detail_with_subdecks(
+        self, deck_id: int
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        payload = self._jiten_get(
+            f"media-deck/{deck_id}/detail",
+            {"offset": 0},
+        )
+        envelope = payload if isinstance(payload, dict) else {}
+        data = envelope.get("data") if isinstance(envelope.get("data"), dict) else envelope
+
+        # Older/mocked API responses are flat DeckDto payloads.
+        if not isinstance(data, dict):
+            return None, []
+        if not any(key in data for key in ("mainDeck", "subDecks", "parentDeck")):
+            return data, []
+
+        main = data.get("mainDeck") if isinstance(data.get("mainDeck"), dict) else None
+        subdecks = [
+            item for item in (data.get("subDecks") or []) if isinstance(item, dict)
+        ]
+        try:
+            total = max(len(subdecks), int(envelope.get("totalItems") or len(subdecks)))
+            page_size = max(1, int(envelope.get("pageSize") or 25))
+        except (TypeError, ValueError):
+            total, page_size = len(subdecks), 25
+
+        # Jiten's detail endpoint pages subdecks 25 at a time. Fetch the rest once
+        # and cache the combined result at the parent-series level.
+        offset = page_size
+        while offset < min(total, 500):
+            page = self._jiten_get(
+                f"media-deck/{deck_id}/detail",
+                {"offset": offset},
+            )
+            page_envelope = page if isinstance(page, dict) else {}
+            page_data = (
+                page_envelope.get("data")
+                if isinstance(page_envelope.get("data"), dict)
+                else page_envelope
+            )
+            values = page_data.get("subDecks") if isinstance(page_data, dict) else []
+            rows = [item for item in (values or []) if isinstance(item, dict)]
+            if not rows:
+                break
+            subdecks.extend(rows)
+            offset += page_size
+        return main, subdecks
+
     def jiten_media_stats(
         self,
         media_id: int,
@@ -1272,35 +1632,49 @@ class LightNovelService:
             result = {"available": False}
         else:
             deck_id = int(selected.get("deckId"))
+            main_deck: dict[str, Any] | None = None
+            subdecks: list[dict[str, Any]] = []
             try:
-                detail_payload = self._jiten_get(f"media-deck/{deck_id}/detail")
-                detail = (
-                    detail_payload.get("data")
-                    if isinstance(detail_payload, dict)
-                    and isinstance(detail_payload.get("data"), dict)
-                    else detail_payload
-                )
-                if isinstance(detail, dict):
-                    selected = {**selected, **detail}
+                main_deck, subdecks = self._jiten_detail_with_subdecks(deck_id)
             except Exception as exc:
                 self._log("Jiten deck detail unavailable for %s: %s", deck_id, exc)
-            coverage = float(selected.get("coverage") or 0.0)
-            learning = float(selected.get("youngCoverage") or 0.0)
-            result = {
-                "available": True,
-                "deck_id": deck_id,
-                "url": f"https://jiten.moe/decks/media/{deck_id}/detail",
-                "character_count": int(selected.get("characterCount") or 0),
-                "word_count": int(selected.get("wordCount") or 0),
-                "unique_word_count": int(selected.get("uniqueWordCount") or 0),
-                "difficulty": int(selected.get("difficulty") if selected.get("difficulty") is not None else -1),
-                "difficulty_raw": float(selected.get("difficultyRaw") or 0.0),
-                "speech_duration_ms": int(selected.get("speechDuration") or 0),
-                "coverage_available": authenticated and selected.get("coverage") is not None,
-                "known_coverage": max(0.0, min(100.0, coverage)),
-                "expected_comprehension": max(0.0, min(100.0, coverage)),
-                "learning_coverage": max(0.0, min(100.0, learning)),
-            }
+
+            aggregate = {**selected, **(main_deck or {})}
+            result = self._jiten_deck_stats(
+                aggregate,
+                url=f"https://jiten.moe/decks/media/{deck_id}/detail",
+            )
+            # Public responses do not carry personal coverage. Do not present a
+            # numeric zero as a real known-word percentage when no key is set.
+            result["coverage_available"] = bool(
+                authenticated and aggregate.get("coverage") is not None
+            )
+
+            volumes: dict[str, dict[str, Any]] = {}
+            used: set[int] = set()
+            for index, child in enumerate(subdecks, start=1):
+                volume = self._jiten_subdeck_volume(child)
+                if volume is None or volume in used:
+                    # Jiten's default subdeck order is the media order shown on
+                    # its detail page, so it is the safest fallback when titles
+                    # omit an explicit "Vol. N" marker.
+                    volume = index
+                    while volume in used:
+                        volume += 1
+                used.add(volume)
+                child_id = int(child.get("deckId") or 0)
+                child_stats = self._jiten_deck_stats(
+                    child,
+                    url=f"https://jiten.moe/decks/media/{child_id}/detail"
+                    if child_id
+                    else result["url"],
+                )
+                child_stats["coverage_available"] = bool(
+                    authenticated and child.get("coverage") is not None
+                )
+                volumes[str(volume)] = child_stats
+            if volumes:
+                result["volumes"] = volumes
         self._jiten_media_cache.put(cache_key, result)
         self._jiten_media_cache.prune(older_than_seconds=60 * 24 * 3600, max_entries=1000)
         return result
@@ -2160,6 +2534,65 @@ class LightNovelService:
         value = re.sub(r"[\[\](){}._-]+", " ", value)
         return re.sub(r"\s+", " ", value).strip().casefold()
 
+    def auto_bind_book_anilist(self, book_id: int) -> dict[str, Any] | None:
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return None
+        try:
+            book = self.book(int(book_id))
+        except LightNovelError:
+            return None
+        if book.get("anilist_id"):
+            return book
+        if self._inherit_series_anilist(int(book_id)):
+            return self.book(int(book_id))
+        query = str(book.get("series_title") or book.get("title") or Path(str(book.get("file_path") or "")).stem)
+        rows = self.search_anilist_novels(query, limit=10)
+        if not rows:
+            return None
+        source = self._match_title(query)
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            candidates = [row.get("title"), *(row.get("titles") or []), *(row.get("synonyms") or [])]
+            best = max((float(fuzz.WRatio(source, self._match_title(str(value or "")))) for value in candidates if value), default=0.0)
+            scored.append((best, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if not scored:
+            return None
+        best_score, best = scored[0]
+        margin = best_score - (scored[1][0] if len(scored) > 1 else 0.0)
+        exact = any(self._match_title(str(value or "")) == source for value in [best.get("title"), *(best.get("titles") or []), *(best.get("synonyms") or [])] if value)
+        if not exact and (best_score < 90.0 or (best_score < 97.0 and margin < 7.0)):
+            self._log("LN AniList auto-match skipped book_id=%s title=%r score=%.1f margin=%.1f", book_id, query, best_score, margin)
+            return None
+        bound = self.bind_anilist(int(book_id), int(best["media_id"]), best)
+        self._log("LN AniList auto-matched book_id=%s media_id=%s title=%r score=%.1f", book_id, best["media_id"], query, best_score)
+        return bound
+
+    def queue_auto_bind_anilist(self, book_id: int, *, delay: float = 0.8) -> bool:
+        book_id = int(book_id)
+        if book_id <= 0 or not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return False
+        with self._anilist_bind_lock:
+            if book_id in self._anilist_bind_inflight:
+                return False
+            self._anilist_bind_inflight.add(book_id)
+
+        def worker() -> None:
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                self.auto_bind_book_anilist(book_id)
+            except Exception as exc:
+                self._log("LN AniList auto-match failed book_id=%s error=%s", book_id, exc)
+            finally:
+                with self._anilist_bind_lock:
+                    self._anilist_bind_inflight.discard(book_id)
+                with self._state_refresh_lock:
+                    self._state_version += 1
+
+        threading.Thread(target=worker, name=f"ln-anilist-{book_id}", daemon=True).start()
+        return True
+
     def auto_bind_anilist(self) -> int:
         if not self.config.anilist.enabled or not self.config.anilist.access_token:
             return 0
@@ -2659,6 +3092,7 @@ class LightNovelService:
 
         def worker() -> None:
             try:
+                self._migrate_inline_covers()
                 self.scan_downloaded()
                 self.reindex_outdated_sources()
                 # Local series inheritance needs no network and should happen even

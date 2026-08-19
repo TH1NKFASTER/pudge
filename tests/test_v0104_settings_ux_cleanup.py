@@ -21,7 +21,7 @@ def test_listen_together_does_not_fill_next_word_during_silence() -> None:
     assert "word=null" in source
     assert "&&speechActive)" in source
     assert "ln-paired-word-finishing" not in source
-    assert "progress>=97" in source
+    assert "until:performance.now()+34" not in source
 
 def test_anilist_hint_is_human_and_uses_configured_shortcut() -> None:
     source = HTML.read_text(encoding="utf-8")

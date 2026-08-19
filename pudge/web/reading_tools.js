@@ -493,6 +493,73 @@
     rememberStudyDeck(activeToken.backend, event.target.value || '');
   }, true);
 
+  function firstStudyTokenFromPayload(payload, backend = 'jiten') {
+    const paragraphs = payload?.paragraphs || [];
+    const vocabulary = new Map();
+    for (const item of payload?.vocabulary || []) {
+      if (!item || typeof item !== 'object') continue;
+      vocabulary.set(`${item.wordId}:${item.readingIndex}`, item);
+    }
+    let fallback = null;
+    for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+      const sentence = String(paragraphs[paragraphIndex] || '');
+      const ordered = [...((payload?.tokens || [])[paragraphIndex] || [])]
+        .sort((a, b) => Number(a.start || 0) - Number(b.start || 0));
+      for (const raw of ordered) {
+        const start = Number(raw.start || 0);
+        const end = Number(raw.end ?? (start + Number(raw.length || 0)));
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue;
+        const surface = sentence.slice(start, Math.min(sentence.length, end));
+        if (!surface || !/[\u3040-\u30ff\u3400-\u9fff]/.test(surface)) continue;
+        const card = raw.card || vocabulary.get(`${raw.wordId}:${raw.readingIndex}`) || {};
+        const token = {...raw, card, surface, sentence, backend};
+        if (!fallback) fallback = token;
+        if (/[\u3400-\u9fff]/.test(surface) || String(card.spelling || '').trim()) return token;
+      }
+    }
+    return fallback;
+  }
+
+  async function openStudyText(text, rect = null, {backend = 'jiten'} = {}) {
+    const selected = String(text || '').replace(/\s+/g, '').trim();
+    if (!selected || !/[\u3040-\u30ff\u3400-\u9fff]/.test(selected)) return false;
+    const parse = API()?.study_parse_text;
+    if (typeof parse !== 'function') return false;
+    const payload = await parse(selected);
+    if (payload?.settings) applyStudyAppearance(payload.settings);
+    const token = firstStudyTokenFromPayload(payload, backend);
+    if (!token) return false;
+    const anchorRect = rect && Number.isFinite(Number(rect.left))
+      ? {
+          left:Number(rect.left), top:Number(rect.top), right:Number(rect.right), bottom:Number(rect.bottom),
+          width:Number(rect.width || Math.max(1, Number(rect.right) - Number(rect.left))),
+          height:Number(rect.height || Math.max(1, Number(rect.bottom) - Number(rect.top))),
+        }
+      : {left:window.innerWidth / 2 - 1, right:window.innerWidth / 2 + 1, top:window.innerHeight / 2 - 1, bottom:window.innerHeight / 2 + 1, width:2, height:2};
+    await openStudyCard({
+      token,
+      target:{getBoundingClientRect:() => anchorRect},
+      backend:String(backend || token.backend || 'jiten'),
+      sentence:token.sentence || selected,
+    });
+    return true;
+  }
+
+  async function openStudyElement(word) {
+    if (!word) return false;
+    const token = registry.get(String(word.dataset?.pudgeStudyToken || ''));
+    if (!token) return false;
+    const selection = window.getSelection?.();
+    if (selection && !selection.isCollapsed) return false;
+    await openStudyCard({
+      token,
+      target: word,
+      backend: token.backend || 'jiten',
+      sentence: token.sentence || '',
+    });
+    return true;
+  }
+
   document.addEventListener('click', async event => {
     const close = event.target.closest?.('[data-pudge-study-close]');
     if (close) {
@@ -515,18 +582,7 @@
     }
     const word = event.target.closest?.('[data-pudge-study-token]');
     if (word) {
-      const token = registry.get(word.dataset.pudgeStudyToken);
-      if (token) {
-        const selection = window.getSelection();
-        if (!selection || selection.isCollapsed) {
-          await openStudyCard({
-            token,
-            target: word,
-            backend: token.backend || 'jiten',
-            sentence: token.sentence || '',
-          });
-        }
-      }
+      await openStudyElement(word);
       return;
     }
     const review = event.target.closest?.('[data-pudge-study-review]');
@@ -581,6 +637,8 @@
   window.PudgeReadingTools = {
     study: {
       open: openStudyCard,
+      openElement: openStudyElement,
+      openText: openStudyText,
       close: closeStudyCard,
       renderParsedText,
       renderParsedParagraph,

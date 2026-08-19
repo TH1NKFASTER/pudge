@@ -18,6 +18,7 @@ import httpx
 from ..branding import APP_SLUG, DATA_DIR
 from ..manager_models import DownloadItem, NyaaRelease
 from .qbittorrent import QBittorrentError
+from .nyaa import release_episode as parsed_release_episode
 
 
 class Aria2Error(QBittorrentError):
@@ -33,6 +34,7 @@ class Aria2Client:
 
     _RUNTIME_PROFILE = "v4-detach-seed-only"
     _SAFE_RPC_TORRENT_BYTES = 1_250_000
+    _VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts"}
 
     def __init__(
         self,
@@ -89,6 +91,46 @@ class Aria2Client:
 
     def close(self) -> None:
         self._http.close()
+
+    def traffic_stats(self) -> dict[str, int]:
+        """Return current managed-sidecar traffic without starting aria2c."""
+        if not self._probe():
+            return {
+                "download_speed": 0,
+                "upload_speed": 0,
+                "active": 0,
+                "waiting": 0,
+            }
+        result = self._rpc_raw("aria2.getGlobalStat") or {}
+        return {
+            "download_speed": max(0, int(result.get("downloadSpeed") or 0)),
+            "upload_speed": max(0, int(result.get("uploadSpeed") or 0)),
+            "active": max(0, int(result.get("numActive") or 0)),
+            "waiting": max(0, int(result.get("numWaiting") or 0)),
+        }
+
+    def shutdown(self, *, save_session: bool = True) -> bool:
+        """Stop the Pudge-owned aria2c sidecar without ever auto-starting it."""
+        with self._lock:
+            if not self._probe():
+                return False
+            if save_session:
+                try:
+                    self._rpc_raw("aria2.saveSession")
+                except Aria2Error:
+                    pass
+            try:
+                self._rpc_raw("aria2.forceShutdown")
+            except Aria2Error:
+                try:
+                    self._rpc_raw("aria2.shutdown")
+                except Aria2Error:
+                    return False
+            for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+                time.sleep(delay)
+                if not self._probe():
+                    return True
+            return not self._probe()
 
     def _load_secret(self) -> str:
         path = self.state_dir / "rpc-secret"
@@ -574,6 +616,7 @@ class Aria2Client:
             "save_path": str(target),
             "media_id": media_id,
             "episode": episode,
+            "release_episode": parsed_release_episode(release.title) or episode,
             "is_batch": bool(is_batch),
             "anime_title": anime_title,
             "release_score": float(score),
@@ -935,6 +978,89 @@ class Aria2Client:
         name = str(((item.get("bittorrent") or {}).get("info") or {}).get("name") or "")
         return str(Path(directory) / name) if directory and name else directory
 
+    def _orphaned_completed_item(self, gid: str, meta: dict[str, Any]) -> DownloadItem | None:
+        """Recover a completed managed torrent after aria2 forgot its task row.
+
+        aria2 can drop the stopped/result entry while Pudge's metadata.json still
+        contains the ownership information. The payload itself remains on disk.
+        Reconstructing a read-only DownloadItem here lets normal sync_downloads()
+        recreate the missing LibraryEpisode without re-adding or touching traffic.
+        """
+        save_path = Path(str(meta.get("save_path") or "")).expanduser()
+        if not save_path.is_dir():
+            return None
+        title = str(meta.get("title") or "").strip()
+        candidates: list[Path] = []
+        if title:
+            exact = save_path / title
+            if exact.is_file():
+                candidates.append(exact)
+        if not candidates:
+            try:
+                candidates = [
+                    path
+                    for path in save_path.rglob("*")
+                    if path.is_file() and path.suffix.casefold() in self._VIDEO_EXTENSIONS
+                ]
+            except OSError:
+                candidates = []
+        if len(candidates) > 1:
+            release_number = meta.get("release_episode")
+            if release_number is None:
+                release_number = parsed_release_episode(title)
+            if release_number is not None:
+                matching = [
+                    path for path in candidates
+                    if parsed_release_episode(path.name) == int(release_number)
+                ]
+                if len(matching) == 1:
+                    candidates = matching
+        if len(candidates) != 1:
+            return None
+        content = candidates[0].resolve()
+        try:
+            size = max(1, int(content.stat().st_size))
+        except OSError:
+            return None
+        media_id = meta.get("media_id")
+        media_episode = meta.get("episode")
+        if media_id is None:
+            return None
+        release_number = meta.get("release_episode")
+        if release_number is None:
+            release_number = parsed_release_episode(title) or media_episode
+        torrent_hash = str(meta.get("info_hash") or gid).strip().lower() or str(gid)
+        return DownloadItem(
+            torrent_hash=torrent_hash,
+            name=title or content.name,
+            state="complete",
+            progress=1.0,
+            save_path=str(save_path.resolve()),
+            content_path=str(content),
+            media_id=int(media_id),
+            episode=int(media_episode) if media_episode is not None else None,
+            media_episode=int(media_episode) if media_episode is not None else None,
+            release_episode=int(release_number) if release_number is not None else None,
+            is_batch=bool(meta.get("is_batch")),
+            added_on=int(meta.get("added_on") or 0),
+            completed_on=int(meta.get("completed_on") or 0) or int(time.time()),
+            raw={
+                "backend": "aria2",
+                "gid": str(gid),
+                "infohash_v1": str(meta.get("info_hash") or "").lower(),
+                "total_size": size,
+                "downloaded": size,
+                "download_speed": 0,
+                "upload_speed": 0,
+                "orphaned_metadata": True,
+                "verified": size,
+                "verifying": False,
+                "_media_id_source": "aria2_metadata_orphan",
+                "_release_score_tag": float(meta.get("release_score") or 0.0),
+                "_anime_title_tag": str(meta.get("anime_title") or ""),
+            },
+        )
+
     def torrents(self, *, category: str = "") -> list[DownloadItem]:
         del category
         statuses = self._all_statuses()
@@ -1060,12 +1186,30 @@ class Aria2Client:
                     content_path=self._content_path(item, meta),
                     media_id=int(meta["media_id"]) if meta.get("media_id") is not None else None,
                     episode=int(meta["episode"]) if meta.get("episode") is not None else None,
+                    media_episode=int(meta["episode"]) if meta.get("episode") is not None else None,
+                    release_episode=(
+                        int(meta["release_episode"])
+                        if meta.get("release_episode") is not None
+                        else parsed_release_episode(str(meta.get("title") or ""))
+                    ),
                     is_batch=bool(meta.get("is_batch")),
                     added_on=int(meta.get("added_on") or 0),
                     completed_on=int(meta.get("completed_on") or 0),
                     raw=raw,
                 )
             )
+        represented_hashes = {str(item.torrent_hash or "").strip().casefold() for item in result}
+        represented_paths = {str(item.content_path or "").strip() for item in result if str(item.content_path or "").strip()}
+        for gid, meta in metadata.items():
+            info_hash = str(meta.get("info_hash") or "").strip().casefold()
+            if info_hash and info_hash in represented_hashes:
+                continue
+            orphan = self._orphaned_completed_item(str(gid), dict(meta))
+            if orphan is None or str(orphan.content_path) in represented_paths:
+                continue
+            result.append(orphan)
+            represented_hashes.add(str(orphan.torrent_hash or "").strip().casefold())
+            represented_paths.add(str(orphan.content_path))
         if changed:
             self._save_metadata(metadata)
         return result

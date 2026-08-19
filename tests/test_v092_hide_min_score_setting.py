@@ -23,4 +23,4 @@ def test_release_version_matches_project() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
     assert f'version = "{expected}"' in pyproject
     assert f"Current version: **{expected}**." in readme
-    assert "pudge-macos-v0.7.17.zip" in readme
+    assert f"pudge-macos-v{expected}.zip" in readme

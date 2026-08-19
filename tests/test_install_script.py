@@ -7,8 +7,10 @@ def test_app_bundle_uses_native_launcher_and_managed_venv() -> None:
     ).read_text(encoding="utf-8")
 
     assert "/usr/bin/clang" in text
-    assert "execv(python, child_argv)" in text
-    assert 'child_argv[out++] = "pudge.app_entry";' in text
+    assert "Py_InitializeFromConfig(&config)" in text
+    assert 'PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry")' in text
+    assert "return Py_RunMain();" in text
+    assert "execv(python" not in text
     assert "PyInstaller" not in text
     assert "--collect-all pudge" not in text
 

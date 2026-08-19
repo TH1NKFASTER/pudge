@@ -315,7 +315,7 @@ aria2_bin = json.dumps(os.environ["ARIA2_BIN"])
 
 template = r"""#import <Foundation/Foundation.h>
 #import <UserNotifications/UserNotifications.h>
-#include <errno.h>
+#include <Python.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -430,25 +430,32 @@ int main(int argc, char *argv[]) {
             setenv("PUDGE_APP_ICON", [icon_path fileSystemRepresentation], 1);
         }
 
-        char **child_argv =
-            calloc((size_t)argc + 4, sizeof(char *));
-        if (child_argv == NULL) {
-            return 70;
-        }
+        // Keep Python in the native Pudge process instead of exec()ing the
+        // Homebrew Python.app executable. macOS derives NSRunningApplication's
+        // bundle/icon from the running executable; exec() was why Force Quit
+        // still showed the Python rocket even after AppKit's Dock icon changed.
+        PyConfig config;
+        PyConfig_InitPythonConfig(&config);
+        config.parse_argv = 0;
 
-        int out = 0;
-        child_argv[out++] = (char *)python;
-        child_argv[out++] = "-m";
-        child_argv[out++] = "pudge.app_entry";
-        for (int i = 1; i < argc; ++i) {
-            child_argv[out++] = argv[i];
+        PyStatus status = PyConfig_SetBytesString(&config, &config.program_name, python);
+        if (!PyStatus_Exception(status)) {
+            status = PyConfig_SetBytesString(&config, &config.executable, python);
         }
-        child_argv[out] = NULL;
-
-        execv(python, child_argv);
-        int saved_errno = errno;
-        free(child_argv);
-        return saved_errno == 0 ? 70 : saved_errno;
+        if (!PyStatus_Exception(status)) {
+            status = PyConfig_SetBytesArgv(&config, argc, argv);
+        }
+        if (!PyStatus_Exception(status)) {
+            status = PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry");
+        }
+        if (!PyStatus_Exception(status)) {
+            status = Py_InitializeFromConfig(&config);
+        }
+        PyConfig_Clear(&config);
+        if (PyStatus_Exception(status)) {
+            Py_ExitStatusException(status);
+        }
+        return Py_RunMain();
     }
 }
 """
@@ -464,12 +471,29 @@ template = (
 source.write_text(template, encoding="utf-8")
 PYNATIVELAUNCHER
 
+PYTHON_CONFIG="$($VENV_DIR/bin/python - <<'PYTHONCONFIG'
+import os
+import sysconfig
+version = str(sysconfig.get_config_var("VERSION") or "")
+bindir = str(sysconfig.get_config_var("BINDIR") or "")
+print(os.path.join(bindir, f"python{version}-config"))
+PYTHONCONFIG
+)"
+if [[ ! -x "$PYTHON_CONFIG" ]]; then
+  echo "Python embed config not found: $PYTHON_CONFIG" >&2
+  exit 1
+fi
+PYTHON_EMBED_CFLAGS="$($PYTHON_CONFIG --embed --cflags)"
+PYTHON_EMBED_LDFLAGS="$($PYTHON_CONFIG --embed --ldflags)"
+
 /usr/bin/clang \
   -fobjc-arc \
   -fblocks \
+  ${=PYTHON_EMBED_CFLAGS} \
   -framework Foundation \
   -framework UserNotifications \
   "$LAUNCHER_SOURCE" \
+  ${=PYTHON_EMBED_LDFLAGS} \
   -o "$APP_LAUNCHER"
 
 chmod 755 "$APP_LAUNCHER"
@@ -597,7 +621,6 @@ cat > "$AGENT_PLIST" <<PLIST
     <string>--config</string>
     <string>$CONFIG_PATH</string>
   </array>
-  <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>300</integer>
   <key>StandardOutPath</key><string>$LOG_DIR/$APP_SLUG-agent.log</string>
   <key>StandardErrorPath</key><string>$LOG_DIR/$APP_SLUG-agent-error.log</string>
@@ -614,7 +637,6 @@ cat > "$AGENT_PLIST" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
 
 printf '%s\n' "$EXPECTED_VERSION" > "$DATA_DIR/installed-version.txt"
 

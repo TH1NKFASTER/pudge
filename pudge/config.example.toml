@@ -95,6 +95,15 @@ mpv_correct_match = "c"
 energy_monitoring_enabled = false
 energy_sample_seconds = 30.0
 
+[companion]
+# Disabled until a companion client is paired. Keep 127.0.0.1 for local-only
+# development; use 0.0.0.0 only on a trusted LAN.
+enabled = false
+bind_host = "127.0.0.1"
+port = 47821
+pairing_ttl_seconds = 300.0
+max_events_per_request = 500
+
 [tools]
 mpv = "mpv"
 ffmpeg = "ffmpeg"

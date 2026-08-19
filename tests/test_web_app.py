@@ -602,8 +602,10 @@ def test_play_monitor_refreshes_cards_when_episode_is_counted() -> None:
 def test_installer_builds_real_native_named_app_bundle() -> None:
     source = Path(__file__).parents[1].joinpath("install.sh").read_text(encoding="utf-8")
     assert "/usr/bin/clang" in source
-    assert "execv(python, child_argv)" in source
-    assert 'child_argv[out++] = "pudge.app_entry";' in source
+    assert "Py_InitializeFromConfig(&config)" in source
+    assert 'PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry")' in source
+    assert "return Py_RunMain();" in source
+    assert "execv(python" not in source
     assert "<key>CFBundleExecutable</key><string>$APP_NAME</string>" in source
     assert "PUDGE_PYTHON" in source
     assert "PyInstaller" not in source
@@ -925,7 +927,7 @@ def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> No
 def test_final_pipeline_cache_schema_bumped_for_cold_open_fix() -> None:
     from pudge import pipeline_cache
 
-    assert pipeline_cache._CACHE_SCHEMA == "final-pipeline-v9"
+    assert pipeline_cache._CACHE_SCHEMA == "final-pipeline-v10"
 
 
 

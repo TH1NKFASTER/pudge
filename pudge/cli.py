@@ -734,6 +734,18 @@ def _jimaku_episode_aliases(
         allow_network=True,
     )
 
+def _authoritative_online_identity(
+    identity: VideoIdentity,
+    episode_hint: int | None,
+    anime: AniListAnime | None,
+) -> VideoIdentity:
+    """Use the manager's season-local episode for online subtitle discovery."""
+    if anime is None or episode_hint is None or int(episode_hint) < 1:
+        return identity
+    episode = int(episode_hint)
+    return identity if identity.episode == episode else replace(identity, episode=episode)
+
+
 def _find_online_subtitles(
     video: Path,
     identity: VideoIdentity,
@@ -1584,6 +1596,22 @@ def process_video(
             if candidate.score >= config.matching.local_min_score
         )
 
+        # When the manager invokes subtitle preparation it already knows the
+        # season-local episode. Filenames from release groups may use absolute
+        # numbering (Seihantai S2: local 7 == release 19). Keep local-file
+        # matching on the raw filename identity, but give Jimaku the
+        # authoritative episode so its alias resolver can include both 7 and 19.
+        authoritative_anime = anime_hint or tracking_anime
+        online_identity = _authoritative_online_identity(
+            identity, args.episode_hint, authoritative_anime
+        )
+        if online_identity is not identity:
+            logger.info(
+                "RESULT step=jimaku.authoritative_episode video=%s filename_episode=%s "
+                "media_episode=%s anilist_id=%s",
+                video.name, identity.episode, online_identity.episode, authoritative_anime.id,
+            )
+
         # When full comparison is enabled, a merely acceptable local subtitle
         # should not block a substantially better Jimaku release.
         if not args.offline and (config.matching.evaluate_all_jimaku or not candidates):
@@ -1591,11 +1619,11 @@ def process_video(
             candidates.extend(
                 _find_online_subtitles(
                     video,
-                    identity,
+                    online_identity,
                     config,
                     llm,
                     args.verbose,
-                    anime_hint=anime_hint or tracking_anime,
+                    anime_hint=authoritative_anime,
                     skip_airing_lookup=args.skip_airing_lookup,
                 )
             )

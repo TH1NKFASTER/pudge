@@ -249,7 +249,7 @@ def test_schema_and_frontend_contracts_cover_v072_features() -> None:
     manga = (root / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
     audio = (root / "pudge/web/media.js").read_text(encoding="utf-8")
     media_css = (root / "pudge/web/media.css").read_text(encoding="utf-8")
-    assert LATEST_SCHEMA_VERSION == 5
+    assert LATEST_SCHEMA_VERSION == 6
     assert 'data-manga-context-action="score"' in manga
     assert 'data-manga-context-action="ocr-book"' in manga
     assert "data-manga-score-book" not in manga
@@ -258,10 +258,11 @@ def test_schema_and_frontend_contracts_cover_v072_features() -> None:
     assert "parseRegionsSequentially" in manga
     assert "cachedOnly: true" in manga
     assert "pollCurrentBookPreparation" in manga
-    assert "closeRegionsOutsidePointer" in manga
+    assert "function mangaRegionReadingOrder(regions)" in manga
     assert "PAGE_CACHE_LIMIT = 8" in manga
-    assert "mokuro-regions-v4" in (root / "pudge/manga.py").read_text(encoding="utf-8")
-    assert "if (content) content.remove()" in manga
+    assert "pudge-manga-regions-v5" in (root / "pudge/manga.py").read_text(encoding="utf-8")
+    assert "if (content) content.remove()" not in manga
+    assert "if (target) renderRegionContent(target, region, payload);" in manga
     assert "showLiteratureScoreModal" in html
     assert "planning_search_anilist" in (root / "pudge/web_app.py").read_text(encoding="utf-8")
     assert "audiobook-scrubber" in audio

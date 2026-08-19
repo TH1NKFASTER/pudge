@@ -16,19 +16,23 @@ from pudge.reading_audio_alignment import (
 from pudge.visual_novels import VisualNovelService
 
 
-def test_v4_schema_has_shared_identity_and_name_overrides(tmp_path: Path) -> None:
+def test_latest_schema_has_shared_identity_and_name_overrides(tmp_path: Path) -> None:
     path = tmp_path / "library.sqlite3"
     Database(path)
     with sqlite3.connect(path) as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert LATEST_SCHEMA_VERSION == version == 5
+    assert LATEST_SCHEMA_VERSION == version == 6
     assert {"character_name_overrides", "media_identities"} <= tables
 
 
 def test_user_character_name_overrides_win_without_anilist(tmp_path: Path) -> None:
     config = SimpleNamespace(
-        library=SimpleNamespace(database_path=tmp_path / "library.sqlite3", root_dir=tmp_path),
+        library=SimpleNamespace(
+            database_path=tmp_path / "library.sqlite3",
+            root_dir=tmp_path,
+            cover_cache_dir=tmp_path / "covers",
+        ),
         paths=SimpleNamespace(cache_dir=tmp_path / "cache"),
         anilist=SimpleNamespace(enabled=False, access_token=""),
         ui=SimpleNamespace(language="en"),
@@ -89,7 +93,9 @@ def test_frontend_contracts_for_requested_batch() -> None:
     assert "light_novel_play_paired_at_offset" in html
     assert "await loadLightNovels(true);return;}\n    if(target.id==='lnPairedAudio'" not in html
     assert "anchorRect" in reading
-    assert "target.classList.contains('active')" in manga
+    assert "activateTextRegion" not in manga
+    assert "deactivateTextRegion" not in manga
+    assert "mangaRegionReadingOrder" in manga
     assert 'data-page="visualnovels"' in html
     assert "visual_novel_start" in vn
     assert "media_identity_search" in html

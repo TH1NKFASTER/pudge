@@ -99,4 +99,4 @@ def test_episode_debug_translation_and_download_controls_are_exposed() -> None:
     assert "pudgeDebugEpisodeSelect" in debug
     assert "study_subtitle_history" in lua and "secondary-sub-text" in lua
     assert "open_subtitle_study" not in lua
-    assert "torrent-stop-all" in web and "backend_id" in web
+    assert "torrent-stop-all" not in web and "backend_id" in web

@@ -8,6 +8,8 @@ from typing import Any
 
 
 _IGNORED_CATEGORIES = {"Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps", "Zl", "Zp", "Zs"}
+_STRONG_PUNCTUATION = frozenset("。！？!?…")
+_SOFT_PUNCTUATION = frozenset("、，,；;：:")
 
 
 def normalize_reading_text(value: str) -> str:
@@ -20,6 +22,215 @@ def normalize_reading_text(value: str) -> str:
         if not character.isspace()
         and unicodedata.category(character) not in _IGNORED_CATEGORIES
     )
+
+
+def _punctuation_boundaries(value: str) -> list[dict[str, int]]:
+    """Return spoken-text offsets where punctuation can explain a pause."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    offset = 0
+    strengths: dict[int, int] = {}
+    for character in normalized:
+        if character in "\r\n":
+            if offset:
+                strengths[offset] = max(3, strengths.get(offset, 0))
+            continue
+        if character in _STRONG_PUNCTUATION:
+            if offset:
+                strengths[offset] = max(3, strengths.get(offset, 0))
+            continue
+        if character in _SOFT_PUNCTUATION:
+            if offset:
+                strengths[offset] = max(1, strengths.get(offset, 0))
+            continue
+        if character.isspace() or unicodedata.category(character) in _IGNORED_CATEGORIES:
+            continue
+        offset += 1
+    return [
+        {"offset": boundary, "strength": strength}
+        for boundary, strength in sorted(strengths.items())
+    ]
+
+
+def _median(values: list[float]) -> float:
+    rows = sorted(float(value) for value in values)
+    middle = len(rows) // 2
+    if len(rows) % 2:
+        return rows[middle]
+    return (rows[middle - 1] + rows[middle]) / 2
+
+
+def _dense_anchor_clock(
+    matches: Iterable[tuple[int, int]],
+    *,
+    anchor_size: int,
+    transcript_times: list[float],
+    chapter_length: int,
+) -> list[dict[str, float | int]]:
+    """Keep every known character boundary inside each exact n-gram match."""
+
+    candidates: dict[int, list[float]] = {}
+    for novel_offset, transcript_offset in matches:
+        available = min(
+            max(0, int(anchor_size)),
+            max(0, int(chapter_length) - int(novel_offset)),
+            max(0, len(transcript_times) - 1 - int(transcript_offset)),
+        )
+        for delta in range(available + 1):
+            candidates.setdefault(int(novel_offset) + delta, []).append(
+                float(transcript_times[int(transcript_offset) + delta])
+            )
+
+    clock: list[dict[str, float | int]] = []
+    last_time = float("-inf")
+    for offset, values in sorted(candidates.items()):
+        time = _median(values)
+        if time <= last_time + 0.0005:
+            later = [value for value in values if value > last_time + 0.0005]
+            if not later:
+                continue
+            time = _median(later)
+        clock.append({"offset": int(offset), "time": round(time, 3)})
+        last_time = time
+    return clock
+
+
+def _linear_offset_at_time(
+    anchors: list[dict[str, Any]],
+    position: float,
+) -> float:
+    if not anchors:
+        return 0.0
+    position = float(position)
+    for left, right in pairwise(anchors):
+        left_time = float(left["time"])
+        right_time = float(right["time"])
+        if position <= right_time:
+            ratio = (position - left_time) / max(0.02, right_time - left_time)
+            return float(left["offset"]) + max(0.0, min(1.0, ratio)) * (
+                float(right["offset"]) - float(left["offset"])
+            )
+    return float(anchors[-1]["offset"])
+
+
+def _inject_punctuation_pause_anchors(
+    anchors: list[dict[str, Any]],
+    boundaries: Iterable[dict[str, Any]],
+    speech_regions: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Hold the text clock at nearby punctuation during acoustic silence."""
+
+    if len(anchors) < 2:
+        return anchors, 0
+    regions = _clip_activity_regions(
+        speech_regions,
+        float(anchors[0]["time"]),
+        float(anchors[-1]["time"]),
+    )
+    if len(regions) < 2:
+        return anchors, 0
+
+    boundary_rows = [
+        {
+            "offset": int(row.get("offset") or 0),
+            "strength": int(row.get("strength") or 0),
+        }
+        for row in boundaries
+        if isinstance(row, dict) and int(row.get("offset") or 0) > 0
+    ]
+    if not boundary_rows:
+        return anchors, 0
+
+    additions: list[dict[str, float | int]] = []
+    pause_windows: list[tuple[float, float, int]] = []
+    used: set[int] = set()
+    for previous, following in pairwise(regions):
+        gap_start = float(previous["end"])
+        gap_end = float(following["start"])
+        gap = gap_end - gap_start
+        if gap < 0.12:
+            continue
+
+        before = [
+            row for row in anchors if float(row["time"]) <= gap_start + 1e-6
+        ]
+        after = [
+            row for row in anchors if float(row["time"]) >= gap_end - 1e-6
+        ]
+        if not before or not after:
+            continue
+        minimum_offset = int(before[-1]["offset"])
+        maximum_offset = int(after[0]["offset"])
+        if maximum_offset < minimum_offset:
+            continue
+
+        expected = _linear_offset_at_time(anchors, (gap_start + gap_end) / 2)
+        choices: list[tuple[float, dict[str, int]]] = []
+        for row in boundary_rows:
+            offset = int(row["offset"])
+            strength = int(row["strength"])
+            if offset in used or not minimum_offset <= offset <= maximum_offset:
+                continue
+            if strength < 3 and gap < 0.18:
+                continue
+            span = max(1.0, float(maximum_offset - minimum_offset))
+            allowance = max(2.0 if strength >= 3 else 1.25, span * (0.45 if strength >= 3 else 0.30))
+            distance = abs(float(offset) - expected)
+            if distance > allowance:
+                continue
+            choices.append((distance - strength * 0.12, row))
+        if not choices:
+            continue
+
+        chosen = min(choices, key=lambda item: item[0])[1]
+        pause_offset = int(chosen["offset"])
+        hold_offset = max(0.0, float(pause_offset) - 0.001)
+        used.add(pause_offset)
+        pause_windows.append((gap_start, gap_end, pause_offset))
+        hold_end = max(gap_start, gap_end - 0.001)
+        additions.extend(
+            [
+                {"offset": hold_offset, "time": round(gap_start, 3)},
+                {"offset": hold_offset, "time": round(hold_end, 3)},
+                {"offset": pause_offset, "time": round(gap_end, 3)},
+            ]
+        )
+
+    if not additions:
+        return anchors, 0
+
+    retained: list[dict[str, Any]] = []
+    for row in anchors:
+        row_time = float(row["time"])
+        if any(
+            gap_start + 1e-6 < row_time < gap_end - 1e-6
+            for gap_start, gap_end, _pause_offset in pause_windows
+        ):
+            continue
+        retained.append(dict(row))
+
+    merged = retained + additions
+    merged.sort(key=lambda row: (float(row["time"]), float(row["offset"])))
+    output: list[dict[str, Any]] = []
+    for row in merged:
+        time = round(float(row["time"]), 3)
+        raw_offset = float(row["offset"])
+        rounded_offset = round(raw_offset)
+        offset: float | int = (
+            int(rounded_offset)
+            if abs(raw_offset - rounded_offset) < 1e-6
+            else round(raw_offset, 4)
+        )
+        if (
+            output
+            and time == float(output[-1]["time"])
+            and abs(float(offset) - float(output[-1]["offset"])) < 1e-6
+        ):
+            continue
+        if output and float(offset) < float(output[-1]["offset"]) - 1e-6:
+            continue
+        output.append({"offset": offset, "time": time})
+    return output, len(pause_windows)
 
 
 def _transcript_clock(segments: Iterable[dict[str, Any]]) -> tuple[str, list[float]]:
@@ -268,6 +479,9 @@ def align_light_novel_to_transcript(
                 "global_start": start,
                 "global_end": cursor,
                 "length": len(normalized),
+                "punctuation_boundaries": _punctuation_boundaries(
+                    str(chapter.get("text") or "")
+                ),
             }
         )
     novel = "".join(novel_parts)
@@ -290,13 +504,12 @@ def align_light_novel_to_transcript(
         span = local[-1][0] - local[0][0] + anchor_size
         if len(local) < 4 and span < chapter["length"] * 0.20:
             continue
-        clock = [
-            {
-                "offset": int(offset),
-                "time": round(float(transcript_times[min(transcript_index_, len(transcript_times) - 1)]), 3),
-            }
-            for offset, transcript_index_ in local
-        ]
+        clock = _dense_anchor_clock(
+            local,
+            anchor_size=anchor_size,
+            transcript_times=transcript_times,
+            chapter_length=int(chapter["length"]),
+        )
         first_time = float(clock[0]["time"])
         last_time = float(clock[-1]["time"])
         character_rate = (
@@ -319,11 +532,67 @@ def align_light_novel_to_transcript(
                 "estimated_start": estimated_start,
                 "estimated_end": estimated_end,
                 "anchors": clock,
+                "punctuation_boundaries": list(
+                    chapter.get("punctuation_boundaries") or []
+                ),
                 "confidence": round(min(1.0, span / max(1, chapter["length"])), 4),
             }
         )
     if not aligned:
         raise ValueError("STT text did not match any readable LN chapter")
+
+    aligned_by_index = {int(row["chapter_index"]): row for row in aligned}
+    ordered_ranges = sorted(chapter_ranges, key=lambda row: int(row["chapter_index"]))
+    if len(aligned_by_index) >= 2:
+        available_indexes = sorted(aligned_by_index)
+        for position, source in enumerate(ordered_ranges):
+            chapter_index = int(source["chapter_index"])
+            if chapter_index in aligned_by_index:
+                continue
+            left_candidates = [value for value in available_indexes if value < chapter_index]
+            right_candidates = [value for value in available_indexes if value > chapter_index]
+            if not left_candidates or not right_candidates:
+                continue
+            left = aligned_by_index[left_candidates[-1]]
+            right = aligned_by_index[right_candidates[0]]
+            left_end = float(left.get("estimated_end", left["last_anchor_time"]))
+            right_start = float(right.get("estimated_start", right["first_anchor_time"]))
+            gap_duration = right_start - left_end
+            if gap_duration < 0.25:
+                continue
+            between = [row for row in ordered_ranges if left_candidates[-1] < int(row["chapter_index"]) < right_candidates[0]]
+            total_chars = sum(int(row["length"]) for row in between) or 1
+            elapsed = 0.0
+            for row in between:
+                span = gap_duration * int(row["length"]) / total_chars
+                start_time = left_end + elapsed
+                end_time = start_time + span
+                elapsed += span
+                if int(row["chapter_index"]) != chapter_index:
+                    continue
+                aligned.append(
+                    {
+                        "chapter_index": int(row["chapter_index"]),
+                        "title": row["title"],
+                        "normalized_length": int(row["length"]),
+                        "first_anchor_time": start_time,
+                        "last_anchor_time": end_time,
+                        "estimated_start": start_time,
+                        "estimated_end": end_time,
+                        "anchors": [
+                            {"offset": 0, "time": round(start_time, 3)},
+                            {"offset": int(row["length"]), "time": round(end_time, 3)},
+                        ],
+                        "punctuation_boundaries": list(row.get("punctuation_boundaries") or []),
+                        "confidence": 0.35,
+                        "interpolated": True,
+                    }
+                )
+                aligned_by_index[chapter_index] = aligned[-1]
+                available_indexes = sorted(aligned_by_index)
+                break
+
+    aligned.sort(key=lambda row: int(row["chapter_index"]))
 
     for index, chapter in enumerate(aligned):
         if index:
@@ -353,6 +622,12 @@ def align_light_novel_to_transcript(
             float(chapter["start"]),
             float(chapter["end"]),
         )
+        chapter["anchors"], pause_count = _inject_punctuation_pause_anchors(
+            list(chapter["anchors"]),
+            chapter.pop("punctuation_boundaries", []),
+            chapter["speech_regions"],
+        )
+        chapter["punctuation_pause_count"] = pause_count
         for key in ("first_anchor_time", "last_anchor_time", "estimated_start", "estimated_end"):
             chapter.pop(key, None)
 
@@ -362,12 +637,15 @@ def align_light_novel_to_transcript(
         "duration": round(float(duration), 3),
         "transcript_characters": len(transcript),
         "novel_characters": len(novel),
-        "anchor_count": len(anchors),
+        "anchor_count": sum(len(row.get("anchors") or []) for row in aligned),
+        "matched_anchor_count": len(anchors),
+        "punctuation_pause_count": sum(
+            int(row.get("punctuation_pause_count") or 0) for row in aligned
+        ),
         "anchor_size": anchor_size,
         "chapters": aligned,
         "confidence": round(sum(float(row["confidence"]) for row in aligned) / len(aligned), 4),
     }
-
 
 def audio_position_for_light_novel(
     alignment: dict[str, Any], chapter_index: int, progress: float
@@ -384,16 +662,14 @@ def audio_position_for_light_novel(
         return None
     target = max(0.0, min(1.0, float(progress))) * max(1, int(chapter["normalized_length"]))
     anchors = list(chapter.get("anchors") or [])
-    speech_regions = list(chapter.get("speech_regions") or [])
     for left, right in pairwise(anchors):
         left_offset, right_offset = float(left["offset"]), float(right["offset"])
         if target <= right_offset:
             ratio = (target - left_offset) / max(1.0, right_offset - left_offset)
-            return _time_for_activity_ratio(
-                speech_regions,
-                float(left["time"]),
-                float(right["time"]),
-                ratio,
+            left_time = float(left["time"])
+            right_time = float(right["time"])
+            return left_time + max(0.0, min(1.0, ratio)) * (
+                right_time - left_time
             )
     return float(chapter["end"])
 
@@ -401,7 +677,7 @@ def audio_position_for_light_novel(
 def audio_position_for_light_novel_offset(
     alignment: dict[str, Any], chapter_index: int, character_offset: int
 ) -> float | None:
-    """Resolve a normalized LN character offset on the acoustic speech clock."""
+    """Resolve a normalized LN character offset on the linear anchor clock."""
 
     chapter = next(
         (
@@ -417,20 +693,24 @@ def audio_position_for_light_novel_offset(
     if not anchors:
         return None
     target = max(0.0, min(float(character_offset), float(chapter.get("normalized_length") or 0)))
-    speech_regions = list(chapter.get("speech_regions") or [])
+    exact_times = [
+        float(row.get("time") or 0.0)
+        for row in anchors
+        if abs(float(row.get("offset") or 0.0) - target) < 1e-6
+    ]
+    if exact_times:
+        return max(exact_times)
     for left, right in pairwise(anchors):
         left_offset = float(left.get("offset") or 0.0)
         right_offset = float(right.get("offset") or left_offset)
         if target <= right_offset:
             ratio = (target - left_offset) / max(1.0, right_offset - left_offset)
-            return _time_for_activity_ratio(
-                speech_regions,
-                float(left.get("time") or 0.0),
-                float(right.get("time") or 0.0),
-                ratio,
+            left_time = float(left.get("time") or 0.0)
+            right_time = float(right.get("time") or left_time)
+            return left_time + max(0.0, min(1.0, ratio)) * (
+                right_time - left_time
             )
     return float(anchors[-1].get("time") or chapter.get("end") or 0.0)
-
 
 def light_novel_position_for_audio(
     alignment: dict[str, Any], position: float
@@ -459,28 +739,51 @@ def light_novel_position_for_audio(
     left_anchor = anchors[0]
     right_anchor = anchors[0]
     speech_regions = list(chapter.get("speech_regions") or [])
-    for left, right in pairwise(anchors):
+    anchor_index = 0
+    for anchor_index, (left, right) in enumerate(pairwise(anchors)):
         if float(position) <= float(right["time"]):
-            ratio = _activity_ratio(
-                speech_regions,
-                float(left["time"]),
-                float(right["time"]),
-                float(position),
-            )
-            target_offset = float(left["offset"]) + max(0.0, min(1.0, ratio)) * (float(right["offset"]) - float(left["offset"]))
+            left_time = float(left["time"])
+            right_time = float(right["time"])
+            if abs(float(position) - right_time) < 1e-6:
+                target_offset = float(right["offset"])
+            else:
+                ratio = (float(position) - left_time) / max(
+                    0.02,
+                    right_time - left_time,
+                )
+                target_offset = float(left["offset"]) + max(0.0, min(1.0, ratio)) * (float(right["offset"]) - float(left["offset"]))
             left_anchor = left
             right_anchor = right
             break
     else:
         target_offset = float(chapter["normalized_length"])
+        anchor_index = max(0, len(anchors) - 2)
         if len(anchors) > 1:
             left_anchor, right_anchor = anchors[-2], anchors[-1]
+
+    anchor_path: list[dict[str, float]] = []
+    horizon = float(position) + 2.5
+    for row in anchors[anchor_index:]:
+        if not isinstance(row, dict):
+            continue
+        try:
+            path_time = float(row["time"])
+            path_offset = float(row["offset"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        anchor_path.append({"time": path_time, "offset": path_offset})
+        if len(anchor_path) >= 2 and path_time >= horizon:
+            break
+        if len(anchor_path) >= 64:
+            break
+
     length = max(1, int(chapter["normalized_length"]))
     anchor_window: dict[str, Any] = {
         "left_time": float(left_anchor["time"]),
         "left_offset": float(left_anchor["offset"]),
         "right_time": float(right_anchor["time"]),
         "right_offset": float(right_anchor["offset"]),
+        "path": anchor_path,
     }
     window_activity = _clip_activity_regions(
         speech_regions,

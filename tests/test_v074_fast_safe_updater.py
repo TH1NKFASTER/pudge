@@ -17,8 +17,10 @@ def test_in_app_updates_preserve_runtime_environment() -> None:
 def test_native_app_uses_managed_pudge_without_frozen_copy() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     assert "/usr/bin/clang" in installer
-    assert "execv(python, child_argv)" in installer
-    assert 'child_argv[out++] = "pudge.app_entry";' in installer
+    assert "Py_InitializeFromConfig(&config)" in installer
+    assert 'PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry")' in installer
+    assert "return Py_RunMain();" in installer
+    assert "execv(python" not in installer
     assert "--collect-all pudge" not in installer
     assert "PyInstaller" not in installer
 

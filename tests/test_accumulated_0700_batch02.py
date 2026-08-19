@@ -23,5 +23,5 @@ def test_batch02_static_contracts() -> None:
     assert "AniList #${book.anilist_id}" not in html and "book.anilist_status?`<span>" not in html and "data-ln-context-action" in html
     assert "if (has('s_agent_enabled')) return 'advanced';" in settings and "s_playback_enabled', 's_agent_enabled" not in settings
     assert "debug_reselect_subtitles" in web and "fresh-subtitles" in debug and "--force-search" in manager and "--resync" in manager
-    assert "audiobookImportFolder" in media and "stop-audio" in media and "delete-audio" in media and "choose_audiobook_folder" in web and "audiobook_stop" in web and "audiobook_delete" in web
+    assert "audiobookImportFolder" not in media and "stop-audio" in media and "delete-audio" in media and "audiobook_stop" in web and "audiobook_delete" in web
     assert "config.aria2.enabled = True" not in install

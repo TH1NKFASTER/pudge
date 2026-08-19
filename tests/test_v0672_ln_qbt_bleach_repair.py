@@ -193,7 +193,7 @@ def test_ln_cards_and_settings_match_v0672_ui() -> None:
     assert 'id="s_ln_nyaa_category"' not in html
 
     settings_block = html.split('<input id="s_anilist_enabled"', 1)[1].split(
-        '<div class="setting-block"><h3>${t(\'settings.lightNovels\')}</h3>', 1
+        '<div class="setting-block" data-settings-category="essential"><h3>${ui.lang===\'ru\'?\'Jiten / JPDB\'', 1
     )[0]
     assert "action.anilistDocs" not in settings_block
     assert html.count("https://docs.anilist.co/guide/auth/") == 1

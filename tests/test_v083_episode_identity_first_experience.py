@@ -18,7 +18,7 @@ from pudge.manager_models import DownloadItem, LibraryEpisode
 def test_schema_v5_backfills_separate_episode_identity(tmp_path: Path) -> None:
     path = tmp_path / "library.sqlite3"
     db = Database(path)
-    assert LATEST_SCHEMA_VERSION == 5
+    assert LATEST_SCHEMA_VERSION == 6
     with db.connect() as conn:
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()

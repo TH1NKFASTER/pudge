@@ -8,15 +8,16 @@
     if (has('s_library', 's_watched_folders', 's_disk_limit_enabled')) return 'library';
     if (has('s_subtitle_folders', 's_ocr_image_subtitles')) return 'subtitles';
     if (has('s_qbt_enabled', 's_aria2_enabled', 's_nyaa_enabled')) return 'downloads';
-    if (has('s_ln_jiten_key', 'mangaOcrStatus', 'installMangaOcr')) return 'reading';
+    if (has('s_ln_jiten_key')) return 'essential';
+    if (has('s_ln_parse_ahead', 'mangaOcrStatus', 'installMangaOcr')) return 'advanced';
     if (has('s_playback_enabled')) return 'advanced';
     if (has('s_agent_enabled')) return 'advanced';
     return 'advanced';
   };
 
   const labels = {
-    en: {essential: 'Essential', library: 'Library', subtitles: 'Subtitles', downloads: 'Downloads', reading: 'Reading', advanced: 'Advanced'},
-    ru: {essential: 'Основное', library: 'Библиотека', subtitles: 'Субтитры', downloads: 'Загрузки', reading: 'Чтение', advanced: 'Дополнительно'},
+    en: {essential: 'Essential', library: 'Library', subtitles: 'Subtitles', downloads: 'Downloads', advanced: 'Advanced'},
+    ru: {essential: 'Основное', library: 'Библиотека', subtitles: 'Субтитры', downloads: 'Загрузки', advanced: 'Дополнительно'},
   };
 
   let active = 'essential';
@@ -37,7 +38,7 @@
     const root = document.getElementById('settingsContent');
     if (!root || root.querySelector('.settings-categories')) return;
     root.querySelectorAll('.setting-block').forEach(block => {
-      block.dataset.settingsCategory = categoryFor(block);
+      block.dataset.settingsCategory = block.dataset.settingsCategory || categoryFor(block);
     });
     const strings = labels[language] || labels.en;
     const tabs = document.createElement('div');
@@ -88,5 +89,7 @@
     }
   });
 
-  window.PudgeSettings = {enhance, focusAction};
+  const refresh = () => { const root = document.getElementById('settingsContent'); if (root) show(root, active); };
+
+  window.PudgeSettings = {enhance, focusAction, refresh};
 })();

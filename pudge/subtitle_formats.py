@@ -50,6 +50,43 @@ _SIMPLIFIED_CHINESE_HINTS = set(
 )
 
 
+_FILENAME_JAPANESE_MARKER_RE = re.compile(
+    r"(?i)(?:^|[\s._\-\[\(,])"
+    r"(?:ja(?:\[cc\])?|jp|jpn|japanese|日本語)"
+    r"(?:$|[\s._\-\[\]\),])"
+)
+_FILENAME_CHINESE_MARKER_RE = re.compile(
+    r"(?i)(?:^|[\s._\-\[\(,])"
+    r"(?:chs|cht|chi|zho|zh(?:[-_](?:cn|tw|hans|hant))?|chinese|中文|简中|繁中|簡中)"
+    r"(?:$|[\s._\-\[\]\),])"
+)
+
+
+def subtitle_filename_language_profile(filename: str | Path) -> dict[str, object]:
+    """Classify explicit Japanese/Chinese language markers in a subtitle name."""
+    name = Path(filename).name
+    japanese = bool(_FILENAME_JAPANESE_MARKER_RE.search(name))
+    chinese = bool(_FILENAME_CHINESE_MARKER_RE.search(name))
+    if japanese and chinese:
+        purity = "mixed_japanese_chinese"
+        priority = 0
+    elif japanese:
+        purity = "japanese_only"
+        priority = 2
+    elif chinese:
+        purity = "chinese_only"
+        priority = 0
+    else:
+        purity = "unknown"
+        priority = 1
+    return {
+        "purity": purity,
+        "priority": priority,
+        "japanese_marker": japanese,
+        "chinese_marker": chinese,
+    }
+
+
 def format_preference_bonus(filename: str | Path, prefer_srt: bool = True) -> float:
     """Format-quality prior: native SRT is safer than post-processed ASS/SSA."""
     if not prefer_srt:
@@ -175,6 +212,50 @@ def _cue_script_kind(text: str) -> str:
     return "other"
 
 
+def _parallel_han_cue_indices(
+    cues: list[tuple[float, float, str]],
+    kinds: list[str] | None = None,
+    *,
+    timestamp_tolerance: float = 0.180,
+) -> set[int]:
+    """Find Han-only cues sharing essentially the same interval with Japanese cues."""
+    resolved_kinds = kinds or [_cue_script_kind(text) for _start, _end, text in cues]
+    japanese = sorted(
+        [
+            (index, start, end)
+            for index, ((start, end, _text), kind) in enumerate(zip(cues, resolved_kinds))
+            if kind == "japanese"
+        ],
+        key=lambda item: (item[1], item[2]),
+    )
+    paired: set[int] = set()
+    for index, ((start, end, _text), kind) in enumerate(zip(cues, resolved_kinds)):
+        if kind != "han_only":
+            continue
+        duration = max(end - start, 0.001)
+        for _japanese_index, japanese_start, japanese_end in japanese:
+            if japanese_start > end + timestamp_tolerance:
+                break
+            if japanese_end < start - timestamp_tolerance:
+                continue
+            same_interval = (
+                abs(start - japanese_start) <= timestamp_tolerance
+                and abs(end - japanese_end) <= timestamp_tolerance
+            )
+            japanese_duration = max(japanese_end - japanese_start, 0.001)
+            overlap = max(0.0, min(end, japanese_end) - max(start, japanese_start))
+            overlap_ratio = overlap / max(min(duration, japanese_duration), 0.001)
+            near_parallel = bool(
+                abs(start - japanese_start) <= 0.350
+                and abs(end - japanese_end) <= 0.350
+                and overlap_ratio >= 0.90
+            )
+            if same_interval or near_parallel:
+                paired.add(index)
+                break
+    return paired
+
+
 def bilingual_cjk_profile(
     cues: list[tuple[float, float, str]],
 ) -> dict[str, object]:
@@ -189,14 +270,18 @@ def bilingual_cjk_profile(
         left != right and {left, right} == {"japanese", "han_only"}
         for left, right in zip(kinds, kinds[1:])
     )
+    parallel_han = len(_parallel_han_cue_indices(cues, kinds))
     relevant = japanese + han_only
     transition_ratio = transitions / max(relevant - 1, 1)
     short_han_ratio = short_han / max(han_only, 1)
+    parallel_han_ratio = parallel_han / max(han_only, 1)
     suspected = bool(
         japanese >= 20
         and han_only >= 20
-        and short_han_ratio >= 0.50
-        and transition_ratio >= 0.35
+        and (
+            (short_han_ratio >= 0.50 and transition_ratio >= 0.35)
+            or parallel_han_ratio >= 0.50
+        )
     )
     return {
         "suspected_bilingual_cjk": suspected,
@@ -204,9 +289,10 @@ def bilingual_cjk_profile(
         "han_only_cues": han_only,
         "short_han_cues": short_han,
         "short_han_ratio": round(short_han_ratio, 4),
+        "parallel_han_cues": parallel_han,
+        "parallel_han_ratio": round(parallel_han_ratio, 4),
         "alternating_ratio": round(transition_ratio, 4),
     }
-
 
 def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
     suffix = path.suffix.casefold()
@@ -239,29 +325,74 @@ def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
     return bilingual_cjk_profile(cues)
 
 
+def _filter_inline_chinese_lines(
+    cues: list[tuple[float, float, str]],
+) -> tuple[list[tuple[float, float, str]], int]:
+    """Drop a Chinese translation line embedded in the same subtitle cue.
+
+    Some JP+CN releases store Japanese and Chinese as two lines inside one ASS
+    Dialogue/SRT cue. Cue-level script classification then sees kana and treats
+    the whole cue as Japanese, so the old parallel-cue filter cannot remove the
+    Chinese half. Keep short kanji-only Japanese fragments conservatively.
+    """
+    filtered: list[tuple[float, float, str]] = []
+    removed = 0
+    for start, end, text in cues:
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if len(lines) < 2:
+            filtered.append((start, end, text))
+            continue
+        kinds = [_cue_script_kind(line) for line in lines]
+        has_japanese = any(kind == "japanese" for kind in kinds)
+        if not has_japanese or not any(kind == "han_only" for kind in kinds):
+            filtered.append((start, end, text))
+            continue
+        kept: list[str] = []
+        for line, kind in zip(lines, kinds):
+            if kind != "han_only":
+                kept.append(line)
+                continue
+            compact = re.sub(r"[^\u3400-\u4dbf\u4e00-\u9fff]", "", line)
+            has_simplified_hint = any(ch in _SIMPLIFIED_CHINESE_HINTS for ch in compact)
+            likely_translation = bool(has_simplified_hint or len(compact) >= 4)
+            if likely_translation:
+                removed += 1
+                continue
+            kept.append(line)
+        cleaned = "\n".join(kept).strip()
+        if cleaned:
+            filtered.append((start, end, cleaned))
+    return filtered, removed
+
+
 def _filter_parallel_chinese_cues(
     cues: list[tuple[float, float, str]],
 ) -> tuple[list[tuple[float, float, str]], dict[str, object]]:
+    cues, inline_removed = _filter_inline_chinese_lines(cues)
+    kinds = [_cue_script_kind(text) for _start, _end, text in cues]
+    paired_han_indices = _parallel_han_cue_indices(cues, kinds)
     profile = bilingual_cjk_profile(cues)
     if not profile.get("suspected_bilingual_cjk"):
+        profile = dict(profile)
+        profile["removed_inline_chinese_lines"] = inline_removed
+        profile["suspected_bilingual_cjk"] = bool(inline_removed)
         return cues, profile
 
     filtered: list[tuple[float, float, str]] = []
     removed = 0
-    for start, end, text in cues:
-        if _cue_script_kind(text) != "han_only":
+    for index, ((start, end, text), kind) in enumerate(zip(cues, kinds)):
+        if kind != "han_only":
             filtered.append((start, end, text))
             continue
         compact = re.sub(r"[^\u3400-\u4dbf\u4e00-\u9fff]", "", text)
         duration = end - start
         has_simplified_hint = any(ch in _SIMPLIFIED_CHINESE_HINTS for ch in compact)
-        # Parallel bilingual ASS tracks become alternating SRT cues after
-        # overlap removal. The translated line is usually squeezed to the
-        # minimum 300 ms duration. Longer full sentences and lines containing
-        # simplified-Chinese-only characters are also translations. Preserve
-        # short ambiguous kanji-only Japanese cues such as 私, 本当 or 大丈夫.
+        # A Han-only line sharing its interval with a kana-containing line is the
+        # parallel Chinese track. Remove it regardless of duration, while keeping
+        # unpaired short kanji-only Japanese cues such as 私, 本当 or 大丈夫.
         translated = bool(
-            duration <= 0.45
+            index in paired_han_indices
+            or duration <= 0.45
             or len(compact) > 4
             or has_simplified_hint
         )
@@ -272,10 +403,12 @@ def _filter_parallel_chinese_cues(
 
     profile = dict(profile)
     profile["removed_han_only_cues"] = removed
+    profile["removed_inline_chinese_lines"] = inline_removed
     profile["remaining_cues"] = len(filtered)
+    profile["suspected_bilingual_cjk"] = bool(
+        profile.get("suspected_bilingual_cjk") or inline_removed
+    )
     return filtered, profile
-
-
 
 def _merge_parallel_cues(
     cues: list[tuple[float, float, str]],
@@ -408,17 +541,17 @@ def clean_srt_for_playback(
     output_dir = (cache_dir / "playback-srt").expanduser()
     try:
         subtitle.resolve().relative_to(output_dir.resolve())
-        if subtitle.name.startswith("v12-"):
+        if subtitle.name.startswith("v14-"):
             return subtitle, {"reason": "already_clean", "cleaned": False}
     except ValueError:
         pass
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v12".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v14".encode()
     ).hexdigest()[:20]
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v12-{digest}.srt"
+    output = output_dir / f"v14-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
@@ -485,6 +618,9 @@ def _manual_ass_to_srt(source: Path, output: Path) -> bool:
             cues.append((start, end, payload))
     if not cues:
         return False
+    cues, _bilingual_profile = _filter_parallel_chinese_cues(cues)
+    if not cues:
+        return False
     cues, _parallel_merged = _merge_parallel_cues(cues)
     write_srt(cues, output)
     return True
@@ -507,17 +643,28 @@ def convert_to_plain_srt(
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v4".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v6".encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "converted"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v12-{digest}.srt"
+    output = output_dir / f"v14-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
         return output, {"reason": "cached", "converted": True, "output": str(output)}
 
-    resolved = shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path
+    filename_language = subtitle_filename_language_profile(subtitle.name)
+    explicit_mixed_cjk = (
+        filename_language.get("purity") == "mixed_japanese_chinese"
+    )
+    # ffmpeg may merge two ASS tracks into one multiline cue before we can
+    # identify the Chinese half. Explicit mixed files use the manual parser,
+    # which keeps parallel Dialogue events separate until filtering.
+    resolved = (
+        None
+        if explicit_mixed_cjk
+        else (shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path)
+    )
     ffmpeg_error = ""
     if resolved:
         command = [
@@ -542,15 +689,26 @@ def convert_to_plain_srt(
                 # Rewrite through our parser to strip any style tags retained by ffmpeg.
                 cues = parse_srt(output)
                 if cues:
-                    cues, parallel_merged = _merge_parallel_cues(cues)
-                    write_srt(cues, output)
-                    return output, {
-                        "reason": "converted",
-                        "converted": True,
-                        "method": "ffmpeg",
-                        "output": str(output),
-                        "parallel_merged": parallel_merged,
-                    }
+                    cues, bilingual_profile = _filter_parallel_chinese_cues(cues)
+                    if not cues:
+                        output.unlink(missing_ok=True)
+                    else:
+                        cues, parallel_merged = _merge_parallel_cues(cues)
+                        write_srt(cues, output)
+                        return output, {
+                            "reason": "converted",
+                            "converted": True,
+                            "method": "ffmpeg",
+                            "output": str(output),
+                            "parallel_merged": parallel_merged,
+                            "bilingual_cjk": bool(
+                                bilingual_profile.get("suspected_bilingual_cjk")
+                            ),
+                            "bilingual_removed": int(
+                                bilingual_profile.get("removed_han_only_cues") or 0
+                            ),
+                            "bilingual_profile": bilingual_profile,
+                        }
             ffmpeg_error = completed.stdout[-1000:]
         except (OSError, subprocess.TimeoutExpired) as exc:
             ffmpeg_error = str(exc)

@@ -62,6 +62,10 @@ def test_audio_position_exposes_exact_interpolation_window() -> None:
         "left_offset": 0.0,
         "right_time": 18.0,
         "right_offset": 40.0,
+        "path": [
+            {"time": 10.0, "offset": 0.0},
+            {"time": 18.0, "offset": 40.0},
+        ],
     }
 
 
@@ -146,7 +150,7 @@ def test_frontend_contracts_for_listen_together_and_planning_fallback() -> None:
 
     assert 'data-ln-audio-seek="15"' in html
     assert 'data-ln-audio-seek="30"' not in html
-    assert "ArrowLeft:-5,ArrowRight:5,ArrowUp:15,ArrowDown:-15" in html
+    assert "ArrowLeft:-5,ArrowRight:5,ArrowUp:-15,ArrowDown:15" in html
     assert "await showLnPopup(target.dataset.lnToken,target)" in html
     assert "Play from here" in html
     assert "startLnPairedInterpolation" in html

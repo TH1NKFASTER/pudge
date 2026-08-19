@@ -63,8 +63,11 @@ class NyaaConfig:
     proxy_url: str = ""
     pre_search_command: str = ""
     auto_download_current: bool = True
-    subsplease_rss_enabled: bool = False
-    subsplease_rss_preferred: bool = False
+    # Separate capability (configured backends) from the user's legal/intent
+    # switch. Searches stay available while torrent traffic is off.
+    torrents_enabled: bool = True
+    subsplease_rss_enabled: bool = True
+    subsplease_rss_preferred: bool = True
     auto_require_trusted: bool = True
     only_trusted_groups: bool = False
     min_release_score: float = 72.0
@@ -158,6 +161,15 @@ class ShortcutsConfig:
 class DiagnosticsConfig:
     energy_monitoring_enabled: bool = False
     energy_sample_seconds: float = 30.0
+
+
+@dataclass(slots=True)
+class CompanionConfig:
+    enabled: bool = False
+    bind_host: str = "127.0.0.1"
+    port: int = 47821
+    pairing_ttl_seconds: float = 300.0
+    max_events_per_request: int = 500
 
 
 @dataclass(slots=True)
@@ -281,6 +293,7 @@ class AppConfig:
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     shortcuts: ShortcutsConfig = field(default_factory=ShortcutsConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
+    companion: CompanionConfig = field(default_factory=CompanionConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     jimaku: JimakuConfig = field(default_factory=JimakuConfig)
     anilist: AniListConfig = field(default_factory=AniListConfig)
@@ -346,6 +359,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     playback = _section(raw, "playback")
     shortcuts = _section(raw, "shortcuts")
     diagnostics = _section(raw, "diagnostics")
+    companion = _section(raw, "companion")
     tools = _section(raw, "tools")
     jimaku = _section(raw, "jimaku")
     anilist = _section(raw, "anilist")
@@ -398,8 +412,9 @@ def load_config(path: Path | None = None) -> AppConfig:
             proxy_url=str(nyaa.get("proxy_url", "")).strip(),
             pre_search_command=str(nyaa.get("pre_search_command", "")).strip(),
             auto_download_current=bool(nyaa.get("auto_download_current", True)),
-            subsplease_rss_enabled=bool(nyaa.get("subsplease_rss_enabled", False)),
-            subsplease_rss_preferred=bool(nyaa.get("subsplease_rss_preferred", False)),
+            torrents_enabled=bool(nyaa.get("torrents_enabled", False)),
+            subsplease_rss_enabled=True,
+            subsplease_rss_preferred=True,
             auto_require_trusted=bool(nyaa.get("auto_require_trusted", True)),
             only_trusted_groups=bool(nyaa.get("only_trusted_groups", False)),
             min_release_score=float(nyaa.get("min_release_score", 72.0)),
@@ -483,6 +498,13 @@ def load_config(path: Path | None = None) -> AppConfig:
         diagnostics=DiagnosticsConfig(
             energy_monitoring_enabled=bool(diagnostics.get("energy_monitoring_enabled", False)),
             energy_sample_seconds=max(10.0, float(diagnostics.get("energy_sample_seconds", 30.0))),
+        ),
+        companion=CompanionConfig(
+            enabled=bool(companion.get("enabled", False)),
+            bind_host=str(companion.get("bind_host", "127.0.0.1")).strip() or "127.0.0.1",
+            port=max(1024, min(65535, int(companion.get("port", 47821)))),
+            pairing_ttl_seconds=max(30.0, float(companion.get("pairing_ttl_seconds", 300.0))),
+            max_events_per_request=max(1, min(2000, int(companion.get("max_events_per_request", 500)))),
         ),
         tools=ToolsConfig(
             mpv=str(tools.get("mpv", "mpv")),
@@ -641,8 +663,9 @@ proxy_mode = {_toml_string(config.nyaa.proxy_mode)}
 proxy_url = {_toml_string(config.nyaa.proxy_url)}
 pre_search_command = {_toml_string(config.nyaa.pre_search_command)}
 auto_download_current = {_toml_bool(config.nyaa.auto_download_current)}
-subsplease_rss_enabled = {_toml_bool(config.nyaa.subsplease_rss_enabled)}
-subsplease_rss_preferred = {_toml_bool(config.nyaa.subsplease_rss_preferred)}
+torrents_enabled = {_toml_bool(config.nyaa.torrents_enabled)}
+subsplease_rss_enabled = true
+subsplease_rss_preferred = true
 auto_require_trusted = {_toml_bool(config.nyaa.auto_require_trusted)}
 only_trusted_groups = {_toml_bool(config.nyaa.only_trusted_groups)}
 min_release_score = {config.nyaa.min_release_score}
@@ -711,6 +734,13 @@ mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 [diagnostics]
 energy_monitoring_enabled = {_toml_bool(config.diagnostics.energy_monitoring_enabled)}
 energy_sample_seconds = {config.diagnostics.energy_sample_seconds}
+
+[companion]
+enabled = {_toml_bool(config.companion.enabled)}
+bind_host = {_toml_string(config.companion.bind_host)}
+port = {config.companion.port}
+pairing_ttl_seconds = {config.companion.pairing_ttl_seconds}
+max_events_per_request = {config.companion.max_events_per_request}
 
 [tools]
 mpv = {_toml_string(config.tools.mpv)}

@@ -10,7 +10,7 @@ from pathlib import Path
 from ..subtitle_formats import parse_srt, write_srt
 
 
-_ALGORITHM_VERSION = "timeline-v5.9-early-edit-speech-gate"
+_ALGORITHM_VERSION = "timeline-v6.0-opening-gap-reacquire"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -1265,6 +1265,153 @@ def _local_transition_refinement(
     return segments, boundaries, diagnostics
 
 
+
+def _post_opening_gap_reacquire(
+    source_cues: list[tuple[float, float, str]],
+    source_onsets: list[float],
+    reference_onsets: list[float],
+    source_bins: set[int],
+    reference_bins: set[int],
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
+    """Move a dominant post-opening clock into the opening silence.
+
+    Different broadcast masters often have a different-length opening.  A
+    wide onset window can then invent one or more weak transitional clocks
+    after the opening.  When the first minute after a long early silence is
+    better explained by a later, strongly supported segment, switch to that
+    clock inside the silence instead of carrying the stale pre-opening clock
+    through spoken dialogue.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if len(segments) < 2 or not boundaries or len(source_cues) < 4:
+        return segments, boundaries, diagnostics
+
+    gap: tuple[float, float] | None = None
+    for left, right in zip(source_cues, source_cues[1:]):
+        left_end = float(left[1])
+        right_start = float(right[0])
+        silence = right_start - left_end
+        if left_end > 210.0:
+            break
+        if silence >= 45.0:
+            gap = (left_end, right_start)
+            break
+    if gap is None:
+        diagnostics["reason"] = "no_early_long_gap"
+        return segments, boundaries, diagnostics
+
+    left_end, first_post = gap
+    gap_boundary = (left_end + first_post) / 2.0
+    start_index = bisect.bisect_right(boundaries, gap_boundary)
+    if start_index >= len(segments) - 1:
+        diagnostics["reason"] = "gap_after_last_transition"
+        return segments, boundaries, diagnostics
+
+    current_offset = float(segments[start_index]["offset_seconds"])
+    centers: list[float] = []
+    center = first_post + 2.0
+    scan_end = min(first_post + 60.0, float(source_cues[-1][1]))
+    while center <= scan_end + 1e-9:
+        centers.append(center)
+        center += 6.0
+    if len(centers) < 4:
+        diagnostics["reason"] = "post_gap_window_too_short"
+        return segments, boundaries, diagnostics
+
+    def evaluate(offset: float) -> dict[str, float]:
+        rows = [
+            _score_window(
+                center=center,
+                offset=offset,
+                source_onsets=source_onsets,
+                reference_onsets=reference_onsets,
+                source_bins=source_bins,
+                reference_bins=reference_bins,
+                window_seconds=24.0,
+            )
+            for center in centers
+        ]
+        return {
+            "activity": statistics.fmean(row.activity_f1 for row in rows),
+            "mean_error": statistics.fmean(row.mean_error for row in rows),
+            "coverage": statistics.fmean(row.onset_coverage for row in rows),
+            "score": statistics.fmean(row.score for row in rows),
+        }
+
+    current_metrics = evaluate(current_offset)
+    candidates: list[tuple[int, float, dict[str, float]]] = []
+    for index in range(start_index + 1, len(segments)):
+        segment = segments[index]
+        offset = float(segment["offset_seconds"])
+        if abs(offset - current_offset) < 2.5:
+            continue
+        if int(segment.get("support") or 0) < 4:
+            continue
+        metrics = evaluate(offset)
+        candidates.append((index, offset, metrics))
+    if not candidates:
+        diagnostics["reason"] = "no_strong_later_clock"
+        return segments, boundaries, diagnostics
+
+    candidate_index, candidate_offset, candidate_metrics = max(
+        candidates,
+        key=lambda item: (
+            item[2]["activity"],
+            -item[2]["mean_error"],
+            item[2]["coverage"],
+            int(segments[item[0]].get("support") or 0),
+        ),
+    )
+    activity_gain = candidate_metrics["activity"] - current_metrics["activity"]
+    error_gain = current_metrics["mean_error"] - candidate_metrics["mean_error"]
+    diagnostics.update(
+        {
+            "gap_seconds": round(first_post - left_end, 3),
+            "gap_boundary_source_time": round(gap_boundary, 3),
+            "first_post_gap_source_time": round(first_post, 3),
+            "current_offset_seconds": round(current_offset, 3),
+            "candidate_offset_seconds": round(candidate_offset, 3),
+            "candidate_support": int(segments[candidate_index].get("support") or 0),
+            "activity_gain": round(activity_gain, 4),
+            "mean_error_gain_seconds": round(error_gain, 4),
+            "current_activity": round(current_metrics["activity"], 4),
+            "candidate_activity": round(candidate_metrics["activity"], 4),
+            "current_mean_error_seconds": round(current_metrics["mean_error"], 4),
+            "candidate_mean_error_seconds": round(candidate_metrics["mean_error"], 4),
+            "candidate_coverage": round(candidate_metrics["coverage"], 4),
+        }
+    )
+    if (
+        candidate_metrics["activity"] < 0.90
+        or candidate_metrics["coverage"] < 0.65
+        or activity_gain < 0.018
+        or error_gain < 0.08
+    ):
+        diagnostics["reason"] = "later_clock_not_clearly_better"
+        return segments, boundaries, diagnostics
+
+    # The jump happens inside a long silence, so keep the pre-opening segment
+    # only up to the gap midpoint and let the proven later clock take over
+    # immediately afterwards.  This intentionally removes weak transitional
+    # segments that were inferred from windows spanning the edit.
+    left = dict(segments[start_index])
+    left["last_center"] = gap_boundary
+    winner = dict(segments[candidate_index])
+    winner["first_center"] = gap_boundary
+    winner["kind"] = "post_opening_reacquire"
+
+    new_segments = segments[:start_index] + [left, winner] + segments[candidate_index + 1:]
+    new_boundaries = boundaries[:start_index] + [gap_boundary] + boundaries[candidate_index:]
+    if len(new_boundaries) != len(new_segments) - 1:
+        diagnostics["reason"] = "rebuild_mismatch"
+        return segments, boundaries, diagnostics
+
+    diagnostics["applied"] = True
+    diagnostics["reason"] = "dominant_clock_reacquired_after_opening_gap"
+    return new_segments, new_boundaries, diagnostics
+
 def _stabilize_decreasing_boundaries(
     source_cues: list[tuple[float, float, str]],
     segments: list[dict[str, object]],
@@ -1874,6 +2021,17 @@ def align_subtitle_timelines(
         boundary_payload,
         edge_hints,
     )
+    segments, boundaries, opening_gap_reacquire = _post_opening_gap_reacquire(
+        source_cues,
+        source_onsets,
+        reference_onsets,
+        source_bins,
+        reference_bins,
+        segments,
+        boundaries,
+    )
+    if opening_gap_reacquire.get("applied"):
+        boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
     segments, boundaries, monotonic_refinements = _stabilize_decreasing_boundaries(
         source_cues,
         segments,
@@ -2092,6 +2250,7 @@ def align_subtitle_timelines(
         timeline_boundary_refinements=boundary_refinements,
         timeline_cold_start=cold_start,
         timeline_transition_refinements=transition_refinements,
+        timeline_opening_gap_reacquire=opening_gap_reacquire,
         timeline_monotonic_refinements=monotonic_refinements,
         timeline_early_edit_audio_verification=timeline_early_edit_audio_verification,
         timeline_path=[item.as_dict() for item in path],

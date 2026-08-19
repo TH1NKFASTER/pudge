@@ -45,12 +45,14 @@ def test_jiten_uses_current_api_prefix_and_does_not_retry_404(tmp_path: Path, mo
     assert seen == [("https://api.jiten.moe/api/reader/ping", "ApiKey secret")]
 
 
-def test_epub_cover_is_embedded_for_webview(tmp_path: Path):
+def test_epub_cover_is_file_backed_for_webview(tmp_path: Path):
     service = LightNovelService(cfg(tmp_path))
     epub = tmp_path / "book.epub"
     make_cover_epub(epub)
     book = service.import_file(epub)
-    assert book["cover_url"].startswith("data:image/jpeg;base64,")
+    assert book["cover_url"].startswith("covers/ln-")
+    assert not book["cover_url"].startswith("data:")
+    assert (service.cover_cache_dir / Path(book["cover_url"]).name).is_file()
 
 
 def test_anilist_search_text_strips_publisher_and_volume_suffix():

@@ -16,7 +16,7 @@ def test_planning_suggestions_and_reader_controls_have_requested_order() -> None
     assert "$('plannedContent')?.before(root)" not in html
     assert "z-index:9500" in html
     assert "tray.hidden=!ui.lnBook?.paired_audio" in html
-    assert "toolbar.insertBefore(tray,$('lnReaderAppearanceToggle'))" in html
+    assert "toolbar.insertBefore(tray,toolbar.querySelector('.ln-reader-actions')||$('lnReaderAppearanceToggle'))" in html
     assert "lnCharacterNames" not in html
     assert "node.hidden=!ready||!ui.lnPairedExpanded" in html
     assert "ui.lnPairedExpanded=true" in html
@@ -32,8 +32,8 @@ def test_names_editor_is_in_ln_context_menu_and_credential_guides_are_available(
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert 'data-ln-context-action="name-cues"' in html
-    assert "if(action==='name-cues'){await showCharacterGlossaryEditor" in html
+    assert 'data-ln-context-action="name-cues"' not in html
+    assert "if(action==='name-cues'){await showCharacterGlossaryEditor" not in html
     assert "https://jimaku.cc/account" in html
     assert "https://jimaku.cc/profile" not in html
     assert "https://jimaku.cc/api/docs" not in html
