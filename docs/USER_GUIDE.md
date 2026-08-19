@@ -8,7 +8,7 @@ This guide describes the normal workflows rather than every individual control. 
 2. Open its context menu and choose a series release, or use **Download released automatically**.
 3. Pudge checks the local library before every Nyaa search, so an episode already on disk is skipped.
 4. The episode then moves through subtitle preparation. A text subtitle that passes language and timing validation makes the episode **Ready**.
-5. Open **Settings → Job Center** to cancel the current Nyaa run or retry a failed/cancelled one.
+5. If preparation fails or is interrupted, start the action again from the relevant media card or Diagnostics.
 
 For a partial season, automatic per-episode download searches only for released episode numbers and records one result for each episode. It does not silently replace a local file.
 
@@ -29,7 +29,7 @@ A library scan is observational: it cannot move `ready`, `watched`, `dropped` or
 
 ### Bitmap subtitles and OCR
 
-PGS/SUP and other image subtitles cannot provide selectable text. With image-subtitle OCR enabled, Pudge extracts the image track, runs OCR and validates the resulting Japanese text. Until that succeeds, the video remains `waiting_text_subtitles`; the bitmap track can still be used for Library-only playback. Cancel or retry OCR from Job Center.
+PGS/SUP and other image subtitles cannot provide selectable text. With image-subtitle OCR enabled, Pudge extracts the image track, runs OCR and validates the resulting Japanese text. Until that succeeds, the video remains `waiting_text_subtitles`; the bitmap track can still be used for Library-only playback. Retry the relevant preparation action if OCR fails.
 
 ## 3. Read a Light Novel with pitch accent
 
@@ -57,28 +57,15 @@ When linked, the audiobook receives the novel's AniList identity if it has none 
 
 If only the audiobook is local, choose **Find LN on Nyaa** on its card. The query uses the linked novel title first, then the audiobook AniList title, then the local filename, and includes the volume when known.
 
-## 5. Use Job Center
-
-Open **Settings → Job Center**. It combines operations that used to have unrelated progress indicators:
-
-| Kind | Cancel behaviour | Retry behaviour |
-|---|---|---|
-| Nyaa | Stops before the next episode search | Starts the per-episode run again, still skipping local files |
-| OCR | Stops page preparation/workers | Clears cached page regions and starts OCR again |
-| STT | Terminates the active transcription subprocess | Starts a fresh transcription and replaces its cache only on success |
-| Import | Stops before the next selected file | Imports the original paths again |
-
-History persists across restarts. A task interrupted because Pudge closed becomes **Failed** and can be retried; completed jobs remain as history and are pruned after the newest 250 final entries.
-
-## 6. Jimaku trial and personal keys
+## 5. Jimaku trial and personal keys
 
 A release may include a shared Jimaku key for the first 48 hours. The release workflow reads it from the GitHub Actions repository secret `PUDGE_TRIAL_JIMAKU_API_KEY`; the key is not committed to the source tree or saved to the user's config. A personal Jimaku key always takes priority.
 
 If a self-built release does not provide that build secret, trial access is disabled and personal Jimaku keys continue to work.
 
-## 7. Common recovery scenarios
+## 6. Common recovery scenarios
 
 - **A scan changed an episode backwards:** current builds prevent this. Refresh once; if it persists, inspect the episode and subtitle job in Diagnostics and include the state history in a bug report.
-- **OCR/STT appears stuck:** cancel it in Job Center. Retry creates a new recorded attempt.
+- **OCR/STT appears stuck:** retry the relevant preparation action from the media card or inspect Diagnostics before reporting it.
 - **The wrong LN and audiobook linked:** unlink them in the LN audio picker, set the correct AniList identities, and link manually. Automatic matching will not overwrite an existing link.
 - **Nyaa found nothing for an audiobook:** adjust the local audiobook title or bind AniList, then run **Find LN on Nyaa** again.

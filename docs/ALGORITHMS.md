@@ -94,7 +94,7 @@ For each unlinked audiobook and LN:
 
 An existing link is never overwritten. Identity propagation fills only a missing identity. These constraints make automatic linking useful for clean filenames while leaving genuinely ambiguous libraries for manual selection.
 
-## Job Center persistence
+## Background job persistence
 
 Every operation writes an `app_jobs` row with immutable ID, kind, retry payload, attempt parent, timestamps and mutable state/progress. Valid states are `queued`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`.
 
