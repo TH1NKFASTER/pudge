@@ -175,7 +175,12 @@ def test_companion_can_prepare_srt_after_hls_was_already_cached(tmp_path: Path) 
         "1\n00:00:01,000 --> 00:00:02,250\n日本語です\n",
         encoding="utf-8",
     )
-    service = CompanionStreamingService(db, cache_dir=tmp_path / "cache")
+    service = CompanionStreamingService(
+        db,
+        cache_dir=tmp_path / "cache",
+        ffmpeg="/definitely/missing-ffmpeg",
+        ffprobe="/definitely/missing-ffprobe",
+    )
     out = tmp_path / "hls"
     result = service._prepare_subtitles(
         {
@@ -193,6 +198,7 @@ def test_companion_can_prepare_srt_after_hls_was_already_cached(tmp_path: Path) 
     vtt = (out / "subtitles.vtt").read_text(encoding="utf-8")
     assert vtt.startswith("WEBVTT")
     assert "00:00:01.000 --> 00:00:02.250" in vtt
+    assert service._ffmpeg_optional_path() == "/definitely/missing-ffmpeg"
     source = (ROOT / "pudge" / "companion_streaming.py").read_text(encoding="utf-8")
     prepare = source[source.index("    def prepare("):source.index("    def media_path(")]
     assert prepare.index("_prepare_subtitles") < prepare.index("_ensure_job")

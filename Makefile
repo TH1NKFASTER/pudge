@@ -1,4 +1,4 @@
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard .venv-test/bin/python),.venv-test/bin/python,python3)
 BATCHES ?= 4
 
 .PHONY: install-dev test test-batches lint bump release build-release clean

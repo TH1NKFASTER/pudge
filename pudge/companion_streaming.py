@@ -239,6 +239,17 @@ class CompanionStreamingService:
             return resolved
         raise ValueError("ffmpeg is required for anime streaming")
 
+    def _ffmpeg_optional_path(self) -> str:
+        """Return the best ffmpeg command hint without requiring it to exist.
+
+        Subtitle recovery can finish directly from an existing SRT/VTT and must
+        not require ffmpeg merely to discover that direct path.
+        """
+        candidate = Path(self.ffmpeg).expanduser()
+        if candidate.is_file():
+            return str(candidate)
+        return shutil.which(self.ffmpeg) or str(candidate)
+
     def _ffprobe_path(self) -> str:
         candidate = Path(self.ffprobe).expanduser()
         if candidate.is_file():
@@ -295,7 +306,7 @@ class CompanionStreamingService:
                 stored_embedded_id=episode.get("embedded_subtitle_id"),
                 stored_origin=str(episode.get("subtitle_origin") or ""),
                 ffprobe=self._ffprobe_path(),
-                ffmpeg=self._ffmpeg_path(),
+                ffmpeg=self._ffmpeg_optional_path(),
                 allow_bitmap=False,
             )
             if selection.found:
@@ -360,7 +371,7 @@ class CompanionStreamingService:
                         self._write_srt_as_vtt(external, target)
                     else:
                         command = [
-                            self._ffmpeg_path(), "-y", "-hide_banner", "-loglevel", "error",
+                            self._ffmpeg_optional_path(), "-y", "-hide_banner", "-loglevel", "error",
                             "-i", str(external), "-c:s", "webvtt", str(target),
                         ]
                         completed = subprocess.run(
@@ -376,7 +387,7 @@ class CompanionStreamingService:
                     error = str(exc)
             elif selection.embedded_stream_index is not None:
                 command = [
-                    self._ffmpeg_path(), "-y", "-hide_banner", "-loglevel", "error",
+                    self._ffmpeg_optional_path(), "-y", "-hide_banner", "-loglevel", "error",
                     "-i", str(video_path), "-map", f"0:{int(selection.embedded_stream_index)}",
                     "-c:s", "webvtt", str(target),
                 ]
