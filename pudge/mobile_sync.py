@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import Database
+from .episode_state import watched_by_anilist_progress
 
 
 PROTOCOL_VERSION = 1
@@ -129,6 +130,7 @@ class MobileSyncService:
             "cursor": "monotonic-event-id",
             "entities": ["anime_episode", "manga", "light_novel", "audiobook"],
             "events": ["progress.updated"],
+            "capabilities": ["base_revision", "conflicts", "cursor_reset"],
         }
 
     def start_pairing(self) -> dict[str, Any]:
@@ -259,15 +261,22 @@ class MobileSyncService:
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone() is not None
 
-    def _local_entities(self, conn: sqlite3.Connection) -> list[LocalSyncEntity]:
+    def _local_entities(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        updated_since: float = 0.0,
+    ) -> list[LocalSyncEntity]:
         result: list[LocalSyncEntity] = []
-        result.extend(self._anime_entities(conn))
-        result.extend(self._manga_entities(conn))
-        result.extend(self._light_novel_entities(conn))
-        result.extend(self._audiobook_entities(conn))
+        result.extend(self._anime_entities(conn, updated_since=updated_since))
+        result.extend(self._manga_entities(conn, updated_since=updated_since))
+        result.extend(self._light_novel_entities(conn, updated_since=updated_since))
+        result.extend(self._audiobook_entities(conn, updated_since=updated_since))
         return result
 
-    def _anime_entities(self, conn: sqlite3.Connection) -> list[LocalSyncEntity]:
+    def _anime_entities(
+        self, conn: sqlite3.Connection, *, updated_since: float = 0.0
+    ) -> list[LocalSyncEntity]:
         if not self._table_exists(conn, "episodes"):
             return []
         rows = conn.execute(
@@ -275,13 +284,20 @@ class MobileSyncService:
             SELECT e.media_id,COALESCE(e.media_episode,e.episode) AS logical_episode,
                    e.title AS episode_title,e.playback_position,e.playback_duration,
                    e.playback_updated_at,e.watched_at,e.state,e.updated_at,
-                   a.title AS anime_title,a.cover_url,a.site_url
+                   a.title AS anime_title,a.cover_url,a.site_url,a.progress,
+                   a.episodes,a.format,a.updated_at AS anime_updated_at
             FROM episodes e
             LEFT JOIN anime a ON a.media_id=e.media_id
             WHERE e.media_id IS NOT NULL
               AND COALESCE(e.media_episode,e.episode) IS NOT NULL
+              AND MAX(
+                    COALESCE(e.playback_updated_at,0),
+                    COALESCE(e.updated_at,0),
+                    COALESCE(a.updated_at,0)
+                  )>?
             ORDER BY e.media_id,logical_episode,e.updated_at DESC
-            """
+            """,
+            (max(0.0, float(updated_since)),),
         ).fetchall()
         seen: set[str] = set()
         entities: list[LocalSyncEntity] = []
@@ -294,7 +310,16 @@ class MobileSyncService:
             seen.add(local_key)
             seconds = max(0.0, float(row["playback_position"] or 0.0))
             duration = max(0.0, float(row["playback_duration"] or 0.0))
-            completed = bool(row["watched_at"]) or str(row["state"] or "") == "watched"
+            completed = (
+                bool(row["watched_at"])
+                or str(row["state"] or "") == "watched"
+                or watched_by_anilist_progress(
+                    episode,
+                    row["progress"],
+                    total_episodes=row["episodes"],
+                    media_format=row["format"],
+                )
+            )
             status = "completed" if completed else ("in_progress" if seconds > 0 else "not_started")
             entities.append(
                 LocalSyncEntity(
@@ -316,20 +341,27 @@ class MobileSyncService:
                         "duration_ms": int(round(duration * 1000.0)),
                     },
                     status=status,
-                    occurred_at=float(row["playback_updated_at"] or row["updated_at"] or 0.0),
+                    occurred_at=max(
+                        float(row["playback_updated_at"] or 0.0),
+                        float(row["updated_at"] or 0.0),
+                        float(row["anime_updated_at"] or 0.0),
+                    ),
                 )
             )
         return entities
 
-    def _manga_entities(self, conn: sqlite3.Connection) -> list[LocalSyncEntity]:
+    def _manga_entities(
+        self, conn: sqlite3.Connection, *, updated_since: float = 0.0
+    ) -> list[LocalSyncEntity]:
         if not self._table_exists(conn, "manga_books"):
             return []
         rows = conn.execute(
             """
             SELECT id,path,title,page_count,position,reading_direction,anilist_id,
                    cover_url,site_url,source_fingerprint,updated_at
-            FROM manga_books ORDER BY id
-            """
+            FROM manga_books WHERE updated_at>? ORDER BY id
+            """,
+            (max(0.0, float(updated_since)),),
         ).fetchall()
         from .manga import _manga_series_key, _manga_series_title, _manga_volume
 
@@ -379,7 +411,9 @@ class MobileSyncService:
             )
         return entities
 
-    def _light_novel_entities(self, conn: sqlite3.Connection) -> list[LocalSyncEntity]:
+    def _light_novel_entities(
+        self, conn: sqlite3.Connection, *, updated_since: float = 0.0
+    ) -> list[LocalSyncEntity]:
         if not self._table_exists(conn, "ln_books"):
             return []
         rows = conn.execute(
@@ -390,8 +424,10 @@ class MobileSyncService:
             FROM ln_books b
             LEFT JOIN ln_chapters c
               ON c.book_id=b.id AND c.chapter_index=b.current_chapter
+            WHERE b.updated_at>?
             ORDER BY b.id
-            """
+            """,
+            (max(0.0, float(updated_since)),),
         ).fetchall()
         from .light_novels import _series_key as _ln_series_key, _series_title as _ln_series_title
 
@@ -443,14 +479,17 @@ class MobileSyncService:
             )
         return entities
 
-    def _audiobook_entities(self, conn: sqlite3.Connection) -> list[LocalSyncEntity]:
+    def _audiobook_entities(
+        self, conn: sqlite3.Connection, *, updated_since: float = 0.0
+    ) -> list[LocalSyncEntity]:
         if not self._table_exists(conn, "audiobooks"):
             return []
         rows = conn.execute(
             """
             SELECT id,title,duration,position,finished,speed,updated_at
-            FROM audiobooks ORDER BY id
-            """
+            FROM audiobooks WHERE updated_at>? ORDER BY id
+            """,
+            (max(0.0, float(updated_since)),),
         ).fetchall()
         entities: list[LocalSyncEntity] = []
         for row in rows:
@@ -555,10 +594,17 @@ class MobileSyncService:
         return int(cursor.lastrowid)
 
     def capture_local_changes(self) -> int:
-        now = time.time()
+        capture_started = time.time()
         last_event_id = 0
         with self.database.connect() as conn:
-            for entity in self._local_entities(conn):
+            cursor_row = conn.execute(
+                "SELECT value FROM state WHERE key='mobile_sync_last_capture_at'"
+            ).fetchone()
+            try:
+                updated_since = max(0.0, float(cursor_row["value"] if cursor_row else 0.0))
+            except (TypeError, ValueError):
+                updated_since = 0.0
+            for entity in self._local_entities(conn, updated_since=updated_since):
                 entity_id = self._ensure_entity(conn, entity)
                 position_json = _json_dumps(entity.position)
                 snapshot = conn.execute(
@@ -576,7 +622,15 @@ class MobileSyncService:
                     if unchanged:
                         last_event_id = max(last_event_id, int(snapshot["event_id"] or 0))
                         continue
-                    if float(snapshot["occurred_at"] or 0.0) > entity.occurred_at + 0.001:
+                    desktop_completion = bool(
+                        entity.kind == "anime_episode"
+                        and entity.status == "completed"
+                        and str(snapshot["status"] or "") != "completed"
+                    )
+                    if (
+                        not desktop_completion
+                        and float(snapshot["occurred_at"] or 0.0) > entity.occurred_at + 0.001
+                    ):
                         continue
                 digest = hashlib.sha1(
                     f"{entity_id}:{position_json}:{entity.status}:{entity.occurred_at:.6f}".encode(
@@ -591,7 +645,7 @@ class MobileSyncService:
                     event_type="progress.updated",
                     payload={"position": entity.position, "status": entity.status},
                     occurred_at=max(0.0, entity.occurred_at),
-                    received_at=now,
+                    received_at=capture_started,
                 )
                 if event_id is None:
                     existing = conn.execute(
@@ -608,6 +662,8 @@ class MobileSyncService:
                         status=excluded.status,
                         source_device_id=excluded.source_device_id,
                         event_id=excluded.event_id,
+                        base_event_id=sync_snapshots.event_id,
+                        revision=sync_snapshots.revision+1,
                         occurred_at=excluded.occurred_at,
                         updated_at=excluded.updated_at
                     """,
@@ -618,11 +674,32 @@ class MobileSyncService:
                         SERVER_DEVICE_ID,
                         event_id,
                         max(0.0, entity.occurred_at),
-                        now,
+                        capture_started,
                     ),
                 )
                 last_event_id = max(last_event_id, int(event_id or 0))
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES('mobile_sync_last_capture_at',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (f"{capture_started:.6f}", capture_started),
+            )
+            self._prune_events(conn)
         return last_event_id
+
+    @staticmethod
+    def _prune_events(conn: sqlite3.Connection, *, retain: int = 10_000) -> int:
+        cutoff = conn.execute(
+            "SELECT id FROM sync_events ORDER BY id DESC LIMIT 1 OFFSET ?",
+            (max(100, int(retain)),),
+        ).fetchone()
+        if cutoff is None:
+            return 0
+        cursor = conn.execute(
+            "DELETE FROM sync_events WHERE id<=? "
+            "AND id NOT IN (SELECT event_id FROM sync_snapshots)",
+            (int(cutoff["id"]),),
+        )
+        return max(0, int(cursor.rowcount or 0))
 
     def library_snapshot(self) -> dict[str, Any]:
         self.capture_local_changes()
@@ -630,7 +707,7 @@ class MobileSyncService:
             rows = conn.execute(
                 """
                 SELECT e.entity_id,e.kind,e.external_key,e.title,e.metadata_json,
-                       s.position_json,s.status,s.event_id AS revision,s.occurred_at
+                       s.position_json,s.status,s.revision,s.event_id AS event_cursor,s.occurred_at
                 FROM sync_entities e
                 LEFT JOIN sync_snapshots s ON s.entity_id=e.entity_id
                 ORDER BY e.kind,e.title,e.entity_id
@@ -651,6 +728,7 @@ class MobileSyncService:
                     "position": _json_loads(str(row["position_json"] or "{}"), {}),
                     "status": str(row["status"] or "not_started"),
                     "revision": int(row["revision"] or 0),
+                    "event_cursor": int(row["event_cursor"] or 0),
                     "occurred_at": float(row["occurred_at"] or 0.0),
                 }
                 for row in rows
@@ -844,6 +922,7 @@ class MobileSyncService:
         start = max(0, int(cursor))
         page_size = max(1, min(self.max_events_per_request, int(limit)))
         with self.database.connect() as conn:
+            earliest_row = conn.execute("SELECT COALESCE(MIN(id),0) AS cursor FROM sync_events").fetchone()
             rows = conn.execute(
                 """
                 SELECT id,event_uuid,device_id,entity_id,event_type,payload_json,
@@ -855,10 +934,13 @@ class MobileSyncService:
         has_more = len(rows) > page_size
         visible = rows[:page_size]
         next_cursor = int(visible[-1]["id"]) if visible else start
+        earliest_cursor = int(earliest_row["cursor"] if earliest_row else 0)
         return {
             "protocol_version": PROTOCOL_VERSION,
             "cursor": next_cursor,
             "has_more": has_more,
+            "earliest_cursor": earliest_cursor,
+            "reset_required": bool(start > 0 and earliest_cursor > 0 and start < earliest_cursor - 1),
             "events": [
                 {
                     "cursor": int(row["id"]),
@@ -882,6 +964,10 @@ class MobileSyncService:
         event_list = list(events)
         if len(event_list) > self.max_events_per_request:
             raise MobileSyncValidationError("Too many events in one request")
+        # Desktop playback writes directly to the library tables. Capture those
+        # writes before comparing a phone event with the canonical revision so
+        # an old mobile resume update cannot reopen a completed episode.
+        self.capture_local_changes()
         now = time.time()
         results: list[dict[str, Any]] = []
         max_cursor = 0
@@ -960,9 +1046,90 @@ class MobileSyncService:
                 "cursor": int(existing["id"] if existing else 0),
             }
         snapshot = conn.execute(
-            "SELECT occurred_at,event_id FROM sync_snapshots WHERE entity_id=?",
+            "SELECT position_json,status,occurred_at,event_id,revision FROM sync_snapshots WHERE entity_id=?",
             (entity_id,),
         ).fetchone()
+        try:
+            base_revision = int(raw.get("base_revision") or payload.get("base_revision") or 0)
+        except (TypeError, ValueError):
+            base_revision = 0
+        normalized = self._normalize_position(str(entity["kind"]), position)
+        incoming_json = _json_dumps(normalized)
+        current_revision = int(snapshot["revision"] or 0) if snapshot is not None else 0
+        completed_downgrade = bool(
+            snapshot is not None
+            and str(snapshot["status"] or "") == "completed"
+            and status != "completed"
+        )
+        if str(entity["kind"]) == "anime_episode" and status != "completed":
+            media_id, episode = (
+                int(value) for value in str(entity["local_key"]).split(":", 1)
+            )
+            local_episode = conn.execute(
+                """
+                SELECT e.watched_at,e.state,a.progress,a.episodes,a.format
+                FROM episodes e
+                LEFT JOIN anime a ON a.media_id=e.media_id
+                WHERE e.media_id=? AND COALESCE(e.media_episode,e.episode)=?
+                ORDER BY e.updated_at DESC LIMIT 1
+                """,
+                (media_id, episode),
+            ).fetchone()
+            completed_downgrade = completed_downgrade or bool(
+                local_episode is not None
+                and (
+                    local_episode["watched_at"]
+                    or str(local_episode["state"] or "") == "watched"
+                    or watched_by_anilist_progress(
+                        episode,
+                        local_episode["progress"],
+                        total_episodes=local_episode["episodes"],
+                        media_format=local_episode["format"],
+                    )
+                )
+            )
+        conflict = bool(
+            completed_downgrade
+            or (
+                snapshot is not None
+                and base_revision > 0
+                and base_revision != current_revision
+                and (
+                    str(snapshot["position_json"] or "{}") != incoming_json
+                    or str(snapshot["status"] or "") != status
+                )
+            )
+        )
+        if conflict:
+            conflict_cursor = conn.execute(
+                """
+                INSERT INTO sync_conflicts(
+                    entity_id,device_id,base_revision,current_revision,incoming_json,created_at,resolved_at
+                ) VALUES(?,?,?,?,?,?,0)
+                """,
+                (
+                    entity_id,
+                    device_id,
+                    base_revision,
+                    current_revision,
+                    _json_dumps(
+                        {
+                            "event_id": event_uuid,
+                            "position": normalized,
+                            "status": status,
+                            "occurred_at": occurred_at,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            return {
+                "event_id": event_uuid,
+                "status": "conflict",
+                "cursor": event_id,
+                "conflict_id": int(conflict_cursor.lastrowid),
+                "current_revision": current_revision,
+            }
         applies = (
             snapshot is None
             or occurred_at > float(snapshot["occurred_at"] or 0.0) + 0.001
@@ -972,7 +1139,6 @@ class MobileSyncService:
             )
         )
         if applies:
-            normalized = self._normalize_position(str(entity["kind"]), position)
             self._apply_to_local(
                 conn,
                 kind=str(entity["kind"]),
@@ -991,6 +1157,8 @@ class MobileSyncService:
                     status=excluded.status,
                     source_device_id=excluded.source_device_id,
                     event_id=excluded.event_id,
+                    base_event_id=sync_snapshots.event_id,
+                    revision=sync_snapshots.revision+1,
                     occurred_at=excluded.occurred_at,
                     updated_at=excluded.updated_at
                 """,
@@ -1008,7 +1176,55 @@ class MobileSyncService:
             "event_id": event_uuid,
             "status": "applied" if applies else "recorded_stale",
             "cursor": event_id,
+            "revision": current_revision + 1 if applies else current_revision,
         }
+
+    def conflicts(self) -> list[dict[str, Any]]:
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sync_conflicts WHERE resolved_at=0 ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            {
+                **dict(row),
+                "incoming": _json_loads(str(row["incoming_json"] or "{}"), {}),
+            }
+            for row in rows
+        ]
+
+    def resolve_conflict(self, conflict_id: int, *, accept_incoming: bool) -> dict[str, Any]:
+        now = time.time()
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sync_conflicts WHERE id=? AND resolved_at=0",
+                (int(conflict_id),),
+            ).fetchone()
+            if row is None:
+                raise MobileSyncValidationError("Unknown or resolved conflict")
+            result: dict[str, Any] = {"status": "kept_current"}
+            if accept_incoming:
+                incoming = _json_loads(str(row["incoming_json"] or "{}"), {})
+                snapshot = conn.execute(
+                    "SELECT revision FROM sync_snapshots WHERE entity_id=?",
+                    (str(row["entity_id"]),),
+                ).fetchone()
+                raw = {
+                    "event_id": f"conflict-resolution-{int(conflict_id)}-{int(now * 1000)}",
+                    "entity_id": str(row["entity_id"]),
+                    "type": "progress.updated",
+                    "payload": {
+                        "position": incoming.get("position") or {},
+                        "status": incoming.get("status") or "in_progress",
+                    },
+                    "occurred_at": now,
+                    "base_revision": int(snapshot["revision"] if snapshot else 0),
+                }
+                result = self._push_one(conn, str(row["device_id"]), raw, now=now)
+            conn.execute(
+                "UPDATE sync_conflicts SET resolved_at=? WHERE id=?",
+                (now, int(conflict_id)),
+            )
+        return {"conflict_id": int(conflict_id), **result}
 
     @staticmethod
     def _normalize_position(kind: str, position: dict[str, Any]) -> dict[str, Any]:

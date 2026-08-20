@@ -1,7 +1,8 @@
-# VN reader: 0.8 implementation boundary
+# Visual Novel reader plan
 
-The visual-novel reader should be a separate optional subsystem. It must not run
-inside ordinary library refresh, subtitle preparation, or the manga reader.
+The Visual Novel reader is an optional tool that starts only when the user opens
+it. Ordinary library refreshes, subtitle preparation, and manga reading must not
+start screen capture or OCR.
 
 ## Capture pipeline
 
@@ -27,7 +28,7 @@ inside ordinary library refresh, subtitle preparation, or the manga reader.
   override AniList and are reusable by LN, manga, subtitles, and VN translation.
 - Deduplicate cards by backend word/reading id and preserve the original sentence.
 
-## Delivery phases
+## Planned releases
 
 - **0.8.0:** window picker, permission flow, adaptive capture, selectable OCR,
   transcript, Jiten/JPDB actions, and energy diagnostics.

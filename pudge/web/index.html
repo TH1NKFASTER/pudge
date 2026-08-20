@@ -51,6 +51,10 @@ button:disabled { opacity:.62; cursor:default; }
 .relation-preview-title { font-size:14px; font-weight:800; line-height:1.28; overflow-wrap:anywhere; }
 .relation-preview-meta { display:grid; gap:5px; margin-top:10px; color:#c7d5e8; font-size:12px; }
 .main { min-width:0; height:100%; overflow:hidden; display:flex; flex-direction:column; }
+.safe-mode-banner { display:none; align-items:center; gap:10px; margin:0 0 14px; padding:11px 13px; border:1px solid rgba(244,189,99,.58); border-radius:10px; background:rgba(244,189,99,.1); color:#ffe8bd; }
+.safe-mode-banner.show { display:flex; }
+.safe-mode-banner span { flex:1; }
+.safe-mode-banner button { padding:6px 9px; white-space:nowrap; }
 .toolbar { flex:0 0 auto; display:flex; align-items:center; gap:12px; padding:18px 24px 12px; border-bottom:1px solid rgba(37,54,77,.45); }
 .toolbar h1 { font-size:25px; margin:0; }
 .toolbar .count { color:var(--muted); }
@@ -207,6 +211,10 @@ td.path { max-width:560px; overflow:hidden; text-overflow:ellipsis; }
 .setting-block:last-child { border-bottom:0; }
 .setting-block > h3 { margin:0 0 6px; font-size:15px; }
 .setting-block > p { margin:0 0 12px; }
+.setting-block.danger-zone { background:rgba(255,107,125,.055); border-top:1px solid rgba(255,107,125,.38); }
+.setting-block.danger-zone > h3 { color:#ff9ba8; }
+button.uninstall-pudge { background:#a51f33; border-color:#ff6b7d; color:#fff; font-weight:750; }
+button.uninstall-pudge:hover { background:#c32a40; }
 .setting-toggle { display:flex; align-items:center; gap:10px; min-height:30px; font-weight:700; color:#dfe9f8; }
 .setting-toggle input { width:auto; margin:0; }
 .conditional-settings { display:grid; gap:10px; margin-top:12px; padding:12px 0 0 24px; border-left:2px solid #2a405d; transition:opacity .15s ease,filter .15s ease; }
@@ -576,6 +584,7 @@ html.ui-inactive *::after { animation-play-state:paused !important; }
       <h1 id="pageTitle">Anime</h1><span id="pageCount" class="count"></span><span class="spacer"></span><div id="pageSelectionActions" class="page-selection-actions" hidden></div><button id="pageImportButton" class="primary" hidden>Import</button>
     </div>
     <div id="scroll" class="page-scroll">
+      <div id="safeModeBanner" class="safe-mode-banner" role="status"></div>
       <div id="startupBanner" class="startup-banner"><span class="spinner"></span><span id="startupBannerText"></span></div>
       <section id="current" class="page active"><div id="currentContent"></div></section>
       <section id="planned" class="page">
@@ -800,6 +809,7 @@ const escapeHtml=value=>String(value??'').replace(/[&<>'"]/g,ch=>({'&':'&amp;','
 function appName(){return ui.state?.branding?.name||document.getElementById('appBrandName')?.textContent||'__APP_NAME__';}
 function t(key,params={}){let value=(STRINGS[ui.lang]&&STRINGS[ui.lang][key])||STRINGS.en[key]||key;value=String(value).replaceAll('Anime MPV',appName());for(const [k,v] of Object.entries(params))value=value.replaceAll(`{${k}}`,String(v));return value;}
 function setStatus(text){$('status').textContent=text;}
+function safeModeActive(){return !!ui.state?.safe_mode?.active;}
 function toast(text){const el=$('toast');el.textContent=text;el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2600);}
 function titleIsClipped(el){
   if(!el||el.clientWidth<=0||el.clientHeight<=0)return false;
@@ -2053,8 +2063,8 @@ function syncLnPairedTray(state={}){
 function renderLnPairedPosition(state,offsetValue=null,options={}){
   const speechActive=options.speechActive!==false;
   const reader=$('lnReader'),scroll=$('lnReaderScroll'),paragraphs=[...reader?.querySelectorAll('[data-ln-paragraph]')||[]];if(!reader||!paragraphs.length)return;
-  const chapterIndex=Number(state.ln_chapter_index??ui.lnChapter?.chapter_index??0),rawOffset=Number(offsetValue??state.chapter_char_offset_exact??state.chapter_char_offset),audioPosition=Number(state.position||0),previousAudioRaw=ui.lnPairedLastAudioPosition,previousAudio=previousAudioRaw===null||previousAudioRaw===undefined?NaN:Number(previousAudioRaw),lastChapterRaw=ui.lnPairedLastChapter,sameChapter=lastChapterRaw!==null&&lastChapterRaw!==undefined&&Number(lastChapterRaw)===chapterIndex,seekJump=sameChapter&&Number.isFinite(previousAudio)&&(audioPosition<previousAudio-.45||Math.abs(audioPosition-previousAudio)>2.5);
-  if(seekJump){lnPairedResetWordProgress(reader);ui.lnPairedActiveWord=null;ui.lnPairedPendingWord=null;ui.lnPairedCatchupHoldUntil=0;ui.lnPairedHighlightKey='';ui.lnPairedLastDisplayOffset=null;ui.lnPairedLastRenderAt=performance.now();ui.lnPairedSpeechWasActive=null;ui.lnPairedResumeTarget=null;ui.lnPairedResumeNeedsSnap=false;lnPairedTrace('seek',state,{sourceOffset:rawOffset,renderedOffset:rawOffset,previous_audio_position:previousAudio});}
+  const chapterIndex=Number(state.ln_chapter_index??ui.lnChapter?.chapter_index??0),rawOffset=Number(offsetValue??state.chapter_char_offset_exact??state.chapter_char_offset),audioPosition=Number(state.position||0),previousAudioRaw=ui.lnPairedLastAudioPosition,previousAudio=previousAudioRaw===null||previousAudioRaw===undefined?NaN:Number(previousAudioRaw),lastChapterRaw=ui.lnPairedLastChapter,sameChapter=lastChapterRaw!==null&&lastChapterRaw!==undefined&&Number(lastChapterRaw)===chapterIndex,seekJump=options.seekJump===true||(sameChapter&&Number.isFinite(previousAudio)&&(audioPosition<previousAudio-.45||Math.abs(audioPosition-previousAudio)>2.5));
+  if(seekJump){lnPairedResetWordProgress(reader);ui.lnPairedActiveWord=null;ui.lnPairedPendingWord=null;ui.lnPairedCatchupHoldUntil=0;ui.lnPairedHighlightKey='';ui.lnPairedLastDisplayOffset=null;ui.lnPairedLastRenderAt=performance.now();ui.lnPairedSpeechWasActive=null;ui.lnPairedResumeTarget=null;ui.lnPairedResumeNeedsSnap=false;lnPairedTrace('seek',state,{sourceOffset:rawOffset,renderedOffset:rawOffset,previous_audio_position:previousAudio,reason:String(options.reason||'detected')});}
   const lastDisplayRaw=ui.lnPairedLastDisplayOffset,lastDisplay=lastDisplayRaw===null||lastDisplayRaw===undefined?NaN:Number(lastDisplayRaw),resumedAfterPause=speechActive&&ui.lnPairedSpeechWasActive===false;let resumeSnap=resumedAfterPause&&Number.isFinite(lastDisplay);const transportResumeSnap=ui.lnPairedResumeNeedsSnap===true&&state.playing&&Number.isFinite(lastDisplay);if(transportResumeSnap)resumeSnap=true;
   if(resumeSnap){ui.lnPairedResumeTarget=null;ui.lnPairedCatchupHoldUntil=0;}if(resumeSnap)ui.lnPairedResumeNeedsSnap=false;
   else if(ui.lnPairedResumeTarget!==null&&ui.lnPairedResumeTarget!==undefined&&Number.isFinite(Number(ui.lnPairedResumeTarget))&&speechActive)ui.lnPairedResumeTarget=Math.max(Number(ui.lnPairedResumeTarget),rawOffset);
@@ -2118,7 +2128,7 @@ function startLnPairedInterpolation(state){
     const live=ui.lnPairedState||state,desiredPlaying=lnPairedTransportClockDesired(live);
     if(!desiredPlaying||!$('lnReaderShell')?.classList.contains('open')){ui.lnPairedAnimationFrame=null;return;}
     const clockTime=lnPairedTransportClockNow(live),estimatedTime=Math.max(leftTime,Math.min(rightTime,clockTime)),estimatedOffset=lnPairedOffsetAtTime(state,estimatedTime),previewTime=Math.min(rightTime,estimatedTime+.1*speed),previewOffset=lnPairedOffsetAtTime(state,previewTime),renderState={...state,playing:true,paused:false,position:clockTime};
-    renderLnPairedPosition(state,estimatedOffset,{speechActive:true,previewOffset});
+    renderLnPairedPosition(renderState,estimatedOffset,{speechActive:true,previewOffset});
     const target=Number(state.chapter_char_offset_exact??state.chapter_char_offset),behind=Number.isFinite(target)&&target-estimatedOffset>1.2;
     if(desiredPlaying&&(estimatedTime<rightTime||behind||clockTime>rightTime))ui.lnPairedAnimationFrame=requestAnimationFrame(frame);
     else ui.lnPairedAnimationFrame=null;
@@ -2127,7 +2137,7 @@ function startLnPairedInterpolation(state){
 }
 
 
-async function applyLnPairedPosition(state){
+async function applyLnPairedPosition(state,options={}){
   cancelLnPairedInterpolation();
   const chapterIndex=Number(state.ln_chapter_index??ui.lnChapter?.chapter_index??0);
   if(ui.lnChapter&&chapterIndex!==Number(ui.lnChapter.chapter_index)){
@@ -2145,12 +2155,13 @@ async function applyLnPairedPosition(state){
   }
   const backendPosition=Number(state.position),speed=Math.max(.5,Number(state.speed||1)),desiredPlaying=lnPairedTransportClockDesired(state),clockPosition=desiredPlaying?lnPairedTransportClockNow(state):backendPosition;
   state=desiredPlaying?{...state,playing:true,paused:false,position:clockPosition}:state;
-  const position=Number(state.position),displayOffset=lnPairedOffsetAtTime(state,Number(state.position)),previewOffset=lnPairedOffsetAtTime(state,clockPosition+.1*speed);
-  renderLnPairedPosition(state,displayOffset,{reason:'poll',speechActive:true,previewOffset});
+  const position=Number(state.position),displayOffset=lnPairedOffsetAtTime(state,position),previewOffset=lnPairedOffsetAtTime(state,clockPosition+.1*speed);
+  if(options.seekJump===true)renderLnPairedPosition(state,displayOffset,{reason:String(options.reason||'poll'),speechActive:true,previewOffset,seekJump:true});
+  else renderLnPairedPosition(state,displayOffset,{reason:'poll',speechActive:true,previewOffset});
   startLnPairedInterpolation(state);
 }
 function pollLnPaired(){if(ui.lnPairedPollTimer){clearTimeout(ui.lnPairedPollTimer);ui.lnPairedPollTimer=null;}const generation=++ui.lnPairedPollGeneration,check=async()=>{if(generation!==ui.lnPairedPollGeneration||!$('lnReaderShell')?.classList.contains('open')||!ui.lnBook?.paired_audio)return;try{const state=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));if(generation!==ui.lnPairedPollGeneration)return;const pending=typeof ui.lnPairedTransportDesired==='boolean',desiredPlaying=pending?Boolean(ui.lnPairedTransportDesired):Boolean(state.playing),clock=lnPairedTransportClockReconcile(state,{settled:!pending});if(clock.snap&&desiredPlaying)ui.lnPairedResumeNeedsSnap=true;syncLnPairedTray(state);if(!desiredPlaying)cancelLnPairedInterpolation();if(desiredPlaying){await applyLnPairedPosition({...state,playing:true,paused:false,position:clock.position});if(generation!==ui.lnPairedPollGeneration)return;}const status=String(state.alignment?.status||'');if(desiredPlaying||state.player_running||['queued','transcribing','aligning'].includes(status))ui.lnPairedPollTimer=setTimeout(check,desiredPlaying?250:(state.player_running?350:700));}catch(e){console.error(e);}};ui.lnPairedPollTimer=setTimeout(check,100);}
-async function seekLnPairedRelative(seconds){if(!ui.lnBook?.paired_audio)return;invalidateLnPairedPoll();const current=ui.lnPairedState?.audiobook_id?ui.lnPairedState:await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));await pywebview.api.audiobook_seek(Number(current.audiobook_id),Number(seconds));const updated=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));lnPairedTransportClockReset(updated);syncLnPairedTray(updated);await applyLnPairedPosition(updated);if(updated.playing)pollLnPaired();}
+async function seekLnPairedRelative(seconds){if(!ui.lnBook?.paired_audio)return;const generation=Number(ui.lnPairedSeekGeneration||0)+1;ui.lnPairedSeekGeneration=generation;invalidateLnPairedPoll();const current=ui.lnPairedState?.audiobook_id?ui.lnPairedState:await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));if(generation!==Number(ui.lnPairedSeekGeneration||0))return;await pywebview.api.audiobook_seek(Number(current.audiobook_id),Number(seconds));if(generation!==Number(ui.lnPairedSeekGeneration||0))return;const updated=await pywebview.api.light_novel_paired_state(Number(ui.lnBook.id));if(generation!==Number(ui.lnPairedSeekGeneration||0))return;lnPairedTransportClockReset(updated);syncLnPairedTray(updated);await applyLnPairedPosition(updated,{seekJump:true,reason:'shortcut'});if(generation!==Number(ui.lnPairedSeekGeneration||0))return;if(updated.playing)pollLnPaired();}
 async function seekLnPairedToOffset(characterOffset){if(!ui.lnBook?.paired_audio||!ui.lnChapter)return;invalidateLnPairedPoll();const state=await pywebview.api.light_novel_play_paired_at_offset(Number(ui.lnBook.id),Number(ui.lnChapter.chapter_index),Number(characterOffset||0),Number($('lnPairedSpeed')?.value||ui.lnPairedState?.speed||1));lnPairedTransportClockReset(state);syncLnPairedTray(state);await applyLnPairedPosition(state);if(state.playing)pollLnPaired();}
 async function toggleLnPairedPlayback(){
   if(!ui.lnBook?.paired_audio||!ui.lnChapter)return;
@@ -2414,6 +2425,7 @@ function renderSettings(){
     <div class="setting-block"><label class="setting-toggle"><input id="s_energy_monitoring" type="checkbox">${t('settings.energyDiagnostics')}</label><p class="subtle">${t('settings.energyDiagnosticsHint')}</p><div id="settings-energy-fields" class="conditional-settings"><div class="form-grid">${input('s_energy_sample',t('settings.energySample'),'number')}</div><p class="subtle">${t('settings.energyLogPath',{path:escapeHtml(s.energy_log_path||'')})}</p><div class="setting-inline-actions"><button id="openEnergyLog">${t('action.openEnergyLog')}</button></div></div></div>
     <div class="setting-block" id="settingsMaintenance"><h3>${t('settings.maintenance')}</h3><p class="subtle">${t('settings.maintenanceHint')}</p><div class="setting-inline-actions"><button id="openDownloadCenter" data-action="open-downloads">${t('action.openDownloads')}</button><button id="checkReleaseUpgrades">${t('action.checkReleaseUpgrades')}</button><button id="checkSubtitleUpgrades">${t('action.checkSubtitleUpgrades')}</button><button id="repairLibrary">${t('action.repairLibrary')}</button><button id="openDiagnosticsPage">${t('action.openDiagnostics')}</button></div><div id="repairSummary" class="repair-summary"></div><p class="subtle" style="margin-top:12px">${t('label.backupHint')}</p><div class="setting-inline-actions"><button id="createBackup">${t('action.createBackup')}</button><button id="restoreBackup">${t('action.restoreBackup')}</button></div></div>
     <div class="setting-block"><h3>${t('settings.shortcuts')}</h3><p class="subtle">${t('settings.shortcutsHint')}</p><div class="setting-divider-title">${t('settings.shortcutsMpv')}</div><div class="form-grid">${shortcutRecorder('s_shortcut_mpv_watched',t('settings.shortcutMpvWatched'))}${shortcutRecorder('s_shortcut_mpv_anilist',t('settings.shortcutMpvAniList'))}${shortcutRecorder('s_shortcut_mpv_correct',t('settings.shortcutMpvCorrect'))}${shortcutRecorder('s_shortcut_mpv_translate',ui.lang==='ru'?'Выделить и перевести текущие субтитры':'Select and translate current subtitle')}</div></div>
+    <div class="setting-block danger-zone"><h3>${ui.lang==='ru'?'Удаление Pudge':'Remove Pudge'}</h3><p class="subtle">${ui.lang==='ru'?'Удаляет приложение, настройки, базу, backup-копии, кэш, логи, привязанные устройства, ключи Pudge и файлы из папки библиотеки Pudge. Добавленные внешние папки и общие программы останутся.':'Removes the app, settings, database, backups, cache, logs, paired devices, Pudge keys, and files in the Pudge library folder. Added external folders and shared tools remain.'}</p><button id="uninstallPudge" type="button" class="uninstall-pudge">${ui.lang==='ru'?'Удалить Pudge с этого Mac':'Delete Pudge from this Mac'}</button></div>
   </section>
   <div class="form-actions"><button id="saveSettings" class="primary">${t('action.save')}</button></div></div>`;
   fillSettings(ui.state.settings);if(typeof fillExtendedTorrentSettings==='function')fillExtendedTorrentSettings(ui.state.settings);syncConditionalSettings();updateAniListSyncUi();renderAppUpdateState(ui.appUpdate);prepareSettingsSearch();globalThis.PudgeSettings?.enhance(ui.lang);
@@ -2700,6 +2712,7 @@ async function pollTorrentTraffic(){
 }
 
 function renderSafely(name,renderer){try{renderer();return true;}catch(error){console.error(`EVENT ui.render.fail page=${name}`,error);return false;}}
+function renderSafeModeBanner(){const banner=$('safeModeBanner'),safe=ui.state?.safe_mode||{};if(!banner)return;banner.classList.toggle('show',!!safe.active);if(!safe.active){banner.innerHTML='';return;}const message=ui.lang==='ru'?'Pudge запущен в безопасном режиме. Фоновые задачи приостановлены.':'Pudge is running in Safe Mode. Background work is paused.',resume=ui.lang==='ru'?'Продолжить обычно':'Continue normally',backup=safe.migration_backup?(ui.lang==='ru'?'Показать резервную копию':'Show backup'):'';banner.innerHTML=`<span>${message}</span>${backup?`<button data-action="safe-mode-backup">${backup}</button>`:''}<button class="primary" data-action="safe-mode-restart">${resume}</button>`;}
 function currentRenderSignature(state=ui.state){
   const volatileKeys=new Set(['remaining_seconds','delete_remaining_seconds']);
   const home=state?.home||{};
@@ -2712,6 +2725,7 @@ function currentRenderSignature(state=ui.state){
 function renderDataPages(force=false){
   if(!force&&!ui.windowActive){ui.pendingDataRender=true;return;}
   ui.pendingDataRender=false;
+  renderSafely('safe_mode',renderSafeModeBanner);
   const nextCurrentSignature=currentRenderSignature();
   if(ui.currentRenderSignature!==nextCurrentSignature){
     if(renderSafely('current',renderCurrent))ui.currentRenderSignature=nextCurrentSignature;
@@ -2733,7 +2747,7 @@ function renderSettingsSafely(){
 }
 function renderAll(){applyStaticLanguage();renderSettingsSafely();applyStaticLanguage();renderDataPages();updateAniListSyncUi();refreshTorrentToggle();}
 async function syncAniList(startup=false){if(ui.anilistSyncing)return null;ui.anilistSyncing=true;updateAniListSyncUi();if(!startup)setStatus(t('status.anilist'));try{const r=startup?await pywebview.api.startup_sync_anilist():await pywebview.api.sync_anilist();if(!r.skipped){ui.state=r.state;await reloadRelationGraphCache();renderDataPages();if(!startup)toast(r.stats?.warning?t('toast.anilistRefreshPending'):t('toast.anilistUpdated'));}setStatus(t('status.ready'));return r;}catch(e){setStatus(t('error.anilist',{error:e.message||e}));if(!startup)toast(t('error.anilist',{error:e.message||e}));return null;}finally{ui.anilistSyncing=false;updateAniListSyncUi();}}
-function showStartupBanner(show,text=''){const el=$('startupBanner');el.classList.toggle('show',show);$('startupBannerText').textContent=text;}
+function showStartupBanner(show,text=''){const el=$('startupBanner'),visible=!!show&&!safeModeActive();el.classList.toggle('show',visible);$('startupBannerText').textContent=visible?text:'';}
 async function loadLogs(){const output=$('logOutput');if(!output)return;output.textContent='Loading…';try{const result=await pywebview.api.get_recent_logs(400);$('logPath').textContent=result.path||'';output.textContent=(result.lines||[]).join('\n')||'No log entries yet.';output.scrollTop=output.scrollHeight;}catch(err){output.textContent=t('error.generic',{error:err.message||err});}}
 function activeDownloads(){return (ui.state?.downloads||[]).filter(d=>(d.progress||0)<.999);}
 function prioritySubtitleJobs(){return (ui.state?.subtitle_jobs||[]).filter(j=>Number(j.priority||0)>=200&&(j.state==='pending'||j.state==='processing'));}
@@ -2788,9 +2802,9 @@ function foregroundDataSignature(state){
   const jobs=(state?.subtitle_jobs||[]).map(item=>`${item.video||''}:${item.attempts||0}:${Math.floor(Number(item.next_check||0))}:${item.error||''}`).sort();
   return `${foregroundDownloadSignature(state)}#${episodes.join('|')}#${jobs.join('|')}`;
 }
-async function pollForegroundWork(){ui.foregroundPollTimer=null;if(ui.foregroundPolling)return;ui.foregroundPolling=true;const before=foregroundDataSignature(ui.state);try{showStartupBanner(true,t('status.monitoring'));const r=await pywebview.api.poll_downloads_and_subtitles();ui.state=r.state;refreshTorrentToggle();const after=foregroundDataSignature(ui.state);if(before!==after)renderDataPages();if(hasActiveForegroundWork()){ui.emptyPolls=0;}else{ui.emptyPolls+=1;}}catch(e){console.error(e);ui.emptyPolls+=1;}finally{ui.foregroundPolling=false;const subtitleChecking=duePrioritySubtitleJobs().length>0;if(subtitleChecking){if(!ui.localRefreshing&&!ui.startupMaintenanceRunning)setLocalRefreshUi(false);setStatus(t('status.subtitleCheckingBackground'));}else if(!ui.localRefreshing&&!ui.startupMaintenanceRunning){setLocalRefreshUi(false);}if(hasActiveForegroundWork()||foregroundSubtitleJobs().length||ui.emptyPolls<2){ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}else{showStartupBanner(false);setStatus(t('status.ready'));}}}
-function rescheduleForegroundPoll(){if(!ui.foregroundPollTimer)return;clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}
-function ensureForegroundPollScheduled(){if(ui.foregroundPolling||ui.foregroundPollTimer)return;if(hasActiveForegroundWork()||foregroundSubtitleJobs().length)ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}
+async function pollForegroundWork(){ui.foregroundPollTimer=null;if(ui.foregroundPolling)return;if(safeModeActive()){showStartupBanner(false);setStatus(t('status.ready'));return;}ui.foregroundPolling=true;const before=foregroundDataSignature(ui.state);try{showStartupBanner(true,t('status.monitoring'));const r=await pywebview.api.poll_downloads_and_subtitles();ui.state=r.state;refreshTorrentToggle();const after=foregroundDataSignature(ui.state);if(before!==after)renderDataPages();if(hasActiveForegroundWork()){ui.emptyPolls=0;}else{ui.emptyPolls+=1;}}catch(e){console.error(e);ui.emptyPolls+=1;}finally{ui.foregroundPolling=false;if(safeModeActive()){showStartupBanner(false);setStatus(t('status.ready'));return;}const subtitleChecking=duePrioritySubtitleJobs().length>0;if(subtitleChecking){if(!ui.localRefreshing&&!ui.startupMaintenanceRunning)setLocalRefreshUi(false);setStatus(t('status.subtitleCheckingBackground'));}else if(!ui.localRefreshing&&!ui.startupMaintenanceRunning){setLocalRefreshUi(false);}if(hasActiveForegroundWork()||foregroundSubtitleJobs().length||ui.emptyPolls<2){ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}else{showStartupBanner(false);setStatus(t('status.ready'));}}}
+function rescheduleForegroundPoll(){if(safeModeActive()){if(ui.foregroundPollTimer)clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=null;showStartupBanner(false);return;}if(!ui.foregroundPollTimer)return;clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}
+function ensureForegroundPollScheduled(){if(safeModeActive()||ui.foregroundPolling||ui.foregroundPollTimer)return;if(hasActiveForegroundWork()||foregroundSubtitleJobs().length)ui.foregroundPollTimer=setTimeout(pollForegroundWork,foregroundPollDelay());}
 async function syncReadyStateVersion(force=false){
   if(ui.readyStateChecking)return;
   if(!force&&(document.hidden||!ui.windowActive))return;
@@ -2861,7 +2875,7 @@ function setWindowActivity(active){
   rescheduleForegroundPoll();
 }
 async function pollStartupMaintenance(){ui.startupMaintenancePollTimer=null;if(!ui.startupMaintenanceRunning)return;setLocalRefreshUi(true,'status.startup');try{const r=await pywebview.api.startup_maintenance_status();ui.state=r.state;if(ui.windowActive)renderDataPages(true);else ui.pendingDataRender=true;ui.startupMaintenanceRunning=!!r.running;if(r.running){ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,1000);return;}setLocalRefreshUi(false);if(r.error)toast(t('error.generic',{error:r.error}));else toast(t('toast.startupFinished'));setStatus(t('status.ready'));}catch(e){console.error(e);ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,3000);}}
-async function startupSequence(){if(ui.startupRunning)return;ui.startupRunning=true;setLocalRefreshUi(true,'status.anilist');showStartupBanner(true,t('status.anilist'));setStatus(t('status.anilist'));try{await syncAniList(true);showStartupBanner(true,t('status.startup'));setStatus(t('status.startup'));const r=await pywebview.api.startup_maintenance();ui.state=r.state;renderDataPages();ui.startupMaintenanceRunning=!!r.running;ui.emptyPolls=0;if(ui.startupMaintenanceRunning&&!ui.startupMaintenancePollTimer)ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,500);if(!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,1000);showStartupBanner(false);setStatus(ui.startupMaintenanceRunning?t('status.startupBackground'):t('status.ready'));}catch(e){setStatus(t('error.generic',{error:e.message||e}));showStartupBanner(false);}finally{ui.startupRunning=false;setLocalRefreshUi(ui.startupMaintenanceRunning,ui.startupMaintenanceRunning?'status.startup':'status.refreshing');}}
+async function startupSequence(){if(ui.startupRunning)return;if(safeModeActive()){if(ui.foregroundPollTimer)clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=null;showStartupBanner(false);renderSafeModeBanner();setStatus(t('status.ready'));return;}ui.startupRunning=true;setLocalRefreshUi(true,'status.anilist');showStartupBanner(true,t('status.anilist'));setStatus(t('status.anilist'));try{await syncAniList(true);showStartupBanner(true,t('status.startup'));setStatus(t('status.startup'));const r=await pywebview.api.startup_maintenance();ui.state=r.state;renderDataPages();ui.startupMaintenanceRunning=!!r.running;ui.emptyPolls=0;if(ui.startupMaintenanceRunning&&!ui.startupMaintenancePollTimer)ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,500);if(!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,1000);showStartupBanner(false);setStatus(ui.startupMaintenanceRunning?t('status.startupBackground'):t('status.ready'));}catch(e){setStatus(t('error.generic',{error:e.message||e}));showStartupBanner(false);}finally{ui.startupRunning=false;setLocalRefreshUi(ui.startupMaintenanceRunning,ui.startupMaintenanceRunning?'status.startup':'status.refreshing');}}
 async function loadState(){setStatus(t('status.loading'));const statePromise=pywebview.api.get_state();const graphCachePromise=pywebview.api.get_relation_graph_cache().catch(error=>{console.error(error);return {graphs:{},media_to_graph:{}};});ui.state=await statePromise;ui.readyStateVersion=String(ui.state?.ready_state_version||'');ui.uiStateVersion=String(ui.state?.ui_state_version||'');installRelationGraphCache(await graphCachePromise);ui.lang=ui.state.settings.language||'en';renderAll();scheduleTorrentTrafficPoll(250);void loadLightNovels(true);void resumePlanningEpisodeDownload();scheduleReadyStateWatch(1000);const firstPermissionRequest=!ui.state.settings.permissions_requested;try{const permissions=await pywebview.api.request_permissions();ui.state.settings=permissions.settings||ui.state.settings;if(firstPermissionRequest)toast(t('toast.permissionsRequested'));}catch(error){console.error(error);}setStatus(t('status.ready'));if(ui.state.settings.onboarding_completed)void startupSequence();else showOnboarding(false);}
 async function refreshAll(){if(ui.startupRunning||ui.startupMaintenanceRunning){toast(t('toast.alreadyRefreshing'));return;}if(ui.localRefreshing){toast(t('toast.alreadyRefreshing'));return;}ui.localRefreshing=true;setLocalRefreshUi(true,'status.refreshing');setStatus(t('status.refreshing'));try{const r=await pywebview.api.refresh_local();ui.state=r.state;renderDataPages();if(ui.page==='lightnovels')await loadLightNovels(true);const subtitleChecking=duePrioritySubtitleJobs().length>0;toast(t(subtitleChecking?'toast.refreshedSubtitlesQueued':'toast.refreshed'));setStatus(t(subtitleChecking?'status.subtitleCheckingBackground':'status.ready'));if((hasActiveForegroundWork()||foregroundSubtitleJobs().length)&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,subtitleChecking?500:foregroundPollDelay());}catch(e){setStatus(t('error.generic',{error:e.message||e}));toast(t('error.generic',{error:e.message||e}));}finally{ui.localRefreshing=false;setLocalRefreshUi(false);requestAnimationFrame(()=>{if(!ui.startupRunning&&!ui.startupMaintenanceRunning&&!ui.localRefreshing)setLocalRefreshUi(false);});}}
 
@@ -3253,6 +3267,8 @@ async function handleEscape(event){
 }
 async function handleAction(target){
   const action=target.dataset.action;if(!action)return;
+  if(action==='safe-mode-backup'){await pywebview.api.reveal_safe_mode_backup();return;}
+  if(action==='safe-mode-restart'){target.disabled=true;try{const result=await pywebview.api.safe_mode_restart_normally();if(result?.state)ui.state=result.state;else ui.state.safe_mode={...(ui.state.safe_mode||{}),active:false};renderSafeModeBanner();showStartupBanner(false);toast(ui.lang==='ru'?'Обычный режим включён':'Normal mode enabled');void startupSequence();}finally{target.disabled=false;}return;}
   if(action==='open-downloads'){await openDownloadCenter(target.dataset.mediaId||null);return;}
   if(action==='refresh-downloads'){stopDownloadCenterPoll();await refreshDownloadCenter(true);return;}
   if(action==='torrent-filter'){ui.downloadCenterFilter=target.dataset.filter||'all';renderDownloadCenter(ui.downloadCenter);return;}
@@ -3455,6 +3471,14 @@ document.addEventListener('click',async e=>{
   if(e.target.id==='checkSubtitleUpgrades'){e.target.disabled=true;try{const r=await pywebview.api.check_subtitle_upgrades();ui.state=r.state;renderDataPages();setPage('settings');toast(t('toast.subtitleUpgradeChecked',{count:r.scheduled||0}));if((r.scheduled||0)>0&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,500);}catch(err){toast(t('error.generic',{error:err.message||err}));}}
   if(e.target.id==='createBackup'){e.target.disabled=true;try{const r=await pywebview.api.create_full_backup();toast(t('toast.backupCreated',{path:r.path||''}));}catch(err){toast(t('error.generic',{error:err.message||err}));}finally{const b=$('createBackup');if(b)b.disabled=false;}}
   if(e.target.id==='restoreBackup'){if(!await pudgeConfirm(t('confirm.restoreBackup')))return;e.target.disabled=true;try{const r=await pywebview.api.restore_full_backup();if(r?.cancelled)return;if(!r?.ok)throw new Error(r?.error||'Restore failed');ui.state=r.state;renderAll();setPage('settings');toast(t('toast.backupRestored'));}catch(err){toast(t('error.generic',{error:err.message||err}));}finally{const b=$('restoreBackup');if(b)b.disabled=false;}}
+  if(e.target.id==='uninstallPudge'){
+    const warning=ui.lang==='ru'?'Это безвозвратно удалит приложение Pudge, настройки, базу, созданные Pudge backup-копии в Downloads, кэш, логи, привязанные мобильные устройства, ключи Pudge из Связки ключей и файлы в папке библиотеки Pudge.\n\nДобавленные внешние папки и общие программы — mpv, qBittorrent и JitenMPV — удалены не будут.':'This permanently removes the Pudge app, settings, database, Pudge backups in Downloads, cache, logs, paired mobile devices, Pudge Keychain items, and files in the Pudge library folder.\n\nAdded external folders and shared tools such as mpv, qBittorrent, and JitenMPV will not be removed.';
+    if(!await pudgeConfirm(warning,{danger:true,title:ui.lang==='ru'?'Удалить Pudge?':'Delete Pudge?',confirmText:ui.lang==='ru'?'Продолжить':'Continue'}))return;
+    const finalWarning=ui.lang==='ru'?'Последнее подтверждение: отменить удаление после этого будет нельзя.':'Final confirmation: this cannot be undone.';
+    if(!await pudgeConfirm(finalWarning,{danger:true,title:ui.lang==='ru'?'Удалить всё':'Delete everything',confirmText:ui.lang==='ru'?'Удалить Pudge':'Delete Pudge'}))return;
+    e.target.disabled=true;
+    try{await pywebview.api.uninstall_pudge();}catch(err){e.target.disabled=false;toast(t('error.generic',{error:err.message||err}));}
+  }
   if(e.target.id==='runSetupGuide')showOnboarding(true);
   if(e.target.id==='onboardingSkip')await skipOnboarding();
   if(e.target.id==='onboardingBack'){captureOnboardingStep();ui.onboardingStep=Math.max(0,ui.onboardingStep-1);renderOnboarding();}

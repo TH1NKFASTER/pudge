@@ -7,6 +7,7 @@ import json
 import math
 import re
 import subprocess
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, replace
@@ -21,6 +22,7 @@ import httpx
 from ..filename import fold_search_title, normalize_title, title_similarity
 from ..branding import APP_SLUG
 from ..manager_models import LibraryAnime, NyaaRelease
+from .base import CircuitBreaker
 
 
 NYAA_NS = "https://nyaa.si/xmlns/nyaa"
@@ -569,6 +571,9 @@ class NyaaClient:
         self.pre_search_command = pre_search_command.strip()
         self.category = category
         self.timeout = timeout
+        self._breaker = CircuitBreaker(failure_threshold=3, recovery_seconds=30.0)
+        self._clients: dict[str, httpx.Client] = {}
+        self._client_lock = threading.Lock()
 
     @staticmethod
     def _normalize_proxy_url(value: str) -> str:
@@ -597,24 +602,41 @@ class NyaaClient:
             raise NyaaError(f"Команда перед поиском Nyaa завершилась с ошибкой: {detail}")
 
     def _get(self, url: str, proxy: str | None) -> str:
+        if not self._breaker.allow():
+            raise NyaaError("Nyaa temporarily paused after repeated network failures")
         try:
-            with httpx.Client(
-                timeout=self.timeout,
-                follow_redirects=True,
-                proxy=proxy,
-                headers={"User-Agent": APP_SLUG},
-            ) as client:
-                response = client.get(url)
-                response.raise_for_status()
-                return response.text
+            key = str(proxy or "")
+            with self._client_lock:
+                client = self._clients.get(key)
+                if client is None:
+                    client = httpx.Client(
+                        timeout=self.timeout,
+                        follow_redirects=True,
+                        proxy=proxy,
+                        headers={"User-Agent": APP_SLUG},
+                    )
+                    self._clients[key] = client
+            response = client.get(url)
+            response.raise_for_status()
+            self._breaker.success()
+            return response.text
         except ImportError as exc:
+            self._breaker.failure()
             raise NyaaError(
                 "Для SOCKS-прокси не установлена зависимость socksio. "
                 "Повторно запустите ./install.sh."
             ) from exc
         except httpx.HTTPError as exc:
+            self._breaker.failure()
             route = f" через {proxy}" if proxy else " напрямую"
             raise NyaaError(f"Nyaa недоступен{route}: {exc}") from exc
+
+    def close(self) -> None:
+        with self._client_lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for client in clients:
+            client.close()
 
     def search(self, query: str, *, category: str | None = None, filter_id: int = 0) -> list[NyaaRelease]:
         self._run_hook()
@@ -1487,4 +1509,3 @@ def search_subsplease_ranked(
     ]
     ranked.sort(key=lambda item: (item.score, item.published), reverse=True)
     return ranked
-

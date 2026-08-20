@@ -19,6 +19,7 @@ from .database import Database
 from .filename import parse_anime_filename, title_similarity
 from .language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS
 from .jimaku_trial import apply_jimaku_trial
+from .identity import IdentityResolver, MediaIdentity
 from .library import (
     VIDEO_EXTENSIONS,
     japanese_subtitle_details,
@@ -33,11 +34,13 @@ from .episode_numbering import (
     media_episode_from_release as shared_media_episode_from_release,
     resolve_episode_numbering,
 )
+from .episode_state import watched_by_anilist_progress
 from .presentation_state import derive_episode_presentation, download_complete
 from .work_scheduler import WorkScheduler
 from .logging_utils import configure_logging, timed_step
 from .maintenance_lock import maintenance_lock
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
+from .manager_services import ReleaseTelemetryService
 from .notifications import send_native_notification
 from .pipeline_cache import invalidate_final_pipeline_result
 from .providers.anilist import AniListClient, AniListError, AniListHTTPError
@@ -242,6 +245,8 @@ class AnimeManager:
         self.work_scheduler = WorkScheduler(
             config.paths.cache_dir, logger=self.logger
         )
+        self.identity_resolver = IdentityResolver(self.db)
+        self.release_telemetry = ReleaseTelemetryService(self.db)
         self.download_intents = DownloadIntentStore(self.db)
         self._last_anilist_warning = ""
         self._last_anilist_used_cache = False
@@ -280,6 +285,43 @@ class AnimeManager:
                 retry_generation,
                 retried,
             )
+
+    def _record_media_identity(
+        self,
+        item: LibraryEpisode,
+        *,
+        source: str,
+        provenance: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            self.identity_resolver.record(
+                MediaIdentity(
+                    media_id=item.media_id,
+                    media_episode=item.media_episode,
+                    release_episode=item.release_episode,
+                    video_path=item.video_path,
+                    torrent_hash=item.torrent_hash,
+                    source=source,
+                    provenance=dict(provenance or {}),
+                )
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "FALLBACK step=identity.record media_id=%s episode=%s path=%r error=%r",
+                item.media_id,
+                item.media_episode,
+                str(item.video_path),
+                str(exc),
+            )
+
+    @staticmethod
+    def _release_provider(release: NyaaRelease) -> str:
+        category = str(release.category_id or "").casefold()
+        if "subsplease" in category:
+            return "subsplease"
+        if "shana" in category:
+            return "shana"
+        return "nyaa"
 
     def _anime_is_fully_ready(self, anime: LibraryAnime) -> bool:
         episodes = self.db.episodes(anime.media_id)
@@ -1367,6 +1409,7 @@ class AnimeManager:
         }
 
         def search_nyaa_source() -> tuple[list[NyaaRelease], NyaaError | None]:
+            client = self.nyaa_client(timeout=6.0 if automatic else 20.0)
             try:
                 with timed_step(
                     self.logger,
@@ -1377,7 +1420,7 @@ class AnimeManager:
                     title=anime.title,
                 ):
                     return search_ranked(
-                        self.nyaa_client(timeout=6.0 if automatic else 20.0),
+                        client,
                         anime,
                         # Automatic refresh should search the same title aliases as
                         # Find episode. The wall-clock budget below keeps background
@@ -1392,6 +1435,10 @@ class AnimeManager:
                     media_id, episode, str(exc),
                 )
                 return [], exc
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
 
         def search_subsplease_source(
             *,
@@ -2201,6 +2248,14 @@ class AnimeManager:
 
         pool = list(candidates[:3])
         for index, release in enumerate(pool):
+            candidate_started = time.monotonic()
+            self.release_telemetry.record(
+                release,
+                media_id=media_id,
+                media_episode=episode,
+                provider="aria2",
+                outcome="candidate",
+            )
             self.download_intents.update(
                 media_id,
                 episode,
@@ -2251,6 +2306,15 @@ class AnimeManager:
                     except QBittorrentError:
                         snapshot = None
                     if snapshot and self._torrent_race_is_alive(snapshot):
+                        self.release_telemetry.record(
+                            release,
+                            media_id=media_id,
+                            media_episode=episode,
+                            provider="aria2",
+                            outcome="winner",
+                            snapshot=snapshot,
+                            elapsed_seconds=time.monotonic() - candidate_started,
+                        )
                         self.download_intents.update(
                             media_id,
                             episode,
@@ -2275,6 +2339,15 @@ class AnimeManager:
                 except QBittorrentError:
                     snapshot = snapshot or None
                 if snapshot and self._torrent_race_is_alive(snapshot):
+                    self.release_telemetry.record(
+                        release,
+                        media_id=media_id,
+                        media_episode=episode,
+                        provider="aria2",
+                        outcome="winner",
+                        snapshot=snapshot,
+                        elapsed_seconds=time.monotonic() - candidate_started,
+                    )
                     self.download_intents.update(
                         media_id,
                         episode,
@@ -2305,6 +2378,15 @@ class AnimeManager:
                 except QBittorrentError:
                     pass
                 self.db.delete_torrent_records(release.info_hash)
+                self.release_telemetry.record(
+                    release,
+                    media_id=media_id,
+                    media_episode=episode,
+                    provider="aria2",
+                    outcome="no_progress",
+                    snapshot=snapshot,
+                    elapsed_seconds=time.monotonic() - candidate_started,
+                )
                 self.logger.info(
                     "RETRY step=nyaa.race backend=aria2 media_id=%s episode=%s "
                     "candidate=%s reason=no_progress",
@@ -2342,7 +2424,22 @@ class AnimeManager:
             return None
         if not hasattr(self, "download_intents"):
             self.download_intents = DownloadIntentStore(self.db)
+        if not hasattr(self, "release_telemetry"):
+            self.release_telemetry = ReleaseTelemetryService(self.db)
         backend = "qbittorrent" if self.config.qbittorrent.enabled else "aria2"
+        fast_seconds, total_seconds = self.release_telemetry.deadlines(
+            provider=backend,
+            default_fast=float(fast_seconds),
+            default_total=float(total_seconds),
+        )
+        for release in pool:
+            self.release_telemetry.record(
+                release,
+                media_id=media_id,
+                media_episode=episode,
+                provider=backend,
+                outcome="candidate",
+            )
         self.download_intents.begin(
             media_id, episode, batch, pool, backend=backend
         )
@@ -2394,6 +2491,7 @@ class AnimeManager:
         client = self.qbt_client()
         entries: list[tuple[NyaaRelease, str, Path]] = []
         live_hashes: set[str] = set()
+        latest_snapshots: dict[str, dict[str, Any]] = {}
         stale_existing_hash = ""
         started_at = time.monotonic()
 
@@ -2431,6 +2529,7 @@ class AnimeManager:
                 snapshot = client.torrent_status(torrent_hash)
                 if snapshot is None:
                     continue
+                latest_snapshots[torrent_hash.casefold()] = dict(snapshot)
                 if self._torrent_race_is_alive(snapshot):
                     live_hashes.add(torrent_hash.casefold())
                 self.logger.info(
@@ -2466,6 +2565,16 @@ class AnimeManager:
             for entry in entries:
                 if entry[1] != winner_hash:
                     remove_entry(entry)
+                release, torrent_hash, _slot = entry
+                self.release_telemetry.record(
+                    release,
+                    media_id=media_id,
+                    media_episode=episode,
+                    provider="qbittorrent",
+                    outcome="winner" if torrent_hash == winner_hash else "loser",
+                    snapshot=latest_snapshots.get(torrent_hash.casefold()),
+                    elapsed_seconds=time.monotonic() - started_at,
+                )
             if stale_existing_hash and stale_existing_hash.casefold() != winner_hash.casefold():
                 try:
                     client.delete(stale_existing_hash, delete_files=True)
@@ -2629,6 +2738,16 @@ class AnimeManager:
             if winner_entry is None:
                 for entry in entries:
                     remove_entry(entry)
+                    release, torrent_hash, _slot = entry
+                    self.release_telemetry.record(
+                        release,
+                        media_id=media_id,
+                        media_episode=episode,
+                        provider="qbittorrent",
+                        outcome="no_progress",
+                        snapshot=latest_snapshots.get(torrent_hash.casefold()),
+                        elapsed_seconds=time.monotonic() - started_at,
+                    )
                 cleanup_empty_dirs()
                 self.logger.warning(
                     "FALLBACK step=torrent.race_none_live media_id=%s episode=%s batch=%s candidates=%s",
@@ -3928,6 +4047,11 @@ class AnimeManager:
                 library_episode,
                 downloaded_at=float(item.completed_on or time.time()),
             )
+            self._record_media_identity(
+                library_episode,
+                source="completed_download",
+                provenance={"subtitle_source": subtitle_source},
+            )
             if subtitle_source in {"none", "external_bitmap", "embedded_bitmap"}:
                 if is_new_completion:
                     self.db.queue_subtitle_job(
@@ -4379,8 +4503,7 @@ class AnimeManager:
                 ffmpeg=self.config.tools.ffmpeg,
             )
 
-        self.db.upsert_episode(
-            LibraryEpisode(
+        repaired_episode = LibraryEpisode(
                 media_id=item.media_id,
                 title=anime.title if anime else identity.title,
                 episode=media_number,
@@ -4402,8 +4525,15 @@ class AnimeManager:
                     else "waiting_subtitles"
                 ),
                 torrent_hash=item.torrent_hash,
-            ),
+            )
+        self.db.upsert_episode(
+            repaired_episode,
             downloaded_at=float(item.completed_on or time.time()),
+        )
+        self._record_media_identity(
+            repaired_episode,
+            source="download_reconciliation",
+            provenance={"subtitle_source": subtitle_source},
         )
 
         if subtitle_source in {"none", "external_bitmap", "embedded_bitmap"}:
@@ -4570,6 +4700,7 @@ class AnimeManager:
             torrent_hash="",
         )
         self.db.upsert_episode(item, downloaded_at=time.time())
+        self._record_media_identity(item, source="manual_import")
         if subtitle_source in {"none", "external_bitmap", "embedded_bitmap"}:
             self.db.ensure_subtitle_job(video, item.media_id, media_number)
         return self.db.episode_by_path(video) or item
@@ -4663,10 +4794,20 @@ class AnimeManager:
         }
         action_job = jobs[0] if jobs else None
         primary_download = downloads[0] if downloads else None
+        watched_externally = bool(
+            selected is not None
+            and watched_by_anilist_progress(
+                selected.episode,
+                anime.progress,
+                total_episodes=anime.episodes,
+                media_format=anime.format,
+            )
+        )
         presentation = derive_episode_presentation(
             local=selected,
             download=primary_download,
             action_job=action_job,
+            watched_externally=watched_externally,
         )
 
         video_exists = bool(selected and selected.video_path.is_file())
@@ -4754,6 +4895,7 @@ class AnimeManager:
             "ready": subtitle_ready,
             "video_path": str(selected.video_path) if selected else "",
             "state": selected.state if selected else "missing",
+            "watched_on_anilist": watched_externally,
             "presentation": presentation,
             "checks": checks,
             "downloads": [

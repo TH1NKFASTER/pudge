@@ -2,12 +2,14 @@
 
 (() => {
   let pendingResolve = null;
+  let pendingDanger = false;
 
   const finish = value => {
     const backdrop = document.getElementById('pudgeConfirmBackdrop');
     if (backdrop) backdrop.classList.remove('open');
     const resolve = pendingResolve;
     pendingResolve = null;
+    pendingDanger = false;
     if (resolve) resolve(Boolean(value));
   };
 
@@ -27,6 +29,8 @@
       .pudge-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
       .pudge-confirm-actions button{min-width:92px}
       .pudge-confirm-actions .confirm{background:#6f8cff;border-color:#6f8cff;color:white}
+      .pudge-confirm-actions .confirm.danger{background:#b42336;border-color:#ff6b7d;color:#fff}
+      .pudge-confirm-actions .confirm.danger:hover{background:#cf2d43}
     `;
     document.head.appendChild(style);
 
@@ -63,13 +67,13 @@
     if (event.key === 'Escape') {
       event.preventDefault();
       finish(false);
-    } else if (event.key === 'Enter') {
+    } else if (event.key === 'Enter' && !pendingDanger) {
       event.preventDefault();
       finish(true);
     }
   }, true);
 
-  window.pudgeConfirm = message => new Promise(resolve => {
+  window.pudgeConfirm = (message, options = {}) => new Promise(resolve => {
     if (pendingResolve) {
       const previous = pendingResolve;
       pendingResolve = null;
@@ -78,14 +82,18 @@
 
     const backdrop = ensureDialog();
     const lang = String(window.ui?.lang || document.documentElement.lang || 'en').toLowerCase();
+    const danger = Boolean(options?.danger);
     document.getElementById('pudgeConfirmMessage').textContent = String(message ?? '');
+    document.getElementById('pudgeConfirmTitle').textContent = String(options?.title || 'Pudge');
 
     const cancel = backdrop.querySelector('[data-pudge-confirm="cancel"]');
     const ok = backdrop.querySelector('[data-pudge-confirm="ok"]');
     cancel.textContent = lang.startsWith('ru') ? 'Отмена' : 'Cancel';
-    ok.textContent = lang.startsWith('ru') ? 'Подтвердить' : 'Confirm';
+    ok.textContent = String(options?.confirmText || (lang.startsWith('ru') ? 'Подтвердить' : 'Confirm'));
+    ok.classList.toggle('danger', danger);
 
     pendingResolve = resolve;
+    pendingDanger = danger;
     backdrop.classList.add('open');
     requestAnimationFrame(() => ok.focus());
   });

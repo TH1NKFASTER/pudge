@@ -1,67 +1,59 @@
 # Releasing Pudge
 
-The normal maintainer path is one command:
+Pudge releases are built from an exact version tag. The release script checks
+the branch, runs every required check, creates the commit and tag, and pushes
+only after all checks pass.
+
+## Standard release
+
+From a clean `main` checkout with the release changes already reviewed:
 
 ```bash
-make release VERSION=0.7.21 PYTHON=.venv-test/bin/python
+make release VERSION=0.7.23 PYTHON=.venv-test/bin/python
 ```
 
-It fetches `origin/main` and tags, refuses a stale/diverged checkout, bumps the
-version, runs lint plus all four test batches, checks whitespace, stages all
-non-ignored project changes (including new docs), commits, pushes `main`, and
-creates/pushes the matching version tag. Existing tags are never moved.
+The command:
 
-Use `make build-release` only when you explicitly want to build the release
-archive without committing/tagging.
+1. fetches `origin/main` and the existing tags;
+2. stops if the checkout is stale, diverged, or contains an unsafe version tag;
+3. updates the version in package and documentation files;
+4. runs lint and all four test batches;
+5. checks the staged diff for whitespace errors;
+6. commits the release, pushes `main`, and creates the matching tag.
 
+Public tags are never moved. If a step fails, fix the cause and start again
+instead of forcing the tag or publishing an unchecked archive.
 
-GitHub Releases are automated from version tags.
+## Build without publishing
 
-## 1. Update the version
-
-Use the version helper:
+Use this when you need to inspect the archive but do not want a commit or tag:
 
 ```bash
-make bump VERSION=0.6.69
+make build-release
 ```
 
-It updates `pudge/__init__.py`, `pyproject.toml` and the README example together.
+The archive is written to `dist/pudge-macos-vX.Y.Z.zip`.
 
-## 2. Run checks locally
+## Run the checks yourself
+
+The release command runs these checks automatically, but they are useful before
+the final review:
 
 ```bash
 make test-batches
 make lint
+python -m compileall -q pudge scripts
 ```
 
-## 3. Commit and push
+## What GitHub Actions publishes
 
-```bash
-git status --short
-git add pudge tests scripts .github README.md CHANGELOG.md DEVELOPMENT.md \
-  CONTRIBUTING.md SECURITY.md LICENSE RELEASING.md pyproject.toml \
-  config.example.toml install.sh build_release.sh
-git diff --cached --check
-git commit -m "Pudge v0.6.69"
-git push
-```
+After a valid version tag is pushed, GitHub Actions:
 
-## 4. Create and push the tag
+1. verifies that the tag matches `pudge.__version__`;
+2. runs the full suite in four macOS test batches;
+3. builds `pudge-macos-vX.Y.Z.zip`;
+4. creates the GitHub Release;
+5. attaches the ZIP and its SHA-256 checksum.
 
-```bash
-git tag v0.6.69
-git push origin v0.6.69
-```
-
-GitHub Actions will then:
-
-1. verify that the tag matches `pudge.__version__`;
-2. run the full test suite in four macOS batches;
-3. build `pudge-macos-v0.6.69.zip`;
-4. create a GitHub Release and attach the ZIP plus its `.sha256` checksum.
-
-If any test batch fails, the release ZIP is not published.
-
-Do not publish from a working tree containing unreviewed generated files. The
-tag must point at the reviewed release commit; do not move an existing public
-tag. This keeps the maintainer handoff reproducible.
+No archive is published when a test batch or metadata check fails. The tag must
+always point to the reviewed release commit.

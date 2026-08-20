@@ -1,71 +1,106 @@
 # Pudge user guide
 
-This guide describes the normal workflows rather than every individual control. Pudge is local-first: it indexes files already on disk, then uses optional services only for metadata, downloads, subtitles and study data.
+This guide covers the tasks you are most likely to do. Pudge keeps its library
+on your Mac and contacts online services only for features you turn on.
 
-## 1. Add an anime and prepare it for watching
+## Watch an anime
 
-1. Add the title to Planning through AniList or the Planning search.
-2. Open its context menu and choose a series release, or use **Download released automatically**.
-3. Pudge checks the local library before every Nyaa search, so an episode already on disk is skipped.
-4. The episode then moves through subtitle preparation. A text subtitle that passes language and timing validation makes the episode **Ready**.
-5. If preparation fails or is interrupted, start the action again from the relevant media card or Diagnostics.
+1. Add a title from Planning or AniList.
+2. Open its menu and download an episode or a full available release.
+3. Pudge checks whether the episode is already on disk, then downloads only what is missing.
+4. It finds Japanese subtitles, checks their timing, and shows the episode as **Ready**.
+5. Open the episode. Pudge saves your position and marks it watched when you reach the configured completion threshold.
 
-For a partial season, automatic per-episode download searches only for released episode numbers and records one result for each episode. It does not silently replace a local file.
+If subtitle preparation stops, retry it from the episode card. Diagnostics shows
+the reason when a retry needs more than a normal network refresh.
 
-## 2. Understand video and subtitle states
+### What the episode labels mean
 
-The durable episode states are:
+| Label | Meaning |
+|---|---|
+| Found locally | The video is on disk but subtitle preparation has not started. |
+| Preparing subtitles | Pudge is finding, extracting, or checking subtitles. |
+| Waiting for text subtitles | The available subtitle is image-based; selectable Japanese text is still being prepared. |
+| Ready | A checked Japanese text subtitle or embedded text track is available. |
+| Watched | The episode was completed. |
+| Dropped | The title was removed from the active library. |
 
-| State | Meaning | Normal next state |
-|---|---|---|
-| `local` | Video was found; preparation has not been requested yet | `waiting_subtitles` |
-| `waiting_subtitles` | Text subtitle discovery/alignment is queued | `ready` or `waiting_text_subtitles` |
-| `waiting_text_subtitles` | A bitmap subtitle exists, but Pudge is finding or creating selectable Japanese text | `ready` |
-| `ready` | A validated text subtitle or embedded text track is selected | `watched` |
-| `watched` | Playback met the watched threshold | `ready` after an explicit progress reset |
-| `dropped` | The title was dropped and may be scheduled for cleanup | `local` after an explicit restore |
+A normal scan never turns a watched or ready episode back into an earlier state.
+Resetting progress or running a repair is always an explicit action.
 
-A library scan is observational: it cannot move `ready`, `watched`, `dropped` or a confirmed bitmap fallback backwards. Repair actions are explicit transitions and are written to state history.
+### Image-based subtitles
 
-### Bitmap subtitles and OCR
+PGS/SUP subtitles are pictures, so their text cannot be selected. When image
+subtitle OCR is enabled, Pudge converts them to Japanese text and checks the
+result. The original image track can still be used for playback while this is
+in progress.
 
-PGS/SUP and other image subtitles cannot provide selectable text. With image-subtitle OCR enabled, Pudge extracts the image track, runs OCR and validates the resulting Japanese text. Until that succeeds, the video remains `waiting_text_subtitles`; the bitmap track can still be used for Library-only playback. Retry the relevant preparation action if OCR fails.
+## Read a Light Novel
 
-## 3. Read a Light Novel with pitch accent
+1. Import an EPUB or TXT file from **Light Novels**.
+2. Link it to AniList if you want cover art and progress updates.
+3. Choose Jiten or JPDB in Settings for dictionary and study actions.
+4. Adjust font, width, colors, furigana, and pitch accent in reader appearance.
+5. Select a word to open its reading and study card.
 
-1. Import one or more EPUB/TXT files from **Light Novels**.
-2. Link the book to the AniList novel entry when prompted.
-3. Enable **Furigana** and **Inline pitch accent** in reader appearance.
-4. Select a word to open its Jiten/JPDB card and study actions.
+**Finish volume** needs two clicks within five seconds. This prevents an
+accidental AniList progress update. **Remove Finished** clears only Pudge's
+local badge and does not reduce AniList progress.
 
-For an inflected surface form, Pudge rebuilds the displayed reading from Jiten token ruby ranges. If Jiten supplies a surface-form accent, it is used directly. Otherwise Pudge transfers the dictionary downstep to the reconstructed mora sequence and marks it as derived. This keeps the diagram aligned with the actual conjugated reading without presenting the fallback as a separately verified dictionary entry.
+## Read manga
 
-### Finish a volume safely
+Import a CBZ or ZIP archive from **Manga**. Reading works without OCR. Run
+MangaOCR only when you want selectable Japanese text from a page; it does not
+run simply because you opened the book.
 
-**Finish volume** is a two-step action: click it once to arm it, then click it again within five seconds. Finishing may update AniList volume progress. To remove only the local badge, right-click the volume and choose **Remove Finished**. Removing the badge deliberately does not reduce AniList progress.
+## Pair a Light Novel with an audiobook
 
-## 4. Pair a Light Novel and audiobook
+Import both items and give them the correct AniList identity when possible.
+Pudge links obvious matches automatically, but leaves ambiguous titles for you
+to choose. Once audio transcription and alignment finish, **Listen together**
+keeps audio position and reader highlighting in step.
 
-Pudge attempts a conservative automatic link after either side is imported or receives an AniList identity:
+If Pudge chose the wrong match, unlink it, correct the AniList entries, and
+select the pair manually. Existing manual links are never replaced by automatic
+matching.
 
-- an identical AniList ID is the strongest signal;
-- normalized titles must otherwise be at least 90% similar;
-- explicit volume numbers must agree;
-- ambiguous candidates are left unlinked.
+## Use Pudge on a phone or tablet
 
-When linked, the audiobook receives the novel's AniList identity if it has none (or the novel receives the audiobook identity). Japanese STT runs in the background, then text/audio alignment enables **Listen together**, synchronized seeking and reader highlighting. You can still change AniList or the audio link manually.
+Enable the companion server in Settings, start pairing, and open the provided
+address or QR code on a device connected to the same trusted network. The
+device receives a revocable access token; it never reads the SQLite database
+directly.
 
-If only the audiobook is local, choose **Find LN on Nyaa** on its card. The query uses the linked novel title first, then the audiobook AniList title, then the local filename, and includes the volume when known.
+The companion library refreshes whenever it returns to the foreground and every
+15 seconds while it remains visible. When an episode is completed on the Mac,
+an older mobile resume event cannot turn it back into **Continue**. If the Mac
+is asleep or Pudge is closed, the phone keeps its last view until it can connect
+again.
 
-## 5. Jimaku trial and personal keys
+## Back up and restore
 
-A release may include a shared Jimaku key for the first 48 hours. The release workflow reads it from the GitHub Actions repository secret `PUDGE_TRIAL_JIMAKU_API_KEY`; the key is not committed to the source tree or saved to the user's config. A personal Jimaku key always takes priority.
+Use **Settings → Maintenance → Create full backup**. A backup contains settings,
+the library database, mappings, queues, history, and prepared subtitle files. It
+does not contain videos, torrent payloads, or API credentials.
 
-If a self-built release does not provide that build secret, trial access is disabled and personal Jimaku keys continue to work.
+Restoring replaces the current settings and database but keeps the credentials
+already stored on that Mac.
 
-## 6. Common recovery scenarios
+## Remove Pudge completely
 
-- **A scan changed an episode backwards:** current builds prevent this. Refresh once; if it persists, inspect the episode and subtitle job in Diagnostics and include the state history in a bug report.
-- **OCR/STT appears stuck:** retry the relevant preparation action from the media card or inspect Diagnostics before reporting it.
-- **The wrong LN and audiobook linked:** unlink them in the LN audio picker, set the correct AniList identities, and link manually. Automatic matching will not overwrite an existing link.
-- **Nyaa found nothing for an audiobook:** adjust the local audiobook title or bind AniList, then run **Find LN on Nyaa** again.
+Open **Settings → Remove Pudge** and click the red button. Two confirmations are
+required because the action cannot be undone.
+
+The uninstaller removes Pudge's app bundle, command-line tools, LaunchAgent,
+settings, database, Pudge-created backups in Downloads, cache, logs,
+paired-device records, Keychain entries, and the Pudge library folder. Folders
+added only for watching or subtitle search remain. Homebrew and shared tools
+such as mpv, qBittorrent, and JitenMPV also remain installed.
+
+## If something looks wrong
+
+- **A completed episode still says Continue on mobile:** bring the companion page to the foreground and make sure the Mac is awake and Pudge is running.
+- **An episode moved backwards:** refresh once, then include its state history from Diagnostics in a bug report.
+- **OCR or transcription is not moving:** retry the item, then check Diagnostics for the last job error.
+- **Nyaa found the wrong or no Light Novel:** correct the local title or AniList link and search again.
+- **The wrong book and audiobook were linked:** unlink them and choose the pair manually.

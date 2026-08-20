@@ -10,4 +10,7 @@ Please use GitHub's private vulnerability reporting for this repository. If that
 
 Include the affected version, macOS version, reproduction steps and impact. Do not include real API tokens, private media filenames or personal AniList data. You should receive an acknowledgement within seven days.
 
-Pudge backups intentionally redact Jimaku, AniList, qBittorrent, LLM, Jiten and JPDB credentials. A report showing credential material in a newly created backup should be treated as sensitive.
+Pudge backups omit Jimaku, AniList, qBittorrent, LLM, Jiten, and JPDB
+credentials. The built-in uninstaller removes Pudge's own Keychain entries but
+does not remove shared third-party applications. Treat any report of credentials
+appearing in a newly created backup as sensitive.

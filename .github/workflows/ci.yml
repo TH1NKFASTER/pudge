@@ -8,11 +8,12 @@ on:
 
 jobs:
   tests:
-    name: Tests ${{ matrix.batch }}/4
+    name: Python ${{ matrix.python }} · tests ${{ matrix.batch }}/4
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.11", "3.12"]
         batch: [1, 2, 3, 4]
 
     steps:
@@ -20,7 +21,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: Install test dependencies
@@ -54,6 +55,11 @@ jobs:
         run: |
           python -m ruff check --select E9,F pudge scripts
           python -m ruff check --select E9,F63,F7 tests
+          python -m ruff check --select BLE001 pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/web_controllers.py pudge/manager_services.py pudge/providers/base.py
+          python -m ruff format --check pudge/alignment_replay.py pudge/cache_registry.py pudge/diagnostics.py pudge/identity.py pudge/manager_services.py pudge/providers/base.py pudge/safe_mode.py pudge/secrets_store.py pudge/subtitles/pipeline.py pudge/task_supervisor.py pudge/web_controllers.py pudge/web_state.py scripts/check_release_metadata.py scripts/sync_config_example.py scripts/torrent_backtest.py tests/test_audit_properties.py tests/test_audit_v0722_stabilization.py tests/test_performance_budgets.py
+          python scripts/sync_config_example.py --check
+          python -m mypy --follow-imports=skip pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/providers/base.py
+          python scripts/check_release_metadata.py
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -73,3 +79,7 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Run migration, media and UI smoke tests
         run: python -m pytest -q tests/test_p0_p1_features.py tests/test_ui_integration.py tests/test_config.py
+      - name: Verify SRT fallback without Homebrew media tools
+        run: |
+          PYTHON_BIN="$(command -v python)"
+          PATH="$(dirname "$PYTHON_BIN"):/usr/bin:/bin" "$PYTHON_BIN" -m pytest -q tests/test_v0118_runtime_reset_permissions.py -k companion_can_prepare_srt

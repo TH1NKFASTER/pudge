@@ -28,6 +28,7 @@ proxy_url = ""
 pre_search_command = ""
 auto_download_current = true
 subsplease_rss_enabled = false
+subsplease_rss_preferred = false
 auto_require_trusted = true
 only_trusted_groups = false
 min_release_score = 72.0
@@ -110,6 +111,7 @@ ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 alass = "alass"
 mpv_extra_args = []
+mpv_study_plugin = "auto"
 
 [jimaku]
 api_key = ""

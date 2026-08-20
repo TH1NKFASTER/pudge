@@ -39,7 +39,15 @@ def main() -> int:
     for path in selected:
         print(f"  {path}")
 
-    cmd = [sys.executable, "-m", "pytest", "-q", *(str(path) for path in selected), *args.pytest_args]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "--durations=15",
+        *(str(path) for path in selected),
+        *args.pytest_args,
+    ]
     return subprocess.call(cmd)
 
 

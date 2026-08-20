@@ -7,7 +7,7 @@ RELEASE = ROOT / "scripts" / "release.py"
 
 def test_make_release_requires_version_and_uses_release_helper() -> None:
     source = MAKEFILE.read_text(encoding="utf-8")
-    assert 'Usage: make release VERSION=0.7.21' in source
+    assert 'Usage: make release VERSION=0.7.23' in source
     assert 'scripts/release.py "$(VERSION)" --python "$(PYTHON)"' in source
     assert ".venv-test/bin/python" in source.splitlines()[0]
     assert "build-release:" in source
@@ -19,7 +19,7 @@ def test_release_helper_has_full_safe_release_pipeline() -> None:
         '"fetch", "origin", "main", "--tags"',
         '"merge-base", "--is-ancestor", "origin/main", "HEAD"',
         'run(python, "scripts/bump_version.py", version)',
-        'run("make", "lint", f"PYTHON={python}")',
+        'run("make", "quality", f"PYTHON={python}")',
         'run("make", "test-batches", f"PYTHON={python}")',
         'git("diff", "--check")',
         'git("add", "-A")',

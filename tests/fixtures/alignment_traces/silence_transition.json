@@ -1,0 +1,13 @@
+{
+  "description": "Speech, a stable silence interval, and resumed narration.",
+  "events": [
+    {"sourceOffset": 0.00, "renderedOffset": 0.00, "speechActive": true},
+    {"sourceOffset": 0.55, "renderedOffset": 0.58, "speechActive": true},
+    {"sourceOffset": 1.10, "renderedOffset": 1.15, "speechActive": true},
+    {"sourceOffset": 1.10, "renderedOffset": 1.15, "speechActive": false},
+    {"sourceOffset": 1.10, "renderedOffset": 1.15, "speechActive": false},
+    {"sourceOffset": 1.65, "renderedOffset": 1.71, "speechActive": true},
+    {"sourceOffset": 2.20, "renderedOffset": 2.28, "speechActive": true},
+    {"sourceOffset": 2.75, "renderedOffset": 2.84, "speechActive": true}
+  ]
+}

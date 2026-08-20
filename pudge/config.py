@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import tomllib
 from dataclasses import dataclass, field
@@ -10,11 +9,13 @@ from typing import Any
 
 from .branding import CACHE_DIR, CONFIG_DIR, DEFAULT_DATABASE_PATH, DEFAULT_LIBRARY_DIR, QBITTORRENT_CATEGORY
 from .jimaku_trial import apply_jimaku_trial, persisted_jimaku_api_key
+from .secrets_store import SecretStore
 
 
 APP_DIR = CONFIG_DIR
 DEFAULT_CONFIG_PATH = APP_DIR / "config.toml"
 DEFAULT_CACHE_DIR = CACHE_DIR
+_SECRET_STORE = SecretStore()
 
 
 @dataclass(slots=True)
@@ -354,6 +355,7 @@ def _load_watched_media_dirs(paths: dict[str, Any]) -> list[Path]:
 
 def load_config(path: Path | None = None) -> AppConfig:
     config_path = Path(path or DEFAULT_CONFIG_PATH).expanduser()
+    use_keychain = config_path.resolve() == DEFAULT_CONFIG_PATH.expanduser().resolve()
     raw: dict[str, Any] = {}
     if config_path.exists():
         with config_path.open("rb") as fh:
@@ -447,11 +449,17 @@ def load_config(path: Path | None = None) -> AppConfig:
             enabled=bool(qbittorrent.get("enabled", False)),
             base_url=str(qbittorrent.get("base_url", "http://127.0.0.1:8080")).rstrip("/"),
             username=str(qbittorrent.get("username", "admin")),
-            password=os.getenv(
-                "PUDGE_QBITTORRENT_PASSWORD", str(qbittorrent.get("password", ""))
+            password=_SECRET_STORE.resolve(
+                "qbittorrent-password",
+                qbittorrent.get("password", ""),
+                env="PUDGE_QBITTORRENT_PASSWORD",
+                use_keychain=use_keychain,
             ),
-            api_key=os.getenv(
-                "PUDGE_QBITTORRENT_API_KEY", str(qbittorrent.get("api_key", ""))
+            api_key=_SECRET_STORE.resolve(
+                "qbittorrent-api-key",
+                qbittorrent.get("api_key", ""),
+                env="PUDGE_QBITTORRENT_API_KEY",
+                use_keychain=use_keychain,
             ),
             verify_tls=bool(qbittorrent.get("verify_tls", True)),
             category=str(qbittorrent.get("category", QBITTORRENT_CATEGORY)),
@@ -515,19 +523,30 @@ def load_config(path: Path | None = None) -> AppConfig:
             mpv_study_plugin=str(tools.get("mpv_study_plugin", "auto")).strip().casefold(),
         ),
         jimaku=JimakuConfig(
-            api_key=os.getenv("JIMAKU_API_KEY", str(jimaku.get("api_key", ""))).strip(),
-            personal_api_key=os.getenv(
-                "JIMAKU_API_KEY", str(jimaku.get("api_key", ""))
-            ).strip(),
+            api_key=_SECRET_STORE.resolve(
+                "jimaku-api-key",
+                jimaku.get("api_key", ""),
+                env="JIMAKU_API_KEY",
+                use_keychain=use_keychain,
+            ),
+            personal_api_key=_SECRET_STORE.resolve(
+                "jimaku-api-key",
+                jimaku.get("api_key", ""),
+                env="JIMAKU_API_KEY",
+                use_keychain=use_keychain,
+            ),
             base_url=str(jimaku.get("base_url", "https://jimaku.cc")).rstrip("/"),
         ),
         anilist=AniListConfig(
             enabled=bool(anilist.get("enabled", True)),
             endpoint=str(anilist.get("endpoint", "https://graphql.anilist.co")),
             client_id=str(anilist.get("client_id", "")).strip(),
-            access_token=os.getenv(
-                "ANILIST_ACCESS_TOKEN", str(anilist.get("access_token", ""))
-            ).strip(),
+            access_token=_SECRET_STORE.resolve(
+                "anilist-access-token",
+                anilist.get("access_token", ""),
+                env="ANILIST_ACCESS_TOKEN",
+                use_keychain=use_keychain,
+            ),
             auto_update_progress=bool(anilist.get("auto_update_progress", True)),
             watched_threshold=0.85,
             watched_max_remaining_minutes=10.0,
@@ -544,7 +563,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         llm=LLMConfig(
             enabled=bool(llm.get("enabled", False)),
             base_url=str(llm.get("base_url", "http://127.0.0.1:11434")).rstrip("/"),
-            api_key=os.getenv("PUDGE_LLM_API_KEY", str(llm.get("api_key", ""))).strip(),
+            api_key=_SECRET_STORE.resolve(
+                "llm-api-key",
+                llm.get("api_key", ""),
+                env="PUDGE_LLM_API_KEY",
+                use_keychain=use_keychain,
+            ),
             model=str(llm.get("model", "qwen3.5:9b-q8_0")),
             ambiguity_margin=float(llm.get("ambiguity_margin", 8.0)),
             think=bool(llm.get("think", False)),
@@ -633,6 +657,24 @@ def _toml_bool(value: bool) -> str:
 def write_config(config: AppConfig, destination: Path | None = None) -> Path:
     destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
+    use_keychain = destination.resolve() == DEFAULT_CONFIG_PATH.expanduser().resolve()
+    qbt_password = _SECRET_STORE.persisted_config_value(
+        "qbittorrent-password", config.qbittorrent.password, use_keychain=use_keychain
+    )
+    qbt_api_key = _SECRET_STORE.persisted_config_value(
+        "qbittorrent-api-key", config.qbittorrent.api_key, use_keychain=use_keychain
+    )
+    jimaku_api_key = _SECRET_STORE.persisted_config_value(
+        "jimaku-api-key",
+        persisted_jimaku_api_key(config.jimaku),
+        use_keychain=use_keychain,
+    )
+    anilist_token = _SECRET_STORE.persisted_config_value(
+        "anilist-access-token", config.anilist.access_token, use_keychain=use_keychain
+    )
+    llm_api_key = _SECRET_STORE.persisted_config_value(
+        "llm-api-key", config.llm.api_key, use_keychain=use_keychain
+    )
     text = f'''[ui]
 language = {_toml_string(config.ui.language)}
 onboarding_completed = {_toml_bool(config.ui.onboarding_completed)}
@@ -690,8 +732,8 @@ max_upgrade_checks_per_run = {config.nyaa.max_upgrade_checks_per_run}
 enabled = {_toml_bool(config.qbittorrent.enabled)}
 base_url = {_toml_string(config.qbittorrent.base_url)}
 username = {_toml_string(config.qbittorrent.username)}
-password = {_toml_string(config.qbittorrent.password)}
-api_key = {_toml_string(config.qbittorrent.api_key)}
+password = {_toml_string(qbt_password)}
+api_key = {_toml_string(qbt_api_key)}
 verify_tls = {_toml_bool(config.qbittorrent.verify_tls)}
 category = {_toml_string(config.qbittorrent.category)}
 pre_download_command = {_toml_string(config.qbittorrent.pre_download_command)}
@@ -751,14 +793,14 @@ mpv_extra_args = {_toml_string_list(config.tools.mpv_extra_args)}
 mpv_study_plugin = {_toml_string(config.tools.mpv_study_plugin)}
 
 [jimaku]
-api_key = {_toml_string(persisted_jimaku_api_key(config.jimaku))}
+api_key = {_toml_string(jimaku_api_key)}
 base_url = {_toml_string(config.jimaku.base_url)}
 
 [anilist]
 enabled = {_toml_bool(config.anilist.enabled)}
 endpoint = {_toml_string(config.anilist.endpoint)}
 client_id = {_toml_string(config.anilist.client_id)}
-access_token = {_toml_string(config.anilist.access_token)}
+access_token = {_toml_string(anilist_token)}
 auto_update_progress = {_toml_bool(config.anilist.auto_update_progress)}
 watched_threshold = {config.anilist.watched_threshold}
 watched_max_remaining_minutes = {config.anilist.watched_max_remaining_minutes}
@@ -773,7 +815,7 @@ relations_by_release_date = {_toml_bool(config.anilist.relations_by_release_date
 [llm]
 enabled = {_toml_bool(config.llm.enabled)}
 base_url = {_toml_string(config.llm.base_url)}
-api_key = {_toml_string(config.llm.api_key)}
+api_key = {_toml_string(llm_api_key)}
 model = {_toml_string(config.llm.model)}
 ambiguity_margin = {config.llm.ambiguity_margin}
 think = {_toml_bool(config.llm.think)}

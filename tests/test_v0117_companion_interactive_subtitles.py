@@ -52,11 +52,11 @@ def test_interactive_subtitle_ui_contract() -> None:
     ):
         assert f'id="{element_id}"' in html
 
-    assert "app.js?v=13" in html
-    assert "styles.css?v=13" in html
+    assert "app.js?v=15" in html
+    assert "styles.css?v=15" in html
     assert ".subtitle-token.state-learning" in css
     assert ".anime-study-sheet" in css
-    assert "pudge-companion-shell-v13" in sw
+    assert "pudge-companion-shell-v15" in sw
 
 
 def test_subtitle_overlay_is_not_a_button_anymore() -> None:

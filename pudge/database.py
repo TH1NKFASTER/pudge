@@ -13,9 +13,6 @@ from .episode_state import transition_episode_state, stronger_episode_state
 
 
 SCHEMA = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS anime (
     media_id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
@@ -429,16 +426,65 @@ CREATE TABLE IF NOT EXISTS media_identities (
 );
 """
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
+
+
+def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a SQLite script without ``executescript``'s implicit COMMIT.
+
+    ``sqlite3.Connection.executescript`` commits any pending transaction before
+    executing its input.  That made the old multi-step migrations only partly
+    recoverable.  ``sqlite3.complete_statement`` understands trigger bodies, so
+    feeding complete statements one-by-one keeps schema creation and migrations
+    inside the transaction opened by :class:`Database`.
+    """
+
+    statement = ""
+    for line in script.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip()
+        statement = ""
+        if sql:
+            conn.execute(sql)
+    if statement.strip():
+        raise sqlite3.OperationalError("incomplete SQL migration statement")
 
 
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existing_database = self.path.is_file() and self.path.stat().st_size > 0
         with self.connect() as conn:
-            conn.executescript(SCHEMA)
-            self._migrate(conn)
+            version_row = conn.execute("PRAGMA user_version").fetchone()
+            previous_version = int(version_row[0] if version_row else 0)
+            if existing_database and previous_version < LATEST_SCHEMA_VERSION:
+                self._backup_before_migration(conn, previous_version)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _execute_sql_script(conn, SCHEMA)
+                self._migrate(conn)
+                integrity = conn.execute("PRAGMA quick_check").fetchone()
+                if integrity is None or str(integrity[0]).casefold() != "ok":
+                    raise sqlite3.DatabaseError(
+                        f"database integrity check failed: {integrity[0] if integrity else 'no result'}"
+                    )
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def _backup_before_migration(self, conn: sqlite3.Connection, version: int) -> Path:
+        """Create a consistent last-known-good copy before changing the schema."""
+
+        backup_path = self.path.with_name(f"{self.path.name}.pre-v{LATEST_SCHEMA_VERSION}.backup")
+        destination = sqlite3.connect(backup_path)
+        try:
+            conn.backup(destination)
+        finally:
+            destination.close()
+        return backup_path
 
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
@@ -461,6 +507,9 @@ class Database:
             conn.execute("PRAGMA user_version=5")
         if version < 6:
             self._migrate_v6(conn)
+            conn.execute("PRAGMA user_version=6")
+        if version < 7:
+            self._migrate_v7(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -538,7 +587,8 @@ class Database:
             ("action_code", "TEXT NOT NULL DEFAULT ''"),
         ):
             self._ensure_column(conn, "subtitle_jobs", column, declaration)
-        conn.executescript(
+        _execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS manga_books (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -599,7 +649,8 @@ class Database:
             "last_played_at",
             "REAL NOT NULL DEFAULT 0",
         )
-        conn.executescript(
+        _execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS audiobook_bookmarks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -623,7 +674,8 @@ class Database:
         )
 
     def _migrate_v4(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
+        _execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS character_name_overrides (
                 media_id INTEGER NOT NULL,
@@ -650,9 +702,15 @@ class Database:
     def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA journal_mode=WAL")
         try:
             yield conn
             conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -704,7 +762,8 @@ class Database:
                 )
             """
         )
-        conn.executescript(
+        _execute_sql_script(
+            conn,
             """
             CREATE INDEX IF NOT EXISTS idx_episodes_media_identity
             ON episodes(media_id,media_episode);
@@ -715,7 +774,8 @@ class Database:
 
     def _migrate_v6(self, conn: sqlite3.Connection) -> None:
         """Add the device-neutral event log used by companion clients."""
-        conn.executescript(
+        _execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS sync_devices (
                 device_id TEXT PRIMARY KEY,
@@ -781,6 +841,125 @@ class Database:
                 FOREIGN KEY(event_id) REFERENCES sync_events(id) ON DELETE CASCADE
             );
             """
+        )
+
+    def _migrate_v7(self, conn: sqlite3.Connection) -> None:
+        """Add durable infrastructure for auditability and resumable work."""
+
+        self._ensure_column(conn, "app_jobs", "resumable", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "app_jobs", "correlation_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(conn, "sync_snapshots", "revision", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "sync_snapshots", "base_event_id", "INTEGER NOT NULL DEFAULT 0")
+        _execute_sql_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS app_job_checkpoints (
+                job_id TEXT PRIMARY KEY,
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES app_jobs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS media_identity_ledger (
+                canonical_id TEXT PRIMARY KEY,
+                media_id INTEGER,
+                media_episode INTEGER,
+                release_episode INTEGER,
+                video_path TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL DEFAULT '',
+                torrent_hash TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                locked INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_identity_media_episode
+            ON media_identity_ledger(media_id,media_episode);
+            CREATE INDEX IF NOT EXISTS idx_identity_release_episode
+            ON media_identity_ledger(media_id,release_episode);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_video_path
+            ON media_identity_ledger(video_path) WHERE video_path!='';
+            CREATE INDEX IF NOT EXISTS idx_identity_torrent
+            ON media_identity_ledger(torrent_hash) WHERE torrent_hash!='';
+
+            CREATE TABLE IF NOT EXISTS sync_dirty_entities (
+                kind TEXT NOT NULL,
+                local_key TEXT NOT NULL,
+                dirtied_at REAL NOT NULL,
+                PRIMARY KEY(kind,local_key)
+            );
+            CREATE TABLE IF NOT EXISTS sync_conflicts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                base_revision INTEGER NOT NULL DEFAULT 0,
+                current_revision INTEGER NOT NULL DEFAULT 0,
+                incoming_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                resolved_at REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY(entity_id) REFERENCES sync_entities(entity_id) ON DELETE CASCADE,
+                FOREIGN KEY(device_id) REFERENCES sync_devices(device_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_conflicts_open
+            ON sync_conflicts(resolved_at,created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS torrent_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash TEXT NOT NULL,
+                media_id INTEGER,
+                media_episode INTEGER,
+                provider TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0,
+                listed_seeders INTEGER NOT NULL DEFAULT 0,
+                listed_leechers INTEGER NOT NULL DEFAULT 0,
+                live_seeders INTEGER,
+                live_leechers INTEGER,
+                metadata_seconds REAL,
+                download_speed_bps REAL,
+                outcome TEXT NOT NULL DEFAULT 'candidate',
+                details_json TEXT NOT NULL DEFAULT '{}',
+                observed_at REAL NOT NULL,
+                FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_torrent_observations_release
+            ON torrent_observations(info_hash,observed_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_torrent_observations_media
+            ON torrent_observations(media_id,media_episode,observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS cache_registry (
+                cache_key TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                accessed_at REAL NOT NULL,
+                expires_at REAL NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_cache_registry_eviction
+            ON cache_registry(category,pinned,accessed_at);
+
+            CREATE TABLE IF NOT EXISTS diagnostic_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                correlation_id TEXT NOT NULL,
+                component TEXT NOT NULL,
+                event TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',
+                media_id INTEGER,
+                media_episode INTEGER,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_diagnostic_events_correlation
+            ON diagnostic_events(correlation_id,id);
+            CREATE INDEX IF NOT EXISTS idx_diagnostic_events_media
+            ON diagnostic_events(media_id,media_episode,created_at DESC);
+            """,
         )
 
     def get_state(self, key: str, default: str = "") -> str:
@@ -1096,9 +1275,32 @@ class Database:
             relations=list(json.loads(row["relations_json"] or "[]")) if "relations_json" in row.keys() else [],
         )
 
+    @staticmethod
+    def _ensure_anime_parent(
+        conn: sqlite3.Connection,
+        media_id: int | None,
+        title: str = "",
+    ) -> None:
+        """Keep legacy import paths valid while enforcing SQLite foreign keys.
+
+        Older versions silently allowed an episode/download to arrive before
+        its AniList row because foreign keys were disabled on normal
+        connections.  Preserve that ordering by creating a minimal parent row;
+        the next AniList refresh fills it using the regular upsert.
+        """
+
+        if media_id is None:
+            return
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO anime(media_id,title,updated_at) VALUES(?,?,?)",
+            (int(media_id), str(title or f"AniList {int(media_id)}"), now),
+        )
+
     def upsert_episode(self, episode: LibraryEpisode, *, downloaded_at: float | None = None) -> None:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, episode.media_id, episode.title)
             previous = conn.execute(
                 "SELECT state FROM episodes WHERE video_path=?", (str(episode.video_path),)
             ).fetchone()
@@ -1589,6 +1791,7 @@ class Database:
     ) -> None:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, video_path.stem)
             conn.execute(
                 "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
                 "state='waiting_subtitles',updated_at=? "
@@ -1622,6 +1825,7 @@ class Database:
     ) -> None:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, video_path.stem)
             conn.execute(
                 """
                 INSERT INTO subtitle_jobs(
@@ -1663,6 +1867,7 @@ class Database:
         """Create a missing resolver job without changing an existing backoff."""
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, video_path.stem)
             cursor = conn.execute(
                 """
                 INSERT INTO subtitle_jobs(
@@ -1939,6 +2144,7 @@ class Database:
 
     def upsert_download(self, item: DownloadItem) -> None:
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, item.media_id, item.name)
             conn.execute(
                 """
                 INSERT INTO downloads(
@@ -2027,6 +2233,7 @@ class Database:
         release_episode: int | None = None,
     ) -> None:
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id)
             conn.execute(
                 "UPDATE downloads SET media_id=?,episode=?,media_episode=?,"
                 "release_episode=COALESCE(?,release_episode),is_batch=?,updated_at=? WHERE torrent_hash=?",
@@ -2056,6 +2263,7 @@ class Database:
         release_episode: int | None = None,
     ) -> None:
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, title)
             conn.execute(
                 "INSERT OR REPLACE INTO release_history("
                 "info_hash,media_id,episode,media_episode,release_episode,title,score,selected_at"
@@ -2175,6 +2383,7 @@ class Database:
     ) -> None:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO upgrade_jobs(
@@ -2224,6 +2433,7 @@ class Database:
     ) -> int:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, video_path.stem)
             cursor = conn.execute(
                 """
                 INSERT INTO subtitle_history(
@@ -2376,6 +2586,14 @@ class Database:
     ) -> int:
         now = time.time()
         with self.connect() as conn:
+            self._ensure_anime_parent(conn, media_id, name)
+            for item in items:
+                raw_media_id = item.get("media_id")
+                self._ensure_anime_parent(
+                    conn,
+                    int(raw_media_id) if raw_media_id is not None else None,
+                    str(item.get("title") or name),
+                )
             cursor = conn.execute(
                 "INSERT INTO playlists(name,kind,media_id,created_at,updated_at) VALUES(?,?,?,?,?)",
                 (str(name), str(kind), media_id, now, now),

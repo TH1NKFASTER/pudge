@@ -96,6 +96,15 @@ mpv_correct_match = "c"
 energy_monitoring_enabled = false
 energy_sample_seconds = 30.0
 
+[companion]
+# Disabled until a companion client is paired. Keep 127.0.0.1 for local-only
+# development; use 0.0.0.0 only on a trusted LAN.
+enabled = false
+bind_host = "127.0.0.1"
+port = 47821
+pairing_ttl_seconds = 300.0
+max_events_per_request = 500
+
 [tools]
 mpv = "mpv"
 ffmpeg = "ffmpeg"
@@ -150,6 +159,10 @@ srt_alignment_tolerance_absolute = 50.0
 evaluate_all_jimaku = true
 max_jimaku_candidates = 0
 ocr_image_subtitles = false
+auto_upgrade_subtitles = true
+subtitle_upgrade_min_score_gain = 25.0
+subtitle_upgrade_check_hours = 24.0
+max_subtitle_upgrade_checks_per_run = 2
 
 [sync]
 enabled = true

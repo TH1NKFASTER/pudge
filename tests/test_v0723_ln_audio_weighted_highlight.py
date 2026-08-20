@@ -50,7 +50,8 @@ def test_weighted_highlight_finishes_word_before_switch() -> None:
     assert "previous.style.setProperty('--ln-paired-word-progress','100%')" in block
     assert "until:performance.now()+34" not in block
     assert "lnPairedOffsetAtTime(state,estimatedTime)" in block
-    assert "lnPairedOffsetAtTime(state,Number(state.position))" in block
+    assert "lnPairedOffsetAtTime(state,position)" in block
+    assert "{reason:'poll',speechActive:true,previewOffset}" in block
     assert "clamp_backward" in block
 
 

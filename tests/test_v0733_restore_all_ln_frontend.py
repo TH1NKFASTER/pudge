@@ -19,7 +19,7 @@ def test_all_ln_frontend_features_are_restored() -> None:
         "function exportLnPairedTrace()",
         "light_novel_export_audio_sync_trace",
         "event.code!=='KeyL'",
-        "speechActive:true",
+        "{reason:'poll',speechActive:true,previewOffset}",
         "const previousWord=previous;",
         "surface:lnPairedSurface(current)",
         'class="ln-reader-actions"',

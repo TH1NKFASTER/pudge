@@ -10,7 +10,7 @@ def test_v6_only_switches_after_current_word_visually_finishes() -> None:
     assert "progress=parseFloat(previous.style.getPropertyValue(" in source
     assert "until:performance.now()+34" not in source
     assert "previous_progress:progress" in source
-    assert "renderLnPairedPosition(state,estimatedOffset,{speechActive:true,previewOffset})" in source
+    assert "renderLnPairedPosition(renderState,estimatedOffset,{speechActive:true,previewOffset})" in source
 
 
 def test_v6_preserves_silence_freeze_contracts() -> None:

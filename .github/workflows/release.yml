@@ -40,6 +40,9 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: python scripts/check_release_tag.py "$RELEASE_TAG"
 
+      - name: Verify release metadata and lockfile
+        run: python scripts/check_release_metadata.py
+
       - name: Run test batch
         run: python scripts/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4
 

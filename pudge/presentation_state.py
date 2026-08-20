@@ -97,6 +97,7 @@ def derive_episode_presentation(
     local: Any = None,
     download: Any = None,
     action_job: Any = None,
+    watched_externally: bool = False,
 ) -> dict[str, Any]:
     """Return one canonical user-facing episode status.
 
@@ -110,7 +111,7 @@ def derive_episode_presentation(
     action_code = str(_value(action_job, "action_code", "") or "")
     action_state = str(_value(action_job, "state", "") or "").casefold()
 
-    if local_exists and local_state == "watched":
+    if local_exists and (local_state == "watched" or watched_externally):
         return {"status": "watched", "ready": True, "action_code": ""}
     if local_exists and local_state == "ready":
         return {"status": "ready", "ready": True, "action_code": ""}

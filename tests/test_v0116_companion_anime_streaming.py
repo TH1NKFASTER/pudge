@@ -117,7 +117,7 @@ def test_companion_anime_player_and_http_contracts() -> None:
     assert js.group(1) == css_version.group(1)
     assert int(js.group(1)) >= 12
     assert ".anime-video-stage" in css
-    assert "streaming.prepare(entity_id)" in http
+    assert "streaming.prepare(entity_id, device_id=device_id)" in http
     assert "streaming.media_path" in http
     assert "CompanionStreamingService" in web_app
     assert "streaming=self.companion_streaming" in web_app

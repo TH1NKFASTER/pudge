@@ -8,7 +8,7 @@ WEB = ROOT / "pudge" / "web"
 def test_branded_confirm_dialog_uses_pudge_logo() -> None:
     source = (WEB / "pudge_confirm.js").read_text(encoding="utf-8")
     assert 'src="app-logo.png"' in source
-    assert "window.pudgeConfirm = message => new Promise" in source
+    assert "window.pudgeConfirm = (message, options = {}) => new Promise" in source
     assert "event.key === 'Escape'" in source
     assert "event.key === 'Enter'" in source
 

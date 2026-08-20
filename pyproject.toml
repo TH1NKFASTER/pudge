@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.22"
-description = "macOS anime library manager with AniList, Nyaa, qBittorrent, mpv and Japanese subtitles"
+version = "0.7.23"
+description = "A local-first Mac app for anime, Japanese subtitles, manga, Light Novels, and audiobooks"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "pudge" }]
@@ -31,7 +31,13 @@ sync = [
   "mlx-whisper>=0.4.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 manga = ["manga-ocr>=0.1.14,<1"]
-dev = ["pytest>=8,<9", "ruff>=0.9,<1"]
+dev = [
+  "coverage[toml]>=7,<8",
+  "hypothesis>=6,<7",
+  "mypy>=1.13,<2",
+  "pytest>=8,<9",
+  "ruff>=0.9,<1",
+]
 
 [project.scripts]
 pudge = "pudge.cli:main"
@@ -57,3 +63,9 @@ required-environments = [
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true

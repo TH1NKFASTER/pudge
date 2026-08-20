@@ -1336,6 +1336,17 @@ class AudiobookService:
                     else "Queued"
                 ),
             )
+            self.job_center.checkpoint(
+                job_id,
+                {
+                    "audiobook_id": int(audiobook_id),
+                    "file": int(updated.get("file") or 0),
+                    "file_count": int(updated.get("file_count") or 0),
+                    "processed_audio_seconds": float(
+                        updated.get("processed_audio_seconds") or 0.0
+                    ),
+                },
+            )
 
     def _transcribe_worker(self, audiobook_id: int, output: Path, event: threading.Event) -> None:
         with self._lock:
@@ -1587,6 +1598,8 @@ class AudiobookService:
                     payload={"audiobook_id": audiobook_id},
                     total=total_duration,
                     attempt_of=str(attempt_of or ""),
+                    resumable=True,
+                    correlation_id=f"audiobook-stt:{audiobook_id}",
                 )
                 if self.job_center is not None
                 else ""

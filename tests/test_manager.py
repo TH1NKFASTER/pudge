@@ -1224,7 +1224,7 @@ def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, mon
     monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
 
     assert manager.process_subtitle_jobs(limit=1) == 1
-    command = calls[0]
+    command = next(command for command in calls if "--media-id" in command)
     assert command[command.index("--media-id") + 1] == "204466"
     assert "--skip-airing-lookup" in command
     assert command[command.index("--episode-hint") + 1] == "5"

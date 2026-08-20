@@ -204,7 +204,7 @@ class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
         prefix = "/api/v1/content/"
         if not request.path.startswith(prefix):
             return False
-        self._device_id()
+        device_id = self._device_id()
         suffix = request.path[len(prefix):]
         parts = [unquote(part) for part in suffix.split("/") if part]
         if not parts:
@@ -231,7 +231,10 @@ class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
             streaming = self.server.streaming
             if streaming is None:
                 raise MobileSyncError("Anime streaming is unavailable")
-            self._send_json(200, {"ok": True, **streaming.prepare(entity_id)})
+            self._send_json(
+                200,
+                {"ok": True, **streaming.prepare(entity_id, device_id=device_id)},
+            )
             return True
         raise MobileSyncValidationError("Unsupported companion content route")
 

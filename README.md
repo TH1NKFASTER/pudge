@@ -1,84 +1,114 @@
 # Pudge
 
-Pudge is a macOS media companion focused on anime with Japanese subtitles. It combines a local library, AniList progress, Nyaa downloads, qBittorrent/aria2, mpv playback, subtitle discovery and automatic timing repair in one native window.
+Pudge is a Mac app for watching anime with Japanese subtitles and keeping your
+anime, manga, Light Novels, and audiobooks together. It can find new episodes,
+prepare subtitles, play video through mpv, and update AniList without turning
+the setup into a collection of separate scripts.
 
-Current version: **0.7.22**.
+Current version: **0.7.23**.
 
-## What it does
+## What Pudge can do
 
-- prepares Japanese subtitles automatically and rejects low-confidence timing instead of asking the viewer to edit them;
-- uses embedded subtitle clocks and container chapters around openings/transitions, with cached tiny Japanese STT as a last resort;
-- keeps anime lists and watched progress in sync with AniList;
-- finds releases through Nyaa and downloads them with its built-in downloader; qBittorrent remains an optional advanced backend;
-- reads EPUB/TXT light novels, CBZ/ZIP manga, and M4B/MP3/Opus/FLAC audiobooks;
-- keeps Activity out of the primary navigation while surfacing only genuine user-action blockers on Home.
+- find anime releases through Nyaa and download them with its built-in downloader;
+- use qBittorrent instead when you want its extra torrent-management controls;
+- find, check, and repair Japanese subtitle timing automatically;
+- keep watched progress in sync with AniList;
+- read EPUB/TXT Light Novels and CBZ/ZIP manga;
+- play M4B, MP3, Opus, and FLAC audiobooks, including paired reading with a Light Novel;
+- open a private companion page on your phone or tablet for reading and local playback.
 
-Pudge is local-first. The optional local LLM is disabled for subtitle decisions by default. API tokens are not included in exported backups.
+Pudge keeps its library and progress on your Mac. Optional online services are
+used only for the features you enable. Exported backups do not contain API
+tokens.
 
-See the [user guide](docs/USER_GUIDE.md) for end-to-end scenarios and [algorithms/state model](docs/ALGORITHMS.md) for the matching, subtitle, pitch-accent and job rules.
+For everyday instructions, see the [user guide](docs/USER_GUIDE.md). For the
+rules behind matching, subtitles, and media states, see
+[algorithms and state model](docs/ALGORITHMS.md).
 
 ## Requirements
 
-- macOS 14 or newer, preferably Apple Silicon;
+- macOS 14 or newer; Apple Silicon is recommended;
 - [Homebrew](https://brew.sh/);
-- accounts/tokens only for the integrations you enable (Jimaku, AniList or Jiten);
-  the official jpdb-mpv-plugin manages its own authorization.
+- accounts or tokens only for the integrations you choose, such as Jimaku,
+  AniList, or Jiten. The official jpdb-mpv-plugin handles its own authorization.
 
-The installer adds mpv, ffmpeg/ffprobe, ALASS, 7-Zip, aria2 and Python 3.12 through Homebrew.
-First experience also checks mpv and ffmpeg and can repair a missing Homebrew
-installation of either component. It can optionally install the separate
-[JitenMPV](https://github.com/Sirush/JitenMPV) plugin for interactive subtitle
-words inside mpv and reuse the Jiten API key entered in Pudge settings.
-Automatic downloads need no torrent-client setup: Pudge starts its private local aria2 process when needed.
-qBittorrent can still be selected in Settings as an advanced alternative. Versions below 5.2 use
-the Web UI username and password; API-key authentication requires qBittorrent 5.2 or newer.
+The installer adds mpv, ffmpeg/ffprobe, ALASS, 7-Zip, aria2, and Python 3.12
+through Homebrew. During initial setup, Pudge checks mpv and ffmpeg and can
+repair a missing Homebrew installation. It can also install the separate
+[JitenMPV](https://github.com/Sirush/JitenMPV) plugin when you explicitly select
+it.
+
+Automatic downloads work without a separate torrent app: Pudge starts its own
+local aria2 process when needed. qBittorrent remains an advanced alternative in
+Settings. Versions below 5.2 use a Web UI username and password;
+API-key authentication requires qBittorrent 5.2 or newer.
 
 ## Install a release
 
-Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then:
+Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.22.zip
+unzip pudge-macos-v0.7.23.zip
 cd pudge
 ./install.sh
 ```
 
-After installation, Settings → Application updates can check GitHub manually.
-Release installs verify the published SHA-256 checksum before reinstalling;
-development checkouts update only from the official origin when the current
-branch is clean and can be fast-forwarded. The previous app bundle is restored
-automatically if installation fails.
+After installation, use **Settings → Application updates** to check for a new
+version. Release installs verify the published SHA-256 checksum and restore the
+previous app bundle automatically if installation fails.
 
-The first STT fallback may download a small MLX Whisper model. Subtitle transcription only runs after deterministic alignment methods fail. Audiobook transcription starts automatically after import, continues in the background outside the reader, reports live progress, and is cached by content. Linked Light Novels are aligned automatically when that transcript is ready.
+The first subtitle transcription may download a small MLX Whisper model. Pudge
+uses transcription only after ordinary timing methods fail. Audiobook
+transcription runs after import, continues in the background, and is cached by
+content.
 
 ## Jimaku and AniList credentials
 
 ### Jimaku
 
-Official release builds may include a shared Jimaku key for the first 48 hours. A personal key always takes priority. The shared key is injected from a GitHub Actions repository secret during release builds and is not committed to the source tree.
+Official release builds may provide shared Jimaku access for the first 48
+hours. A personal key always takes priority, and the shared build key is never
+stored in the repository.
 
-1. Open [Jimaku registration/login](https://jimaku.cc/login) and choose **Register**. Jimaku asks only for a username and password; no email is required.
+1. Open [Jimaku registration/login](https://jimaku.cc/login) and choose **Register**.
 2. After signing in, open [your Jimaku account](https://jimaku.cc/account) and copy the API key.
 3. In Pudge, open **Settings → Jimaku**, paste the key, and save.
 
 ### AniList
 
 1. Sign in to AniList and open [Developer settings](https://anilist.co/settings/developer).
-2. Choose **Create New Client**. Set the name to `Pudge` and the redirect URL to `https://anilist.co/api/v2/oauth/pin`, then save.
-3. Copy only the numeric Client ID into **Settings → AniList → Client ID** in Pudge.
-4. Pudge then reveals **Get key**. Open it, authorize the application on AniList, and copy the issued token into the newly shown field.
-5. Save Pudge settings. Pudge updates AniList data automatically after the credentials change.
+2. Choose **Create New Client**, name it `Pudge`, and use `https://anilist.co/api/v2/oauth/pin` as the redirect URL.
+3. Copy the numeric Client ID into **Settings → AniList → Client ID**.
+4. Open **Get key**, approve access on AniList, and paste the issued token into Pudge.
+5. Save the settings. Pudge updates AniList data automatically after the credentials change.
 
-The token grants access to your AniList account and should be treated like a password. The flow follows AniList's [implicit-grant authentication guide](https://docs.anilist.co/guide/auth/).
+Treat the AniList token like a password. This flow follows AniList's
+[implicit-grant authentication guide](https://docs.anilist.co/guide/auth/).
 
-Manga reading works without OCR. To enable on-demand [MangaOCR](https://github.com/kha-white/manga-ocr) in an installed release:
+## MangaOCR
+
+Manga reading works without OCR. To add on-demand Japanese text recognition to
+an installed release:
 
 ```bash
 ~/.local/share/pudge/venv/bin/python -m pip install "manga-ocr>=0.1.14,<1"
 ```
 
-MangaOCR downloads its model on first use. Pudge never runs it while merely browsing pages.
+MangaOCR downloads its model the first time it runs. Pudge does not run OCR
+while you are simply browsing pages.
+
+## Remove Pudge
+
+Open **Settings → Remove Pudge** and click the red
+**Delete Pudge from this Mac** button. After two confirmations, Pudge removes
+the app, its command-line tools, LaunchAgent, settings, database, Pudge-created
+backups in Downloads, cache, logs, paired devices, Pudge Keychain entries, and
+files in the Pudge library folder.
+
+Folders you added only for watching or subtitle search are left alone. Shared
+tools such as Homebrew, mpv, qBittorrent, and JitenMPV are also left installed
+because other apps may use them.
 
 ## Development
 
@@ -91,15 +121,19 @@ make test-batches
 make lint
 ```
 
-Use `.[manga]` as well when developing the OCR path. See [DEVELOPMENT.md](DEVELOPMENT.md) for the test layout.
+Add `.[manga]` when working on OCR. More details are in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Troubleshooting
 
-- If an episode appears under **Action required**, open the indicated setting. Pudge uses that section only for missing Jimaku credentials, macOS folder access, or disabled bitmap OCR—not for ordinary network retries.
-- Subtitle timing details and engine evidence are recorded in the app log. The visible Activity page remains intentionally hidden; maintenance and diagnostics are available from Settings.
-- Backups preserve the library, settings and cached prepared subtitles, but keep the currently installed credentials when restored.
+- If an episode appears under **Action required**, open the setting named on the card.
+- For subtitle problems, open **Settings → Diagnostics** and include the relevant log details in a bug report.
+- If a mobile library looks old, bring the companion page to the foreground. It refreshes immediately and every 15 seconds while visible.
+- Backups keep the library, settings, and prepared subtitle cache. Restoring a backup keeps the credentials already installed on that Mac.
 
-Please report security issues using [SECURITY.md](SECURITY.md). Contribution and release workflows are in [CONTRIBUTING.md](CONTRIBUTING.md) and [RELEASING.md](RELEASING.md).
+Report security issues through [SECURITY.md](SECURITY.md). Contribution and
+release instructions are in [CONTRIBUTING.md](CONTRIBUTING.md) and
+[RELEASING.md](RELEASING.md).
 
 ## License
 

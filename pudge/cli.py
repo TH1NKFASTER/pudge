@@ -56,7 +56,11 @@ from .subtitles.discovery import deduplicate_candidates
 from .subtitles.jobs import SubtitleJobReporter
 from .subtitles.models import SubtitleJobStage
 from .subtitles.validation import quality_from_result
-from .syncing import optimize_candidates, optimize_subtitle, subtitle_quality_accepted
+from .subtitles.pipeline import (
+    optimize_candidates,
+    optimize_subtitle,
+    subtitle_quality_accepted,
+)
 
 
 
@@ -914,11 +918,46 @@ def _find_online_subtitles(
                 sorted(conflicting_ids),
                 [(entry.id, entry.anilist_id, entry.name) for entry in identity_exact_entries],
             )
-        entries = jimaku.rank_entries(list(deduplicated.values()), identity, anime.id if anime else None)
+        ranked_entries = jimaku.rank_entries(
+            list(deduplicated.values()), identity, anime.id if anime else None
+        )
+        authoritative_names = [identity.title]
+        if anime is not None:
+            authoritative_names.extend(anime.titles)
+            authoritative_names.extend(anime.synonyms)
+        normalized_authoritative_names = {
+            normalize_title(name) for name in authoritative_names if normalize_title(name)
+        }
+
+        def authoritative_title_entry(entry: JimakuEntry) -> bool:
+            return any(
+                normalize_title(name) in normalized_authoritative_names
+                for name in (entry.name, entry.english_name or "", entry.japanese_name or "")
+                if normalize_title(name)
+            )
+
+        pinned_entries = [
+            entry
+            for entry in ranked_entries
+            if (
+                anime is not None
+                and entry.anilist_id is not None
+                and int(entry.anilist_id) == int(anime.id)
+            )
+            or authoritative_title_entry(entry)
+        ]
+        entries = list(
+            {
+                entry.id: entry
+                for entry in [*pinned_entries, *ranked_entries]
+            }.values()
+        )
+        entry_limit = max(4, len(pinned_entries))
         logger.info(
-            "RESULT step=jimaku.entries video=%s by_id=%s by_name=%s deduplicated=%s ranked=%s "
+            "RESULT step=jimaku.entries video=%s by_id=%s by_name=%s deduplicated=%s ranked=%s pinned=%s limit=%s "
             "id_entries=%s name_entries=%s",
             video.name, len(entries_by_id), len(entries_by_name), len(deduplicated), len(entries),
+            [(entry.id, entry.anilist_id, entry.name) for entry in pinned_entries], entry_limit,
             [(entry.id, entry.anilist_id, entry.name) for entry in entries_by_id],
             [(entry.id, entry.anilist_id, entry.name) for entry in entries_by_name],
         )
@@ -930,7 +969,7 @@ def _find_online_subtitles(
         candidates: list[SubtitleCandidate] = []
         seen_urls: set[str] = set()
         limit = max(0, config.matching.max_jimaku_candidates)
-        for entry in entries[:4]:
+        for entry in entries[:entry_limit]:
             logger.info(
                 "CANDIDATE step=jimaku.entry video=%s entry_id=%s anilist_id=%s name=%r",
                 video.name, entry.id, entry.anilist_id, entry.name,

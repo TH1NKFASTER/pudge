@@ -16,6 +16,10 @@ python -m pip install -e ".[dev,sync]"
 
 Keep implementation details out of user-facing copy. Do not add explanatory text such as how cards are grouped, which metadata provider is preferred, cache behavior, internal pipelines, or other technical implementation notes unless the information helps the user make a decision or complete an action.
 
+Use the same names that appear in the app. Prefer ordinary phrases such as
+"initial setup", "refresh", and "remove Pudge" over internal project labels.
+Documentation should explain an action or outcome before its implementation.
+
 ## Tests
 
 Run the complete suite:

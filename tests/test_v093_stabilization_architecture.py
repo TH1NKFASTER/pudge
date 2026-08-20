@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from pudge.config import AppConfig
 from pudge.episode_numbering import episode_numbering_from_graph
+from pudge.episode_state import watched_by_anilist_progress
 from pudge.foreground import clear_foreground, mark_foreground
 from pudge.library import sidecar_subtitle
 from pudge.presentation_state import derive_episode_presentation
@@ -109,6 +110,20 @@ def test_presentation_download_has_percent_and_eta() -> None:
     assert state["eta_seconds"] == 91
 
 
+def test_anilist_watched_presentation_does_not_require_local_watch_timestamp(
+    tmp_path: Path,
+) -> None:
+    video = tmp_path / "episode-06.mkv"
+    video.write_bytes(b"x")
+    local = {"state": "ready", "video_path": str(video)}
+
+    state = derive_episode_presentation(local=local, watched_externally=True)
+
+    assert watched_by_anilist_progress(6, 6, total_episodes=12, media_format="TV")
+    assert not watched_by_anilist_progress(7, 6, total_episodes=12, media_format="TV")
+    assert state == {"status": "watched", "ready": True, "action_code": ""}
+
+
 def test_work_scheduler_blocks_new_heavy_work_during_foreground(tmp_path: Path) -> None:
     cfg = AppConfig()
     cfg.paths.cache_dir = tmp_path / "cache"
@@ -121,9 +136,24 @@ def test_work_scheduler_blocks_new_heavy_work_during_foreground(tmp_path: Path) 
     finally:
         clear_foreground(cfg.paths.cache_dir)
 
-    lease = scheduler.acquire_heavy("test", blocking=False)
+    lease = scheduler.acquire_heavy("test", blocking=False, foreground_sensitive=False)
     assert lease is not None
     try:
-        assert scheduler.acquire_heavy("second", blocking=False) is None
+        assert scheduler.acquire_heavy("second", blocking=False, foreground_sensitive=False) is None
     finally:
         lease.release()
+
+
+def test_work_scheduler_resource_probe_failure_is_nonfatal(tmp_path: Path, monkeypatch) -> None:
+    scheduler = WorkScheduler(tmp_path / "cache")
+
+    def fail_run(*_args, **_kwargs):
+        raise TypeError("simulated broken process layer")
+
+    monkeypatch.setattr("pudge.work_scheduler.subprocess.run", fail_run)
+    status = scheduler.resource_status(refresh=True)
+
+    assert status["thermal_limited"] is False
+    assert status["on_battery"] is False
+    assert status["battery_percent"] is None
+    assert scheduler.background_allowed() is True

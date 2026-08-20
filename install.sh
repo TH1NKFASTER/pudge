@@ -581,6 +581,10 @@ if [[ -f "$ICON_SOURCE" ]]; then
 fi
 
 # Replacement is complete before the working app is touched.
+# The installer is an intentional shutdown, not a crash. Remove the runtime
+# session marker before terminating an existing app so the replacement does
+# not enter Safe Mode on its first launch.
+rm -f "$DATA_DIR/app-session.json"
 pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
 pkill -f "pudge.app_entry" >/dev/null 2>&1 || true
 for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do

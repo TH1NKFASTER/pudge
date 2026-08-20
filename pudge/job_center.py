@@ -9,6 +9,8 @@ from .database import Database
 
 
 ACTIVE_JOB_STATES = {"queued", "running", "cancel_requested"}
+
+
 class JobCenter:
     """Small persistent journal shared by long-running user operations."""
 
@@ -20,9 +22,20 @@ class JobCenter:
         now = time.time()
         with self.db.connect() as conn:
             conn.execute(
+                "UPDATE app_jobs SET state='queued',error='',message='Ready to resume',"
+                "finished_at=0,updated_at=? "
+                "WHERE state IN ('queued','running') AND resumable=1",
+                (now,),
+            )
+            conn.execute(
                 "UPDATE app_jobs SET state='failed',error='Pudge closed before the job finished',"
                 "message='Interrupted',finished_at=?,updated_at=? "
-                "WHERE state IN ('queued','running','cancel_requested')",
+                "WHERE state IN ('queued','running','cancel_requested') AND resumable=0",
+                (now, now),
+            )
+            conn.execute(
+                "UPDATE app_jobs SET state='cancelled',message='Cancelled',finished_at=?,updated_at=? "
+                "WHERE state='cancel_requested' AND resumable=1",
                 (now, now),
             )
 
@@ -34,6 +47,8 @@ class JobCenter:
         payload: dict[str, Any] | None = None,
         total: float = 0,
         attempt_of: str = "",
+        resumable: bool = False,
+        correlation_id: str = "",
     ) -> str:
         job_id = uuid.uuid4().hex
         now = time.time()
@@ -42,8 +57,8 @@ class JobCenter:
                 """
                 INSERT INTO app_jobs(
                     id,kind,title,state,current,total,message,error,payload_json,
-                    result_json,attempt_of,created_at,updated_at,finished_at
-                ) VALUES(?,?,?,'queued',0,?,'Queued','',?,'{}',?,?,?,0)
+                    result_json,attempt_of,created_at,updated_at,finished_at,resumable,correlation_id
+                ) VALUES(?,?,?,'queued',0,?,'Queued','',?,'{}',?,?,?,0,?,?)
                 """,
                 (
                     job_id,
@@ -54,6 +69,8 @@ class JobCenter:
                     str(attempt_of or ""),
                     now,
                     now,
+                    int(resumable),
+                    str(correlation_id or ""),
                 ),
             )
             self._prune(conn)
@@ -108,6 +125,7 @@ class JobCenter:
                     str(job_id),
                 ),
             )
+            conn.execute("DELETE FROM app_job_checkpoints WHERE job_id=?", (str(job_id),))
 
     def fail(self, job_id: str, error: object, *, message: str = "Failed") -> None:
         now = time.time()
@@ -138,6 +156,44 @@ class JobCenter:
         with self.db.connect() as conn:
             row = conn.execute("SELECT * FROM app_jobs WHERE id=?", (str(job_id),)).fetchone()
         return self._payload(row) if row is not None else None
+
+    def checkpoint(self, job_id: str, payload: dict[str, Any]) -> None:
+        """Persist enough state for a resumable worker to continue after restart."""
+
+        now = time.time()
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT resumable FROM app_jobs WHERE id=?", (str(job_id),)
+            ).fetchone()
+            if row is None or not bool(row["resumable"]):
+                raise ValueError("job is not resumable")
+            conn.execute(
+                "INSERT INTO app_job_checkpoints(job_id,checkpoint_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(job_id) DO UPDATE SET checkpoint_json=excluded.checkpoint_json,"
+                "updated_at=excluded.updated_at",
+                (str(job_id), json.dumps(payload, ensure_ascii=False), now),
+            )
+            conn.execute("UPDATE app_jobs SET updated_at=? WHERE id=?", (now, str(job_id)))
+
+    def resume_candidates(self, *, kind: str = "") -> list[dict[str, Any]]:
+        sql = (
+            "SELECT j.*,c.checkpoint_json FROM app_jobs j "
+            "LEFT JOIN app_job_checkpoints c ON c.job_id=j.id "
+            "WHERE j.resumable=1 AND j.state='queued'"
+        )
+        values: list[Any] = []
+        if kind:
+            sql += " AND j.kind=?"
+            values.append(str(kind))
+        sql += " ORDER BY j.updated_at"
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, values).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            payload = self._payload(row)
+            payload["checkpoint"] = self._decode(row["checkpoint_json"])
+            result.append(payload)
+        return result
 
     def jobs(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self.db.connect() as conn:

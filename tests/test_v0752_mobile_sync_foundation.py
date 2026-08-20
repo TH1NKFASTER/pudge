@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from pudge.config import AppConfig, load_config, write_config
-from pudge.database import Database
+from pudge.database import LATEST_SCHEMA_VERSION, Database
 from pudge.mobile_sync import (
     MobileSyncAuthenticationError,
     MobileSyncService,
@@ -141,7 +141,7 @@ def test_database_migrates_mobile_sync_schema(tmp_path: Path) -> None:
             str(row[0])
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert version == 6
+    assert version == LATEST_SCHEMA_VERSION
     assert {
         "sync_devices",
         "sync_pairing_codes",
@@ -250,6 +250,128 @@ def test_older_offline_event_is_recorded_without_overwriting_newer_progress(
     with db.connect() as conn:
         position = conn.execute("SELECT position FROM manga_books").fetchone()[0]
     assert position == 70
+
+
+def test_stale_phone_progress_cannot_reopen_episode_completed_on_desktop(
+    tmp_path: Path,
+) -> None:
+    db = _database(tmp_path)
+    _seed_library(db)
+    service = MobileSyncService(db)
+    anime = next(
+        item
+        for item in service.library_snapshot()["entities"]
+        if item["kind"] == "anime_episode"
+    )
+    pairing = service.start_pairing()
+    paired = service.complete_pairing(
+        pairing["pairing_token"], name="iPhone", platform="ios"
+    )
+
+    phone_progress = {
+        "event_id": "phone-progress-before-desktop-completion",
+        "entity_id": anime["entity_id"],
+        "base_revision": anime["revision"],
+        "occurred_at": time.time() + 60,
+        "payload": {
+            "position": {
+                "episode": 2,
+                "position_ms": 700_000,
+                "duration_ms": 1_400_000,
+            },
+            "status": "in_progress",
+        },
+    }
+    progress_result = service.push_events(paired["device_id"], [phone_progress])
+    assert progress_result["results"][0]["status"] == "applied"
+
+    assert db.schedule_cleanup(Path("/tmp/episode.mkv"), 24) == 1
+    stale_phone_event = {
+        "event_id": "stale-phone-resume-after-desktop-completion",
+        "entity_id": anime["entity_id"],
+        "base_revision": progress_result["results"][0]["revision"],
+        "occurred_at": time.time() + 120,
+        "payload": {
+            "position": {
+                "episode": 2,
+                "position_ms": 800_000,
+                "duration_ms": 1_400_000,
+            },
+            "status": "in_progress",
+        },
+    }
+
+    pushed = service.push_events(paired["device_id"], [stale_phone_event])
+
+    assert pushed["results"][0]["status"] == "conflict"
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT state,watched_at FROM episodes WHERE media_id=10 AND media_episode=2"
+        ).fetchone()
+    assert row["state"] == "watched"
+    assert float(row["watched_at"] or 0) > 0
+    refreshed = next(
+        item
+        for item in service.library_snapshot()["entities"]
+        if item["entity_id"] == anime["entity_id"]
+    )
+    assert refreshed["status"] == "completed"
+
+
+def test_anilist_progress_completes_mobile_episode_without_local_cleanup(
+    tmp_path: Path,
+) -> None:
+    db = _database(tmp_path)
+    _seed_library(db)
+    service = MobileSyncService(db)
+    original = next(
+        item
+        for item in service.library_snapshot()["entities"]
+        if item["kind"] == "anime_episode"
+    )
+    assert original["status"] == "in_progress"
+
+    pairing = service.start_pairing()
+    paired = service.complete_pairing(
+        pairing["pairing_token"], name="iPhone", platform="ios"
+    )
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE anime SET progress=2,episodes=12,format='TV',updated_at=? WHERE media_id=10",
+            (time.time() + 1,),
+        )
+
+    stale_phone_event = {
+        "event_id": "phone-progress-after-anilist-completion",
+        "entity_id": original["entity_id"],
+        "base_revision": original["revision"],
+        "occurred_at": time.time() + 60,
+        "payload": {
+            "position": {
+                "episode": 2,
+                "position_ms": 800_000,
+                "duration_ms": 1_400_000,
+            },
+            "status": "in_progress",
+        },
+    }
+
+    pushed = service.push_events(paired["device_id"], [stale_phone_event])
+
+    assert pushed["results"][0]["status"] == "conflict"
+    refreshed = next(
+        item
+        for item in service.library_snapshot()["entities"]
+        if item["entity_id"] == original["entity_id"]
+    )
+    assert refreshed["status"] == "completed"
+    with db.connect() as conn:
+        local = conn.execute(
+            "SELECT state,watched_at,delete_after FROM episodes WHERE media_id=10 AND media_episode=2"
+        ).fetchone()
+    assert local["state"] == "ready"
+    assert local["watched_at"] is None
+    assert local["delete_after"] is None
 
 
 def test_http_api_health_pairing_library_and_events(tmp_path: Path) -> None:

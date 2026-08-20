@@ -7,6 +7,7 @@
   const PUDGE_COMPANION_LIBRARY_GROUPS_V11 = true;
   const PUDGE_COMPANION_ANIME_STREAMING_V12 = true;
   const PUDGE_COMPANION_INTERACTIVE_SUBTITLES_V13 = true;
+  const PUDGE_COMPANION_LIVE_SYNC_V15 = true;
   const TOKEN_KEY = 'pudge.companion.token.v1';
   const DEVICE_KEY = 'pudge.companion.device.v1';
   const DB_NAME = 'pudge-companion-v1';
@@ -37,6 +38,7 @@
     subtitleResumeAfterSheet: false,
     wakeLock: null,
     lastAnimeSyncAt: 0,
+    libraryLoading: false,
   };
   const $ = selector => document.querySelector(selector);
 
@@ -549,20 +551,26 @@
     }
 
     try {
-      await api('/api/v1/sync/events', {
+      const result = await api('/api/v1/sync/events', {
         method: 'POST',
         body: JSON.stringify({
           events: [{
             event_id: crypto.randomUUID ? crypto.randomUUID() : `iphone-${Date.now()}-${Math.random()}`,
             entity_id: entity.entity_id,
             type: 'progress.updated',
+            base_revision: Number(entity.revision || 0),
             payload: {position, status: 'in_progress'},
             occurred_at: Date.now() / 1000,
           }],
         }),
       });
+      if (result.results?.[0]?.status === 'conflict') {
+        loadLibrary().catch(() => {});
+        return;
+      }
       entity.position = position;
       entity.status = 'in_progress';
+      if (result.results?.[0]?.revision != null) entity.revision = Number(result.results[0].revision);
     } catch (_) {}
   };
 
@@ -954,18 +962,24 @@
       duration_ms: Math.round(Math.max(0, durationSeconds) * 1000),
     };
     try {
-      await api('/api/v1/sync/events', {
+      const result = await api('/api/v1/sync/events', {
         method: 'POST',
         body: JSON.stringify({events: [{
           event_id: crypto.randomUUID ? crypto.randomUUID() : `iphone-anime-${Date.now()}-${Math.random()}`,
           entity_id: player.entity.entity_id,
           type: 'progress.updated',
+          base_revision: Number(player.entity.revision || 0),
           payload: {position, status: completed ? 'completed' : 'in_progress'},
           occurred_at: Date.now() / 1000,
         }]}),
       });
+      if (result.results?.[0]?.status === 'conflict') {
+        loadLibrary().catch(() => {});
+        return;
+      }
       player.entity.position = position;
       player.entity.status = completed ? 'completed' : 'in_progress';
+      if (result.results?.[0]?.revision != null) player.entity.revision = Number(result.results[0].revision);
       state.lastAnimeSyncAt = Date.now();
     } catch (_) {}
   };
@@ -1178,19 +1192,35 @@
   const openLnSeries = series => openSeries(series);
 
   const loadLibrary = async () => {
-    const payload = await api('/api/v1/library');
-    state.entities = Array.isArray(payload.entities) ? payload.entities : [];
-    $('#pairView').hidden = true;
-    $('#libraryView').hidden = false;
-    $('#refreshButton').hidden = false;
-    $('#forgetDevice').hidden = false;
-    $('#connectionState').textContent = 'Connected';
-    render();
-    await evictUnusedMedia();
-    const estimate = await storageEstimate();
-    if (estimate.quota) {
-      $('#storageSummary').textContent = `Storage ${(estimate.usage / 1024 / 1024).toFixed(0)} MB / ${(estimate.quota / 1024 / 1024 / 1024).toFixed(1)} GB · media only on request`;
+    if (state.libraryLoading) return;
+    state.libraryLoading = true;
+    try {
+      const openSeriesIdentity = state.series ? {key: state.series.key, type: state.series.type} : null;
+      const payload = await api('/api/v1/library');
+      state.entities = Array.isArray(payload.entities) ? payload.entities : [];
+      $('#pairView').hidden = true;
+      $('#libraryView').hidden = false;
+      $('#refreshButton').hidden = false;
+      $('#forgetDevice').hidden = false;
+      $('#connectionState').textContent = 'Connected';
+      render();
+      if (openSeriesIdentity) {
+        const refreshed = allSeries().find(item => item.key === openSeriesIdentity.key && item.type === openSeriesIdentity.type);
+        if (refreshed) window.requestAnimationFrame(() => openSeries(refreshed));
+      }
+      await evictUnusedMedia();
+      const estimate = await storageEstimate();
+      if (estimate.quota) {
+        $('#storageSummary').textContent = `Storage ${(estimate.usage / 1024 / 1024).toFixed(0)} MB / ${(estimate.quota / 1024 / 1024 / 1024).toFixed(1)} GB · media only on request`;
+      }
+    } finally {
+      state.libraryLoading = false;
     }
+  };
+
+  const refreshVisibleLibrary = () => {
+    if (document.visibilityState !== 'visible' || !state.token || state.reader || state.animePlayer) return;
+    loadLibrary().catch(() => {});
   };
 
   $('#pairForm').addEventListener('submit', async event => {
@@ -1324,7 +1354,10 @@
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && state.animePlayer) syncAnimeProgress();
+    if (document.visibilityState === 'visible') refreshVisibleLibrary();
   });
+  window.addEventListener('focus', refreshVisibleLibrary);
+  window.setInterval(refreshVisibleLibrary, 15000);
 
   $('#readerBack').addEventListener('click', async () => {
     await syncReaderProgress();

@@ -93,6 +93,8 @@ def test_frontend_uses_wall_clock_ratio_and_immediate_word_switch() -> None:
     assert "for(let index=0;index<path.length-1;index++)" in source
     assert "speechActive=lnPairedSpeechActive(anchor,estimatedTime)" not in source
     assert "speechActive=lnPairedSpeechActive(anchor,position)" not in source
+    assert "renderLnPairedPosition(renderState,estimatedOffset,{speechActive:true,previewOffset})" in source
+    assert "{reason:'poll',speechActive:true,previewOffset}" in source
     assert "until:performance.now()+34" not in source
     assert "ui.lnPairedResumeTarget!==null" in source
     assert "ui.lnPairedResumeTarget!==undefined" in source

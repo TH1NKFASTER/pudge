@@ -100,7 +100,7 @@ def ensure_release_version(version: str, python: str) -> None:
 def validate(python: str) -> None:
     # Cheap checks first, expensive test batches only if they pass.
     git("diff", "--check")
-    run("make", "lint", f"PYTHON={python}")
+    run("make", "quality", f"PYTHON={python}")
     run("make", "test-batches", f"PYTHON={python}")
     git("diff", "--check")
 

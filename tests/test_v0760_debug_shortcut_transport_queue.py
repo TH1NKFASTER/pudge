@@ -78,7 +78,7 @@ def test_cmd_shift_l_routes_to_active_debug_context_without_ui_buttons() -> None
     assert "def export_runtime_debug_bundle(" in web_app
     assert "debug_log_dir()" in web_app
     assert "Pudge-patch-logs" not in web_app
-    assert 'archive.write(DEFAULT_LOG_PATH, "runtime.log")' in web_app
+    assert "self.diagnostics_controller.export(" in web_app
 
 
 def test_ocr_status_uses_processed_without_page_counter() -> None:

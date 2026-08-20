@@ -16,7 +16,6 @@ import threading
 import time
 import unicodedata
 import webbrowser
-import zipfile
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -29,10 +28,13 @@ from .cache_management import cleanup_segment_audio_cache
 from .audiobooks import AUDIOBOOK_EXTENSIONS, AudiobookService
 from .backup import create_backup, restore_backup
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
+from .cache_registry import CacheRegistry
 from .config import load_config, write_config
 from .companion_streaming import CompanionStreamingService
 from .debug_snapshot import DebugSnapshotService
+from .diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
+from .episode_state import watched_by_anilist_progress
 from .episode_numbering import resolve_episode_numbering
 from .presentation_state import derive_episode_presentation
 from .first_experience import (
@@ -62,9 +64,15 @@ from .providers.aria2 import Aria2Client
 from .providers.nyaa import NyaaClient
 from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
+from .safe_mode import SafeModeController
+from .secrets_store import keep_masked_secret, masked_secret
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
+from .task_supervisor import TaskSupervisor
+from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
 from .visual_novels import VisualNovelService
+from .web_controllers import CompanionController, DiagnosticsController
+from .web_state import UIStateSnapshotCache
 
 
 def _plain_anilist_description(value: Any) -> str:
@@ -87,7 +95,13 @@ class WebAppApi:
         self.config_path = config_path.expanduser()
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
+        self.safe_mode = SafeModeController(
+            self.config.paths.cache_dir,
+            self.config.library.database_path,
+        )
+        self.safe_mode.begin()
         mark_app_running()
+        self.task_supervisor = TaskSupervisor(logger=self.logger)
         cleanup_debug_logs()
         cache_cleanup = cleanup_segment_audio_cache(self.config.paths.cache_dir, force=True)
         if int(cache_cleanup.get("removed_files") or 0):
@@ -98,22 +112,10 @@ class WebAppApi:
                 float(cache_cleanup.get("remaining_bytes") or 0) / (1024 * 1024),
             )
         self.manager = AnimeManager(self.config, log=self.logger.info)
-        self.mobile_sync = MobileSyncService(
-            self.manager.db,
-            pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
-            max_events_per_request=self.config.companion.max_events_per_request,
-        )
-        self.companion_streaming = CompanionStreamingService(
-            self.manager.db,
-            cache_dir=self.config.paths.cache_dir,
-            ffmpeg=self.config.tools.ffmpeg,
-            ffprobe=self.config.tools.ffprobe,
-            logger=self.logger,
-        )
         self.companion_base_url = ""
         self._companion_server: Any | None = None
         self._companion_thread: threading.Thread | None = None
-        self.job_center = JobCenter(self.manager.db)
+        self._configure_database_services()
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
             self.manager.db,
@@ -132,11 +134,12 @@ class WebAppApi:
             job_center=self.job_center,
             work_scheduler=self.manager.work_scheduler,
         )
-        threading.Thread(
-            target=self.audiobooks.resume_pending_transcriptions,
-            name="audiobook-stt-resume",
-            daemon=True,
-        ).start()
+        if not self.safe_mode.active:
+            self.task_supervisor.start(
+                name="audiobook-stt-resume",
+                target=self.audiobooks.resume_pending_transcriptions,
+            )
+        self._ui_state_cache = UIStateSnapshotCache()
         self.visual_novels = VisualNovelService(logger=self.logger)
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
@@ -213,9 +216,44 @@ class WebAppApi:
             interval_seconds=self.config.diagnostics.energy_sample_seconds,
             logger=self.logger,
         )
-        if self.config.diagnostics.energy_monitoring_enabled:
+        if self.config.diagnostics.energy_monitoring_enabled and not self.safe_mode.active:
             self.energy_monitor.start()
-        self._start_scheduled_agent()
+        if not self.safe_mode.active:
+            self._start_scheduled_agent()
+
+    def _configure_database_services(self) -> None:
+        """Rebind small controllers whenever configuration replaces the database."""
+
+        previous_streaming = getattr(self, "companion_streaming", None)
+        if previous_streaming is not None:
+            previous_streaming.close()
+        self.cache_registry = CacheRegistry(self.manager.db, self.config.paths.cache_dir)
+        self.diagnostics = DiagnosticRecorder(self.manager.db)
+        self.debug_bundle_builder = DebugBundleBuilder(self.manager.db, self.diagnostics)
+        self.mobile_sync = MobileSyncService(
+            self.manager.db,
+            pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
+            max_events_per_request=self.config.companion.max_events_per_request,
+        )
+        self.companion_streaming = CompanionStreamingService(
+            self.manager.db,
+            cache_dir=self.config.paths.cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
+            ffprobe=self.config.tools.ffprobe,
+            logger=self.logger,
+            work_scheduler=self.manager.work_scheduler,
+            task_supervisor=self.task_supervisor,
+            cache_registry=self.cache_registry,
+        )
+        self.companion_controller = CompanionController(
+            self.mobile_sync,
+            self.companion_streaming,
+        )
+        self.diagnostics_controller = DiagnosticsController(
+            self.debug_bundle_builder,
+            lambda media_id, episode: self.debug_snapshots.snapshot(media_id, episode),
+        )
+        self.job_center = JobCenter(self.manager.db)
 
     @staticmethod
     def _scheduled_agent_plist() -> Path:
@@ -296,6 +334,39 @@ class WebAppApi:
         self.energy_monitor.stop()
         self.audiobooks.stop_all()
         self.visual_novels.stop()
+        supervisor = getattr(self, "task_supervisor", None)
+        if supervisor is not None:
+            supervisor.shutdown(timeout=5.0)
+        safe_mode = getattr(self, "safe_mode", None)
+        if safe_mode is not None:
+            safe_mode.finish_cleanly()
+
+    def _close_window_for_uninstall(self) -> None:
+        window = self.window
+        if window is None:
+            return
+        try:
+            window.destroy()
+        except Exception as exc:
+            self.logger.warning("FALLBACK step=app.uninstall_close error=%r", str(exc))
+
+    def uninstall_pudge(self) -> dict[str, Any]:
+        """Start a detached cleanup process, then close the application."""
+
+        if sys.platform != "darwin":
+            raise RuntimeError("The built-in uninstaller is available only on macOS")
+        plan = build_uninstall_plan(
+            config_path=self.config_path,
+            cache_dir=self.config.paths.cache_dir,
+            database_path=self.config.library.database_path,
+            library_root=self.config.library.root_dir,
+        )
+        launch_uninstaller(plan)
+        self.logger.info("EVENT app.uninstall_started targets=%s", len(plan.targets))
+        close_timer = threading.Timer(0.2, self._close_window_for_uninstall)
+        close_timer.daemon = True
+        close_timer.start()
+        return {"ok": True, "target_count": len(plan.targets)}
 
     @staticmethod
     def _companion_lan_host() -> str:
@@ -394,14 +465,10 @@ class WebAppApi:
         return self.companion_status()
 
     def companion_status(self) -> dict[str, Any]:
-        return {
-            "enabled": bool(self.config.companion.enabled),
-            "base_url": self._companion_effective_base_url(),
-            "bind_host": str(self.config.companion.bind_host),
-            "port": int(self.config.companion.port),
-            "protocol": self.mobile_sync.protocol_info(),
-            "devices": self.mobile_sync.devices(),
-        }
+        return self.companion_controller.status(
+            self.config.companion,
+            self._companion_effective_base_url(),
+        )
 
     def companion_start_pairing(self) -> dict[str, Any]:
         if not self.config.companion.enabled or self._companion_server is None:
@@ -417,10 +484,17 @@ class WebAppApi:
         return payload
 
     def companion_revoke_device(self, device_id: str) -> dict[str, Any]:
-        return {
-            "ok": self.mobile_sync.revoke_device(str(device_id or "")),
-            "devices": self.mobile_sync.devices(),
-        }
+        return self.companion_controller.revoke(str(device_id or ""))
+
+    def companion_sync_conflicts(self, limit: int = 100) -> dict[str, Any]:
+        return self.companion_controller.conflicts(limit=int(limit))
+
+    def companion_resolve_sync_conflict(
+        self, conflict_id: int, resolution: str = "local"
+    ) -> dict[str, Any]:
+        return self.companion_controller.resolve_conflict(
+            int(conflict_id), str(resolution)
+        )
 
     def companion_library_snapshot(self) -> dict[str, Any]:
         return self.mobile_sync.library_snapshot()
@@ -828,6 +902,18 @@ class WebAppApi:
             return relative
         return value
 
+    def _watched_on_anilist(
+        self, anime: LibraryAnime | None, episode: int | None
+    ) -> bool:
+        if anime is None:
+            return False
+        return watched_by_anilist_progress(
+            self._display_episode_number(anime, episode),
+            anime.progress,
+            total_episodes=anime.episodes,
+            media_format=anime.format,
+        )
+
     def _local_episode_for_relative(
         self, anime: LibraryAnime, relative_episode: int | None
     ):
@@ -969,6 +1055,8 @@ class WebAppApi:
             ):
                 continue
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
+            if self._watched_on_anilist(anime, item.episode):
+                continue
             position = float(item.playback_position or 0.0)
             duration = float(item.playback_duration or 0.0)
             payloads.append(
@@ -1030,6 +1118,8 @@ class WebAppApi:
             ):
                 group["watched_folder"] = True
             effective_state = item.state
+            if self._watched_on_anilist(anime, item.episode):
+                effective_state = "watched"
             if effective_state == "ready" and (
                 str(item.subtitle_origin or "").casefold() == "bitmap"
                 or (
@@ -1076,7 +1166,7 @@ class WebAppApi:
             )
             group["episode_count"] = len(group["episodes"])
             group["ready_count"] = sum(
-                1 for item in group["episodes"] if item["state"] in {"ready", "watched"}
+                1 for item in group["episodes"] if item["state"] == "ready"
             )
             group["watched_count"] = sum(
                 1 for item in group["episodes"] if item["state"] == "watched"
@@ -1111,10 +1201,12 @@ class WebAppApi:
 
         incomplete = self.manager.incomplete_download_paths()
         for item in self.manager.db.episodes():
+            anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             if (
                 item.state != "ready"
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
+                or self._watched_on_anilist(anime, item.episode)
             ):
                 continue
             key: tuple[str, object]
@@ -1194,10 +1286,12 @@ class WebAppApi:
         incomplete = self.manager.incomplete_download_paths()
         groups: dict[tuple[str, object], Any] = {}
         for item in self.manager.db.episodes():
+            anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             if (
                 item.state in {"ready", "watched"}
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
+                or self._watched_on_anilist(anime, item.episode)
             ):
                 continue
             key = (
@@ -1843,8 +1937,8 @@ class WebAppApi:
             "qbt_enabled": cfg.qbittorrent.enabled,
             "qbt_url": cfg.qbittorrent.base_url,
             "qbt_user": cfg.qbittorrent.username,
-            "qbt_password": cfg.qbittorrent.password,
-            "qbt_api_key": cfg.qbittorrent.api_key,
+            "qbt_password": masked_secret(cfg.qbittorrent.password),
+            "qbt_api_key": masked_secret(cfg.qbittorrent.api_key),
             "aria2_enabled": cfg.aria2.enabled,
             "aria2_binary": cfg.aria2.binary,
             "aria2_rpc_port": cfg.aria2.rpc_port,
@@ -1863,13 +1957,13 @@ class WebAppApi:
             "delete_hours": cfg.agent.delete_after_watched_hours,
             "anilist_enabled": cfg.anilist.enabled,
             "anilist_client_id": cfg.anilist.client_id,
-            "anilist_token": cfg.anilist.access_token,
+            "anilist_token": masked_secret(cfg.anilist.access_token),
             "anilist_auto_progress": cfg.anilist.auto_update_progress,
             "anilist_add_if_missing": cfg.anilist.add_if_missing,
             "anilist_threshold": round(cfg.anilist.watched_threshold * 100, 2),
             "anilist_max_remaining_minutes": cfg.anilist.watched_max_remaining_minutes,
             "relations_by_release_date": cfg.anilist.relations_by_release_date,
-            "jimaku_api_key": cfg.jimaku.personal_api_key,
+            "jimaku_api_key": masked_secret(cfg.jimaku.personal_api_key),
             "jimaku_trial_active": cfg.jimaku.trial_active,
             "jimaku_trial_expires_at": cfg.jimaku.trial_expires_at,
             "jimaku_trial_remaining_seconds": max(
@@ -1882,7 +1976,7 @@ class WebAppApi:
             "max_subtitle_upgrade_checks_per_run": cfg.matching.max_subtitle_upgrade_checks_per_run,
             "llm_enabled": cfg.llm.enabled,
             "llm_url": cfg.llm.base_url,
-            "llm_api_key": cfg.llm.api_key,
+            "llm_api_key": masked_secret(cfg.llm.api_key),
             "llm_model": cfg.llm.model,
             "subtitle_semantic_checks": cfg.llm.validate_embedded_reference,
             "use_container_chapters": cfg.sync.use_container_chapters,
@@ -1984,14 +2078,10 @@ class WebAppApi:
         }
 
     def _get_state(self, *, refresh_storage: bool) -> dict[str, Any]:
-        # Completed torrent metadata must become a durable episode row before
-        # Home decides whether the next episode is Ready/Waiting. This is local
-        # SQLite/filesystem reconciliation and does not contact torrent clients.
-        self.manager.reconcile_completed_download_rows()
-        self.manager.reconcile_prepared_subtitle_rows()
-        current_anime = self.manager.db.anime_list(("CURRENT",))
-        planned_anime = self.manager.db.anime_list(("PLANNING",))
-        anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
+        all_anime = self.manager.db.anime_list()
+        current_anime = [anime for anime in all_anime if anime.status == "CURRENT"]
+        planned_anime = [anime for anime in all_anime if anime.status == "PLANNING"]
+        anime_by_id = {anime.media_id: anime for anime in all_anime}
         download_rows = self.manager.db.downloads()
         downloads = [
             self._download_payload(item, anime_by_id) for item in download_rows
@@ -2171,6 +2261,7 @@ class WebAppApi:
             "ready_state_version": self.manager.db.get_state("ready_state_version", ""),
             "ui_state_version": self.manager.db.get_state("ui_state_version", ""),
             "storage": self._storage_payload(refresh=refresh_storage),
+            "safe_mode": self.safe_mode.status(run_checks=False),
         }
 
     def ready_state_version(self) -> str:
@@ -2186,7 +2277,14 @@ class WebAppApi:
         }
 
     def get_state(self) -> dict[str, Any]:
-        return self._get_state(refresh_storage=True)
+        # Reconciliation is a write operation, so it only runs on explicit full
+        # refreshes and never in the one-second UI polling path.
+        self.manager.reconcile_completed_download_rows()
+        self.manager.reconcile_prepared_subtitle_rows()
+        payload = self._get_state(refresh_storage=True)
+        return self._ui_state_cache.store(
+            str(payload.get("ui_state_version") or ""), payload
+        )
 
     def get_state_fast(self) -> dict[str, Any]:
         """Return UI state without recursively scanning the video library.
@@ -2195,7 +2293,19 @@ class WebAppApi:
         can move to the Ready section immediately. Disk usage is reused from the
         most recent full state and is refreshed when maintenance finishes.
         """
-        return self._get_state(refresh_storage=False)
+        version = self.manager.db.get_state("ui_state_version", "")
+        cached = self._ui_state_cache.get(version)
+        if cached is not None:
+            return cached
+        payload = self._get_state(refresh_storage=False)
+        return self._ui_state_cache.store(version, payload)
+
+    def get_state_delta(self, ui_state_version: str = "") -> dict[str, Any]:
+        version = self.manager.db.get_state("ui_state_version", "")
+        if str(ui_state_version) == version:
+            return {"changed": False, "ui_state_version": version}
+        state = self.get_state_fast()
+        return {"changed": True, "ui_state_version": version, "state": state}
 
     def torrent_downloads(
         self,
@@ -2640,6 +2750,16 @@ class WebAppApi:
 
     def startup_maintenance(self) -> dict[str, Any]:
         """Start the complete launch maintenance pass without blocking the UI."""
+        if bool(getattr(getattr(self, "safe_mode", None), "active", False)):
+            return {
+                "skipped": True,
+                "running": False,
+                "done": True,
+                "stats": {},
+                "error": "",
+                "safe_mode": True,
+                "state": self.get_state_fast(),
+            }
         with self._startup_maintenance_lock:
             thread = self._startup_maintenance_thread
             if self._startup_maintenance_done:
@@ -2690,6 +2810,13 @@ class WebAppApi:
         only that video's high-priority subtitle job is started immediately if no
         full maintenance refresh currently owns the shared lock.
         """
+        if bool(getattr(getattr(self, "safe_mode", None), "active", False)):
+            return {
+                "skipped": True,
+                "safe_mode": True,
+                "stats": {},
+                "state": self.get_state_fast(),
+            }
         if not self._download_poll_lock.acquire(blocking=False):
             return {"skipped": True, "stats": {}, "state": self.get_state()}
         stats = {"downloads": 0, "subs": 0}
@@ -3254,6 +3381,8 @@ class WebAppApi:
                     payload={"book_id": book_id},
                     total=float(self.manga.ocr_cache_status(book_id).get("total_pages") or 0),
                     attempt_of=str(attempt_of or ""),
+                    resumable=True,
+                    correlation_id=f"manga-ocr:{book_id}",
                 )
                 thread = threading.Thread(
                     target=self._run_serialized_manga_book_ocr,
@@ -4302,8 +4431,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.qbittorrent.enabled = bool(values.get("qbt_enabled", cfg.qbittorrent.enabled))
         cfg.qbittorrent.base_url = str(values.get("qbt_url", cfg.qbittorrent.base_url)).strip().rstrip("/")
         cfg.qbittorrent.username = str(values.get("qbt_user", cfg.qbittorrent.username)).strip()
-        cfg.qbittorrent.password = str(values.get("qbt_password", cfg.qbittorrent.password))
-        cfg.qbittorrent.api_key = str(values.get("qbt_api_key", cfg.qbittorrent.api_key)).strip()
+        cfg.qbittorrent.password = keep_masked_secret(
+            values.get("qbt_password", cfg.qbittorrent.password), cfg.qbittorrent.password
+        )
+        cfg.qbittorrent.api_key = keep_masked_secret(
+            values.get("qbt_api_key", cfg.qbittorrent.api_key), cfg.qbittorrent.api_key
+        ).strip()
         cfg.qbittorrent.pre_download_command = str(values.get("download_hook", cfg.qbittorrent.pre_download_command)).strip()
         cfg.aria2.enabled = bool(values.get("aria2_enabled", cfg.aria2.enabled))
         cfg.aria2.binary = "aria2c"
@@ -4322,7 +4455,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.agent.delete_after_watched_hours = max(0.0, float(values.get("delete_hours", cfg.agent.delete_after_watched_hours)))
         cfg.anilist.enabled = bool(values.get("anilist_enabled", cfg.anilist.enabled))
         cfg.anilist.client_id = str(values.get("anilist_client_id", cfg.anilist.client_id)).strip()
-        cfg.anilist.access_token = str(values.get("anilist_token", cfg.anilist.access_token)).strip()
+        cfg.anilist.access_token = keep_masked_secret(
+            values.get("anilist_token", cfg.anilist.access_token), cfg.anilist.access_token
+        ).strip()
         cfg.anilist.auto_update_progress = bool(values.get("anilist_auto_progress", cfg.anilist.auto_update_progress))
         cfg.anilist.add_if_missing = bool(values.get("anilist_add_if_missing", cfg.anilist.add_if_missing))
         cfg.anilist.watched_threshold = 0.85
@@ -4351,8 +4486,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.diagnostics.energy_sample_seconds = max(
             10.0, float(values.get("energy_sample_seconds", cfg.diagnostics.energy_sample_seconds))
         )
-        personal_jimaku_key = str(
-            values.get("jimaku_api_key", cfg.jimaku.personal_api_key)
+        personal_jimaku_key = keep_masked_secret(
+            values.get("jimaku_api_key", cfg.jimaku.personal_api_key),
+            cfg.jimaku.personal_api_key,
         ).strip()
         cfg.jimaku.personal_api_key = personal_jimaku_key
         cfg.jimaku.api_key = personal_jimaku_key
@@ -4366,7 +4502,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.matching.max_subtitle_upgrade_checks_per_run = 2
         cfg.llm.enabled = bool(values.get("llm_enabled", cfg.llm.enabled))
         cfg.llm.base_url = str(values.get("llm_url", cfg.llm.base_url)).strip().rstrip("/")
-        cfg.llm.api_key = str(values.get("llm_api_key", cfg.llm.api_key)).strip()
+        cfg.llm.api_key = keep_masked_secret(
+            values.get("llm_api_key", cfg.llm.api_key), cfg.llm.api_key
+        ).strip()
         cfg.llm.model = str(values.get("llm_model", cfg.llm.model)).strip()
         cfg.llm.validate_embedded_reference = bool(
             values.get("subtitle_semantic_checks", cfg.llm.validate_embedded_reference)
@@ -4380,6 +4518,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.audiobooks.stop_all()
         self.config = load_config(self.config_path)
         self.manager = AnimeManager(self.config, log=self.logger.info)
+        self._configure_database_services()
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
             self.manager.db,
@@ -4395,13 +4534,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ffmpeg=self.config.tools.ffmpeg,
             python=python_executable(),
             stt_model=self.config.sync.japanese_stt_model,
+            job_center=self.job_center,
             work_scheduler=self.manager.work_scheduler,
         )
-        threading.Thread(
-            target=self.audiobooks.resume_pending_transcriptions,
+        if not self.safe_mode.active:
+            self.task_supervisor.start(
             name="audiobook-stt-resume",
-            daemon=True,
-        ).start()
+                target=self.audiobooks.resume_pending_transcriptions,
+                replace=True,
+            )
+        self._ui_state_cache.invalidate()
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
@@ -4418,7 +4560,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             jpdb_api_token=str(ln_values.get("jpdb_api_token") or ""),
         )
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
-        if self.config.diagnostics.energy_monitoring_enabled:
+        if self.config.diagnostics.energy_monitoring_enabled and not self.safe_mode.active:
             self.energy_monitor.start()
         else:
             self.energy_monitor.stop()
@@ -5293,30 +5435,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         output_dir = debug_log_dir()
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        suffix = int(time.time_ns() % 1_000_000)
-        target = output_dir / f"pudge-runtime-debug-{stamp}-{suffix:06d}.zip"
-        manifest = {
-            "schema": 1,
-            "generated_at": time.time(),
-            "pudge_version": __version__,
-            "platform": platform.platform(),
-            "python": sys.version,
-            "frontend": dict(payload) if isinstance(payload, dict) else {},
-            "files": {
-                "runtime_log": str(DEFAULT_LOG_PATH),
-                "energy_log": str(ENERGY_LOG_PATH),
-            },
-        }
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
-            )
-            if DEFAULT_LOG_PATH.is_file():
-                archive.write(DEFAULT_LOG_PATH, "runtime.log")
-            if ENERGY_LOG_PATH.is_file():
-                archive.write(ENERGY_LOG_PATH, "energy.log")
+        frontend = dict(payload) if isinstance(payload, dict) else {}
+        target = self.diagnostics_controller.export(
+            output_dir,
+            version=__version__,
+            frontend=frontend,
+            logs={"runtime": DEFAULT_LOG_PATH, "energy": ENERGY_LOG_PATH},
+        )
         try:
             subprocess.Popen(["open", "-R", str(target)])
         except OSError:
@@ -5478,7 +5603,55 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         safe_event = str(event or "unknown")[:120]
         safe_payload = dict(payload or {})
         self.logger.info("EVENT ui.%s payload=%s", safe_event, safe_payload)
+        try:
+            self.diagnostics.record(
+                str(safe_payload.get("correlation_id") or ""),
+                "ui",
+                safe_event,
+                media_id=(
+                    int(safe_payload["media_id"])
+                    if safe_payload.get("media_id") is not None
+                    else None
+                ),
+                media_episode=(
+                    int(safe_payload["episode"])
+                    if safe_payload.get("episode") is not None
+                    else None
+                ),
+                payload=safe_payload,
+            )
+        except (OSError, TypeError, ValueError):
+            self.logger.warning("FALLBACK step=diagnostics.ui_event event=%s", safe_event)
         return {"ok": True}
+
+    def safe_mode_status(self) -> dict[str, Any]:
+        return self.safe_mode.status(run_checks=True)
+
+    def safe_mode_restart_normally(self) -> dict[str, Any]:
+        self.safe_mode.leave_on_restart()
+        self._ui_state_cache.invalidate()
+        self.task_supervisor.start(
+            name="audiobook-stt-resume",
+            target=self.audiobooks.resume_pending_transcriptions,
+            replace=True,
+        )
+        if self.config.diagnostics.energy_monitoring_enabled:
+            self.energy_monitor.start()
+        self._start_scheduled_agent()
+        self.logger.info("EVENT app.safe_mode_resumed")
+        return {
+            "ok": True,
+            "restart_required": False,
+            "state": self.get_state(),
+        }
+
+    def reveal_safe_mode_backup(self) -> dict[str, Any]:
+        backup = self.safe_mode.latest_backup()
+        if backup is None:
+            return {"ok": False, "error": "No migration backup is available"}
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(backup)])
+        return {"ok": True, "path": str(backup)}
 
     def get_relation_graph_cache(self) -> dict[str, Any]:
         media_ids = [
@@ -5517,6 +5690,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def diagnose_episode(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         return self.manager.diagnose_episode(int(media_id), episode)
 
+    def media_identity_lock(self, canonical_id: str, locked: bool = True) -> dict[str, Any]:
+        return {
+            "ok": self.manager.identity_resolver.lock(str(canonical_id), bool(locked)),
+            "canonical_id": str(canonical_id),
+            "locked": bool(locked),
+        }
+
     def anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         return DebugSnapshotService(self.manager, cache_dir=self.config.paths.cache_dir, runtime_log_path=DEFAULT_LOG_PATH).snapshot(
             int(media_id), None if episode is None else int(episode)
@@ -5532,7 +5712,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
             except Exception as exc:
                 self.logger.exception("FAIL step=subtitle.debug_fresh_background video=%r error=%r", str(video), str(exc))
-        threading.Thread(target=worker, name=f"{APP_SLUG}-debug-fresh-subtitles", daemon=True).start()
+        self.task_supervisor.start(
+            name=f"{APP_SLUG}-debug-fresh-subtitles",
+            target=worker,
+            replace=True,
+        )
         return result
 
     def export_anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
@@ -5639,6 +5823,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             for episode in episodes:
                 if episode.state == "watched" or episode.state != "ready":
+                    continue
+                if self._watched_on_anilist(anime, episode.episode):
                     continue
                 if not episode.video_path.is_file():
                     continue
@@ -5778,12 +5964,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.audiobooks.stop_all()
             self.config = load_config(self.config_path)
             self.manager = AnimeManager(self.config, log=self.logger.info)
+            self._configure_database_services()
             self.light_novels = LightNovelService(self.config, logger=self.logger)
             self.manga = MangaService(
-            self.manager.db,
-            cache_dir=self.config.paths.cache_dir,
-            python=python_executable(),
-        )
+                self.manager.db,
+                cache_dir=self.config.paths.cache_dir,
+                python=python_executable(),
+                work_scheduler=self.manager.work_scheduler,
+            )
             self.audiobooks = AudiobookService(
                 self.manager.db,
                 ffprobe=self.config.tools.ffprobe,
@@ -5792,14 +5980,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 ffmpeg=self.config.tools.ffmpeg,
                 python=python_executable(),
                 stt_model=self.config.sync.japanese_stt_model,
+                job_center=self.job_center,
                 work_scheduler=self.manager.work_scheduler,
-
             )
-            threading.Thread(
-                target=self.audiobooks.resume_pending_transcriptions,
-                name="audiobook-stt-resume",
-                daemon=True,
-            ).start()
+            if not self.safe_mode.active:
+                self.task_supervisor.start(
+                    name="audiobook-stt-resume",
+                    target=self.audiobooks.resume_pending_transcriptions,
+                    replace=True,
+                )
+            self._ui_state_cache.invalidate()
             self._planning_search_cache = MetadataCache(
                 self.config.paths.cache_dir,
                 "anilist-planning-search",

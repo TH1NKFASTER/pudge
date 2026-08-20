@@ -11,5 +11,6 @@ def test_v3_preserves_silence_and_poll_contracts() -> None:
     assert "if(!speechActive)" in source
     assert "const previousWord=previous;" in source
     assert "word=previousWord" in source
-    assert "lnPairedOffsetAtTime(state,Number(state.position))" in source
+    assert "lnPairedOffsetAtTime(state,position)" in source
+    assert "{reason:'poll',speechActive:true,previewOffset}" in source
     assert "speech_active:speechActive" in source

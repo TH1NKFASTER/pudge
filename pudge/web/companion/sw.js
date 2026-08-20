@@ -1,8 +1,8 @@
-const SHELL_CACHE='pudge-companion-shell-v13';
+const SHELL_CACHE='pudge-companion-shell-v15';
 const SHELL=[
   '/companion/',
-  '/companion/app.js?v=13',
-  '/companion/styles.css?v=13',
+  '/companion/app.js?v=15',
+  '/companion/styles.css?v=15',
   '/companion/manifest.webmanifest',
   '/companion/icon.svg'
 ];

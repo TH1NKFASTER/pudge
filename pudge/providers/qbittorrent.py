@@ -42,6 +42,10 @@ class QBittorrentClient:
         self._authenticated = bool(self.api_key)
         self._version: str | None = None
 
+    @property
+    def backend_name(self) -> str:
+        return "qbittorrent"
+
     @staticmethod
     def _normalize_url(value: str) -> str:
         value = value.strip().rstrip("/")

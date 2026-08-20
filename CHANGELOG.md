@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## v0.7.23
+
+- Matched Ready and Continue Watching with AniList progress, so episodes already
+  watched elsewhere no longer reappear on the Mac or in the mobile companion.
+- Preserved completed episodes when stale mobile progress arrives and refreshed
+  the companion library when it becomes active again.
+- Fixed audiobook highlighting after `-5`, `+5`, `-15`, and `+15` second seeks
+  while keeping the crisp linear highlighting used during normal playback.
+- Checked exact AniList and title matches beyond Jimaku's first four entries,
+  fixing missed subtitles when duplicate listings hide the correct release.
+- Prevented planned updates from enabling Safe Mode and stopped download and
+  subtitle monitoring whenever Safe Mode is active.
+- Added a two-step in-app uninstaller that removes Pudge and its own data while
+  leaving external media folders and third-party applications untouched.
+- Made background resource probes non-fatal and rewrote the user-facing
+  documentation in direct, ordinary language.
+
+## v0.7.22
+
 - Fixed large cold-open timing edits by applying a validated local subtitle
   offset only before the opening gap, while preserving the stable main-episode
   timeline; affected cached selections are re-prepared once.
@@ -32,6 +51,30 @@
   while an episode is playing, backed by the normal translation cache.
 - Avoided aria2's default RPC upload limit for large torrent metadata, reduced
   resume rechecking heat, and isolated installer test output from runtime logs.
+
+## v0.7.21
+
+- Added authenticated companion anime playback with HLS, subtitles and local progress sync.
+
+## v0.7.20
+
+- Added the local-first companion protocol, paired-device management and incremental media progress exchange.
+
+## v0.7.19
+
+- Hardened subtitle preparation recovery, runtime diagnostics and media identity repair.
+
+## v0.7.18
+
+- Improved audiobook and Light Novel paired-reading stability and release metadata checks.
+
+## v0.7.17
+
+- Expanded initial dependency setup, torrent recovery and per-episode diagnostics.
+
+## v0.7.16
+
+- Added aria2 download management, guided initial setup and safer episode identity handling.
 
 ## v0.7.15
 
@@ -348,7 +391,7 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 - Added a managed aria2c torrent backend. qBittorrent remains preferred when enabled; otherwise pudge starts a private local aria2c RPC process and keeps automatic downloads, progress monitoring, completion detection, cleanup, and release upgrades working.
 - The macOS installer installs aria2 automatically, records its absolute path for Finder and LaunchAgent environments, and enables the fallback for existing installations.
 - Settings and Activity now describe the active torrent backend and provide a direct aria2 connection test.
-- First Experience now explicitly explains that qBittorrent is optional: aria2 still downloads automatically, while qBittorrent provides richer categories, tags, and torrent-management controls.
+- Initial setup now explains that qBittorrent is optional: aria2 still downloads automatically, while qBittorrent provides richer categories, tags, and torrent-management controls.
 - Release upgrades are now configurable and visible in Activity, with manual checks, score thresholds, cooldowns, and retained upgrade history.
 - Japanese subtitle selections now have history and safe automatic upgrades: the current subtitle is backed up and replaced only when the new candidate clears the configured score gain. Manual subtitle selections are protected.
 - Added smart Watch queues for the next local episodes or an entire ready franchise in watch order. The next item launches only after the current episode is actually marked watched.

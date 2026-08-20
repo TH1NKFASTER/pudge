@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import mimetypes
 import re
 import os
@@ -14,10 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from .database import Database
+from .cache_registry import CachePolicy, CacheRegistry
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
+from .task_supervisor import TaskSupervisor
+from .work_scheduler import WorkPriority, WorkScheduler
 
 
-_STREAM_TTL_SECONDS = 6 * 60 * 60
+_STREAM_TTL_SECONDS = 30 * 60
 _CACHE_MAX_AGE_SECONDS = 3 * 24 * 60 * 60
 _CACHE_MAX_BYTES = 6 * 1024 * 1024 * 1024
 _ALLOWED_MEDIA_FILES = {"index.m3u8", "subtitles.vtt"}
@@ -44,6 +48,7 @@ class _Ticket:
     entity_id: str
     output_dir: Path
     expires_at: float
+    device_id: str = ""
 
 
 class CompanionStreamingService:
@@ -62,6 +67,9 @@ class CompanionStreamingService:
         ffmpeg: str = "ffmpeg",
         ffprobe: str = "ffprobe",
         logger: Any = None,
+        work_scheduler: WorkScheduler | None = None,
+        task_supervisor: TaskSupervisor | None = None,
+        cache_registry: CacheRegistry | None = None,
     ) -> None:
         self.database = database
         self.cache_root = Path(cache_dir).expanduser() / "companion-hls"
@@ -69,6 +77,9 @@ class CompanionStreamingService:
         self.ffmpeg = str(ffmpeg or "ffmpeg")
         self.ffprobe = str(ffprobe or "ffprobe")
         self.logger = logger
+        self.work_scheduler = work_scheduler
+        self.task_supervisor = task_supervisor
+        self.cache_registry = cache_registry
         self._lock = threading.RLock()
         self._subtitle_lock = threading.RLock()
         self._jobs: dict[str, _Job] = {}
@@ -83,7 +94,7 @@ class CompanionStreamingService:
         if callable(callback):
             try:
                 callback(message, *args)
-            except Exception:
+            except (OSError, RuntimeError, TypeError, ValueError):
                 pass
 
     def _resolve_episode(self, entity_id: str) -> dict[str, Any]:
@@ -170,15 +181,34 @@ class CompanionStreamingService:
         except OSError:
             return False
 
-    def _issue_ticket(self, *, cache_key: str, entity_id: str, output_dir: Path) -> _Ticket:
+    def _issue_ticket(
+        self,
+        *,
+        cache_key: str,
+        entity_id: str,
+        output_dir: Path,
+        device_id: str = "",
+    ) -> _Ticket:
         now = time.time()
         with self._lock:
             for ticket in self._tickets.values():
-                if ticket.cache_key == cache_key and ticket.entity_id == entity_id and ticket.expires_at > now + 60:
+                if (
+                    ticket.cache_key == cache_key
+                    and ticket.entity_id == entity_id
+                    and ticket.device_id == str(device_id)
+                    and ticket.expires_at > now + 60
+                ):
                     ticket.expires_at = now + _STREAM_TTL_SECONDS
                     return ticket
             token = secrets.token_urlsafe(24)
-            ticket = _Ticket(token, cache_key, entity_id, output_dir, now + _STREAM_TTL_SECONDS)
+            ticket = _Ticket(
+                token,
+                cache_key,
+                entity_id,
+                output_dir,
+                now + _STREAM_TTL_SECONDS,
+                str(device_id),
+            )
             self._tickets[token] = ticket
             return ticket
 
@@ -255,6 +285,41 @@ class CompanionStreamingService:
         if candidate.is_file():
             return str(candidate)
         return shutil.which(self.ffprobe) or self.ffprobe
+
+    def _stream_copy_compatible(self, source: Path) -> bool:
+        try:
+            completed = subprocess.run(
+                [
+                    self._ffprobe_path(),
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_type,codec_name",
+                    "-of",
+                    "json",
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            payload = json.loads(completed.stdout or "{}") if completed.returncode == 0 else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError, json.JSONDecodeError):
+            return False
+        streams = payload.get("streams") if isinstance(payload, dict) else None
+        if not isinstance(streams, list):
+            return False
+        video = next((row for row in streams if row.get("codec_type") == "video"), None)
+        audio = next((row for row in streams if row.get("codec_type") == "audio"), None)
+        return bool(
+            isinstance(video, dict)
+            and str(video.get("codec_name") or "").casefold() in {"h264", "avc1"}
+            and (
+                audio is None
+                or str(audio.get("codec_name") or "").casefold() in {"aac", "mp3"}
+            )
+        )
 
     @staticmethod
     def _subtitle_marker(output_dir: Path) -> Path:
@@ -463,18 +528,23 @@ class CompanionStreamingService:
             "-map", "0:a:0?",
             "-sn",
             "-dn",
-            "-c:v", encoder,
-            "-pix_fmt", "yuv420p",
         ]
-        if encoder == "h264_videotoolbox":
+        if encoder == "copy":
+            command += ["-c:v", "copy", "-c:a", "copy"]
+        elif encoder == "h264_videotoolbox":
+            command += ["-c:v", encoder, "-pix_fmt", "yuv420p"]
             command += ["-allow_sw", "1", "-b:v", "3500k", "-maxrate", "4500k", "-bufsize", "7000k"]
         else:
+            command += ["-c:v", encoder, "-pix_fmt", "yuv420p"]
             command += ["-preset", "veryfast", "-crf", "22", "-maxrate", "4500k", "-bufsize", "7000k"]
+        if encoder != "copy":
+            command += [
+                "-c:a", "aac",
+                "-b:a", "160k",
+                "-ac", "2",
+                "-force_key_frames", "expr:gte(t,n_forced*4)",
+            ]
         command += [
-            "-c:a", "aac",
-            "-b:a", "160k",
-            "-ac", "2",
-            "-force_key_frames", "expr:gte(t,n_forced*4)",
             "-f", "hls",
             "-hls_time", "4",
             "-hls_playlist_type", "event",
@@ -497,8 +567,22 @@ class CompanionStreamingService:
         output_dir = job.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
         encoders = ["h264_videotoolbox", "libx264"] if os.uname().sysname == "Darwin" else ["libx264"]
+        if self._stream_copy_compatible(job.video_path):
+            encoders.insert(0, "copy")
         error = ""
+        lease = None
         try:
+            if self.work_scheduler is not None:
+                lease = self.work_scheduler.acquire_heavy(
+                    f"companion-hls:{job.entity_id}",
+                    blocking=True,
+                    wait_for_foreground=True,
+                    cancel_check=lambda: self._closed,
+                    priority=WorkPriority.USER,
+                    resource="gpu",
+                )
+                if lease is None:
+                    return
             for encoder in encoders:
                 if self._closed:
                     return
@@ -530,6 +614,16 @@ class CompanionStreamingService:
                     except OSError:
                         pass
                     self._log("info", "RESULT step=companion.hls entity=%s encoder=%s", job.entity_id, encoder)
+                    if self.cache_registry is not None:
+                        self.cache_registry.register(
+                            "hls",
+                            output_dir,
+                            expires_at=time.time() + _CACHE_MAX_AGE_SECONDS,
+                            metadata={"entity_id": job.entity_id, "encoder": encoder},
+                        )
+                        self.cache_registry.enforce(
+                            {"hls": CachePolicy(_CACHE_MAX_BYTES, _CACHE_MAX_AGE_SECONDS)}
+                        )
                     return
                 error = stderr.decode("utf-8", errors="replace")[-1800:].strip() or f"ffmpeg exited {process.returncode}"
                 self._log("warning", "FALLBACK step=companion.hls entity=%s encoder=%s error=%r", job.entity_id, encoder, error)
@@ -539,6 +633,8 @@ class CompanionStreamingService:
                 job.error = error or "Unable to prepare HLS stream"
                 job.process = None
         finally:
+            if lease is not None:
+                lease.release()
             with self._lock:
                 if self._closed and job.process is not None:
                     try:
@@ -563,16 +659,23 @@ class CompanionStreamingService:
                 started_at=time.time(),
             )
             self._jobs[cache_key] = job
-            thread = threading.Thread(
-                target=self._run_job,
-                args=(job, dict(episode)),
-                name=f"pudge-hls-{cache_key[:8]}",
-                daemon=True,
-            )
-            thread.start()
+            if self.task_supervisor is not None:
+                self.task_supervisor.start(
+                    f"pudge-hls-{cache_key[:8]}",
+                    self._run_job,
+                    args=(job, dict(episode)),
+                )
+            else:
+                thread = threading.Thread(
+                    target=self._run_job,
+                    args=(job, dict(episode)),
+                    name=f"pudge-hls-{cache_key[:8]}",
+                    daemon=True,
+                )
+                thread.start()
             return job
 
-    def prepare(self, entity_id: str) -> dict[str, Any]:
+    def prepare(self, entity_id: str, *, device_id: str = "") -> dict[str, Any]:
         if self._closed:
             raise ValueError("Companion streaming is shutting down")
         episode = self._resolve_episode(entity_id)
@@ -581,7 +684,12 @@ class CompanionStreamingService:
         self.cleanup_cache(keep={cache_key})
         subtitle_result = self._prepare_subtitles(episode, output_dir)
         job = self._ensure_job(episode, cache_key, output_dir)
-        ticket = self._issue_ticket(cache_key=cache_key, entity_id=str(entity_id), output_dir=output_dir)
+        ticket = self._issue_ticket(
+            cache_key=cache_key,
+            entity_id=str(entity_id),
+            output_dir=output_dir,
+            device_id=str(device_id),
+        )
 
         playlist_ready = self._playlist_ready(output_dir)
         with self._lock:
@@ -623,6 +731,7 @@ class CompanionStreamingService:
             ticket = self._tickets.get(token)
         if ticket is None or ticket.expires_at <= time.time():
             raise ValueError("Stream ticket expired")
+        ticket.expires_at = time.time() + _STREAM_TTL_SECONDS
         name = str(filename or "")
         if name not in _ALLOWED_MEDIA_FILES and not (
             name.startswith("segment-") and name.endswith(".ts") and name[8:-3].isdigit()
@@ -646,10 +755,21 @@ class CompanionStreamingService:
             content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
         return path, content_type
 
+    def revoke_device(self, device_id: str) -> int:
+        with self._lock:
+            tokens = [
+                token for token, ticket in self._tickets.items()
+                if ticket.device_id == str(device_id)
+            ]
+            for token in tokens:
+                self._tickets.pop(token, None)
+        return len(tokens)
+
     def close(self) -> None:
         self._closed = True
         with self._lock:
             jobs = list(self._jobs.values())
+            self._tickets.clear()
         for job in jobs:
             process = job.process
             if process is None or process.poll() is not None:

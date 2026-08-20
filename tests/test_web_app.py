@@ -684,6 +684,81 @@ def test_home_state_groups_ready_downloaded_episodes(tmp_path: Path) -> None:
     assert downloaded[0]["local"]["episode"] == 2
 
 
+def test_anilist_progress_hides_late_download_from_ready_and_continue(
+    tmp_path: Path,
+) -> None:
+    from pudge.manager_models import LibraryEpisode
+
+    api = make_api(tmp_path)
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=200637,
+            title="Hyakkano 3",
+            status="CURRENT",
+            progress=6,
+            episodes=12,
+            format="TV",
+            media_status="RELEASING",
+            next_airing_episode=8,
+        )
+    )
+    videos: dict[int, Path] = {}
+    for episode in (6, 7):
+        video = (tmp_path / f"Hyakkano 3 - {episode:02d}.mkv").resolve()
+        video.write_bytes(b"video")
+        videos[episode] = video
+        api.manager.db.upsert_episode(
+            LibraryEpisode(
+                media_id=200637,
+                title="Hyakkano 3",
+                episode=episode,
+                video_path=video,
+                state="ready",
+                torrent_hash=f"hash-{episode}",
+            )
+        )
+    api.manager.db.record_playback(videos[6], 600, 1_400, 60)
+
+    state = api.get_state()
+    downloaded = next(item for item in state["downloaded"] if item["media_id"] == 200637)
+    library = next(item for item in state["library"] if item["media_id"] == 200637)
+    library_states = {item["episode"]: item["state"] for item in library["episodes"]}
+
+    assert downloaded["ready_episodes"] == [7]
+    assert all(item["episode"] != 6 for item in state["home"]["continue_watching"])
+    assert library_states == {6: "watched", 7: "ready"}
+    assert library["ready_count"] == 1
+    assert library["watched_count"] == 1
+    assert [item["episode"] for item in api._ready_queue_items([200637])] == [7]
+
+    persisted = api.manager.db.episode_by_path(videos[6])
+    assert persisted is not None
+    assert persisted.state == "ready"
+    assert persisted.watched_at is None
+    assert persisted.delete_after is None
+
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=200637,
+            title="Hyakkano 3",
+            status="CURRENT",
+            progress=5,
+            episodes=12,
+            format="TV",
+            media_status="RELEASING",
+            next_airing_episode=8,
+        )
+    )
+    rolled_back = api.get_state()
+    downloaded_after_rollback = next(
+        item for item in rolled_back["downloaded"] if item["media_id"] == 200637
+    )
+    assert downloaded_after_rollback["ready_episodes"] == [6, 7]
+    assert any(
+        item["episode"] == 6 for item in rolled_back["home"]["continue_watching"]
+    )
+
+
 def test_current_page_uses_actionable_home_sections_without_all_anime() -> None:
     html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
         encoding="utf-8"
@@ -903,7 +978,7 @@ def test_onboarding_can_be_completed_and_skipped(tmp_path: Path) -> None:
     )
     assert completed["settings"]["onboarding_completed"] is True
     assert completed["settings"]["language"] == "ru"
-    assert completed["settings"]["jimaku_api_key"] == "jimaku"
+    assert completed["settings"]["jimaku_api_key"] == "••••••••"
 
     api.config.ui.onboarding_completed = False
     write_config(api.config, api.config_path)

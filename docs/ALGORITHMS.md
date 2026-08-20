@@ -1,6 +1,7 @@
 # Algorithms and state model
 
-This document describes decision logic that affects user-visible results. Thresholds are conservative so automatic work can abstain instead of making a destructive match.
+This document explains the rules behind results users can see. Pudge prefers to
+leave an uncertain item alone instead of making a confident-looking wrong match.
 
 ## Episode state machine
 
@@ -22,7 +23,9 @@ stateDiagram-v2
     dropped --> local: explicit restore
 ```
 
-Worker stages such as discovering, extracting, OCR, aligning and validating are job state, not durable media state. Keeping them separate prevents a process crash during OCR from corrupting what the library knows about the video.
+Steps such as discovery, extraction, OCR, alignment, and validation belong to a
+background job, not to the episode itself. If one of those jobs stops, the
+library still remembers the last valid episode state.
 
 `transition_episode_state(current, requested, trigger)` enforces three rules:
 
@@ -58,7 +61,8 @@ After ALASS, Pudge can apply a rigid local correction only when all of these che
 4. the first main-dialogue cue is already aligned within 0.9 seconds;
 5. shifting every cue in the pre-main block cannot reorder cues or overlap the main dialogue.
 
-The correction never changes the already-aligned main episode. Diagnostics retain the inferred correction, onset errors, fingerprint error, runner-up margin and post-opening error.
+The correction never shifts the already aligned main episode. Diagnostics keeps
+the evidence needed to explain why the correction was accepted.
 
 ## Nyaa ranking and automatic episode runs
 
@@ -77,7 +81,8 @@ Accent selection is:
 3. keep heiban `0`, or clamp a positive downstep to `len(morae(R))`;
 4. label the result `pitchDerived` when `R` differs from the dictionary reading.
 
-The derived branch is a display fallback, not a claim that every conjugation has an independently verified lexical accent. This distinction is retained in the DOM/CSS and can later be replaced by a morphological accent provider without changing the reader contract.
+A derived accent is a display fallback; it does not claim that the conjugated
+form has its own verified dictionary entry. The UI marks that distinction.
 
 ## LN/audiobook automatic linking
 

@@ -14,14 +14,14 @@ def test_renderer_keeps_explicit_pause_support_for_nonstandard_callers() -> None
     assert "speech_active:speechActive" in source
 
 
-def test_normal_playback_uses_linear_anchor_clock_without_fft_freeze() -> None:
+def test_normal_playback_uses_linear_anchor_clock_without_fft_micro_freezes() -> None:
     source = HTML.read_text(encoding="utf-8")
 
     assert "function lnPairedSpeechActive(anchor,time)" in source
     assert "speechActive=lnPairedSpeechActive(anchor,estimatedTime)" not in source
     assert "speechActive=lnPairedSpeechActive(anchor,position)" not in source
     assert (
-        "renderLnPairedPosition(state,estimatedOffset,{speechActive:true,previewOffset})"
+        "renderLnPairedPosition(renderState,estimatedOffset,{speechActive:true,previewOffset})"
         in source
     )
     assert (
