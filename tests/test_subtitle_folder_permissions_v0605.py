@@ -71,7 +71,7 @@ def test_local_search_ignores_unconfigured_downloads(tmp_path: Path):
     assert configured and configured[0].path.parent == downloads
 
 
-def test_permission_probe_includes_library_watched_and_subtitle_folders(monkeypatch, tmp_path: Path):
+def test_permission_preflight_is_not_repeated_after_first_run(monkeypatch, tmp_path: Path):
     library = tmp_path / "library"
     subtitles = tmp_path / "subs"
     library.mkdir()
@@ -97,7 +97,8 @@ def test_permission_probe_includes_library_watched_and_subtitle_folders(monkeypa
     result = api.request_permissions()
 
     assert result["ok"] is True
-    assert captured == [library, tmp_path / "Downloads-legacy", subtitles]
+    assert captured == []
+    assert result["folders"] == {}
 
 
 def test_web_ui_exposes_optional_subtitle_folder_and_requests_access_early():

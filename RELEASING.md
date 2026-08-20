@@ -1,5 +1,20 @@
 # Releasing Pudge
 
+The normal maintainer path is one command:
+
+```bash
+make release VERSION=0.7.21 PYTHON=.venv-test/bin/python
+```
+
+It fetches `origin/main` and tags, refuses a stale/diverged checkout, bumps the
+version, runs lint plus all four test batches, checks whitespace, stages all
+non-ignored project changes (including new docs), commits, pushes `main`, and
+creates/pushes the matching version tag. Existing tags are never moved.
+
+Use `make build-release` only when you explicitly want to build the release
+archive without committing/tagging.
+
+
 GitHub Releases are automated from version tags.
 
 ## 1. Update the version

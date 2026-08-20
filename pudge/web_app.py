@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -29,6 +30,7 @@ from .audiobooks import AUDIOBOOK_EXTENSIONS, AudiobookService
 from .backup import create_backup, restore_backup
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG
 from .config import load_config, write_config
+from .companion_streaming import CompanionStreamingService
 from .debug_snapshot import DebugSnapshotService
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
 from .episode_numbering import resolve_episode_numbering
@@ -60,6 +62,7 @@ from .providers.aria2 import Aria2Client
 from .providers.nyaa import NyaaClient
 from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
+from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
 from .updater import AppUpdater
 from .visual_novels import VisualNovelService
 
@@ -100,7 +103,16 @@ class WebAppApi:
             pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
             max_events_per_request=self.config.companion.max_events_per_request,
         )
+        self.companion_streaming = CompanionStreamingService(
+            self.manager.db,
+            cache_dir=self.config.paths.cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
+            ffprobe=self.config.tools.ffprobe,
+            logger=self.logger,
+        )
         self.companion_base_url = ""
+        self._companion_server: Any | None = None
+        self._companion_thread: threading.Thread | None = None
         self.job_center = JobCenter(self.manager.db)
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
@@ -277,14 +289,114 @@ class WebAppApi:
             aria2_stopped,
             cache_cleanup.get("removed_files", 0),
         )
+        self._stop_companion_server()
+        streaming = getattr(self, "companion_streaming", None)
+        if streaming is not None:
+            streaming.close()
         self.energy_monitor.stop()
         self.audiobooks.stop_all()
         self.visual_novels.stop()
 
+    @staticmethod
+    def _companion_lan_host() -> str:
+        candidates: list[str] = []
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect(("1.1.1.1", 80))
+                candidates.append(str(sock.getsockname()[0]))
+            finally:
+                sock.close()
+        except OSError:
+            pass
+        try:
+            candidates.extend(
+                str(item[4][0])
+                for item in socket.getaddrinfo(
+                    socket.gethostname(),
+                    None,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                )
+            )
+        except OSError:
+            pass
+        for host in candidates:
+            if host and host != "0.0.0.0" and not host.startswith("127."):
+                return host
+        return "127.0.0.1"
+
+    def _companion_effective_base_url(self) -> str:
+        server = getattr(self, "_companion_server", None)
+        if server is not None:
+            host, port = server.server_address
+            host = str(host)
+            if host in {"0.0.0.0", "::"}:
+                host = self._companion_lan_host()
+            return f"http://{host}:{int(port)}"
+        raw = str(self.companion_base_url or "")
+        if raw and "0.0.0.0" not in raw:
+            return raw
+        return ""
+
+    def _start_companion_server(self) -> None:
+        if self._companion_server is not None:
+            return
+        server, thread = start_mobile_sync_server(
+            self.mobile_sync,
+            host=self.config.companion.bind_host,
+            port=self.config.companion.port,
+            streaming=self.companion_streaming,
+            study_parser=self.light_novels.parse_study_text,
+            logger=self.logger,
+        )
+        self._companion_server = server
+        self._companion_thread = thread
+        host, port = server.server_address
+        self.companion_base_url = f"http://{host}:{int(port)}"
+
+    def _stop_companion_server(self) -> None:
+        server = getattr(self, "_companion_server", None)
+        self._companion_server = None
+        self._companion_thread = None
+        self.companion_base_url = ""
+        if server is None:
+            return
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+
+    def companion_enable_lan(self) -> dict[str, Any]:
+        cfg = self.config.companion
+        previous_enabled = bool(cfg.enabled)
+        previous_host = str(cfg.bind_host)
+        if self._companion_server is not None:
+            bound_host = str(self._companion_server.server_address[0])
+            if bound_host not in {"0.0.0.0", "::"}:
+                self._stop_companion_server()
+        cfg.enabled = True
+        cfg.bind_host = "0.0.0.0"
+        write_config(self.config, self.config_path)
+        try:
+            self._start_companion_server()
+        except OSError:
+            cfg.enabled = previous_enabled
+            cfg.bind_host = previous_host
+            write_config(self.config, self.config_path)
+            raise
+        return self.companion_status()
+
+    def companion_disable(self) -> dict[str, Any]:
+        self._stop_companion_server()
+        self.config.companion.enabled = False
+        write_config(self.config, self.config_path)
+        return self.companion_status()
+
     def companion_status(self) -> dict[str, Any]:
         return {
             "enabled": bool(self.config.companion.enabled),
-            "base_url": str(self.companion_base_url or ""),
+            "base_url": self._companion_effective_base_url(),
             "bind_host": str(self.config.companion.bind_host),
             "port": int(self.config.companion.port),
             "protocol": self.mobile_sync.protocol_info(),
@@ -292,8 +404,16 @@ class WebAppApi:
         }
 
     def companion_start_pairing(self) -> dict[str, Any]:
+        if not self.config.companion.enabled or self._companion_server is None:
+            self.companion_enable_lan()
         payload = self.mobile_sync.start_pairing()
-        payload["base_url"] = str(self.companion_base_url or "")
+        base_url = self._companion_effective_base_url()
+        payload["base_url"] = base_url
+        payload["companion_url"] = (
+            f"{base_url}/companion/?pair={quote(str(payload['pairing_token']))}"
+            if base_url
+            else ""
+        )
         return payload
 
     def companion_revoke_device(self, device_id: str) -> dict[str, Any]:
@@ -3153,6 +3273,7 @@ class WebAppApi:
 
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
+                directory=str(Path.home()),
                 allow_multiple=True,
                 file_types=("Manga archives (*.cbz;*.zip)",),
             )
@@ -3747,6 +3868,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             import webview
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
+                directory=str(Path.home()),
                 allow_multiple=True,
                 file_types=("Light novels (*.epub;*.txt)", "EPUB (*.epub)", "Text (*.txt)"),
             )
@@ -4927,6 +5049,67 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 return {"ok": True, "duplicate": True, **state}
             try:
                 episode = self.manager.db.episode_by_path(path)
+                explicit_library_embedded_sid = (
+                    int(episode.embedded_subtitle_id)
+                    if (
+                        episode is not None
+                        and allow_image_subtitles
+                        and episode.state == "waiting_text_subtitles"
+                        and episode.embedded_subtitle_id is not None
+                    )
+                    else None
+                )
+                legacy_bitmap_only = (
+                    episode is not None
+                    and episode.state == "waiting_text_subtitles"
+                    and episode.embedded_subtitle_id is not None
+                    and (
+                        episode.subtitle_path is None
+                        or not episode.subtitle_path.is_file()
+                    )
+                )
+                if episode is not None and not legacy_bitmap_only:
+                    selection = resolve_episode_subtitle(
+                        self.manager.db,
+                        video_path=path,
+                        media_id=episode.media_id,
+                        episode=episode.episode,
+                        stored_path=episode.subtitle_path,
+                        stored_embedded_id=episode.embedded_subtitle_id,
+                        stored_origin=episode.subtitle_origin,
+                        ffprobe=self.config.tools.ffprobe,
+                        ffmpeg=self.config.tools.ffmpeg,
+                        allow_bitmap=bool(allow_image_subtitles),
+                    )
+                    if selection.found:
+                        repaired = repair_episode_subtitle(
+                            self.manager.db,
+                            video_path=path,
+                            selection=selection,
+                        )
+                        episode.subtitle_path = selection.external_path
+                        episode.embedded_subtitle_id = (
+                            None if selection.external_path is not None
+                            else selection.embedded_subtitle_id
+                        )
+                        episode.subtitle_origin = selection.source or episode.subtitle_origin
+                        if repaired or selection.recovered:
+                            self.logger.info(
+                                "RESULT step=play.subtitle_recover video=%s source=%s reason=%s external=%s embedded_sid=%s",
+                                path.name,
+                                selection.source,
+                                selection.reason,
+                                bool(selection.external_path),
+                                selection.embedded_subtitle_id,
+                            )
+                    if (
+                        explicit_library_embedded_sid is not None
+                        and (
+                            episode.subtitle_path is None
+                            or not episode.subtitle_path.is_file()
+                        )
+                    ):
+                        episode.embedded_subtitle_id = explicit_library_embedded_sid
                 command = [
                     python_executable(),
                     "-m",
@@ -4967,6 +5150,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     ):
                         command.extend(
                             ["--embedded-sid", str(episode.embedded_subtitle_id)]
+                        )
+                    if (
+                        explicit_library_embedded_sid is not None
+                        and "--sub" not in command
+                        and "--embedded-sid" not in command
+                    ):
+                        command.extend(
+                            ["--embedded-sid", str(explicit_library_embedded_sid)]
                         )
                     if episode.episode is not None:
                         command.extend(["--episode-hint", str(episode.episode)])
@@ -5242,9 +5433,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {"ok": delivered, "delivered": delivered, "permission": permission}
 
     def request_permissions(self) -> dict[str, Any]:
-        """Probe configured folders on every launch; request notifications once."""
-        folder_paths = [self.config.library.root_dir, *self.config.paths.download_dirs, *self.config.paths.subtitle_dirs]
-        folders = request_folder_access(folder_paths)
+        """Request protected-folder/notification access only during first-run preflight."""
+        if self.config.ui.permissions_requested:
+            folders: dict[str, bool] = {}
+        else:
+            folder_paths = [
+                self.config.library.root_dir,
+                *self.config.paths.download_dirs,
+                *self.config.paths.subtitle_dirs,
+            ]
+            folders = request_folder_access(folder_paths)
         if self.config.ui.permissions_requested:
             notifications: dict[str, object] = {
                 "supported": True,
@@ -6144,8 +6342,12 @@ def launch_web_app(config_path: Path) -> int:
                 api.mobile_sync,
                 host=api.config.companion.bind_host,
                 port=api.config.companion.port,
+                streaming=api.companion_streaming,
+                study_parser=api.light_novels.parse_study_text,
                 logger=api.logger,
             )
+            api._companion_server = companion_server
+            api._companion_thread = _companion_thread
             companion_host, companion_port = companion_server.server_address
             api.companion_base_url = f"http://{companion_host}:{companion_port}"
             api.logger.info(

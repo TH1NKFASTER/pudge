@@ -279,6 +279,23 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]] && ! grep -Fq 'export PATH="$HOME/.local/bi
   printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$HOME/.zshrc"
 fi
 
+# Ordinary Python/web updates must not replace/re-sign the native launcher.
+# macOS Files & Folders permissions are tied to app code identity, so rebuilding
+# this tiny shell on every patch caused repeated Downloads-folder prompts.
+NATIVE_SHELL_REV=1
+NATIVE_SHELL_REV_FILE="$DATA_DIR/native-shell-rev"
+PRESERVE_NATIVE_APP=0
+if (( FAST_UPDATE )) && [[ "${PUDGE_FORCE_NATIVE_REBUILD:-0}" != "1" ]] \
+   && [[ -x "$APP_PATH/Contents/MacOS/$APP_NAME" ]] \
+   && [[ -f "$APP_PATH/Contents/Info.plist" ]]; then
+  EXISTING_SHELL_REV="$(cat "$NATIVE_SHELL_REV_FILE" 2>/dev/null || echo "$NATIVE_SHELL_REV")"
+  if [[ "$EXISTING_SHELL_REV" == "$NATIVE_SHELL_REV" ]]; then
+    PRESERVE_NATIVE_APP=1
+    echo "Fast update: preserving native app identity and existing macOS folder grants."
+  fi
+fi
+
+if (( ! PRESERVE_NATIVE_APP )); then
 # Build a tiny native app bundle that always runs the managed venv package.
 # The .app contains no frozen copy of Pudge, Python stdlib, or third-party
 # packages; after an update, the newly installed wheel is the code the GUI runs.
@@ -605,6 +622,8 @@ if ! /bin/mv "$NEW_APP" "$APP_PATH"; then
 fi
 
 codesign --force --deep --sign - "$APP_PATH" >/dev/null 2>&1 || true
+fi
+printf '%s\n' "$NATIVE_SHELL_REV" > "$NATIVE_SHELL_REV_FILE"
 
 cat > "$AGENT_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

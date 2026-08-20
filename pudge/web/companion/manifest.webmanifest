@@ -1,0 +1,17 @@
+{
+  "name": "Pudge",
+  "short_name": "Pudge",
+  "start_url": "/companion/",
+  "scope": "/companion/",
+  "display": "standalone",
+  "background_color": "#0b1320",
+  "theme_color": "#0b1320",
+  "icons": [
+    {
+      "src": "/companion/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

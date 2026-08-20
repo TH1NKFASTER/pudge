@@ -313,6 +313,16 @@ def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 
+def _load_subtitle_dirs(paths: dict[str, Any]) -> list[Path]:
+    """Load explicit subtitle folders without reviving the old implicit Downloads default."""
+    explicit = paths.get("subtitle_dirs")
+    if explicit is not None:
+        return [_expand_path(p) for p in explicit]
+    legacy = [_expand_path(p) for p in paths.get("download_dirs", [])]
+    implicit_downloads = _expand_path(Path.home() / "Downloads")
+    return [path for path in legacy if path != implicit_downloads]
+
+
 def _load_watched_media_dirs(paths: dict[str, Any]) -> list[Path]:
     """Load explicit media-watch folders without reviving legacy subtitle dirs.
 
@@ -378,17 +388,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         paths=PathsConfig(
             download_dirs=_load_watched_media_dirs(paths),
-            subtitle_dirs=[
-                _expand_path(p)
-                for p in paths.get(
-                    "subtitle_dirs",
-                    # Pre-v0.6.37 installations used download_dirs as the
-                    # external subtitle inbox. Preserve that migration, but do
-                    # not silently turn the same legacy value into a watched
-                    # media folder.
-                    paths.get("download_dirs", []),
-                )
-            ],
+            subtitle_dirs=_load_subtitle_dirs(paths),
             cache_dir=_expand_path(paths.get("cache_dir", DEFAULT_CACHE_DIR)),
             max_scanned_files=int(paths.get("max_scanned_files", 8000)),
         ),

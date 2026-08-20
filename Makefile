@@ -1,7 +1,7 @@
 PYTHON ?= python3
 BATCHES ?= 4
 
-.PHONY: install-dev test test-batches lint bump release clean
+.PHONY: install-dev test test-batches lint bump release build-release clean
 
 install-dev:
 	$(PYTHON) -m pip install -e ".[dev,sync]"
@@ -30,6 +30,10 @@ lint:
 	find pudge/web -type f -name '*.js' -print0 | xargs -0 -n1 node --check
 
 release:
+	@test -n "$(VERSION)" || (echo "Usage: make release VERSION=0.7.21" && exit 2)
+	$(PYTHON) scripts/release.py "$(VERSION)" --python "$(PYTHON)"
+
+build-release:
 	./build_release.sh
 
 clean:

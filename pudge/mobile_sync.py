@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mimetypes
+import re
 import secrets
 import sqlite3
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable
 
 from .database import Database
@@ -327,11 +331,21 @@ class MobileSyncService:
             FROM manga_books ORDER BY id
             """
         ).fetchall()
+        from .manga import _manga_series_key, _manga_series_title, _manga_volume
+
         entities: list[LocalSyncEntity] = []
         for row in rows:
             book_id = int(row["id"])
             page_count = max(0, int(row["page_count"] or 0))
             page_index = _clamp_int(row["position"], 0, max(0, page_count - 1))
+            raw_title = str(row["title"] or Path(str(row["path"] or "")).stem)
+            volume = _manga_volume(raw_title)
+            series_title = _manga_series_title(raw_title) or raw_title
+            series_key = (
+                f"anilist:{int(row['anilist_id'])}"
+                if row["anilist_id"] is not None
+                else f"title:{_manga_series_key(raw_title)}"
+            )
             external = (
                 f"anilist:{int(row['anilist_id'])}:manga"
                 if row["anilist_id"] is not None
@@ -346,6 +360,9 @@ class MobileSyncService:
                     metadata={
                         "book_id": book_id,
                         "anilist_id": row["anilist_id"],
+                        "volume": volume,
+                        "series_title": series_title,
+                        "series_key": series_key,
                         "page_count": page_count,
                         "reading_direction": str(row["reading_direction"] or "rtl"),
                         "cover_url": str(row["cover_url"] or ""),
@@ -376,10 +393,15 @@ class MobileSyncService:
             ORDER BY b.id
             """
         ).fetchall()
+        from .light_novels import _series_key as _ln_series_key, _series_title as _ln_series_title
+
         entities: list[LocalSyncEntity] = []
         for row in rows:
             book_id = int(row["id"])
             chapter_index = max(0, int(row["current_chapter"] or 0))
+            raw_title = str(row["title"] or "")
+            series_title = _ln_series_title(raw_title) or raw_title
+            series_key = (f"anilist:{int(row['anilist_id'])}" if row["anilist_id"] is not None else f"title:{_ln_series_key(raw_title)}")
             chapter_text = str(row["text"] or "")
             chapter_length = len(chapter_text)
             fraction = _clamp_float(row["current_offset"], 0.0, 1.0)
@@ -399,6 +421,8 @@ class MobileSyncService:
                         "book_id": book_id,
                         "anilist_id": row["anilist_id"],
                         "volume": row["volume"],
+                        "series_title": series_title,
+                        "series_key": series_key,
                         "cover_url": str(row["cover_url"] or ""),
                         "chapter_title": str(row["chapter_title"] or ""),
                     },
@@ -663,6 +687,157 @@ class MobileSyncService:
                 }
             )
         return relations
+
+    @staticmethod
+    def _companion_natural_key(value: str) -> list[object]:
+        return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", value)]
+
+    def _companion_entity(self, conn: sqlite3.Connection, entity_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT entity_id,kind,local_key FROM sync_entities WHERE entity_id=?",
+            (str(entity_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError("Unknown companion entity")
+        return row
+
+    def companion_content(self, entity_id: str, *, index: int | None = None) -> dict[str, Any]:
+        self.capture_local_changes()
+        with self.database.connect() as conn:
+            entity = self._companion_entity(conn, entity_id)
+            kind = str(entity["kind"])
+            local_key = str(entity["local_key"])
+
+            if kind == "light_novel":
+                book_id = int(local_key)
+                book = conn.execute(
+                    "SELECT current_chapter,current_offset FROM ln_books WHERE id=?",
+                    (book_id,),
+                ).fetchone()
+                if book is None:
+                    raise KeyError("Light novel is missing")
+                rows = conn.execute(
+                    "SELECT chapter_index,title,text,text_hash FROM ln_chapters WHERE book_id=? ORDER BY chapter_index",
+                    (book_id,),
+                ).fetchall()
+                if not rows:
+                    raise ValueError("Light novel has no readable chapters")
+                desired = int(book["current_chapter"] or 0) if index is None else int(index)
+                position = max(0, min(desired, len(rows) - 1))
+                chapter = rows[position]
+                actual_index = int(chapter["chapter_index"])
+                text = str(chapter["text"] or "")
+                fraction = float(book["current_offset"] or 0.0) if actual_index == int(book["current_chapter"] or 0) else 0.0
+                return {
+                    "supported": True,
+                    "kind": kind,
+                    "index": actual_index,
+                    "total_items": len(rows),
+                    "chapter_title": str(chapter["title"] or f"Chapter {actual_index + 1}"),
+                    "text": text,
+                    "chapter_length": len(text),
+                    "chapter_hash": str(chapter["text_hash"] or ""),
+                    "fraction": _clamp_float(fraction, 0.0, 1.0),
+                }
+
+            if kind == "manga":
+                book_id = int(local_key)
+                book = conn.execute(
+                    "SELECT path,page_count,position,reading_direction FROM manga_books WHERE id=?",
+                    (book_id,),
+                ).fetchone()
+                if book is None:
+                    raise KeyError("Manga is missing")
+                page_count = max(0, int(book["page_count"] or 0))
+                if page_count <= 0:
+                    raise ValueError("Manga has no pages")
+                selected = int(book["position"] or 0) if index is None else int(index)
+                selected = max(0, min(selected, page_count - 1))
+                return {
+                    "supported": True,
+                    "kind": kind,
+                    "index": selected,
+                    "total_items": page_count,
+                    "page_count": page_count,
+                    "reading_direction": str(book["reading_direction"] or "rtl"),
+                }
+
+            return {"supported": False, "kind": kind, "index": 0, "total_items": 1}
+
+    def companion_cover(self, entity_id: str) -> tuple[bytes, str, str]:
+        self.capture_local_changes()
+        with self.database.connect() as conn:
+            entity = self._companion_entity(conn, entity_id)
+            kind = str(entity["kind"])
+            if kind == "light_novel":
+                row = conn.execute("SELECT cover_url,file_path,file_type FROM ln_books WHERE id=?", (int(entity["local_key"]),)).fetchone()
+            elif kind == "manga":
+                row = conn.execute("SELECT cover_url,path AS file_path,'' AS file_type FROM manga_books WHERE id=?", (int(entity["local_key"]),)).fetchone()
+            else:
+                return b"", "application/octet-stream", ""
+        if row is None: raise KeyError("Content is missing")
+        cover_url = str(row["cover_url"] or "").strip()
+        if cover_url.startswith(("https://", "http://")): return b"", "application/octet-stream", cover_url
+        candidate = cover_url
+        if candidate.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+            candidate = unquote(urlparse(candidate).path)
+        if candidate:
+            path = Path(candidate).expanduser()
+            if path.is_file(): return path.read_bytes(), mimetypes.guess_type(path.name)[0] or "image/jpeg", ""
+        file_path = Path(str(row["file_path"] or "")).expanduser()
+        if kind == "light_novel" and str(row["file_type"] or "").casefold() == "epub" and file_path.is_file():
+            from .light_novels import _epub_metadata
+            _title, _chapters, cover = _epub_metadata(file_path)
+            if cover is not None:
+                raw, suffix = cover
+                return raw, mimetypes.guess_type("cover" + str(suffix or ".jpg"))[0] or "image/jpeg", ""
+        if kind == "manga" and file_path.is_file():
+            with zipfile.ZipFile(file_path) as archive:
+                pages = [
+                    item.filename
+                    for item in archive.infolist()
+                    if not item.is_dir()
+                    and Path(item.filename).suffix.casefold()
+                    in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+                ]
+                pages.sort(key=self._companion_natural_key)
+                if pages:
+                    name = pages[0]
+                    return archive.read(name), mimetypes.guess_type(name)[0] or "image/jpeg", ""
+        raise ValueError("Cover is unavailable")
+
+    def companion_manga_page(self, entity_id: str, *, page_index: int) -> tuple[bytes, str]:
+        self.capture_local_changes()
+        with self.database.connect() as conn:
+            entity = self._companion_entity(conn, entity_id)
+            if str(entity["kind"]) != "manga":
+                raise ValueError("Entity is not manga")
+            row = conn.execute(
+                "SELECT path FROM manga_books WHERE id=?",
+                (int(entity["local_key"]),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("Manga is missing")
+            path = Path(str(row["path"])).expanduser()
+
+        if not path.is_file():
+            raise ValueError("Manga archive is missing")
+        with zipfile.ZipFile(path) as archive:
+            names = [
+                item.filename
+                for item in archive.infolist()
+                if not item.is_dir()
+                and Path(item.filename).suffix.casefold()
+                in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+            ]
+            names.sort(key=self._companion_natural_key)
+            if not names:
+                raise ValueError("Manga archive has no image pages")
+            selected = max(0, min(int(page_index), len(names) - 1))
+            name = names[selected]
+            body = archive.read(name)
+        return body, mimetypes.guess_type(name)[0] or "application/octet-stream"
 
     def changes(self, *, cursor: int = 0, limit: int = 200) -> dict[str, Any]:
         self.capture_local_changes()

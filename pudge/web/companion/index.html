@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1320">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Pudge">
+  <title>Pudge</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="./styles.css?v=13">
+</head>
+<body>
+  <header class="topbar" id="mainTopbar">
+    <div><strong class="brand">Pudge</strong><span id="connectionState">Connecting…</span></div>
+    <button type="button" id="refreshButton" hidden>Refresh</button>
+  </header>
+  <main>
+    <section class="pair-card" id="pairView" hidden>
+      <div class="logo">P</div>
+      <h1>Connect to Pudge</h1>
+      <p>On your Mac open Pudge → Settings → Advanced → iPhone and choose Pair iPhone.</p>
+      <form id="pairForm">
+        <input id="pairToken" autocomplete="one-time-code" placeholder="Pairing code" spellcheck="false">
+        <button class="primary" type="submit">Connect</button>
+      </form>
+      <p class="error" id="pairError" hidden></p>
+    </section>
+    <section id="libraryView" hidden>
+      <div class="library-head">
+        <div><h1>Your library</h1><p id="librarySummary"></p></div>
+        <input id="librarySearch" type="search" placeholder="Search">
+      </div>
+      <nav class="tabs" id="libraryTabs">
+        <button class="active" data-kind="all">All</button>
+        <button data-kind="continue">Continue</button>
+        <button data-kind="anime_episode">Anime</button>
+        <button data-kind="manga">Manga</button>
+        <button data-kind="light_novel">LN</button>
+        <button data-kind="audiobook">Audio</button>
+      </nav>
+      <div class="grid" id="libraryGrid"></div>
+      <div class="empty" id="libraryEmpty" hidden>Nothing here yet.</div>
+    </section>
+    <section class="series-view" id="seriesView" hidden>
+      <div class="series-toolbar"><button type="button" id="seriesBack">‹ Library</button><strong id="seriesKind">Series</strong><span></span></div>
+      <div class="series-scroll">
+        <section class="series-hero"><div class="series-cover-wrap"><img id="seriesCover" class="series-cover" alt="" hidden><div id="seriesCoverPlaceholder" class="series-cover placeholder">L</div></div><div class="series-copy"><span class="eyebrow">LIGHT NOVEL</span><h1 id="seriesTitle"></h1><p id="seriesMeta"></p><button type="button" class="primary" id="seriesContinue" hidden>Continue</button></div></section>
+        <section class="series-volumes"><h2 id="seriesItemsHeading">Items</h2><div class="volume-grid" id="volumeGrid"></div></section>
+      </div>
+    </section>
+
+    <section class="anime-player-view" id="animePlayerView" hidden>
+      <div class="anime-player-toolbar">
+        <button type="button" id="animePlayerBack">‹ Library</button>
+        <div class="anime-player-heading"><strong id="animePlayerTitle"></strong><span id="animePlayerSubtitle"></span></div>
+        <div class="anime-player-nav"><button type="button" id="animePrevEpisode">‹</button><button type="button" id="animeNextEpisode">›</button></div>
+      </div>
+      <div class="anime-player-scroll">
+        <div class="anime-video-stage">
+          <video id="animeVideo" controls playsinline preload="metadata"></video>
+          <div id="animeSubtitleOverlay" class="anime-subtitle-overlay" hidden aria-live="polite"></div>
+          <div id="animeStreamStatus" class="anime-stream-status">Preparing stream on Mac…</div>
+        </div>
+        <div class="anime-quick-controls">
+          <button type="button" id="animeBack10">−10s</button>
+          <button type="button" id="animeForward10">+10s</button>
+          <label class="anime-speed-label">Speed <select id="animeSpeed"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+          <button type="button" id="animeSubtitleToggle" class="active">字幕</button>
+        </div>
+        <div class="anime-subtitle-controls">
+          <div class="anime-subtitle-control-group">
+            <span>Sync</span>
+            <button type="button" id="animeSubtitleOffsetMinus">−0.5s</button>
+            <button type="button" id="animeSubtitleOffsetValue" title="Reset subtitle sync">0.0s</button>
+            <button type="button" id="animeSubtitleOffsetPlus">+0.5s</button>
+          </div>
+          <div class="anime-subtitle-control-group">
+            <span>Size</span>
+            <button type="button" id="animeSubtitleSizeMinus">A−</button>
+            <span id="animeSubtitleSizeValue">100%</span>
+            <button type="button" id="animeSubtitleSizePlus">A+</button>
+          </div>
+        </div>
+        <div class="anime-stream-meta"><span id="animeTranscodeInfo"></span><span id="animeSubtitleDiagnostic"></span></div>
+        <aside id="animeSubtitleStudySheet" class="anime-study-sheet" hidden>
+          <div class="anime-study-handle"></div>
+          <div class="anime-study-head">
+            <div><strong id="animeStudyWord"></strong><span id="animeStudyReading"></span></div>
+            <button type="button" id="animeSubtitleStudyClose" aria-label="Close">×</button>
+          </div>
+          <div class="anime-study-meta"><span id="animeStudyState"></span><span id="animeStudyPitch"></span></div>
+          <ol id="animeStudyMeanings" class="anime-study-meanings"></ol>
+          <div class="anime-study-actions">
+            <button type="button" id="animeStudyCopyWord">Copy word</button>
+            <button type="button" id="animeStudyCopyLine">Copy line</button>
+            <button type="button" id="animeStudyReplayLine">Replay line</button>
+            <button type="button" id="animeStudyResume" class="primary">Resume</button>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="reader" id="readerView" hidden>
+      <div class="reader-toolbar">
+        <button type="button" id="readerBack">‹ Library</button>
+        <div class="reader-heading">
+          <strong id="readerTitle"></strong>
+          <span id="readerSubtitle"></span>
+        </div>
+        <div class="reader-nav">
+          <button type="button" id="readerPrev">‹</button>
+          <button type="button" id="readerNext">›</button>
+        </div>
+      </div>
+      <div class="reader-scroll" id="readerScroll">
+        <article class="ln-reader-text" id="lnReaderText" hidden></article>
+        <div class="manga-reader-page" id="mangaReaderPage" hidden><img id="mangaReaderImage" alt=""></div>
+        <div class="unsupported" id="readerUnsupported" hidden></div>
+      </div>
+    </section>
+  </main>
+  <footer id="mainFooter">
+    <span id="storageSummary">Media downloads only on request.</span>
+    <button id="forgetDevice" hidden>Forget this iPhone</button>
+  </footer>
+  <script src="./app.js?v=13" defer></script>
+</body>
+</html>

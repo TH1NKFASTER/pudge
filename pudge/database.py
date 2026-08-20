@@ -1337,13 +1337,21 @@ class Database:
                 """
                 UPDATE episodes
                 SET state=CASE
-                        WHEN subtitle_path IS NOT NULL OR embedded_subtitle_id IS NOT NULL THEN 'ready'
-                        ELSE 'local'
+                        WHEN state='watched' OR watched_at IS NOT NULL THEN
+                            CASE
+                                WHEN subtitle_path IS NOT NULL OR embedded_subtitle_id IS NOT NULL THEN 'ready'
+                                ELSE 'local'
+                            END
+                        ELSE state
                     END,
                     watched_at=NULL,delete_after=NULL,
                     playback_position=NULL,playback_duration=NULL,playback_updated_at=NULL,
                     playback_active_seconds=0,updated_at=?
-                WHERE media_id=? AND (state='watched' OR watched_at IS NOT NULL)
+                WHERE media_id=? AND (
+                    state='watched' OR watched_at IS NOT NULL OR delete_after IS NOT NULL
+                    OR playback_position IS NOT NULL OR playback_duration IS NOT NULL
+                    OR playback_updated_at IS NOT NULL OR playback_active_seconds>0
+                )
                 """,
                 (now, int(media_id)),
             )
