@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.7.24
+
+- Added global local-media search, recently watched history, and sidebar context
+  actions for subtitle discovery, AniList refresh, local rescans, and new releases.
+- Improved subtitle synchronization around pre-opening discontinuities by using
+  embedded dialogue references without disturbing the stable main-episode timeline.
+- Reworked Manga and Light Novel libraries around series-level selection, context
+  actions, Jiten metadata, AniList scores, recursive Manga imports, and cleaner cards.
+- Added robust Manga volume normalization and physical-spread handling, including
+  nested Manga-Zip layouts and preserved page names for future imports.
+- Made Manga reading progress explicit: preloading no longer marks pages read,
+  forward page turns do, the final page completes on display, and progress tooltips
+  show read pages out of total pages.
+- Stabilized Manga library rendering and series scrolling, and clear Manga/LN
+  selections automatically when leaving their page.
+- Simplified Light Novel preparation to always parse the current and next chapter,
+  and enabled low-overhead macOS energy diagnostics automatically at a 30-second
+  sampling interval.
+- Reconciled managed local anime behind AniList progress so already-watched episodes
+  do not remain incorrectly ready for playback.
+
 ## v0.7.23
 
 - Matched Ready and Continue Watching with AniList progress, so episodes already

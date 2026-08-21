@@ -40,6 +40,9 @@ def _natural_key(value: str) -> list[object]:
 
 def _strip_manga_release_metadata(value: str) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    # pudge-v0.7.23-nested-manga-import-v1
+    # Common raw-manga mirrors prefix every folder with their site name.
+    text = re.sub(r"(?i)^Mang-Zip\.info(?:[_\s-]+)?", "", text).strip()
     # Square-bracket groups at filename edges are release-group metadata in
     # manga archives, e.g. "[Group] Title 2" or "Title 2 [aKraa]". Strip
     # repeatedly so they cannot hide a bare trailing volume number.
@@ -378,13 +381,14 @@ class MangaService:
             if match is None:
                 return False
             conn.execute(
-                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,mean_score=?,updated_at=? "
                 "WHERE id=?",
                 (
                     match["anilist_id"],
                     match["cover_url"],
                     match["site_url"],
                     match["user_score"],
+                    match["mean_score"],
                     time.time(),
                     int(book_id),
                 ),
@@ -404,13 +408,14 @@ class MangaService:
                 if sibling_key != key:
                     continue
                 conn.execute(
-                    "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                    "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,mean_score=?,updated_at=? "
                     "WHERE id=?",
                     (
                         row["anilist_id"],
                         row["cover_url"],
                         row["site_url"],
                         row["user_score"],
+                        row["mean_score"],
                         time.time(),
                         int(sibling["id"]),
                     ),
@@ -450,12 +455,13 @@ class MangaService:
                         continue
                     conn.execute(
                         "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,"
-                        "user_score=?,updated_at=? WHERE id=?",
+                        "user_score=?,mean_score=?,updated_at=? WHERE id=?",
                         (
                             donor["anilist_id"],
                             donor["cover_url"],
                             donor["site_url"],
                             donor["user_score"],
+                            donor["mean_score"],
                             now,
                             int(sibling["id"]),
                         ),
@@ -491,12 +497,124 @@ class MangaService:
         self._inherit_series_anilist(int(row["id"]))
         return self._payload(self._book(int(row["id"])))
 
-    def import_images(self, paths: list[Path]) -> dict[str, Any]:
+    @staticmethod
+    def discover_image_files(root: Path, *, limit: int = 50000) -> list[Path]:
+        """Find loose manga pages recursively without following unrelated files."""
+        source = Path(root).expanduser().resolve()
+        if not source.is_dir():
+            return []
+        found: list[Path] = []
+        try:
+            for item in source.rglob("*"):
+                if not item.is_file() or item.suffix.casefold() not in _IMAGE_EXTENSIONS:
+                    continue
+                found.append(item.resolve())
+                if len(found) >= max(1, int(limit)):
+                    break
+        except (OSError, PermissionError):
+            pass
+        return sorted(set(found), key=lambda path: _natural_key(str(path)))
+
+    @staticmethod
+    def _image_group_root(image: Path) -> Path:
+        """Choose the nearest explicit volume folder, otherwise the page folder."""
+        parent = image.parent
+        for candidate in (parent, *list(parent.parents)[:4]):
+            name = unicodedata.normalize("NFKC", candidate.name)
+            if re.search(r"(?i)(?:vol(?:ume)?|v)\s*[._ -]*\d{1,3}\s*[-–]\s*\d{1,3}", name):
+                continue
+            if (
+                re.search(r"(?i)(?:^|[\s._\-\[(])(?:vol(?:ume)?|v)\s*[._ -]*0*\d{1,3}(?:\.\d+)?(?:$|[\s._\-\])])", name)
+                or re.search(r"第\s*0*\d{1,3}(?:\.\d+)?\s*巻", name)
+                or re.search(r"(?:^|[\s._\-])0*\d{1,3}(?:\.\d+)?\s*巻(?:$|[\s._\-])", name)
+            ):
+                return candidate
+        return parent
+
+    @staticmethod
+    def _image_group_volume(group_root: Path) -> int | None:
+        direct = _manga_volume(group_root.name)
+        if direct is not None:
+            return direct
+        text = unicodedata.normalize("NFKC", group_root.name)
+        numbers = {int(match) for match in re.findall(r"(?<!\d)(\d{1,3})(?!\d)", text) if 0 < int(match) <= 300}
+        return next(iter(numbers)) if len(numbers) == 1 else None
+
+    @staticmethod
+    def _image_series_hint(value: str) -> str:
+        text = _strip_manga_release_metadata(value)
+        text = re.sub(
+            r"(?i)(?:^|[\s._\-\[(])(?:vol(?:ume)?|v)\s*[._ -]*0*\d{1,3}\s*[-–]\s*0*\d{1,3}(?:$|[\s._\-\])])",
+            " ", text,
+        )
+        text = re.sub(r"[\s._-]+$", "", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _image_series_candidate(group_root: Path) -> str:
+        candidate = _manga_series_title(_strip_manga_release_metadata(group_root.name)).strip()
+        if not candidate or candidate.isdigit():
+            return ""
+        return candidate
+
+    @staticmethod
+    def _canonical_image_series(group_roots: list[Path], *, source_root: Path | None = None) -> str:
+        counts: dict[str, int] = {}
+        for group_root in group_roots:
+            candidate = MangaService._image_series_candidate(group_root)
+            if candidate:
+                counts[candidate] = counts.get(candidate, 0) + 1
+        if counts:
+            candidate, count = max(counts.items(), key=lambda item: (item[1], len(item[0])))
+            if count >= 2:
+                return candidate
+        if source_root is not None:
+            hint = MangaService._image_series_hint(source_root.name)
+            if hint:
+                return hint
+        if counts:
+            return max(counts, key=lambda item: (counts[item], len(item)))
+        return ""
+
+    def import_image_groups(self, paths: list[Path], *, source_root: Path | None = None) -> list[dict[str, Any]]:
+        """Import loose pages as one volume per folder and one stable series."""
+        # pudge-v0.7.23-nested-manga-series-v2
+        unique = sorted(
+            {Path(path).expanduser().resolve() for path in paths if Path(path).expanduser().is_file() and Path(path).suffix.casefold() in _IMAGE_EXTENSIONS},
+            key=lambda path: _natural_key(str(path)),
+        )
+        if not unique:
+            raise ValueError("No readable image files were dropped")
+        groups: dict[Path, list[Path]] = {}
+        for image in unique:
+            groups.setdefault(self._image_group_root(image), []).append(image)
+        group_roots = sorted(groups, key=lambda path: _natural_key(str(path)))
+        canonical = self._canonical_image_series(
+            group_roots,
+            source_root=Path(source_root).expanduser().resolve() if source_root is not None else None,
+        )
+        japanese_series = bool(re.search(r"[ぁ-ゟ゠-ヿ一-鿿]", canonical))
+        books: list[dict[str, Any]] = []
+        used_volumes: set[int] = set()
+        for group_root in group_roots:
+            volume = self._image_group_volume(group_root)
+            if volume is not None and volume in used_volumes:
+                volume = None
+            if volume is not None:
+                used_volumes.add(volume)
+            if canonical and volume is not None:
+                title = f"{canonical} 第{volume:02d}巻" if japanese_series else f"{canonical} Vol. {volume}"
+            else:
+                title = _strip_manga_release_metadata(group_root.name) or group_root.name
+            books.append(self.import_images(groups[group_root], title=title))
+        return books
+
+    def import_images(self, paths: list[Path], *, title: str | None = None) -> dict[str, Any]:
         images = [Path(path).expanduser().resolve() for path in paths]
         images = [path for path in images if path.is_file() and path.suffix.casefold() in _IMAGE_EXTENSIONS]
         if not images:
             raise ValueError("No readable image files were dropped")
-        images.sort(key=lambda path: _natural_key(path.name))
+        images = sorted(set(images), key=lambda path: _natural_key(str(path)))
         signature_rows: list[str] = []
         for path in images:
             stat = path.stat()
@@ -504,14 +622,43 @@ class MangaService:
         digest = hashlib.sha1("|".join(signature_rows).encode("utf-8")).hexdigest()[:20]
         target_dir = self.cache_dir / "manga-imports"
         target_dir.mkdir(parents=True, exist_ok=True)
-        title = images[0].parent.name if len(images) > 1 else images[0].stem
-        safe_title = re.sub(r"[^\w .()\[\]-]+", "_", title, flags=re.UNICODE).strip() or "Dropped manga"
+        logical_title = _strip_manga_release_metadata(str(title or images[0].parent.name)) or str(title or images[0].parent.name)
+        safe_title = re.sub(r"[^\w .()\[\]-]+", "_", logical_title, flags=re.UNICODE).strip() or "Dropped manga"
         target = target_dir / f"{safe_title}-{digest}.cbz"
+        legacy_targets = sorted(
+            [candidate for candidate in target_dir.glob(f"*-{digest}.cbz") if candidate.resolve() != target.resolve()],
+            key=lambda path: _natural_key(path.name),
+        )
+        if not target.exists() and legacy_targets:
+            legacy = legacy_targets[0]
+            with self.db.connect() as conn:
+                legacy_row = conn.execute("SELECT id FROM manga_books WHERE path=?", (str(legacy.resolve()),)).fetchone()
+                target_row = conn.execute("SELECT id FROM manga_books WHERE path=?", (str(target.resolve()),)).fetchone()
+                if legacy_row is not None and target_row is None:
+                    legacy.replace(target)
+                    conn.execute(
+                        "UPDATE manga_books SET path=?,title=?,updated_at=? WHERE id=?",
+                        (str(target.resolve()), logical_title, time.time(), int(legacy_row["id"])),
+                    )
         if not target.is_file():
             with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                 for index, image in enumerate(images, 1):
-                    archive.write(image, arcname=f"{index:04d}{image.suffix.casefold()}")
-        return self.import_file(target)
+                    source_stem = re.sub(
+                        r"[^\w.\-]+",
+                        "_",
+                        image.stem,
+                        flags=re.UNICODE,
+                    ).strip("._")[:120] or f"page-{index:04d}"
+                    archive.write(
+                        image,
+                        arcname=f"{index:04d}__{source_stem}{image.suffix.casefold()}",
+                    )
+        book = self.import_file(target)
+        book_id = int(book["id"])
+        with self.db.connect() as conn:
+            conn.execute("UPDATE manga_books SET title=?,updated_at=? WHERE id=?", (logical_title, time.time(), book_id))
+        self._inherit_series_anilist(book_id)
+        return self._payload(self._book(book_id))
 
     def remove_books(self, book_ids: list[int]) -> int:
         ids = sorted({int(value) for value in book_ids if int(value) > 0})
@@ -648,10 +795,14 @@ class MangaService:
             "volume": _manga_volume(metadata_source) or 1,
             "page_count": int(row["page_count"] or 0),
             "position": int(row["position"] or 0),
+            # pudge-v0.7.23-manga-read-pages-v1
+            "read_pages": int(row["read_pages"] or 0),
             "reading_direction": str(row["reading_direction"] or "rtl"),
             "anilist_id": int(row["anilist_id"]) if row["anilist_id"] is not None else None,
             "site_url": str(row["site_url"] or ""),
             "user_score": float(row["user_score"]) if row["user_score"] is not None else None,
+            # pudge-v0.7.23-manga-mean-score-v1
+            "mean_score": float(row["mean_score"]) if row["mean_score"] is not None else None,
             "cover_url": cached_remote or local_cover,
             "remote_cover_url": remote_cover,
             "cover_source": "anilist_cache" if cached_remote else "first_page",
@@ -666,16 +817,18 @@ class MangaService:
         cover_url: str = "",
         site_url: str = "",
         user_score: float | None = None,
+        mean_score: float | None = None,
     ) -> dict[str, Any]:
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,updated_at=? "
+                "UPDATE manga_books SET anilist_id=?,cover_url=?,site_url=?,user_score=?,mean_score=?,updated_at=? "
                 "WHERE id=?",
                 (
                     int(media_id),
                     str(cover_url or ""),
                     str(site_url or ""),
                     user_score,
+                    mean_score,
                     time.time(),
                     int(book_id),
                 ),
@@ -711,17 +864,25 @@ class MangaService:
             now = time.time()
             conn.executemany(
                 "UPDATE manga_books SET anilist_id=NULL,cover_url='',site_url='',"
-                "user_score=NULL,updated_at=? WHERE id=?",
+                "user_score=NULL,mean_score=NULL,updated_at=? WHERE id=?",
                 [(now, sibling_id) for sibling_id in ids],
             )
         return self._payload(self._book(int(book_id)))
 
     def set_score(self, book_id: int, score: float) -> dict[str, Any]:
+        row = self._book(int(book_id))
+        now = time.time()
         with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE manga_books SET user_score=?,updated_at=? WHERE id=?",
-                (float(score), time.time(), int(book_id)),
-            )
+            if row["anilist_id"] is not None:
+                conn.execute(
+                    "UPDATE manga_books SET user_score=?,updated_at=? WHERE anilist_id=?",
+                    (float(score), now, int(row["anilist_id"])),
+                )
+            else:
+                conn.execute(
+                    "UPDATE manga_books SET user_score=?,updated_at=? WHERE id=?",
+                    (float(score), now, int(book_id)),
+                )
         return self._payload(self._book(int(book_id)))
 
     def ocr_cache_status(self, book_id: int) -> dict[str, Any]:
@@ -742,6 +903,27 @@ class MangaService:
             "total_pages": total,
             "complete": bool(total > 0 and cached >= total),
         }
+
+    def set_mean_scores(self, scores: dict[int, float]) -> int:
+        # pudge-v0.7.23-manga-mean-score-backfill-v1
+        normalized = {
+            int(media_id): float(score)
+            for media_id, score in (scores or {}).items()
+            if int(media_id) > 0 and score is not None
+        }
+        if not normalized:
+            return 0
+        changed = 0
+        now = time.time()
+        with self.db.connect() as conn:
+            for media_id, score in normalized.items():
+                cursor = conn.execute(
+                    "UPDATE manga_books SET mean_score=?,updated_at=? "
+                    "WHERE anilist_id=? AND (mean_score IS NULL OR mean_score<>?)",
+                    (score, now, media_id, score),
+                )
+                changed += max(0, int(cursor.rowcount or 0))
+        return changed
 
     def state(self) -> dict[str, Any]:
         self._reconcile_series_anilist()
@@ -771,15 +953,32 @@ class MangaService:
         path = Path(str(row["path"]))
         pages = self._pages(path)
         index = max(0, min(int(page_index), len(pages) - 1))
+        # pudge-v0.7.23-manga-spread-detection-v1
+        page_name = pages[index]
         with zipfile.ZipFile(path) as archive:
-            data = archive.read(pages[index])
-        media_type = mimetypes.guess_type(pages[index])[0] or "image/jpeg"
-        self.set_position(book_id, index)
+            data = archive.read(page_name)
+        spread = False
+        range_match = re.search(
+            r"(?:^|[^0-9])(\d{1,4})\s*[-–—]\s*(\d{1,4})(?:[^0-9]|$)",
+            Path(page_name).stem,
+        )
+        if range_match:
+            spread = int(range_match.group(2)) == int(range_match.group(1)) + 1
+        if not spread:
+            try:
+                with Image.open(io.BytesIO(data)) as source_image:
+                    width, height = source_image.size
+                spread = bool(width > 0 and height > 0 and width >= height * 1.15)
+            except (OSError, ValueError):
+                spread = False
+        media_type = mimetypes.guess_type(page_name)[0] or "image/jpeg"
+        # Page fetch/preload is intentionally read-only for progress.
         return {
             "book_id": int(book_id),
             "page_index": index,
             "page_count": len(pages),
-            "name": pages[index],
+            "name": page_name,
+            "spread": spread,
             "data_uri": f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}",
         }
 
@@ -789,6 +988,23 @@ class MangaService:
                 "UPDATE manga_books SET position=?,updated_at=? WHERE id=?",
                 (max(0, int(page_index)), time.time(), int(book_id)),
             )
+
+    def mark_read(self, book_id: int, page_index: int) -> dict[str, Any]:
+        """Mark pages through page_index completed without ever regressing."""
+        row = self._book(int(book_id))
+        total = max(0, int(row["page_count"] or 0))
+        if total <= 0:
+            return self._payload(row)
+        target = max(0, min(total, int(page_index) + 1))
+        current = max(0, int(row["read_pages"] or 0))
+        if target <= current:
+            return self._payload(row)
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE manga_books SET read_pages=?,updated_at=? WHERE id=?",
+                (target, time.time(), int(book_id)),
+            )
+        return self._payload(self._book(int(book_id)))
 
     def _vision_text_regions(self, image: Image.Image) -> list[dict[str, Any]]:
         """Detect manga text geometry with several Vision-friendly image passes.

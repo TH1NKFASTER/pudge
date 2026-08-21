@@ -48,6 +48,9 @@ def test_audiobook_play_passes_speed_to_mpv(tmp_path: Path, monkeypatch) -> None
     source.write_bytes(b"audio")
     service = AudiobookService(db, ffprobe="ffprobe", mpv="mpv", cache_dir=tmp_path / "cache")
     monkeypatch.setattr(service, "_probe", lambda _path: (60.0, []))
+    # Import now starts background STT immediately. Keep this playback unit test
+    # deterministic and focused on the mpv command rather than racing STT Popen.
+    monkeypatch.setattr(service, "prepare_transcription", lambda _book_id: {"status": "disabled"})
     book = service.import_file(source)
     commands: list[list[str]] = []
 
@@ -59,7 +62,10 @@ def test_audiobook_play_passes_speed_to_mpv(tmp_path: Path, monkeypatch) -> None
     monkeypatch.setattr("pudge.audiobooks.threading.Thread", lambda **_kwargs: SimpleNamespace(start=lambda: None))
 
     service.play(book["id"], speed=1.5)
-    assert any(item == "--speed=1.500" for item in commands[0])
+    mpv_commands = [command for command in commands if "--no-video" in command]
+    assert len(mpv_commands) == 1
+    assert any(item == "--speed=1.500" for item in mpv_commands[0])
+    assert "--audio-pitch-correction=yes" in mpv_commands[0]
 
 
 def test_audiobook_ui_has_busy_state_speed_and_skip_controls() -> None:

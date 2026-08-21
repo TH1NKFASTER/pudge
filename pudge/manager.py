@@ -5647,6 +5647,52 @@ class AnimeManager:
             self.logger.info("SKIP step=cleanup.empty_folder path=%r error=%r", str(parent), exc)
             return False
 
+    def _reconcile_managed_episodes_behind_anilist_progress(self) -> int:
+        """Schedule managed rows that were recreated after they were already watched."""
+        now = time.time()
+        delay_seconds = max(
+            0.0,
+            float(self.config.agent.delete_after_watched_hours) * 3600.0,
+        )
+        # This is inferred cleanup evidence, not the real watch time. Keep it
+        # just outside the Recently watched TTL.
+        inferred_watched_at = now - delay_seconds - 1.0
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE episodes
+                SET state='watched',
+                    watched_at=?,
+                    delete_after=?,
+                    playback_position=NULL,
+                    playback_duration=NULL,
+                    playback_updated_at=NULL,
+                    playback_active_seconds=0,
+                    updated_at=?
+                WHERE media_id IS NOT NULL
+                  AND COALESCE(media_episode,episode) IS NOT NULL
+                  AND state NOT IN ('watched','dropped')
+                  AND watched_at IS NULL
+                  AND delete_after IS NULL
+                  AND (torrent_hash!='' OR downloaded_at IS NOT NULL)
+                  AND EXISTS (
+                      SELECT 1
+                      FROM anime
+                      WHERE anime.media_id=episodes.media_id
+                        AND anime.progress>COALESCE(episodes.media_episode,episodes.episode)
+                  )
+                """,
+                (inferred_watched_at, now, now),
+            )
+            changed = max(0, int(cursor.rowcount or 0))
+        if changed:
+            self.logger.info(
+                "REPAIR step=cleanup.managed_behind_progress rows=%s marker=%s",
+                changed,
+                "pudge-v0.7.23-managed-behind-progress-cleanup-v1",
+            )
+        return changed
+
     def cleanup(self) -> int:
         repaired = self.db.repair_missing_cleanup_schedule(
             self.config.agent.delete_after_watched_hours
@@ -5661,6 +5707,12 @@ class AnimeManager:
             self.logger.info(
                 "REPAIR step=cleanup.torrent_hash rows=%s",
                 hash_repairs,
+            )
+        progress_repairs = self._reconcile_managed_episodes_behind_anilist_progress()
+        if progress_repairs:
+            self.logger.info(
+                "REPAIR step=cleanup.anilist_progress rows=%s",
+                progress_repairs,
             )
         due = self.db.due_cleanup()
         watched_due = [row for row in due if str(row["state"] or "") == "watched"]

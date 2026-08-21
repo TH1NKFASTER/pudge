@@ -93,7 +93,7 @@ mpv_open_anilist = "Ctrl+b"
 mpv_correct_match = "c"
 
 [diagnostics]
-energy_monitoring_enabled = false
+energy_monitoring_enabled = true
 energy_sample_seconds = 30.0
 
 [companion]

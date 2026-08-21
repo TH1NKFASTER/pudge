@@ -179,8 +179,9 @@ def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
     key_block = html[html.index("document.addEventListener('keydown'"):]
     cmd_f = key_block[key_block.index("String(event.key||'').toLowerCase()==='f'"):][:650]
     assert "setPage('planned')" not in cmd_f
-    assert "ui.page==='settings'" in cmd_f
-    assert "ui.page==='planned'" in cmd_f
+    assert "openGlobalSearch()" in cmd_f
+    assert "ui.page==='settings'" not in cmd_f
+    assert "ui.page==='planned'" not in cmd_f
     for control in (
         'lnrFont', 'lnrFontSize', 'lnrTheme', 'lnrTextColor', 'lnrBgColor',
         'lnrWidth', 'lnrLineHeight', 'lnrIndent', 'lnrVertical', 'lnrMode',

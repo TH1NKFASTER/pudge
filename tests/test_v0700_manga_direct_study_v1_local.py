@@ -97,5 +97,6 @@ def test_manga_fullscreen_and_library_clicks_match_ln_style() -> None:
     # right-click menu model used by Light Novels.
     assert 'data-manga-v2-action="read" data-id="${id}"' in js
     assert 'data-manga-context-action="anilist"' in js
-    assert 'data-manga-context-action="score"' in js
+    assert 'data-manga-context-action="score-series"' in js
+    assert 'data-manga-context-action="score"' not in js
     assert 'data-manga-context-action="ocr-book"' in js

@@ -689,7 +689,7 @@ class LightNovelService:
                 self._study_trigger_codes(values.get("study_card_triggers", "MouseLeft"))
             ),
             custom_css=values.get("custom_css", ""),
-            parse_ahead=values.get("parse_ahead", "next") if values.get("parse_ahead", "next") in {"current", "next", "book"} else "next",
+            parse_ahead="next",  # automatic: current + next chapter
             auto_download_nyaa=values.get("auto_download_nyaa", "0") == "1",
             nyaa_category=values.get("nyaa_category", "3_3") or "3_3",
             reader_font=values.get("reader_font", "mincho") or "mincho",
@@ -774,7 +774,7 @@ class LightNovelService:
                 self._study_trigger_codes(values.get("study_card_triggers", current.study_card_triggers))
             ),
             "custom_css": str(values.get("custom_css", current.custom_css)),
-            "parse_ahead": str(values.get("parse_ahead", current.parse_ahead)).strip().lower(),
+            "parse_ahead": "next",
             "auto_download_nyaa": "1" if bool(values.get("auto_download_nyaa", current.auto_download_nyaa)) else "0",
             "nyaa_category": str(values.get("nyaa_category", current.nyaa_category)).strip() or "3_3",
             "reader_font": str(values.get("reader_font", current.reader_font)).strip() or "mincho",
@@ -2647,11 +2647,25 @@ class LightNovelService:
         return self.book(int(book_id))
 
     def set_score(self, book_id: int, score: float) -> dict[str, Any]:
+        # pudge-v0.7.23-ln-series-score-v1
+        now = time.time()
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE ln_books SET anilist_user_score=?,updated_at=? WHERE id=?",
-                (float(score), time.time(), int(book_id)),
-            )
+            row = conn.execute(
+                "SELECT anilist_id FROM ln_books WHERE id=?",
+                (int(book_id),),
+            ).fetchone()
+            if row is None:
+                raise LightNovelError(f"Unknown light novel id={book_id}")
+            if row["anilist_id"] is not None:
+                conn.execute(
+                    "UPDATE ln_books SET anilist_user_score=?,updated_at=? WHERE anilist_id=?",
+                    (float(score), now, int(row["anilist_id"])),
+                )
+            else:
+                conn.execute(
+                    "UPDATE ln_books SET anilist_user_score=?,updated_at=? WHERE id=?",
+                    (float(score), now, int(book_id)),
+                )
         return self.book(int(book_id))
 
     def _save_anilist_volume(self, media_id: int, progress_volumes: int, status: str | None = None) -> dict[str, Any]:

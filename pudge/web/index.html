@@ -26,6 +26,17 @@ button { border:1px solid var(--line); background:#1a2b42; color:var(--text); bo
 button:hover { background:#243a56; }
 button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
 button.ghost { background:transparent; }
+/* pudge-v0.7.23-destructive-red-v1: destructive actions are always red. */
+button.danger-action,button.selection-delete,button.uninstall-pudge {
+  background:rgba(255,107,125,.16);
+  border-color:var(--danger);
+  color:#ffd9df;
+}
+button.danger-action:hover,button.selection-delete:hover,button.uninstall-pudge:hover {
+  background:rgba(255,107,125,.28);
+  border-color:var(--danger);
+  color:#fff;
+}
 button:disabled { opacity:.62; cursor:default; }
 .play-button { min-width:108px; }
 .spinner { display:inline-block; width:13px; height:13px; margin-right:7px; border:2px solid rgba(255,255,255,.35); border-top-color:#fff; border-radius:50%; vertical-align:-2px; animation:spin .75s linear infinite; }
@@ -133,6 +144,14 @@ button:disabled { opacity:.62; cursor:default; }
 .planned-jiten { display:flex; flex-wrap:wrap; gap:5px; margin-top:auto; padding-top:9px; min-height:24px; }
 .planned-jiten button { display:flex; flex-wrap:wrap; gap:5px; align-items:center; width:max-content; max-width:100%; padding:0; border:0; background:transparent; text-align:left; }
 .planned-jiten-chip { padding:3px 7px; border:1px solid #334a69; border-radius:999px; color:#cbd9ec; font-size:10px; line-height:1.15; }
+/* pudge-v0.7.23-jiten-difficulty-colours-v1
+   Jiten palette: Beginner green-700/300, Easy green-500/200,
+   Average cyan-500/300, Hard amber-600/300, Expert/Insane red-600/300. */
+.planned-jiten-chip.difficulty-0{border-color:rgba(21,128,61,.8);background:rgba(21,128,61,.16);color:#86efac}
+.planned-jiten-chip.difficulty-1{border-color:rgba(34,197,94,.8);background:rgba(34,197,94,.16);color:#bbf7d0}
+.planned-jiten-chip.difficulty-2{border-color:rgba(6,182,212,.8);background:rgba(6,182,212,.16);color:#67e8f9}
+.planned-jiten-chip.difficulty-3{border-color:rgba(217,119,6,.8);background:rgba(217,119,6,.16);color:#fcd34d}
+.planned-jiten-chip.difficulty-4,.planned-jiten-chip.difficulty-5{border-color:rgba(220,38,38,.8);background:rgba(220,38,38,.16);color:#fca5a5}
 .planned-jiten-chip.known { border-color:rgba(87,211,140,.48); color:#a8e8c4; }
 .planned-jiten-loading { color:var(--muted); font-size:10px; }
 .app-update-state { margin-top:8px; min-height:18px; }
@@ -464,7 +483,30 @@ html.ui-inactive *::after { animation-play-state:paused !important; }
 .history-row strong,.upgrade-row strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .history-row span,.upgrade-row span { color:var(--muted); font-size:11px; overflow-wrap:anywhere; }
 
-.ln-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.ln-toolbar .spacer{flex:1}.ln-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(280px,100%),1fr));gap:12px;min-width:0;width:100%;max-width:100%;overflow-x:hidden;box-sizing:border-box}.ln-card{display:grid;grid-template-columns:76px minmax(0,1fr);gap:12px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.ln-card-cover[data-ln-anilist-url]:not([data-ln-anilist-url=""]){cursor:pointer}.ln-card-cover{width:76px;height:108px;border-radius:6px;object-fit:cover;background:#20334f}.ln-card-body{display:flex;min-width:0;flex-direction:column}.ln-card h3{margin:0 0 6px;font-size:15px}.ln-card-meta{display:flex;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin-bottom:8px}.ln-card-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}.ln-card-actions select{max-width:190px;background:#0f1b2a;color:var(--text);border:1px solid #334862;border-radius:7px;padding:7px}.ln-entry{cursor:pointer;transition:border-color .12s ease,box-shadow .12s ease,background .12s ease}.ln-entry:hover{border-color:#607c9f;box-shadow:0 0 0 1px rgba(133,171,216,.28);background:rgba(31,50,73,.82)}.ln-entry.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.42);background:rgba(65,87,145,.22)}.ln-entry.compact{grid-template-columns:54px minmax(0,1fr);min-width:0;width:100%;max-width:100%;box-sizing:border-box;overflow:hidden;padding:9px}.ln-entry.compact>*{min-width:0}.ln-entry.compact .ln-card-cover{width:54px;height:76px}.ln-context-hint{font-size:10px;margin-top:auto}.ln-grid>*{min-width:0}.ln-series-group{display:grid;gap:9px;min-width:0;width:100%;max-width:100%;box-sizing:border-box;overflow:hidden;padding:11px;border:1px solid var(--line);border-radius:11px;background:rgba(17,29,45,.66)}.ln-series-head{display:flex;gap:8px;min-width:0;align-items:flex-start;justify-content:space-between;min-height:28px}.ln-series-title-block{min-width:0;display:grid;gap:4px}.ln-series-title-block>strong{overflow-wrap:anywhere}.ln-series-head>.ln-series-count{color:var(--muted);font-size:11px;white-space:nowrap;padding-top:2px}.ln-series-head .planned-jiten{margin:0;padding-top:0;min-height:20px}.ln-series-books{display:grid;gap:7px;min-width:0;width:100%;max-width:100%;box-sizing:border-box}.ln-series-books.series-scroll{height:195px;overflow-y:auto;overflow-x:hidden;grid-auto-rows:max-content;align-content:start;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:3px;scroll-behavior:auto}.ln-series-books.series-scroll::-webkit-scrollbar{width:7px}.ln-series-books.series-scroll::-webkit-scrollbar-thumb{background:#334b69;border-radius:999px}.ln-series-books.series-scroll::-webkit-scrollbar-track{background:transparent}.ln-settings{margin-top:18px}.ln-settings textarea{min-height:120px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ln-reader-shell{position:fixed;z-index:9000;inset:0;background:var(--bg);display:none;grid-template-rows:auto 1fr}.ln-reader-shell.open{display:grid}.ln-reader-toolbar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:#0f1a29}.ln-reader-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ln-reader-toolbar .spacer{flex:1}.ln-reader-toolbar select{max-width:320px;background:#0f1b2a;color:var(--text);border:1px solid #334862;border-radius:7px;padding:7px}.ln-reader-scroll{overflow:auto;padding:42px 24px 100px}.ln-reader{font-family:"Hiragino Mincho ProN","Yu Mincho",serif;font-size:22px;line-height:1.9}.ln-reader p{margin:0 0 1.25em}.ln-word{cursor:pointer;border-radius:3px;padding:0 1px}.ln-word:hover{background:rgba(111,140,255,.18)}.ln-word.state-new{color:#f3f6fb}.ln-word.state-learning{color:#f4bd63}.ln-word.state-due{color:#ff7d8c}.ln-word.state-known{color:#57d38c}.ln-word.state-blacklisted{color:#7d8795}.ln-reader.hide-furigana rt{visibility:hidden}.ln-context-furigana rt{visibility:hidden}.ln-reader.furigana-hover .ln-word:hover ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-word-current ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-furigana-preview ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-furigana-linger ruby.ln-furigana-ruby>rt{visibility:visible!important}.ln-study-pop{position:fixed;z-index:9100;width:min(420px,calc(100vw - 24px));max-height:min(520px,calc(100vh - 24px));overflow:auto;padding:12px;border:1px solid #4b6482;border-radius:10px;background:#091321;box-shadow:0 16px 48px rgba(0,0,0,.55);display:none}.ln-study-pop.open{display:block}.ln-study-pop h3{margin:0 0 4px;font-size:20px}.ln-study-pop .reading{color:#b7c7dc}.ln-study-pop .meanings{margin:10px 0;display:grid;gap:6px}.ln-study-pop .actions{display:flex;gap:6px;flex-wrap:wrap}.ln-study-pop button{padding:6px 9px}.ln-nyaa-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--line)}.ln-nyaa-row .title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identity-title-link{display:block;min-width:0;padding:0;border:0;background:transparent;color:var(--text);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identity-title-link:hover{background:transparent;color:#a9bdff;text-decoration:underline}.ln-status{font-size:11px;color:var(--muted)}
+.ln-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}.ln-toolbar .spacer{flex:1}.ln-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(280px,100%),1fr));gap:12px;min-width:0;width:100%;max-width:100%;overflow-x:hidden;box-sizing:border-box}.ln-card{display:grid;grid-template-columns:76px minmax(0,1fr);gap:12px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}.ln-card-cover[data-ln-anilist-url]:not([data-ln-anilist-url=""]){cursor:pointer}.ln-card-cover{width:76px;height:108px;border-radius:6px;object-fit:cover;background:#20334f}.ln-card-body{display:flex;min-width:0;flex-direction:column}.ln-card h3{margin:0 0 6px;font-size:15px}.ln-card-meta{display:flex;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin-bottom:8px}.ln-card-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}.ln-card-actions select{max-width:190px;background:#0f1b2a;color:var(--text);border:1px solid #334862;border-radius:7px;padding:7px}.ln-entry{cursor:pointer;transition:border-color .12s ease,box-shadow .12s ease,background .12s ease}.ln-entry:hover{border-color:#607c9f;box-shadow:0 0 0 1px rgba(133,171,216,.28);background:rgba(31,50,73,.82)}.ln-entry.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.42);background:rgba(65,87,145,.22)}.ln-entry.compact{grid-template-columns:54px minmax(0,1fr);min-width:0;width:100%;max-width:100%;box-sizing:border-box;overflow:hidden;padding:9px}.ln-entry.compact>*{min-width:0}.ln-entry.compact .ln-card-cover{width:54px;height:76px}.ln-context-hint{font-size:10px;margin-top:auto}.ln-grid>*{min-width:0}.ln-series-group{display:grid;gap:9px;min-width:0;width:100%;max-width:100%;box-sizing:border-box;overflow:hidden;padding:11px;border:1px solid var(--line);border-radius:11px;background:rgba(17,29,45,.66)}/* pudge-v0.7.23-ln-manga-series-parity-score-v1 */
+.ln-series-group{transition:border-color .12s ease,box-shadow .12s ease,background .12s ease}
+.ln-series-group:hover:not(:has(.ln-entry:hover)){border-color:#607c9f;box-shadow:0 0 0 1px rgba(133,171,216,.28);background:rgba(31,50,73,.82)}
+.ln-series-head[data-ln-series-select],.ln-series-head[data-manga-series-select]{cursor:pointer}
+.ln-series-group.series-selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.42);background:rgba(65,87,145,.22)}
+.ln-series-group.series-partial{border-color:rgba(111,140,255,.62);box-shadow:0 0 0 1px rgba(111,140,255,.24)}
+.ln-series-stats{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-height:20px}/* pudge-v0.7.23-series-stats-width-v1 */
+.ln-series-title-block{flex:1 1 0;width:auto}
+.ln-series-head>.ln-series-count{flex:0 0 auto}
+.ln-series-stats{width:100%;min-width:0}
+.ln-series-stats>.anilist-score-chip{flex:0 0 auto}
+/* pudge-v0.7.23-series-stats-full-width-v2 */
+.ln-series-head{position:relative;display:block;min-width:0}
+.ln-series-title-block{display:block;width:100%;min-width:0}
+.ln-series-title-block>strong{display:block;box-sizing:border-box;padding-right:120px}
+.ln-series-head>.ln-series-count{position:absolute;right:0;top:0;z-index:1;white-space:nowrap}
+.ln-series-stats{display:flex;width:100%;max-width:none;min-width:0;box-sizing:border-box;align-items:center;gap:5px;flex-wrap:wrap;margin-top:5px}
+.ln-series-stats>.planned-jiten{flex:0 0 auto;width:max-content;max-width:none;min-height:0;margin-top:0;padding-top:0}
+.ln-series-stats>.planned-jiten button{width:max-content;max-width:none;flex-wrap:nowrap}
+.ln-series-stats>.anilist-score-chip{flex:0 0 auto}
+
+.anilist-score-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border:1px solid hsla(var(--score-hue),72%,48%,.78);border-radius:999px;background:hsla(var(--score-hue),72%,48%,.16);color:hsl(var(--score-hue),82%,78%);font-size:10px;line-height:1.15;font-weight:750;white-space:nowrap}
+.ln-card-meta>.anilist-score-chip{padding:2px 6px}
+.ln-series-head{display:flex;gap:8px;min-width:0;align-items:flex-start;justify-content:space-between;min-height:28px}.ln-series-title-block{min-width:0;display:grid;gap:4px}.ln-series-title-block>strong{overflow-wrap:anywhere}.ln-series-head>.ln-series-count{color:var(--muted);font-size:11px;white-space:nowrap;padding-top:2px}.ln-series-head .planned-jiten{margin:0;padding-top:0;min-height:20px}.ln-series-books{display:grid;gap:7px;min-width:0;width:100%;max-width:100%;box-sizing:border-box}.ln-series-books.series-scroll{height:195px;overflow-y:auto;overflow-x:hidden;grid-auto-rows:max-content;align-content:start;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:3px;scroll-behavior:auto}.ln-series-books.series-scroll::-webkit-scrollbar{width:7px}.ln-series-books.series-scroll::-webkit-scrollbar-thumb{background:#334b69;border-radius:999px}.ln-series-books.series-scroll::-webkit-scrollbar-track{background:transparent}.ln-settings{margin-top:18px}.ln-settings textarea{min-height:120px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ln-reader-shell{position:fixed;z-index:9000;inset:0;background:var(--bg);display:none;grid-template-rows:auto 1fr}.ln-reader-shell.open{display:grid}.ln-reader-toolbar{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:#0f1a29}.ln-reader-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ln-reader-toolbar .spacer{flex:1}.ln-reader-toolbar select{max-width:320px;background:#0f1b2a;color:var(--text);border:1px solid #334862;border-radius:7px;padding:7px}.ln-reader-scroll{overflow:auto;padding:42px 24px 100px}.ln-reader{font-family:"Hiragino Mincho ProN","Yu Mincho",serif;font-size:22px;line-height:1.9}.ln-reader p{margin:0 0 1.25em}.ln-word{cursor:pointer;border-radius:3px;padding:0 1px}.ln-word:hover{background:rgba(111,140,255,.18)}.ln-word.state-new{color:#f3f6fb}.ln-word.state-learning{color:#f4bd63}.ln-word.state-due{color:#ff7d8c}.ln-word.state-known{color:#57d38c}.ln-word.state-blacklisted{color:#7d8795}.ln-reader.hide-furigana rt{visibility:hidden}.ln-context-furigana rt{visibility:hidden}.ln-reader.furigana-hover .ln-word:hover ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-word-current ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-furigana-preview ruby.ln-furigana-ruby>rt,.ln-reader.furigana-reading .ln-word.ln-paired-furigana-linger ruby.ln-furigana-ruby>rt{visibility:visible!important}.ln-study-pop{position:fixed;z-index:9100;width:min(420px,calc(100vw - 24px));max-height:min(520px,calc(100vh - 24px));overflow:auto;padding:12px;border:1px solid #4b6482;border-radius:10px;background:#091321;box-shadow:0 16px 48px rgba(0,0,0,.55);display:none}.ln-study-pop.open{display:block}.ln-study-pop h3{margin:0 0 4px;font-size:20px}.ln-study-pop .reading{color:#b7c7dc}.ln-study-pop .meanings{margin:10px 0;display:grid;gap:6px}.ln-study-pop .actions{display:flex;gap:6px;flex-wrap:wrap}.ln-study-pop button{padding:6px 9px}.ln-nyaa-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--line)}.ln-nyaa-row .title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identity-title-link{display:block;min-width:0;padding:0;border:0;background:transparent;color:var(--text);text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.identity-title-link:hover{background:transparent;color:#a9bdff;text-decoration:underline}.ln-status{font-size:11px;color:var(--muted)}
 .ln-grid{grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr))}.ln-card h3{line-height:1.25;display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2}.ln-card-meta{gap:5px;font-size:10px;margin-bottom:6px}.ln-card-meta span{padding:2px 5px;border:1px solid rgba(110,137,172,.32);border-radius:999px}.ln-card-progress{height:4px;margin:2px 0 7px;border-radius:999px;overflow:hidden;background:#25364d}.ln-card-progress span{display:block;height:100%;background:var(--accent)}.ln-card-genres{display:flex;gap:5px;min-width:0;margin-bottom:6px;color:#b8c6d8;font-size:10px}.ln-card-genres span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ln-card .planned-jiten{margin:0;padding:0;min-height:0}.ln-card .planned-jiten>[data-tooltip]{display:flex;flex-wrap:wrap;gap:5px}.ln-card .planned-jiten-chip{font-size:9px}.ln-entry.compact h3{font-size:13px;-webkit-line-clamp:1}.ln-entry.compact .ln-card-meta{margin-bottom:4px}.ln-entry.compact .ln-card-genres{display:none}.ln-entry.compact .planned-jiten-chip:nth-child(n+3){display:none}.ln-reader-heading{display:flex;align-items:center;gap:7px;min-width:0;flex:0 1 520px}.ln-reader-heading strong{min-width:90px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ln-reader-heading select{max-width:220px}.ln-study-pop .meanings{margin:10px 0;padding-left:1.7em;display:grid;gap:7px}
 .ln-word.state-new{color:var(--pudge-study-new,#f3f6fb)}.ln-word.state-learning{color:var(--pudge-study-learning,#f4bd63)}.ln-word.state-due{color:var(--pudge-study-due,#ff7d8c)}.ln-word.state-known{color:var(--pudge-study-known,#57d38c)}.ln-word.state-blacklisted{color:var(--pudge-study-blacklisted,#7d8795)}
 :root[data-pudge-study-theme="focus"] .ln-word.state-known{color:inherit}:root[data-pudge-study-theme="focus"] .ln-word.state-blacklisted{color:inherit;opacity:.55}
@@ -906,11 +948,11 @@ function formatRemaining(sec){if(sec==null)return '';sec=Math.max(0,sec);const d
 function cover(anime,cls='',polychrome=false,linkUrl=''){const shell=cls.includes('airing')?'airing-cover-shell':'list-cover-shell';const content=anime.cover?`<img class="${cls}" src="${escapeHtml(anime.cover)}" draggable="false" alt="">`:`<div class="${cls.includes('airing')?'cover-placeholder':'list-cover-placeholder'}">${t('label.cover')}</div>`;const shellHtml=`<div class="cover-shell ${shell} ${polychrome?'polychrome':''}">${content}</div>`;return linkUrl?`<div class="cover-action" role="button" tabindex="0" data-action="url" data-url="${escapeHtml(linkUrl)}" aria-label="AniList">${shellHtml}</div>`:shellHtml;}
 function isWatchable(a){return !!(a.local&&a.local.state!=='watched'&&(a.local.subtitle_source==='embedded'||a.local.subtitle_source==='external'||a.local.state==='ready'));}
 function loadActivatedPage(page){if(page==='lightnovels')void loadLightNovels();else if(page==='manga')void (window.PudgeMangaReaderV2?.renderLibrary?.()||window.PudgeMedia?.loadManga?.());else if(page==='audiobooks')void window.PudgeMedia?.loadAudio?.();else if(page==='visualnovels')void window.PudgeVisualNovels?.load?.();}
-function setPage(page,force=false){if(!force&&ui.page===page)return false;ui.page=page;document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===page));document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('pageTitle').textContent=t(`nav.${page}`);const importButton=$('pageImportButton');if(importButton)importButton.hidden=!['lightnovels','manga','audiobooks'].includes(page);updatePageSelectionActions();updateCount();$('scroll').scrollTop=0;if(page==='current')queuePolychromeWake();if(ui.skipActivatedPageLoadOnce)ui.skipActivatedPageLoadOnce=false;else requestAnimationFrame(()=>loadActivatedPage(page));return true;}
+function setPage(page,force=false){if(!force&&ui.page===page)return false;const previousPage=ui.page;if(previousPage==='lightnovels'&&page!==previousPage)clearLnSelection();else if(previousPage==='manga'&&page!==previousPage)window.PudgeMangaReaderV2?.clearSelection?.();ui.page=page;document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===page));document.querySelectorAll('.nav button').forEach(x=>x.classList.toggle('active',x.dataset.page===page));$('pageTitle').textContent=t(`nav.${page}`);const importButton=$('pageImportButton');if(importButton)importButton.hidden=!['lightnovels','manga','audiobooks'].includes(page);updatePageSelectionActions();updateCount();$('scroll').scrollTop=0;if(page==='current')queuePolychromeWake();if(ui.skipActivatedPageLoadOnce)ui.skipActivatedPageLoadOnce=false;else requestAnimationFrame(()=>loadActivatedPage(page));return true;}
 function updateCount(){
   if(!ui.state)return;
   const home=ui.state.home||{};
-  const homeCount=['continue_watching','needs_action','new_ready','completed_ready','waiting','download_available','caught_up','dropped'].reduce((sum,key)=>sum+(home[key]||[]).reduce((inner,item)=>inner+(item.kind==='watch_sequence'?(item.items?.length||0):1),0),0);
+  const homeCount=['continue_watching','needs_action','new_ready','completed_ready','waiting','download_available','caught_up','recently_watched','dropped'].reduce((sum,key)=>sum+(home[key]||[]).reduce((inner,item)=>inner+(item.kind==='watch_sequence'?(item.items?.length||0):1),0),0);
   const counts={current:homeCount,planned:ui.plannedVisibleCount||0,lightnovels:(ui.lnState?.books||[]).length,manga:window.PudgeMedia?.counts?.manga||0,audiobooks:window.PudgeMedia?.counts?.audiobooks||0,visualnovels:'',diagnostics:'',settings:''};
   $('pageCount').textContent=counts[ui.page]===''?'':`${counts[ui.page]} ${t('label.items')}`;
 }
@@ -1165,7 +1207,7 @@ function animeCard(a,planned=false){
   const freshness=planned||unreleased?'':a.outdated?`<div class="danger">${t('label.outdated',{released:a.released_episodes,missing:a.missing_count})}</div>`:`<div class="good">${t('label.upToDate')}</div>`;
   const finalText=!planned&&a.is_final_episode?` • <span class="final-tag">${t('label.final')}</span>`:'';
   const airing=a.next_airing_episode?`<div class="subtle">${t('label.airingIn',{episode:a.next_airing_episode,time:formatRemaining(a.remaining_seconds)})}</div>`:'';
-  const score=a.mean_score!=null?` • ${t('label.rating')}: ${a.mean_score}`:'';const status=a.media_status?` • ${escapeHtml(a.media_status)}`:'';
+  const score=a.mean_score!=null?` ${anilistScoreChip(a.mean_score,'percent')}`:'';const status=a.media_status?` • ${escapeHtml(a.media_status)}`:'';
   const progress=unreleased?'':`<div class="meta">${t('label.watched')}: ${a.progress} / ${total}${score}${status}</div>`;
   const studio=planned&&a.studio?`<div class="meta planned-studio">${t('label.studio',{studio:escapeHtml(a.studio)})}</div>`:'';
   const jiten=planned?planningJitenShell(a):'';
@@ -1247,6 +1289,14 @@ function continueHomeCard(a){
   const state=a.is_movie?t('label.continueMovie',{time:formatClock(a.resume_start)}):t('label.continueEpisode',{episode,time:formatClock(a.resume_start)});
   return `<article class="airing-card downloaded-card" data-continue-card="1" data-media-id="${a.media_id??''}" data-site-url="${escapeHtml(a.site_url||(a.media_id?`https://anilist.co/anime/${a.media_id}`:''))}" data-media-status="${escapeHtml(a.media_status||'')}" data-title="${escapeHtml(a.title)}" data-path="${escapeHtml(a.video_path)}" data-play-path="${escapeHtml(a.video_path)}" data-starting-label="${t('action.starting')}" data-running-label="${t('action.running')}">${cover(a,'airing-cover',true)}<div class="airing-meta"><strong data-full-title="${escapeHtml(a.title)}" title="${escapeHtml(a.title)}">${escapeHtml(a.title)}</strong><span class="airing-state">${state}</span>${progress}</div></article>`;
 }
+function recentlyWatchedHomeCard(a){
+  const episode=a.episode??'?';
+  const progress=a.progress_percent==null?'':`<div class="resume-progress"><span style="width:${Math.max(0,Math.min(100,a.progress_percent))}%"></span></div>`;
+  const state=a.is_movie
+    ?(ui.lang==='ru'?'Недавно просмотрено':'Recently watched')
+    :(ui.lang==='ru'?`Серия ${episode} · недавно просмотрена`:`Episode ${episode} · recently watched`);
+  return `<article class="airing-card downloaded-card recently-watched-card" data-continue-card="1" data-media-id="${a.media_id??''}" data-site-url="${escapeHtml(a.site_url||(a.media_id?`https://anilist.co/anime/${a.media_id}`:''))}" data-media-status="${escapeHtml(a.media_status||'')}" data-title="${escapeHtml(a.title)}" data-path="${escapeHtml(a.video_path)}" data-play-path="${escapeHtml(a.video_path)}" data-starting-label="${t('action.starting')}" data-running-label="${t('action.running')}">${cover(a,'airing-cover',true)}<div class="airing-meta"><strong data-full-title="${escapeHtml(a.title)}" title="${escapeHtml(a.title)}">${escapeHtml(a.title)}</strong><span class="airing-state">${state}</span>${progress}</div></article>`;
+}
 function validEpisodeNumber(value){
   if(value===null||value===undefined||value==='')return null;
   const number=Number(value);
@@ -1284,7 +1334,7 @@ function homeSection(titleKey,items,renderer,extraClass=''){
   return items.length?`<section class="home-section ${extraClass}"><h2 class="section-title">${t(titleKey)}</h2><div class="airing-grid">${items.map(renderer).join('')}</div></section>`:'';
 }
 function renderCurrent(){
-  const home=ui.state.home||{continue_watching:[],needs_action:[],new_ready:[],completed_ready:[],waiting:[],download_available:[],caught_up:[],dropped:[]};
+  const home=ui.state.home||{continue_watching:[],needs_action:[],new_ready:[],completed_ready:[],waiting:[],download_available:[],caught_up:[],recently_watched:[],dropped:[]};
   const readySections=[
     homeSection('section.newReady',home.new_ready||[],readyHomeRenderer,'ready-section'),
     homeSection('section.completedReady',home.completed_ready||[],readyHomeRenderer,'ready-section completed-ready-section'),
@@ -1295,6 +1345,7 @@ function renderCurrent(){
     +homeSection('section.waitingPreparation',home.waiting||[],waitingHomeCard)
     +homeSection('section.availableDownload',home.download_available||[],downloadAvailableHomeCard)
     +homeSection('section.caughtUp',home.caught_up||[],caughtUpHomeCard,'caught-up-section')
+    +homeSection(ui.lang==='ru'?'Недавно просмотренные':'Recently watched',home.recently_watched||[],recentlyWatchedHomeCard,'recently-watched-section')
     +homeSection('section.dropped',home.dropped||[],droppedHomeCard);
   $('currentContent').innerHTML=html||`<div class="empty">${t('label.noHomeItems')}</div>`;applyOverflowTitleTooltips($('currentContent'));
 }
@@ -1307,6 +1358,42 @@ function plannedKey(a){return `${a.media_kind||'anime'}:${a.media_id}`;}
 let plannedJitenObserver=null,plannedJitenRunning=false;
 const plannedJitenCache=new Map(),plannedJitenQueue=[];
 function planningUsesJiten(){return ['difficulty','characters','comprehension','uniqueWords'].includes($('plannedSort')?.value)||[$('plannedDifficultyFilter')?.value,$('plannedLengthFilter')?.value,$('plannedKnownFilter')?.value].some(value=>value&&value!=='all');}
+function normalizeAniListScore(value,scale='auto'){
+  const raw=Number(value);
+  if(!Number.isFinite(raw)||raw<=0)return null;
+  const score=scale==='percent'?raw/10:scale==='ten'?raw:(raw>10?raw/10:raw);
+  return Math.max(0,Math.min(10,score));
+}
+function anilistScoreEmoji(value,scale='auto'){
+  const score=normalizeAniListScore(value,scale);
+  if(score==null)return '';
+  // pudge-v0.7.23-popular-score-distribution-v1
+  // Real AniList top-5000/category data (2026-08-21), equal-category
+  // weighted over scored Anime/Manga/LN: sextiles 6.1/6.6/6.9/7.3/7.7.
+  if(score>=8.0)return '🤩';
+  if(score>=7.5)return '😊';
+  if(score>=6.8)return '🙂';
+  if(score>=6.1)return '😐';
+  if(score>=5.4)return '🙁';
+  return '😞';
+}
+function anilistScoreText(value,scale='auto'){
+  const score=normalizeAniListScore(value,scale);
+  return score==null?'':`${score.toFixed(1)} ${anilistScoreEmoji(score,'ten')}`;
+}
+function anilistScoreChip(value,scale='auto'){
+  const score=normalizeAniListScore(value,scale);
+  if(score==null)return '';
+  const hue=Math.round(Math.max(0,Math.min(120,(score-5.4)/(8.4-5.4)*120)));
+  return `<span class="anilist-score-chip" style="--score-hue:${hue}">${score.toFixed(1)} ${anilistScoreEmoji(score,'ten')}</span>`;
+}
+window.PudgeAniListScore={normalize:normalizeAniListScore,text:anilistScoreText,chip:anilistScoreChip,emoji:anilistScoreEmoji};
+function jitenDifficultyClass(value){
+  const numeric=Number(value);
+  if(!Number.isFinite(numeric))return '';
+  const index=Math.min(5,Math.max(0,Math.floor(numeric)));
+  return `difficulty-${index}`;
+}
 function updatePlanningJitenLoading(){const node=$('plannedJitenLoading');if(!node)return;const remaining=plannedItems().filter(item=>String(item.media_status||'').trim().toUpperCase()==='FINISHED'&&!plannedJitenCache.has(plannedKey(item))).length;node.hidden=!planningUsesJiten()||remaining===0;node.textContent=ui.lang==='ru'?`Загружаю Jiten: ${remaining}`:`Loading Jiten: ${remaining}`;}
 function planningJitenShell(a){
   return String(a.media_status||'').trim().toUpperCase()==='FINISHED'
@@ -1333,18 +1420,25 @@ function renderPlanningJiten(region,stats){
   const difficultyText=difficulty>=0&&difficulty<names.length?(ui.lang==='ru'?'Сложность: ':'Difficulty: ')+names[difficulty]:'';
   const length=Number(shown.speech_duration_ms||0)>0
     ?(ui.lang==='ru'?'Речь: ':'Speech: ')+jitenDuration(shown.speech_duration_ms)
-    :(Number(shown.character_count||0)>0?(ui.lang==='ru'?'Объём: '+compactJitenNumber(shown.character_count)+' зн.':'Length: '+compactJitenNumber(shown.character_count)+' chars'):'');
+    :(Number(shown.word_count||0)>0?(ui.lang==='ru'?'Объём: '+compactJitenNumber(shown.word_count)+' слов':'Length: '+compactJitenNumber(shown.word_count)+' words'):'');
   const known=shown.coverage_available?(ui.lang==='ru'?'Знаю: ':'Known: ')+Number(shown.known_coverage||0).toFixed(1)+'%':'';
   const locale=ui.lang==='ru'?'ru':'en';
+  // pudge-v0.7.23-hide-series-length-tooltip-v4
+  const wholeSeries=region.hasAttribute('data-ln-series-jiten')||region.hasAttribute('data-manga-series-jiten');
   const detail=(ui.lang==='ru'?'Jiten · слов: ':'Jiten · words: ')+Number(shown.word_count||0).toLocaleString(locale)+(ui.lang==='ru'?' · уникальных: ':' · unique: ')+Number(shown.unique_word_count||0).toLocaleString(locale);
+  const displayedLength=wholeSeries?'':length;
   const chips=[
-    {text:difficultyText,className:''},
-    {text:length,className:''},
+    {text:difficultyText,className:jitenDifficultyClass(difficulty)},
+    {text:displayedLength,className:''},
     {text:known,className:'known'},
   ].filter(item=>item.text).map(item=>'<span class="planned-jiten-chip '+item.className+'">'+escapeHtml(item.text)+'</span>').join('');
-  region.innerHTML=(region.hasAttribute('data-ln-card-jiten')||region.hasAttribute('data-library-card-jiten'))?'<div data-tooltip="'+escapeHtml(detail)+'">'+chips+'</div>':'<button data-action="url" data-url="'+escapeHtml(shown.url||'')+'" data-tooltip="'+escapeHtml(detail)+'">'+chips+'</button>';
-  const series=region.closest?.('[data-series-scroll]');
-  if(series)requestAnimationFrame(()=>window.PudgeSeriesScroll?.focus?.(series.parentElement||document));
+  if(wholeSeries){
+    region.innerHTML='<button data-action="url" data-url="'+escapeHtml(shown.url||'')+'">'+chips+'</button>';
+  }else{
+    region.innerHTML=(region.hasAttribute('data-ln-card-jiten')||region.hasAttribute('data-library-card-jiten'))?'<div data-tooltip="'+escapeHtml(detail)+'">'+chips+'</div>':'<button data-action="url" data-url="'+escapeHtml(shown.url||'')+'" data-tooltip="'+escapeHtml(detail)+'">'+chips+'</button>';
+  }
+  // Async Jiten hydration must not repeatedly resize/refocus series scrollers.
+  // Initial library rendering focuses the current volume once.
 }
 function queuePlanningJiten(a,region){
   const key=plannedKey(a),cached=plannedJitenCache.get(key);
@@ -1434,7 +1528,6 @@ function plannedSuggestionsRoot(){const content=$('plannedContent');let root=$('
 function plannedSuggestionFacts(row){
   const facts=[];
   if(row.year)facts.push(String(row.year));
-  if(row.mean_score)facts.push(`${Math.round(Number(row.mean_score))}%`);
   if(row.episodes)facts.push(`${Number(row.episodes)} ep`);
   if(row.chapters)facts.push(`${Number(row.chapters)} ch`);
   if(row.volumes)facts.push(`${Number(row.volumes)} vol`);
@@ -1444,7 +1537,7 @@ function plannedSuggestionFacts(row){
 function renderPlannedSuggestions(rows,query){
   const root=plannedSuggestionsRoot(),existing=new Set(plannedItems().map(plannedKey)),type=$('plannedTypeFilter')?.value||'all';
   const visible=(rows||[]).filter(row=>!existing.has(plannedKey(row))&&(type==='all'||row.media_kind===type));
-  root.innerHTML=visible.length?`<h2>${ui.lang==='ru'?'Предложения AniList':'AniList suggestions'} <span>${escapeHtml(query)}</span></h2><div class="planned-suggestion-grid">${visible.map(row=>{const facts=plannedSuggestionFacts(row),genres=(row.genres||[]).join(' · '),description=String(row.description||'').trim();return `<article data-action="url" data-url="${escapeHtml(row.site_url||'')}" tabindex="0" title="${ui.lang==='ru'?'Открыть в AniList':'Open on AniList'}"><img src="${escapeHtml(row.cover||'')}" alt="" loading="lazy"><div class="planned-suggestion-main"><strong>${escapeHtml(row.title||'')}</strong>${row.native_title&&row.native_title!==row.title?`<span>${escapeHtml(row.native_title)}</span>`:''}<span>${escapeHtml(row.format||row.media_kind||'')}${facts?` · ${escapeHtml(facts)}`:''}</span></div><button data-planning-suggestion="${Number(row.media_id)}" data-media-kind="${escapeHtml(row.media_kind||'anime')}">${ui.lang==='ru'?'В план':'Add'}</button><div class="planned-suggestion-info"><strong>${escapeHtml(row.title||'')}</strong>${facts?`<span>${escapeHtml(facts)}</span>`:''}${row.media_status?`<span>${escapeHtml(row.media_status)}</span>`:''}${genres?`<span>${escapeHtml(genres)}</span>`:''}${description?`<p>${escapeHtml(description)}</p>`:''}</div></article>`;}).join('')}</div>`:'';
+  root.innerHTML=visible.length?`<h2>${ui.lang==='ru'?'Предложения AniList':'AniList suggestions'} <span>${escapeHtml(query)}</span></h2><div class="planned-suggestion-grid">${visible.map(row=>{const facts=plannedSuggestionFacts(row),score=anilistScoreChip(row.mean_score,'percent'),genres=(row.genres||[]).join(' · '),description=String(row.description||'').trim();return `<article data-action="url" data-url="${escapeHtml(row.site_url||'')}" tabindex="0" title="${ui.lang==='ru'?'Открыть в AniList':'Open on AniList'}"><img src="${escapeHtml(row.cover||'')}" alt="" loading="lazy"><div class="planned-suggestion-main"><strong>${escapeHtml(row.title||'')}</strong>${row.native_title&&row.native_title!==row.title?`<span>${escapeHtml(row.native_title)}</span>`:''}<span>${escapeHtml(row.format||row.media_kind||'')}${score?` · ${score}`:''}${facts?` · ${escapeHtml(facts)}`:''}</span></div><button data-planning-suggestion="${Number(row.media_id)}" data-media-kind="${escapeHtml(row.media_kind||'anime')}">${ui.lang==='ru'?'В план':'Add'}</button><div class="planned-suggestion-info"><strong>${escapeHtml(row.title||'')}</strong>${score}${facts?`<span>${escapeHtml(facts)}</span>`:''}${row.media_status?`<span>${escapeHtml(row.media_status)}</span>`:''}${genres?`<span>${escapeHtml(genres)}</span>`:''}${description?`<p>${escapeHtml(description)}</p>`:''}</div></article>`;}).join('')}</div>`:'';
 }
 function schedulePlannedSuggestions(){
   if(plannedSuggestionTimer)clearTimeout(plannedSuggestionTimer);const query=String($('plannedSearch')?.value||'').trim(),token=++plannedSuggestionToken;
@@ -1509,7 +1602,7 @@ function lnBookCard(book,compact=false){
   const volume=Number(book.volume||1),title=compact?(ui.lang==='ru'?`Том ${volume}`:`Volume ${volume}`):escapeHtml(book.title);
   const score=Number(book.anilist_mean_score||0),year=Number(book.anilist_year||0),characters=Number(book.character_count||0),genres=(book.anilist_genres||[]).slice(0,2);
   const readCharacters=Math.max(0,Math.min(characters,Math.round(Number(book.read_character_count||0)))),progressLocale=ui.lang==='ru'?'ru-RU':'en-US',progressTitle=characters?`${readCharacters.toLocaleString(progressLocale)} / ${characters.toLocaleString(progressLocale)} ${ui.lang==='ru'?'символов':'characters'}`:`${percent}%`;
-  const factValues=compact?[`${percent}%`,characters?`${compactJitenNumber(characters)} ${ui.lang==='ru'?'зн.':'chars'}`:'',book.finished?(ui.lang==='ru'?'Прочитано':'Finished'):'']:[ui.lang==='ru'?`Том ${volume}`:`Volume ${volume}`,`${chapterCount} ${ui.lang==='ru'?'глав':'chapters'}`,characters?`${compactJitenNumber(characters)} ${ui.lang==='ru'?'зн.':'chars'}`:'',`${percent}%`,score?`AniList ${Math.round(score)}%`:'',year?String(year):'',book.finished?(ui.lang==='ru'?'Прочитано':'Finished'):''];const facts=factValues.filter(Boolean).map(value=>value===`${percent}%`?`<span data-tooltip="${escapeHtml(progressTitle)}" aria-label="${escapeHtml(progressTitle)}">${escapeHtml(value)}</span>`:`<span>${escapeHtml(value)}</span>`).join('');
+  const factValues=compact?[`${percent}%`,characters?`${compactJitenNumber(characters)} ${ui.lang==='ru'?'зн.':'chars'}`:'',book.finished?(ui.lang==='ru'?'Прочитано':'Finished'):'']:[ui.lang==='ru'?`Том ${volume}`:`Volume ${volume}`/* pudge-v0.7.23-ln-hide-volume-chapter-count-v1 */,characters?`${compactJitenNumber(characters)} ${ui.lang==='ru'?'зн.':'chars'}`:'',`${percent}%`,year?String(year):'',book.finished?(ui.lang==='ru'?'Прочитано':'Finished'):''];const scoreHtml=!compact&&score?anilistScoreChip(score,'percent'):'';const facts=factValues.filter(Boolean).map(value=>value===`${percent}%`?`<span data-tooltip="${escapeHtml(progressTitle)}" aria-label="${escapeHtml(progressTitle)}">${escapeHtml(value)}</span>`:`<span>${escapeHtml(value)}</span>`).join('')+scoreHtml;
   const genreHtml=genres.length?`<div class="ln-card-genres">${genres.map(value=>`<span>${escapeHtml(value)}</span>`).join('')}</div>`:'';
   const jiten=book.anilist_id?`<div class="planned-jiten" data-planned-jiten data-ln-card-jiten="${Number(book.anilist_id)}" data-jiten-book="${Number(book.id)}" data-jiten-volume="${volume}"><span class="planned-jiten-loading">Jiten…</span></div>`:'';
   return `<article class="ln-card ln-entry ${compact?'compact':''} ${ui.lnSelection?.has(Number(book.id))?'selected':''}" data-ln-book="${book.id}" data-ln-action="read" data-ln-volume="${volume}" data-id="${book.id}">${cover}<div class="ln-card-body"><h3>${title}</h3><div class="ln-card-meta">${facts}</div><div class="ln-card-progress" data-tooltip="${escapeHtml(progressTitle)}" aria-label="${escapeHtml(progressTitle)}"><span style="width:${percent}%"></span></div>${genreHtml}${jiten}</div></article>`;
@@ -1559,15 +1652,36 @@ function lnSeriesGroupHtml(group){
   if(group.length===1)return lnBookCard(group[0],false);
   const first=group[0],title=first.series_title||first.title||'Light Novel',current=currentSeriesBook(group),key=lnSeriesKey(first);
   const scrollClass=group.length>2?' series-scroll':'';
+  const seriesIds=group.map(book=>Number(book.id)).filter(Boolean).join(',');
   const seriesJiten=first.anilist_id?`<div class="planned-jiten" data-planned-jiten data-ln-series-jiten="${Number(first.anilist_id)}" data-jiten-book="${Number(first.id)}"><span class="planned-jiten-loading">Jiten…</span></div>`:'';
-  return `<section class="ln-series-group" data-ln-series-key="${escapeHtml(key)}"><div class="ln-series-head"><div class="ln-series-title-block"><strong>${escapeHtml(title)}</strong>${seriesJiten}</div><span class="ln-series-count">${group.length} ${ui.lang==='ru'?'тома/томов':'volumes'}</span></div><div class="ln-series-books${scrollClass}" ${group.length>2?'data-series-scroll="1"':''} data-series-current-book="${Number(current?.id||0)}">${group.map(book=>lnBookCard(book,true)).join('')}</div></section>`;
+  const seriesScore=first.anilist_mean_score?anilistScoreChip(first.anilist_mean_score,'percent'):'';
+  const seriesStats=(seriesJiten||seriesScore)?`<div class="ln-series-stats">${seriesJiten}${seriesScore}</div>`:'';
+  return `<section class="ln-series-group" data-ln-series-key="${escapeHtml(key)}" data-ln-series-ids="${seriesIds}"><div class="ln-series-head" data-ln-series-select="${escapeHtml(key)}"><div class="ln-series-title-block"><strong>${escapeHtml(title)}</strong>${seriesStats}</div><span class="ln-series-count">${group.length} ${ui.lang==='ru'?'тома/томов':'volumes'}</span></div><div class="ln-series-books${scrollClass}" ${group.length>2?'data-series-scroll="1"':''} data-series-current-book="${Number(current?.id||0)}">${group.map(book=>lnBookCard(book,true)).join('')}</div></section>`;
 }
 function lnSeriesGroups(books){
   const groups=new Map();
   for(const book of books){const key=lnSeriesKey(book);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(book);}
   return [...groups.values()].sort((a,b)=>String(a[0]?.series_title||a[0]?.title||'').localeCompare(String(b[0]?.series_title||b[0]?.title||''),ui.lang)).map(lnSeriesGroupHtml).join('');
 }
-function applyLnSelection(){for(const node of document.querySelectorAll('[data-ln-book]'))node.classList.toggle('selected',ui.lnSelection.has(Number(node.dataset.lnBook)));updatePageSelectionActions();}
+function lnSeriesForKey(key){
+  const books=ui.lnState?.books||[],group=books.filter(book=>lnSeriesKey(book)===String(key||''));
+  return group.length?group:null;
+}
+function toggleLnSeriesSelection(group){
+  const ids=(group||[]).map(book=>Number(book.id)).filter(Boolean);if(!ids.length)return;
+  const allSelected=ids.every(id=>ui.lnSelection.has(id));
+  for(const id of ids){if(allSelected)ui.lnSelection.delete(id);else ui.lnSelection.add(id);}
+  applyLnSelection();
+}
+function applyLnSelection(){
+  for(const node of document.querySelectorAll('[data-ln-book]'))node.classList.toggle('selected',ui.lnSelection.has(Number(node.dataset.lnBook)));
+  for(const node of document.querySelectorAll('[data-ln-series-ids]')){
+    const ids=String(node.dataset.lnSeriesIds||'').split(',').map(Number).filter(Boolean),selected=ids.filter(id=>ui.lnSelection.has(id)).length;
+    node.classList.toggle('series-selected',Boolean(ids.length)&&selected===ids.length);
+    node.classList.toggle('series-partial',selected>0&&selected<ids.length);
+  }
+  updatePageSelectionActions();
+}
 function toggleLnSelection(bookId){const id=Number(bookId);if(!id)return;if(ui.lnSelection.has(id))ui.lnSelection.delete(id);else ui.lnSelection.add(id);applyLnSelection();}
 function clearLnSelection(){ui.lnSelection.clear();applyLnSelection();}
 function updatePageSelectionActions(){
@@ -1581,16 +1695,26 @@ function updatePageSelectionActions(){
   box.hidden=false;importButton.hidden=true;
 }
 function showLnBookMenu(book,x,y){
-  if(!book)return;ui.lnContextBook=book;const menu=$('contextMenu');
+  if(!book)return;ui.lnContextBook=book;ui.lnContextSeries=null;const menu=$('contextMenu');
   const selected=ui.lnSelection?.has(Number(book.id));
   const select=`<button data-ln-context-action="select">${selected?(ui.lang==='ru'?'Снять выделение':'Deselect'):(ui.lang==='ru'?'Выделить':'Select')}</button>`;
   const openAniList=book.anilist_id?`<button data-ln-context-action="open-anilist">${ui.lang==='ru'?'Открыть AniList':'Open AniList'}</button>`:'';
-  const score=book.anilist_id?`<button data-ln-context-action="score">${ui.lang==='ru'?'Поставить оценку':'Set score'}</button>`:'';
   const names='';
   const finish=book.finished
     ?`<button data-ln-context-action="unfinish">${ui.lang==='ru'?'Убрать метку Finished':'Remove Finished'}</button>`
     :`<button data-ln-context-action="finish">${ui.lang==='ru'?'Отметить прочитанным':'Mark read'}</button>`;
-  menu.innerHTML=`${select}<button data-ln-context-action="read">${ui.lang==='ru'?'Читать':'Read'}</button>${openAniList}${score}${names}<button data-ln-context-action="anilist-search">${book.anilist_id?(ui.lang==='ru'?'Изменить AniList':'Change AniList'):(ui.lang==='ru'?'Найти в AniList':'Find on AniList')}</button>${finish}<button data-ln-context-action="reset-position">${ui.lang==='ru'?'Сбросить прогресс чтения':'Reset reading progress'}</button><button class="danger-action" data-ln-context-action="delete">${ui.lang==='ru'?'Удалить из библиотеки':'Remove from library'}</button>`;
+  menu.innerHTML=`${select}<button data-ln-context-action="read">${ui.lang==='ru'?'Читать':'Read'}</button>${openAniList}${names}<button data-ln-context-action="anilist-search">${book.anilist_id?(ui.lang==='ru'?'Изменить AniList':'Change AniList'):(ui.lang==='ru'?'Найти в AniList':'Find on AniList')}</button>${finish}<button data-ln-context-action="reset-position">${ui.lang==='ru'?'Сбросить прогресс чтения':'Reset reading progress'}</button><button class="danger-action" data-ln-context-action="delete">${ui.lang==='ru'?'Удалить из библиотеки':'Remove from library'}</button>`;
+  positionContextMenu(menu,x,y);
+}
+function showLnSeriesMenu(group,x,y){
+  if(!group?.length)return;
+  const book=group.find(item=>item.anilist_id)||group[0];ui.lnContextBook=book;ui.lnContextSeries=group;const menu=$('contextMenu');
+  const allSelected=group.every(item=>ui.lnSelection.has(Number(item.id)));
+  const select=`<button data-ln-context-action="select-series">${allSelected?(ui.lang==='ru'?'Снять выделение со всех томов':'Deselect all volumes'):(ui.lang==='ru'?'Выделить все тома':'Select all volumes')}</button>`;
+  const openAniList=book.anilist_id?`<button data-ln-context-action="open-anilist">${ui.lang==='ru'?'Открыть AniList':'Open AniList'}</button>`:'';
+  const score=book.anilist_id?`<button data-ln-context-action="score-series">${ui.lang==='ru'?'Поставить оценку':'Set score'}</button>`:'';
+  const link=`<button data-ln-context-action="anilist-search">${book.anilist_id?(ui.lang==='ru'?'Изменить AniList':'Change AniList'):(ui.lang==='ru'?'Найти в AniList':'Find on AniList')}</button>`;
+  menu.innerHTML=`${select}<button data-ln-context-action="read-series">${ui.lang==='ru'?'Читать':'Read'}</button>${openAniList}${score}${link}<button class="danger-action" data-ln-context-action="delete-series">${ui.lang==='ru'?'Удалить все тома из библиотеки':'Remove all volumes from library'}</button>`;
   positionContextMenu(menu,x,y);
 }
 async function showLnAudiobookLink(book){
@@ -2349,7 +2473,7 @@ function torrentCard(download){
   const livePeers=`${Number(download.seeders||0)} / ${Number(download.peers||0)}`,listedSeeders=Number(download.listed_seeders||0),listedPeers=Number(download.listed_peers||0),peerStats=listedSeeders||listedPeers?`${livePeers} · Nyaa ${listedSeeders} / ${listedPeers}`:livePeers;
   const stats=[[ui.lang==='ru'?'Скачано':'Downloaded',`${torrentBytes(download.downloaded_bytes)} / ${torrentBytes(download.total_bytes)}`],['↓',torrentRate(download.download_speed)],['↑',torrentRate(download.upload_speed)],[ui.lang==='ru'?'Сиды / пиры':'Seeds / peers',peerStats],[ui.lang==='ru'?'Рейтинг':'Ratio',Number(download.ratio||0).toFixed(2)],[ui.lang==='ru'?'Время':'Time',torrentElapsed(download)],['ETA',finished?'—':torrentEta(download.eta_seconds)]],controllable=!finished||/active|waiting|paused|seeding|uploading/i.test(String(download.state||''));
   const backendAttr=` data-backend="${escapeHtml(download.backend_id||download.backend||'')}"`;
-  return `<article class="download-card" data-download-hash="${escapeHtml(download.hash)}"><div class="download-card-head"><div class="download-card-title"><strong title="${escapeHtml(download.anime_title||download.name)}">${escapeHtml(download.anime_title||download.name||t('label.unknownAnime'))}</strong><span title="${escapeHtml(download.name)}">${[episode,download.backend,String(download.name||'')].filter(Boolean).map(escapeHtml).join(' · ')}</span></div><span class="download-state">${escapeHtml(download.state||'—')}</span></div><div class="download-progress" title="${percent}%"><span style="width:${percent}%"></span></div><div class="download-stats">${stats.map(([label,value])=>`<div class="download-stat"><small>${label}</small><strong>${value}</strong></div>`).join('')}</div>${stalled&&Number(download.listed_seeders||0)>0?`<div class="setup-callout warning">${ui.lang==='ru'?'Сейчас нет живых соединений; число сидов Nyaa могло устареть. Pudge попробует переподключиться автоматически.':'There are no live connections; Nyaa’s seed count may be stale. Pudge will reconnect automatically.'}</div>`:''}${download.save_path?`<div class="subtle" title="${escapeHtml(download.save_path)}">${escapeHtml(download.save_path)}</div>`:''}${download.error?`<div class="danger">${escapeHtml(download.error)}</div>`:''}<div class="download-card-actions">${controllable?`<button data-action="torrent-${paused?'resume':'pause'}" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${paused?(ui.lang==='ru'?'Продолжить':'Resume'):(ui.lang==='ru'?'Пауза':'Pause')}</button>`:''}${download.backend==='aria2'&&!finished?`<button data-action="torrent-reconnect" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Переподключить':'Reconnect'}</button>`:''}<button data-action="torrent-remove" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Убрать':'Remove'}</button><button class="danger-action" data-action="torrent-remove-files" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Удалить с файлами':'Remove + files'}</button></div></article>`;
+  return `<article class="download-card" data-download-hash="${escapeHtml(download.hash)}"><div class="download-card-head"><div class="download-card-title"><strong title="${escapeHtml(download.anime_title||download.name)}">${escapeHtml(download.anime_title||download.name||t('label.unknownAnime'))}</strong><span title="${escapeHtml(download.name)}">${[episode,download.backend,String(download.name||'')].filter(Boolean).map(escapeHtml).join(' · ')}</span></div><span class="download-state">${escapeHtml(download.state||'—')}</span></div><div class="download-progress" title="${percent}%"><span style="width:${percent}%"></span></div><div class="download-stats">${stats.map(([label,value])=>`<div class="download-stat"><small>${label}</small><strong>${value}</strong></div>`).join('')}</div>${stalled&&Number(download.listed_seeders||0)>0?`<div class="setup-callout warning">${ui.lang==='ru'?'Сейчас нет живых соединений; число сидов Nyaa могло устареть. Pudge попробует переподключиться автоматически.':'There are no live connections; Nyaa’s seed count may be stale. Pudge will reconnect automatically.'}</div>`:''}${download.save_path?`<div class="subtle" title="${escapeHtml(download.save_path)}">${escapeHtml(download.save_path)}</div>`:''}${download.error?`<div class="danger">${escapeHtml(download.error)}</div>`:''}<div class="download-card-actions">${controllable?`<button data-action="torrent-${paused?'resume':'pause'}" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${paused?(ui.lang==='ru'?'Продолжить':'Resume'):(ui.lang==='ru'?'Пауза':'Pause')}</button>`:''}${download.backend==='aria2'&&!finished?`<button data-action="torrent-reconnect" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Переподключить':'Reconnect'}</button>`:''}<button class="danger-action" data-action="torrent-remove" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Убрать':'Remove'}</button><button class="danger-action" data-action="torrent-remove-files" data-hash="${escapeHtml(download.hash)}"${backendAttr}>${ui.lang==='ru'?'Удалить с файлами':'Remove + files'}</button></div></article>`;
 }
 function torrentFilterMatch(download,filter){if(filter==='active')return !torrentFinished(download)&&!torrentPaused(download.state);if(filter==='paused')return torrentPaused(download.state);if(filter==='seeding')return torrentFinished(download)&&!torrentPaused(download.state)&&(/active|seeding|uploading/i.test(String(download.state||''))||Number(download.upload_speed||0)>0);if(filter==='finished')return torrentFinished(download);return true;}
 function renderDownloadCenter(result=ui.downloadCenter){
@@ -2409,7 +2533,6 @@ function renderSettings(){
     <div class="setting-block"><h3>${t('section.jimaku')}</h3><p class="subtle">${t('settings.jimakuImportant')}</p>${jimakuTrialNotice()}<div class="form-grid">${input('s_jimaku',s.jimaku_trial_active?(ui.lang==='ru'?'Личный Jimaku API key (необязательно пока действует доступ)':'Personal Jimaku API key (optional during access)'):t('settings.jimakuKey'),'password')}</div>${jimakuCredentialGuide()}<div class="setting-inline-actions"><button data-action="url" data-url="https://jimaku.cc/login">${ui.lang==='ru'?'Регистрация / вход':'Register / sign in'}</button><button data-action="url" data-url="https://jimaku.cc/account">Account / API key</button></div></div>
     <div class="setting-block"><label class="setting-toggle"><input id="s_anilist_enabled" type="checkbox">${t('settings.useAniList')}</label><p class="subtle">${t('settings.anilistOptional')}</p><div id="settings-anilist-fields" class="conditional-settings">${anilistCredentialFlow('s',{clientId:s.anilist_client_id,token:s.anilist_token})}<div class="setting-stack"><label class="check"><input id="s_anilist_add_missing" type="checkbox">${t('settings.addImportedToAniList')}</label><label class="check"><input id="s_relations_release" type="checkbox">${t('settings.relationsByReleaseDate')}</label></div><div class="setting-subgroup"><label class="setting-toggle"><input id="s_anilist_auto" type="checkbox">${t('settings.autoProgress')}</label><div id="settings-anilist-auto-fields" class="conditional-settings"><p class="subtle" style="margin:0">${ui.lang==='ru'?"Серия засчитывается, когда просмотрено не меньше 85% и до конца осталось не больше 10 минут. Вручную всегда можно засчитать её шорткатом ":"Episode is marked watched once you've viewed at least 85% and 10 minutes or less remain. You can always mark it manually with "} ${watchedShortcut}</p></div></div><div class="setting-inline-actions"><button id="syncAniList">${t('action.updateAniList')}</button><span id="anilistSyncedAt" class="subtle"></span></div></div></div>
     <div class="setting-block" data-settings-category="essential"><h3>${ui.lang==='ru'?'Jiten / JPDB':'Jiten / JPDB'}</h3><p class="subtle">${t('settings.lnHint')}</p><div class="form-grid"><label for="s_ln_jiten_key">${t('settings.lnJitenToken')}</label><div class="credential-field"><input id="s_ln_jiten_key" type="password"><button type="button" class="inline-settings-link" data-action="url" data-url="https://jiten.moe/settings">${ui.lang==='ru'?'API Key в Jiten ↗':'Jiten API Key ↗'}</button></div><label for="s_ln_jpdb_key">${t('settings.lnJpdbToken')}</label><div class="credential-field"><input id="s_ln_jpdb_key" type="password"><button type="button" class="inline-settings-link" data-action="url" data-url="https://jpdb.io/settings">${ui.lang==='ru'?'API token внизу Settings ↗':'API token at bottom of Settings ↗'}</button></div><label for="s_ln_backend">${t('settings.lnStudyBackend')}</label><select id="s_ln_backend"><option value="jiten">Jiten</option><option value="jpdb">JPDB</option></select><label for="s_mpv_study_plugin">${ui.lang==='ru'?'Интерактивные субтитры MPV':'Interactive MPV subtitles'}</label><select id="s_mpv_study_plugin"><option value="jiten">JitenMPV</option><option value="jpdb">jpdb-mpv-plugin</option></select><span></span><span id="s_mpv_study_status" class="subtle"></span><span></span><div id="s_jiten_devtools" class="setup-callout jiten-devtools-callout"><strong>Developer Tools</strong><p style="margin:6px 0">${ui.lang==='ru'?'Для JitenMPV включите Pudge и mpv в System Settings → Privacy & Security → Developer Tools. macOS не позволяет выдать это разрешение автоматически.':'For JitenMPV, enable both Pudge and mpv in System Settings → Privacy & Security → Developer Tools. macOS does not allow this permission to be granted automatically.'}</p><div class="setting-inline-actions"><button id="openJitenDeveloperTools" type="button">${ui.lang==='ru'?'Открыть Developer Tools':'Open Developer Tools'}</button><label class="check"><input id="s_jiten_devtools_confirmed" type="checkbox">${ui.lang==='ru'?'Я включил Pudge и mpv':'I enabled Pudge and mpv'}</label></div></div></div><div class="setting-inline-actions"><button data-ln-action="test-study" data-backend="jiten">Test Jiten</button><button data-ln-action="test-study" data-backend="jpdb">Test JPDB</button></div></div>
-    <div class="setting-block" data-settings-category="advanced"><h3>${t('settings.lightNovels')}</h3><div class="form-grid"><label for="s_ln_parse_ahead">${t('settings.lnParseAhead')}</label><select id="s_ln_parse_ahead"><option value="current">Current chapter only</option><option value="next">Current + next chapter</option><option value="book">Whole book in background</option></select></div></div>
     <div class="setting-block" data-settings-category="advanced"><h3>${ui.lang==='ru'?'Light Novels — загрузки':'Light Novels — downloads'}</h3><div class="form-grid"><span></span><label class="check"><input id="s_ln_auto_download" type="checkbox">${t('settings.lnAutoNyaa')}</label></div></div>
     <div class="setting-block" data-settings-category="essential"><h3>${t('settings.mangaOcr')}</h3><p class="subtle">${t('settings.mangaOcrHint')}</p><div class="form-grid"><span>${t('settings.mangaOcrState')}</span><strong id="mangaOcrStatus">—</strong><span></span><div class="setting-inline-actions"><button id="installMangaOcr" type="button">${t('action.installMangaOcr')}</button><button id="openMangaOcrLog" type="button" hidden>${t('action.openMangaOcrLog')}</button></div><span></span><div id="mangaOcrDetail" class="subtle"></div></div></div>
     <div class="setting-block"><label class="setting-toggle"><input id="s_llm_enabled" type="checkbox">${t('settings.useLlm')}</label><p class="subtle">${t('settings.llmOptional')}</p><div id="settings-llm-fields" class="conditional-settings"><div class="form-grid">${input('s_llm_url',t('settings.llmUrl'))}${input('s_llm_key',t('settings.llmKey'),'password')}${input('s_llm_model',t('settings.llmModel'))}</div></div></div>
@@ -2422,7 +2545,6 @@ function renderSettings(){
     <div class="setting-block"><label class="setting-toggle"><input id="s_disk_limit_enabled" type="checkbox">${t('settings.diskLimitEnabled')}</label><div id="settings-disk-fields" class="conditional-settings"><div class="form-grid">${input('s_disk_limit_gb',t('settings.diskLimitGb'),'number')}</div><p class="subtle">${ui.state.storage?t('label.storage',{used:ui.state.storage.used_gb,limit:ui.state.storage.limit_gb}):''}</p></div></div>
     <div class="setting-block"><label class="setting-toggle"><input id="s_nyaa_enabled" type="checkbox">${t('settings.useNyaa')}</label><div id="settings-nyaa-fields" class="conditional-settings"><div class="form-grid">${input('s_nyaa_url',t('settings.nyaaUrl'))}<label for="s_proxy_mode">${t('settings.proxyMode')}</label><select id="s_proxy_mode"><option>direct</option><option>direct_then_proxy</option><option>proxy_only</option><option>proxy_then_direct</option></select>${input('s_proxy_url',t('settings.proxyUrl'))}${input('s_search_hook',t('settings.searchHook'))}<label for="s_resolution">${t('settings.resolution')}</label><select id="s_resolution"><option value="480p">480p</option><option value="720p">720p</option><option value="1080p">1080p</option><option value="1440p">1440p</option><option value="2160p">2160p / 4K</option><option value="highest">${t('settings.resolutionHighest')}</option></select>${checkbox('s_only_trusted_groups',t('settings.onlyTrustedGroups'))}${input('s_groups',t('settings.trustedGroups'))}${input('s_preferred_groups',t('settings.preferredGroups'))}${input('s_blocked_groups',t('settings.blockedGroups'))}<div class="setting-divider-title">${t('label.releaseUpgradeSettings')}</div>${checkbox('s_auto_upgrade_downloaded',t('settings.autoUpgradeDownloaded'))}${input('s_upgrade_hours',t('settings.upgradeCheckHours'),'number')}${input('s_upgrade_max_checks',t('settings.maxUpgradeChecks'),'number')}</div><p class="subtle">${t('help.nyaa')}</p><div class="setting-inline-actions"><button id="presetNyaaSocks">${t('action.presetSocks')}</button><button id="testNyaaProxy">${t('action.testNyaa')}</button></div></div></div>
     <div class="setting-block"><label class="setting-toggle"><input id="s_agent_enabled" type="checkbox">${t('settings.enableAgent')}</label><div id="settings-agent-fields" class="conditional-settings"><div class="form-grid">${input('s_agent_poll',t('settings.agentPoll'),'number')}${input('s_anilist_refresh_poll',t('settings.anilistRefreshPoll'),'number')}${input('s_sub_poll',t('settings.subtitlePoll'),'number')}${input('s_delete_hours',t('settings.deleteHours'),'number')}</div><p class="subtle">${t('help.startup')}</p></div></div>
-    <div class="setting-block"><label class="setting-toggle"><input id="s_energy_monitoring" type="checkbox">${t('settings.energyDiagnostics')}</label><p class="subtle">${t('settings.energyDiagnosticsHint')}</p><div id="settings-energy-fields" class="conditional-settings"><div class="form-grid">${input('s_energy_sample',t('settings.energySample'),'number')}</div><p class="subtle">${t('settings.energyLogPath',{path:escapeHtml(s.energy_log_path||'')})}</p><div class="setting-inline-actions"><button id="openEnergyLog">${t('action.openEnergyLog')}</button></div></div></div>
     <div class="setting-block" id="settingsMaintenance"><h3>${t('settings.maintenance')}</h3><p class="subtle">${t('settings.maintenanceHint')}</p><div class="setting-inline-actions"><button id="openDownloadCenter" data-action="open-downloads">${t('action.openDownloads')}</button><button id="checkReleaseUpgrades">${t('action.checkReleaseUpgrades')}</button><button id="checkSubtitleUpgrades">${t('action.checkSubtitleUpgrades')}</button><button id="repairLibrary">${t('action.repairLibrary')}</button><button id="openDiagnosticsPage">${t('action.openDiagnostics')}</button></div><div id="repairSummary" class="repair-summary"></div><p class="subtle" style="margin-top:12px">${t('label.backupHint')}</p><div class="setting-inline-actions"><button id="createBackup">${t('action.createBackup')}</button><button id="restoreBackup">${t('action.restoreBackup')}</button></div></div>
     <div class="setting-block"><h3>${t('settings.shortcuts')}</h3><p class="subtle">${t('settings.shortcutsHint')}</p><div class="setting-divider-title">${t('settings.shortcutsMpv')}</div><div class="form-grid">${shortcutRecorder('s_shortcut_mpv_watched',t('settings.shortcutMpvWatched'))}${shortcutRecorder('s_shortcut_mpv_anilist',t('settings.shortcutMpvAniList'))}${shortcutRecorder('s_shortcut_mpv_correct',t('settings.shortcutMpvCorrect'))}${shortcutRecorder('s_shortcut_mpv_translate',ui.lang==='ru'?'Выделить и перевести текущие субтитры':'Select and translate current subtitle')}</div></div>
     <div class="setting-block danger-zone"><h3>${ui.lang==='ru'?'Удаление Pudge':'Remove Pudge'}</h3><p class="subtle">${ui.lang==='ru'?'Удаляет приложение, настройки, базу, backup-копии, кэш, логи, привязанные устройства, ключи Pudge и файлы из папки библиотеки Pudge. Добавленные внешние папки и общие программы останутся.':'Removes the app, settings, database, backups, cache, logs, paired devices, Pudge keys, and files in the Pudge library folder. Added external folders and shared tools remain.'}</p><button id="uninstallPudge" type="button" class="uninstall-pudge">${ui.lang==='ru'?'Удалить Pudge с этого Mac':'Delete Pudge from this Mac'}</button></div>
@@ -2468,7 +2590,7 @@ function normalizeSettingsSearch(value){return String(value||'').toLocaleLowerCa
 function settingsTranslationStem(value){return normalizeSettingsSearch(String(value||'').replace(/\{[^}]+\}/g,' '));}
 function prepareSettingsSearch(){const root=$('settingsContent'),input=$('settingsSearch');if(!root||!input||typeof root.querySelectorAll!=='function')return;const strings=(typeof STRINGS!=='undefined'&&STRINGS)||{},current=strings[ui.lang]||{},dicts=[strings.en||{},strings.ru||{}];const targets=[...root.querySelectorAll('.setting-block label,.setting-block h3,.setting-block .setting-divider-title,.setting-block button,.setting-block .subtle')];for(const target of targets){const visible=normalizeSettingsSearch(target.textContent);let index=visible;for(const [key,val] of Object.entries(current)){const stem=settingsTranslationStem(val);if(stem&&stem.length>=3&&visible.includes(stem)){for(const dict of dicts)index+=' '+normalizeSettingsSearch(dict[key]||'');}}target.dataset.settingsSearchIndex=index;}for(const block of root.querySelectorAll('.setting-block'))block.dataset.settingsSearchIndex=normalizeSettingsSearch(block.textContent)+' '+[...block.querySelectorAll('[data-settings-search-index]')].map(x=>x.dataset.settingsSearchIndex).join(' ');input.addEventListener('input',applySettingsSearch);applySettingsSearch();}
 function applySettingsSearch(){const root=$('settingsContent'),input=$('settingsSearch');if(!root||!input)return;const q=normalizeSettingsSearch(input.value);for(const node of root.querySelectorAll('.settings-search-hit'))node.classList.remove('settings-search-hit');for(const block of root.querySelectorAll('.setting-block')){block.classList.remove('settings-search-hidden','settings-search-block-hit');if(!q)continue;const hits=[...block.querySelectorAll('[data-settings-search-index]')].filter(node=>(node.dataset.settingsSearchIndex||'').includes(q));const matched=hits.length>0||(block.dataset.settingsSearchIndex||'').includes(q);block.classList.toggle('settings-search-hidden',!matched);if(matched){block.classList.add('settings-search-block-hit');for(const node of hits)node.classList.add('settings-search-hit');}}}
-function fillSettings(s){const ln=s.light_novels||{},plugins=s.mpv_study_plugins||{},selected=s.mpv_study_plugin==='auto'?(plugins.mpv_study?.effective||'jiten'):(s.mpv_study_plugin||'jiten');const values={s_language:s.language||'en',s_escape_fullscreen:s.escape_exits_fullscreen!==false,s_notifications:s.notifications_enabled!==false,s_jiten_devtools_confirmed:!!s.jiten_developer_tools_confirmed,s_library:s.library_root,s_watched_folders:s.watched_folders||'',s_subtitle_folders:s.subtitle_folders||s.subtitle_folder||'',s_disk_limit_enabled:s.disk_limit_enabled,s_disk_limit_gb:s.disk_limit_gb,s_playback_enabled:s.playback_enabled,s_playback_rewind:s.playback_rewind,s_nyaa_enabled:s.nyaa_enabled,s_nyaa_url:s.nyaa_url,s_proxy_mode:s.proxy_mode,s_proxy_url:s.proxy_url,s_search_hook:s.search_hook,s_min_score:s.min_score,s_resolution:s.preferred_resolution,s_require_japanese:s.require_japanese_audio,s_avoid_upscaled:s.avoid_upscaled,s_only_trusted_groups:s.only_trusted_groups,s_groups:s.trusted_groups,s_preferred_groups:s.preferred_groups,s_blocked_groups:s.blocked_groups,s_auto_upgrade_downloaded:s.auto_upgrade_downloaded,s_upgrade_min_gain:s.upgrade_min_score_gain,s_upgrade_hours:s.upgrade_check_hours,s_upgrade_max_checks:s.max_upgrade_checks_per_run,s_qbt_enabled:s.qbt_enabled,s_qbt_url:s.qbt_url,s_qbt_user:s.qbt_user,s_qbt_password:s.qbt_password,s_qbt_api:s.qbt_api_key,s_aria2_enabled:s.aria2_enabled,s_aria2_binary:s.aria2_binary,s_aria2_port:s.aria2_rpc_port,s_download_hook:s.download_hook,s_agent_enabled:s.agent_enabled,s_agent_poll:s.agent_poll,s_anilist_refresh_poll:s.anilist_refresh_poll,s_sub_poll:s.subtitle_poll,s_delete_hours:s.delete_hours,s_anilist_enabled:s.anilist_enabled,s_anilist_client:s.anilist_client_id,s_anilist_token:s.anilist_token,s_anilist_auto:s.anilist_auto_progress,s_anilist_add_missing:s.anilist_add_if_missing,s_relations_release:s.relations_by_release_date!==false,s_anilist_threshold:s.anilist_threshold,s_anilist_max_remaining:s.anilist_max_remaining_minutes,s_jimaku:s.jimaku_api_key,s_ocr_image_subtitles:s.ocr_image_subtitles,s_use_container_chapters:s.use_container_chapters!==false,s_japanese_stt_fallback:s.japanese_stt_fallback!==false,s_subtitle_semantic_checks:!!s.subtitle_semantic_checks,s_auto_upgrade_subtitles:s.auto_upgrade_subtitles,s_sub_upgrade_min_gain:s.subtitle_upgrade_min_score_gain,s_sub_upgrade_hours:s.subtitle_upgrade_check_hours,s_sub_upgrade_max_checks:s.max_subtitle_upgrade_checks_per_run,s_llm_enabled:s.llm_enabled,s_llm_url:s.llm_url,s_llm_key:s.llm_api_key,s_llm_model:s.llm_model,s_shortcut_mpv_watched:s.shortcut_mpv_mark_watched,s_shortcut_mpv_anilist:s.shortcut_mpv_open_anilist,s_shortcut_mpv_correct:s.shortcut_mpv_correct_match,s_energy_monitoring:s.energy_monitoring_enabled,s_energy_sample:s.energy_sample_seconds,s_ln_jiten_key:ln.jiten_api_key||'',s_ln_jpdb_key:ln.jpdb_api_token||'',s_ln_backend:ln.study_backend||'jiten',s_mpv_study_plugin:selected,s_ln_parse_ahead:ln.parse_ahead||'next',s_ln_auto_download:!!ln.auto_download_nyaa};for(const [id,v] of Object.entries(values)){const el=$(id);if(!el)continue;if(el.classList.contains('shortcut-recorder'))setShortcutRecorder(el,v);else if(el.type==='checkbox')el.checked=!!v;else el.value=v??'';}}
+function fillSettings(s){const ln=s.light_novels||{},plugins=s.mpv_study_plugins||{},selected=s.mpv_study_plugin==='auto'?(plugins.mpv_study?.effective||'jiten'):(s.mpv_study_plugin||'jiten');const values={s_language:s.language||'en',s_escape_fullscreen:s.escape_exits_fullscreen!==false,s_notifications:s.notifications_enabled!==false,s_jiten_devtools_confirmed:!!s.jiten_developer_tools_confirmed,s_library:s.library_root,s_watched_folders:s.watched_folders||'',s_subtitle_folders:s.subtitle_folders||s.subtitle_folder||'',s_disk_limit_enabled:s.disk_limit_enabled,s_disk_limit_gb:s.disk_limit_gb,s_playback_enabled:s.playback_enabled,s_playback_rewind:s.playback_rewind,s_nyaa_enabled:s.nyaa_enabled,s_nyaa_url:s.nyaa_url,s_proxy_mode:s.proxy_mode,s_proxy_url:s.proxy_url,s_search_hook:s.search_hook,s_min_score:s.min_score,s_resolution:s.preferred_resolution,s_require_japanese:s.require_japanese_audio,s_avoid_upscaled:s.avoid_upscaled,s_only_trusted_groups:s.only_trusted_groups,s_groups:s.trusted_groups,s_preferred_groups:s.preferred_groups,s_blocked_groups:s.blocked_groups,s_auto_upgrade_downloaded:s.auto_upgrade_downloaded,s_upgrade_min_gain:s.upgrade_min_score_gain,s_upgrade_hours:s.upgrade_check_hours,s_upgrade_max_checks:s.max_upgrade_checks_per_run,s_qbt_enabled:s.qbt_enabled,s_qbt_url:s.qbt_url,s_qbt_user:s.qbt_user,s_qbt_password:s.qbt_password,s_qbt_api:s.qbt_api_key,s_aria2_enabled:s.aria2_enabled,s_aria2_binary:s.aria2_binary,s_aria2_port:s.aria2_rpc_port,s_download_hook:s.download_hook,s_agent_enabled:s.agent_enabled,s_agent_poll:s.agent_poll,s_anilist_refresh_poll:s.anilist_refresh_poll,s_sub_poll:s.subtitle_poll,s_delete_hours:s.delete_hours,s_anilist_enabled:s.anilist_enabled,s_anilist_client:s.anilist_client_id,s_anilist_token:s.anilist_token,s_anilist_auto:s.anilist_auto_progress,s_anilist_add_missing:s.anilist_add_if_missing,s_relations_release:s.relations_by_release_date!==false,s_anilist_threshold:s.anilist_threshold,s_anilist_max_remaining:s.anilist_max_remaining_minutes,s_jimaku:s.jimaku_api_key,s_ocr_image_subtitles:s.ocr_image_subtitles,s_use_container_chapters:s.use_container_chapters!==false,s_japanese_stt_fallback:s.japanese_stt_fallback!==false,s_subtitle_semantic_checks:!!s.subtitle_semantic_checks,s_auto_upgrade_subtitles:s.auto_upgrade_subtitles,s_sub_upgrade_min_gain:s.subtitle_upgrade_min_score_gain,s_sub_upgrade_hours:s.subtitle_upgrade_check_hours,s_sub_upgrade_max_checks:s.max_subtitle_upgrade_checks_per_run,s_llm_enabled:s.llm_enabled,s_llm_url:s.llm_url,s_llm_key:s.llm_api_key,s_llm_model:s.llm_model,s_shortcut_mpv_watched:s.shortcut_mpv_mark_watched,s_shortcut_mpv_anilist:s.shortcut_mpv_open_anilist,s_shortcut_mpv_correct:s.shortcut_mpv_correct_match,s_ln_jiten_key:ln.jiten_api_key||'',s_ln_jpdb_key:ln.jpdb_api_token||'',s_ln_backend:ln.study_backend||'jiten',s_mpv_study_plugin:selected,s_ln_auto_download:!!ln.auto_download_nyaa};for(const [id,v] of Object.entries(values)){const el=$(id);if(!el)continue;if(el.classList.contains('shortcut-recorder'))setShortcutRecorder(el,v);else if(el.type==='checkbox')el.checked=!!v;else el.value=v??'';}}
 function fillExtendedTorrentSettings(s){const values={s_aria2_seed_mode:s.aria2_seed_mode||'off',s_aria2_seed_ratio:s.aria2_seed_ratio??1,s_aria2_seed_time:s.aria2_seed_time_minutes??120,s_aria2_upload_limit:s.aria2_upload_limit_kib??0,s_aria2_vpn_interface:s.aria2_vpn_interface||'',s_aria2_vpn_kill_switch:!!s.aria2_vpn_kill_switch,s_shortcut_mpv_translate:s.shortcut_mpv_translate_subtitle||'Ctrl+t'};for(const [id,value] of Object.entries(values)){const el=$(id);if(!el)continue;if(el.classList.contains('shortcut-recorder'))setShortcutRecorder(el,value);else if(el.type==='checkbox')el.checked=!!value;else el.value=value??'';}}
 const LN_THEME_PRESETS={night:['#cfcdc8','#16181c'],washi:['#2b2a27','#faf7f0'],sepia:['#4a3a29','#f3e7d0'],paper:['#1a1a1a','#ffffff'],sumi:['#c9c7c2','#000000'],ai:['#cfdae3','#14202b'],moss:['#e2e6d8','#1c221b'],contrast:['#ffffff','#000000']};
 const LN_WORD_COLOR_PRESETS={balanced:['#f3f6fb','#f4bd63','#ff7d8c','#57d38c','#7d8795'],jiten:['#a566ef','#e8a020','#ff5940','#70c000','#969696'],jpdb:['#4b8dff','#55b87a','#e03030','#8acb88','#888888'],focus:['#4b8dff','#f4bd63','#ff7d8c','#57d38c','#7d8795'],underline:['#4b8dff','#e8a020','#e03030','#57d38c','#7d8795'],none:['#f3f6fb','#f4bd63','#ff7d8c','#57d38c','#7d8795']};
@@ -2588,7 +2710,6 @@ function settingsDisabledReason(sectionId=''){
     'settings-disk-fields':ru?'Сначала включите лимит диска':'Enable the disk limit first',
     'settings-nyaa-fields':ru?'Сначала включите Nyaa':'Enable Nyaa first',
     'settings-agent-fields':ru?'Сначала включите agent':'Enable the agent first',
-    'settings-energy-fields':ru?'Сначала включите диагностику энергопотребления':'Enable energy diagnostics first',
   };
   return reasons[sectionId]||(ru?'Недоступно при текущих настройках':'Unavailable with the current settings');
 }
@@ -2626,7 +2747,7 @@ function syncConditionalSettings(){
     'settings-anilist-fields':enabled('s_anilist_enabled'),'settings-anilist-auto-fields':enabled('s_anilist_enabled')&&enabled('s_anilist_auto'),
     'settings-llm-fields':enabled('s_llm_enabled'),'settings-qbt-fields':enabled('s_qbt_enabled'),'settings-aria2-fields':enabled('s_aria2_enabled'),
     'settings-playback-fields':enabled('s_playback_enabled'),'settings-disk-fields':enabled('s_disk_limit_enabled'),'settings-nyaa-fields':enabled('s_nyaa_enabled'),
-    'settings-agent-fields':enabled('s_agent_enabled'),'settings-energy-fields':enabled('s_energy_monitoring'),
+    'settings-agent-fields':enabled('s_agent_enabled'),
   };
   for(const [id,available] of Object.entries(availability)){const fields=$(id);if(!fields)continue;fields.classList.toggle('settings-unavailable',!available);fields.dataset.settingsAvailable=available?'1':'0';}
   for(const control of document.querySelectorAll('.conditional-settings input,.conditional-settings select,.conditional-settings textarea,.conditional-settings button')){const blocker=[...control.closest('.setting-block')?.querySelectorAll('.conditional-settings')||[]].filter(section=>section.contains(control)).find(section=>section.dataset.settingsAvailable==='0');control.disabled=!!blocker;setDisabledReason(control,blocker?settingsDisabledReason(blocker.id):'');}
@@ -2639,7 +2760,7 @@ function syncConditionalSettings(){
   syncAniListCredentialFlow('s_anilist_client','s_anilist_token');
   syncSettingsDisabledReasons();
 }
-function collectSettings(){const v=id=>$(id)?.value??'',c=id=>!!$(id)?.checked;return {language:v('s_language'),escape_exits_fullscreen:c('s_escape_fullscreen'),notifications_enabled:c('s_notifications'),jiten_developer_tools_confirmed:c('s_jiten_devtools_confirmed'),library_root:v('s_library'),watched_folders:v('s_watched_folders'),subtitle_folders:v('s_subtitle_folders'),disk_limit_enabled:c('s_disk_limit_enabled'),disk_limit_gb:Number(v('s_disk_limit_gb')),playback_enabled:true,playback_rewind:10,nyaa_enabled:c('s_nyaa_enabled'),torrents_enabled:!!ui.state.settings?.torrents_enabled,nyaa_url:v('s_nyaa_url'),proxy_mode:v('s_proxy_mode'),proxy_url:v('s_proxy_url'),search_hook:v('s_search_hook'),min_score:Number(ui.state.settings?.min_score??72),preferred_resolution:v('s_resolution'),require_japanese_audio:true,avoid_upscaled:true,only_trusted_groups:c('s_only_trusted_groups'),trusted_groups:v('s_groups'),preferred_groups:v('s_preferred_groups'),blocked_groups:v('s_blocked_groups'),auto_upgrade_downloaded:c('s_auto_upgrade_downloaded'),upgrade_min_score_gain:30,upgrade_check_hours:Number(v('s_upgrade_hours')),max_upgrade_checks_per_run:Number(v('s_upgrade_max_checks')),qbt_enabled:c('s_qbt_enabled'),qbt_url:v('s_qbt_url'),qbt_user:v('s_qbt_user'),qbt_password:v('s_qbt_password'),qbt_api_key:v('s_qbt_api'),aria2_enabled:c('s_aria2_enabled'),aria2_binary:'aria2c',aria2_rpc_port:Number(ui.state.settings?.aria2_rpc_port??6801),download_hook:v('s_download_hook'),agent_enabled:c('s_agent_enabled'),agent_poll:Number(v('s_agent_poll')),anilist_refresh_poll:Number(v('s_anilist_refresh_poll')),subtitle_poll:Number(v('s_sub_poll')),delete_hours:Number(v('s_delete_hours')),anilist_enabled:c('s_anilist_enabled'),anilist_client_id:v('s_anilist_client'),anilist_token:v('s_anilist_token'),anilist_auto_progress:c('s_anilist_auto'),anilist_add_if_missing:c('s_anilist_add_missing'),relations_by_release_date:c('s_relations_release'),anilist_threshold:85,anilist_max_remaining_minutes:10,jimaku_api_key:v('s_jimaku'),ocr_image_subtitles:c('s_ocr_image_subtitles'),use_container_chapters:true,japanese_stt_fallback:true,subtitle_semantic_checks:c('s_subtitle_semantic_checks'),auto_upgrade_subtitles:true,subtitle_upgrade_min_score_gain:25,subtitle_upgrade_check_hours:6,max_subtitle_upgrade_checks_per_run:2,llm_enabled:c('s_llm_enabled'),llm_url:v('s_llm_url'),llm_api_key:v('s_llm_key'),llm_model:v('s_llm_model'),shortcut_mpv_mark_watched:($('s_shortcut_mpv_watched')?.dataset.shortcutValue||''),shortcut_mpv_open_anilist:($('s_shortcut_mpv_anilist')?.dataset.shortcutValue||''),shortcut_mpv_correct_match:($('s_shortcut_mpv_correct')?.dataset.shortcutValue||''),energy_monitoring_enabled:c('s_energy_monitoring'),energy_sample_seconds:Number(v('s_energy_sample')),ln_jiten_api_key:v('s_ln_jiten_key'),ln_jpdb_api_token:v('s_ln_jpdb_key'),ln_study_backend:v('s_ln_backend'),ln_parse_ahead:v('s_ln_parse_ahead'),ln_auto_download_nyaa:c('s_ln_auto_download')};}
+function collectSettings(){const v=id=>$(id)?.value??'',c=id=>!!$(id)?.checked;return {language:v('s_language'),escape_exits_fullscreen:c('s_escape_fullscreen'),notifications_enabled:c('s_notifications'),jiten_developer_tools_confirmed:c('s_jiten_devtools_confirmed'),library_root:v('s_library'),watched_folders:v('s_watched_folders'),subtitle_folders:v('s_subtitle_folders'),disk_limit_enabled:c('s_disk_limit_enabled'),disk_limit_gb:Number(v('s_disk_limit_gb')),playback_enabled:true,playback_rewind:10,nyaa_enabled:c('s_nyaa_enabled'),torrents_enabled:!!ui.state.settings?.torrents_enabled,nyaa_url:v('s_nyaa_url'),proxy_mode:v('s_proxy_mode'),proxy_url:v('s_proxy_url'),search_hook:v('s_search_hook'),min_score:Number(ui.state.settings?.min_score??72),preferred_resolution:v('s_resolution'),require_japanese_audio:true,avoid_upscaled:true,only_trusted_groups:c('s_only_trusted_groups'),trusted_groups:v('s_groups'),preferred_groups:v('s_preferred_groups'),blocked_groups:v('s_blocked_groups'),auto_upgrade_downloaded:c('s_auto_upgrade_downloaded'),upgrade_min_score_gain:30,upgrade_check_hours:Number(v('s_upgrade_hours')),max_upgrade_checks_per_run:Number(v('s_upgrade_max_checks')),qbt_enabled:c('s_qbt_enabled'),qbt_url:v('s_qbt_url'),qbt_user:v('s_qbt_user'),qbt_password:v('s_qbt_password'),qbt_api_key:v('s_qbt_api'),aria2_enabled:c('s_aria2_enabled'),aria2_binary:'aria2c',aria2_rpc_port:Number(ui.state.settings?.aria2_rpc_port??6801),download_hook:v('s_download_hook'),agent_enabled:c('s_agent_enabled'),agent_poll:Number(v('s_agent_poll')),anilist_refresh_poll:Number(v('s_anilist_refresh_poll')),subtitle_poll:Number(v('s_sub_poll')),delete_hours:Number(v('s_delete_hours')),anilist_enabled:c('s_anilist_enabled'),anilist_client_id:v('s_anilist_client'),anilist_token:v('s_anilist_token'),anilist_auto_progress:c('s_anilist_auto'),anilist_add_if_missing:c('s_anilist_add_missing'),relations_by_release_date:c('s_relations_release'),anilist_threshold:85,anilist_max_remaining_minutes:10,jimaku_api_key:v('s_jimaku'),ocr_image_subtitles:c('s_ocr_image_subtitles'),use_container_chapters:true,japanese_stt_fallback:true,subtitle_semantic_checks:c('s_subtitle_semantic_checks'),auto_upgrade_subtitles:true,subtitle_upgrade_min_score_gain:25,subtitle_upgrade_check_hours:6,max_subtitle_upgrade_checks_per_run:2,llm_enabled:c('s_llm_enabled'),llm_url:v('s_llm_url'),llm_api_key:v('s_llm_key'),llm_model:v('s_llm_model'),shortcut_mpv_mark_watched:($('s_shortcut_mpv_watched')?.dataset.shortcutValue||''),shortcut_mpv_open_anilist:($('s_shortcut_mpv_anilist')?.dataset.shortcutValue||''),shortcut_mpv_correct_match:($('s_shortcut_mpv_correct')?.dataset.shortcutValue||''),ln_jiten_api_key:v('s_ln_jiten_key'),ln_jpdb_api_token:v('s_ln_jpdb_key'),ln_study_backend:v('s_ln_backend'),ln_auto_download_nyaa:c('s_ln_auto_download')};}
 const collectSettingsBase=collectSettings;
 collectSettings=function(){const base=collectSettingsBase(),v=id=>$(id)?.value??'',c=id=>!!$(id)?.checked;return {...base,aria2_seed_mode:v('s_aria2_seed_mode'),aria2_seed_ratio:Number(v('s_aria2_seed_ratio')),aria2_seed_time_minutes:Number(v('s_aria2_seed_time')),aria2_upload_limit_kib:Number(v('s_aria2_upload_limit')),aria2_vpn_interface:v('s_aria2_vpn_interface'),aria2_vpn_kill_switch:c('s_aria2_vpn_kill_switch'),shortcut_mpv_translate_subtitle:($('s_shortcut_mpv_translate')?.dataset.shortcutValue||''),mpv_study_plugin:v('s_mpv_study_plugin')};};
 function onboardingInitialDraft(){const x=ui.state.settings,plugins=x.mpv_study_plugins||{};const hasConfigured=!!x.subtitle_folder;return {profile:'full',language:x.language||'en',jimaku_api_key:x.jimaku_api_key||'',ln_jiten_api_key:x.light_novels?.jiten_api_key||'',ln_jpdb_api_token:x.light_novels?.jpdb_api_token||'',mpv_study_plugin:x.mpv_study_plugin==='auto'?(plugins.mpv_study?.effective||'jiten'):(x.mpv_study_plugin||'jiten'),install_jiten_mpv:false,jiten_developer_tools_confirmed:!!x.jiten_developer_tools_confirmed,anilist_enabled:!!x.anilist_enabled,anilist_client_id:x.anilist_client_id||'',anilist_token:x.anilist_token||'',nyaa_enabled:x.nyaa_enabled!==false,agent_enabled:x.agent_enabled!==false,qbt_enabled:!!x.qbt_enabled,qbt_url:x.qbt_url||'http://127.0.0.1:8080',qbt_user:x.qbt_user||'admin',qbt_password:x.qbt_password||'',qbt_api_key:x.qbt_api_key||'',aria2_enabled:x.aria2_enabled!==false,subtitle_folder_enabled:hasConfigured||!x.onboarding_completed,subtitle_folder:x.subtitle_folder||x.default_subtitle_folder||''};}
@@ -2913,7 +3034,7 @@ function showAnimeMenu(mediaId,planned,x,y,suppressDiagnosis=false,fallback={}){
   ui.contextAnime={...a,planned:!!planned,readinessDiagnosisSuppressed:!!suppressDiagnosis};
   const menu=$('contextMenu');
   const diagnose=!planned&&!suppressDiagnosis&&needsReadinessDiagnosis(a)?`<button data-context-action="diagnose">${t('action.whyNotReady')}</button>`:'';
-  const debug=mediaInHomeSection('caught_up',a.media_id)?'':`<button data-context-action="debug">${t('action.debugAnime')}</button>`;
+  const debug=(planned||mediaInHomeSection('caught_up',a.media_id))?'':`<button data-context-action="debug">${t('action.debugAnime')}</button>`;
   const downloads=(ui.state.downloads||[]).some(item=>Number(item.media_id)===Number(a.media_id))?`<button data-context-action="downloads">${t('action.openDownloads')}</button>`:'';
   const unreleased=String(a.media_status||'').trim().toUpperCase()==='NOT_YET_RELEASED';
   const franchiseQueue=!unreleased&&a.queue_franchise_available?`<button data-context-action="queue-franchise">${t('action.createFranchiseQueue')}</button>`:'';
@@ -2931,6 +3052,67 @@ function positionContextMenu(menu,x,y){
   const rect=menu.getBoundingClientRect();
   menu.style.left=`${Math.max(8,Math.min(x,window.innerWidth-rect.width-8))}px`;
   menu.style.top=`${Math.max(8,Math.min(y,window.innerHeight-rect.height-8))}px`;
+}
+// pudge-sidebar-context-v1
+function showSidebarContextMenu(kind,x,y){
+  hideContextMenu();
+  const menu=$('contextMenu');
+  if(kind==='refresh'){
+    menu.innerHTML=`
+      <button data-sidebar-context-action="subtitles-new">${ui.lang==='ru'?'Искать субтитры':'Find subtitles'}</button>
+      <button data-sidebar-context-action="anilist">${ui.lang==='ru'?'Обновить AniList':'Update AniList'}</button>
+      <button data-sidebar-context-action="scan-local">${ui.lang==='ru'?'Пересканировать локальные файлы':'Rescan local files'}</button>
+      <button data-sidebar-context-action="releases">${ui.lang==='ru'?'Искать новые эпизоды':'Find new episodes'}</button>`;
+  }else{
+    const enabled=!!ui.state?.settings?.torrents_enabled;
+    menu.innerHTML=`
+      <button data-sidebar-context-action="torrent-toggle">${enabled?(ui.lang==='ru'?'Отключить торрент-трафик':'Disable torrent traffic'):(ui.lang==='ru'?'Включить торрент-трафик':'Enable torrent traffic')}</button>
+      <button data-sidebar-context-action="downloads">${ui.lang==='ru'?'Открыть Downloads':'Open Downloads'}</button>`;
+  }
+  positionContextMenu(menu,x,y);
+}
+async function handleSidebarContextAction(action){
+  hideContextMenu();
+  try{
+    if(action==='subtitles-new'){
+      setStatus(ui.lang==='ru'?'Ищу субтитры для новых серий…':'Finding subtitles for new episodes…');
+      const r=await pywebview.api.search_new_subtitles();
+      if(r?.state){ui.state=r.state;renderDataPages();}
+      const eligible=Number(r?.eligible||0),processed=Number(r?.processed||0);
+      if(!eligible)toast(ui.lang==='ru'?'Новых серий для поиска субтитров нет':'No new episodes need subtitle search');
+      else if(r?.queued)toast(ui.lang==='ru'?`Новые серии в очереди субтитров: ${eligible}`:`New episodes queued for subtitles: ${eligible}`);
+      else toast(ui.lang==='ru'?`Субтитры: обработано ${processed} из ${eligible}`:`Subtitles: processed ${processed} of ${eligible}`);
+      setStatus(t('status.ready'));
+      if((r?.queued||processed<eligible)&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,500);
+      return;
+    }
+    if(action==='anilist'){await syncAniList(false);return;}
+    if(action==='scan-local'){
+      setStatus(t('status.scanning'));
+      ui.state=await pywebview.api.scan_library();
+      renderDataPages();
+      setStatus(t('status.ready'));
+      toast(ui.lang==='ru'?'Локальные файлы пересканированы':'Local files rescanned');
+      return;
+    }
+    if(action==='releases'){
+      setStatus(ui.lang==='ru'?'Ищу новые эпизоды…':'Finding new episodes…');
+      const r=await pywebview.api.search_new_releases();
+      if(r?.state){ui.state=r.state;renderDataPages();}
+      setStatus(t('status.ready'));
+      if(r?.warning)toast(t('error.generic',{error:r.warning}));
+      else toast(Number(r?.started||0)>0
+        ?(ui.lang==='ru'?`Добавлено новых загрузок/ожиданий: ${Number(r.started)}`:`New downloads/waiting items: ${Number(r.started)}`)
+        :(ui.lang==='ru'?'Новых эпизодов не найдено':'No new episodes found'));
+      if(Number(r?.started||0)>0&&!ui.foregroundPollTimer)ui.foregroundPollTimer=setTimeout(pollForegroundWork,1000);
+      return;
+    }
+    if(action==='torrent-toggle'){$('torrentToggleButton')?.click();return;}
+    if(action==='downloads'){await openDownloadCenter(null);return;}
+  }catch(error){
+    setStatus(t('status.ready'));
+    toast(t('error.generic',{error:error.message||error}));
+  }
 }
 function showRelationMenu(node,x,y){
   const listStatus=String(node.dataset.listStatus||'').toUpperCase();
@@ -3333,6 +3515,7 @@ document.addEventListener('click',async e=>{
   if(e.target.id==='openJitenDeveloperTools'||e.target.id==='onboardingOpenJitenDeveloperTools'){await pywebview.api.open_developer_tools_settings();return;}
   const suggestion=e.target.closest('[data-planning-suggestion]');
   if(suggestion){e.preventDefault();suggestion.disabled=true;try{const r=await pywebview.api.add_media_to_planning(Number(suggestion.dataset.planningSuggestion),suggestion.dataset.mediaKind||'anime');if(r.state)ui.state=r.state;if(r.light_novel_state)ui.lnState=r.light_novel_state;await loadLightNovels(true);buildPlannedOnce();schedulePlannedSuggestions();toast(t('toast.addedPlanning'));}catch(err){toast(t('error.generic',{error:err.message||err}));}finally{suggestion.disabled=false;}return;}
+  const sidebarContextAction=e.target.closest('[data-sidebar-context-action]');if(sidebarContextAction){await handleSidebarContextAction(sidebarContextAction.dataset.sidebarContextAction);return;}
   const contextAction=e.target.closest('[data-context-action]');if(contextAction){await handleContextAction(contextAction.dataset.contextAction);return;}
   if(!e.target.closest('#contextMenu'))hideContextMenu();
   const action=e.target.closest('[data-action]');if(action){await handleAction(action);return;}
@@ -3354,6 +3537,12 @@ function openAnimeContextFromPointer(e){
   return true;
 }
 document.addEventListener('contextmenu',e=>{
+  const sidebar=e.target.closest?.('#refreshAll,#torrentToggleButton');
+  if(sidebar){
+    e.preventDefault();e.stopImmediatePropagation();
+    showSidebarContextMenu(sidebar.id==='refreshAll'?'refresh':'torrents',e.clientX,e.clientY);
+    return;
+  }
   if(openAnimeContextFromPointer(e)){e.preventDefault();e.stopImmediatePropagation();}
 },true);
 document.addEventListener('pointerup',async e=>{
@@ -3365,8 +3554,10 @@ document.addEventListener('pointerup',async e=>{
   e.preventDefault();e.stopImmediatePropagation();
   await startPlay(card.dataset.path,true);
 },true);
+// pudge-v0.7.23-series-primary-click-select-all-v1
+document.addEventListener('click',e=>{const series=e.target.closest?.('[data-ln-series-key]'),volume=e.target.closest?.('[data-ln-book]');if(!series||volume||$('lnReaderShell')?.classList.contains('open')||e.target.closest?.('button,a,input,select,textarea,[data-action]'))return;const group=lnSeriesForKey(series.dataset.lnSeriesKey);if(!group)return;e.preventDefault();e.stopImmediatePropagation();toggleLnSeriesSelection(group);},true);
 document.addEventListener('click',e=>{const entry=e.target.closest?.('[data-ln-book]');if(!entry||!e.metaKey||$('lnReaderShell')?.classList.contains('open'))return;e.preventDefault();e.stopImmediatePropagation();toggleLnSelection(Number(entry.dataset.lnBook));},true);
-document.addEventListener('contextmenu',e=>{const entry=e.target.closest('[data-ln-book]');if(!entry)return;const book=(ui.lnState?.books||[]).find(item=>Number(item.id)===Number(entry.dataset.lnBook));if(!book)return;e.preventDefault();e.stopPropagation();showLnBookMenu(book,e.clientX,e.clientY);});
+document.addEventListener('contextmenu',e=>{const entry=e.target.closest?.('[data-ln-book]');if(entry){const book=(ui.lnState?.books||[]).find(item=>Number(item.id)===Number(entry.dataset.lnBook));if(!book)return;e.preventDefault();e.stopPropagation();showLnBookMenu(book,e.clientX,e.clientY);return;}const seriesNode=e.target.closest?.('[data-ln-series-key]');if(!seriesNode)return;const group=lnSeriesForKey(seriesNode.dataset.lnSeriesKey);if(!group)return;e.preventDefault();e.stopPropagation();showLnSeriesMenu(group,e.clientX,e.clientY);});
 document.addEventListener('mouseover',e=>{const relation=e.target.closest?.('[data-relation-node="1"]');if(relation){if(!relation.contains(e.relatedTarget))showRelationPreview(relation);return;}const title=e.target.closest?.('[data-full-title],[data-tooltip]');if(!title||title.contains(e.relatedTarget))return;showTitleTooltip(title);});
 document.addEventListener('mouseout',e=>{const relation=e.target.closest?.('[data-relation-node="1"]');if(relation){if(!relation.contains(e.relatedTarget))hideRelationPreview();return;}const title=e.target.closest?.('[data-full-title],[data-tooltip]');if(!title||title.contains(e.relatedTarget))return;hideTitleTooltip();});
 window.addEventListener('blur',()=>{hideContextMenu();hideTitleTooltip();hideRelationPreview();setWindowActivity(false);});
@@ -3455,7 +3646,29 @@ document.addEventListener('click',async e=>{
   if(e.target.id==='anilistAuthorize')await openAniListTokenPage('s_anilist_client','s_anilist_token');
   if(e.target.id==='onboardingAniListAuthorize')await openAniListTokenPage('o_anilist_client','o_anilist_token');
   if(e.target.id==='syncAniList')await syncAniList(false);
-  if(e.target.id==='saveSettings'){e.target.disabled=true;try{const values=collectSettings();const r=await pywebview.api.save_settings(values);if(r.state)ui.state=r.state;else ui.state.settings=r.settings;ui.state.settings=r.settings||ui.state.settings;ui.lang=ui.state.settings.language||'en';if(ui.lnState)ui.lnState.settings=ui.state.settings.light_novels||ui.lnState.settings;renderAll();setPage('settings');toast(t('toast.settingsSaved'));if(r.recheck_subtitles){ui.emptyPolls=0;if(ui.foregroundPollTimer)clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=setTimeout(pollForegroundWork,0);}}catch(err){toast(t('error.generic',{error:err.message||err}));}finally{const btn=$('saveSettings');if(btn)btn.disabled=false;}}
+  if(e.target.id==='saveSettings'){e.target.disabled=true;try{
+    const previous=ui.state?.settings||{},previousLn=previous.light_novels||{},values=collectSettings(),changedCredentials=[];
+    const changedSecret=(value,oldValue)=>String(value??'')!==String(oldValue??'');
+    if(changedSecret(values.jimaku_api_key,previous.jimaku_api_key))changedCredentials.push('jimaku');
+    if(changedSecret(values.anilist_token,previous.anilist_token))changedCredentials.push('anilist');
+    if(changedSecret(values.ln_jiten_api_key,previousLn.jiten_api_key))changedCredentials.push('jiten');
+    if(changedSecret(values.ln_jpdb_api_token,previousLn.jpdb_api_token))changedCredentials.push('jpdb');
+    const r=await pywebview.api.save_settings(values);
+    if(r.state)ui.state=r.state;else ui.state.settings=r.settings;
+    ui.state.settings=r.settings||ui.state.settings;ui.lang=ui.state.settings.language||'en';
+    if(ui.lnState)ui.lnState.settings=ui.state.settings.light_novels||ui.lnState.settings;
+    renderAll();setPage('settings');toast(t('toast.settingsSaved'));
+    if(changedCredentials.length){
+      try{
+        const checks=await pywebview.api.test_saved_credentials(changedCredentials);
+        const messages=(checks||[]).map(credentialCheckMessage).filter(Boolean);
+        if(messages.length)setTimeout(()=>toast(messages.join(' · ')),180);
+      }catch(checkError){
+        setTimeout(()=>toast(ui.lang==='ru'?`Ключ сохранён, но проверка не выполнена: ${checkError.message||checkError}`:`Key saved, but validation failed: ${checkError.message||checkError}`),180);
+      }
+    }
+    if(r.recheck_subtitles){ui.emptyPolls=0;if(ui.foregroundPollTimer)clearTimeout(ui.foregroundPollTimer);ui.foregroundPollTimer=setTimeout(pollForegroundWork,0);}
+  }catch(err){toast(t('error.generic',{error:err.message||err}));}finally{const btn=$('saveSettings');if(btn)btn.disabled=false;}}
   if(e.target.id==='presetNyaaSocks'){$('s_proxy_mode').value='proxy_only';$('s_proxy_url').value='socks5://[::1]:1080';toast(t('toast.socksPreset'));}
   if(e.target.id==='testNyaaProxy'){e.target.disabled=true;setStatus(t('status.nyaaTest'));try{const r=await pywebview.api.test_nyaa_proxy(collectSettings());toast(`Nyaa: ${r.count}`);setStatus(t('status.ready'));}catch(err){toast(t('error.generic',{error:err.message||err}));setStatus(t('error.generic',{error:err.message||err}));}finally{e.target.disabled=false;}}
   if(e.target.id==='testQbt'){e.target.disabled=true;try{const values=collectSettings();const r=await pywebview.api.test_qbittorrent(values);if(r.url)$('s_qbt_url').value=r.url;toast(`qBittorrent ${r.version}; ${r.url}`);}catch(err){toast(t('error.generic',{error:err.message||err}));}finally{e.target.disabled=false;}}
@@ -3512,6 +3725,159 @@ document.addEventListener('pointerout',event=>{
   if(!cover||cover.contains(event.relatedTarget))return;
   delete cover.dataset.polychromeHoverActive;
 });
+// pudge-ui-v0.7.23-global-search-recent-v1
+let globalSearchRows=[],globalSearchTimer=null,globalSearchRequest=0;
+
+function ensureGlobalSearchOverlay(){
+  let overlay=$('globalSearchOverlay');
+  if(overlay)return overlay;
+  overlay=document.createElement('div');
+  overlay.id='globalSearchOverlay';
+  overlay.hidden=true;
+  overlay.style.cssText='position:fixed;inset:0;z-index:10120;background:rgba(2,7,13,.72);backdrop-filter:blur(9px);display:grid;place-items:start center;padding-top:min(15vh,120px)';
+  overlay.innerHTML=`<div style="width:min(720px,calc(100vw - 36px));max-height:min(72vh,720px);display:flex;flex-direction:column;overflow:hidden;border:1px solid #405675;border-radius:14px;background:#101b2a;box-shadow:0 24px 80px rgba(0,0,0,.55)">
+    <input id="globalSearchInput" type="search" autocomplete="off" spellcheck="false" placeholder="${ui.lang==='ru'?'Поиск по Pudge…':'Search Pudge…'}" style="width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;background:#132238;color:var(--text);padding:15px 17px;font-size:17px;outline:none">
+    <div id="globalSearchResults" style="min-height:74px;overflow:auto;padding:8px"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+
+  const input=$('globalSearchInput');
+  input.addEventListener('input',()=>{
+    if(globalSearchTimer)clearTimeout(globalSearchTimer);
+    globalSearchTimer=setTimeout(()=>void runGlobalSearch(input.value),180);
+  });
+  input.addEventListener('keydown',event=>{
+    if(event.key==='Escape'){event.preventDefault();closeGlobalSearch();return;}
+    if(event.key==='Enter'){
+      const first=$('globalSearchResults')?.querySelector('[data-global-open-index]');
+      if(first){event.preventDefault();first.click();}
+    }
+  });
+  overlay.addEventListener('pointerdown',event=>{
+    if(event.target===overlay)closeGlobalSearch();
+  });
+  overlay.addEventListener('click',async event=>{
+    const play=event.target.closest?.('[data-global-play-index]');
+    const open=event.target.closest?.('[data-global-open-index]');
+    if(!play&&!open)return;
+    event.preventDefault();event.stopPropagation();
+    const index=Number((play||open).dataset[play?'globalPlayIndex':'globalOpenIndex']);
+    const item=globalSearchRows[index];
+    if(!item)return;
+    if(play){
+      closeGlobalSearch();
+      await startPlay(String(item.video_path||''),true);
+      return;
+    }
+    await openGlobalSearchResult(item);
+  });
+  return overlay;
+}
+
+function globalSearchKindLabel(item){
+  if(item.kind==='episode')return ui.lang==='ru'?`Аниме · серия ${item.episode}`:`Anime · episode ${item.episode}`;
+  if(item.kind==='anime')return ui.lang==='ru'?'Аниме':'Anime';
+  if(item.kind==='light_novel')return ui.lang==='ru'?'Ранобэ':'Light Novel';
+  if(item.kind==='manga')return ui.lang==='ru'?'Манга':'Manga';
+  return String(item.kind||'');
+}
+
+function renderGlobalSearchResults(rows,query=''){
+  globalSearchRows=Array.isArray(rows)?rows:[];
+  const root=$('globalSearchResults');if(!root)return;
+  if(!globalSearchRows.length){
+    root.innerHTML=`<div class="subtle" style="padding:18px 10px;text-align:center">${query?(ui.lang==='ru'?'Ничего не найдено':'Nothing found'):(ui.lang==='ru'?'Начните вводить название':'Type a title')}</div>`;
+    return;
+  }
+  root.innerHTML=globalSearchRows.map((item,index)=>{
+    const cover=item.cover?`<img src="${escapeHtml(item.cover)}" alt="" style="width:42px;height:58px;object-fit:cover;border-radius:5px;background:#20334f">`:`<div style="width:42px;height:58px;border-radius:5px;background:#20334f"></div>`;
+    const matched=item.matched_title&&String(item.matched_title)!==String(item.title)?`<div class="subtle" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${ui.lang==='ru'?'Совпало: ':'Matched: '}${escapeHtml(item.matched_title)}</div>`:'';
+    const volume=item.volume?` · ${ui.lang==='ru'?'том':'vol.'} ${escapeHtml(item.volume)}`:'';
+    const play=item.video_path?`<button data-global-play-index="${index}" title="${ui.lang==='ru'?'Продолжить / открыть':'Resume / open'}" style="align-self:center">▶</button>`:'';
+    return `<div data-global-open-index="${index}" style="display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:11px;align-items:center;padding:8px;border-radius:9px;cursor:pointer">
+      ${cover}<div style="min-width:0"><strong style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(item.title||'')}</strong><div class="subtle" style="font-size:11px">${escapeHtml(globalSearchKindLabel(item))}${volume}</div>${matched}</div>${play}
+    </div>`;
+  }).join('');
+}
+
+async function runGlobalSearch(query){
+  const cleaned=String(query||'').trim(),request=++globalSearchRequest;
+  if(!cleaned){renderGlobalSearchResults([],'');return;}
+  const root=$('globalSearchResults');
+  if(root)root.innerHTML=`<div class="subtle" style="padding:18px 10px;text-align:center">${ui.lang==='ru'?'Ищу…':'Searching…'}</div>`;
+  try{
+    const rows=await pywebview.api.global_media_search(cleaned,40);
+    if(request!==globalSearchRequest)return;
+    renderGlobalSearchResults(rows,cleaned);
+  }catch(error){
+    if(request!==globalSearchRequest)return;
+    if(root)root.innerHTML=`<div class="subtle" style="padding:18px 10px;text-align:center">${escapeHtml(error.message||error)}</div>`;
+  }
+}
+
+function openGlobalSearch(){
+  const overlay=ensureGlobalSearchOverlay();
+  overlay.hidden=false;
+  overlay.style.display='grid';
+  const input=$('globalSearchInput');
+  input.placeholder=ui.lang==='ru'?'Поиск по Pudge…':'Search Pudge…';
+  requestAnimationFrame(()=>{input.focus();input.select();});
+  if(input.value.trim())void runGlobalSearch(input.value);else renderGlobalSearchResults([],'');
+}
+
+function closeGlobalSearch(){
+  const overlay=$('globalSearchOverlay');if(!overlay)return;
+  overlay.hidden=true;overlay.style.display='none';
+  globalSearchRequest++;
+}
+
+async function openGlobalSearchResult(item){
+  if(item.kind==='episode'){
+    closeGlobalSearch();
+    await startPlay(String(item.video_path||''),true);
+    return;
+  }
+  if(item.kind==='light_novel'){
+    closeGlobalSearch();
+    setPage('lightnovels');
+    await openLightNovel(Number(item.local_id));
+    return;
+  }
+  if(item.kind==='manga'){
+    closeGlobalSearch();
+    setPage('manga');
+    await window.PudgeMangaReaderV2?.renderLibrary?.();
+    await window.PudgeMangaReaderV2?.openBook?.(Number(item.local_id));
+    return;
+  }
+  if(item.kind==='anime'){
+    closeGlobalSearch();
+    if(item.page==='planned'){
+      setPage('planned');
+      const search=$('plannedSearch');
+      if(search){search.value=item.title||'';search.dispatchEvent(new Event('input',{bubbles:true}));}
+      return;
+    }
+    setPage('current');
+    requestAnimationFrame(()=>{
+      const card=$('currentContent')?.querySelector(`[data-media-id="${Number(item.media_id)}"]`);
+      if(card){card.scrollIntoView({block:'center'});card.classList.add('drop-focus');}
+      else if(item.site_url)void pywebview.api.open_url(item.site_url);
+    });
+  }
+}
+
+function credentialCheckMessage(check){
+  const service=String(check?.service||'API'),status=String(check?.status||'');
+  if(status==='ok')return `✓ ${service}: ${ui.lang==='ru'?'ключ работает':'key works'}`;
+  if(status==='empty')return `⚠ ${service}: ${ui.lang==='ru'?'тестовый запрос ничего не вернул — возможно, ключ некорректный или доступ ограничен':'test request returned nothing — the key may be invalid or access may be limited'}`;
+  if(status==='invalid')return `⚠ ${service}: ${ui.lang==='ru'?'ключ отклонён сервисом':'key was rejected by the service'}`;
+  if(status==='missing')return `${service}: ${ui.lang==='ru'?'ключ удалён':'key removed'}`;
+  if(status==='rate_limited')return `⚠ ${service}: ${ui.lang==='ru'?'проверка отложена из-за rate limit':'validation was blocked by rate limiting'}`;
+  if(status==='unreachable')return `⚠ ${service}: ${ui.lang==='ru'?'не удалось проверить из-за сети':'could not be checked because of a network error'}`;
+  return `⚠ ${service}: ${ui.lang==='ru'?'не удалось проверить ключ':'could not validate the key'}`;
+}
+
 function editableShortcutTarget(target){return !!target?.closest?.('input,textarea,select,[contenteditable="true"]');}
 document.addEventListener('click',event=>{const recorder=event.target.closest?.('.shortcut-recorder');if(recorder){event.preventDefault();event.stopPropagation();startShortcutCapture(recorder);return;}if(ui.shortcutCaptureTarget)stopShortcutCapture();},true);
 document.addEventListener('keydown',event=>{
@@ -3534,9 +3900,26 @@ document.addEventListener('keydown',event=>{
   const lnAudioShortcutActive=$('lnReaderShell')?.classList.contains('open')&&ui.lnPairedExpanded&&ui.lnPairedState?.alignment?.ready&&!event.metaKey&&!event.ctrlKey&&!event.altKey&&!event.shiftKey&&!event.target.closest?.('input,textarea,select,button,[contenteditable="true"]');
   if(lnAudioShortcutActive&&event.code==='Space'){event.preventDefault();event.stopPropagation();if(!event.repeat)void toggleLnPairedPlayback();return;}
   if(lnAudioShortcutActive&&Object.prototype.hasOwnProperty.call(lnAudioShortcuts,event.key)){event.preventDefault();event.stopPropagation();if(!event.repeat)void seekLnPairedRelative(lnAudioShortcuts[event.key]);return;}
+  const lnFontShortcut=$('lnReaderShell')?.classList.contains('open')&&event.metaKey&&!event.ctrlKey&&!event.altKey;
+  if(lnFontShortcut&&(event.code==='Minus'||event.key==='-')){
+    event.preventDefault();event.stopPropagation();
+    if(!event.repeat){const current=Number(ui.lnState?.settings?.reader_font_size||ui.lnChapter?.settings?.reader_font_size||30),next=Math.max(14,Math.min(72,current-2));if($('lnrFontSize'))$('lnrFontSize').value=next;applyLnReaderSettingsPatch({reader_font_size:next},true);}
+    return;
+  }
+  if(lnFontShortcut&&(event.code==='Equal'||event.key==='+'||event.key==='=')){
+    event.preventDefault();event.stopPropagation();
+    if(!event.repeat){const current=Number(ui.lnState?.settings?.reader_font_size||ui.lnChapter?.settings?.reader_font_size||30),next=Math.max(14,Math.min(72,current+2));if($('lnrFontSize'))$('lnrFontSize').value=next;applyLnReaderSettingsPatch({reader_font_size:next},true);}
+    return;
+  }
+  if(lnFontShortcut&&event.code==='Digit0'){
+    event.preventDefault();event.stopPropagation();
+    if(!event.repeat){if($('lnrFontSize'))$('lnrFontSize').value=30;applyLnReaderSettingsPatch({reader_font_size:30},true);}
+    return;
+  }
   const standard=event.metaKey&&!event.ctrlKey&&!event.altKey&&!event.shiftKey;
   if(standard&&/^[1-9]$/.test(event.key)){const buttons=[...document.querySelectorAll('.nav button[data-page]')].filter(button=>button.offsetParent!==null||button.getClientRects().length);const button=buttons[Number(event.key)-1];if(button){event.preventDefault();event.stopPropagation();setPage(button.dataset.page);return;}}
-  if(standard&&String(event.key||'').toLowerCase()==='f'){if(ui.page==='settings'){event.preventDefault();event.stopPropagation();const search=$('settingsSearch');if(search){search.focus();search.select();}return;}if(ui.page==='planned'){event.preventDefault();event.stopPropagation();const search=$('plannedSearch');if(search){search.focus();search.select();}return;}}
+  if(standard&&String(event.key||'').toLowerCase()==='f'){event.preventDefault();event.stopPropagation();openGlobalSearch();return;}
+  if(event.key==='Escape'&&!$('globalSearchOverlay')?.hidden){event.preventDefault();event.stopPropagation();closeGlobalSearch();return;}
   void handleEscape(event);
 },true);
 window.addEventListener('resize',()=>{hideTitleTooltip();applyOverflowTitleTooltips();});
@@ -3555,15 +3938,18 @@ document.addEventListener('click',async e=>{
   const target=e.target.closest('[data-ln-action],[data-ln-context-action],[data-ln-token],[data-ln-review],[data-ln-bookmark-here],[data-ln-anilist-url],#lnImport,#lnReaderClose,#lnReaderAppearanceToggle,#lnPairedAudio,[data-ln-audio-seek],#lnFinishVolume,#lnAddCard,#lnPlayFromWord,[data-ln-release],[data-ln-anilist-result],[data-ln-link-audio],[data-ln-unlink-audio]');if(!target)return;
   try{
     if(target.dataset.lnContextAction){
-      const book=ui.lnContextBook;hideContextMenu();if(!book)return;const action=target.dataset.lnContextAction;
+      const book=ui.lnContextBook,series=ui.lnContextSeries;hideContextMenu();if(!book)return;const action=target.dataset.lnContextAction;
+      if(action==='select-series'&&series){toggleLnSeriesSelection(series);return;}
+      if(action==='read-series'&&series){const current=currentSeriesBook(series)||series[0];await openLightNovel(Number(current.id));return;}
       if(action==='select'){toggleLnSelection(Number(book.id));return;}
       if(action==='read'){await openLightNovel(Number(book.id));return;}
       if(action==='open-anilist'&&book.anilist_id){await pywebview.api.open_url(`https://anilist.co/manga/${Number(book.anilist_id)}`);return;}
-      if(action==='score'&&book.anilist_id){window.showLiteratureScoreModal('novel',book.id,book.anilist_id,book.series_title||book.title,book.anilist_user_score);return;}
+      if(action==='score-series'&&series&&book.anilist_id){window.showLiteratureScoreModal('novel',book.id,book.anilist_id,book.series_title||book.title,book.anilist_user_score);return;}
       if(action==='anilist-search'){await showLnAniListSearch(Number(book.id),book.title||'');return;}
       if(action==='finish'){if(!await pudgeConfirm(ui.lang==='ru'?'Завершить этот том?':'Finish this volume?'))return;await pywebview.api.light_novel_finish_volume(Number(book.id));await loadLightNovels(true);toast(ui.lang==='ru'?'Отмечено прочитанным':'Marked read');return;}
       if(action==='unfinish'){await pywebview.api.light_novel_set_finished(Number(book.id),false);await loadLightNovels(true);toast(ui.lang==='ru'?'Метка Finished убрана':'Finished removed');return;}
       if(action==='reset-position'){if(!await pudgeConfirm(ui.lang==='ru'?'Сбросить закладку и прогресс этого тома?':'Reset this volume bookmark and reading progress?'))return;const result=await pywebview.api.light_novel_reset_position(Number(book.id));ui.lnState=result.state;renderLightNovels();toast(ui.lang==='ru'?'Прогресс сброшен':'Reading progress reset');return;}
+      if(action==='delete-series'&&series){if(!await pudgeConfirm(ui.lang==='ru'?'Удалить все тома этой LN из библиотеки Pudge? Исходные файлы останутся на диске.':'Remove all volumes of this LN from Pudge? Source files will stay on disk.'))return;deleteLnBooksOptimistic(series.map(item=>Number(item.id)));return;}
       if(action==='delete'){if(!await pudgeConfirm(ui.lang==='ru'?'Удалить книгу из библиотеки Pudge? Исходный файл останется на диске.':'Remove this book from Pudge library? The source file will stay on disk.'))return;deleteLnBooksOptimistic([Number(book.id)]);return;}
     }
     if(target.dataset.lnLinkAudio){await pywebview.api.light_novel_link_audiobook(Number(target.dataset.lnBookId),Number(target.dataset.lnLinkAudio));$('modalBackdrop').classList.remove('open');ui.lnBook=await pywebview.api.light_novel_open(Number(target.dataset.lnBookId));syncLnPairedTray(ui.lnBook.paired_audio||{});pollLnPaired();toast(ui.lang==='ru'?'Аудиокнига связана':'Audiobook linked');return;}

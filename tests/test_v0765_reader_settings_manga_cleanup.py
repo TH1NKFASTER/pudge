@@ -72,12 +72,44 @@ def test_settings_categories_match_new_contract() -> None:
     assert "reading: 'Reading'" not in settings
     assert "reading: 'Чтение'" not in settings
     assert 'data-settings-category="essential"><h3>${ui.lang===\'ru\'?\'Jiten / JPDB\'' in html
-    parse_pos = html.index('id="s_ln_parse_ahead"')
-    advanced_pos = html.rfind('data-settings-category="advanced"', 0, parse_pos)
-    assert advanced_pos >= 0
+    assert 'id="s_ln_parse_ahead"' not in html
+    assert 'settings.lnParseAhead' not in html[html.index('function renderSettings'):html.index('function fillSettings')]
+    assert 'id="s_energy_monitoring"' not in html
+    assert 'id="s_energy_sample"' not in html
     manga_pos = html.index('id="mangaOcrStatus"')
     essential_pos = html.rfind('data-settings-category="essential"', 0, manga_pos)
     assert essential_pos >= 0
     assert "status.state === 'ready' ? 'advanced' : 'essential'" in media
     assert "block.dataset.settingsCategory = block.dataset.settingsCategory || categoryFor(block)" in settings
     assert "PudgeSettings = {enhance, focusAction, refresh}" in settings
+
+
+def test_library_selection_clears_when_leaving_ln_or_manga_page() -> None:
+    html = HTML.read_text(encoding="utf-8")
+    set_page = html[html.index("function setPage(page,force=false)"):html.index("function updateCount()")]
+    assert "const previousPage=ui.page" in set_page
+    assert "previousPage==='lightnovels'&&page!==previousPage)clearLnSelection()" in set_page
+    assert "previousPage==='manga'&&page!==previousPage)window.PudgeMangaReaderV2?.clearSelection?.()" in set_page
+
+
+def test_manga_percentage_chip_uses_same_data_tooltip_contract_as_progress_bar() -> None:
+    manga = MANGA.read_text(encoding="utf-8")
+    assert '? `<span data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}">${esc(value)}</span>`' in manga
+    assert 'class="ln-card-progress" data-tooltip="${esc(progressTitle)}"' in manga
+
+
+def test_ln_parse_ahead_is_automatic_next_and_energy_diagnostics_are_always_on() -> None:
+    html = HTML.read_text(encoding="utf-8")
+    light_novels = (ROOT / "pudge/light_novels.py").read_text(encoding="utf-8")
+    config = (ROOT / "pudge/config.py").read_text(encoding="utf-8")
+    assert 'id="s_ln_parse_ahead"' not in html
+    assert 'parse_ahead="next",  # automatic: current + next chapter' in light_novels
+    assert '"parse_ahead": "next",' in light_novels
+    assert 'id="s_energy_monitoring"' not in html
+    assert 'id="s_energy_sample"' not in html
+    assert "energy_monitoring_enabled: bool = True" in config
+    assert "energy_monitoring_enabled=True" in config
+    assert "energy_sample_seconds=30.0" in config
+    web_app = WEB_APP.read_text(encoding="utf-8")
+    assert 'sys.platform == "darwin"' in web_app
+    assert "and self.config.diagnostics.energy_monitoring_enabled" in web_app

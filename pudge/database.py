@@ -329,11 +329,13 @@ CREATE TABLE IF NOT EXISTS manga_books (
     title TEXT NOT NULL,
     page_count INTEGER NOT NULL DEFAULT 0,
     position INTEGER NOT NULL DEFAULT 0,
+    read_pages INTEGER NOT NULL DEFAULT 0,
     reading_direction TEXT NOT NULL DEFAULT 'rtl',
     anilist_id INTEGER,
     cover_url TEXT NOT NULL DEFAULT '',
     site_url TEXT NOT NULL DEFAULT '',
     user_score REAL,
+    mean_score REAL,
     source_fingerprint TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -517,6 +519,18 @@ class Database:
         self._ensure_column(conn, "manga_books", "cover_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "manga_books", "site_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "manga_books", "user_score", "REAL")
+        self._ensure_column(conn, "manga_books", "mean_score", "REAL")
+        manga_progress_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(manga_books)").fetchall()
+        }
+        manga_read_pages_missing = "read_pages" not in manga_progress_columns
+        self._ensure_column(conn, "manga_books", "read_pages", "INTEGER NOT NULL DEFAULT 0")
+        if manga_read_pages_missing:
+            # Preserve old progress reasonably, but position=0 may mean merely opened.
+            conn.execute(
+                "UPDATE manga_books SET read_pages="
+                "CASE WHEN position>0 THEN MIN(page_count,position+1) ELSE 0 END"
+            )
         self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
         self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")

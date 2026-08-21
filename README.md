@@ -5,7 +5,7 @@ anime, manga, Light Novels, and audiobooks together. It can find new episodes,
 prepare subtitles, play video through mpv, and update AniList without turning
 the setup into a collection of separate scripts.
 
-Current version: **0.7.23**.
+Current version: **0.7.24**.
 
 ## What Pudge can do
 
@@ -49,7 +49,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.23.zip
+unzip pudge-macos-v0.7.24.zip
 cd pudge
 ./install.sh
 ```

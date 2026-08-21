@@ -200,7 +200,7 @@ def test_drop_routing_contract_uses_pywebview_full_paths_and_focus_event() -> No
     assert "self.manager.import_local_video(path)" in source
     assert "self.light_novels.import_file(path, explicit=True)" in source
     assert "self.manga.import_file(path)" in source
-    assert "self.manga.import_images(image_paths)" in source
+    assert "self.manga.import_image_groups(image_paths)" in source
     assert "self.audiobooks.import_file(path)" in source
     assert "pudge-files-imported" in source and "pudge-files-imported" in html
     assert "scrollIntoView" in html and "drop-focus" in html

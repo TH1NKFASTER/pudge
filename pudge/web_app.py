@@ -16,6 +16,8 @@ import threading
 import time
 import unicodedata
 import webbrowser
+import httpx
+from rapidfuzz import fuzz
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -82,6 +84,51 @@ def _plain_anilist_description(value: Any) -> str:
     text = html.unescape(text).replace("\xa0", " ")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+
+# pudge-ui-v0.7.23-global-search-recent-v1
+def _global_search_normalize(value: Any) -> str:
+    text = unicodedata.normalize(
+        "NFKC",
+        html.unescape(str(value or "")),
+    ).casefold()
+    return "".join(char for char in text if char.isalnum())
+
+
+def _global_search_score(
+    query: str,
+    names: list[str],
+) -> tuple[float, str]:
+    cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
+    query_key = _global_search_normalize(cleaned)
+    if not query_key:
+        return 0.0, ""
+
+    best_score = 0.0
+    best_name = ""
+    for raw_name in names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        name_key = _global_search_normalize(name)
+        if not name_key:
+            continue
+        if name_key == query_key:
+            score = 100.0
+        elif name_key.startswith(query_key):
+            score = 97.0
+        elif query_key in name_key:
+            score = 93.0
+        else:
+            score = max(
+                float(fuzz.WRatio(cleaned.casefold(), name.casefold())),
+                float(fuzz.ratio(query_key, name_key)),
+            )
+        if score > best_score:
+            best_score = score
+            best_name = name
+    return best_score, best_name
 
 
 class WebAppApi:
@@ -216,7 +263,11 @@ class WebAppApi:
             interval_seconds=self.config.diagnostics.energy_sample_seconds,
             logger=self.logger,
         )
-        if self.config.diagnostics.energy_monitoring_enabled and not self.safe_mode.active:
+        if (
+            sys.platform == "darwin"
+            and self.config.diagnostics.energy_monitoring_enabled
+            and not self.safe_mode.active
+        ):
             self.energy_monitor.start()
         if not self.safe_mode.active:
             self._start_scheduled_agent()
@@ -1668,6 +1719,103 @@ class WebAppApi:
         age = (today or date.today()) - ended
         return 0 <= age.days <= days
 
+    def _recently_watched_payloads(
+        self,
+        anime_by_id: dict[int, LibraryAnime],
+    ) -> list[dict[str, Any]]:
+        # Latest watched local episode per anime inside the cleanup TTL.
+        try:
+            ttl_hours = max(
+                0.0,
+                float(self.config.agent.delete_after_watched_hours),
+            )
+        except (TypeError, ValueError):
+            ttl_hours = 0.0
+        if ttl_hours <= 0.0:
+            return []
+
+        cutoff = time.time() - ttl_hours * 3600.0
+        incomplete = self.manager.incomplete_download_paths()
+        latest: dict[int, Any] = {}
+
+        for item in self.manager.db.episodes():
+            if item.media_id is None or item.watched_at is None:
+                continue
+            try:
+                watched_at = float(item.watched_at)
+            except (TypeError, ValueError):
+                continue
+            if watched_at < cutoff:
+                continue
+            if not item.video_path.is_file():
+                continue
+            if self.manager._path_within(item.video_path, incomplete):
+                continue
+
+            media_id = int(item.media_id)
+            previous = latest.get(media_id)
+            if (
+                previous is None
+                or watched_at > float(previous.watched_at or 0.0)
+            ):
+                latest[media_id] = item
+
+        rows: list[dict[str, Any]] = []
+        rewind = max(0.0, float(self.config.playback.rewind_seconds or 0.0))
+        for media_id, item in latest.items():
+            anime = anime_by_id.get(media_id)
+            if anime is None:
+                continue
+
+            position = max(0.0, float(item.playback_position or 0.0))
+            duration = max(0.0, float(item.playback_duration or 0.0))
+            progress = (
+                round(max(0.0, min(100.0, position / duration * 100.0)), 2)
+                if duration > 0.0
+                else None
+            )
+            episode = item.media_episode if item.media_episode is not None else item.episode
+            payload = self._anime_payload(anime)
+            payload.update(
+                {
+                    "episode": episode,
+                    "next_episode": episode,
+                    "video_path": str(item.video_path),
+                    "watched_at": float(item.watched_at or 0.0),
+                    "resume_start": max(0.0, position - rewind),
+                    "progress_percent": progress,
+                    "is_movie": str(anime.format or "").upper() == "MOVIE",
+                    "local": {
+                        "episode": episode,
+                        "state": "watched",
+                        "video_path": str(item.video_path),
+                        "subtitle_path": (
+                            str(item.subtitle_path)
+                            if item.subtitle_path is not None
+                            else ""
+                        ),
+                        "subtitle_source": (
+                            "external"
+                            if item.subtitle_path is not None
+                            else "embedded"
+                            if item.embedded_subtitle_id is not None
+                            else "none"
+                        ),
+                        "playback_position": item.playback_position,
+                        "playback_duration": item.playback_duration,
+                    },
+                }
+            )
+            rows.append(payload)
+
+        rows.sort(
+            key=lambda item: (
+                -float(item.get("watched_at") or 0.0),
+                str(item.get("title") or "").casefold(),
+            )
+        )
+        return rows
+
     def _home_sections(
         self,
         current_anime: list[LibraryAnime],
@@ -2163,6 +2311,7 @@ class WebAppApi:
             for item in self.manager.db.episodes()
         ]
         home = self._home_sections(current_anime, anime_by_id)
+        home["recently_watched"] = self._recently_watched_payloads(anime_by_id)
 
         def _attach_download(card: dict[str, Any]) -> None:
             if card.get("kind") == "watch_sequence":
@@ -2725,6 +2874,89 @@ class WebAppApi:
         # Backwards-compatible alias. This no longer contacts AniList.
         return self.refresh_local()
 
+    # pudge-v0.7.23-sidebar-context-menus-v1
+    def search_new_subtitles(self) -> dict[str, Any]:
+        # Only process subtitle jobs that have never been attempted. Do not
+        # reset backoff, requeue old jobs, or touch ready/watched episodes.
+        now = time.time()
+        fresh_jobs = []
+        for row in self.manager.db.subtitle_jobs():
+            try:
+                attempts = int(row["attempts"] or 0)
+                next_check = float(row["next_check"] or 0)
+            except (TypeError, ValueError):
+                continue
+            if attempts != 0 or str(row["state"] or "") != "pending" or next_check > now:
+                continue
+            path = Path(str(row["video_path"] or "")).expanduser()
+            if path.is_file():
+                fresh_jobs.append(row)
+
+        preferred_paths = tuple(
+            Path(str(row["video_path"])).expanduser().resolve()
+            for row in fresh_jobs
+        )
+        processed = 0
+        queued = False
+        if preferred_paths:
+            with maintenance_lock(
+                self.config.paths.cache_dir,
+                blocking=False,
+            ) as maintenance_acquired:
+                if maintenance_acquired:
+                    with timed_step(
+                        self.logger,
+                        "web.subtitle_new_only",
+                        videos=len(preferred_paths),
+                    ):
+                        processed = int(
+                            self.manager.process_subtitle_jobs(
+                                limit=max(1, len(preferred_paths)),
+                                preferred_paths=preferred_paths,
+                            )
+                            or 0
+                        )
+                else:
+                    queued = True
+
+        return {
+            "eligible": len(preferred_paths),
+            "processed": processed,
+            "queued": queued,
+            "state": self.get_state(),
+        }
+
+    def search_new_releases(self) -> dict[str, Any]:
+        # Focused manual missing-episode discovery; unlike Refresh this does not
+        # scan the library or touch AniList/subtitle retry state.
+        started = 0
+        synced = 0
+        warning = ""
+        with timed_step(self.logger, "web.release_search_manual"):
+            try:
+                started = int(self.manager.auto_search_current() or 0)
+            except Exception as exc:
+                warning = str(exc)
+                self.logger.warning(
+                    "FAIL step=web.release_search_manual error=%r",
+                    warning,
+                )
+            if started and self._downloads_enabled():
+                try:
+                    synced = int(self.manager.sync_downloads() or 0)
+                except Exception as exc:
+                    warning = str(exc)
+                    self.logger.warning(
+                        "FALLBACK step=web.release_search_sync error=%r",
+                        warning,
+                    )
+        return {
+            "started": started,
+            "downloads": synced,
+            "warning": warning,
+            "state": self.get_state(),
+        }
+
     def _run_startup_maintenance_background(self) -> None:
         stats: dict[str, Any] = {}
         error = ""
@@ -2939,10 +3171,9 @@ class WebAppApi:
                         item for item in path.iterdir()
                         if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
                     ]
-                    images = [
-                        item for item in path.iterdir()
-                        if item.is_file() and item.suffix.casefold() in image_extensions
-                    ]
+                    # pudge-v0.7.23-nested-manga-drop-v1
+                    # Manga torrents are often unpacked as pack/volume/page trees.
+                    images = self.manga.discover_image_files(path, limit=50000)
                 except OSError as exc:
                     errors.append(f"{path.name}: {exc}")
                     continue
@@ -3008,12 +3239,17 @@ class WebAppApi:
 
         if image_paths:
             try:
-                book = self.manga.import_images(image_paths)
-                record(
-                    "manga", "manga",
-                    {"id": int(book["id"]), "title": str(book.get("title") or "Dropped manga"), "book": book},
-                    image_paths[0],
-                )
+                books = self.manga.import_image_groups(image_paths)
+                for book in books:
+                    record(
+                        "manga", "manga",
+                        {
+                            "id": int(book["id"]),
+                            "title": str(book.get("title") or "Dropped manga"),
+                            "book": book,
+                        },
+                        image_paths[0],
+                    )
             except Exception as exc:
                 errors.append(f"images: {exc}")
 
@@ -3039,8 +3275,40 @@ class WebAppApi:
             book["paired_audio"] = self.audiobooks.link_for_light_novel(int(book["id"]))
         return state
 
+    def _backfill_manga_mean_scores(self, state: dict[str, Any]) -> dict[str, Any]:
+        # pudge-v0.7.23-manga-mean-score-backfill-v1
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return state
+        attempted = set(getattr(self, "_manga_mean_score_attempted", set()))
+        missing = sorted(
+            {
+                int(book["anilist_id"])
+                for book in state.get("books", [])
+                if book.get("anilist_id")
+                and book.get("mean_score") is None
+                and int(book["anilist_id"]) not in attempted
+            }
+        )
+        if not missing:
+            return state
+        attempted.update(missing)
+        self._manga_mean_score_attempted = attempted
+        gql = "query($ids:[Int]){Page(page:1,perPage:50){media(id_in:$ids,type:MANGA){id meanScore}}}"
+        try:
+            data = self.light_novels._anilist_post(gql, {"ids": missing})
+            scores = {
+                int(media["id"]): float(media["meanScore"])
+                for media in (data.get("Page") or {}).get("media") or []
+                if media.get("id") is not None and media.get("meanScore") is not None
+            }
+            if scores and self.manga.set_mean_scores(scores):
+                return self.manga.state()
+        except Exception as exc:
+            self.logger.warning("Manga AniList mean-score backfill skipped: %s", exc)
+        return state
+
     def manga_state(self) -> dict[str, Any]:
-        return self.manga.state()
+        return self._backfill_manga_mean_scores(self.manga.state())
 
     def manga_remove_series(self, book_id: int) -> dict[str, Any]:
         removed = self.manga.remove_series(int(book_id))
@@ -3063,7 +3331,7 @@ class WebAppApi:
         if not cleaned:
             return []
         gql = """
-        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
+        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status meanScore title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self.light_novels._anilist_post(gql, {"search": cleaned})
         rows: list[dict[str, Any]] = []
@@ -3081,6 +3349,7 @@ class WebAppApi:
                     "chapters": media.get("chapters"),
                     "volumes": media.get("volumes"),
                     "media_status": media.get("status") or "",
+                    "mean_score": float(media.get("meanScore")) if media.get("meanScore") is not None else None,
                     "list_status": entry.get("status") or "",
                     "progress": entry.get("progress") or 0,
                     "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
@@ -3103,6 +3372,7 @@ class WebAppApi:
             cover_url=str(item.get("cover") or ""),
             site_url=str(item.get("site_url") or f"https://anilist.co/manga/{int(media_id)}"),
             user_score=item.get("user_score"),
+            mean_score=item.get("mean_score"),
         )
         return {"book": book, "state": self.manga.state()}
 
@@ -3452,8 +3722,133 @@ class WebAppApi:
             self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
         return {"cancelled": False, "books": books, "errors": errors, "state": self.manga.state()}
 
+    def choose_manga_folder(self) -> dict[str, Any]:
+        # Import all manga content recursively under one selected folder.
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=str(Path.home() / "Downloads"),
+                allow_multiple=False,
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+
+        raw = result[0] if isinstance(result, (list, tuple)) else result
+        source_root = Path(str(raw)).expanduser().resolve()
+        if not source_root.is_dir():
+            return {"cancelled": False, "error": "Selected manga folder does not exist"}
+
+        # pudge-v0.7.23-manga-folder-picker-v1
+        image_paths = self.manga.discover_image_files(source_root, limit=50000)
+        archive_paths = sorted(
+            [
+                path.resolve()
+                for path in source_root.rglob("*")
+                if path.is_file() and path.suffix.casefold() in {".cbz", ".zip"}
+            ],
+            key=lambda path: str(path).casefold(),
+        )
+
+        job_id = self.job_center.start(
+            "import",
+            "Import manga folder",
+            payload={
+                "media_kind": "manga_folder",
+                "paths": [str(source_root)],
+                "image_count": len(image_paths),
+                "archive_count": len(archive_paths),
+            },
+            total=max(1, len(archive_paths) + (1 if image_paths else 0)),
+        )
+        cancel_event = threading.Event()
+        self._import_cancel_events[job_id] = cancel_event
+        books: list[dict[str, Any]] = []
+        errors: list[str] = []
+        current = 0
+
+        try:
+            if image_paths and not cancel_event.is_set():
+                try:
+                    books.extend(
+                        self.manga.import_image_groups(
+                            image_paths,
+                            source_root=source_root,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(f"images: {exc}")
+                current += 1
+                self.job_center.update(
+                    job_id,
+                    state="running",
+                    current=current,
+                    total=max(1, len(archive_paths) + 1),
+                    message=f"Imported {len(books)} manga books",
+                )
+
+            for archive in archive_paths:
+                if cancel_event.is_set():
+                    break
+                try:
+                    books.append(self.manga.import_file(archive))
+                except Exception as exc:
+                    errors.append(f"{archive.name}: {exc}")
+                current += 1
+                self.job_center.update(
+                    job_id,
+                    state="running",
+                    current=current,
+                    total=max(1, len(archive_paths) + (1 if image_paths else 0)),
+                    message=f"Imported {len(books)} manga books",
+                )
+        finally:
+            self._import_cancel_events.pop(job_id, None)
+
+        if cancel_event.is_set():
+            self.job_center.cancelled(job_id)
+            return {"cancelled": True, "books": books, "errors": errors, "state": self.manga.state()}
+
+        if books:
+            self.job_center.finish(
+                job_id,
+                message=f"Imported {len(books)} manga books; errors {len(errors)}",
+                result={
+                    "book_ids": [int(book["id"]) for book in books],
+                    "errors": errors,
+                    "folder": str(source_root),
+                },
+            )
+        else:
+            message = "No manga images or CBZ/ZIP archives found in the selected folder"
+            if errors:
+                message = " • ".join(errors)
+            self.job_center.fail(job_id, message)
+            if not errors:
+                errors.append(message)
+
+        return {
+            "cancelled": False,
+            "books": books,
+            "errors": errors,
+            "folder": str(source_root),
+            "state": self.manga.state(),
+        }
+
     def manga_page(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.page(int(book_id), int(page_index))
+
+    def manga_set_position(self, book_id: int, page_index: int) -> dict[str, Any]:
+        self.manga.set_position(int(book_id), int(page_index))
+        return {"book_id": int(book_id), "page_index": int(page_index)}
+
+    def manga_mark_read(self, book_id: int, page_index: int) -> dict[str, Any]:
+        return self.manga.mark_read(int(book_id), int(page_index))
 
     def manga_text_regions(
         self,
@@ -4947,6 +5342,481 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "stats": stats,
             "state": self.get_state(),
         }
+
+    def _global_anilist_aliases(
+        self,
+        media_ids: set[int],
+    ) -> dict[int, list[str]]:
+        cache = getattr(self, "_global_search_anilist_alias_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._global_search_anilist_alias_cache = cache
+
+        missing = sorted(
+            int(media_id)
+            for media_id in media_ids
+            if int(media_id) > 0 and int(media_id) not in cache
+        )
+        if not missing:
+            return cache
+        if (
+            not self.config.anilist.enabled
+            or not self.config.anilist.access_token
+        ):
+            return cache
+
+        gql = '''
+        query($ids:[Int]){
+          Page(page:1,perPage:50){
+            media(id_in:$ids){
+              id
+              title{userPreferred romaji english native}
+              synonyms
+            }
+          }
+        }
+        '''
+        for offset in range(0, len(missing), 50):
+            chunk = missing[offset : offset + 50]
+            try:
+                data = self.light_novels._anilist_post(gql, {"ids": chunk})
+                returned: set[int] = set()
+                for media in (data.get("Page") or {}).get("media") or []:
+                    try:
+                        media_id = int(media.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    returned.add(media_id)
+                    titles = media.get("title") or {}
+                    names = [
+                        titles.get("userPreferred"),
+                        titles.get("romaji"),
+                        titles.get("english"),
+                        titles.get("native"),
+                        *(media.get("synonyms") or []),
+                    ]
+                    cache[media_id] = list(
+                        dict.fromkeys(
+                            str(value or "").strip()
+                            for value in names
+                            if str(value or "").strip()
+                        )
+                    )
+                for media_id in chunk:
+                    if media_id not in returned:
+                        cache.setdefault(media_id, [])
+            except Exception as exc:
+                self.logger.debug(
+                    "Global AniList alias lookup unavailable ids=%s error=%s",
+                    chunk,
+                    exc,
+                )
+                break
+        return cache
+
+    def global_media_search(
+        self,
+        query: str,
+        limit: int = 40,
+    ) -> list[dict[str, Any]]:
+        cleaned = re.sub(r"\s+", " ", str(query or "")).strip()[:120]
+        if not cleaned:
+            return []
+
+        anime_rows = self.manager.db.anime_list()
+        ln_state = self.light_novels.state()
+        manga_state = self.manga.state()
+        ln_books = [
+            dict(item)
+            for item in (ln_state.get("books") or [])
+            if isinstance(item, dict)
+        ]
+        manga_books = [
+            dict(item)
+            for item in (manga_state.get("books") or [])
+            if isinstance(item, dict)
+        ]
+
+        linked_ids = {
+            int(anime.media_id)
+            for anime in anime_rows
+            if anime.media_id
+        }
+        linked_ids.update(
+            int(item["anilist_id"])
+            for item in [*ln_books, *manga_books]
+            if item.get("anilist_id")
+        )
+        aliases = self._global_anilist_aliases(linked_ids)
+
+        incomplete = self.manager.incomplete_download_paths()
+        episodes_by_media: dict[int, list[Any]] = {}
+        for item in self.manager.db.episodes():
+            if item.media_id is None or not item.video_path.is_file():
+                continue
+            if self.manager._path_within(item.video_path, incomplete):
+                continue
+            episodes_by_media.setdefault(int(item.media_id), []).append(item)
+
+        results: list[dict[str, Any]] = []
+        episode_hint = re.search(
+            r"(?:\b(?:ep(?:isode)?|e|сер(?:ия)?)\s*)?(\d{1,3})\s*$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        episode_number = int(episode_hint.group(1)) if episode_hint else None
+        episode_prefix = (
+            cleaned[: episode_hint.start(1)].rstrip(" .#-_")
+            if episode_hint
+            else ""
+        )
+
+        for anime in anime_rows:
+            names = list(
+                dict.fromkeys(
+                    [
+                        anime.title,
+                        *anime.titles,
+                        *anime.synonyms,
+                        *aliases.get(int(anime.media_id), []),
+                    ]
+                )
+            )
+            score, matched = _global_search_score(cleaned, names)
+            local_eps = episodes_by_media.get(int(anime.media_id), [])
+
+            chosen = next(
+                (
+                    item
+                    for item in local_eps
+                    if item.episode is not None
+                    and int(item.episode) == int(anime.next_episode)
+                ),
+                None,
+            )
+            if chosen is None and local_eps:
+                chosen = max(
+                    local_eps,
+                    key=lambda item: (
+                        float(
+                            item.playback_updated_at
+                            or item.watched_at
+                            or 0.0
+                        ),
+                        int(item.episode or 0),
+                    ),
+                )
+
+            if score >= 52.0:
+                results.append(
+                    {
+                        "kind": "anime",
+                        "media_id": int(anime.media_id),
+                        "title": anime.title,
+                        "matched_title": matched,
+                        "cover": self._cover_uri(anime),
+                        "site_url": anime.site_url,
+                        "status": anime.status,
+                        "page": (
+                            "planned"
+                            if str(anime.status or "").upper() == "PLANNING"
+                            else "current"
+                        ),
+                        "video_path": str(chosen.video_path) if chosen else "",
+                        "episode": chosen.episode if chosen else None,
+                        "score": round(score, 3),
+                        "priority_tier": (
+                            0
+                            if chosen is not None
+                            and str(chosen.state or "").lower() in {"ready", "watched"}
+                            else 1
+                            if chosen is not None
+                            or str(anime.status or "").upper() != "PLANNING"
+                            else 2
+                        ),
+                    }
+                )
+
+            if (
+                episode_number is not None
+                and len(_global_search_normalize(episode_prefix)) >= 2
+            ):
+                prefix_score, prefix_match = _global_search_score(
+                    episode_prefix,
+                    names,
+                )
+                if prefix_score >= 52.0:
+                    exact = next(
+                        (
+                            item
+                            for item in local_eps
+                            if item.episode is not None
+                            and int(item.episode) == episode_number
+                        ),
+                        None,
+                    )
+                    if exact is not None:
+                        results.append(
+                            {
+                                "kind": "episode",
+                                "media_id": int(anime.media_id),
+                                "title": anime.title,
+                                "matched_title": prefix_match,
+                                "cover": self._cover_uri(anime),
+                                "site_url": anime.site_url,
+                                "episode": episode_number,
+                                "video_path": str(exact.video_path),
+                                "page": "current",
+                                "score": round(min(100.0, prefix_score + 6.0), 3),
+                                "priority_tier": (
+                                    0
+                                    if str(exact.state or "").lower()
+                                    in {"ready", "watched"}
+                                    else 1
+                                ),
+                            }
+                        )
+
+        for book in ln_books:
+            names = [
+                str(book.get("title") or ""),
+                str(book.get("series_title") or ""),
+                *aliases.get(int(book.get("anilist_id") or 0), []),
+            ]
+            score, matched = _global_search_score(cleaned, names)
+            if score < 52.0:
+                continue
+            results.append(
+                {
+                    "kind": "light_novel",
+                    "local_id": int(book.get("id") or 0),
+                    "media_id": (
+                        int(book["anilist_id"])
+                        if book.get("anilist_id")
+                        else None
+                    ),
+                    "title": str(
+                        book.get("title")
+                        or book.get("series_title")
+                        or "Light Novel"
+                    ),
+                    "matched_title": matched,
+                    "cover": str(book.get("cover_url") or ""),
+                    "page": "lightnovels",
+                    "volume": book.get("volume"),
+                    "score": round(score, 3),
+                    "priority_tier": 0,
+                }
+            )
+
+        for book in manga_books:
+            names = [
+                str(book.get("title") or ""),
+                str(book.get("series_title") or ""),
+                str(book.get("anilist_title") or ""),
+                *aliases.get(int(book.get("anilist_id") or 0), []),
+            ]
+            score, matched = _global_search_score(cleaned, names)
+            if score < 52.0:
+                continue
+            results.append(
+                {
+                    "kind": "manga",
+                    "local_id": int(book.get("id") or 0),
+                    "media_id": (
+                        int(book["anilist_id"])
+                        if book.get("anilist_id")
+                        else None
+                    ),
+                    "title": str(
+                        book.get("title")
+                        or book.get("series_title")
+                        or "Manga"
+                    ),
+                    "matched_title": matched,
+                    "cover": str(
+                        book.get("cover_url")
+                        or book.get("local_cover_url")
+                        or ""
+                    ),
+                    "page": "manga",
+                    "volume": book.get("volume"),
+                    "score": round(score, 3),
+                    "priority_tier": 0,
+                }
+            )
+
+        kind_rank = {
+            "episode": 0,
+            "anime": 1,
+            "light_novel": 2,
+            "manga": 3,
+        }
+        # pudge-ui-v0.7.23-global-search-priority-v4
+        # Search priority:
+        #   0 = ready/imported/local
+        #   1 = current/local but not fully ready
+        #   2 = Planning
+        #   3 = remote/random AniList
+        # Text score only orders items inside the same bucket.
+        results.sort(
+            key=lambda item: (
+                int(item.get("priority_tier", 3)),
+                -float(item.get("score") or 0.0),
+                kind_rank.get(str(item.get("kind") or ""), 9),
+                str(item.get("title") or "").casefold(),
+            )
+        )
+        return results[: max(1, min(100, int(limit or 40)))]
+
+    def test_saved_credentials(
+        self,
+        kinds: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        requested = {
+            str(value or "").strip().lower()
+            for value in (kinds or [])
+            if str(value or "").strip()
+        }
+        checks: list[dict[str, Any]] = []
+
+        if "jimaku" in requested:
+            key = str(self.config.jimaku.personal_api_key or "").strip()
+            if not key:
+                checks.append({"service": "Jimaku", "status": "missing"})
+            else:
+                try:
+                    response = httpx.get(
+                        f"{self.config.jimaku.base_url.rstrip('/')}/api/entries/search",
+                        headers={
+                            "Authorization": key,
+                            "Accept": "application/json",
+                            "User-Agent": APP_SLUG,
+                        },
+                        params={"anime": "true", "query": "Frieren"},
+                        timeout=8.0,
+                        follow_redirects=True,
+                    )
+                    if response.status_code in {401, 403}:
+                        checks.append({"service": "Jimaku", "status": "invalid"})
+                    elif response.status_code == 429:
+                        checks.append({"service": "Jimaku", "status": "rate_limited"})
+                    else:
+                        response.raise_for_status()
+                        payload = response.json()
+                        count = len(payload) if isinstance(payload, list) else 0
+                        checks.append(
+                            {
+                                "service": "Jimaku",
+                                "status": "ok" if count > 0 else "empty",
+                                "count": count,
+                            }
+                        )
+                except httpx.HTTPError as exc:
+                    checks.append(
+                        {
+                            "service": "Jimaku",
+                            "status": "unreachable",
+                            "detail": str(exc),
+                        }
+                    )
+                except ValueError as exc:
+                    checks.append(
+                        {
+                            "service": "Jimaku",
+                            "status": "error",
+                            "detail": str(exc),
+                        }
+                    )
+
+        if "anilist" in requested:
+            token = str(self.config.anilist.access_token or "").strip()
+            if not token:
+                checks.append({"service": "AniList", "status": "missing"})
+            else:
+                try:
+                    response = httpx.post(
+                        self.config.anilist.endpoint,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                        },
+                        json={"query": "query{Viewer{id name}}"},
+                        timeout=8.0,
+                    )
+                    if response.status_code in {401, 403}:
+                        checks.append({"service": "AniList", "status": "invalid"})
+                    else:
+                        response.raise_for_status()
+                        payload = response.json()
+                        viewer = (
+                            (payload.get("data") or {}).get("Viewer")
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        checks.append(
+                            {
+                                "service": "AniList",
+                                "status": "ok" if viewer else "empty",
+                            }
+                        )
+                except httpx.HTTPError as exc:
+                    checks.append(
+                        {
+                            "service": "AniList",
+                            "status": "unreachable",
+                            "detail": str(exc),
+                        }
+                    )
+                except ValueError as exc:
+                    checks.append(
+                        {
+                            "service": "AniList",
+                            "status": "error",
+                            "detail": str(exc),
+                        }
+                    )
+
+        for backend, service in (("jiten", "Jiten"), ("jpdb", "JPDB")):
+            if backend not in requested:
+                continue
+            settings = self.light_novels.settings()
+            token = (
+                settings.jiten_api_key
+                if backend == "jiten"
+                else settings.jpdb_api_token
+            )
+            if not str(token or "").strip():
+                checks.append({"service": service, "status": "missing"})
+                continue
+            try:
+                self.light_novels.test_study(backend)
+                checks.append({"service": service, "status": "ok"})
+            except Exception as exc:
+                detail = str(exc)
+                lowered = detail.casefold()
+                status = (
+                    "invalid"
+                    if "401" in lowered
+                    or "403" in lowered
+                    or "unauthorized" in lowered
+                    or "forbidden" in lowered
+                    else "unreachable"
+                    if "timeout" in lowered
+                    or "connect" in lowered
+                    or "network" in lowered
+                    else "error"
+                )
+                checks.append(
+                    {
+                        "service": service,
+                        "status": status,
+                        "detail": detail,
+                    }
+                )
+
+        return checks
 
     def planning_search_anilist(self, query: str) -> list[dict[str, Any]]:
         """Search AniList beyond the user's existing Planning collection."""

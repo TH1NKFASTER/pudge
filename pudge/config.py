@@ -160,7 +160,7 @@ class ShortcutsConfig:
 
 @dataclass(slots=True)
 class DiagnosticsConfig:
-    energy_monitoring_enabled: bool = False
+    energy_monitoring_enabled: bool = True
     energy_sample_seconds: float = 30.0
 
 
@@ -370,7 +370,6 @@ def load_config(path: Path | None = None) -> AppConfig:
     agent = _section(raw, "agent")
     playback = _section(raw, "playback")
     shortcuts = _section(raw, "shortcuts")
-    diagnostics = _section(raw, "diagnostics")
     companion = _section(raw, "companion")
     tools = _section(raw, "tools")
     jimaku = _section(raw, "jimaku")
@@ -504,8 +503,9 @@ def load_config(path: Path | None = None) -> AppConfig:
             mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
         ),
         diagnostics=DiagnosticsConfig(
-            energy_monitoring_enabled=bool(diagnostics.get("energy_monitoring_enabled", False)),
-            energy_sample_seconds=max(10.0, float(diagnostics.get("energy_sample_seconds", 30.0))),
+            # Always-on, low-overhead diagnostics. Kept out of Settings UI.
+            energy_monitoring_enabled=True,
+            energy_sample_seconds=30.0,
         ),
         companion=CompanionConfig(
             enabled=bool(companion.get("enabled", False)),

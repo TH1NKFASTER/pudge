@@ -63,7 +63,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.39-early-edit-speech-verification:{tag}:"
+        f"syncing-v0.3.43-preop-embedded-reference-refine:{tag}:"
         f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
@@ -5614,6 +5614,10 @@ def _local_speech_shift_estimate(
         "accepted": accepted,
         "reason": "improved" if accepted else "no_clear_improvement",
         "shift_seconds": round(float(best_shift), 3) if accepted else 0.0,
+        # Keep the best candidate visible even when the generic gate rejects it.
+        # A later caller may have an independent signal that can safely confirm
+        # this otherwise-borderline local estimate.
+        "best_shift_seconds": round(float(best_shift), 3),
         "baseline": {
             "matched": baseline_matched,
             "coverage": round(float(baseline["coverage"]), 4),
@@ -5640,6 +5644,8 @@ def _restore_embedded_opening_clock_scaffold(
     embedded_result: dict[str, object],
     speech_result: dict[str, object],
     cache_dir: Path,
+    *,
+    embedded_reference: Path | None = None,
 ) -> tuple[Path, dict[str, object]]:
     if aligned.parent.name == "embedded-opening-scaffold":
         return aligned, _result(
@@ -5716,13 +5722,122 @@ def _restore_embedded_opening_clock_scaffold(
             reason_detail="clock_delta_out_of_range",
             correction_seconds=round(correction, 3),
         )
-    if first_support < 2 or post_support < 6:
+    strong_single_window_early_clock = False
+    single_window_evidence: dict[str, object] = {}
+    if first_support == 1 and post_support >= 12:
+        validation = embedded_result.get("timeline_validation")
+        after_validation = (
+            validation.get("after")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("after"), dict)
+            else {}
+        )
+        holdout = (
+            validation.get("holdout")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("holdout"), dict)
+            else {}
+        )
+        edge_hints_raw = embedded_result.get("timeline_edge_hints_seconds")
+        edge_hints: list[float] = []
+        if isinstance(edge_hints_raw, list):
+            for value in edge_hints_raw:
+                try:
+                    edge_hints.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+        try:
+            first_score = float(first.get("mean_score") or 0.0)
+            first_coverage = float(first.get("mean_coverage") or 0.0)
+            after_f1 = float(after_validation.get("f1") or 0.0)
+            activity_f1 = (
+                float(validation.get("activity_f1") or 0.0)
+                if isinstance(validation, dict)
+                else 0.0
+            )
+            holdout_p90 = float(holdout.get("p90_abs_residual_seconds"))
+            holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
+            early_span = float(risk.get("early_offset_span_seconds") or 0.0)
+            early_jump = float(risk.get("early_max_jump_seconds") or 0.0)
+        except (TypeError, ValueError):
+            first_score = 0.0
+            first_coverage = 0.0
+            after_f1 = 0.0
+            activity_f1 = 0.0
+            holdout_p90 = float("inf")
+            holdout_coverage = 0.0
+            early_span = 0.0
+            early_jump = 0.0
+
+        first_hint_error = (
+            min(abs(first_offset - value) for value in edge_hints)
+            if edge_hints
+            else float("inf")
+        )
+        post_hint_error = (
+            min(abs(post_offset - value) for value in edge_hints)
+            if edge_hints
+            else float("inf")
+        )
+        risk_reasons_raw = risk.get("reasons")
+        risk_reasons = (
+            {str(value) for value in risk_reasons_raw}
+            if isinstance(risk_reasons_raw, list)
+            else set()
+        )
+        speech_post_error = abs(speech_offset - post_offset)
+        strong_single_window_early_clock = bool(
+            first_score >= 3.0
+            and first_coverage >= 0.85
+            and "early_path_clock_change" in risk_reasons
+            and early_span >= 6.0
+            and early_jump >= 4.0
+            and first_hint_error <= 2.0
+            and post_hint_error <= 1.0
+            and after_f1 >= 0.78
+            and activity_f1 >= 0.86
+            and holdout_p90 <= 1.0
+            and holdout_coverage >= 0.84
+            and speech_post_error <= 2.5
+        )
+        single_window_evidence = {
+            "accepted": strong_single_window_early_clock,
+            "first_score": round(first_score, 4),
+            "first_coverage": round(first_coverage, 4),
+            "first_hint_error_seconds": (
+                round(first_hint_error, 4)
+                if math.isfinite(first_hint_error)
+                else None
+            ),
+            "post_hint_error_seconds": (
+                round(post_hint_error, 4)
+                if math.isfinite(post_hint_error)
+                else None
+            ),
+            "after_f1": round(after_f1, 4),
+            "activity_f1": round(activity_f1, 4),
+            "holdout_p90_seconds": (
+                round(holdout_p90, 4)
+                if math.isfinite(holdout_p90)
+                else None
+            ),
+            "holdout_mean_coverage": round(holdout_coverage, 4),
+            "early_offset_span_seconds": round(early_span, 4),
+            "early_max_jump_seconds": round(early_jump, 4),
+            "speech_post_error_seconds": round(speech_post_error, 4),
+        }
+
+    if (
+        (first_support < 2 and not strong_single_window_early_clock)
+        or post_support < 6
+    ):
         return aligned, _result(
             "opening_scaffold_unavailable",
             applied=False,
             reason_detail="insufficient_segment_support",
             first_support=first_support,
             post_support=post_support,
+            single_window_evidence=single_window_evidence,
         )
     if abs(speech_offset - post_offset) > 2.5:
         return aligned, _result(
@@ -5776,13 +5891,329 @@ def _restore_embedded_opening_clock_scaffold(
             )
         )
 
+    # A single strong early timeline window can recover the large pre-OP
+    # edit, but its coarse 1-second clock may still leave a small residual.
+    # Once the large jump is fixed, measure only that remaining residual
+    # against the cached Japanese STT reference. Apply it only when:
+    #   1) the local speech estimate itself is accepted, and
+    #   2) it agrees with the independent cold-start edge hint.
+    # This keeps the normal post-OP/main-episode clock untouched.
+    base_correction = correction
+    residual_speech_refinement: dict[str, object] = {
+        "attempted": False,
+        "accepted": False,
+        "reason": "not_needed",
+    }
+    residual_shift = 0.0
+    if strong_single_window_early_clock:
+        reference_raw = speech_result.get("timing_reference")
+        cold_start = embedded_result.get("timeline_cold_start")
+        cold_delta: float | None = None
+        if isinstance(cold_start, dict):
+            try:
+                candidate_delta = float(cold_start.get("delta_seconds"))
+            except (TypeError, ValueError):
+                candidate_delta = 0.0
+            if (
+                str(cold_start.get("reason") or "")
+                == "cold_start_overlaps_main_boundary"
+                and 0.45 <= abs(candidate_delta) <= 2.5
+            ):
+                cold_delta = candidate_delta
+
+        reference = (
+            Path(str(reference_raw)).expanduser()
+            if reference_raw not in {None, ""}
+            else None
+        )
+        if reference is None or not reference.is_file():
+            residual_speech_refinement = {
+                "attempted": False,
+                "accepted": False,
+                "reason": "timing_reference_unavailable",
+                "cold_hint_delta_seconds": (
+                    round(cold_delta, 3) if cold_delta is not None else None
+                ),
+            }
+        elif cold_delta is None:
+            residual_speech_refinement = {
+                "attempted": False,
+                "accepted": False,
+                "reason": "independent_cold_hint_unavailable",
+            }
+        else:
+            try:
+                reference_cues = parse_srt(reference)
+            except OSError as exc:
+                residual_speech_refinement = {
+                    "attempted": True,
+                    "accepted": False,
+                    "reason": "timing_reference_read_error",
+                    "error": str(exc),
+                }
+            else:
+                pre_starts = [
+                    float(start)
+                    for start, _end, _text in repaired[:split_index]
+                ][:48]
+                reference_starts = [
+                    float(start)
+                    for start, _end, _text in reference_cues
+                ]
+                if pre_starts and split_index > 0:
+                    low = min(pre_starts) - 3.0
+                    high = float(repaired[split_index - 1][1]) + 3.0
+                    local_reference = [
+                        value
+                        for value in reference_starts
+                        if low <= value <= high
+                    ]
+                    estimate = _local_speech_shift_estimate(
+                        pre_starts,
+                        local_reference,
+                        max_shift_seconds=2.5,
+                    )
+                    try:
+                        raw_candidate_shift = estimate.get("best_shift_seconds")
+                        if raw_candidate_shift in {None, ""}:
+                            raw_candidate_shift = estimate.get("shift_seconds")
+                        candidate_shift = float(raw_candidate_shift or 0.0)
+                    except (TypeError, ValueError):
+                        candidate_shift = 0.0
+
+                    best_metrics = estimate.get("best")
+                    best_metrics = (
+                        best_metrics if isinstance(best_metrics, dict) else {}
+                    )
+                    try:
+                        best_matched = int(best_metrics.get("matched") or 0)
+                        best_coverage = float(best_metrics.get("coverage") or 0.0)
+                        matched_gain = int(estimate.get("matched_gain") or 0)
+                        error_gain = float(
+                            estimate.get("mean_error_gain_seconds") or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        best_matched = matched_gain = 0
+                        best_coverage = error_gain = 0.0
+
+                    # The generic local-STT gate deliberately wants >=45%
+                    # coverage or a larger match gain. In a short cold open
+                    # that can be too strict. Allow the borderline estimate
+                    # only in this already-strong single-window edit path and
+                    # only when the independent embedded edge hint agrees.
+                    borderline_speech = bool(
+                        not bool(estimate.get("accepted"))
+                        and best_matched >= 6
+                        and best_coverage >= 0.38
+                        and matched_gain >= 1
+                        and error_gain >= 0.10
+                    )
+                    speech_supported = bool(
+                        bool(estimate.get("accepted")) or borderline_speech
+                    )
+                    agrees_with_hint = bool(
+                        speech_supported
+                        and 0.20 <= abs(candidate_shift) <= 2.5
+                        and candidate_shift * cold_delta > 0.0
+                        and abs(candidate_shift - cold_delta) <= 0.85
+                    )
+                    residual_speech_refinement = {
+                        "attempted": True,
+                        "accepted": agrees_with_hint,
+                        "reason": (
+                            (
+                                "borderline_speech_and_cold_hint_agree"
+                                if borderline_speech
+                                else "local_speech_and_cold_hint_agree"
+                            )
+                            if agrees_with_hint
+                            else "residual_not_independently_confirmed"
+                        ),
+                        "speech": estimate,
+                        "borderline_speech": borderline_speech,
+                        "cold_hint_delta_seconds": round(cold_delta, 3),
+                        "speech_shift_seconds": round(candidate_shift, 3),
+                        "agreement_error_seconds": round(
+                            abs(candidate_shift - cold_delta), 3
+                        ),
+                    }
+                    if agrees_with_hint:
+                        residual_shift = candidate_shift
+                        repaired = [
+                            (
+                                max(
+                                    0.0,
+                                    float(start)
+                                    + (
+                                        residual_shift
+                                        if index < split_index
+                                        else 0.0
+                                    ),
+                                ),
+                                max(
+                                    0.05,
+                                    float(end)
+                                    + (
+                                        residual_shift
+                                        if index < split_index
+                                        else 0.0
+                                    ),
+                                ),
+                                cue_text,
+                            )
+                            for index, (start, end, cue_text)
+                            in enumerate(repaired)
+                        ]
+                        correction += residual_shift
+                else:
+                    residual_speech_refinement = {
+                        "attempted": True,
+                        "accepted": False,
+                        "reason": "pre_opening_cues_unavailable",
+                    }
+
+    # Final small correction: the embedded text subtitle belongs to the exact
+    # video and is a better local clock than Whisper in a short/noisy cold open.
+    # The large edit is still recovered by the timeline+STT scaffold above.
+    # Here we only measure a <=2s residual before the opening, and only accept it
+    # when the independent cold-start edge hint agrees in direction/magnitude.
+    embedded_reference_shift = 0.0
+    embedded_reference_refinement: dict[str, object] = {
+        "attempted": False,
+        "accepted": False,
+        "reason": "not_available",
+    }
+
+    if (
+        strong_single_window_early_clock
+        and embedded_reference is not None
+        and Path(embedded_reference).is_file()
+        and split_index > 0
+    ):
+        cold_start = embedded_result.get("timeline_cold_start")
+        cold_delta: float | None = None
+        if isinstance(cold_start, dict):
+            try:
+                candidate_delta = float(cold_start.get("delta_seconds"))
+            except (TypeError, ValueError):
+                candidate_delta = 0.0
+            if (
+                str(cold_start.get("reason") or "")
+                == "cold_start_overlaps_main_boundary"
+                and 0.40 <= abs(candidate_delta) <= 2.5
+            ):
+                cold_delta = candidate_delta
+
+        try:
+            reference_cues = parse_srt(Path(embedded_reference))
+        except OSError as exc:
+            embedded_reference_refinement = {
+                "attempted": True,
+                "accepted": False,
+                "reason": "embedded_reference_read_error",
+                "error": str(exc),
+            }
+        else:
+            pre_cues = repaired[:split_index]
+            if cold_delta is None:
+                embedded_reference_refinement = {
+                    "attempted": True,
+                    "accepted": False,
+                    "reason": "cold_hint_unavailable",
+                }
+            elif len(pre_cues) < 6 or len(reference_cues) < 8:
+                embedded_reference_refinement = {
+                    "attempted": True,
+                    "accepted": False,
+                    "reason": "too_few_cues",
+                }
+            else:
+                region_start = max(
+                    0.0,
+                    min(float(start) for start, _end, _text in pre_cues) - 1.5,
+                )
+                region_end = (
+                    max(float(end) for _start, end, _text in pre_cues) + 1.5
+                )
+                probe = _windowed_reference_shift(
+                    repaired,
+                    reference_cues,
+                    region_start=region_start,
+                    region_end=region_end,
+                    max_shift_seconds=2.0,
+                )
+                try:
+                    candidate_shift = float(probe.get("shift_seconds") or 0.0)
+                    matched = int(probe.get("matched_onsets") or 0)
+                    coverage = float(probe.get("coverage") or 0.0)
+                    improvement = float(probe.get("score_improvement") or 0.0)
+                except (TypeError, ValueError):
+                    candidate_shift = 0.0
+                    matched = 0
+                    coverage = 0.0
+                    improvement = 0.0
+
+                agrees = bool(
+                    bool(probe.get("confident"))
+                    and matched >= 6
+                    and coverage >= 0.35
+                    and improvement >= 0.04
+                    and 0.20 <= abs(candidate_shift) <= 1.80
+                    and candidate_shift * cold_delta > 0.0
+                    and abs(candidate_shift - cold_delta) <= 1.25
+                )
+                embedded_reference_refinement = {
+                    "attempted": True,
+                    "accepted": agrees,
+                    "reason": (
+                        "embedded_reference_and_cold_hint_agree"
+                        if agrees
+                        else "embedded_reference_not_confirmed"
+                    ),
+                    "shift_seconds": round(candidate_shift, 3),
+                    "cold_hint_delta_seconds": round(cold_delta, 3),
+                    "agreement_error_seconds": round(
+                        abs(candidate_shift - cold_delta), 3
+                    ),
+                    "probe": probe,
+                }
+                if agrees:
+                    embedded_reference_shift = candidate_shift
+                    repaired = [
+                        (
+                            max(
+                                0.0,
+                                float(start)
+                                + (
+                                    embedded_reference_shift
+                                    if index < split_index
+                                    else 0.0
+                                ),
+                            ),
+                            max(
+                                0.05,
+                                float(end)
+                                + (
+                                    embedded_reference_shift
+                                    if index < split_index
+                                    else 0.0
+                                ),
+                            ),
+                            cue_text,
+                        )
+                        for index, (start, end, cue_text)
+                        in enumerate(repaired)
+                    ]
+                    correction += embedded_reference_shift
+
     stat = aligned.stat()
     digest = hashlib.sha1(
         (
             f"embedded-opening-scaffold-v1:"
             f"{aligned.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
             f"{first_offset:.3f}:{post_offset:.3f}:{speech_offset:.3f}:"
-            f"{split_index}:{correction:.3f}"
+            f"{split_index}:{correction:.3f}:"
+            f"{embedded_reference_shift:.3f}:embedded-ref-v1"
         ).encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "embedded-opening-scaffold"
@@ -5796,6 +6227,11 @@ def _restore_embedded_opening_clock_scaffold(
         applied=True,
         output=str(output),
         correction_seconds=round(correction, 3),
+        base_correction_seconds=round(base_correction, 3),
+        residual_speech_shift_seconds=round(residual_shift, 3),
+        residual_speech_refinement=residual_speech_refinement,
+        embedded_reference_shift_seconds=round(embedded_reference_shift, 3),
+        embedded_reference_refinement=embedded_reference_refinement,
         target_relative_clock_seconds=round(target_relative_clock, 3),
         existing_relative_clock_seconds=round(existing_relative_clock, 3),
         pre_refinement_seconds=round(pre_refinement, 3),
@@ -5805,6 +6241,8 @@ def _restore_embedded_opening_clock_scaffold(
         speech_offset_seconds=round(speech_offset, 3),
         first_support=first_support,
         post_support=post_support,
+        early_support_override=strong_single_window_early_clock,
+        single_window_evidence=single_window_evidence,
         gap_seconds=round(gap_seconds, 3),
         gap_midpoint_seconds=round(gap_midpoint, 3),
         split_cue_index=split_index,
@@ -8053,6 +8491,7 @@ def optimize_candidates(
                             risky_timeline_result,
                             speech_result,
                             cache_dir,
+                            embedded_reference=timing_reference,
                         )
                     )
                     prefer_embedded, conflict_meta = (

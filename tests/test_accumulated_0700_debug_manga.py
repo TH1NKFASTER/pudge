@@ -74,7 +74,7 @@ def test_accumulated_ui_contract() -> None:
     assert 'id="s_ln_translation_language"' not in html
     assert "light_novel_translate(text,context,ui.lang||'',Number(ui.lnBook?.anilist_id||0)||null)" in html
     assert 'data-context-action="debug"' in html
-    assert "mediaInHomeSection('caught_up',a.media_id)?'':" in html
+    assert "(planned||mediaInHomeSection('caught_up',a.media_id))?'':" in html
     assert 'src="debug.js"' in html and 'href="debug.css"' in html
     assert "installMangaOcr" in html and "install_manga_ocr" in media
     assert "anime_debug_snapshot" in web_app

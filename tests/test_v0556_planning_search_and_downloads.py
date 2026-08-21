@@ -22,7 +22,7 @@ def make_api(tmp_path: Path) -> WebAppApi:
     return WebAppApi(cfg.config_path)
 
 
-def test_planning_search_supports_cmd_f_titles_aliases_and_anilist_id(tmp_path: Path) -> None:
+def test_planning_search_supports_titles_aliases_and_global_cmd_f(tmp_path: Path) -> None:
     api = make_api(tmp_path)
     api.manager.db.upsert_anime(
         LibraryAnime(
@@ -48,8 +48,8 @@ def test_planning_search_supports_cmd_f_titles_aliases_and_anilist_id(tmp_path: 
     assert "shortcut_app_planning_search" not in html
     assert "String(event.key||'').toLowerCase()==='f'" in html
     assert "if(ui.page!=='planned')setPage('planned')" not in html
-    assert "ui.page==='settings'" in html
-    assert "search.focus();search.select()" in html
+    assert "openGlobalSearch();" in html
+    assert "global_media_search(cleaned,40)" in html
 
 
 def test_finished_watching_title_without_ready_files_is_available_to_download(tmp_path: Path) -> None:

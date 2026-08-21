@@ -82,7 +82,8 @@ def test_manga_multivolume_has_first_paint_height_cap() -> None:
     html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     manga = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
     assert ".ln-series-books.series-scroll{height:195px" in html
-    assert "requestAnimationFrame(() => window.PudgeSeriesScroll?.focus?.(root));" in manga
+    assert "window.PudgeSeriesScroll?.focus?.(root);" in manga
+    assert "if (scrollHost && previousScrollTop != null) scrollHost.scrollTop = previousScrollTop;" in manga
 
 
 def test_native_launcher_embeds_python_in_pudge_process() -> None:
