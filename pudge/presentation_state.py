@@ -98,6 +98,7 @@ def derive_episode_presentation(
     download: Any = None,
     action_job: Any = None,
     watched_externally: bool = False,
+    allow_ocr_ready: bool = True,
 ) -> dict[str, Any]:
     """Return one canonical user-facing episode status.
 
@@ -107,6 +108,7 @@ def derive_episode_presentation(
     """
 
     local_state = str(_value(local, "state", "") or "").casefold()
+    local_origin = str(_value(local, "subtitle_origin", "") or "").casefold()
     local_exists = _local_file_exists(local)
     action_code = str(_value(action_job, "action_code", "") or "")
     action_state = str(_value(action_job, "state", "") or "").casefold()
@@ -114,6 +116,12 @@ def derive_episode_presentation(
     if local_exists and (local_state == "watched" or watched_externally):
         return {"status": "watched", "ready": True, "action_code": ""}
     if local_exists and local_state == "ready":
+        if local_origin == "ocr" and not allow_ocr_ready:
+            return {
+                "status": "waiting_text_subtitles",
+                "ready": False,
+                "action_code": action_code,
+            }
         return {"status": "ready", "ready": True, "action_code": ""}
     if action_job is not None and (action_state == "needs_action" or action_code):
         return {

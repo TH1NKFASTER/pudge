@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .branding import APP_NAME, APP_SLUG, DEFAULT_ENERGY_LOG_PATH
 
@@ -139,12 +140,18 @@ class EnergyDiagnosticsMonitor:
             return "webkit-gpu"
         if "com.apple.webkit.networking" in value:
             return "webkit-network"
+        if "pudge.agent" in value and "--scheduled" in value:
+            return "agent"
+        if "pudge.cli" in value and "--prepare-only" in value:
+            return "subtitle-worker"
         if executable.endswith("/mpv") or executable == "mpv":
             return "player"
         if "qbittorrent" in value:
-            return "torrent-client"
+            return "qbittorrent"
         if "aria2c" in value:
-            return "torrent-client"
+            return "aria2"
+        if executable.endswith("/7zz") or executable.endswith("/7z") or executable in {"7zz", "7z"}:
+            return "archive-worker"
         if "ffmpeg" in value or "ffprobe" in value:
             return "media-worker"
         if "python" in value:
@@ -201,8 +208,28 @@ class EnergyDiagnosticsMonitor:
             command = str(row.get("command") or "").casefold()
             executable = command.split(None, 1)[0] if command else ""
             is_mpv = executable.endswith("/mpv") or executable == "mpv"
-            if is_mpv or "jpdb-mpv" in command or "qbittorrent" in command or "aria2c" in command:
+            is_agent = "pudge.agent" in command and "--scheduled" in command
+            is_subtitle_worker = "pudge.cli" in command and "--prepare-only" in command
+            if (
+                is_mpv
+                or is_agent
+                or is_subtitle_worker
+                or "jpdb-mpv" in command
+                or "qbittorrent" in command
+                or "aria2c" in command
+            ):
                 context_ids.add(pid)
+
+        # LaunchAgent and its subtitle/ffmpeg children are not descendants of
+        # the GUI process. Once a Pudge context root is recognized, include its
+        # own process tree so worker cost is not lost from the energy account.
+        stack = list(context_ids)
+        while stack:
+            parent = stack.pop()
+            for child in by_parent.get(parent, []):
+                if child not in app_ids and child not in context_ids:
+                    context_ids.add(child)
+                    stack.append(child)
 
         result: list[dict[str, Any]] = []
         for pid in app_ids | context_ids:
@@ -230,7 +257,10 @@ class EnergyDiagnosticsMonitor:
         rows = self._related_processes(self._process_rows())
         app_cpu = sum(max(0.0, float(row["cpu_percent"])) for row in rows if row.get("scope") == "app")
         context_cpu = sum(max(0.0, float(row["cpu_percent"])) for row in rows if row.get("scope") == "context")
+        app_rss = sum(max(0.0, float(row.get("rss_mb") or 0.0)) for row in rows if row.get("scope") == "app")
+        context_rss = sum(max(0.0, float(row.get("rss_mb") or 0.0)) for row in rows if row.get("scope") == "context")
         total_cpu = app_cpu + context_cpu
+        role_totals: dict[str, dict[str, float | int]] = {}
         for row in rows:
             scope_total = app_cpu if row.get("scope") == "app" else context_cpu
             row["activity_share_percent"] = (
@@ -238,6 +268,14 @@ class EnergyDiagnosticsMonitor:
                 if scope_total > 0
                 else 0.0
             )
+            role = str(row.get("role") or "unknown")
+            total = role_totals.setdefault(role, {"cpu_percent": 0.0, "rss_mb": 0.0, "process_count": 0})
+            total["cpu_percent"] = float(total["cpu_percent"]) + max(0.0, float(row.get("cpu_percent") or 0.0))
+            total["rss_mb"] = float(total["rss_mb"]) + max(0.0, float(row.get("rss_mb") or 0.0))
+            total["process_count"] = int(total["process_count"]) + 1
+        for total in role_totals.values():
+            total["cpu_percent"] = round(float(total["cpu_percent"]), 2)
+            total["rss_mb"] = round(float(total["rss_mb"]), 2)
         return {
             "timestamp": time.time(),
             "platform": sys.platform,
@@ -245,9 +283,13 @@ class EnergyDiagnosticsMonitor:
             "sample_interval_seconds": self.interval_seconds,
             "app_cpu_percent": round(app_cpu, 2),
             "context_cpu_percent": round(context_cpu, 2),
+            "app_rss_mb": round(app_rss, 2),
+            "context_rss_mb": round(context_rss, 2),
+            "related_rss_mb": round(app_rss + context_rss, 2),
             # Retained for compatibility with v0.6.55 log readers.
             "related_cpu_percent": round(total_cpu, 2),
             "energy_metric": "cpu_activity_proxy",
+            "role_totals": role_totals,
             "processes": rows,
         }
 
@@ -267,11 +309,165 @@ class EnergyDiagnosticsMonitor:
             self.logger.info("EVENT energy_diagnostics.start interval_seconds=%s path=%s", self.interval_seconds, ENERGY_LOG_PATH)
         try:
             # Sample immediately so enabling the setting gives useful output
-            # without waiting a full interval.
+            # without waiting a full interval. A malformed/temporary process
+            # snapshot must not kill the monitor for the rest of the app session.
             while not self._stop.is_set():
-                self._append(self.sample())
+                try:
+                    self._append(self.sample())
+                except Exception as exc:
+                    if self.logger is not None:
+                        self.logger.exception(
+                            "FAIL step=energy_diagnostics.sample error=%r",
+                            str(exc),
+                        )
                 if self._stop.wait(self.interval_seconds):
                     break
         finally:
             if self.logger is not None:
                 self.logger.info("EVENT energy_diagnostics.stop")
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, float(fraction))) * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(len(ordered) - 1, lower + 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _metric_stats(values: Iterable[float]) -> dict[str, float]:
+    rows = [max(0.0, float(value)) for value in values]
+    if not rows:
+        return {"avg": 0.0, "median": 0.0, "p95": 0.0, "max": 0.0}
+    return {
+        "avg": round(sum(rows) / len(rows), 2),
+        "median": round(float(statistics.median(rows)), 2),
+        "p95": round(_percentile(rows, 0.95), 2),
+        "max": round(max(rows), 2),
+    }
+
+
+def _role_totals_for_sample(sample: dict[str, Any]) -> dict[str, dict[str, float]]:
+    raw = sample.get("role_totals")
+    if isinstance(raw, dict):
+        result: dict[str, dict[str, float]] = {}
+        for role, values in raw.items():
+            if not isinstance(values, dict):
+                continue
+            result[str(role)] = {
+                "cpu_percent": max(0.0, float(values.get("cpu_percent") or 0.0)),
+                "rss_mb": max(0.0, float(values.get("rss_mb") or 0.0)),
+            }
+        return result
+    result: dict[str, dict[str, float]] = {}
+    for row in sample.get("processes") or []:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "unknown")
+        total = result.setdefault(role, {"cpu_percent": 0.0, "rss_mb": 0.0})
+        total["cpu_percent"] += max(0.0, float(row.get("cpu_percent") or 0.0))
+        total["rss_mb"] += max(0.0, float(row.get("rss_mb") or 0.0))
+    return result
+
+
+def summarize_energy_samples(
+    samples: Iterable[dict[str, Any]],
+    *,
+    now: float | None = None,
+    windows_seconds: tuple[int, ...] = (300, 900, 3600),
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            timestamp = float(sample.get("timestamp") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if timestamp <= 0:
+            continue
+        item = dict(sample)
+        item["timestamp"] = timestamp
+        rows.append(item)
+    rows.sort(key=lambda item: float(item["timestamp"]))
+    anchor = float(time.time() if now is None else now)
+    latest = float(rows[-1]["timestamp"]) if rows else 0.0
+    summary: dict[str, Any] = {
+        "schema": 1,
+        "generated_at": anchor,
+        "latest_sample_at": latest or None,
+        "latest_sample_age_seconds": round(max(0.0, anchor - latest), 2) if latest else None,
+        "sample_count": len(rows),
+        "windows": {},
+    }
+    for seconds in windows_seconds:
+        seconds = max(1, int(seconds))
+        selected = [row for row in rows if anchor - float(row["timestamp"]) <= seconds]
+        label = f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s"
+        roles = sorted({role for row in selected for role in _role_totals_for_sample(row)})
+        role_summary: dict[str, Any] = {}
+        for role in roles:
+            cpu_values: list[float] = []
+            rss_values: list[float] = []
+            for row in selected:
+                values = _role_totals_for_sample(row).get(role, {})
+                cpu_values.append(float(values.get("cpu_percent") or 0.0))
+                rss_values.append(float(values.get("rss_mb") or 0.0))
+            role_summary[role] = {
+                "cpu_percent": _metric_stats(cpu_values),
+                "rss_mb": _metric_stats(rss_values),
+            }
+        summary["windows"][label] = {
+            "window_seconds": seconds,
+            "sample_count": len(selected),
+            "app_cpu_percent": _metric_stats(float(row.get("app_cpu_percent") or 0.0) for row in selected),
+            "context_cpu_percent": _metric_stats(float(row.get("context_cpu_percent") or 0.0) for row in selected),
+            "related_cpu_percent": _metric_stats(float(row.get("related_cpu_percent") or 0.0) for row in selected),
+            "app_rss_mb": _metric_stats(
+                float(row.get("app_rss_mb") or sum(
+                    float(proc.get("rss_mb") or 0.0)
+                    for proc in row.get("processes") or []
+                    if isinstance(proc, dict) and proc.get("scope") == "app"
+                ))
+                for row in selected
+            ),
+            "context_rss_mb": _metric_stats(
+                float(row.get("context_rss_mb") or sum(
+                    float(proc.get("rss_mb") or 0.0)
+                    for proc in row.get("processes") or []
+                    if isinstance(proc, dict) and proc.get("scope") == "context"
+                ))
+                for row in selected
+            ),
+            "roles": role_summary,
+        }
+    return summary
+
+
+def summarize_energy_log(
+    path: Path = ENERGY_LOG_PATH,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    source = Path(path).expanduser()
+    samples: list[dict[str, Any]] = []
+    try:
+        lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            samples.append(value)
+    summary = summarize_energy_samples(samples, now=now)
+    summary["path"] = str(source)
+    summary["exists"] = source.is_file()
+    return summary

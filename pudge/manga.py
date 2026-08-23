@@ -784,15 +784,20 @@ class MangaService:
         path = str(row["path"] or "")
         metadata_source = f"{title} {Path(path).stem}"
         series_title = _manga_series_title(title or Path(path).stem) or title or Path(path).stem
-        cached_remote = self._cached_remote_cover_data_uri(remote_cover)
+        volume = _manga_volume(metadata_source) or 1
         local_cover = self._local_cover_data_uri(row)
+        # AniList exposes a clean series cover, which normally corresponds to
+        # volume 1. Later volumes must keep their own physical cover instead of
+        # inheriting that same image across the whole local series.
+        cached_remote = self._cached_remote_cover_data_uri(remote_cover) if volume == 1 else ""
+        selected_cover = cached_remote or local_cover
         return {
             "id": int(row["id"]),
             "path": path,
             "title": title,
             "series_title": series_title,
             "series_key": _manga_series_key(series_title) or f"book:{int(row['id'])}",
-            "volume": _manga_volume(metadata_source) or 1,
+            "volume": volume,
             "page_count": int(row["page_count"] or 0),
             "position": int(row["position"] or 0),
             # pudge-v0.7.23-manga-read-pages-v1
@@ -803,7 +808,7 @@ class MangaService:
             "user_score": float(row["user_score"]) if row["user_score"] is not None else None,
             # pudge-v0.7.23-manga-mean-score-v1
             "mean_score": float(row["mean_score"]) if row["mean_score"] is not None else None,
-            "cover_url": cached_remote or local_cover,
+            "cover_url": selected_cover,
             "remote_cover_url": remote_cover,
             "cover_source": "anilist_cache" if cached_remote else "first_page",
             "updated_at": float(row["updated_at"] or 0),

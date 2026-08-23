@@ -64,7 +64,7 @@ def test_manual_refresh_reconciles_new_torrent_in_same_click() -> None:
     calls: list[str] = []
 
     class Manager:
-        def run_interactive_refresh(self):
+        def run_interactive_refresh(self, **_kwargs):
             calls.append("run")
             return {"auto": 1}
 

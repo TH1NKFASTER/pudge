@@ -153,8 +153,6 @@ class ShortcutsConfig:
     # not configurable: Cmd+1..N maps to the visible sidebar order and Cmd+F
     # focuses Planning search. Only mpv bindings are user-configurable.
     mpv_mark_watched: str = "Ctrl+a"
-    mpv_open_anilist: str = "Ctrl+b"
-    mpv_correct_match: str = "c"
     mpv_translate_subtitle: str = "Ctrl+t"
 
 
@@ -243,7 +241,12 @@ class MatchingConfig:
     srt_alignment_tolerance_absolute: float = 50.0
     evaluate_all_jimaku: bool = True
     max_jimaku_candidates: int = 0
-    ocr_image_subtitles: bool = False
+    ocr_image_subtitles: bool = True
+    ocr_image_subtitles_disabled_by_user: bool = False
+    # OCR may be cached for playback without making the episode Home-ready.
+    # Keep this conservative by default: machine-generated text is a fallback,
+    # not equivalent to verified Japanese text subtitles.
+    ocr_counts_as_ready: bool = False
     auto_upgrade_subtitles: bool = True
     subtitle_upgrade_min_score_gain: float = 25.0
     subtitle_upgrade_check_hours: float = 6.0
@@ -498,8 +501,6 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         shortcuts=ShortcutsConfig(
             mpv_mark_watched=str(shortcuts.get("mpv_mark_watched", "Ctrl+a")).strip(),
-            mpv_open_anilist=str(shortcuts.get("mpv_open_anilist", "Ctrl+b")).strip(),
-            mpv_correct_match=str(shortcuts.get("mpv_correct_match", "c")).strip(),
             mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
         ),
         diagnostics=DiagnosticsConfig(
@@ -590,7 +591,21 @@ def load_config(path: Path | None = None) -> AppConfig:
             srt_alignment_tolerance_absolute=float(matching.get("srt_alignment_tolerance_absolute", 50.0)),
             evaluate_all_jimaku=bool(matching.get("evaluate_all_jimaku", True)),
             max_jimaku_candidates=int(matching.get("max_jimaku_candidates", 0)),
-            ocr_image_subtitles=bool(matching.get("ocr_image_subtitles", False)),
+            # v37 and older wrote ``false`` as the product default, so an old
+            # config cannot distinguish that untouched default from a deliberate
+            # opt-out. v38 records explicit opt-outs separately and upgrades the
+            # legacy default to automatic bitmap OCR.
+            ocr_image_subtitles=(
+                False
+                if bool(matching.get("ocr_image_subtitles_disabled_by_user", False))
+                else True
+                if "ocr_image_subtitles_disabled_by_user" not in matching
+                else bool(matching.get("ocr_image_subtitles", True))
+            ),
+            ocr_image_subtitles_disabled_by_user=bool(
+                matching.get("ocr_image_subtitles_disabled_by_user", False)
+            ),
+            ocr_counts_as_ready=bool(matching.get("ocr_counts_as_ready", False)),
             auto_upgrade_subtitles=True,
             subtitle_upgrade_min_score_gain=25.0,
             subtitle_upgrade_check_hours=6.0,
@@ -769,8 +784,6 @@ save_interval_seconds = {config.playback.save_interval_seconds}
 
 [shortcuts]
 mpv_mark_watched = {_toml_string(config.shortcuts.mpv_mark_watched)}
-mpv_open_anilist = {_toml_string(config.shortcuts.mpv_open_anilist)}
-mpv_correct_match = {_toml_string(config.shortcuts.mpv_correct_match)}
 mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 
 [diagnostics]
@@ -838,6 +851,8 @@ srt_alignment_tolerance_absolute = {config.matching.srt_alignment_tolerance_abso
 evaluate_all_jimaku = {_toml_bool(config.matching.evaluate_all_jimaku)}
 max_jimaku_candidates = {config.matching.max_jimaku_candidates}
 ocr_image_subtitles = {_toml_bool(config.matching.ocr_image_subtitles)}
+ocr_image_subtitles_disabled_by_user = {_toml_bool(config.matching.ocr_image_subtitles_disabled_by_user)}
+ocr_counts_as_ready = {_toml_bool(config.matching.ocr_counts_as_ready)}
 auto_upgrade_subtitles = {_toml_bool(config.matching.auto_upgrade_subtitles)}
 subtitle_upgrade_min_score_gain = {config.matching.subtitle_upgrade_min_score_gain}
 subtitle_upgrade_check_hours = {config.matching.subtitle_upgrade_check_hours}

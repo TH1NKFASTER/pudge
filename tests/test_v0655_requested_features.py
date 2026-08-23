@@ -98,9 +98,11 @@ def test_only_mpv_shortcuts_are_configurable_and_app_shortcuts_are_standard(tmp_
 
     lua = LUA.read_text(encoding="utf-8")
     assert "PUDGE_SHORTCUT_MARK_WATCHED" in lua
-    assert "PUDGE_SHORTCUT_OPEN_ANILIST" in lua
-    assert "PUDGE_SHORTCUT_CORRECT_MATCH" in lua
+    assert "PUDGE_SHORTCUT_OPEN_ANILIST" not in lua
+    assert "PUDGE_SHORTCUT_CORRECT_MATCH" not in lua
+    assert "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE" in lua
     assert "add_reliable_binding(shortcut_mark_watched" in lua
+    assert "add_reliable_binding(shortcut_translate_subtitle" in lua
 
 
 def test_library_uses_relative_episode_number_and_singular_label(tmp_path: Path) -> None:

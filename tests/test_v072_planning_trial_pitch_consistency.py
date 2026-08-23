@@ -116,7 +116,7 @@ def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path
     manager = SimpleNamespace(
         downloads_enabled=lambda: True,
         sync_downloads=lambda: None,
-        scan_library=lambda: [],
+        scan_library=lambda **_kwargs: [],
         search_and_add_best=lambda _media_id, **kwargs: (
             calls.append((int(kwargs["episode"]), bool(kwargs["automatic"])))
             or (release if int(kwargs["episode"]) == 5 else None)

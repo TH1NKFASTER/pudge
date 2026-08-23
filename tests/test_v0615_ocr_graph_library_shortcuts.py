@@ -168,7 +168,7 @@ def test_library_episode_width_card_link_shortcuts_and_polychrome_restart() -> N
 def test_ocr_is_a_prepare_time_fallback_after_text_selection() -> None:
     source = (ROOT / "pudge" / "cli.py").read_text(encoding="utf-8")
     discovery = source.index("if subtitle is None and subtitle_id is None and not args.fast_play:")
-    ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play:")
+    ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play and not args.text_only:")
     ready = source.index('print("PREPARE_STATUS=ready")')
     assert discovery < ocr_step < ready
     assert "OCR: преобразую графические японские субтитры в SRT заранее" in source
@@ -189,7 +189,7 @@ def test_text_candidates_are_selected_before_bitmap_ocr_fallback() -> None:
     source = (ROOT / "pudge" / "cli.py").read_text(encoding="utf-8")
     split = source.index("text_candidates = [")
     optimization = source.index("best, optimized_path, result = optimize_candidates(")
-    ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play:")
+    ocr_step = source.index("if config.matching.ocr_image_subtitles and not args.fast_play and not args.text_only:")
     assert split < optimization < ocr_step
     assert "candidates = text_candidates" in source[split:optimization]
     assert "bitmap_candidate_fallback" in source[split:ocr_step]

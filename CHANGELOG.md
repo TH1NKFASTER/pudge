@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.7.25
+
+- Made the macOS window lifecycle behave like a native Mac app: the red close button and `Cmd+W` hide the window without stopping Pudge, reopening from the Dock restores the same live session, and `Cmd+Q` remains the explicit full quit path; also fixed the PyObjC shutdown crash seen on window close.
+- Stabilized Ready state during background subtitle upgrades and repaired episodes that had been demoted by stale upgrade jobs, including the Akiba Meido Sensou recovery case.
+- Separated bitmap OCR preparation from readiness policy: OCR results can be cached and used for playback without counting as Ready unless `ocr_counts_as_ready` is explicitly enabled.
+- Made startup Home updates atomic across AniList sync and maintenance so cards no longer jump between sections while the initial refresh is still running.
+- Reworked PGS/SUP OCR into a streaming pipeline that no longer retains thousands of decoded subtitle images in memory, added an OCR worker RSS safety guard, and added progress diagnostics.
+- Added persistent Jimaku archive/materialization and bitmap OCR caches so already extracted or synchronized `.sup` subtitles are reused without repeating Jimaku lookup, 7-Zip extraction, alignment, or OCR.
+- Added persistent library fingerprint caching and heavy-work coordination to avoid repeated full rescans of an unchanged library and to keep library scans from overlapping CPU-heavy OCR work.
+- Expanded energy diagnostics with per-role CPU/RSS accounting and 5/15/60-minute summaries, and removed the duplicate library scan from a single manual Refresh cycle.
+- Hardened local-download recovery for stale aria2 `paused 0/0` rows and legacy episode identity corruption, preventing an older episode from claiming a newer sibling video while preserving recoverable completed files.
+- Polished Planning/global-search behavior, local-media selection rules, ready labels, and `Cmd+F` handling while keeping completed/downloaded state stable across refreshes.
+
 ## v0.7.24
 
 - Added global local-media search, recently watched history, and sidebar context
@@ -101,26 +114,21 @@
 
 - Release validation update for the exact-process in-app restart fix.
 
-
 ## v0.7.14
 
 - Fixed update restarts to terminate the exact running Pudge process before installing and reopening the app.
-
 
 ## v0.7.13
 
 - Release validation update for the improved in-app restart flow.
 
-
 ## v0.7.12
 
 - Fixed app updates leaving the previous Pudge window running after the new version opened.
 
-
 ## v0.7.11
 
 - Fixed automatic updates launched from the macOS app failing to find an existing Homebrew installation.
-
 
 ## v0.7.10
 
@@ -128,22 +136,18 @@
 - Made update restarts wait for the previous Pudge process to exit before reopening the updated app, preventing duplicate windows.
 - Removed the native WebView update confirmation dialog that appeared with the Python host icon.
 
-
 ## v0.7.9
 
 - Fixed the macOS application icon when Pudge runs through the managed Python environment, avoiding the default Python launcher icon during application startup.
-
 
 ## v0.7.8
 
 - Fixed release updates so extracted installers do not depend on executable file permissions.
 - Isolated post-install package verification from the current working directory and Python environment, preventing valid updates from being mistaken for stale installations.
 
-
 ## v0.7.7
 
 - Fixed in-app updates for the native managed-environment launcher so the running Pudge process is stopped correctly and the updated app can reopen automatically.
-
 
 ## v0.7.6
 
@@ -225,8 +229,6 @@
 
 ## v0.6.68
 
-
-
 ## Development and GitHub
 
 Source development instructions are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
@@ -256,7 +258,6 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 - Added direct Jiten and JPDB API-token study actions, card-state CSS classes, furigana toggle and custom reader CSS.
 - Added AniList NOVEL linking/status: opening Planning moves it to Current; finishing a volume updates `progressVolumes` and can complete the title. Strong title matches bind automatically.
 - Added Nyaa literature search and optional next-volume auto-download to qBittorrent category `pudge-ln`; completed EPUB/TXT files are discovered automatically.
-
 
 - Manual Refresh now waits for active maintenance instead of silently skipping, and searches missing Nyaa releases before long subtitle preparation.
 - Restores prepared subtitle selections whose cache paths moved during the Anime MPV -> pudge rename.
@@ -332,7 +333,6 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 - Foreground polling is faster near torrent completion (2 s at 98%+) and immediately processes high-priority subtitle jobs.
 - Legacy OCR results from older releases are recognized from OCR/playback cache lineage and invalidated safely.
 
-
 ## v0.6.41
 
 - Revalidate watched-folder auto-imports even after they reached `ready`, while preserving watched/resumable/torrent-managed rows and skipping destructive cleanup on AniList network errors.
@@ -368,7 +368,6 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 - Исправлен Hyakkano S03E05: первая реплика после 106-секундного разрыва получает +0.35 с вместо ложных +2.26 с.
 - Старые playback-SRT автоматически переподготавливаются.
 
-
 - Исправлена групповая синхронизация `1–3 ↔ 1–3`: английская длинная реплика больше не растягивает и не сжимает внутренние границы японских SRT-cues.
 - Split/merge-группа теперь передаёт только общий локальный сдвиг, сохраняя исходные длительности и паузы японских субтитров.
 - Добавлен quality gate: коррекция отклоняется, если почти не улучшает timing activity или заметно меняет длительности cues.
@@ -379,7 +378,6 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 - Increased the native SRT format bonus from 12 to 16 points.
 - SRT now has a 10-point advantage over ASS and an 11-point advantage over SSA before timing-quality evaluation.
 - Materially better ASS/SSA candidates still win through the embedded-reference activity check; invalid SRT files remain rejected.
-
 
 ## v0.6.33
 

@@ -19,7 +19,7 @@ def stub_regular_maintenance(monkeypatch, manager: AnimeManager) -> None:
     monkeypatch.setattr(manager, "_requeue_after_resolver_upgrade", lambda: 0)
     monkeypatch.setattr(manager, "sync_downloads", lambda: 0)
     monkeypatch.setattr(manager, "cleanup_duplicate_torrents", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "refresh_anilist_if_due", lambda: 0)
     monkeypatch.setattr(manager, "auto_search_current", lambda: 0)
     monkeypatch.setattr(manager, "auto_upgrade_downloaded", lambda: 0)

@@ -230,7 +230,7 @@ def test_refresh_local_does_not_sync_anilist(tmp_path: Path, monkeypatch) -> Non
     api = make_api(tmp_path)
     calls = {"local": 0, "anilist": 0}
 
-    def local_refresh():
+    def local_refresh(**_kwargs):
         calls["local"] += 1
         return {"library": 0}
 

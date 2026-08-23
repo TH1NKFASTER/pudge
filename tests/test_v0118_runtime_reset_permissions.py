@@ -249,7 +249,7 @@ def test_desktop_play_uses_runtime_subtitle_recovery_and_imports_do_not_default_
 def test_fast_update_preserves_native_app_identity() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     assert "PRESERVE_NATIVE_APP=0" in installer
-    assert "NATIVE_SHELL_REV=1" in installer
+    assert "NATIVE_SHELL_REV=2" in installer
     assert "PUDGE_FORCE_NATIVE_REBUILD" in installer
     assert "preserving native app identity and existing macOS folder grants" in installer
     assert "EXISTING_APP_VERSION" not in installer

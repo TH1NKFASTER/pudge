@@ -180,7 +180,9 @@ def test_ui_settings_search_cmd_f_and_activity_removal() -> None:
     cmd_f = key_block[key_block.index("String(event.key||'').toLowerCase()==='f'"):][:650]
     assert "setPage('planned')" not in cmd_f
     assert "openGlobalSearch()" in cmd_f
-    assert "ui.page==='settings'" not in cmd_f
+    assert "ui.page==='settings'" in cmd_f
+    assert "$('settingsSearch')" in cmd_f
+    assert "search.focus();search.select();" in cmd_f
     assert "ui.page==='planned'" not in cmd_f
     for control in (
         'lnrFont', 'lnrFontSize', 'lnrTheme', 'lnrTextColor', 'lnrBgColor',

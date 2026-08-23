@@ -101,6 +101,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--fast-play", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--embedded-sid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--prepared-bitmap-sub", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--text-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--media-id", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--media-title", default="", help=argparse.SUPPRESS)
     parser.add_argument("--media-titles-json", default="[]", help=argparse.SUPPRESS)
@@ -1540,6 +1542,7 @@ def process_video(
         and args.embedded_sid is None
         and not args.force_search
         and not args.fast_play
+        and not args.text_only
     )
     cached_pipeline = (
         load_final_pipeline_result(video, config)
@@ -1570,6 +1573,19 @@ def process_video(
         if args.fast_play:
             already_synced = True
             print(f"Подготовленные субтитры: {subtitle}")
+    elif args.prepared_bitmap_sub is not None:
+        subtitle = _validate_explicit_subtitle(args.prepared_bitmap_sub)
+        if subtitle.suffix.casefold() not in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}:
+            raise RuntimeError(f"Prepared bitmap subtitle is not PGS/SUP: {subtitle}")
+        selected_source = "prepared_bitmap_cache"
+        # The manager stores the synchronized bitmap path after the first
+        # preparation attempt. Re-synchronizing that file would compound the
+        # timing correction; v38 feeds it directly into OCR instead.
+        already_synced = True
+        logger.info(
+            "CACHE step=subtitle.prepared_bitmap video=%s path=%s", video.name, subtitle
+        )
+        pipeline_timer.mark("prepared_bitmap_cache", cache="hit")
     elif args.embedded_sid is not None:
         subtitle_id = int(args.embedded_sid)
         selected_source = "embedded"
@@ -1863,7 +1879,7 @@ def process_video(
             if bool(result.get("sync_was_successful")):
                 subtitle = synchronized_path
 
-    if config.matching.ocr_image_subtitles and not args.fast_play:
+    if config.matching.ocr_image_subtitles and not args.fast_play and not args.text_only:
         image_path = (
             subtitle
             if subtitle is not None
@@ -2110,13 +2126,10 @@ def process_video(
         "PUDGE_CONFIG": str(config.config_path),
         "PUDGE_UI_LANGUAGE": config.ui.language,
         "PUDGE_APP_NAME": APP_NAME,
-        "PUDGE_APP_CLI": APP_CLI,
         "PUDGE_PLAYBACK_ENABLED": "1" if config.playback.enabled else "0",
         "PUDGE_PLAYBACK_VIDEO": str(video),
         "PUDGE_PLAYBACK_INTERVAL": str(config.playback.save_interval_seconds),
         "PUDGE_SHORTCUT_MARK_WATCHED": config.shortcuts.mpv_mark_watched,
-        "PUDGE_SHORTCUT_OPEN_ANILIST": config.shortcuts.mpv_open_anilist,
-        "PUDGE_SHORTCUT_CORRECT_MATCH": config.shortcuts.mpv_correct_match,
         "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE": config.shortcuts.mpv_translate_subtitle,
         "PUDGE_SUBTITLE_PATH": str(subtitle or ""),
     }

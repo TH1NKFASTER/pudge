@@ -89,8 +89,6 @@ app_library = "Cmd+3"
 app_settings = "Cmd+4"
 app_planning_search = "Cmd+F"
 mpv_mark_watched = "Ctrl+a"
-mpv_open_anilist = "Ctrl+b"
-mpv_correct_match = "c"
 
 [diagnostics]
 energy_monitoring_enabled = true
@@ -158,7 +156,9 @@ srt_alignment_tolerance_ratio = 0.002
 srt_alignment_tolerance_absolute = 50.0
 evaluate_all_jimaku = true
 max_jimaku_candidates = 0
-ocr_image_subtitles = false
+ocr_image_subtitles = true
+ocr_image_subtitles_disabled_by_user = false
+ocr_counts_as_ready = false
 auto_upgrade_subtitles = true
 subtitle_upgrade_min_score_gain = 25.0
 subtitle_upgrade_check_hours = 24.0

@@ -120,7 +120,7 @@ def test_light_novel_toolbar_uses_import_only_and_common_refresh_scans_local_fir
 
     refresh_py = app[app.index("    def refresh_local(") : app.index("    def refresh_all(")]
     assert refresh_py.index("self.light_novels.scan_downloaded()") < refresh_py.index(
-        "self.manager.run_interactive_refresh()"
+        "self.manager.run_interactive_refresh("
     )
 
 

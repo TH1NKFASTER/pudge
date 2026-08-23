@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .database import Database
+from .energy_diagnostics import summarize_energy_log
 
 
 class DiagnosticRecorder:
@@ -148,6 +149,12 @@ class DebugBundleBuilder:
         target = Path(target).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
         snapshot_rows = list(snapshots or [])
+        energy_path = Path((logs or {}).get("energy", "")) if (logs or {}).get("energy") else None
+        energy_summary = (
+            summarize_energy_log(energy_path)
+            if energy_path is not None
+            else summarize_energy_log(Path("/__pudge_missing_energy_log__"))
+        )
         manifest = {
             "schema": 2,
             "generated_at": time.time(),
@@ -155,6 +162,7 @@ class DebugBundleBuilder:
             "platform": platform.platform(),
             "frontend": self._redact(dict(frontend or {})),
             "database": self._database_summary(),
+            "energy": energy_summary,
         }
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
@@ -166,6 +174,10 @@ class DebugBundleBuilder:
                     indent=2,
                     default=str,
                 ),
+            )
+            archive.writestr(
+                "energy-summary.json",
+                json.dumps(energy_summary, ensure_ascii=False, indent=2, default=str),
             )
             for index, snapshot in enumerate(snapshot_rows, start=1):
                 archive.writestr(

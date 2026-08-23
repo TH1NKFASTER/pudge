@@ -36,7 +36,7 @@ from .episode_numbering import (
 )
 from .episode_state import watched_by_anilist_progress
 from .presentation_state import derive_episode_presentation, download_complete
-from .work_scheduler import WorkScheduler
+from .work_scheduler import WorkPriority, WorkScheduler
 from .logging_utils import configure_logging, timed_step
 from .maintenance_lock import maintenance_lock
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
@@ -81,6 +81,27 @@ LogFn = Callable[[str], None]
 
 class ManagerError(RuntimeError):
     pass
+
+
+def _process_rss_mb(pid: int) -> float | None:
+    """Return resident memory for one child process using the native ps tool."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(int(pid))],
+            text=True,
+            capture_output=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        rss_kb = float((completed.stdout or "").strip().splitlines()[0])
+    except (IndexError, TypeError, ValueError):
+        return None
+    return max(0.0, rss_kb / 1024.0)
 
 
 _NETWORK_RETRY_MARKERS = (
@@ -878,6 +899,183 @@ class AnimeManager:
         downloaded = max(0, int(raw.get("downloaded") or 0))
         return total > 0 and downloaded >= total
 
+    @classmethod
+    def _completed_download_video_files(cls, item: DownloadItem) -> list[Path]:
+        """Resolve videos owned by one completed download without stealing siblings.
+
+        A historical single-episode aria2 row can lose ``content_path`` while its
+        ``save_path`` still points at the whole series directory.  Scanning every
+        video below that directory lets an old episode claim a newer sibling.
+        Batch rows may own many files; single-episode rows must resolve to one
+        unambiguous episode only.
+        """
+        content_value = str(item.content_path or "").strip()
+        content = Path(content_value).expanduser() if content_value else None
+        if content is not None and content.is_file():
+            resolved = content.resolve()
+            if item.is_batch:
+                return [resolved]
+            wanted_release = item.release_episode
+            if wanted_release is None:
+                wanted_release = parsed_release_episode(str(item.name or ""))
+            if wanted_release is not None:
+                actual_release = parsed_release_episode(resolved.name)
+                if actual_release is None or int(actual_release) != int(wanted_release):
+                    return []
+            return [resolved]
+
+        root: Path | None = None
+        if content is not None and content.is_dir():
+            root = content
+        else:
+            save_value = str(item.save_path or "").strip()
+            save = Path(save_value).expanduser() if save_value else None
+            if save is not None and save.is_dir():
+                root = save
+        if root is None:
+            return []
+
+        try:
+            candidates = [
+                path.resolve()
+                for path in root.rglob("*")
+                if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS
+            ]
+        except OSError:
+            return []
+        if item.is_batch:
+            return candidates
+
+        wanted_release = item.release_episode
+        if wanted_release is None:
+            wanted_release = parsed_release_episode(str(item.name or ""))
+        if wanted_release is not None:
+            matching = [
+                path
+                for path in candidates
+                if parsed_release_episode(path.name) == int(wanted_release)
+            ]
+            return matching if len(matching) == 1 else []
+
+        # With no episode identity at all, one exact candidate is the only
+        # unambiguous fallback. Never let "there is only one file left" make a
+        # known episode claim a newer sibling after its own watched file was
+        # deleted.
+        return candidates if len(candidates) == 1 else []
+
+    @classmethod
+    def _stale_aria2_zero_shell_local_file(cls, item: DownloadItem) -> Path | None:
+        """Return an authoritative local file for an already-corrupted aria2 row.
+
+        Older syncs could overwrite a completed DB row with aria2's metadata-only
+        ``paused, 0/0`` shell.  At that point there is no durable ``complete``
+        flag left to preserve. Recover only a single-file download whose exact
+        content path still exists, whose filename matches the managed episode,
+        and which has no aria2 control sidecar (an actual in-progress transfer
+        keeps that sidecar).
+        """
+        if item.is_batch or cls._download_is_complete(item):
+            return None
+        raw = dict(item.raw or {})
+        if str(raw.get("backend") or "").casefold() != "aria2":
+            return None
+        if str(item.state or "").casefold() not in {"paused", "stopped", "waiting"}:
+            return None
+        if float(item.progress or 0.0) > 0.001:
+            return None
+        if max(0, int(raw.get("total_size") or 0)) != 0:
+            return None
+        if max(0, int(raw.get("downloaded") or 0)) != 0:
+            return None
+
+        content_value = str(item.content_path or "").strip()
+        if not content_value:
+            return None
+        content = Path(content_value).expanduser()
+        if not content.is_file() or content.suffix.casefold() not in VIDEO_EXTENSIONS:
+            return None
+        try:
+            if int(content.stat().st_size) <= 0:
+                return None
+        except OSError:
+            return None
+        if Path(str(content) + ".aria2").exists():
+            return None
+
+        name = str(item.name or "").strip()
+        if name and Path(name).name.casefold() != content.name.casefold():
+            return None
+        wanted_release = item.release_episode
+        if wanted_release is None:
+            wanted_release = parsed_release_episode(name)
+        if wanted_release is not None:
+            actual_release = parsed_release_episode(content.name)
+            if actual_release is None or int(actual_release) != int(wanted_release):
+                return None
+        return content.resolve()
+
+    @classmethod
+    def _recover_stale_aria2_zero_shell(cls, item: DownloadItem) -> DownloadItem | None:
+        content = cls._stale_aria2_zero_shell_local_file(item)
+        if content is None:
+            return None
+        try:
+            size = max(1, int(content.stat().st_size))
+        except OSError:
+            return None
+        raw = dict(item.raw or {})
+        raw.update(
+            {
+                "total_size": size,
+                "downloaded": size,
+                "download_speed": 0,
+                "aria2_status": "complete",
+                "verifying": False,
+                "recovered_stale_zero_local": True,
+            }
+        )
+        return DownloadItem(
+            torrent_hash=item.torrent_hash,
+            name=item.name or content.name,
+            state="complete",
+            progress=1.0,
+            save_path=item.save_path or str(content.parent),
+            content_path=str(content),
+            media_id=item.media_id,
+            episode=item.media_episode,
+            media_episode=item.media_episode,
+            release_episode=item.release_episode,
+            is_batch=False,
+            added_on=item.added_on,
+            completed_on=item.completed_on or int(time.time()),
+            raw=raw,
+        )
+
+    @classmethod
+    def _stale_aria2_row_shadowed_by_completed_local(
+        cls, live: DownloadItem, stored: DownloadItem | None
+    ) -> bool:
+        """Keep durable completion when aria2 resurrects a zero-byte stale shell."""
+        if stored is None or not cls._download_is_complete(stored):
+            return False
+        stored_path = cls._download_content_path(stored)
+        if stored_path is None or not stored_path.is_file():
+            return False
+        raw = dict(live.raw or {})
+        if str(raw.get("backend") or "").casefold() != "aria2":
+            return False
+        if cls._download_is_complete(live):
+            return False
+        state = str(live.state or "").casefold()
+        total = max(0, int(raw.get("total_size") or 0))
+        downloaded = max(0, int(raw.get("downloaded") or 0))
+        return bool(
+            state in {"active", "waiting", "paused", "stopped"}
+            and float(live.progress or 0.0) <= 0.001
+            and total == 0
+            and downloaded == 0
+        )
+
     def incomplete_download_paths(self) -> tuple[Path, ...]:
         paths: list[Path] = []
         for item in self.db.downloads():
@@ -921,7 +1119,160 @@ class AnimeManager:
                 break
         return repaired
 
-    def scan_library(self) -> list[LibraryEpisode]:
+    _LIBRARY_SCAN_CACHE_KEY = "library_scan_cache_v39"
+    _LIBRARY_SCAN_CACHE_GENERATION = 1
+    _LIBRARY_SCAN_CACHE_TTL_SECONDS = 15 * 60
+
+    def _library_scan_roots(self) -> tuple[Path, ...]:
+        roots: list[Path] = []
+        main_root = self.config.library.root_dir.expanduser()
+        try:
+            roots.append(main_root.resolve())
+        except (OSError, RuntimeError):
+            roots.append(main_root)
+        for configured in self.config.paths.download_dirs:
+            root = Path(configured).expanduser()
+            if not root.is_dir():
+                continue
+            try:
+                resolved = root.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if any(resolved == old or old in resolved.parents for old in roots):
+                continue
+            roots.append(resolved)
+        return tuple(roots)
+
+    def _library_scan_snapshot(self) -> dict[str, Any] | None:
+        """Build a cheap filesystem signature for files relevant to library import.
+
+        Full library reconciliation probes containers and can take ~45 seconds on
+        a modest library. Walking paths + stat is orders of magnitude cheaper and
+        lets the GUI and LaunchAgent share a short-lived scan result safely.
+        """
+        digest = hashlib.sha256()
+        digest.update(
+            f"generation={self._LIBRARY_SCAN_CACHE_GENERATION};recursive={int(self.config.library.recursive)}\n".encode()
+        )
+        relevant = set(VIDEO_EXTENSIONS) | set(TEXT_SUBTITLE_EXTENSIONS) | set(IMAGE_SUBTITLE_EXTENSIONS) | {".pgs"}
+        file_count = 0
+        roots = self._library_scan_roots()
+        try:
+            for root in roots:
+                digest.update(f"root={root}\n".encode("utf-8", errors="surrogateescape"))
+                if not root.exists():
+                    continue
+                iterator = root.rglob("*") if self.config.library.recursive else root.glob("*")
+                for path in iterator:
+                    if path.suffix.casefold() not in relevant or not path.is_file():
+                        continue
+                    stat = path.stat()
+                    resolved = path.resolve()
+                    digest.update(
+                        f"{resolved}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode(
+                            "utf-8", errors="surrogateescape"
+                        )
+                    )
+                    file_count += 1
+        except (OSError, PermissionError, RuntimeError):
+            return None
+        return {"fingerprint": digest.hexdigest(), "file_count": file_count}
+
+    def _cached_library_items(self) -> list[LibraryEpisode]:
+        roots = self._library_scan_roots()
+        result: list[LibraryEpisode] = []
+        for item in self.db.episodes():
+            try:
+                path = item.video_path.expanduser().resolve()
+            except (OSError, RuntimeError):
+                continue
+            if not path.is_file() or not self._path_within(path, roots):
+                continue
+            result.append(item)
+        return result
+
+    def _load_library_scan_cache(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.db.get_state(self._LIBRARY_SCAN_CACHE_KEY, "{}") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _store_library_scan_cache(self, snapshot: dict[str, Any], rows: int) -> None:
+        payload = {
+            "generation": self._LIBRARY_SCAN_CACHE_GENERATION,
+            "fingerprint": str(snapshot.get("fingerprint") or ""),
+            "file_count": int(snapshot.get("file_count") or 0),
+            "rows": max(0, int(rows)),
+            "completed_at": time.time(),
+        }
+        self.db.set_state(
+            self._LIBRARY_SCAN_CACHE_KEY,
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        )
+
+    def scan_library(
+        self,
+        *,
+        reuse_unchanged: bool = False,
+        user_requested: bool = False,
+    ) -> list[LibraryEpisode]:
+        if not reuse_unchanged:
+            return self._scan_library_uncached()
+
+        snapshot = self._library_scan_snapshot()
+        cached = self._load_library_scan_cache()
+        now = time.time()
+        try:
+            completed_at = float(cached.get("completed_at") or 0.0)
+        except (TypeError, ValueError):
+            completed_at = 0.0
+        age = max(0.0, now - completed_at) if completed_at else float("inf")
+        cache_hit = bool(
+            snapshot is not None
+            and int(cached.get("generation") or 0) == self._LIBRARY_SCAN_CACHE_GENERATION
+            and str(cached.get("fingerprint") or "") == str(snapshot.get("fingerprint") or "")
+            and age <= self._LIBRARY_SCAN_CACHE_TTL_SECONDS
+        )
+        if cache_hit:
+            items = self._cached_library_items()
+            self.logger.info(
+                "CACHE step=library.scan_fingerprint age_s=%.1f files=%s rows=%s",
+                age,
+                snapshot.get("file_count", 0) if snapshot else 0,
+                len(items),
+            )
+            return items
+
+        lease = self.work_scheduler.acquire_heavy(
+            "library-scan",
+            blocking=False,
+            foreground_sensitive=True,
+            priority=WorkPriority.USER if user_requested else WorkPriority.BACKGROUND,
+            resource="cpu",
+        )
+        if lease is None:
+            items = self._cached_library_items()
+            self.logger.info(
+                "SKIP step=library.scan reason=heavy_work_active files=%s rows=%s",
+                snapshot.get("file_count", 0) if snapshot else -1,
+                len(items),
+            )
+            return items
+
+        with lease:
+            items = self._scan_library_uncached()
+            final_snapshot = self._library_scan_snapshot()
+            if final_snapshot is not None:
+                self._store_library_scan_cache(final_snapshot, len(items))
+                self.logger.info(
+                    "CACHE step=library.scan_fingerprint_write files=%s rows=%s",
+                    final_snapshot.get("file_count", 0),
+                    len(items),
+                )
+            return items
+
+    def _scan_library_uncached(self) -> list[LibraryEpisode]:
         self._repair_legacy_library_episode_paths()
         excluded = self.incomplete_download_paths()
         # Remove rows created by older versions that scanned qBittorrent's
@@ -3751,6 +4102,24 @@ class AnimeManager:
         self._last_missing_episode_rows = self._remove_missing_episode_rows(active_hashes)
         self.db.prune_downloads(active_hashes)
         for item in items:
+            stored = self.db.download_by_hash(item.torrent_hash) if item.torrent_hash else None
+            if self._stale_aria2_row_shadowed_by_completed_local(item, stored):
+                self.logger.info(
+                    "REPAIR step=aria2.stale_zero_progress hash=%s "
+                    "reason=completed_local_file_is_authoritative",
+                    item.torrent_hash,
+                )
+                item = stored
+            else:
+                recovered = self._recover_stale_aria2_zero_shell(item)
+                if recovered is not None:
+                    self.logger.info(
+                        "REPAIR step=aria2.stale_zero_local_file hash=%s path=%r "
+                        "reason=exact_file_without_control_sidecar",
+                        item.torrent_hash,
+                        recovered.content_path,
+                    )
+                    item = recovered
             self._resolve_download_media(item)
             score_tag = item.raw.get("_release_score_tag")
             if (
@@ -3856,6 +4225,28 @@ class AnimeManager:
             recoverable_missing_control = bool(
                 state == "error" and raw.get("recoverable_missing_control")
             )
+            stale_zero_local_with_control = False
+            if (
+                state == "paused"
+                and total == 0
+                and downloaded == 0
+                and not item.is_batch
+            ):
+                content_value = str(item.content_path or "").strip()
+                content = Path(content_value).expanduser() if content_value else None
+                if content is not None and content.is_file():
+                    wanted_release = item.release_episode
+                    if wanted_release is None:
+                        wanted_release = parsed_release_episode(str(item.name or ""))
+                    actual_release = parsed_release_episode(content.name)
+                    identity_ok = bool(
+                        wanted_release is None
+                        or (actual_release is not None and int(actual_release) == int(wanted_release))
+                    )
+                    stale_zero_local_with_control = bool(
+                        identity_ok and Path(str(content) + ".aria2").exists()
+                    )
+
             stalled_candidate = (
                 state in {"active", "waiting"}
                 and not bool(raw.get("verifying"))
@@ -3866,7 +4257,7 @@ class AnimeManager:
                 and speed == 0
                 and connections == 0
             )
-            if not stalled_candidate and not recoverable_missing_control:
+            if not stalled_candidate and not recoverable_missing_control and not stale_zero_local_with_control:
                 if self.db.get_state(key, ""):
                     self.db.set_state(key, "")
                 continue
@@ -3891,6 +4282,39 @@ class AnimeManager:
                 )
             stalled_for = current - float(marker["stalled_since"] or current)
             since_reconnect = current - float(marker["last_reconnect"] or 0)
+
+            if stale_zero_local_with_control:
+                # A legacy aria2 task can be paused at 0/0 while the exact video
+                # and its control sidecar are still present. Do not promote it to
+                # complete blindly; resume/reconnect aria2 immediately so it can
+                # reconstruct metadata and verify or continue the existing data.
+                last_local_attempt = float(marker.get("last_local_zero_attempt") or 0)
+                if current - last_local_attempt >= 2 * 60:
+                    marker["last_local_zero_attempt"] = current
+                    try:
+                        if reconnect(item.torrent_hash):
+                            recovered += 1
+                            marker["last_reconnect"] = current
+                            marker["stalled_since"] = current
+                            self.logger.info(
+                                "REPAIR step=aria2.stale_zero_local_control hash=%s "
+                                "mode=resume_verify",
+                                item.torrent_hash,
+                            )
+                        else:
+                            self.logger.info(
+                                "RETRY step=aria2.stale_zero_local_control hash=%s "
+                                "reason=no_recovery_source delay_s=120",
+                                item.torrent_hash,
+                            )
+                    except QBittorrentError as exc:
+                        self.logger.warning(
+                            "RETRY step=aria2.stale_zero_local_control hash=%s "
+                            "delay_s=120 error=%r",
+                            item.torrent_hash, str(exc),
+                        )
+                self.db.set_state(key, json.dumps(marker, separators=(",", ":")))
+                continue
 
             if recoverable_missing_control:
                 # Missing-control recovery may need to fetch torrent metadata.
@@ -3959,14 +4383,7 @@ class AnimeManager:
         *,
         completed_paths: list[Path] | None = None,
     ) -> int:
-        content = Path(item.content_path).expanduser()
-        if content.is_file():
-            files = [content]
-        elif content.is_dir():
-            files = [path for path in content.rglob("*") if path.suffix.casefold() in VIDEO_EXTENSIONS]
-        else:
-            save = Path(item.save_path).expanduser()
-            files = [path for path in save.rglob("*") if path.suffix.casefold() in VIDEO_EXTENSIONS]
+        files = self._completed_download_video_files(item)
         count = 0
         new_paths: list[Path] = []
         anime = self.db.get_anime(item.media_id) if item.media_id else None
@@ -4079,6 +4496,24 @@ class AnimeManager:
     @property
     def last_completed_video_paths(self) -> tuple[Path, ...]:
         return self._last_completed_video_paths
+
+    @staticmethod
+    def _prepared_bitmap_retry_path(item: LibraryEpisode | None) -> Path | None:
+        """Reuse the synchronized bitmap stored by an earlier prepare attempt.
+
+        Once a PGS/SUP candidate has been discovered and synchronized, retrying
+        Jimaku discovery and archive extraction is pure duplicate work.  The
+        background CLI can feed this exact path straight into OCR.
+        """
+        if item is None or item.state != "waiting_text_subtitles":
+            return None
+        path = item.subtitle_path
+        if path is None or path.suffix.casefold() not in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}:
+            return None
+        try:
+            return path if path.is_file() and path.stat().st_size > 0 else None
+        except OSError:
+            return None
 
     @staticmethod
     def _subtitle_upgrade_state_key(video: Path) -> str:
@@ -4227,6 +4662,94 @@ class AnimeManager:
                 str(video), item.media_id, item.episode, source,
             )
             changed.append(video)
+        return changed
+
+    def _active_subtitle_upgrade_paths(self) -> set[str]:
+        paths: set[str] = set()
+        for item in self.db.episodes():
+            key = self._subtitle_upgrade_state_key(item.video_path)
+            if self.db.get_state(key, "").strip():
+                paths.add(str(item.video_path))
+        return paths
+
+    def _restore_interrupted_subtitle_upgrades(self) -> int:
+        """Restore Ready selections hidden by legacy upgrade/repair races.
+
+        v39 and older reused ordinary subtitle jobs for upgrade checks. A later
+        repair pass could therefore demote the episode while the upgrade marker
+        still preserved the previous valid selection. Rehydrate that selection
+        and keep/recreate the upgrade job so checking remains transparent.
+        """
+        restored = 0
+        for item in self.db.episodes():
+            key = self._subtitle_upgrade_state_key(item.video_path)
+            raw = self.db.get_state(key, "").strip()
+            if not raw:
+                continue
+            try:
+                request = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(request, dict):
+                continue
+            previous_value = str(request.get("previous_subtitle_path") or "").strip()
+            previous_path = Path(previous_value) if previous_value else None
+            previous_sid_raw = request.get("previous_embedded_sid")
+            previous_sid = int(previous_sid_raw) if previous_sid_raw is not None else None
+            valid_previous = bool(
+                previous_sid is not None
+                or (previous_path is not None and previous_path.is_file())
+            )
+            if not valid_previous:
+                continue
+            if item.state not in {"ready", "watched"}:
+                if self.db.restore_ready_selection_for_upgrade(
+                    item.video_path,
+                    previous_path,
+                    previous_sid,
+                    origin=str(request.get("previous_origin") or ""),
+                ):
+                    restored += 1
+                    self.logger.info(
+                        "REPAIR step=subtitle.upgrade_restore media_id=%s episode=%s video=%r",
+                        item.media_id, item.episode, str(item.video_path),
+                    )
+            self.db.queue_subtitle_job(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                priority=120,
+                error="Checking subtitle upgrade",
+            )
+        return restored
+
+    def _reconcile_ocr_readiness_policy(self) -> int:
+        """Keep OCR text cached/playable without calling it verified Ready."""
+        if self.config.matching.ocr_counts_as_ready:
+            return 0
+        changed = 0
+        for item in self.db.episodes():
+            if item.state == "watched" or not item.video_path.is_file():
+                continue
+            if not self._is_legacy_ocr_prepared_subtitle(item):
+                continue
+            if item.subtitle_path is None or not item.subtitle_path.is_file():
+                continue
+            if item.state != "waiting_text_subtitles" or str(item.subtitle_origin or "").casefold() != "ocr":
+                self.db.set_ocr_fallback_not_ready(item.video_path, item.subtitle_path)
+                changed += 1
+                self.logger.info(
+                    "REPAIR step=subtitle.ocr_readiness media_id=%s episode=%s video=%r state=waiting_text_subtitles",
+                    item.media_id, item.episode, str(item.video_path),
+                )
+            self.db.queue_subtitle_job(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                priority=80,
+                delay_seconds=max(60.0, self.config.agent.subtitle_poll_minutes * 60.0),
+                error="OCR fallback cached; waiting for verified Japanese text subtitles",
+            )
         return changed
 
     def schedule_subtitle_upgrades(
@@ -4575,13 +5098,7 @@ class AnimeManager:
                 and not item.is_batch
             ):
                 continue
-            if content.is_file():
-                candidate_files = [content]
-            else:
-                candidate_files = [
-                    path for path in content.rglob("*")
-                    if path.is_file() and path.suffix.casefold() in VIDEO_EXTENSIONS
-                ]
+            candidate_files = self._completed_download_video_files(item)
             def row_matches_download(path: Path) -> bool:
                 row = self.db.episode_by_path(path.resolve())
                 if row is None:
@@ -4808,6 +5325,7 @@ class AnimeManager:
             download=primary_download,
             action_job=action_job,
             watched_externally=watched_externally,
+            allow_ocr_ready=bool(self.config.matching.ocr_counts_as_ready),
         )
 
         video_exists = bool(selected and selected.video_path.is_file())
@@ -5171,6 +5689,45 @@ class AnimeManager:
                 if "--force-search" not in command:
                     command.append("--force-search")
                 command.append("--resync")
+            prepared_bitmap: Path | None = None
+            ocr_fallback_path: Path | None = None
+            existing_episode = self.db.episode_by_path(video)
+            if (
+                manual_path is None
+                and not debug_force
+                and upgrade_request is None
+                and existing_episode is not None
+                and existing_episode.state == "waiting_text_subtitles"
+                and str(existing_episode.subtitle_origin or "").casefold() == "ocr"
+                and existing_episode.subtitle_path is not None
+                and existing_episode.subtitle_path.is_file()
+                and not self.config.matching.ocr_counts_as_ready
+            ):
+                # OCR is retained as a playback fallback, but background retries
+                # must search only for verified text. Otherwise the final OCR
+                # cache would be accepted again on every poll and bounce the
+                # episode back to Ready.
+                ocr_fallback_path = existing_episode.subtitle_path
+                if "--force-search" not in command:
+                    command.append("--force-search")
+                command.append("--text-only")
+                self.logger.info(
+                    "CACHE step=subtitle.ocr_fallback_text_retry media_id=%s episode=%s "
+                    "video=%s path=%s",
+                    job["media_id"], job["episode"], video.name, ocr_fallback_path,
+                )
+            elif manual_path is None and not debug_force and upgrade_request is None:
+                prepared_bitmap = self._prepared_bitmap_retry_path(existing_episode)
+                if prepared_bitmap is not None:
+                    command.extend(["--prepared-bitmap-sub", str(prepared_bitmap)])
+                    self.logger.info(
+                        "CACHE step=subtitle.prepare_bitmap_source media_id=%s episode=%s "
+                        "video=%s path=%s",
+                        job["media_id"],
+                        job["episode"],
+                        video.name,
+                        prepared_bitmap,
+                    )
             command.append(str(video))
             env = dict(os.environ)
             env["PUDGE_CONFIG"] = str(self.config.config_path)
@@ -5230,6 +5787,9 @@ class AnimeManager:
                     )
                     deadline = time.monotonic() + 20 * 60
                     cancelled_for_foreground = False
+                    memory_guard_triggered = False
+                    memory_guard_limit_mb = 4096.0
+                    next_memory_check = time.monotonic() + 5.0
                     last_report_stage = ""
                     while process.poll() is None:
                         report = read_job_report(status_path)
@@ -5256,6 +5816,31 @@ class AnimeManager:
                                     },
                                 )
                                 last_report_stage = report_stage
+                        now_monotonic = time.monotonic()
+                        if (
+                            prepared_bitmap is not None
+                            and self.config.matching.ocr_image_subtitles
+                            and now_monotonic >= next_memory_check
+                        ):
+                            next_memory_check = now_monotonic + 5.0
+                            rss_mb = _process_rss_mb(process.pid)
+                            if rss_mb is not None and rss_mb > memory_guard_limit_mb:
+                                memory_guard_triggered = True
+                                self.logger.warning(
+                                    "STOP step=subtitle.prepare reason=ocr_memory_guard "
+                                    "media_id=%s episode=%s video=%s rss_mb=%.1f limit_mb=%.1f",
+                                    job["media_id"],
+                                    job["episode"],
+                                    video.name,
+                                    rss_mb,
+                                    memory_guard_limit_mb,
+                                )
+                                process.terminate()
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    process.kill()
+                                break
                         if not self.work_scheduler.background_allowed():
                             cancelled_for_foreground = True
                             process.terminate()
@@ -5285,6 +5870,22 @@ class AnimeManager:
                                 final_stage,
                                 progress=details if isinstance(details, dict) else {},
                             )
+                    if memory_guard_triggered:
+                        self.db.postpone_bitmap_ocr_job(
+                            video,
+                            "Bitmap OCR exceeded the 4096 MB memory safety limit",
+                            30 * 60,
+                        )
+                        self.logger.info(
+                            "RETRY step=subtitle.prepare reason=ocr_memory_guard "
+                            "media_id=%s episode=%s video=%s delay_s=%s",
+                            job["media_id"],
+                            job["episode"],
+                            video.name,
+                            30 * 60,
+                        )
+                        requeue_unstarted(job_index + 1)
+                        break
                     if cancelled_for_foreground:
                         if not restore_upgrade_selection("Foreground playback requested"):
                             self.db.clear_subtitle_selection(video)
@@ -5488,10 +6089,15 @@ class AnimeManager:
                         video, "Waiting for Japanese text subtitles", delay
                     )
                 # postpone_subtitle_job uses the generic waiting state; restore
-                # the more precise bitmap-fallback state afterwards.
-                self.db.set_waiting_text_subtitles(
-                    video, subtitle, embedded_subtitle_id
-                )
+                # the more precise fallback state afterwards. An already cached
+                # OCR SRT is retained as playback fallback while text-only
+                # discovery continues in the background.
+                if ocr_fallback_path is not None and ocr_fallback_path.is_file():
+                    self.db.set_ocr_fallback_not_ready(video, ocr_fallback_path)
+                else:
+                    self.db.set_waiting_text_subtitles(
+                        video, subtitle, embedded_subtitle_id
+                    )
                 self.logger.info(
                     "RETRY step=subtitle.prepare media_id=%s episode=%s video=%s attempts=%s delay_s=%s reason=waiting_text_subtitles",
                     job["media_id"], job["episode"], video.name, attempts, delay,
@@ -5499,10 +6105,40 @@ class AnimeManager:
             elif completed.returncode == 0:
                 previous = self.db.episode_by_path(video)
                 was_ready = bool(previous is not None and previous.state in {"ready", "watched"})
+                generated_ocr = bool(subtitle_meta.get("generated_by_ocr"))
+                if generated_ocr and not self.config.matching.ocr_counts_as_ready:
+                    # OCR is useful as a playback fallback/cache but does not
+                    # satisfy the user's Ready policy. Keep the SRT, keep a
+                    # low-frequency text-only retry, and never notify Ready.
+                    self.db.set_ocr_fallback_not_ready(video, subtitle)
+                    retry_delay = max(6 * 3600.0, self.config.agent.subtitle_poll_minutes * 60.0)
+                    self.db.postpone_subtitle_job(
+                        video,
+                        "OCR fallback cached; waiting for verified Japanese text subtitles",
+                        retry_delay,
+                    )
+                    self.db.set_ocr_fallback_not_ready(video, subtitle)
+                    self.db.record_subtitle_history(
+                        video_path=video,
+                        media_id=media_id,
+                        episode=int(job["episode"]) if job["episode"] is not None else None,
+                        source="ocr",
+                        candidate_name=str(subtitle_meta.get("name") or (subtitle.name if subtitle else "ocr")),
+                        candidate_path=str(subtitle_meta.get("candidate_path") or subtitle or ""),
+                        score=(float(subtitle_meta["score"]) if subtitle_meta.get("score") is not None else None),
+                        status="ocr_fallback",
+                        reason="OCR cached for playback but excluded from Ready by policy",
+                        details=subtitle_meta,
+                    )
+                    self.logger.info(
+                        "RESULT step=subtitle.ocr_readiness media_id=%s episode=%s video=%r ready=false retry_s=%s",
+                        media_id, job["episode"], str(video), int(retry_delay),
+                    )
+                    continue
                 self.db.set_subtitle_ready(
                     video, subtitle, embedded_subtitle_id,
                     origin=(
-                        "ocr" if bool(subtitle_meta.get("generated_by_ocr"))
+                        "ocr" if generated_ocr
                         else str(subtitle_meta.get("source") or ("embedded" if embedded_subtitle_id is not None else "external"))
                     ),
                 )
@@ -5531,7 +6167,10 @@ class AnimeManager:
                 # path playable. This matters after validation rules become
                 # stricter: a cache file can still exist while the current run
                 # explicitly rejects it.
-                self.db.clear_subtitle_selection(video)
+                if ocr_fallback_path is not None and ocr_fallback_path.is_file():
+                    self.db.set_ocr_fallback_not_ready(video, ocr_fallback_path)
+                else:
+                    self.db.clear_subtitle_selection(video)
                 # ffsubsync writes ordinary INFO lines to stderr. Using stderr
                 # alone hid the actual deterministic validation failure printed
                 # to stdout and reduced a 6h backoff to the normal 10m retry.
@@ -5581,6 +6220,8 @@ class AnimeManager:
                     self.db.defer_subtitle_job(video, detail or "Jimaku rate limited (429)", delay)
                 else:
                     self.db.postpone_subtitle_job(video, detail or "Субтитры пока не найдены", delay)
+                if ocr_fallback_path is not None and ocr_fallback_path.is_file():
+                    self.db.set_ocr_fallback_not_ready(video, ocr_fallback_path)
         return ready
 
     def _prune_empty_library_dirs(self) -> int:
@@ -6348,13 +6989,35 @@ class AnimeManager:
             self.log(str(exc))
 
     def run_startup_once(self) -> dict[str, int]:
-        """Run one startup maintenance pass unless another process already owns it."""
+        """Run one startup maintenance pass unless recent user work already did it."""
         with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
             if not acquired:
                 self.logger.info(
                     "SKIP step=maintenance.total mode=startup reason=another_process_active"
                 )
                 return self._maintenance_stats()
+            raw_interactive = self.db.get_state("interactive_refresh_completed_at_v39", "")
+            try:
+                interactive = json.loads(raw_interactive) if raw_interactive else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                interactive = {}
+            try:
+                last_interactive = float(interactive.get("completed_at") or 0.0)
+                interactive_pid = int(interactive.get("pid") or 0)
+            except (AttributeError, TypeError, ValueError):
+                last_interactive = 0.0
+                interactive_pid = 0
+            age = time.time() - last_interactive if last_interactive else float("inf")
+            if interactive_pid == os.getpid() and 0.0 <= age <= 5 * 60:
+                stats = self._maintenance_stats()
+                stats["library"] = len(self._cached_library_items())
+                self.logger.info(
+                    "SKIP step=maintenance.total mode=startup "
+                    "reason=recent_interactive_refresh age_s=%.1f rows=%s",
+                    age,
+                    stats["library"],
+                )
+                return stats
             return self._run_startup_once_unlocked()
 
     def _run_startup_once_unlocked(self) -> dict[str, int]:
@@ -6375,7 +7038,11 @@ class AnimeManager:
         self.logger.info("SUMMARY mode=startup-fast-refresh stats=%s", stats)
         return stats
 
-    def run_interactive_refresh(self) -> dict[str, int]:
+    def run_interactive_refresh(
+        self,
+        *,
+        pre_scanned_library_count: int | None = None,
+    ) -> dict[str, int]:
         """Refresh user-visible availability without waiting on subtitle alignment.
 
         One click must be enough even if another process is already preparing
@@ -6391,13 +7058,23 @@ class AnimeManager:
                     force_subtitle_retry=True,
                     prioritize_release_search=True,
                     defer_subtitle_processing=True,
+                    pre_scanned_library_count=pre_scanned_library_count,
                 )
                 stats["subtitle_check_queued"] = self.db.priority_subtitle_job_count(
                     min_priority=200
                 )
+                self.db.set_state(
+                    "interactive_refresh_completed_at_v39",
+                    json.dumps(
+                        {"pid": os.getpid(), "completed_at": time.time()},
+                        separators=(",", ":"),
+                    ),
+                )
                 return stats
         self.logger.info("FALLBACK step=maintenance.interactive reason=heavy_maintenance_active")
         stats = self._maintenance_stats()
+        if pre_scanned_library_count is not None:
+            stats["library"] = max(0, int(pre_scanned_library_count))
         forced_jobs = self.db.force_requeue_unresolved_subtitle_jobs(
             priority=200, recover_processing=False
         )
@@ -6455,6 +7132,7 @@ class AnimeManager:
         force_subtitle_retry: bool = False,
         prioritize_release_search: bool = False,
         defer_subtitle_processing: bool = False,
+        pre_scanned_library_count: int | None = None,
     ) -> dict[str, int]:
         stats = self._maintenance_stats()
         # AniList is intentionally not refreshed by the periodic/local refresh.
@@ -6475,20 +7153,33 @@ class AnimeManager:
                         "REPAIR step=subtitle.bitmap_ready rows=%s",
                         bitmap_repaired,
                     )
-                preserved = self.db.repair_spurious_ready_subtitle_jobs()
+                restored_upgrades = self._restore_interrupted_subtitle_upgrades()
+                upgrade_paths = self._active_subtitle_upgrade_paths()
+                preserved = self.db.repair_spurious_ready_subtitle_jobs(
+                    preserve_paths=upgrade_paths
+                )
                 if preserved:
                     self.logger.info(
                         "REPAIR step=subtitle.spurious_ready_jobs removed=%s",
                         preserved,
                     )
-                repaired = self.db.repair_stale_subtitle_selections()
+                repaired = self.db.repair_stale_subtitle_selections(
+                    preserve_paths=upgrade_paths
+                )
                 if repaired:
                     self.logger.info(
                         "REPAIR step=subtitle.stale_selection cleared=%s",
                         repaired,
                     )
+                if restored_upgrades:
+                    self.logger.info(
+                        "REPAIR step=subtitle.upgrade_restore rows=%s",
+                        restored_upgrades,
+                    )
                 if not self.config.matching.ocr_image_subtitles:
                     self.invalidate_disabled_ocr_subtitles()
+                elif not self.config.matching.ocr_counts_as_ready:
+                    self._reconcile_ocr_readiness_policy()
                 self._requeue_legacy_generated_subtitles()
                 self._requeue_stt_timeline_clock_conflicts()
                 self._requeue_opening_gap_timeline_upgrade()
@@ -6500,8 +7191,15 @@ class AnimeManager:
                     stats["torrent_duplicates"] = self.cleanup_duplicate_torrents()
                 except QBittorrentError as exc:
                     self.log(str(exc))
-            with timed_step(self.logger, "library.scan", priority="before_subtitles"):
-                stats["library"] = len(self.scan_library())
+            if pre_scanned_library_count is None:
+                with timed_step(self.logger, "library.scan", priority="before_subtitles"):
+                    stats["library"] = len(self.scan_library(reuse_unchanged=True))
+            else:
+                stats["library"] = max(0, int(pre_scanned_library_count))
+                self.logger.info(
+                    "SKIP step=library.scan reason=already_scanned_in_refresh rows=%s",
+                    stats["library"],
+                )
             with timed_step(self.logger, "subtitle.inbox"):
                 inbox = self.scan_subtitle_inbox()
                 stats["inbox_requeued"] = int(inbox.get("requeued", 0) or 0)

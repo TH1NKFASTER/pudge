@@ -84,14 +84,14 @@ def test_manual_refresh_searches_nyaa_before_long_subtitle_work(tmp_path: Path, 
 
     monkeypatch.setattr(manager, "_repair_brand_moved_subtitle_selections", lambda: 0)
     monkeypatch.setattr(manager.db, "repair_bitmap_ready_rows", lambda: 0)
-    monkeypatch.setattr(manager.db, "repair_spurious_ready_subtitle_jobs", lambda: 0)
-    monkeypatch.setattr(manager.db, "repair_stale_subtitle_selections", lambda: 0)
+    monkeypatch.setattr(manager.db, "repair_spurious_ready_subtitle_jobs", lambda **_kwargs: 0)
+    monkeypatch.setattr(manager.db, "repair_stale_subtitle_selections", lambda **_kwargs: 0)
     monkeypatch.setattr(manager, "invalidate_disabled_ocr_subtitles", lambda: 0)
     monkeypatch.setattr(manager, "_requeue_legacy_generated_subtitles", lambda: 0)
     monkeypatch.setattr(manager, "_requeue_after_resolver_upgrade", lambda: 0)
     monkeypatch.setattr(manager, "sync_downloads", lambda: 0)
     monkeypatch.setattr(manager, "cleanup_duplicate_torrents", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "scan_subtitle_inbox", lambda: {})
     monkeypatch.setattr(manager, "repair_library_if_due", lambda: {})
     monkeypatch.setattr(manager, "schedule_subtitle_upgrades", lambda: 0)
@@ -115,7 +115,7 @@ def test_web_refresh_uses_interactive_maintenance(tmp_path: Path) -> None:
     calls: list[str] = []
 
     class Manager:
-        def run_interactive_refresh(self):
+        def run_interactive_refresh(self, **_kwargs):
             calls.append("interactive")
             return {"auto": 0}
 

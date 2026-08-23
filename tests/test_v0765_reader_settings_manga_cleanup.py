@@ -112,4 +112,5 @@ def test_ln_parse_ahead_is_automatic_next_and_energy_diagnostics_are_always_on()
     assert "energy_sample_seconds=30.0" in config
     web_app = WEB_APP.read_text(encoding="utf-8")
     assert 'sys.platform == "darwin"' in web_app
-    assert "and self.config.diagnostics.energy_monitoring_enabled" in web_app
+    assert 'self._ensure_energy_monitor(reason="startup")' in web_app
+    assert 'safe_mode_active = bool(getattr(getattr(self, "safe_mode", None), "active", False))' in web_app

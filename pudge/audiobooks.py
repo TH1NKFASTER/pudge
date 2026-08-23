@@ -392,13 +392,14 @@ class AudiobookService:
     def _bookmarks(self, book_id: int) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM audiobook_bookmarks WHERE book_id=? ORDER BY position,id", (int(book_id),)
+                "SELECT * FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id", (int(book_id),)
             ).fetchall()
         return [
             {
                 "id": int(row["id"]),
                 "position": float(row["position"]),
                 "title": str(row["title"] or ""),
+                "sort_order": int(row["sort_order"] or 0),
                 "created_at": float(row["created_at"]),
             }
             for row in rows
@@ -1094,14 +1095,21 @@ class AudiobookService:
                 position = live
         label = str(title or "").strip() or f"{int(position // 60)}:{int(position % 60):02d}"
         with self.db.connect() as conn:
+            next_order = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sort_order),-1)+1 FROM audiobook_bookmarks WHERE book_id=?",
+                    (book_id,),
+                ).fetchone()[0]
+            )
             cursor = conn.execute(
-                "INSERT INTO audiobook_bookmarks(book_id,position,title,created_at) VALUES(?,?,?,?)",
-                (book_id, position, label, time.time()),
+                "INSERT INTO audiobook_bookmarks(book_id,position,title,sort_order,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (book_id, position, label, next_order, time.time()),
             )
             bookmark_id = int(cursor.lastrowid)
         return {"ok": True, "bookmark_id": bookmark_id, "book": self.book(book_id)}
 
-    def delete_bookmark(self, bookmark_id: int) -> dict[str, Any]:
+    def rename_bookmark(self, bookmark_id: int, title: str) -> dict[str, Any]:
         with self.db.connect() as conn:
             row = conn.execute(
                 "SELECT book_id FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),)
@@ -1109,8 +1117,93 @@ class AudiobookService:
             if row is None:
                 return {"ok": False}
             book_id = int(row["book_id"])
-            conn.execute("DELETE FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),))
+            conn.execute(
+                "UPDATE audiobook_bookmarks SET title=? WHERE id=?",
+                (str(title or "").strip(), int(bookmark_id)),
+            )
         return {"ok": True, "book": self.book(book_id)}
+
+    def reorder_bookmarks(self, book_id: int, bookmark_ids: list[int]) -> dict[str, Any]:
+        book_id = int(book_id)
+        requested = [int(value) for value in bookmark_ids]
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id",
+                (book_id,),
+            ).fetchall()
+            existing = [int(row["id"]) for row in rows]
+            if sorted(requested) != sorted(existing):
+                raise ValueError("Bookmark reorder must contain every bookmark exactly once")
+            conn.executemany(
+                "UPDATE audiobook_bookmarks SET sort_order=? WHERE id=? AND book_id=?",
+                [(index, bookmark_id, book_id) for index, bookmark_id in enumerate(requested)],
+            )
+        return {"ok": True, "book": self.book(book_id)}
+
+    def restore_bookmark(
+        self,
+        book_id: int,
+        position: float,
+        title: str,
+        sort_order: int,
+        created_at: float,
+        bookmark_id: int | None = None,
+    ) -> dict[str, Any]:
+        book_id = int(book_id)
+        position = max(0.0, float(position))
+        title = str(title or "").strip()
+        created_at = float(created_at or time.time())
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id",
+                (book_id,),
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in rows]
+            index = max(0, min(int(sort_order), len(existing_ids)))
+            requested_id = int(bookmark_id) if bookmark_id is not None else 0
+            if requested_id > 0 and conn.execute(
+                "SELECT 1 FROM audiobook_bookmarks WHERE id=?", (requested_id,)
+            ).fetchone() is None:
+                cursor = conn.execute(
+                    "INSERT INTO audiobook_bookmarks(id,book_id,position,title,sort_order,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (requested_id, book_id, position, title, len(existing_ids), created_at),
+                )
+                restored_id = int(cursor.lastrowid or requested_id)
+            else:
+                cursor = conn.execute(
+                    "INSERT INTO audiobook_bookmarks(book_id,position,title,sort_order,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (book_id, position, title, len(existing_ids), created_at),
+                )
+                restored_id = int(cursor.lastrowid)
+            ordered_ids = [*existing_ids]
+            ordered_ids.insert(index, restored_id)
+            conn.executemany(
+                "UPDATE audiobook_bookmarks SET sort_order=? WHERE id=? AND book_id=?",
+                [(order, item_id, book_id) for order, item_id in enumerate(ordered_ids)],
+            )
+        return {"ok": True, "bookmark_id": restored_id, "book": self.book(book_id)}
+
+    def delete_bookmark(self, bookmark_id: int) -> dict[str, Any]:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),)
+            ).fetchone()
+            if row is None:
+                return {"ok": False}
+            book_id = int(row["book_id"])
+            deleted = dict(row)
+            conn.execute("DELETE FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),))
+            remaining = conn.execute(
+                "SELECT id FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id",
+                (book_id,),
+            ).fetchall()
+            conn.executemany(
+                "UPDATE audiobook_bookmarks SET sort_order=? WHERE id=? AND book_id=?",
+                [(order, int(item["id"]), book_id) for order, item in enumerate(remaining)],
+            )
+        return {"ok": True, "deleted": deleted, "book": self.book(book_id)}
 
     def mark_finished(self, book_id: int, finished: bool = True) -> dict[str, Any]:
         if self.is_playing(int(book_id)):

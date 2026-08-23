@@ -192,7 +192,9 @@ def test_initial_refresh_button_stays_disabled_until_background_maintenance_fini
     assert "setLocalRefreshUi(false);if(r.error)" in html
 
 
-def test_startup_poll_forces_visible_home_refresh_before_maintenance_finishes():
+def test_startup_poll_defers_home_refresh_until_maintenance_finishes():
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
 
-    assert "ui.state=r.state;if(ui.windowActive)renderDataPages(true);else ui.pendingDataRender=true" in html
+    assert "if(r.running){ui.startupDeferredState=r.state||ui.startupDeferredState" in html
+    assert "ui.state=r.state||ui.startupDeferredState||ui.state" in html
+    assert "if(ui.windowActive)renderDataPages(true);else ui.pendingDataRender=true" in html

@@ -52,7 +52,7 @@ def test_manual_refresh_recreates_missing_job_from_waiting_library_row(
         )
     )
     assert manager.db.subtitle_jobs() == []
-    monkeypatch.setattr(manager, "scan_library", lambda: manager.db.episodes())
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: manager.db.episodes())
 
     observed: dict[str, int] = {}
 
@@ -91,7 +91,7 @@ def test_manual_refresh_recovers_processing_job_before_lease_expires(
     claimed = manager.db.claim_due_subtitle_jobs(1, lease_seconds=3600)
     assert len(claimed) == 1
     assert manager.db.due_subtitle_jobs(limit=10) == []
-    monkeypatch.setattr(manager, "scan_library", lambda: manager.db.episodes())
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: manager.db.episodes())
 
     observed: dict[str, int] = {}
 

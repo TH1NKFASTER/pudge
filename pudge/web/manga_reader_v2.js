@@ -1847,7 +1847,7 @@
     } else if (event.key === previousKey) {
       event.preventDefault();
       void movePage(-1);
-    } else if (event.key.toLowerCase() === 'f') {
+    } else if (event.key.toLowerCase() === 'f' && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
       event.preventDefault();
       void toggleFullscreen();
     } else if (event.key.toLowerCase() === 't') {

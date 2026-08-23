@@ -54,9 +54,9 @@ def test_resolver_upgrade_retries_delayed_jobs_immediately_with_agent_enabled(
     manager.db.queue_subtitle_job(video, 211711, None, delay_seconds=21600)
     manager.db.set_state("subtitle_resolver_generation", "8")
 
-    monkeypatch.setattr(manager, "sync_downloads", lambda: [])
+    monkeypatch.setattr(manager, "sync_downloads", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "cleanup_duplicate_torrents", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "refresh_anilist_if_due", lambda: 0)
     monkeypatch.setattr(manager, "auto_search_current", lambda: 0)
     monkeypatch.setattr(manager, "auto_upgrade_downloaded", lambda: 0)

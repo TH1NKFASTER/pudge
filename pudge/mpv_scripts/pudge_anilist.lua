@@ -11,12 +11,9 @@ local media_id = os.getenv('PUDGE_ANILIST_MEDIA_ID') or ''
 local title = os.getenv('PUDGE_ANILIST_TITLE') or 'anime'
 local auto_update = (os.getenv('PUDGE_ANILIST_AUTO_UPDATE') or '0') == '1'
 local shortcut_mark_watched = os.getenv('PUDGE_SHORTCUT_MARK_WATCHED') or 'Ctrl+a'
-local shortcut_open_anilist = os.getenv('PUDGE_SHORTCUT_OPEN_ANILIST') or 'Ctrl+b'
-local shortcut_correct_match = os.getenv('PUDGE_SHORTCUT_CORRECT_MATCH') or 'c'
 local shortcut_translate_subtitle = os.getenv('PUDGE_SHORTCUT_TRANSLATE_SUBTITLE') or 'Ctrl+t'
 local ui_language = (os.getenv('PUDGE_UI_LANGUAGE') or 'en'):lower()
 local app_name = os.getenv('PUDGE_APP_NAME') or 'pudge'
-local app_cli = os.getenv('PUDGE_APP_CLI') or 'pudge'
 local subtitle_path = os.getenv('PUDGE_SUBTITLE_PATH') or ''
 
 local function tr(english, russian)
@@ -509,47 +506,6 @@ local function update_anilist(manual)
     if not started and not manual then triggered = false end
 end
 
-local function open_anilist()
-    if media_id == '' then return end
-    mp.command_native_async({
-        name = 'subprocess',
-        args = {'open', 'https://anilist.co/anime/' .. media_id},
-        playback_only = false,
-    }, function() end)
-end
-
-local function correct_anilist()
-    if tracking_file == '' then return end
-    local ok, input = pcall(require, 'mp.input')
-    if not ok or not input or not input.get then
-        mp.osd_message(tr(
-            'Correction: ' .. app_cli .. ' --anilist-correct ID <video>',
-            'Исправление: ' .. app_cli .. ' --anilist-correct ID <video>'
-        ), 6)
-        return
-    end
-    input.get({
-        prompt = tr('AniList ID or URL: ', 'AniList ID или URL: '),
-        submit = function(value)
-            if not value or value == '' then return end
-            run_helper('correct', {'--anilist-id', value}, function(success, result)
-                local accepted = success and result and result.status == 0
-                osd_from_result(result, accepted and tr(
-                    'AniList match corrected',
-                    'Сопоставление AniList исправлено'
-                ) or tr(
-                    'Correction failed',
-                    'Ошибка исправления'
-                ))
-                if accepted and result and result.stdout then
-                    local new_id = result.stdout:match('ANILIST_ID:(%d+)')
-                    if new_id then media_id = new_id end
-                end
-            end)
-        end,
-    })
-end
-
 local function check_progress()
     accumulate_active_time()
     if not auto_update or triggered then return end
@@ -679,12 +635,6 @@ end
 
 if shortcut_mark_watched ~= '' then
     add_reliable_binding(shortcut_mark_watched, 'pudge_anilist_update', function() update_anilist(true) end)
-end
-if shortcut_open_anilist ~= '' then
-    add_reliable_binding(shortcut_open_anilist, 'pudge_anilist_open', open_anilist)
-end
-if shortcut_correct_match ~= '' then
-    mp.add_key_binding(shortcut_correct_match, 'pudge_anilist_correct', correct_anilist)
 end
 
 if shortcut_translate_subtitle ~= '' then

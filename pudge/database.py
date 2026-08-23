@@ -391,12 +391,13 @@ CREATE TABLE IF NOT EXISTS audiobook_bookmarks (
     book_id INTEGER NOT NULL,
     position REAL NOT NULL,
     title TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_audiobook_bookmarks_book
-ON audiobook_bookmarks(book_id,position);
+ON audiobook_bookmarks(book_id,sort_order,position);
 
 CREATE TABLE IF NOT EXISTS reading_audio_links (
     ln_book_id INTEGER PRIMARY KEY,
@@ -534,6 +535,29 @@ class Database:
         self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
         self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")
+        bookmark_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(audiobook_bookmarks)").fetchall()
+        }
+        bookmark_sort_missing = "sort_order" not in bookmark_columns
+        self._ensure_column(
+            conn,
+            "audiobook_bookmarks",
+            "sort_order",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        if bookmark_sort_missing:
+            rows = conn.execute(
+                "SELECT id,book_id FROM audiobook_bookmarks ORDER BY book_id,position,id"
+            ).fetchall()
+            next_order: dict[int, int] = {}
+            for row in rows:
+                book_id = int(row["book_id"])
+                order = next_order.get(book_id, 0)
+                conn.execute(
+                    "UPDATE audiobook_bookmarks SET sort_order=? WHERE id=?",
+                    (order, int(row["id"])),
+                )
+                next_order[book_id] = order + 1
         conn.execute(
             "INSERT OR IGNORE INTO state(key,value,updated_at) VALUES('ui_state_version','0',?)",
             (time.time(),),
@@ -671,11 +695,12 @@ class Database:
                 book_id INTEGER NOT NULL,
                 position REAL NOT NULL,
                 title TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_audiobook_bookmarks_book
-            ON audiobook_bookmarks(book_id,position);
+            ON audiobook_bookmarks(book_id,sort_order,position);
             CREATE TABLE IF NOT EXISTS reading_audio_links (
                 ln_book_id INTEGER PRIMARY KEY,
                 audiobook_id INTEGER NOT NULL,
@@ -1678,6 +1703,65 @@ class Database:
                 ),
             )
 
+
+    def set_ocr_fallback_not_ready(
+        self,
+        video_path: Path,
+        subtitle_path: Path | None,
+    ) -> None:
+        """Keep a cached OCR SRT playable without treating it as verified Ready."""
+        with self.connect() as conn:
+            resolved = self._transition_episode(
+                conn, video_path, "waiting_text_subtitles", trigger="ocr_fallback"
+            )
+            conn.execute(
+                "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=NULL,subtitle_origin='ocr',"
+                "state=?,updated_at=? WHERE video_path=?",
+                (
+                    str(subtitle_path) if subtitle_path else None,
+                    resolved,
+                    time.time(),
+                    str(video_path),
+                ),
+            )
+
+    def restore_ready_selection_for_upgrade(
+        self,
+        video_path: Path,
+        subtitle_path: Path | None,
+        embedded_subtitle_id: int | None,
+        *,
+        origin: str = "",
+    ) -> bool:
+        """Restore the old Ready selection while an upgrade check is pending.
+
+        Unlike ``set_subtitle_ready`` this intentionally keeps the subtitle job:
+        upgrade checks are observational and must never make a ready episode
+        disappear while a better candidate is being evaluated.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
+            ).fetchone()
+            if row is None:
+                return False
+            current = str(row["state"] or "local")
+            resolved = transition_episode_state(
+                current, "ready", trigger="subtitle_upgrade_restore"
+            )
+            conn.execute(
+                "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=?,subtitle_origin=?,"
+                "state=?,updated_at=? WHERE video_path=?",
+                (
+                    str(subtitle_path) if subtitle_path else None,
+                    embedded_subtitle_id,
+                    str(origin or ""),
+                    resolved,
+                    time.time(),
+                    str(video_path),
+                ),
+            )
+            return resolved == "ready"
     def clear_subtitle_selection(self, video_path: Path) -> None:
         """Drop a stale prepared subtitle while keeping the retry job intact."""
         with self.connect() as conn:
@@ -1731,7 +1815,9 @@ class Database:
                 repaired.append((video_path, media_id, episode))
         return len(repaired)
 
-    def repair_spurious_ready_subtitle_jobs(self) -> int:
+    def repair_spurious_ready_subtitle_jobs(
+        self, *, preserve_paths: set[str] | None = None
+    ) -> int:
         """Remove resolver jobs accidentally attached to valid ready rows.
 
         Versions through 0.5.79 could preserve a prepared subtitle during a
@@ -1741,6 +1827,7 @@ class Database:
         file still exists (or it references an embedded track).
         """
         removable: list[str] = []
+        preserve = {str(path) for path in (preserve_paths or set())}
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -1752,6 +1839,9 @@ class Database:
                 """
             ).fetchall()
             for row in rows:
+                video_path = str(row["video_path"])
+                if video_path in preserve:
+                    continue
                 subtitle = str(row["subtitle_path"] or "").strip()
                 valid_external = False
                 if subtitle:
@@ -1769,32 +1859,41 @@ class Database:
                 )
         return len(removable)
 
-    def repair_stale_subtitle_selections(self) -> int:
+    def repair_stale_subtitle_selections(
+        self, *, preserve_paths: set[str] | None = None
+    ) -> int:
         """Clear subtitle paths that are not currently considered validated.
 
-        A row with an active subtitle job is awaiting validation, so any older
-        prepared path must not be exposed to the player. The same applies to
-        rows whose state is already ``local`` or ``waiting_subtitles``.
+        Upgrade checks are explicitly excluded: their current selection must
+        remain visible until the candidate is accepted or rejected.
         """
+        preserve = {str(path) for path in (preserve_paths or set())}
         now = time.time()
+        changed = 0
         with self.connect() as conn:
-            cursor = conn.execute(
+            rows = conn.execute(
                 """
-                UPDATE episodes
-                SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',
-                    state='waiting_subtitles',updated_at=?
-                WHERE (subtitle_path IS NOT NULL OR embedded_subtitle_id IS NOT NULL)
-                  AND (
-                    state NOT IN ('ready','watched','waiting_text_subtitles')
-                    OR (
-                        video_path IN (SELECT video_path FROM subtitle_jobs)
-                        AND state!='waiting_text_subtitles'
-                    )
-                  )
-                """,
-                (now,),
-            )
-        return int(cursor.rowcount or 0)
+                SELECT e.video_path,e.state,e.subtitle_path,e.embedded_subtitle_id,
+                       EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.video_path=e.video_path) AS has_job
+                FROM episodes e
+                WHERE e.subtitle_path IS NOT NULL OR e.embedded_subtitle_id IS NOT NULL
+                """
+            ).fetchall()
+            for row in rows:
+                video_path = str(row["video_path"])
+                state = str(row["state"] or "local")
+                has_job = bool(row["has_job"])
+                invalid_state = state not in {"ready", "watched", "waiting_text_subtitles"}
+                invalid_job = has_job and state != "waiting_text_subtitles" and video_path not in preserve
+                if not (invalid_state or invalid_job):
+                    continue
+                conn.execute(
+                    "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
+                    "state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                    (now, video_path),
+                )
+                changed += 1
+        return changed
 
     def invalidate_subtitle(
         self,
@@ -2079,6 +2178,26 @@ class Database:
             conn.execute(
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
                 (time.time(), str(video_path)),
+            )
+
+    def postpone_bitmap_ocr_job(
+        self, video_path: Path, error: str, delay_seconds: float
+    ) -> None:
+        """Retry bitmap OCR without discarding the already prepared PGS source."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE subtitle_jobs SET attempts=attempts+1,stage='retry_scheduled',priority=0,
+                state='pending',lease_until=0,next_check=?,last_error=?,updated_at=?
+                WHERE video_path=?
+                """,
+                (now + delay_seconds, error[-1000:], now, str(video_path)),
+            )
+            conn.execute(
+                "UPDATE episodes SET state='waiting_text_subtitles',subtitle_origin='bitmap',updated_at=? "
+                "WHERE video_path=?",
+                (now, str(video_path)),
             )
 
     def update_subtitle_job_stage(

@@ -20,8 +20,9 @@ def test_lua_tracker_keeps_manual_hotkeys_when_auto_update_is_off():
     assert "AniList: ручной режим" in source
     assert "PUDGE_SHORTCUT_MARK_WATCHED" in source
     assert "add_reliable_binding(shortcut_mark_watched" in source
-    assert "PUDGE_SHORTCUT_CORRECT_MATCH" in source
-    assert "mp.add_key_binding(shortcut_correct_match" in source
+    assert "PUDGE_SHORTCUT_CORRECT_MATCH" not in source
+    assert "shortcut_correct_match" not in source
+    assert "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE" in source
 
 
 

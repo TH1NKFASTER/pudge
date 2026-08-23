@@ -200,8 +200,8 @@ def test_refresh_scans_watched_and_video_sources_before_heavy_refresh() -> None:
     source = WEB_APP.read_text(encoding="utf-8")
     section = source[source.index("def refresh_local"):source.index("def refresh_all")]
     watched = section.index("self.scan_watched_media_folders()")
-    videos = section.index("self.manager.scan_library()")
-    heavy = section.index("self.manager.run_interactive_refresh()")
+    videos = section.index("self.manager.scan_library(reuse_unchanged=True, user_requested=True)")
+    heavy = section.index("self.manager.run_interactive_refresh(")
     assert watched < videos < heavy
 
 

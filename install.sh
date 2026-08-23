@@ -282,7 +282,7 @@ fi
 # Ordinary Python/web updates must not replace/re-sign the native launcher.
 # macOS Files & Folders permissions are tied to app code identity, so rebuilding
 # this tiny shell on every patch caused repeated Downloads-folder prompts.
-NATIVE_SHELL_REV=1
+NATIVE_SHELL_REV=2
 NATIVE_SHELL_REV_FILE="$DATA_DIR/native-shell-rev"
 PRESERVE_NATIVE_APP=0
 if (( FAST_UPDATE )) && [[ "${PUDGE_FORCE_NATIVE_REBUILD:-0}" != "1" ]] \
@@ -416,64 +416,68 @@ static int send_notification(const char *subtitle_arg, const char *message_arg) 
 }
 
 int main(int argc, char *argv[]) {
-    @autoreleasepool {
-        if (argc >= 2 &&
-            strcmp(argv[1], "--pudge-native-notification") == 0) {
-            if (argc < 4) {
-                return 2;
-            }
-            return send_notification(argv[2], argv[3]);
+    if (argc >= 2 &&
+        strcmp(argv[1], "--pudge-native-notification") == 0) {
+        if (argc < 4) {
+            return 2;
         }
+        return send_notification(argv[2], argv[3]);
+    }
 
-        unsetenv("TCL_LIBRARY");
-        unsetenv("TK_LIBRARY");
-        unsetenv("TCLLIBPATH");
-        unsetenv("PYTHONHOME");
-        unsetenv("PYTHONPATH");
-        unsetenv("PYTHONEXECUTABLE");
-        unsetenv("_PYI_ARCHIVE_FILE");
-        unsetenv("_PYI_PARENT_PROCESS_LEVEL");
-        unsetenv("_PYI_APPLICATION_HOME_DIR");
+    unsetenv("TCL_LIBRARY");
+    unsetenv("TK_LIBRARY");
+    unsetenv("TCLLIBPATH");
+    unsetenv("PYTHONHOME");
+    unsetenv("PYTHONPATH");
+    unsetenv("PYTHONEXECUTABLE");
+    unsetenv("_PYI_ARCHIVE_FILE");
+    unsetenv("_PYI_PARENT_PROCESS_LEVEL");
+    unsetenv("_PYI_APPLICATION_HOME_DIR");
 
-        const char *python = __VENV_PYTHON__;
-        setenv("PUDGE_PYTHON", python, 1);
-        setenv("PUDGE_CONFIG", __CONFIG_PATH__, 1);
-        setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);
-        setenv("PUDGE_ARIA2C", __ARIA2_BIN__, 1);
+    const char *python = __VENV_PYTHON__;
+    setenv("PUDGE_PYTHON", python, 1);
+    setenv("PUDGE_CONFIG", __CONFIG_PATH__, 1);
+    setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);
+    setenv("PUDGE_ARIA2C", __ARIA2_BIN__, 1);
 
+    // Only temporary Objective-C objects used before Python starts belong to
+    // this short pool.  Py_RunMain() finalizes Python, so draining an outer
+    // pool afterwards can make PyObjC dealloc callbacks call back into a dead
+    // interpreter (EXC_BAD_ACCESS in PyGILState_Ensure on normal window close).
+    @autoreleasepool {
         NSString *icon_path =
             [[NSBundle mainBundle] pathForResource:@"AppIcon" ofType:@"icns"];
         if (icon_path != nil) {
             setenv("PUDGE_APP_ICON", [icon_path fileSystemRepresentation], 1);
         }
-
-        // Keep Python in the native Pudge process instead of exec()ing the
-        // Homebrew Python.app executable. macOS derives NSRunningApplication's
-        // bundle/icon from the running executable; exec() was why Force Quit
-        // still showed the Python rocket even after AppKit's Dock icon changed.
-        PyConfig config;
-        PyConfig_InitPythonConfig(&config);
-        config.parse_argv = 0;
-
-        PyStatus status = PyConfig_SetBytesString(&config, &config.program_name, python);
-        if (!PyStatus_Exception(status)) {
-            status = PyConfig_SetBytesString(&config, &config.executable, python);
-        }
-        if (!PyStatus_Exception(status)) {
-            status = PyConfig_SetBytesArgv(&config, argc, argv);
-        }
-        if (!PyStatus_Exception(status)) {
-            status = PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry");
-        }
-        if (!PyStatus_Exception(status)) {
-            status = Py_InitializeFromConfig(&config);
-        }
-        PyConfig_Clear(&config);
-        if (PyStatus_Exception(status)) {
-            Py_ExitStatusException(status);
-        }
-        return Py_RunMain();
     }
+
+    // Keep Python in the native Pudge process instead of exec()ing the
+    // Homebrew Python.app executable. macOS derives NSRunningApplication's
+    // bundle/icon from the running executable; exec() was why Force Quit
+    // still showed the Python rocket even after AppKit's Dock icon changed.
+    PyConfig config;
+    PyConfig_InitPythonConfig(&config);
+    config.parse_argv = 0;
+
+    PyStatus status = PyConfig_SetBytesString(&config, &config.program_name, python);
+    if (!PyStatus_Exception(status)) {
+        status = PyConfig_SetBytesString(&config, &config.executable, python);
+    }
+    if (!PyStatus_Exception(status)) {
+        status = PyConfig_SetBytesArgv(&config, argc, argv);
+    }
+    if (!PyStatus_Exception(status)) {
+        status = PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry");
+    }
+    if (!PyStatus_Exception(status)) {
+        status = Py_InitializeFromConfig(&config);
+    }
+    PyConfig_Clear(&config);
+    if (PyStatus_Exception(status)) {
+        Py_ExitStatusException(status);
+    }
+    return Py_RunMain();
 }
 """
 

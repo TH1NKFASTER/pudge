@@ -37,6 +37,7 @@ ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar"}
 # the first minute and then settles at one network request every ~3 seconds.
 JIMAKU_LOCAL_REQUESTS_PER_MINUTE = 20.0
 JIMAKU_LOCAL_BURST_CAPACITY = 4.0
+ARCHIVE_EXTRACT_CACHE_SCHEMA = 1
 
 
 def find_7zip() -> str | None:
@@ -772,6 +773,118 @@ def _copy_extracted_subtitles(
     return sorted(extracted, key=lambda item: item[2], reverse=True)
 
 
+def _archive_extract_manifest_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.extract-v{ARCHIVE_EXTRACT_CACHE_SCHEMA}.json")
+
+
+def _archive_signature(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def _cached_archive_result_rows(
+    path: Path,
+    identity: VideoIdentity,
+    video: Path,
+    output_dir: Path,
+    prefer_srt: bool,
+    allowed_episodes: tuple[int, ...],
+) -> list[tuple[Path, str, float]] | None:
+    """Return cached archive members, or ``None`` when extraction is required.
+
+    Jimaku downloads are cached in a directory unique to the download URL.  Keep
+    the expensive external 7-Zip materialization persistent as well.  The
+    archive stat is part of the manifest so a replaced archive invalidates the
+    extracted members automatically.
+    """
+    manifest = _archive_extract_manifest_path(path)
+    payload: dict[str, object] | None = None
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        payload = raw if isinstance(raw, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        payload = None
+
+    try:
+        size, mtime_ns = _archive_signature(path)
+    except OSError:
+        return None
+
+    members: list[dict[str, str]] | None = None
+    if (
+        payload is not None
+        and int(payload.get("schema") or 0) == ARCHIVE_EXTRACT_CACHE_SCHEMA
+        and int(payload.get("archive_size") or -1) == size
+        and int(payload.get("archive_mtime_ns") or -1) == mtime_ns
+        and isinstance(payload.get("members"), list)
+    ):
+        members = [item for item in payload["members"] if isinstance(item, dict)]
+    elif path.suffix.casefold() in {".7z", ".rar"}:
+        # v37 and older already persisted extracted files, but had no manifest.
+        # A very common Jimaku shape is ``foo.sup.7z`` containing ``foo.sup``.
+        # Bootstrap that exact single-member cache without one final 7zz run.
+        display_name = path.stem
+        if Path(display_name).suffix.casefold() in SUBTITLE_EXTENSIONS:
+            digest = hashlib.sha1(display_name.encode("utf-8", errors="ignore")).hexdigest()[:8]
+            output = output_dir / f"{digest}_{_safe_name(Path(display_name).name)}"
+            if output.is_file() and output.stat().st_size > 0:
+                members = [{"display_name": display_name, "output_name": output.name}]
+                _write_archive_extract_manifest(path, members)
+
+    if members is None:
+        return None
+
+    aliases = {int(value) for value in allowed_episodes if int(value) > 0}
+    if identity.episode is not None:
+        aliases.add(int(identity.episode))
+    results: list[tuple[Path, str, float]] = []
+    for item in members:
+        display_name = str(item.get("display_name") or "")
+        output_name = str(item.get("output_name") or "")
+        if not display_name or not output_name or Path(output_name).name != output_name:
+            return None
+        output = output_dir / output_name
+        try:
+            if not output.is_file() or output.stat().st_size <= 0:
+                return None
+        except OSError:
+            return None
+        parsed = parse_anime_filename(display_name)
+        if (
+            identity.episode is not None
+            and parsed.episode is not None
+            and parsed.episode not in aliases
+        ):
+            continue
+        suffix = output.suffix.casefold()
+        if suffix not in IMAGE_SUBTITLE_EXTENSIONS and not is_japanese_subtitle(output):
+            continue
+        results.append((
+            output,
+            display_name,
+            _archive_member_score(display_name, identity, video, prefer_srt, allowed_episodes),
+        ))
+    return sorted(results, key=lambda item: item[2], reverse=True)
+
+
+def _write_archive_extract_manifest(path: Path, members: list[dict[str, str]]) -> None:
+    try:
+        size, mtime_ns = _archive_signature(path)
+        manifest = _archive_extract_manifest_path(path)
+        payload = {
+            "schema": ARCHIVE_EXTRACT_CACHE_SCHEMA,
+            "archive_size": size,
+            "archive_mtime_ns": mtime_ns,
+            "members": members,
+        }
+        temp = manifest.with_suffix(manifest.suffix + ".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(manifest)
+    except OSError:
+        # Cache persistence must never make subtitle discovery fail.
+        return
+
+
 def _extract_7z_all(
     path: Path,
     identity: VideoIdentity,
@@ -780,6 +893,15 @@ def _extract_7z_all(
     prefer_srt: bool,
     allowed_episodes: tuple[int, ...] = (),
 ) -> list[tuple[Path, str, float]]:
+    cached = _cached_archive_result_rows(
+        path, identity, video, output_dir, prefer_srt, allowed_episodes
+    )
+    if cached is not None:
+        configure_logging().info(
+            "CACHE step=jimaku.archive_extract path=%s members=%s", path, len(cached)
+        )
+        return cached
+
     tool = find_7zip()
     if tool is None:
         print("Jimaku: найден архив .7z/.rar, но 7-Zip не установлен")
@@ -798,9 +920,20 @@ def _extract_7z_all(
             if completed.returncode != 0:
                 print(f"Jimaku: не удалось распаковать {path.name}: {completed.stdout[-500:]}")
                 return []
-            return _copy_extracted_subtitles(
+            results = _copy_extracted_subtitles(
                 root, identity, video, output_dir, prefer_srt, allowed_episodes
             )
+            members = [
+                {"display_name": display_name, "output_name": output.name}
+                for output, display_name, _score in results
+            ]
+            _write_archive_extract_manifest(path, members)
+            configure_logging().info(
+                "RESULT step=jimaku.archive_extract path=%s cache=write members=%s",
+                path,
+                len(members),
+            )
+            return results
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"Jimaku: не удалось распаковать {path.name}: {exc}")
         return []

@@ -201,6 +201,8 @@ class WebAppApi:
         )
         self.logger.info("APP session_start version=%s platform=%s", __version__, platform.platform())
         self.window: Any | None = None
+        self._macos_window_lifecycle: _MacWindowLifecycle | None = None
+        self._macos_app_delegate_proxy: Any | None = None
         self.asset_base = ""
         self._play_processes: dict[str, subprocess.Popen[Any]] = {}
         self._play_started_at: dict[str, float] = {}
@@ -263,12 +265,7 @@ class WebAppApi:
             interval_seconds=self.config.diagnostics.energy_sample_seconds,
             logger=self.logger,
         )
-        if (
-            sys.platform == "darwin"
-            and self.config.diagnostics.energy_monitoring_enabled
-            and not self.safe_mode.active
-        ):
-            self.energy_monitor.start()
+        self._ensure_energy_monitor(reason="startup")
         if not self.safe_mode.active:
             self._start_scheduled_agent()
 
@@ -305,6 +302,46 @@ class WebAppApi:
             lambda media_id, episode: self.debug_snapshots.snapshot(media_id, episode),
         )
         self.job_center = JobCenter(self.manager.db)
+
+    def _ensure_energy_monitor(self, *, reason: str) -> None:
+        """Keep low-overhead energy diagnostics alive, including Safe Mode.
+
+        Safe Mode is exactly when diagnostics are most useful, so it must not
+        suppress the monitor. The monitor itself is resilient to a failed
+        sample and ``start`` is idempotent.
+        """
+
+        safe_mode_active = bool(getattr(getattr(self, "safe_mode", None), "active", False))
+        if sys.platform != "darwin":
+            self.logger.info(
+                "SKIP step=energy_diagnostics.ensure reason=%s platform=%s",
+                reason,
+                sys.platform,
+            )
+            return
+        if not bool(self.config.diagnostics.energy_monitoring_enabled):
+            self.logger.info(
+                "SKIP step=energy_diagnostics.ensure reason=%s disabled=true",
+                reason,
+            )
+            self.energy_monitor.stop()
+            return
+        try:
+            already_running = bool(self.energy_monitor.running)
+            self.energy_monitor.start()
+            self.logger.info(
+                "EVENT energy_diagnostics.ensure reason=%s running=%s already_running=%s safe_mode=%s",
+                reason,
+                bool(self.energy_monitor.running),
+                already_running,
+                safe_mode_active,
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "FAIL step=energy_diagnostics.ensure reason=%s error=%r",
+                reason,
+                str(exc),
+            )
 
     @staticmethod
     def _scheduled_agent_plist() -> Path:
@@ -393,6 +430,9 @@ class WebAppApi:
             safe_mode.finish_cleanly()
 
     def _close_window_for_uninstall(self) -> None:
+        lifecycle = self._macos_window_lifecycle
+        if lifecycle is not None:
+            lifecycle.request_quit("uninstall")
         window = self.window
         if window is None:
             return
@@ -1177,6 +1217,10 @@ class WebAppApi:
                     item.subtitle_path is not None
                     and item.subtitle_path.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
                 )
+                or (
+                    str(item.subtitle_origin or "").casefold() == "ocr"
+                    and not self.config.matching.ocr_counts_as_ready
+                )
             ):
                 effective_state = "waiting_text_subtitles"
             group["episodes"].append(
@@ -1255,6 +1299,10 @@ class WebAppApi:
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             if (
                 item.state != "ready"
+                or (
+                    str(item.subtitle_origin or "").casefold() == "ocr"
+                    and not self.config.matching.ocr_counts_as_ready
+                )
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
                 or self._watched_on_anilist(anime, item.episode)
@@ -1338,8 +1386,13 @@ class WebAppApi:
         groups: dict[tuple[str, object], Any] = {}
         for item in self.manager.db.episodes():
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
+            effective_ocr_waiting = bool(
+                item.state == "ready"
+                and str(item.subtitle_origin or "").casefold() == "ocr"
+                and not self.config.matching.ocr_counts_as_ready
+            )
             if (
-                item.state in {"ready", "watched"}
+                (item.state in {"ready", "watched"} and not effective_ocr_waiting)
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
                 or self._watched_on_anilist(anime, item.episode)
@@ -1382,7 +1435,13 @@ class WebAppApi:
                             and (item.subtitle_path is not None or item.embedded_subtitle_id is not None)
                             else "external" if item.subtitle_path else "none"
                         ),
-                        "state": item.state,
+                        "state": (
+                            "waiting_text_subtitles"
+                            if item.state == "ready"
+                            and str(item.subtitle_origin or "").casefold() == "ocr"
+                            and not self.config.matching.ocr_counts_as_ready
+                            else item.state
+                        ),
                     },
                 }
             )
@@ -2029,6 +2088,7 @@ class WebAppApi:
                     local=local_for_state,
                     download=download,
                     action_job=action_job,
+                    allow_ocr_ready=bool(self.config.matching.ocr_counts_as_ready),
                 )
         return sections
 
@@ -2118,6 +2178,7 @@ class WebAppApi:
                 0, int(cfg.jimaku.trial_expires_at - time.time())
             ) if cfg.jimaku.trial_active else 0,
             "ocr_image_subtitles": cfg.matching.ocr_image_subtitles,
+            "ocr_counts_as_ready": cfg.matching.ocr_counts_as_ready,
             "auto_upgrade_subtitles": cfg.matching.auto_upgrade_subtitles,
             "subtitle_upgrade_min_score_gain": cfg.matching.subtitle_upgrade_min_score_gain,
             "subtitle_upgrade_check_hours": cfg.matching.subtitle_upgrade_check_hours,
@@ -2131,8 +2192,6 @@ class WebAppApi:
             "japanese_stt_fallback": cfg.sync.japanese_stt_fallback,
             "japanese_stt_model": cfg.sync.japanese_stt_model,
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
-            "shortcut_mpv_open_anilist": cfg.shortcuts.mpv_open_anilist,
-            "shortcut_mpv_correct_match": cfg.shortcuts.mpv_correct_match,
             "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
             "mpv_study_plugin": cfg.tools.mpv_study_plugin,
             "mpv_study_plugins": study_plugins,
@@ -2268,6 +2327,11 @@ class WebAppApi:
             fallback = download_by_media.get(int(media_id))
             return fallback if fallback is not None and bool(fallback.get("is_batch")) else None
 
+        ready_by_media = {
+            int(item["media_id"]): item
+            for item in self._downloaded_payloads(anime_by_id)
+            if item.get("media_id") is not None
+        }
         current = [self._anime_payload(a) for a in current_anime]
         for payload in current:
             download = download_for_episode(int(payload["media_id"]), payload.get("next_episode"))
@@ -2279,6 +2343,13 @@ class WebAppApi:
         planned = []
         for anime in planned_anime:
             payload = self._anime_payload(anime)
+            ready = ready_by_media.get(int(anime.media_id))
+            if ready is not None:
+                payload["ready_episodes"] = list(ready.get("ready_episodes") or [])
+                payload["ready_count"] = int(ready.get("ready_count") or 0)
+                payload["all_episodes_ready"] = bool(ready.get("all_episodes_ready"))
+                if payload.get("local") is None:
+                    payload["local"] = ready.get("local")
             download = download_for_episode(int(anime.media_id), payload.get("next_episode"))
             if (
                 download is not None
@@ -2819,10 +2890,10 @@ class WebAppApi:
                 # Register watched/local anime video before release feeds, torrent
                 # reconciliation and subtitle work. This intentionally happens in
                 # the same cheap-first phase as LN/manga/audiobook discovery.
-                local_video_rows = 0
+                local_video_rows: int | None = None
                 try:
                     with timed_step(self.logger, "library.scan_local", priority="first"):
-                        local_video_rows = len(self.manager.scan_library())
+                        local_video_rows = len(self.manager.scan_library(reuse_unchanged=True, user_requested=True))
                 except Exception as exc:
                     self.logger.warning("Watched video scan skipped: %s", exc)
 
@@ -2838,7 +2909,9 @@ class WebAppApi:
                 # Manual Refresh must remain interactive even if the launch agent
                 # is currently aligning subtitles. Release discovery runs now;
                 # expensive subtitle preparation is queued separately.
-                stats = self.manager.run_interactive_refresh()
+                stats = self.manager.run_interactive_refresh(
+                    pre_scanned_library_count=local_video_rows
+                )
                 reconcile_ready = getattr(self.manager, "reconcile_prepared_subtitle_rows", None)
                 repaired_ready = int(reconcile_ready() or 0) if callable(reconcile_ready) else 0
                 if repaired_ready:
@@ -2846,7 +2919,7 @@ class WebAppApi:
                 for key, value in watched_stats.items():
                     if value:
                         stats[f"watched_{key}"] = int(value)
-                if local_video_rows:
+                if local_video_rows is not None:
                     stats["library"] = local_video_rows
                 if ln_imported:
                     stats["light_novels_imported"] = ln_imported
@@ -4239,6 +4312,50 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         result["state"] = self.audiobooks.state()
         return result
 
+    def audiobook_restore_bookmark(
+        self,
+        book_id: int,
+        position: float,
+        title: str,
+        sort_order: int,
+        created_at: float,
+        bookmark_id: int | None = None,
+    ) -> dict[str, Any]:
+        result = self.audiobooks.restore_bookmark(
+            int(book_id),
+            float(position),
+            str(title or ""),
+            int(sort_order),
+            float(created_at),
+            int(bookmark_id) if bookmark_id is not None else None,
+        )
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_rename_bookmark(self, bookmark_id: int, title: str) -> dict[str, Any]:
+        result = self.audiobooks.rename_bookmark(int(bookmark_id), str(title or ""))
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_reorder_bookmarks(self, book_id: int, bookmark_ids: list[int]) -> dict[str, Any]:
+        result = self.audiobooks.reorder_bookmarks(
+            int(book_id), [int(value) for value in bookmark_ids]
+        )
+        result["state"] = self.audiobooks.state()
+        return result
+
+    def audiobook_reveal_source(self, book_id: int) -> dict[str, Any]:
+        book = self.audiobooks.book(int(book_id))
+        source = Path(str(book.get("path") or "")).expanduser()
+        if not source.exists():
+            return {"ok": False, "error": "Audiobook source does not exist"}
+        if sys.platform == "darwin":
+            if source.is_dir():
+                subprocess.Popen(["open", str(source.resolve())])
+            else:
+                subprocess.Popen(["open", "-R", str(source.resolve())])
+        return {"ok": True, "path": str(source.resolve())}
+
     def audiobook_mark_finished(self, book_id: int, finished: bool = True) -> dict[str, Any]:
         result = self.audiobooks.mark_finished(int(book_id), bool(finished))
         result["state"] = self.audiobooks.state()
@@ -4672,7 +4789,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.manager.sync_downloads()
             except Exception as exc:
                 self.manager.log(str(exc))
-        self.manager.scan_library()
+        self.manager.scan_library(reuse_unchanged=True, user_requested=True)
         return self.get_state()
 
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -4705,6 +4822,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ),
         }
         old_ocr_enabled = bool(cfg.matching.ocr_image_subtitles)
+        old_ocr_counts_as_ready = bool(cfg.matching.ocr_counts_as_ready)
         old_jimaku_key = str(cfg.jimaku.api_key or "")
         old_subtitle_dirs = tuple(str(path.expanduser()) for path in cfg.paths.subtitle_dirs)
         old_watched_dirs = tuple(str(path.expanduser()) for path in cfg.paths.download_dirs)
@@ -4864,8 +4982,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
         )
         cfg.shortcuts.mpv_mark_watched = str(values.get("shortcut_mpv_mark_watched", cfg.shortcuts.mpv_mark_watched)).strip()
-        cfg.shortcuts.mpv_open_anilist = str(values.get("shortcut_mpv_open_anilist", cfg.shortcuts.mpv_open_anilist)).strip()
-        cfg.shortcuts.mpv_correct_match = str(values.get("shortcut_mpv_correct_match", cfg.shortcuts.mpv_correct_match)).strip()
         cfg.shortcuts.mpv_translate_subtitle = str(values.get("shortcut_mpv_translate_subtitle", cfg.shortcuts.mpv_translate_subtitle)).strip()
         requested_study_plugin = str(
             values.get("mpv_study_plugin", cfg.tools.mpv_study_plugin)
@@ -4875,12 +4991,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if requested_study_plugin in {"auto", "jiten", "jpdb"}
             else "auto"
         )
-        cfg.diagnostics.energy_monitoring_enabled = bool(
-            values.get("energy_monitoring_enabled", cfg.diagnostics.energy_monitoring_enabled)
-        )
-        cfg.diagnostics.energy_sample_seconds = max(
-            10.0, float(values.get("energy_sample_seconds", cfg.diagnostics.energy_sample_seconds))
-        )
+        cfg.diagnostics.energy_monitoring_enabled = True
+        cfg.diagnostics.energy_sample_seconds = 30.0
         personal_jimaku_key = keep_masked_secret(
             values.get("jimaku_api_key", cfg.jimaku.personal_api_key),
             cfg.jimaku.personal_api_key,
@@ -4890,6 +5002,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         apply_jimaku_trial(cfg)
         cfg.matching.ocr_image_subtitles = bool(
             values.get("ocr_image_subtitles", cfg.matching.ocr_image_subtitles)
+        )
+        cfg.matching.ocr_image_subtitles_disabled_by_user = (
+            not cfg.matching.ocr_image_subtitles
+        )
+        cfg.matching.ocr_counts_as_ready = bool(
+            values.get("ocr_counts_as_ready", cfg.matching.ocr_counts_as_ready)
         )
         cfg.matching.auto_upgrade_subtitles = True
         cfg.matching.subtitle_upgrade_min_score_gain = 25.0
@@ -4955,10 +5073,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             jpdb_api_token=str(ln_values.get("jpdb_api_token") or ""),
         )
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
-        if self.config.diagnostics.energy_monitoring_enabled and not self.safe_mode.active:
-            self.energy_monitor.start()
-        else:
-            self.energy_monitor.stop()
+        self._ensure_energy_monitor(reason="settings_saved")
 
         # Settings that affect video readiness are reconciled immediately. The
         # returned state is rendered by the UI before any manual Refresh.
@@ -4967,6 +5082,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if old_ocr_enabled and not new_ocr_enabled:
             invalidated = self.manager.invalidate_disabled_ocr_subtitles()
             reconcile_stats["ocr_invalidated"] = len(invalidated)
+        if old_ocr_counts_as_ready and not self.config.matching.ocr_counts_as_ready:
+            reconcile_stats["ocr_ready_demoted"] = self.manager._reconcile_ocr_readiness_policy()
 
         new_subtitle_dirs = tuple(str(path.expanduser()) for path in self.config.paths.subtitle_dirs)
         new_watched_dirs = tuple(str(path.expanduser()) for path in self.config.paths.download_dirs)
@@ -5667,6 +5784,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 str(item.get("title") or "").casefold(),
             )
         )
+
         return results[: max(1, min(100, int(limit or 40)))]
 
     def test_saved_credentials(
@@ -6310,7 +6428,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             output_dir,
             version=__version__,
             frontend=frontend,
-            logs={"runtime": DEFAULT_LOG_PATH, "energy": ENERGY_LOG_PATH},
+            logs={
+                "runtime": DEFAULT_LOG_PATH,
+                "energy": ENERGY_LOG_PATH,
+                "agent": DEFAULT_LOG_PATH.parent / f"{APP_SLUG}-agent.log",
+                "agent-error": DEFAULT_LOG_PATH.parent / f"{APP_SLUG}-agent-error.log",
+            },
         )
         try:
             subprocess.Popen(["open", "-R", str(target)])
@@ -6505,8 +6628,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             target=self.audiobooks.resume_pending_transcriptions,
             replace=True,
         )
-        if self.config.diagnostics.energy_monitoring_enabled:
-            self.energy_monitor.start()
+        self._ensure_energy_monitor(reason="safe_mode_resumed")
         self._start_scheduled_agent()
         self.logger.info("EVENT app.safe_mode_resumed")
         return {
@@ -7324,6 +7446,91 @@ def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer
     return server, f"http://{host}:{port}"
 
 
+class _MacWindowLifecycle:
+    """Keep a macOS window alive when the user closes it.
+
+    The red close button and Cmd+W should hide the window while leaving the
+    Python/backend process running.  A real application quit (Cmd+Q / Quit)
+    flips ``quit_requested`` first, allowing pywebview's normal close path.
+    """
+
+    def __init__(self, window: Any, logger: Any) -> None:
+        self.window = window
+        self.logger = logger
+        self.quit_requested = False
+
+    def request_quit(self, source: str = "macos") -> None:
+        self.quit_requested = True
+        self.logger.info("EVENT app.quit_requested source=%s", source)
+
+    def handle_closing(self) -> bool:
+        if self.quit_requested:
+            self.logger.info("EVENT app.window_close action=quit")
+            return True
+        try:
+            self.window.hide()
+            self.logger.info("EVENT app.window_close action=hide")
+        except Exception as exc:
+            self.logger.warning("FALLBACK step=app.window_hide error=%r", str(exc))
+        return False
+
+    def reopen(self) -> bool:
+        try:
+            self.window.show()
+            self.logger.info("EVENT app.window_reopen action=show")
+            return True
+        except Exception as exc:
+            self.logger.warning("FALLBACK step=app.window_reopen error=%r", str(exc))
+            return False
+
+
+def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLifecycle) -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        from AppKit import NSApplication
+        from Foundation import NSObject, YES
+
+        application = NSApplication.sharedApplication()
+        original_delegate = application.delegate()
+        if original_delegate is None:
+            api.logger.warning("FALLBACK step=app.macos_delegate reason=no_original_delegate")
+            return False
+
+        class PudgeApplicationDelegateV41(NSObject):
+            def applicationShouldTerminate_(self, app):
+                lifecycle.request_quit("macos_quit")
+                handler = getattr(original_delegate, "applicationShouldTerminate_", None)
+                return handler(app) if callable(handler) else YES
+
+            def applicationSupportsSecureRestorableState_(self, app):
+                handler = getattr(original_delegate, "applicationSupportsSecureRestorableState_", None)
+                return handler(app) if callable(handler) else YES
+
+            def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_visible_windows):
+                if not bool(has_visible_windows):
+                    lifecycle.reopen()
+                handler = getattr(original_delegate, "applicationShouldHandleReopen_hasVisibleWindows_", None)
+                if callable(handler):
+                    try:
+                        return handler(app, has_visible_windows)
+                    except Exception:
+                        pass
+                return YES
+
+        proxy = PudgeApplicationDelegateV41.alloc().init()
+        # Retain both delegates for the complete Cocoa lifetime.
+        proxy._pudge_original_delegate = original_delegate
+        proxy._pudge_lifecycle = lifecycle
+        api._macos_app_delegate_proxy = proxy
+        application.setDelegate_(proxy)
+        api.logger.info("EVENT app.macos_close_to_hide installed=true")
+        return True
+    except Exception:
+        api.logger.exception("FAIL step=app.macos_close_to_hide")
+        return False
+
+
 def _set_macos_runtime_identity() -> bool:
     """Set the real Cocoa process identity used by Dock and Cmd+Tab.
 
@@ -7434,6 +7641,16 @@ def launch_web_app(config_path: Path) -> int:
         background_color="#0b1320",
     )
     api.set_window(window)
+
+    if sys.platform == "darwin":
+        lifecycle = _MacWindowLifecycle(window, api.logger)
+        api._macos_window_lifecycle = lifecycle
+        window.events.closing += lifecycle.handle_closing
+
+        def on_before_show() -> None:
+            _install_macos_app_delegate_proxy(api, lifecycle)
+
+        window.events.before_show += on_before_show
 
     def on_started() -> None:
         # pywebview initializes NSApplication during start(). Set the icon again

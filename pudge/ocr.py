@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import logging
 import platform
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,7 +16,15 @@ from typing import Iterable
 
 from PIL import Image
 
-from .pgs import END_SEGMENT, ODS_SEGMENT, PCS_SEGMENT, PDS_SEGMENT, iter_pgs_segments
+from .pgs import (
+    END_SEGMENT,
+    HEADER_SIZE,
+    ODS_SEGMENT,
+    PCS_SEGMENT,
+    PDS_SEGMENT,
+    PGS_MAGIC,
+    PGSSegment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,25 +218,34 @@ def _consume_object_segment(
 
 
 def _decode_rle(bitmap: _ObjectBitmap, palette: dict[int, tuple[int, int, int, int]]) -> Image.Image:
-    pixels = [(0, 0, 0, 0)] * max(1, bitmap.width * bitmap.height)
+    """Decode one PGS object with bounded memory.
+
+    The old implementation created one Python tuple per pixel before handing
+    the image to Pillow. A large bitmap could therefore consume hundreds of
+    megabytes even though the final RGBA buffer is only four bytes per pixel.
+    """
+    width = max(1, int(bitmap.width))
+    height = max(1, int(bitmap.height))
+    pixels = bytearray(width * height * 4)
     data = bitmap.data
     x = y = offset = 0
 
     def draw(index: int, length: int) -> None:
         nonlocal x, y
-        color = palette.get(index, (255, 255, 255, 255 if index else 0))
-        for _ in range(max(0, length)):
-            if y >= bitmap.height:
-                return
-            if x >= bitmap.width:
+        remaining = max(0, int(length))
+        color = bytes(palette.get(index, (255, 255, 255, 255 if index else 0)))
+        while remaining > 0 and y < height:
+            if x >= width:
                 x = 0
                 y += 1
-                if y >= bitmap.height:
-                    return
-            pixels[y * bitmap.width + x] = color
-            x += 1
+                continue
+            run = min(remaining, width - x)
+            start = (y * width + x) * 4
+            pixels[start : start + run * 4] = color * run
+            x += run
+            remaining -= run
 
-    while offset < len(data) and y < bitmap.height:
+    while offset < len(data) and y < height:
         value = data[offset]
         offset += 1
         if value:
@@ -255,20 +274,60 @@ def _decode_rle(bitmap: _ObjectBitmap, palette: dict[int, tuple[int, int, int, i
         else:
             index = 0
         draw(index, length)
-    image = Image.new("RGBA", (bitmap.width, bitmap.height))
-    image.putdata(pixels)
-    return image
+    return Image.frombytes("RGBA", (width, height), bytes(pixels))
 
 
-def decode_pgs_compositions(path: Path) -> list[tuple[float, Image.Image | None]]:
+def _iter_pgs_file_segments(path: Path) -> Iterable[PGSSegment]:
+    """Stream raw PGS segments instead of reading the whole SUP into RAM."""
+    offset = 0
+    with path.open("rb") as handle:
+        while True:
+            header = handle.read(HEADER_SIZE)
+            if not header:
+                break
+            if len(header) != HEADER_SIZE:
+                raise OCRConversionError(f"truncated PGS header at byte {offset}")
+            if header[:2] != PGS_MAGIC:
+                raise OCRConversionError(f"missing PG magic at byte {offset}")
+            pts = int.from_bytes(header[2:6], "big")
+            dts = int.from_bytes(header[6:10], "big")
+            segment_type = header[10]
+            payload_length = int.from_bytes(header[11:13], "big")
+            payload = handle.read(payload_length)
+            if len(payload) != payload_length:
+                raise OCRConversionError(f"truncated PGS payload at byte {offset}")
+            yield PGSSegment(
+                offset=offset,
+                pts=pts,
+                dts=dts,
+                segment_type=segment_type,
+                payload_length=payload_length,
+                payload=payload,
+            )
+            offset += HEADER_SIZE + payload_length
+
+
+def iter_pgs_compositions(path: Path) -> Iterable[tuple[float, Image.Image | None]]:
+    """Yield one rendered PGS display at a time.
+
+    v38 materialized every full-frame composition in a list before OCR. A long
+    movie with thousands of PGS updates could therefore retain tens of GB of
+    PIL image buffers. Streaming keeps only the current display in memory.
+    """
     palettes: dict[int, dict[int, tuple[int, int, int, int]]] = {}
     objects: dict[int, _ObjectBitmap] = {}
     chunks: dict[int, bytearray] = {}
     current: _Composition | None = None
-    displays: list[tuple[float, Image.Image | None]] = []
 
-    for segment in iter_pgs_segments(path.read_bytes()):
+    for segment in _iter_pgs_file_segments(path):
         if segment.segment_type == PCS_SEGMENT:
+            # Epoch Start (0x80) starts a self-contained display epoch. Drop
+            # old object/palette payloads so a multi-hour file cannot grow the
+            # object cache forever.
+            if len(segment.payload) >= 8 and segment.payload[7] & 0x80:
+                palettes.clear()
+                objects.clear()
+                chunks.clear()
             current = _parse_composition(segment.payload, segment.time_seconds)
         elif segment.segment_type == PDS_SEGMENT:
             palette_id, colors = _parse_palette(segment.payload)
@@ -278,7 +337,7 @@ def decode_pgs_compositions(path: Path) -> list[tuple[float, Image.Image | None]
             _consume_object_segment(segment.payload, chunks, objects)
         elif segment.segment_type == END_SEGMENT and current is not None:
             if not current.objects:
-                displays.append((current.time_seconds, None))
+                yield current.time_seconds, None
                 current = None
                 continue
             canvas = Image.new("RGBA", (max(1, current.width), max(1, current.height)))
@@ -289,11 +348,22 @@ def decode_pgs_compositions(path: Path) -> list[tuple[float, Image.Image | None]
                 if bitmap is None or not bitmap.data:
                     continue
                 layer = _decode_rle(bitmap, palette)
-                canvas.alpha_composite(layer, (item.x, item.y))
+                try:
+                    canvas.alpha_composite(layer, (item.x, item.y))
+                finally:
+                    layer.close()
                 rendered = True
-            displays.append((current.time_seconds, canvas if rendered else None))
+            if rendered:
+                yield current.time_seconds, canvas
+            else:
+                canvas.close()
+                yield current.time_seconds, None
             current = None
-    return displays
+
+
+def decode_pgs_compositions(path: Path) -> list[tuple[float, Image.Image | None]]:
+    """Compatibility helper for tests/tools; OCR itself uses the streaming iterator."""
+    return list(iter_pgs_compositions(path))
 
 
 def _vision_recognize(image: Image.Image) -> str:
@@ -301,55 +371,69 @@ def _vision_recognize(image: Image.Image) -> str:
         raise OCRUnavailableError("Apple Vision OCR is available only on macOS")
     try:
         import Vision  # type: ignore
-        from Foundation import NSURL  # type: ignore
+        from Foundation import NSAutoreleasePool, NSURL  # type: ignore
     except ImportError as exc:
         raise OCRUnavailableError("pyobjc-framework-Vision is not installed") from exc
 
     bbox = image.getbbox()
     if bbox is None:
         return ""
-    cropped = image.crop(bbox)
-    # A dark opaque background and moderate upscale improve recognition of
-    # anti-aliased PGS glyphs while retaining their original line arrangement.
-    scale = 2 if max(cropped.size) >= 900 else 3
-    cropped = cropped.resize((cropped.width * scale, cropped.height * scale), Image.Resampling.LANCZOS)
-    background = Image.new("RGB", cropped.size, "black")
-    background.paste(cropped, mask=cropped.getchannel("A"))
-
-    with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ocr-") as temp_dir:
-        image_path = Path(temp_dir) / "subtitle.png"
-        background.save(image_path)
-        request = Vision.VNRecognizeTextRequest.alloc().init()
-        request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-        request.setRecognitionLanguages_(["ja-JP"])
-        request.setUsesLanguageCorrection_(True)
-        handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
-            NSURL.fileURLWithPath_(str(image_path)), None
+    pool = NSAutoreleasePool.alloc().init()
+    cropped: Image.Image | None = None
+    resized: Image.Image | None = None
+    background: Image.Image | None = None
+    try:
+        cropped = image.crop(bbox)
+        scale = 2 if max(cropped.size) >= 900 else 3
+        resized = cropped.resize(
+            (cropped.width * scale, cropped.height * scale),
+            Image.Resampling.LANCZOS,
         )
-        success, error = handler.performRequests_error_([request], None)
-        if not success:
-            raise OCRConversionError(str(error or "Vision request failed"))
-        rows: list[_VisionTextRow] = []
-        for observation in request.results() or []:
-            candidates = observation.topCandidates_(1)
-            if not candidates:
-                continue
-            text = str(candidates[0].string()).strip()
-            if not text:
-                continue
-            box = observation.boundingBox()
-            rows.append(
-                _VisionTextRow(
-                    y=float(box.origin.y),
-                    x=float(box.origin.x),
-                    width=float(box.size.width),
-                    height=float(box.size.height),
-                    text=text,
-                )
+        background = Image.new("RGB", resized.size, "black")
+        background.paste(resized, mask=resized.getchannel("A"))
+
+        with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ocr-") as temp_dir:
+            image_path = Path(temp_dir) / "subtitle.png"
+            background.save(image_path)
+            request = Vision.VNRecognizeTextRequest.alloc().init()
+            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+            request.setRecognitionLanguages_(["ja-JP"])
+            request.setUsesLanguageCorrection_(True)
+            handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                NSURL.fileURLWithPath_(str(image_path)), None
             )
-        rows = _filter_probable_furigana_rows(rows)
-        rows.sort(key=lambda item: (-item.y, item.x))
-        return "\n".join(item.text for item in rows).strip()
+            success, error = handler.performRequests_error_([request], None)
+            if not success:
+                raise OCRConversionError(str(error or "Vision request failed"))
+            rows: list[_VisionTextRow] = []
+            for observation in request.results() or []:
+                candidates = observation.topCandidates_(1)
+                if not candidates:
+                    continue
+                text = str(candidates[0].string()).strip()
+                if not text:
+                    continue
+                box = observation.boundingBox()
+                rows.append(
+                    _VisionTextRow(
+                        y=float(box.origin.y),
+                        x=float(box.origin.x),
+                        width=float(box.size.width),
+                        height=float(box.size.height),
+                        text=text,
+                    )
+                )
+            rows = _filter_probable_furigana_rows(rows)
+            rows.sort(key=lambda item: (-item.y, item.x))
+            return "\n".join(item.text for item in rows).strip()
+    finally:
+        if background is not None:
+            background.close()
+        if resized is not None:
+            resized.close()
+        if cropped is not None:
+            cropped.close()
+        pool.drain()
 
 
 def _normalize_ocr_text(value: str) -> str:
@@ -494,49 +578,81 @@ def image_subtitle_to_srt(
             ffmpeg_path=ffmpeg_path,
         )
 
-    displays = decode_pgs_compositions(source)
     cues: list[OCRCue] = []
     recognized = 0
+    display_count = 0
     recognition_cache: dict[str, str] = {}
-    for index, (start, image) in enumerate(displays):
+    started_at = time.monotonic()
+    pending_start: float | None = None
+    pending_image: Image.Image | None = None
+
+    def consume(start: float, end: float, image: Image.Image | None) -> None:
+        nonlocal recognized
         if image is None:
-            continue
-        next_time = displays[index + 1][0] if index + 1 < len(displays) else start + 4.0
-        end = max(start + 0.08, next_time)
-        image_key = hashlib.sha256(
-            f"{image.width}x{image.height}:".encode("ascii") + image.tobytes()
-        ).hexdigest()
-        if image_key not in recognition_cache:
-            recognition_cache[image_key] = _normalize_ocr_text(_vision_recognize(image))
-        text = recognition_cache[image_key]
-        if not text:
-            continue
-        recognized += 1
-        if cues and cues[-1].text == text and start - cues[-1].end <= 0.25:
-            previous = cues[-1]
-            cues[-1] = OCRCue(start=previous.start, end=end, text=previous.text)
-        else:
-            cues.append(OCRCue(start=start, end=end, text=text))
+            return
+        try:
+            image_key = hashlib.sha256(
+                f"{image.width}x{image.height}:".encode("ascii") + image.tobytes()
+            ).hexdigest()
+            if image_key not in recognition_cache:
+                recognition_cache[image_key] = _normalize_ocr_text(_vision_recognize(image))
+            text = recognition_cache[image_key]
+            if not text:
+                return
+            recognized += 1
+            if cues and cues[-1].text == text and start - cues[-1].end <= 0.25:
+                previous = cues[-1]
+                cues[-1] = OCRCue(start=previous.start, end=end, text=previous.text)
+            else:
+                cues.append(OCRCue(start=start, end=end, text=text))
+        finally:
+            image.close()
+
+    try:
+        for start, image in iter_pgs_compositions(source):
+            display_count += 1
+            if pending_start is not None:
+                consume(pending_start, max(pending_start + 0.08, start), pending_image)
+                pending_image = None
+            pending_start = start
+            pending_image = image
+            if display_count % 250 == 0:
+                logger.info(
+                    "PROGRESS step=subtitle.ocr video=%s displays=%s cues=%s unique_images=%s elapsed_s=%.1f",
+                    video.name,
+                    display_count,
+                    len(cues),
+                    len(recognition_cache),
+                    time.monotonic() - started_at,
+                )
+                gc.collect()
+        if pending_start is not None:
+            consume(pending_start, pending_start + 4.0, pending_image)
+            pending_image = None
+    finally:
+        if pending_image is not None:
+            pending_image.close()
+
     if not cues:
         return None, {
             "reason": "ocr_no_text",
-            "display_count": len(displays),
+            "display_count": display_count,
             "recognized_count": recognized,
         }
-    quality = evaluate_ocr_quality(cues, len(displays))
+    quality = evaluate_ocr_quality(cues, display_count)
     _write_srt(cues, output)
     logger.info(
         "RESULT step=subtitle.ocr video=%s source=%s cues=%s displays=%s output=%s",
         video.name,
         source,
         len(cues),
-        len(displays),
+        display_count,
         output,
     )
     return output, {
         "reason": "ocr_ready",
         "cue_count": len(cues),
-        "display_count": len(displays),
+        "display_count": display_count,
         "recognized_count": recognized,
         "quality": quality,
     }

@@ -1076,7 +1076,7 @@ def test_regular_maintenance_searches_missing_before_upgrades(tmp_path: Path, mo
     order: list[str] = []
 
     monkeypatch.setattr(manager, "_requeue_legacy_generated_subtitles", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "sync_downloads", lambda: 0)
     monkeypatch.setattr(manager, "auto_search_current", lambda: order.append("missing") or 0)
     monkeypatch.setattr(manager, "auto_upgrade_downloaded", lambda: order.append("upgrade") or 0)
@@ -1102,7 +1102,7 @@ def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_p
     order: list[str] = []
 
     monkeypatch.setattr(manager, "_requeue_legacy_generated_subtitles", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: order.append("scan") or [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: order.append("scan") or [])
     monkeypatch.setattr(manager, "sync_downloads", lambda: order.append("downloads") or 0)
     monkeypatch.setattr(manager, "process_subtitle_jobs", lambda *a, **k: order.append("subtitles") or 0)
     monkeypatch.setattr(manager, "auto_search_current", lambda: order.append("missing") or 0)
@@ -1736,7 +1736,7 @@ def test_startup_maintenance_runs_one_subtitle_job_when_agent_disabled(tmp_path:
     calls: list[int] = []
 
     monkeypatch.setattr(manager, "_requeue_legacy_generated_subtitles", lambda: 0)
-    monkeypatch.setattr(manager, "scan_library", lambda: [])
+    monkeypatch.setattr(manager, "scan_library", lambda **_kwargs: [])
     monkeypatch.setattr(manager, "sync_downloads", lambda: 0)
     monkeypatch.setattr(manager, "process_subtitle_jobs", lambda limit=4: calls.append(limit) or 0)
     monkeypatch.setattr(manager, "auto_search_current", lambda: 0)

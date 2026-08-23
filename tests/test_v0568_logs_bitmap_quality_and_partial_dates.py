@@ -113,6 +113,10 @@ def test_manager_refuses_ready_exit_code_for_sup(tmp_path: Path, monkeypatch) ->
     cfg.library.database_path = tmp_path / "library.sqlite3"
     cfg.library.root_dir = tmp_path / "library"
     cfg.paths.cache_dir = tmp_path / "cache"
+    # This regression covers the explicit OCR-disabled safety path. v38 enables
+    # bitmap OCR by default, so keep the opt-out intentional in the test.
+    cfg.matching.ocr_image_subtitles = False
+    cfg.matching.ocr_image_subtitles_disabled_by_user = True
     manager = AnimeManager(cfg, log=lambda _message: None)
     video = tmp_path / "Kimetsu.mkv"
     subtitle = tmp_path / "Kimetsu.sup"
