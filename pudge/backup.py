@@ -149,18 +149,34 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
                     conn.execute("PRAGMA journal_mode=DELETE")
             except sqlite3.Error:
                 pass
+        durable_subtitle_dir = database_path.parent / "prepared-subtitles"
         for index, row in enumerate(rows, start=1):
             original = Path(str(row["subtitle_path"])).expanduser()
             try:
                 original_resolved = original.resolve()
-                cache_resolved = cache_dir.resolve()
-                original_resolved.relative_to(cache_resolved)
-            except (OSError, ValueError):
+            except OSError:
                 continue
+            storage = ""
+            try:
+                original_resolved.relative_to(cache_dir.resolve())
+                storage = "cache"
+            except (OSError, ValueError):
+                try:
+                    original_resolved.relative_to(durable_subtitle_dir.resolve())
+                    storage = "durable"
+                except (OSError, ValueError):
+                    continue
             if not original.is_file():
                 continue
-            archive_name = f"cache/subtitles/{index:04d}-{original.name}"
-            cached_files.append({"original": str(original), "archive": archive_name})
+            prefix = "prepared-subtitles" if storage == "durable" else "cache/subtitles"
+            archive_name = f"{prefix}/{index:04d}-{original.name}"
+            cached_files.append(
+                {
+                    "original": str(original),
+                    "archive": archive_name,
+                    "storage": storage,
+                }
+            )
 
         manifest = {
             "app": BACKUP_APP_ID,
@@ -219,7 +235,11 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                 original = str(item.get("original") or "")
                 if not member or member not in names or not original:
                     continue
-                target = cache_dir.expanduser() / "restored-subtitles" / Path(member).name
+                storage = str(item.get("storage") or "")
+                if storage == "durable" or member.startswith("prepared-subtitles/"):
+                    target = database_path.expanduser().parent / "prepared-subtitles" / Path(member).name
+                else:
+                    target = cache_dir.expanduser() / "restored-subtitles" / Path(member).name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with archive.open(member) as source, target.open("wb") as destination:
                     shutil.copyfileobj(source, destination)

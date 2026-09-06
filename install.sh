@@ -102,7 +102,18 @@ fi
 UPDATE_PACKAGE_BACKUP="$DATA_DIR/update-package-backup"
 UPDATE_SITE_PACKAGES=""
 WHEEL_BUILD_DIR=""
+SOURCE_BUILD_BACKUP=""
+SOURCE_BUILD_ISOLATED=0
 APP_SWAP_BACKUP=""
+restore_source_build() {
+  (( SOURCE_BUILD_ISOLATED )) || return 0
+  rm -rf "$PROJECT_DIR/build"
+  if [[ -n "$SOURCE_BUILD_BACKUP" && -e "$SOURCE_BUILD_BACKUP" ]]; then
+    /bin/mv "$SOURCE_BUILD_BACKUP" "$PROJECT_DIR/build"
+  fi
+  SOURCE_BUILD_BACKUP=""
+  SOURCE_BUILD_ISOLATED=0
+}
 cleanup_install() {
   local exit_code=$?
   if (( exit_code != 0 && FAST_UPDATE )) && [[ -n "$UPDATE_SITE_PACKAGES" && -d "$UPDATE_PACKAGE_BACKUP" ]]; then
@@ -122,6 +133,7 @@ cleanup_install() {
   elif (( exit_code == 0 )) && [[ -n "${APP_SWAP_BACKUP:-}" ]]; then
     rm -rf "$APP_SWAP_BACKUP"
   fi
+  restore_source_build
   [[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"
   rm -rf "$UPDATE_PACKAGE_BACKUP"
   return "$exit_code"
@@ -176,14 +188,34 @@ else
   python3.12 -m venv "$VENV_DIR"
   "$VENV_DIR/bin/python" -m pip install --upgrade pip
 fi
-if [[ -d "$PROJECT_DIR/.git" ]]; then
-  # Development checkout: always build the wheel from the current working tree.
+BUILD_CURRENT_TREE=0
+if [[ -e "$PROJECT_DIR/.git" ]]; then
+  BUILD_CURRENT_TREE=1
+elif [[ "${PUDGE_BUILD_CURRENT_TREE:-0}" == "1" ]]; then
+  BUILD_CURRENT_TREE=1
+fi
+if (( BUILD_CURRENT_TREE )); then
+  # Development checkout (including Git worktrees where .git is a file), or
+  # an explicitly patched release checkout requested by a patch installer:
+  # always build the wheel from the current working tree.
   # This prevents a stale wheel from a previous version from being installed
   # after applying a source patch. Keep build artifacts out of the repository.
   WHEEL_BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${APP_SLUG}-wheel.XXXXXX")"
+
+  # setuptools' build_py may reuse PROJECT_DIR/build/lib when it is newer by
+  # mtime than a patched source file. That can silently put stale Python into
+  # a newly built same-version wheel. Isolate the project's existing build/
+  # while the current-tree wheel is created, then restore it byte-for-byte.
+  if [[ -e "$PROJECT_DIR/build" ]]; then
+    SOURCE_BUILD_BACKUP="$WHEEL_BUILD_DIR/project-build-before-wheel"
+    /bin/mv "$PROJECT_DIR/build" "$SOURCE_BUILD_BACKUP"
+  fi
+  SOURCE_BUILD_ISOLATED=1
+
   "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
   "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
     --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
+  restore_source_build
   WHEEL_CANDIDATES=("$WHEEL_BUILD_DIR"/pudge-*.whl(N))
 else
   # Release ZIPs already contain the exact wheel built by GitHub Actions.
@@ -196,14 +228,45 @@ fi
 WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 
 # Install runtime dependencies from the wheel metadata, including the optional
-# subtitle synchronization stack. Then force-reinstall the exact bundled wheel
-# so a rebuilt ZIP can never leave stale or metadata-only package contents.
+# subtitle synchronization stack. Then replace the package directory explicitly
+# before installing the exact wheel. A same-version pip reinstall can otherwise
+# leave stale package files behind in a long-lived update venv.
 if [[ -f "$PROJECT_DIR/release-requirements.txt" && ! -d "$PROJECT_DIR/.git" ]]; then
   "$VENV_DIR/bin/python" -m pip install --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
 else
   "$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
 fi
-"$VENV_DIR/bin/python" -m pip install --force-reinstall --no-deps "$WHEEL_PATH"
+INSTALL_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITEINSTALL'
+import sysconfig
+print(sysconfig.get_paths()["purelib"])
+PYSITEINSTALL
+)"
+rm -rf "$INSTALL_SITE_PACKAGES/pudge" "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N)
+"$VENV_DIR/bin/python" -m pip install --no-cache-dir --no-deps "$WHEEL_PATH"
+
+# Verify the installed package byte-for-byte against the wheel before the app
+# bundle is touched. This catches stale runtime files even when package version
+# metadata is unchanged.
+WHEEL_PATH="$WHEEL_PATH" "$VENV_DIR/bin/python" -I - <<'PYWHEELVERIFY'
+import os
+from pathlib import Path
+import zipfile
+
+import pudge
+
+wheel = Path(os.environ["WHEEL_PATH"])
+root = Path(pudge.__file__).resolve().parent
+with zipfile.ZipFile(wheel) as archive:
+    for name in archive.namelist():
+        if not name.startswith("pudge/") or name.endswith("/"):
+            continue
+        relative = Path(name).relative_to("pudge")
+        installed = root / relative
+        if not installed.is_file():
+            raise SystemExit(f"Installer error: runtime file missing after wheel install: {installed}")
+        if installed.read_bytes() != archive.read(name):
+            raise SystemExit(f"Installer error: stale runtime file after wheel install: {installed}")
+PYWHEELVERIFY
 
 if (( MANGA_OCR_WAS_INSTALLED && ! FAST_UPDATE )); then
   echo "Restoring MangaOCR..."

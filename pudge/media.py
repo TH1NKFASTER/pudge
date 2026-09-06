@@ -48,6 +48,9 @@ def _extract_text_sample(video: Path, stream_index: int, ffmpeg: str) -> str:
             ffmpeg,
             "-v", "error",
             "-y",
+            "-nostdin",
+            "-probesize", "10M",
+            "-analyzeduration", "10000000",
             "-i", str(video),
             "-map", f"0:{stream_index}",
             "-t", "600",
@@ -55,9 +58,9 @@ def _extract_text_sample(video: Path, stream_index: int, ffmpeg: str) -> str:
             str(output),
         ]
         try:
-            subprocess.run(command, check=True, capture_output=True)
+            subprocess.run(command, check=True, capture_output=True, timeout=45)
             return output.read_text(encoding="utf-8", errors="replace")
-        except (subprocess.CalledProcessError, OSError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
             return ""
 
 
@@ -87,10 +90,18 @@ def find_embedded_japanese_subtitles(
             score -= 100
 
         lowered_title = title.casefold()
-        if any(word in lowered_title for word in ("sign", "song", "karaoke", "forced")):
-            score -= 35
-        if any(word in lowered_title for word in ("dialog", "full")):
-            score += 12
+        disposition = stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
+        # Subtitle-track ranking adapted from SubPlz's pragmatic stream scorer.
+        # For Pudge a signs/forced-only Japanese track is worse than no full
+        # Japanese track: accepting it would make an episode look playback-ready.
+        if any(word in lowered_title for word in ("commentary", "comment", "comms")) or int(disposition.get("comment", 0) or 0):
+            score -= 200
+        if any(word in lowered_title for word in ("sign", "song", "karaoke", "forced")) or int(disposition.get("forced", 0) or 0):
+            score -= 110
+        if any(word in lowered_title for word in ("dialog", "dialogue", "full")):
+            score += 20
+        if int(disposition.get("default", 0) or 0):
+            score += 10
 
         # For unlabelled text streams, inspect a sample. This is deliberately skipped
         # for bitmap subtitles because OCR would be required.

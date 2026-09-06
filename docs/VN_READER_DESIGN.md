@@ -1,45 +1,38 @@
-# Visual Novel reader plan
+# Visual Novel reader
 
-The Visual Novel reader is an optional tool that starts only when the user opens
-it. Ordinary library refreshes, subtitle preparation, and manga reading must not
-start screen capture or OCR.
+The Visual Novel reader is an optional macOS tool for games that do not provide
+selectable Japanese text. It stays completely idle until the user opens the
+reader, chooses a window, and presses **Start reader**.
 
-## Capture pipeline
+## Current behavior
 
-1. Ask for macOS Screen Recording permission only after the user selects
-   **Visual Novel reader**.
-2. Use ScreenCaptureKit to list shareable windows and persist a window identity,
-   never a screen-coordinate rectangle. This also covers a CrossOver window.
-3. Capture at 2 fps while text is stable and temporarily increase to 5 fps after
-   a frame change. Keep the queue depth at two frames and discard stale frames.
-4. Detect changed regions before OCR. Run Apple Vision on changed areas and use
-   MangaOCR only for Japanese crops that need a second pass.
-5. Stabilize repeated lines by normalized text and geometry. Expose one selectable
-   overlay plus a chronological transcript instead of appending every frame.
-6. Pause capture when the VN window is hidden, minimized, or unchanged for 30
-   seconds. Stop all workers when the reader closes.
+- Lists suitable visible application windows on macOS.
+- Requests Screen Recording permission only when capture is explicitly started.
+- Captures only the selected window.
+- Skips OCR when the frame has not changed and backs off further when the window stays unchanged.
+- Uses macOS text recognition for the current frame.
+- Waits for repeated matching text before adding a line to the transcript, which reduces duplicates during animation or transitions.
+- Keeps a bounded recent transcript rather than an unlimited screenshot history.
+- Runs recognized Japanese through the same reading/study-card tools used elsewhere in Pudge.
+- Lets the selected VN window carry an AniList identity for library context.
+- Stops capture and workers when the reader is stopped or the application closes.
 
-## Study and context
+The reader does not run OCR during ordinary anime, manga, Light Novel, or
+library refresh activity.
 
-- Feed stable lines through the existing Jiten/JPDB parsing cache.
-- Keep the previous 10 stable lines as local context for translation and the
-  optional local LLM. Never send continuous screenshots to the LLM.
-- Build a per-title name glossary from AniList plus user corrections. Corrections
-  override AniList and are reusable by LN, manga, subtitles, and VN translation.
-- Deduplicate cards by backend word/reading id and preserve the original sentence.
+## Known limitations
 
-## Planned releases
+The current reader recognizes the selected window as an image. It does not yet
+use engine-specific text hooks, speaker-name extraction, region selection, or a
+separate MangaOCR second pass. Very animated windows can therefore produce
+noisier text than static dialogue boxes.
 
-- **0.8.0:** window picker, permission flow, adaptive capture, selectable OCR,
-  transcript, Jiten/JPDB actions, and energy diagnostics.
-- **0.8.1:** local-LLM context disambiguation and editable character glossary.
-- **0.8.2:** optional text-hook adapters when a VN engine supports them; OCR stays
-  the universal fallback for CrossOver and untranslated builds.
+## Possible next improvements
 
-## Acceptance checks
+Future work can improve text-region detection, speaker/name handling, local LLM
+context, and optional engine-specific text hooks. Those are enhancements to the
+existing reader rather than requirements for the current feature.
 
-- No capture or OCR process exists before explicit activation.
-- Memory stays bounded during a two-hour session; no unbounded frame history.
-- A hidden/unchanged window consumes no OCR calls.
-- Repeated dialogue produces one transcript entry and one set of study tokens.
-- Revoking Screen Recording permission fails locally with a clear recovery action.
+Any future capture changes should keep the same safety rules: explicit user
+activation, bounded memory, no background capture after Stop, and no continuous
+screenshots sent to an online service.

@@ -113,7 +113,7 @@ def test_alignment_generation_uses_history_when_old_sync_source_was_pruned(
     assert bleach.state == "waiting_subtitles"
     assert direct is not None and direct.subtitle_path == clean_playback.resolve()
     assert direct.state == "ready"
-    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 
 def test_qbittorrent_can_set_location_and_recheck() -> None:

@@ -196,3 +196,25 @@ def test_refresh_passes_first_library_scan_to_interactive_refresh(tmp_path: Path
     assert scans == [{"reuse_unchanged": True, "user_requested": True}]
     assert received == [3]
     assert result["stats"]["library"] == 3
+
+
+def test_debug_bundle_includes_rotated_runtime_logs(tmp_path):
+    database = Database(tmp_path / "pudge.db")
+    recorder = DiagnosticRecorder(database)
+    runtime = tmp_path / "runtime.log"
+    runtime.write_text("current\n", encoding="utf-8")
+    Path(f"{runtime}.1").write_text("previous\n", encoding="utf-8")
+    Path(f"{runtime}.2").write_text("older\n", encoding="utf-8")
+    target = tmp_path / "debug.zip"
+
+    DebugBundleBuilder(database, recorder).build(
+        target,
+        version="test",
+        logs={"runtime": runtime},
+    )
+
+    with zipfile.ZipFile(target) as archive:
+        names = set(archive.namelist())
+        assert "logs/runtime.log" in names
+        assert "logs/runtime.log.1" in names
+        assert "logs/runtime.log.2" in names

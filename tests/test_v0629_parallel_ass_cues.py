@@ -80,7 +80,7 @@ Dialogue: 0,0:00:14.50,0:00:18.00,Default,,0,0,0,,第二
 
     cues = parse_srt(output)
     assert len(cues) == 2
-    assert cues[0] == (10.0, 14.4, "第一")
+    assert cues[0] == (10.0, 15.0, "第一")
     assert cues[1] == (14.5, 18.0, "第二")
 
 
@@ -123,4 +123,4 @@ def test_generation_eight_requeues_only_old_playback_srt(tmp_path: Path) -> None
     alass = manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv")
     assert playback is not None and playback.subtitle_path is None
     assert alass is not None and alass.subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "17"

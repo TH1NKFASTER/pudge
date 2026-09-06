@@ -136,7 +136,7 @@ def launch_settings(config_path: Path) -> int:
 
         def worker() -> None:
             try:
-                names = list_models(base_url_var.get().strip(), llm_key_var.get().strip())
+                names = list_models(base_url_var.get().strip(), llm_key_var.get().strip(), provider=config.llm.provider)
                 root.after(0, lambda: apply_models(names, None))
             except Exception as exc:  # UI must show connection failures rather than crash
                 root.after(0, lambda error=str(exc): apply_models([], error))

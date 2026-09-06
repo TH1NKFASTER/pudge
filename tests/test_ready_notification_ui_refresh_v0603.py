@@ -13,7 +13,7 @@ def test_foreground_poll_detects_subtitle_state_changes_not_only_download_progre
     assert "item.subtitle?1:0" in html
     assert "const before=foregroundDataSignature(ui.state)" in html
     assert "const after=foregroundDataSignature(ui.state)" in html
-    assert "if(before!==after)renderDataPages()" in html
+    assert "if(before!==after)renderDataPages(true)" in html
 
 
 def test_open_window_checks_tiny_state_versions_before_rebuilding_state():

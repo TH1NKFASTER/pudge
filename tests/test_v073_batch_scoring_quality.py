@@ -220,3 +220,252 @@ def test_batch_first_rejects_movies_multi_season_and_partial_ranges(
     )
 
     assert selected is base
+
+
+def test_production_search_rejects_explicit_wrong_season_before_ranking() -> None:
+    from pudge.providers.nyaa import search_ranked
+
+    anime = LibraryAnime(
+        media_id=16498,
+        title="Shingeki no Kyojin",
+        titles=["Attack on Titan"],
+        episodes=25,
+        format="TV",
+    )
+    wrong = _release(
+        "[Erai-raws] Shingeki no Kyojin Season 2 - 01 ~ 12 "
+        "[720p][BATCH][Multiple Subtitle]",
+        seeders=20,
+        size_gib=8.5,
+        is_batch=True,
+        info_hash="aot-s2",
+    )
+
+    class FakeClient:
+        def search(self, _query: str) -> list[NyaaRelease]:
+            return [wrong]
+
+    ranked = search_ranked(
+        FakeClient(),
+        anime,
+        episode=11,
+        batch=True,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="720p",
+        min_seeders=1,
+        target_episode_min_bytes=40 * 1024 * 1024,
+        target_episode_max_bytes=3500 * 1024 * 1024,
+    )
+    assert ranked == []
+
+
+def test_shared_production_batch_guard_rejects_multi_season_pack(tmp_path: Path) -> None:
+    from pudge.providers.nyaa import release_is_safe_batch_candidate, score_release
+
+    anime = LibraryAnime(
+        media_id=16498,
+        title="Shingeki no Kyojin",
+        titles=["Attack on Titan"],
+        episodes=25,
+        format="TV",
+    )
+    item = _release(
+        "[HorribleSubs] Shingeki no Kyojin S1 - S3 Complete [720p] (Unofficial Batch)",
+        seeders=19,
+        size_gib=22.3,
+        is_batch=True,
+        info_hash="aot-s1-s3",
+    )
+    scored = score_release(
+        item,
+        anime,
+        episode=11,
+        batch=True,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="720p",
+        min_seeders=1,
+        target_episode_min_bytes=40 * 1024 * 1024,
+        target_episode_max_bytes=3500 * 1024 * 1024,
+    )
+    assert release_is_safe_batch_candidate(anime, scored) is False
+
+    manager = _manager(tmp_path)
+    manager.db.upsert_anime(anime)
+    assert manager._release_is_safe_batch_candidate(anime.media_id, scored) is False
+
+
+def test_production_search_rejects_unrelated_title_even_if_provider_returns_it() -> None:
+    from pudge.providers.nyaa import search_ranked
+
+    anime = LibraryAnime(
+        media_id=16498,
+        title="Shingeki no Kyojin",
+        titles=["Attack on Titan"],
+        episodes=25,
+        format="TV",
+    )
+    wrong = _release(
+        "[NoobSubs] Kimetsu no Yaiba - 02 [720p]",
+        seeders=100,
+        size_gib=0.7,
+        is_batch=False,
+        info_hash="kimetsu-for-aot",
+    )
+
+    class FakeClient:
+        def search(self, _query: str) -> list[NyaaRelease]:
+            return [wrong]
+
+    ranked = search_ranked(
+        FakeClient(),
+        anime,
+        episode=2,
+        batch=False,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="720p",
+        min_seeders=1,
+        target_episode_min_bytes=40 * 1024 * 1024,
+        target_episode_max_bytes=3500 * 1024 * 1024,
+    )
+    assert ranked == []
+
+
+def test_shared_identity_guard_rejects_compact_multi_season_ranges(tmp_path: Path) -> None:
+    from pudge.providers.nyaa import (
+        release_identity_mismatch_reason,
+        release_is_safe_batch_candidate,
+    )
+
+    anime = LibraryAnime(
+        media_id=16498,
+        title="Shingeki no Kyojin",
+        titles=["Attack on Titan"],
+        episodes=25,
+        format="TV",
+    )
+    titles = [
+        "[Trix] Shingeki no Kyojin S01-04 + OADs (Complete Series) [720p]",
+        "[Trix] Attack on Titan S1-S4 Complete [720p]",
+        "[Trix] Attack on Titan Season 1-4 Complete [720p]",
+        "[Trix] Attack on Titan S01~S04 Complete [720p]",
+    ]
+    for index, title in enumerate(titles):
+        item = _release(
+            title,
+            seeders=19,
+            size_gib=17.2,
+            is_batch=True,
+            info_hash=f"multi-season-{index}",
+        )
+        assert release_identity_mismatch_reason(anime, title) == "cross-season-multi"
+        assert release_is_safe_batch_candidate(anime, item) is False
+
+
+def test_episode_range_is_not_mistaken_for_season_range() -> None:
+    from pudge.providers.nyaa import release_identity_mismatch_reason
+
+    anime = LibraryAnime(
+        media_id=20755,
+        title="Ansatsu Kyoushitsu",
+        titles=["Assassination Classroom"],
+        episodes=22,
+        format="TV",
+    )
+    assert (
+        release_identity_mismatch_reason(
+            anime, "[HorribleSubs] Assassination Classroom (01-22) [1080p] (Batch)"
+        )
+        is None
+    )
+
+
+def test_production_search_rejects_named_related_kimetsu_sequel_arcs() -> None:
+    from pudge.providers.nyaa import search_ranked
+
+    anime = LibraryAnime(
+        media_id=101922,
+        title="Kimetsu no Yaiba",
+        titles=["Demon Slayer: Kimetsu no Yaiba"],
+        episodes=26,
+        format="TV",
+    )
+    related_titles = (
+        "Kimetsu no Yaiba: Mugen Ressha-hen (TV)",
+        "Kimetsu no Yaiba: Yuukaku-hen",
+        "Kimetsu no Yaiba: Katanakaji no Sato-hen",
+        "Kimetsu no Yaiba: Hashira Geiko-hen",
+    )
+    wrong_titles = [
+        "[Erai-raws] Kimetsu no Yaiba - Mugen Ressha Hen (TV) - 05 [720p][Multiple Subtitle]",
+        "[SubsPlease] Kimetsu no Yaiba - Yuukaku-hen - 05 (720p)",
+        "[Erai-raws] Kimetsu no Yaiba - Katanakaji no Sato Hen - 05 [720p]",
+        "[SubsPlease] Kimetsu no Yaiba - Hashira Geiko-hen - 05 (480p)",
+    ]
+
+    class FakeClient:
+        def search(self, _query: str) -> list[NyaaRelease]:
+            return [
+                _release(
+                    title,
+                    seeders=20,
+                    size_gib=0.5,
+                    is_batch=False,
+                    info_hash=f"wrong-{index}",
+                )
+                for index, title in enumerate(wrong_titles)
+            ]
+
+    ranked = search_ranked(
+        FakeClient(),
+        anime,
+        episode=5,
+        batch=False,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="720p",
+        min_seeders=1,
+        target_episode_min_bytes=40 * 1024 * 1024,
+        target_episode_max_bytes=3500 * 1024 * 1024,
+        negative_titles=related_titles,
+    )
+    assert ranked == []
+
+
+def test_manager_cached_relation_graph_supplies_full_negative_franchise_titles(
+    tmp_path: Path, monkeypatch
+) -> None:
+    anime = LibraryAnime(
+        media_id=101922,
+        title="Kimetsu no Yaiba",
+        titles=["Demon Slayer: Kimetsu no Yaiba"],
+        episodes=26,
+        format="TV",
+    )
+    manager = _manager(tmp_path)
+    manager.db.upsert_anime(anime)
+    monkeypatch.setattr(
+        manager.db,
+        "relation_graph_for_media",
+        lambda _media_id: {
+            "graph": {
+                "nodes": [
+                    {"media_id": 101922, "title": "Kimetsu no Yaiba"},
+                    {"media_id": 129874, "title": "Kimetsu no Yaiba: Mugen Ressha-hen (TV)"},
+                    {"media_id": 142329, "title": "Kimetsu no Yaiba: Yuukaku-hen"},
+                    {"media_id": 145139, "title": "Kimetsu no Yaiba: Katanakaji no Sato-hen"},
+                    {"media_id": 166240, "title": "Kimetsu no Yaiba: Hashira Geiko-hen"},
+                ]
+            }
+        },
+    )
+
+    negatives = manager._release_negative_titles_from_graph(anime)
+    assert "Kimetsu no Yaiba: Hashira Geiko-hen" in negatives
+    assert "Kimetsu no Yaiba" not in negatives

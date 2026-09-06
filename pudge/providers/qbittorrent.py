@@ -610,6 +610,87 @@ class QBittorrentClient:
             self._set_category_and_tags(torrent_hash, category=category, tags=tags)
         return str(torrent_hash or "")
 
+    def inspect_release_files(
+        self,
+        release: NyaaRelease,
+        *,
+        save_path: Path,
+        metadata_timeout: float = 30.0,
+    ) -> list[dict[str, Any]]:
+        """Read a torrent file list through magnet metadata without downloading payload data.
+
+        Existing user torrents are never modified or deleted.  A temporary magnet
+        added by this helper is stopped at metadata and removed again afterwards.
+        """
+        self.login()
+        existing = self._torrent_by_hash(str(release.info_hash or ""))
+        if existing is not None:
+            torrent_hash = str(existing.get("hash") or release.info_hash or "")
+            deadline = time.monotonic() + max(1.0, float(metadata_timeout))
+            while time.monotonic() < deadline:
+                rows = self.files(torrent_hash)
+                if rows:
+                    return rows
+                time.sleep(0.25)
+            return []
+
+        target = save_path.expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "urls": release.magnet,
+            "savepath": str(target),
+            **self._add_state_payload(paused=True, stop_at_metadata=True),
+            "stopCondition": "MetadataReceived",
+        }
+        added_hash = str(release.info_hash or "")
+        added_by_us = False
+        try:
+            response = self.client.post("/api/v2/torrents/add", data=payload)
+            if response.status_code == 409:
+                existing = self._torrent_by_hash(str(release.info_hash or ""))
+                if existing is not None:
+                    torrent_hash = str(existing.get("hash") or release.info_hash or "")
+                    deadline = time.monotonic() + max(1.0, float(metadata_timeout))
+                    while time.monotonic() < deadline:
+                        rows = self.files(torrent_hash)
+                        if rows:
+                            return rows
+                        time.sleep(0.25)
+                    return []
+            response.raise_for_status()
+            added_by_us = True
+            if response.text.strip():
+                try:
+                    result = response.json()
+                except ValueError:
+                    result = None
+                if isinstance(result, dict):
+                    ids = [
+                        str(value)
+                        for value in (result.get("added_torrent_ids") or [])
+                        if value
+                    ]
+                    if ids:
+                        added_hash = ids[0]
+            if not added_hash:
+                raise QBittorrentError("qBittorrent did not return a torrent hash for metadata inspection")
+
+            deadline = time.monotonic() + max(1.0, float(metadata_timeout))
+            while time.monotonic() < deadline:
+                rows = self.files(added_hash)
+                if rows:
+                    return rows
+                time.sleep(0.25)
+            return []
+        except httpx.HTTPError as exc:
+            raise QBittorrentError(f"Не удалось получить metadata торрента через qBittorrent: {exc}") from exc
+        finally:
+            if added_by_us and added_hash:
+                try:
+                    self.delete(added_hash, delete_files=True)
+                except Exception:
+                    pass
+
     def start(self, torrent_hash: str) -> None:
         """Explicitly start/resume a torrent after adding it.
 

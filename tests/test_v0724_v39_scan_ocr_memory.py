@@ -319,3 +319,111 @@ def test_bitmap_ocr_memory_guard_preserves_prepared_bitmap_for_retry(
     assert episode.subtitle_path == bitmap.resolve()
     assert "4096 MB" in str(job["last_error"])
     assert str(job["state"]) == "pending"
+
+
+def test_library_scan_fingerprint_reuses_unchanged_cache_for_one_hour(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Unchanged libraries must not trigger the old 15-minute full rescan."""
+    import json
+    import time
+
+    manager = _manager(tmp_path)
+    _allow_heavy_scan(manager, monkeypatch)
+    video = manager.config.library.root_dir / "Example - 01.mkv"
+    video.write_bytes(b"video")
+    calls: list[str] = []
+
+    def full_scan():
+        calls.append("scan")
+        row = LibraryEpisode(None, "Example", 1, video.resolve(), state="local")
+        manager.db.upsert_episode(row)
+        return [manager.db.episode_by_path(video.resolve()) or row]
+
+    monkeypatch.setattr(manager, "_scan_library_uncached", full_scan)
+    manager.scan_library(reuse_unchanged=True)
+    cached = json.loads(manager.db.get_state(manager._LIBRARY_SCAN_CACHE_KEY, "{}"))
+    cached["completed_at"] = time.time() - 3600
+    manager.db.set_state(manager._LIBRARY_SCAN_CACHE_KEY, json.dumps(cached))
+
+    rows = manager.scan_library(reuse_unchanged=True)
+
+    assert len(rows) == 1
+    assert calls == ["scan"]
+
+
+def test_vision_ocr_uses_pyobjc_autorelease_pool_without_manual_drain(
+    monkeypatch,
+) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    events: list[str] = []
+
+    class Pool:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            events.append("exit")
+            return False
+
+    class Request:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def init(self):
+            return self
+
+        def setRecognitionLevel_(self, _value):
+            return None
+
+        def setRecognitionLanguages_(self, _value):
+            return None
+
+        def setUsesLanguageCorrection_(self, _value):
+            return None
+
+        def results(self):
+            return []
+
+    class Handler:
+        @classmethod
+        def alloc(cls):
+            return cls()
+
+        def initWithURL_options_(self, _url, _options):
+            return self
+
+        def performRequests_error_(self, _requests, _error):
+            return True, None
+
+    class URL:
+        @staticmethod
+        def fileURLWithPath_(path):
+            return path
+
+    fake_vision = SimpleNamespace(
+        VNRecognizeTextRequest=Request,
+        VNImageRequestHandler=Handler,
+        VNRequestTextRecognitionLevelAccurate=1,
+    )
+    fake_objc = SimpleNamespace(autorelease_pool=lambda: Pool())
+    # Deliberately expose no NSAutoreleasePool: importing/using it would make
+    # this regression fail instead of silently double-releasing it again.
+    fake_foundation = SimpleNamespace(NSURL=URL)
+
+    monkeypatch.setattr(ocr.platform, "system", lambda: "Darwin")
+    monkeypatch.setitem(sys.modules, "Vision", fake_vision)
+    monkeypatch.setitem(sys.modules, "objc", fake_objc)
+    monkeypatch.setitem(sys.modules, "Foundation", fake_foundation)
+
+    image = Image.new("RGBA", (8, 4), (255, 255, 255, 255))
+    try:
+        assert ocr._vision_recognize(image) == ""
+    finally:
+        image.close()
+
+    assert events == ["enter", "exit"]

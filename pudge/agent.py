@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
     manager = AnimeManager(config)
     search_due = True
     anilist_due = False
+    subtitle_due = False
     if args.scheduled:
         now = time.time()
         try:
@@ -35,7 +36,16 @@ def main(argv: list[str] | None = None) -> int:
             last_run = 0
         search_due = now - last_run >= max(5, config.agent.poll_minutes) * 60
         anilist_due = manager.anilist_refresh_due(now=now)
-        if not search_due and not anilist_due:
+        # Subtitle jobs carry their own next_check timestamps.  They must be
+        # allowed to wake the launch-agent independently of the general Nyaa
+        # poll, otherwise a larger agent.poll_minutes can silently stretch a
+        # requested 30-minute Jimaku retry into hours.
+        subtitle_due = any(
+            str(row["state"] or "") in {"pending", "processing"}
+            and float(row["next_check"] or 0.0) <= now
+            for row in manager.db.subtitle_jobs()
+        )
+        if not search_due and not anilist_due and not subtitle_due:
             print(f"{APP_NAME} Agent: ещё не наступило время следующей проверки")
             return 0
     try:
@@ -43,7 +53,11 @@ def main(argv: list[str] | None = None) -> int:
             if search_due:
                 stats = manager.run_once()
             else:
-                stats = {"anilist": manager.refresh_anilist_if_due()}
+                stats = {}
+                if subtitle_due:
+                    stats["subs"] = manager.process_subtitle_jobs(limit=8)
+                if anilist_due:
+                    stats["anilist"] = manager.refresh_anilist_if_due()
     except Exception as exc:
         print(f"{APP_NAME} Agent: {exc}", file=sys.stderr)
         return 1

@@ -193,6 +193,15 @@ class DebugBundleBuilder:
                 source = Path(path).expanduser()
                 if source.is_file():
                     archive.write(source, f"logs/{label}{source.suffix or '.log'}")
+                if label not in {"runtime", "agent", "agent-error"}:
+                    continue
+                for rotation in range(1, 4):
+                    rotated = Path(f"{source}.{rotation}")
+                    if rotated.is_file():
+                        archive.write(
+                            rotated,
+                            f"logs/{label}{source.suffix or '.log'}.{rotation}",
+                        )
             subtitle_paths: set[Path] = set()
             for snapshot in snapshot_rows:
                 subtitle_paths.update(self._paths_from_payload(snapshot))

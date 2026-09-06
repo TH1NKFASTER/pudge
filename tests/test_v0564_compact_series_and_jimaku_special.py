@@ -71,7 +71,8 @@ def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Pat
 
     html = HTML.read_text(encoding="utf-8")
     assert ".ready-sequence-card { position:relative;" in html
-    assert "grid-column:1/-1" not in html
+    ready_sequence_css = html.split(".ready-sequence-card {", 1)[1].split("}", 1)[0]
+    assert "grid-column:1/-1" not in ready_sequence_css
     assert "group.title||items[0].title" in html
     assert "ready-sequence-list" in html
     assert "t('label.watchSequence')" not in html

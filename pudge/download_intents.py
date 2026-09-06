@@ -130,6 +130,23 @@ class DownloadIntentStore:
     def clear(self, media_id: int, episode: int | None, batch: bool) -> None:
         self._delete_state(self.key(media_id, episode, batch))
 
+    def complete_if_present(
+        self, media_id: int, episode: int | None, batch: bool, *, detail: str = "Download completed"
+    ) -> bool:
+        payload = self.get(media_id, episode, batch)
+        if payload is None:
+            return False
+        if str(payload.get("state") or "").casefold() == "complete":
+            return False
+        payload["state"] = "complete"
+        payload["updated_at"] = time.time()
+        payload["detail"] = str(detail)[:500]
+        self._set_state(
+            self.key(media_id, episode, batch),
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        return True
+
     def waiting_count(self) -> int:
         connector = getattr(self.db, "connect", None)
         if not callable(connector):

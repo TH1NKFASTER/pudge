@@ -15,8 +15,9 @@ def test_ln_cards_show_local_audiobook_badge_and_tooltip() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
     assert 'Boolean(book.paired_audio)' in html
     assert 'class="ln-paired-audio-badge"' in html
-    assert 'data-tooltip="Has local audiobook"' in html
-    assert '>🎧︎</span>' in html
+    assert "Has audiobook" in html
+    assert "Has local audiobook" not in html
+    assert "Has TTS-generated audiobook" not in html
     assert 'color:#fff' in html
 
 

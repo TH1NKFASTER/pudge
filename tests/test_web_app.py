@@ -347,6 +347,7 @@ def test_save_settings_persists_selected_language(tmp_path: Path) -> None:
 def test_startup_maintenance_runs_once_and_refreshes_new_torrents(tmp_path: Path, monkeypatch) -> None:
     api = make_api(tmp_path)
     api.config.qbittorrent.enabled = True
+    api.config.nyaa.torrents_enabled = True
     calls = {"run": 0, "sync": 0}
 
     def run_once():
@@ -373,6 +374,31 @@ def test_startup_maintenance_runs_once_and_refreshes_new_torrents(tmp_path: Path
     assert second["skipped"] is True
     assert calls == {"run": 1, "sync": 1}
 
+
+
+
+def test_startup_maintenance_keeps_download_sync_idle_when_torrents_off(
+    tmp_path: Path, monkeypatch
+) -> None:
+    api = make_api(tmp_path)
+    api.config.qbittorrent.enabled = True
+    assert api.config.nyaa.torrents_enabled is False
+    calls = {"sync": 0}
+    monkeypatch.setattr(api.manager, "run_startup_once", lambda: {"auto": 1})
+
+    def sync_downloads():
+        calls["sync"] += 1
+        return 1
+
+    monkeypatch.setattr(api.manager, "sync_downloads", sync_downloads)
+
+    api.startup_maintenance()
+    api._startup_maintenance_thread.join(timeout=3)
+    status = api.startup_maintenance_status()
+
+    assert status["done"] is True
+    assert "downloads_after_auto" not in status["stats"]
+    assert calls["sync"] == 0
 
 def test_foreground_poll_checks_downloads_without_running_heavy_subtitles(tmp_path: Path, monkeypatch) -> None:
     api = make_api(tmp_path)

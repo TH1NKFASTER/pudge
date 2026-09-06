@@ -10,12 +10,14 @@ function compactDownloadStatus(download){
 function episodePresentationStatus(a,episode){
   const p=a?.presentation||null;
   if(!p){
+    if(a?.local?.state==='couldnt_sync')return ui.lang==='ru'?"Couldn't sync — можно смотреть сырые":'Couldn\'t sync — raw subtitles available';
     if(a?.local?.state==='waiting_text_subtitles')return t('label.waitingTextSubs');
     if(a?.local?.state==='waiting_subtitles')return t('label.waitingSubs');
     if(a?.download)return compactDownloadStatus(a.download);
     return episode!==null?t('label.episodeNotReady',{episode}):t('label.notReady');
   }
   if(p.status==='needs_action')return ui.lang==='ru'?'Требуется действие':'Action required';
+  if(p.status==='couldnt_sync')return ui.lang==='ru'?"Couldn't sync — можно смотреть сырые":'Couldn\'t sync — raw subtitles available';
   if(p.status==='waiting_text_subtitles')return t('label.waitingTextSubs');
   if(p.status==='waiting_subtitles'||p.status==='waiting_preparation')return t('label.waitingSubs');
   if(p.status==='waiting_download'||p.status==='downloading')return a?.download?compactDownloadStatus(a.download):(ui.lang==='ru'?'Ожидание загрузки':'Waiting for download');

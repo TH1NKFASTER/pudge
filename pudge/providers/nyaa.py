@@ -56,10 +56,32 @@ EPISODE_RANGE_PATTERNS = (
 )
 RESOLUTION_RE = re.compile(r"(?i)\b(2160p|1440p|1080p|720p|480p)\b")
 SEASON_PATTERNS = (
-    re.compile(r"(?i)\bS(?:eason)?[ ._-]*0*(?P<season>\d{1,2})(?:\b|(?=E\d))"),
+    re.compile(
+        r"(?i)\bS(?:eason)?(?:[ ._]*|-(?!\s))0*(?P<season>\d{1,2})(?:\b|(?=E\d))"
+    ),
     re.compile(r"(?i)\b0*(?P<season>\d{1,2})(?:st|nd|rd|th)[ ._-]+Season\b"),
-    re.compile(r"(?i)\bSeason[ ._-]*0*(?P<season>\d{1,2})\b"),
+    re.compile(r"(?i)\bSeason(?:[ ._]*|-(?!\s))0*(?P<season>\d{1,2})\b"),
     re.compile(r"第\s*0*(?P<season>\d{1,2})\s*期"),
+)
+SEASON_RANGE_PATTERNS = (
+    # Compact forms where the first ``S`` makes the range unambiguous.
+    # ``S01-04`` / ``S01~04``.
+    re.compile(
+        r"(?i)\bS0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"
+    ),
+    # Explicit marker on both sides permits whitespace around the separator.
+    # ``S1 - S4`` / ``Season 1 - Season 4`` / ``Season 1 - S4``.
+    re.compile(
+        r"(?i)\bS(?:eason)?[ ._-]*0*(?P<start>\d{1,2})\s*"
+        r"(?:-|~|–|—|\bto\b)\s*"
+        r"S(?:eason)?[ ._-]*0*(?P<end>\d{1,2})\b"
+    ),
+    # ``Season 1-4`` is common, but only accept the no-second-marker form when
+    # the range separator is compact. This deliberately does NOT match
+    # ``Season 1 - 02``, which is a common season + episode spelling.
+    re.compile(
+        r"(?i)\bSeason[ ._-]*0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"
+    ),
 )
 ROMAN_SEASONS = {
     "ii": 2,
@@ -601,22 +623,25 @@ class NyaaClient:
             detail = (completed.stderr or completed.stdout).strip()
             raise NyaaError(f"Команда перед поиском Nyaa завершилась с ошибкой: {detail}")
 
+    def _client_for_proxy(self, proxy: str | None) -> httpx.Client:
+        key = str(proxy or "")
+        with self._client_lock:
+            client = self._clients.get(key)
+            if client is None:
+                client = httpx.Client(
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                    proxy=proxy,
+                    headers={"User-Agent": APP_SLUG},
+                )
+                self._clients[key] = client
+        return client
+
     def _get(self, url: str, proxy: str | None) -> str:
         if not self._breaker.allow():
             raise NyaaError("Nyaa temporarily paused after repeated network failures")
         try:
-            key = str(proxy or "")
-            with self._client_lock:
-                client = self._clients.get(key)
-                if client is None:
-                    client = httpx.Client(
-                        timeout=self.timeout,
-                        follow_redirects=True,
-                        proxy=proxy,
-                        headers={"User-Agent": APP_SLUG},
-                    )
-                    self._clients[key] = client
-            response = client.get(url)
+            response = self._client_for_proxy(proxy).get(url)
             response.raise_for_status()
             self._breaker.success()
             return response.text
@@ -631,6 +656,53 @@ class NyaaClient:
             route = f" через {proxy}" if proxy else " напрямую"
             raise NyaaError(f"Nyaa недоступен{route}: {exc}") from exc
 
+    def _get_bytes(self, url: str, proxy: str | None) -> bytes:
+        if not self._breaker.allow():
+            raise NyaaError("Nyaa temporarily paused after repeated network failures")
+        try:
+            response = self._client_for_proxy(proxy).get(url)
+            response.raise_for_status()
+            payload = bytes(response.content)
+            if not payload or len(payload) > 12 * 1024 * 1024:
+                raise NyaaError("Nyaa returned invalid torrent metadata")
+            self._breaker.success()
+            return payload
+        except ImportError as exc:
+            self._breaker.failure()
+            raise NyaaError(
+                "Для SOCKS-прокси не установлена зависимость socksio. "
+                "Повторно запустите ./install.sh."
+            ) from exc
+        except httpx.HTTPError as exc:
+            self._breaker.failure()
+            route = f" через {proxy}" if proxy else " напрямую"
+            raise NyaaError(f"Nyaa недоступен{route}: {exc}") from exc
+
+    def fetch_torrent_payload(self, url: str) -> bytes:
+        """Fetch a small .torrent file through the same Nyaa proxy route."""
+        source = str(url or "").strip()
+        if not source.casefold().startswith(("http://", "https://")):
+            raise NyaaError("Release does not contain a downloadable torrent file")
+        mode = self.proxy_mode.casefold()
+        if mode == "proxy_only":
+            attempts = [self.proxy_url or None]
+        elif mode == "proxy_then_direct":
+            attempts = [self.proxy_url or None, None]
+        elif mode == "direct":
+            attempts = [None]
+        else:
+            attempts = [None, self.proxy_url or None]
+        attempts = list(dict.fromkeys(attempts))
+        errors: list[str] = []
+        for proxy in attempts:
+            if proxy is None and mode == "proxy_only":
+                continue
+            try:
+                return self._get_bytes(source, proxy)
+            except NyaaError as exc:
+                errors.append(str(exc))
+        raise NyaaError("; ".join(dict.fromkeys(errors)) or "Nyaa torrent metadata is unavailable")
+
     def close(self) -> None:
         with self._client_lock:
             clients = list(self._clients.values())
@@ -638,13 +710,25 @@ class NyaaClient:
         for client in clients:
             client.close()
 
-    def search(self, query: str, *, category: str | None = None, filter_id: int = 0) -> list[NyaaRelease]:
+    def search(
+        self,
+        query: str,
+        *,
+        category: str | None = None,
+        filter_id: int = 0,
+        sort_by: str | None = None,
+        order: str | None = None,
+    ) -> list[NyaaRelease]:
         self._run_hook()
         selected_category = category or self.category
         url = (
             f"{self.base_url}/?page=rss&q={quote_plus(query)}"
             f"&c={quote_plus(selected_category)}&f={int(filter_id)}"
         )
+        if sort_by:
+            url += f"&s={quote_plus(str(sort_by))}"
+        if order:
+            url += f"&o={quote_plus(str(order))}"
         mode = self.proxy_mode.casefold()
         attempts: list[str | None]
         if mode == "proxy_only":
@@ -776,6 +860,114 @@ def _expected_season(anime: LibraryAnime) -> int:
     return 1
 
 
+
+
+_FINAL_SEASON_IDENTITY_RE = re.compile(r"(?i)\b(?:the[ ._-]+)?final[ ._-]+season\b")
+
+
+def _explicit_season_numbers(title: str) -> set[int]:
+    """Return high-confidence explicit season numbers from a release title."""
+    value = str(title or "")
+    result: set[int] = set()
+    for pattern in SEASON_RANGE_PATTERNS:
+        for match in pattern.finditer(value):
+            try:
+                start = int(match.group("start"))
+                end = int(match.group("end"))
+            except (TypeError, ValueError):
+                continue
+            if start <= 0 or end <= 0:
+                continue
+            low, high = sorted((start, end))
+            # Season counts above 20 are almost certainly not season ranges.
+            # Keep the parser fail-safe and avoid interpreting episode spans.
+            if high > 20 or high - low > 12:
+                continue
+            result.update(range(low, high + 1))
+    for pattern in SEASON_PATTERNS:
+        for match in pattern.finditer(value):
+            try:
+                result.add(int(match.group("season")))
+            except (TypeError, ValueError):
+                continue
+    for word, number in SEASON_WORDS.items():
+        if re.search(rf"(?i)\b{re.escape(word)}[ ._-]+Season\b", value):
+            result.add(number)
+    return result
+
+
+def release_identity_mismatch_reason(anime: LibraryAnime, title: str) -> str | None:
+    """Return a hard identity contradiction shared by search and final selection.
+
+    This intentionally rejects only high-confidence contradictions. Ambiguous
+    unnumbered releases remain rankable; explicit other seasons/final-season
+    releases do not. Keeping this in the provider makes benchmark discovery and
+    the application use the same identity contract.
+    """
+    value = str(title or "")
+    targets = [anime.title, *anime.titles, *anime.synonyms]
+    target_final = any(_FINAL_SEASON_IDENTITY_RE.search(str(item or "")) for item in targets)
+    source_final = bool(_FINAL_SEASON_IDENTITY_RE.search(value))
+    if source_final and not target_final:
+        return "cross-season-final"
+
+    expected = _expected_season(anime)
+    explicit = _explicit_season_numbers(value)
+    if len(explicit) > 1:
+        return "cross-season-multi"
+    if explicit and expected not in explicit:
+        return "cross-season-explicit"
+
+    release_season = _season_number(value)
+    if release_season is not None and release_season != expected:
+        return "cross-season-release"
+    if release_season == 0:
+        return "special-season-zero"
+    return None
+
+
+def release_is_safe_batch_candidate(
+    anime: LibraryAnime,
+    item: NyaaRelease,
+    *,
+    negative_titles: tuple[str, ...] = (),
+) -> bool:
+    """Shared production/benchmark guard for one AniList-entry batch download."""
+    reasons = {str(reason) for reason in getattr(item, "reasons", [])}
+    if any(reason.startswith("wrong-season=") for reason in reasons):
+        return False
+    if "single-episode" in reasons or any(
+        reason.startswith("single-episode=") for reason in reasons
+    ):
+        return False
+
+    has_range = any(reason.startswith("range=") for reason in reasons)
+    if has_range and "full-series-range" not in reasons:
+        return False
+
+    title = str(getattr(item, "title", "") or "")
+    if re.search(r"(?i)\b(?:movie|film|special|ova|oad|ona)\b", title):
+        return False
+    if release_identity_mismatch_reason(anime, title) is not None:
+        return False
+    if release_related_title_conflict_reason(anime, title, negative_titles) is not None:
+        return False
+
+    expected = _expected_season(anime)
+    explicit = _explicit_season_numbers(title)
+    # A whole-entry batch must not silently span several seasons. Selective
+    # benchmark logic deliberately follows the same production safety rule so
+    # it can expose application search bugs instead of masking them.
+    if len(explicit) > 1:
+        return False
+    if explicit and explicit != {expected}:
+        return False
+
+    if bool(getattr(item, "is_batch", False)):
+        return True
+    return bool("large-pack-candidate" in reasons and "exact-title-phrase" in reasons)
+
+
 def _ordinal(value: int) -> str:
     if 10 <= value % 100 <= 20:
         suffix = "th"
@@ -880,6 +1072,86 @@ def _token_phrase_present(alias: str, release_title: str) -> bool:
     return any(release_tokens[index:index + width] == alias_tokens for index in range(len(release_tokens) - width + 1))
 
 
+def _relation_title_candidates(relations: Iterable[dict[str, object]]) -> list[str]:
+    result: list[str] = []
+    stack = [item for item in relations if isinstance(item, dict)]
+    while stack:
+        item = stack.pop()
+        title = str(item.get("title") or "").strip()
+        if title:
+            result.append(title)
+        children = item.get("relations")
+        if isinstance(children, list):
+            stack.extend(child for child in children if isinstance(child, dict))
+    return result
+
+
+def relation_negative_titles(
+    anime: LibraryAnime,
+    extra_titles: Iterable[str] = (),
+) -> tuple[str, ...]:
+    """Return distinct titles of other AniList media that must not win identity.
+
+    ``LibraryAnime.relations`` contains nearby franchise entries while the manager
+    can additionally supply every title from its cached full relation graph.  The
+    provider owns the actual conflict decision so Nyaa, RSS fallbacks, the final
+    batch selector and the benchmark all share one identity contract.
+    """
+    positive_norms = {
+        normalize_title(value)
+        for value in [anime.title, *anime.titles, *anime.synonyms]
+        if str(value).strip()
+    }
+    values = [*_relation_title_candidates(anime.relations), *extra_titles]
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = str(raw or "").strip()
+        normalized = normalize_title(value)
+        if not value or not normalized or normalized in positive_norms or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
+    return tuple(result)
+
+
+def release_related_title_conflict_reason(
+    anime: LibraryAnime,
+    release_title: str,
+    negative_titles: Iterable[str] = (),
+) -> str | None:
+    """Reject a release that more specifically names another related AniList media.
+
+    A franchise root such as ``Kimetsu no Yaiba`` is a literal prefix of sequel
+    releases such as ``Kimetsu no Yaiba: Yuukaku-hen``.  Pure positive-title
+    scoring therefore cannot distinguish them.  Related AniList titles are safe
+    negative evidence when the release contains the related title as a complete
+    token phrase and that title is either more specific than a positive alias or
+    is the only exact franchise-title match.
+    """
+    positives = list(dict.fromkeys(
+        str(value).strip()
+        for value in [anime.title, *anime.titles, *anime.synonyms]
+        if str(value).strip()
+    ))
+    release = str(release_title or "")
+    positive_exact = [value for value in positives if _token_phrase_present(value, release)]
+    for negative in relation_negative_titles(anime, negative_titles):
+        if not _token_phrase_present(negative, release):
+            continue
+        if not positive_exact:
+            return "related-media-title"
+        negative_tokens = normalize_title(negative).split()
+        for positive in positive_exact:
+            positive_tokens = normalize_title(positive).split()
+            if (
+                len(negative_tokens) > len(positive_tokens)
+                and _token_phrase_present(positive, negative)
+            ):
+                return "related-media-title"
+    return None
+
+
 def _title_match_score(
     anime: LibraryAnime,
     release_title: str,
@@ -918,6 +1190,27 @@ def _title_match_score(
     if coverage < 0.85:
         return best_similarity * 0.35 - 45.0, [f"title={best_similarity:.0f}", f"partial-title-coverage={coverage:.2f}"]
     return best_similarity * 0.40 - 15.0, [f"title={best_similarity:.0f}", "fuzzy-title-match"]
+
+
+def release_title_is_plausible(
+    anime: LibraryAnime,
+    release_title: str,
+    alternative_titles: tuple[str, ...] = (),
+    negative_titles: tuple[str, ...] = (),
+) -> bool:
+    """Shared fail-closed title identity check for provider results/resume.
+
+    This uses the same production title scoring used by Nyaa ranking. The
+    threshold mirrors the existing SubsPlease provider gate: weak accidental
+    token overlap (for example Kimetsu returned for Shingeki) is rejected,
+    while exact aliases and strong fuzzy aliases remain eligible.
+    """
+    if release_identity_mismatch_reason(anime, release_title) is not None:
+        return False
+    if release_related_title_conflict_reason(anime, release_title, negative_titles) is not None:
+        return False
+    score, _reasons = _title_match_score(anime, release_title, alternative_titles)
+    return score >= 25.0
 
 
 def _episode_size_floor_bytes(anime: LibraryAnime) -> tuple[int, str]:
@@ -1252,6 +1545,7 @@ def search_ranked(
     avoid_upscaled: bool = True,
     alternative_episodes: tuple[int, ...] = (),
     alternative_titles: tuple[str, ...] = (),
+    negative_titles: tuple[str, ...] = (),
     max_queries: int = 5,
     query_budget_seconds: float | None = None,
 ) -> list[NyaaRelease]:
@@ -1361,7 +1655,11 @@ def search_ranked(
     eligible_releases = [
         release
         for release in by_hash.values()
-        if not (
+        if release_identity_mismatch_reason(anime, release.title) is None
+        and release_title_is_plausible(
+            anime, release.title, alternative_titles, negative_titles
+        )
+        and not (
             episode is not None
             and not batch
             and not _release_is_eligible_for_episode(
@@ -1416,6 +1714,7 @@ def search_shana_ranked(
     avoid_upscaled: bool = True,
     alternative_episodes: tuple[int, ...] = (),
     alternative_titles: tuple[str, ...] = (),
+    negative_titles: tuple[str, ...] = (),
 ) -> list[NyaaRelease]:
     ranked = [
         score_release(
@@ -1444,6 +1743,9 @@ def search_shana_ranked(
         item
         for item in ranked
         if any(reason.startswith("exact-title") or reason.startswith("alias-title") or reason.startswith("fuzzy-title") for reason in item.reasons)
+        and release_title_is_plausible(
+            anime, item.title, alternative_titles, negative_titles
+        )
     ]
     ranked.sort(key=lambda item: (item.score, item.published), reverse=True)
     return ranked
@@ -1467,6 +1769,7 @@ def search_subsplease_ranked(
     avoid_upscaled: bool = True,
     alternative_episodes: tuple[int, ...] = (),
     alternative_titles: tuple[str, ...] = (),
+    negative_titles: tuple[str, ...] = (),
 ) -> list[NyaaRelease]:
     releases = client.releases(preferred_resolution)
     eligible: list[NyaaRelease] = []
@@ -1481,7 +1784,9 @@ def search_subsplease_ranked(
         title_score, _title_reasons = _title_match_score(
             anime, release.title, alternative_titles
         )
-        if title_score < 25.0:
+        if title_score < 25.0 or not release_title_is_plausible(
+            anime, release.title, alternative_titles, negative_titles
+        ):
             continue
         eligible.append(release)
 

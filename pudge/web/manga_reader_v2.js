@@ -1896,6 +1896,7 @@
     openBook,
     exportDebug: exportMangaOcrDebug,
     selectedBookIds: () => [...selectedBookIds],
+    selectAll: () => { (state.books || []).forEach(book => selectedBookIds.add(Number(book.id))); applyLibrarySelection(); emitSelection(); },
     clearSelection: () => { selectedBookIds.clear(); applyLibrarySelection(); emitSelection(); },
     deleteSelected: async () => {
       const ids = [...selectedBookIds];

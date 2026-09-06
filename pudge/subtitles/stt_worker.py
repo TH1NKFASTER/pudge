@@ -1,8 +1,53 @@
 from __future__ import annotations
 
+import gc
 import json
+import os
 import sys
 from pathlib import Path
+
+
+def _mlx_memory_snapshot() -> dict[str, int]:
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except Exception:
+        return {}
+    result: dict[str, int] = {}
+    for key, name in (("active_bytes","get_active_memory"),("cache_bytes","get_cache_memory"),("peak_bytes","get_peak_memory")):
+        fn = getattr(mx, name, None)
+        if callable(fn):
+            try: result[key] = int(fn())
+            except Exception: pass
+    return result
+
+
+def _configure_mlx_memory() -> None:
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except Exception:
+        return
+    for env_name, fn_name in (("PUDGE_MLX_CACHE_LIMIT_BYTES","set_cache_limit"),("PUDGE_MLX_MEMORY_LIMIT_BYTES","set_memory_limit")):
+        fn=getattr(mx,fn_name,None)
+        if not callable(fn): continue
+        try:
+            value=int(os.getenv(env_name,"0") or 0)
+            if value>0: fn(value)
+        except Exception: pass
+    reset=getattr(mx,"reset_peak_memory",None)
+    if callable(reset):
+        try: reset()
+        except Exception: pass
+
+
+def _release_mlx_memory() -> None:
+    gc.collect()
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+        clear=getattr(mx,"clear_cache",None)
+        if callable(clear): clear()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _install_progress_reporter(progress_path: Path) -> None:
@@ -24,7 +69,7 @@ def _install_progress_reporter(progress_path: Path) -> None:
             progress_path.parent.mkdir(parents=True, exist_ok=True)
             temporary = progress_path.with_suffix(progress_path.suffix + ".tmp")
             temporary.write_text(
-                json.dumps({"percent": percent, "current": current, "total": total}),
+                json.dumps({"percent": percent, "current": current, "total": total, "memory": _mlx_memory_snapshot()}),
                 encoding="utf-8",
             )
             temporary.replace(progress_path)
@@ -63,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError:
         print("mlx-whisper is not installed; STT fallback remains disabled", file=sys.stderr)
         return 3
+    _configure_mlx_memory()
     if progress_path is not None:
         _install_progress_reporter(progress_path)
     try:
@@ -74,13 +120,17 @@ def main(argv: list[str] | None = None) -> int:
             verbose=False,
         )
     except Exception as exc:
-        print(f"MLX Whisper failed: {exc}", file=sys.stderr)
+        snapshot = _mlx_memory_snapshot()
+        _release_mlx_memory()
+        print(f"MLX Whisper failed: {exc}; memory={snapshot}", file=sys.stderr)
         return 4
+    memory = _mlx_memory_snapshot()
+    _release_mlx_memory()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     if progress_path is not None:
         progress_path.write_text(
-            json.dumps({"percent": 100, "current": 1, "total": 1}),
+            json.dumps({"percent": 100, "current": 1, "total": 1, "memory": memory}),
             encoding="utf-8",
         )
     return 0

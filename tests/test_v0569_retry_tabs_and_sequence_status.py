@@ -28,13 +28,14 @@ def test_completed_watch_order_card_has_ready_status() -> None:
     assert "row.dataset.stateText||t('label.readyMovie')" in source
 
 
-def test_installer_force_reinstalls_bundled_wheel() -> None:
+def test_installer_replaces_runtime_with_bundled_wheel() -> None:
     installer = INSTALLER.read_text(encoding="utf-8")
 
-    assert '[[ -d "$PROJECT_DIR/.git" ]]' in installer
+    assert '[[ -e "$PROJECT_DIR/.git" ]]' in installer
     assert 'pip wheel "$PROJECT_DIR"' in installer
     assert 'WHEEL_CANDIDATES=("$PROJECT_DIR"/pudge-*.whl(N))' in installer
-    assert 'pip install --force-reinstall --no-deps "$WHEEL_PATH"' in installer
+    assert 'rm -rf "$INSTALL_SITE_PACKAGES/pudge" "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N)' in installer
+    assert 'pip install --no-cache-dir --no-deps "$WHEEL_PATH"' in installer
 
 
 def test_resolver_upgrade_retries_delayed_jobs_immediately_with_agent_enabled(

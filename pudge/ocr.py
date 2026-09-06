@@ -371,61 +371,62 @@ def _vision_recognize(image: Image.Image) -> str:
         raise OCRUnavailableError("Apple Vision OCR is available only on macOS")
     try:
         import Vision  # type: ignore
-        from Foundation import NSAutoreleasePool, NSURL  # type: ignore
+        import objc  # type: ignore
+        from Foundation import NSURL  # type: ignore
     except ImportError as exc:
         raise OCRUnavailableError("pyobjc-framework-Vision is not installed") from exc
 
     bbox = image.getbbox()
     if bbox is None:
         return ""
-    pool = NSAutoreleasePool.alloc().init()
     cropped: Image.Image | None = None
     resized: Image.Image | None = None
     background: Image.Image | None = None
     try:
-        cropped = image.crop(bbox)
-        scale = 2 if max(cropped.size) >= 900 else 3
-        resized = cropped.resize(
-            (cropped.width * scale, cropped.height * scale),
-            Image.Resampling.LANCZOS,
-        )
-        background = Image.new("RGB", resized.size, "black")
-        background.paste(resized, mask=resized.getchannel("A"))
-
-        with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ocr-") as temp_dir:
-            image_path = Path(temp_dir) / "subtitle.png"
-            background.save(image_path)
-            request = Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-            request.setRecognitionLanguages_(["ja-JP"])
-            request.setUsesLanguageCorrection_(True)
-            handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
-                NSURL.fileURLWithPath_(str(image_path)), None
+        with objc.autorelease_pool():
+            cropped = image.crop(bbox)
+            scale = 2 if max(cropped.size) >= 900 else 3
+            resized = cropped.resize(
+                (cropped.width * scale, cropped.height * scale),
+                Image.Resampling.LANCZOS,
             )
-            success, error = handler.performRequests_error_([request], None)
-            if not success:
-                raise OCRConversionError(str(error or "Vision request failed"))
-            rows: list[_VisionTextRow] = []
-            for observation in request.results() or []:
-                candidates = observation.topCandidates_(1)
-                if not candidates:
-                    continue
-                text = str(candidates[0].string()).strip()
-                if not text:
-                    continue
-                box = observation.boundingBox()
-                rows.append(
-                    _VisionTextRow(
-                        y=float(box.origin.y),
-                        x=float(box.origin.x),
-                        width=float(box.size.width),
-                        height=float(box.size.height),
-                        text=text,
-                    )
+            background = Image.new("RGB", resized.size, "black")
+            background.paste(resized, mask=resized.getchannel("A"))
+
+            with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-ocr-") as temp_dir:
+                image_path = Path(temp_dir) / "subtitle.png"
+                background.save(image_path)
+                request = Vision.VNRecognizeTextRequest.alloc().init()
+                request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+                request.setRecognitionLanguages_(["ja-JP"])
+                request.setUsesLanguageCorrection_(True)
+                handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                    NSURL.fileURLWithPath_(str(image_path)), None
                 )
-            rows = _filter_probable_furigana_rows(rows)
-            rows.sort(key=lambda item: (-item.y, item.x))
-            return "\n".join(item.text for item in rows).strip()
+                success, error = handler.performRequests_error_([request], None)
+                if not success:
+                    raise OCRConversionError(str(error or "Vision request failed"))
+                rows: list[_VisionTextRow] = []
+                for observation in request.results() or []:
+                    candidates = observation.topCandidates_(1)
+                    if not candidates:
+                        continue
+                    text = str(candidates[0].string()).strip()
+                    if not text:
+                        continue
+                    box = observation.boundingBox()
+                    rows.append(
+                        _VisionTextRow(
+                            y=float(box.origin.y),
+                            x=float(box.origin.x),
+                            width=float(box.size.width),
+                            height=float(box.size.height),
+                            text=text,
+                        )
+                    )
+                rows = _filter_probable_furigana_rows(rows)
+                rows.sort(key=lambda item: (-item.y, item.x))
+                return "\n".join(item.text for item in rows).strip()
     finally:
         if background is not None:
             background.close()
@@ -433,7 +434,6 @@ def _vision_recognize(image: Image.Image) -> str:
             resized.close()
         if cropped is not None:
             cropped.close()
-        pool.drain()
 
 
 def _normalize_ocr_text(value: str) -> str:

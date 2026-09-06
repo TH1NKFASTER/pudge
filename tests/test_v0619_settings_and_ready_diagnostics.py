@@ -23,6 +23,9 @@ def test_settings_nav_can_recover_missing_content() -> None:
 def test_why_not_ready_is_hidden_and_guarded_for_ready_anime() -> None:
     html = web_html()
     assert "function needsReadinessDiagnosis(anime)" in html
-    assert "if(state==='ready'||state==='watched')return false" in html
+    assert "const ocrOnly=state==='ready'" in html
+    assert "if(ocrOnly)return true" in html
+    assert "if(state==='watched')return false" in html
+    assert "if(state==='ready'&&!ocrOnly)return false" in html
     assert "const diagnose=!planned&&!suppressDiagnosis&&needsReadinessDiagnosis(a)?" in html
     assert "if(action==='diagnose'){if(!a.readinessDiagnosisSuppressed&&needsReadinessDiagnosis(a))" in html

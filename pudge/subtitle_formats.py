@@ -469,16 +469,19 @@ def _separate_touching_cues(
     minimum_trimmed_duration: float = _MIN_TRIMMED_CUE_DURATION_SECONDS,
     minimum_start: float = _MIN_SUBTITLE_START_SECONDS,
     preserve_order: bool = False,
+    preserve_overlaps: bool = False,
 ) -> list[tuple[float, float, str]]:
-    """Make playback SRT strictly non-overlapping and safe for mpv.
+    """Normalize cue timing while keeping intentional simultaneous dialogue.
 
     By default cues are sorted for malformed third-party files. Piecewise
     retiming passes ``preserve_order=True``: dialogue order is then sacred and
     must never be changed merely to make timestamps look chronological.
 
-    Every emitted cue starts after zero and lasts at least 300 ms. When two
-    cues collide, trim the previous cue only if it stays readable; otherwise
-    delay and, if necessary, extend the current cue.
+    Playback/alignment writers may pass ``preserve_overlaps=True`` so genuine
+    overlaps remain simultaneous. Exact/near-exact hand-offs are still separated
+    by the small safety gap to prevent a previous line lingering for one frame.
+
+    Every emitted cue starts after zero and lasts at least 300 ms.
     """
     ordered = list(cues) if preserve_order else sorted(cues, key=lambda cue: (cue[0], cue[1]))
     separated: list[list[float | str]] = []
@@ -490,8 +493,18 @@ def _separate_touching_cues(
         if separated:
             previous_start = float(separated[-1][0])
             previous_end = float(separated[-1][1])
+            # Default writers sort cues by source start. If collision handling
+            # moved the previous cue forward, never let a later sorted cue
+            # fall back behind it: that would serialize non-monotonic SRT
+            # starts even though the input starts were monotonic. Preserve-order
+            # retiming is exempt because caller order is intentionally sacred.
+            if not preserve_order and start < previous_start:
+                shift = previous_start - start
+                start = previous_start
+                end = max(end + shift, start + minimum_trimmed_duration)
             gap = start - previous_end
-            if gap < minimum_gap:
+            genuine_overlap = gap < -0.001
+            if gap < minimum_gap and not (preserve_overlaps and genuine_overlap):
                 adjusted_previous_end = start - minimum_gap
                 if adjusted_previous_end - previous_start >= minimum_trimmed_duration:
                     separated[-1][1] = adjusted_previous_end
@@ -511,10 +524,13 @@ def write_srt(
     path: Path,
     *,
     preserve_order: bool = False,
+    preserve_overlaps: bool = True,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     blocks: list[str] = []
-    normalized = _separate_touching_cues(cues, preserve_order=preserve_order)
+    normalized = _separate_touching_cues(
+        cues, preserve_order=preserve_order, preserve_overlaps=preserve_overlaps
+    )
     for index, (start, end, text) in enumerate(normalized, start=1):
         payload = plain_subtitle_text(text)
         if not payload or end <= start:
@@ -541,17 +557,17 @@ def clean_srt_for_playback(
     output_dir = (cache_dir / "playback-srt").expanduser()
     try:
         subtitle.resolve().relative_to(output_dir.resolve())
-        if subtitle.name.startswith("v14-"):
+        if subtitle.name.startswith("v15-"):
             return subtitle, {"reason": "already_clean", "cleaned": False}
     except ValueError:
         pass
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v14".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v15".encode()
     ).hexdigest()[:20]
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v14-{digest}.srt"
+    output = output_dir / f"v15-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
@@ -570,7 +586,7 @@ def clean_srt_for_playback(
         for previous, current in zip(cues, cues[1:])
         if current[0] - previous[1] < _MIN_PLAYBACK_CUE_GAP_SECONDS
     )
-    write_srt(cues, output)
+    write_srt(cues, output, preserve_overlaps=True)
     return output, {
         "reason": "cleaned",
         "cleaned": True,
@@ -581,6 +597,62 @@ def clean_srt_for_playback(
         "bilingual_removed": int(bilingual_profile.get("removed_han_only_cues") or 0),
         "bilingual_profile": bilingual_profile,
     }
+
+
+def subtitle_has_genuine_overlaps(
+    subtitle: Path,
+    *,
+    minimum_overlap_seconds: float = 0.050,
+) -> bool:
+    """Return whether a text subtitle intentionally has simultaneous cues."""
+    suffix = subtitle.suffix.casefold()
+    cues: list[tuple[float, float, str]] = []
+    try:
+        if suffix == ".srt":
+            cues = parse_srt(subtitle)
+        elif suffix in {".ass", ".ssa"}:
+            text = subtitle.read_text(encoding="utf-8-sig", errors="replace")
+            fields: list[str] = []
+            in_events = False
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    in_events = line.casefold() == "[events]"
+                    continue
+                if not in_events:
+                    continue
+                if line.casefold().startswith("format:"):
+                    fields = [part.strip().casefold() for part in line.split(":", 1)[1].split(",")]
+                    continue
+                if not line.casefold().startswith("dialogue:") or not fields:
+                    continue
+                parts = line.split(":", 1)[1].lstrip().split(",", len(fields) - 1)
+                if len(parts) != len(fields):
+                    continue
+                row = dict(zip(fields, parts))
+                try:
+                    start = _timestamp_to_seconds(row.get("start", ""))
+                    end = _timestamp_to_seconds(row.get("end", ""))
+                except ValueError:
+                    continue
+                payload = plain_subtitle_text(row.get("text", ""))
+                if payload and end > start:
+                    cues.append((start, end, payload))
+        else:
+            return False
+    except OSError:
+        return False
+
+    if len(cues) < 2:
+        return False
+    ordered = sorted(cues, key=lambda cue: (cue[0], cue[1]))
+    furthest_end = ordered[0][1]
+    threshold = max(0.001, float(minimum_overlap_seconds))
+    for start, end, _text in ordered[1:]:
+        if start < furthest_end - threshold:
+            return True
+        furthest_end = max(furthest_end, end)
+    return False
 
 
 def _manual_ass_to_srt(source: Path, output: Path) -> bool:
@@ -622,7 +694,7 @@ def _manual_ass_to_srt(source: Path, output: Path) -> bool:
     if not cues:
         return False
     cues, _parallel_merged = _merge_parallel_cues(cues)
-    write_srt(cues, output)
+    write_srt(cues, output, preserve_overlaps=True)
     return True
 
 
@@ -643,11 +715,11 @@ def convert_to_plain_srt(
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v6".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v7".encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "converted"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v14-{digest}.srt"
+    output = output_dir / f"v15-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:
@@ -694,7 +766,7 @@ def convert_to_plain_srt(
                         output.unlink(missing_ok=True)
                     else:
                         cues, parallel_merged = _merge_parallel_cues(cues)
-                        write_srt(cues, output)
+                        write_srt(cues, output, preserve_overlaps=True)
                         return output, {
                             "reason": "converted",
                             "converted": True,

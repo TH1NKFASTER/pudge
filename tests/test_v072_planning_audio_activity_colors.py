@@ -90,4 +90,4 @@ def test_planning_primary_download_and_visible_ln_color_contracts() -> None:
     assert 'input[type="color"]::-webkit-color-swatch' in html
     assert "anchor.activity" in html
     assert '"schema": "reading-audio-v3"' in alignment
-    assert "reading-audio-v3-punctuation-clock-v2" in audiobooks
+    assert "reading-audio-v3-leading-prefix-v18" in audiobooks

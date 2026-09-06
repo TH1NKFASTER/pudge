@@ -19,6 +19,20 @@
   let audioBookmarkDragFrame = 0;
   let audioBookmarkSuppressClickUntil = 0;
   const audioBookmarkUndo = [];
+  const audioSelection = new Set();
+  const emitAudioSelection = () => window.dispatchEvent(new CustomEvent('pudge-audiobook-selection-changed'));
+  const audioSeriesBooks = key => {
+    const wanted=String(key||'').trim();
+    return (audioState.books||[]).filter(book=>String(book.series_key||'').trim()===wanted);
+  };
+  const toggleAudioSeriesSelection = books => {
+    const ids=(books||[]).map(book=>Number(book.id)).filter(Number.isFinite);
+    if(!ids.length)return;
+    const allSelected=ids.every(id=>audioSelection.has(id));
+    for(const id of ids){if(allSelected)audioSelection.delete(id);else audioSelection.add(id);}
+    renderAudio();
+    emitAudioSelection();
+  };
 
   const savedAudioSpeed = bookId => {
     const key=`pudge.audiobook.speed.${Number(bookId)}`;
@@ -73,7 +87,7 @@
     rememberDeletedAudioBookmark(found);
     try{
       const result=await pywebview.api.audiobook_delete_bookmark(Number(bookmarkId));
-      audioState=result.state||await pywebview.api.audiobook_state();
+      applyAudioActionResult(result);
       renderAudio();
       window.toast?.(ru()?'Закладка удалена · ⌘Z — вернуть':'Bookmark deleted · ⌘Z to undo');
     }catch(error){
@@ -93,7 +107,7 @@
         Number(mark.created_at||0),
         Number(mark.id||0)
       );
-      audioState=result.state||await pywebview.api.audiobook_state();
+      applyAudioActionResult(result);
       renderAudio();
       window.toast?.(ru()?'Закладка восстановлена':'Bookmark restored');
       return true;
@@ -105,10 +119,22 @@
   const audioPreparation = transcription => {
     const status=String(transcription?.status||'');
     if (!status || transcription?.ready) return '';
+    if (status==='idle') return `<div class="audiobook-preparation idle"><div><strong>${ru()?'Разбор аудио ещё не запущен':'Audio analysis has not started yet'}</strong></div></div>`;
     if (status==='error') return `<div class="audiobook-preparation danger">${ru()?'Разбор аудио завершился ошибкой':'Audio analysis failed'}${transcription.error?`: ${esc(transcription.error)}`:''}</div>`;
+    if (status==='cancelled') return `<div class="audiobook-preparation idle"><div><strong>${ru()?'Разбор аудио отменён':'Audio analysis cancelled'}</strong></div></div>`;
     const percent=Math.max(0,Math.min(100,Math.round(Number(transcription.progress_percent||0))));
-    const label=status==='queued'?(ru()?'Разбор аудио ожидает запуска':'Audio analysis is queued'):(ru()?'Разбор аудио':'Audio analysis');
-    return `<div class="audiobook-preparation"><div><strong>${label}</strong><span>${percent}%</span></div><progress max="100" value="${percent}"></progress></div>`;
+    if(status==='queued'){
+      const waitReason=String(transcription.wait_reason||'');
+      let queue='';
+      if(waitReason==='foreground') queue=ru()?'ждёт окончания воспроизведения':'waiting for playback to finish';
+      else if(waitReason==='heavy_work') queue=ru()?'ждёт освобождения аудио-обработки':'waiting for audio worker';
+      else {
+        const pos=Math.max(0,Number(transcription.queue_position||0)),size=Math.max(pos,Number(transcription.queue_size||0));
+        queue=pos?(ru()?`в очереди ${pos}${size?` из ${size}`:''}`:`queue ${pos}${size?` of ${size}`:''}`):(ru()?'в очереди':'queued');
+      }
+      return `<div class="audiobook-preparation queued"><div><strong>${ru()?'Разбор аудио':'Audio analysis'}</strong><span>${queue}</span></div></div>`;
+    }
+    return `<div class="audiobook-preparation"><div><strong>${ru()?'Разбор аудио':'Audio analysis'}</strong><span>${percent}%</span></div><progress max="100" value="${percent}"></progress></div>`;
   };
   const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
@@ -120,18 +146,64 @@
         .map(node=>Number(node.dataset.bookId))
         .filter(Number.isFinite)
     );
+    const seriesScrollPositions=new Map(
+      [...root.querySelectorAll('.audiobook-series-scroll[data-series-key]')]
+        .map(node=>[String(node.dataset.seriesKey||''),Number(node.scrollTop||0)])
+    );
     const books = audioState.books || [];
-    const fileBusy=audioImportBusy==='file';
-    root.innerHTML = `<button id="audiobookImport" hidden ${audioImportBusy?'disabled':''}>Import</button>${audioImportBusy?`<div class="audiobook-import-status"><span class="audiobook-pulse"></span>${ru()?'Читаю метаданные аудиокниги…':'Reading audiobook metadata…'}</div>`:''}<div class="audiobook-list">${books.map(book => {
+    const validIds=new Set(books.map(book=>Number(book.id)));
+    [...audioSelection].forEach(id=>{if(!validIds.has(Number(id)))audioSelection.delete(id);});
+    const selectedCount=audioSelection.size;
+    const seriesCounts=new Map();
+    for(const book of books){const key=String(book.series_key||'').trim();if(key)seriesCounts.set(key,(seriesCounts.get(key)||0)+1);}
+    const seriesOrder=new Map();let seriesOrderNext=0;
+    for(const book of books){const key=String(book.series_key||'').trim();if(!seriesOrder.has(key))seriesOrder.set(key,seriesOrderNext++);}
+    const booksForRender=[...books].sort((a,b)=>{
+      const ak=String(a.series_key||''),bk=String(b.series_key||'');
+      const ao=seriesOrder.get(ak)??999999,bo=seriesOrder.get(bk)??999999;if(ao!==bo)return ao-bo;
+      const av=Number(a.volume||0),bv=Number(b.volume||0);
+      if(av>0||bv>0)return (av>0?av:Number.MAX_SAFE_INTEGER)-(bv>0?bv:Number.MAX_SAFE_INTEGER);
+      return String(a.title||'').localeCompare(String(b.title||''),undefined,{numeric:true,sensitivity:'base'});
+    });
+    const renderBookCard=(book,grouped=false)=>{
       const pct=book.duration?Math.min(100,book.position/book.duration*100):0;
       const remaining=Math.max(0,Number(book.duration||0)-Number(book.position||0));
       const speed=Number(book.speed??audioSpeed(book.id));
       const play=book.playing?`<button class="primary" data-media-action="stop-audio" data-id="${book.id}">${ru()?'Стоп':'Stop'}</button>`:`<button class="primary" data-media-action="play-audio" data-id="${book.id}">${book.position>1?(ru()?'Продолжить':'Resume'):(ru()?'Слушать':'Play')}</button>`;
       const speeds=[0.75,1,1.25,1.5,1.75,2,2.5,3].map(value=>`<option value="${value}" ${value===speed?'selected':''}>${value}×</option>`).join('');
       const bookmarks=(book.bookmarks||[]).map(mark=>{const created=formatBookmarkDate(mark.created_at),tooltip=created?(ru()?`Создано: ${created}`:`Created: ${created}`):'';return `<div class="audiobook-bookmark" role="button" tabindex="0" data-media-action="seek-audio-to" data-id="${book.id}" data-book-id="${book.id}" data-bookmark-id="${Number(mark.id)}" data-position="${Number(mark.position||0)}" ${tooltip?`data-tooltip="${esc(tooltip)}" aria-label="${esc(tooltip)}"`:''}><span class="audiobook-bookmark-label">${esc(mark.title||formatAudioTime(mark.position))}</span><button class="audiobook-bookmark-delete" type="button" data-media-action="delete-audio-bookmark" data-bookmark-id="${Number(mark.id)}" aria-label="${ru()?'Удалить закладку':'Delete bookmark'}">×</button></div>`;}).join('');
-      return `<article class="audiobook-card ${book.playing?'playing':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong>${esc(book.title)}</strong>${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span>${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"><span class="audiobook-chapter-hover" aria-hidden="true"></span></div></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">+15s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`
-    }).join('')}</div>${books.length?'':`<div class="empty">${ru()?'Поддерживаются отдельные аудиофайлы и папки, где каждый файл — отдельная глава.':'Single audio files and folders where each file is a chapter are supported.'}</div>`}`;
-    [...root.querySelectorAll('.audiobook-controls')].forEach((controls,index)=>{const book=books[index];if(!book)return;const card=controls.closest('.audiobook-card'),before=controls.querySelector('.danger-action');if(book.cover_url&&card){card.classList.add('has-cover');const cover=document.createElement(book.anilist_id?'button':'div');cover.className='audiobook-cover';cover.dataset.audioCoverId=String(book.id);if(book.anilist_id){cover.dataset.mediaAction='open-audio-cover';cover.dataset.url=String(book.anilist_site_url||`https://anilist.co/manga/${book.anilist_id}`);cover.title='AniList';}cover.innerHTML=`<img src="${esc(book.cover_url)}" alt="">`;card.prepend(cover);}const identity=document.createElement('button');identity.dataset.mediaAction='identify-audio';identity.dataset.id=String(book.id);identity.dataset.title=String(book.title||'');identity.textContent=book.anilist_id?(ru()?'Изменить AniList':'Change AniList'):'AniList';controls.insertBefore(identity,before);if(!book.linked_light_novel){const search=document.createElement('button');search.dataset.mediaAction='find-audio-ln';search.dataset.id=String(book.id);search.textContent=ru()?'Найти LN на Nyaa':'Find LN on Nyaa';controls.insertBefore(search,before);}});
+      const selected=audioSelection.has(Number(book.id));
+      const volume=Number(book.volume||0);
+      const displayTitle=grouped&&volume>0?(ru()?`Том ${volume}`:`Volume ${volume}`):String(book.title||'');
+      return `<article class="audiobook-card ${book.playing?'playing':''} ${selected?'selected':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong title="${esc(String(book.title||''))}">${esc(displayTitle)}</strong>${book.metadata_pending?`<span class="audiobook-metadata-pending">${ru()?'Метаданные…':'Metadata…'}</span>`:''}${book.tts_generated?`<span class="audiobook-tts-badge" title="${ru()?'Создано TTS':'TTS-generated'}" aria-label="${ru()?'Создано TTS':'TTS-generated'}">🤖</span>`:''}${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span>${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"><span class="audiobook-chapter-hover" aria-hidden="true"></span></div></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">+15s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`;
+    };
+    const groups=[];
+    for(const book of booksForRender){
+      const seriesKey=String(book.series_key||'').trim(),grouped=Boolean(seriesKey&&(seriesCounts.get(seriesKey)||0)>1);
+      const groupKey=grouped?`series:${seriesKey}`:`book:${Number(book.id)}`;
+      let group=groups[groups.length-1];
+      if(!group||group.key!==groupKey){group={key:groupKey,seriesKey,grouped,books:[]};groups.push(group);}
+      group.books.push(book);
+    }
+    const libraryHtml=groups.map(group=>{
+      if(!group.grouped)return group.books.map(book=>renderBookCard(book,false)).join('');
+      const first=group.books[0],unfinished=group.books.find(book=>!book.finished),fallback=group.books[Math.max(0,group.books.length-2)],target=unfinished||fallback;
+      const unread=group.books.filter(book=>!book.finished).length;
+      const title=String(first?.series_title||first?.title||'Audiobook');
+      const meta=unread?(ru()?`${unread} не завершено`:`${unread} unfinished`):(ru()?'Все завершены':'All finished');
+      const ids=group.books.map(book=>Number(book.id)).filter(Number.isFinite);
+      const selectedInSeries=ids.filter(id=>audioSelection.has(id)).length;
+      const selectionClass=ids.length&&selectedInSeries===ids.length?'series-selected':selectedInSeries?'series-partial':'';
+      return `<section class="audiobook-series-card ${selectionClass}" data-audiobook-series="${esc(group.seriesKey)}"><div class="audiobook-series-card-head"><div><strong>${esc(title)}</strong><span>${group.books.length} ${ru()?'томов':'volumes'}</span></div><span>${esc(meta)}</span></div><div class="audiobook-series-scroll" data-series-key="${esc(group.seriesKey)}" data-first-unfinished-id="${Number(target?.id||0)}">${group.books.map(book=>renderBookCard(book,true)).join('')}</div></section>`;
+    }).join('');
+    root.innerHTML = `<button id="audiobookImport" hidden ${audioImportBusy?'disabled':''}>Import</button>${audioImportBusy?`<div class="audiobook-import-status"><span class="audiobook-pulse"></span>${ru()?'Читаю метаданные аудиокниги…':'Reading audiobook metadata…'}</div>`:''}<div class="audiobook-list">${libraryHtml}</div>${books.length?'':`<div class="empty">${ru()?'Поддерживаются отдельные аудиофайлы и папки, где каждый файл — отдельная глава.':'Single audio files and folders where each file is a chapter are supported.'}</div>`}`;
+    [...root.querySelectorAll('.audiobook-controls')].forEach(controls=>{const card=controls.closest('.audiobook-card');const book=audiobookById(Number(card?.dataset.audiobookId));if(!book)return;const before=controls.querySelector('.danger-action');if(book.cover_url&&card){card.classList.add('has-cover');const cover=document.createElement(book.anilist_id?'button':'div');cover.className='audiobook-cover';cover.dataset.audioCoverId=String(book.id);if(book.anilist_id){cover.dataset.mediaAction='open-audio-cover';cover.dataset.url=String(book.anilist_site_url||`https://anilist.co/manga/${book.anilist_id}`);cover.title='AniList';}cover.innerHTML=`<img src="${esc(book.cover_url)}" alt="">`;card.prepend(cover);}const identity=document.createElement('button');identity.dataset.mediaAction='identify-audio';identity.dataset.id=String(book.id);identity.dataset.title=String(book.title||'');identity.textContent=book.anilist_id?(ru()?'Изменить AniList':'Change AniList'):'AniList';controls.insertBefore(identity,before);});
+    [...root.querySelectorAll('.audiobook-series-scroll[data-series-key]')].forEach(node=>{
+      const key=String(node.dataset.seriesKey||'');
+      if(seriesScrollPositions.has(key)){node.scrollTop=Number(seriesScrollPositions.get(key)||0);return;}
+      const targetId=Number(node.dataset.firstUnfinishedId||0),target=targetId?node.querySelector(`[data-audiobook-id="${targetId}"]`):null;
+      if(target)node.scrollTop=Math.max(0,target.offsetTop-node.offsetTop-4);
+    });
   };
 
   const loadManga = async () => {
@@ -151,14 +223,40 @@
     if (audioPollTimer) clearTimeout(audioPollTimer);
     const active=document.querySelector('.nav button[data-page="audiobooks"]')?.classList.contains('active');
     const playing=(audioState.books||[]).some(book=>book.playing);
-    const busy=(audioState.books||[]).some(book=>book.playing||['queued','transcribing'].includes(String(book.transcription?.status||'')));
+    const transcribing=(audioState.books||[]).some(book=>String(book.transcription?.status||'')==='transcribing');
+    const covers=(audioState.books||[]).some(book=>book.cover_pending);
+    const queued=(audioState.books||[]).some(book=>String(book.transcription?.status||'')==='queued');
+    const busy=playing||transcribing||covers||queued;
     if (active && busy) {
-      audioPollTimer=setTimeout(()=>void loadAudio(),playing?750:1200);
+      // A 200-book queued library used to rebuild the whole Audiobooks page
+      // every 1.2 s forever. Poll active work quickly, but a passive queue only
+      // needs occasional position updates.
+      const delay=playing?750:transcribing?1400:covers?2200:5000;
+      audioPollTimer=setTimeout(()=>void loadAudio(),delay);
     }
   };
 
   const audiobookById = id =>
     (audioState.books||[]).find(book=>Number(book.id)===Number(id))||null;
+
+  const applyAudioActionResult = result => {
+    if(result?.state?.books){audioState=result.state;return;}
+    if(result?.book){
+      const id=Number(result.book.id),books=audioState.books||[];
+      const index=books.findIndex(book=>Number(book.id)===id);
+      if(index>=0)books[index]={...books[index],...result.book};
+      else books.unshift(result.book);
+    }
+    if(Array.isArray(result?.removed)&&result.removed.length){
+      const removed=new Set(result.removed.map(Number));
+      audioState.books=(audioState.books||[]).filter(book=>!removed.has(Number(book.id)));
+      removed.forEach(id=>audioSelection.delete(id));
+    }else if(result?.book_id&&result?.files_kept!==undefined){
+      const id=Number(result.book_id);
+      audioState.books=(audioState.books||[]).filter(book=>Number(book.id)!==id);
+      audioSelection.delete(id);
+    }
+  };
 
   const optimisticAudioPlaying = (id, playing) => {
     activeAudioBookId=Number(id);
@@ -193,7 +291,7 @@
     optimisticAudioPlaying(id,false);
     try{
       const result=await pywebview.api.audiobook_stop(id);
-      audioState=result.state||await pywebview.api.audiobook_state();
+      applyAudioActionResult(result);
       renderAudio();
       if(notify)window.toast?.(
         ru()?'Остановлено; позиция сохранена':'Stopped; position saved'
@@ -209,7 +307,7 @@
     id=Number(id);
     activeAudioBookId=id;
     const result=await pywebview.api.audiobook_seek(id,Number(seconds||0));
-    audioState=result.state||await pywebview.api.audiobook_state();
+    applyAudioActionResult(result);
     renderAudio();
   };
 
@@ -314,7 +412,7 @@
     const play=book.playing?(ru()?'Стоп':'Stop'):(book.position>1?(ru()?'Продолжить':'Resume'):(ru()?'Слушать':'Play'));
     const anilist=book.anilist_id?`<button data-audio-context-action="open-anilist">${ru()?'Открыть AniList':'Open AniList'}</button>`:'';
     const identify=`<button data-audio-context-action="identify">${book.anilist_id?(ru()?'Изменить AniList':'Change AniList'):(ru()?'Найти в AniList':'Find on AniList')}</button>`;
-    const findLn=!book.linked_light_novel?`<button data-audio-context-action="find-ln">${ru()?'Найти LN на Nyaa':'Find LN on Nyaa'}</button>`:'';
+    const findLn='';
     menu.innerHTML=`<button data-audio-context-action="play">${play}</button>${anilist}${identify}${findLn}<button data-audio-context-action="reveal">${ru()?'Показать в Finder':'Show in Finder'}</button><button class="danger-action" data-audio-context-action="delete">${ru()?'Удалить из Pudge':'Remove from Pudge'}</button>`;
     positionAudioContextMenu(menu,x,y);
   };
@@ -349,6 +447,38 @@
     if(cover){const book=audiobookById(Number(cover.dataset.audioCoverId));if(!book)return;event.preventDefault();event.stopImmediatePropagation();showAudioCoverContextMenu(book,event.clientX,event.clientY);}
   },true);
 
+  // v206: the large series card is a primary select-all surface, matching
+  // light-novel/manga series groups. Inner volume cards keep the existing
+  // Cmd+click / active-selection behavior so their playback controls stay safe.
+  document.addEventListener('click',event=>{
+    const series=event.target.closest?.('#audiobooksContent .audiobook-series-card[data-audiobook-series]');
+    if(!series)return;
+    if(event.target.closest?.('.audiobook-card[data-audiobook-id]'))return;
+    if(event.target.closest?.('button,a,input,select,textarea,label,details,summary,[data-media-action]'))return;
+    const books=audioSeriesBooks(series.dataset.audiobookSeries);
+    if(!books.length)return;
+    event.preventDefault();event.stopImmediatePropagation();
+    toggleAudioSeriesSelection(books);
+  },true);
+
+  // v207: an audiobook volume card is itself a selection control. Clicking
+  // any non-interactive part toggles that one volume, even before a broader
+  // selection exists. Real controls and cover art keep their own actions.
+  const audioSelectionSurface=(target,card)=>{
+    if(!card)return false;
+    if(target.closest?.('.audiobook-cover'))return false;
+    if(target.closest?.('button,a,input,select,textarea,label,details,summary,[data-media-action],.audiobook-bookmarks,.audiobook-scrubber-shell'))return false;
+    return true;
+  };
+  document.addEventListener('click',event=>{
+    const card=event.target.closest?.('#audiobooksContent .audiobook-card[data-audiobook-id]');
+    if(!card||!audioSelectionSurface(event.target,card))return;
+    event.preventDefault();event.stopImmediatePropagation();
+    const id=Number(card.dataset.audiobookId);if(!Number.isFinite(id))return;
+    if(audioSelection.has(id))audioSelection.delete(id);else audioSelection.add(id);
+    renderAudio();emitAudioSelection();
+  },true);
+
   document.addEventListener('click', async event => {
     const contextAction=event.target.closest?.('[data-audio-context-action]');
     if(contextAction){
@@ -361,7 +491,7 @@
       if(type==='identify'&&book){await window.showMediaIdentity?.('audiobook',Number(book.id),book.title||'');return;}
       if(type==='find-ln'&&book){await showAudioLnSearch(Number(book.id));return;}
       if(type==='reveal'&&book){await pywebview.api.audiobook_reveal_source(Number(book.id));return;}
-      if(type==='delete'&&book){if(!await pudgeConfirm(ru()?'Удалить аудиокнигу из Pudge? Исходные файлы останутся на диске.':'Remove this audiobook from Pudge? Source files will stay on disk.',{danger:true}))return;const result=await pywebview.api.audiobook_delete(Number(book.id));audioState=result.state||{books:[]};counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();return;}
+      if(type==='delete'&&book){if(!await pudgeConfirm(ru()?'Удалить аудиокнигу из Pudge? Исходные файлы останутся на диске.':'Remove this audiobook from Pudge? Source files will stay on disk.',{danger:true}))return;const result=await pywebview.api.audiobook_delete(Number(book.id));applyAudioActionResult(result);counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();return;}
       if(type==='rename-bookmark'&&bookmarkId!=null){showAudioBookmarkRename(bookmarkId);return;}
       if(type==='delete-bookmark'&&bookmarkId!=null){await deleteAudioBookmark(Number(bookmarkId));return;}
     }
@@ -433,27 +563,27 @@
       await seekAudiobook(Number(action.dataset.id),Number(action.dataset.seconds||0));
     }
     if (type === 'seek-audio-to') {
-      const result=await pywebview.api.audiobook_seek_to(Number(action.dataset.id),Number(action.dataset.position||0));audioState=result.state||await pywebview.api.audiobook_state();renderAudio();
+      const result=await pywebview.api.audiobook_seek_to(Number(action.dataset.id),Number(action.dataset.position||0));applyAudioActionResult(result);renderAudio();
     }
     if (type === 'bookmark-audio') {
-      const result=await pywebview.api.audiobook_add_bookmark(Number(action.dataset.id),'');audioState=result.state||await pywebview.api.audiobook_state();renderAudio();
+      const result=await pywebview.api.audiobook_add_bookmark(Number(action.dataset.id),'');applyAudioActionResult(result);renderAudio();
     }
     if (type === 'delete-audio-bookmark') {
       await deleteAudioBookmark(Number(action.dataset.bookmarkId));
     }
     if (type === 'save-audio-bookmark-name') {
       const title=String($('audioBookmarkRenameInput')?.value||'').trim();
-      const result=await pywebview.api.audiobook_rename_bookmark(Number(action.dataset.bookmarkId),title);audioState=result.state||await pywebview.api.audiobook_state();$('modalBackdrop')?.classList.remove('open');renderAudio();
+      const result=await pywebview.api.audiobook_rename_bookmark(Number(action.dataset.bookmarkId),title);applyAudioActionResult(result);$('modalBackdrop')?.classList.remove('open');renderAudio();
     }
     if (type === 'finish-audio') {
-      const result=await pywebview.api.audiobook_mark_finished(Number(action.dataset.id),action.dataset.finished==='1');audioState=result.state||await pywebview.api.audiobook_state();renderAudio();
+      const result=await pywebview.api.audiobook_mark_finished(Number(action.dataset.id),action.dataset.finished==='1');applyAudioActionResult(result);renderAudio();
     }
     if (type === 'stop-audio') {
       await stopAudiobook(Number(action.dataset.id));
     }
     if (type === 'delete-audio') {
       if(!await pudgeConfirm(ru()?'Удалить аудиокнигу из Pudge? Исходные файлы останутся на диске.':'Remove this audiobook from Pudge? Source files will stay on disk.'))return;
-      const result=await pywebview.api.audiobook_delete(Number(action.dataset.id));audioState=result.state||{books:[]};counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();
+      const result=await pywebview.api.audiobook_delete(Number(action.dataset.id));applyAudioActionResult(result);counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();
     }
   });
   const showAudioChapterHover = chapter => {
@@ -491,7 +621,7 @@
       .map(node=>Number(node.dataset.bookmarkId));
     try{
       const result=await pywebview.api.audiobook_reorder_bookmarks(Number(drag.bookId),ids);
-      audioState=result.state||await pywebview.api.audiobook_state();
+      applyAudioActionResult(result);
     }catch(error){
       window.toast?.(error?.message||String(error));
       await loadAudio();
@@ -557,14 +687,14 @@
 
   document.addEventListener('change', async event => {
     const position=event.target.closest?.('[data-audio-position]');
-    if(position){const result=await pywebview.api.audiobook_seek_to(Number(position.dataset.id),Number(position.value||0));audioState=result.state||await pywebview.api.audiobook_state();renderAudio();return;}
+    if(position){const result=await pywebview.api.audiobook_seek_to(Number(position.dataset.id),Number(position.value||0));applyAudioActionResult(result);renderAudio();return;}
     const sleep=event.target.closest?.('[data-audio-sleep]');
-    if(sleep){const result=await pywebview.api.audiobook_sleep_timer(Number(sleep.dataset.id),sleep.value||'off');audioState=result.state||await pywebview.api.audiobook_state();renderAudio();return;}
+    if(sleep){const result=await pywebview.api.audiobook_sleep_timer(Number(sleep.dataset.id),sleep.value||'off');applyAudioActionResult(result);renderAudio();return;}
     const control=event.target.closest?.('[data-audio-speed]');
     if(!control)return;
     const id=Number(control.dataset.id),speed=Number(control.value||1);
     control.blur();
-    const result=await pywebview.api.audiobook_set_speed(id,speed);audioState=result.state||await pywebview.api.audiobook_state();renderAudio();
+    const result=await pywebview.api.audiobook_set_speed(id,speed);applyAudioActionResult(result);renderAudio();
   });
 
   document.addEventListener('keydown', event => {
@@ -661,6 +791,20 @@
       await pywebview.api.reveal_manga_ocr_install_log();
     }
   });
+
+  window.PudgeAudiobookSelection={
+    selectedBookIds:()=>[...audioSelection],
+    selectAll:()=>{(audioState.books||[]).forEach(book=>audioSelection.add(Number(book.id)));renderAudio();emitAudioSelection();},
+    clearSelection:()=>{if(!audioSelection.size)return;audioSelection.clear();renderAudio();emitAudioSelection();},
+    deleteSelected:async()=>{
+      const ids=[...audioSelection];if(!ids.length)return;
+      const removed=new Set(ids.map(Number));
+      audioState={...audioState,books:(audioState.books||[]).filter(book=>!removed.has(Number(book.id)))};
+      audioSelection.clear();counts.audiobooks=(audioState.books||[]).length;renderAudio();emitAudioSelection();window.updateCount?.();
+      try{const result=await pywebview.api.audiobook_delete_many(ids);if(result?.errors?.length)throw new Error(result.errors.map(row=>row.error||row).join(' · '));}
+      catch(error){window.toast?.(error?.message||String(error));await loadAudio();}
+    }
+  };
 
   window.PudgeMedia = {counts, loadManga, loadAudio, refreshMangaOcrStatus, showMangaAniListSearch};
 })();

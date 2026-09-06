@@ -404,6 +404,45 @@ local function run_helper(action, extra, callback)
     return true
 end
 
+local function export_episode_debug()
+    if playback_video == '' then
+        mp.osd_message(tr(
+            'Debug export is unavailable for this file',
+            'Экспорт логов недоступен для этого файла'
+        ), 4)
+        return
+    end
+    mp.osd_message(tr('Exporting episode logs…', 'Собираю логи серии…'), 2)
+    local args = {
+        python, '-m', 'pudge.cli',
+        '--export-episode-debug',
+        '--playback-video', playback_video,
+    }
+    if config_path ~= '' then
+        table.insert(args, '--config')
+        table.insert(args, config_path)
+    end
+    mp.command_native_async({
+        name = 'subprocess',
+        args = args,
+        capture_stdout = true,
+        capture_stderr = true,
+        playback_only = false,
+    }, function(success, result)
+        local ok = success and result and result.status == 0
+        mp.osd_message(ok and tr(
+            'Episode logs exported; Finder opened',
+            'Логи серии сохранены; Finder открыт'
+        ) or tr(
+            'Could not export episode logs',
+            'Не удалось собрать логи серии'
+        ), 5)
+        if not ok and result and result.stderr and result.stderr ~= '' then
+            mp.msg.error(result.stderr)
+        end
+    end)
+end
+
 local function accumulate_active_time()
     local now = mp.get_time()
     if last_active_clock == nil then
@@ -640,3 +679,5 @@ end
 if shortcut_translate_subtitle ~= '' then
     add_reliable_binding(shortcut_translate_subtitle, 'pudge_subtitle_translate', translate_visible_subtitle)
 end
+
+add_reliable_binding('Meta+Shift+l', 'pudge_episode_debug_export', export_episode_debug)

@@ -12,13 +12,20 @@ python -m pip install --upgrade pip
 python -m pip install -e ".[dev,sync]"
 ```
 
-## UI copy
+## Product and UI copy
 
-Keep implementation details out of user-facing copy. Do not add explanatory text such as how cards are grouped, which metadata provider is preferred, cache behavior, internal pipelines, or other technical implementation notes unless the information helps the user make a decision or complete an action.
+Keep implementation details out of user-facing copy. Explain what an action
+does, when it runs, and what the user should expect. Internal cache names,
+scoring formulas, pipeline stage names, and retry machinery belong in source,
+tests, or diagnostics unless the detail helps the user make a decision.
 
 Use the same names that appear in the app. Prefer ordinary phrases such as
-"initial setup", "refresh", and "remove Pudge" over internal project labels.
-Documentation should explain an action or outcome before its implementation.
+"initial setup", "refresh", "repair subtitles", and "remove Pudge" over
+internal project labels.
+
+The same rule applies to documentation: write the shortest explanation that is
+still accurate. Developer-facing protocol and release documents may be more
+technical where precision is necessary.
 
 ## Tests
 
@@ -28,7 +35,7 @@ Run the complete suite:
 make test
 ```
 
-Run the complete suite in four deterministic batches:
+Or run the complete suite in deterministic batches:
 
 ```bash
 make test-batches
@@ -40,20 +47,26 @@ Run one batch manually:
 python scripts/run_test_batch.py --batch 0 --batches 4
 ```
 
-Every `tests/test_*.py` file belongs to exactly one batch.
+Every `tests/test_*.py` file belongs to exactly one batch. Behavior fixes should
+include a regression test for the user-visible failure, not only for the new
+implementation shape.
 
-## Lint
+## Lint and static checks
 
 ```bash
 make lint
+python -m compileall -q pudge scripts
 ```
+
+Changed JavaScript modules should also pass `node --check`.
 
 ## Build a release ZIP locally
 
 ```bash
-make release
+make build-release
 ```
 
 The resulting archive is written to `dist/pudge-macos-vX.Y.Z.zip`.
 
-Generated wheels, ZIPs, virtual environments, caches, logs and local config are ignored by git.
+Generated wheels, ZIPs, virtual environments, caches, logs and local config are
+ignored by git.

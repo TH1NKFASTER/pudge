@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -1362,19 +1363,19 @@ class Database:
                     release_episode=COALESCE(excluded.release_episode,episodes.release_episode),
                     subtitle_path=CASE
                         WHEN excluded.subtitle_path IS NOT NULL THEN excluded.subtitle_path
-                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles','couldnt_sync')
                         THEN episodes.subtitle_path
                         ELSE NULL
                     END,
                     embedded_subtitle_id=CASE
                         WHEN excluded.embedded_subtitle_id IS NOT NULL THEN excluded.embedded_subtitle_id
-                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles','couldnt_sync')
                         THEN episodes.embedded_subtitle_id
                         ELSE NULL
                     END,
                     subtitle_origin=CASE
                         WHEN excluded.subtitle_origin!='' THEN excluded.subtitle_origin
-                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles')
+                        WHEN episodes.state IN ('ready','watched','waiting_text_subtitles','couldnt_sync')
                         THEN episodes.subtitle_origin
                         ELSE ''
                     END,
@@ -1457,7 +1458,7 @@ class Database:
         return self._episode_from_row(row) if row else None
 
     def ready_episode(self, media_id: int, episode: int | None = None) -> LibraryEpisode | None:
-        sql = "SELECT * FROM episodes WHERE media_id=? AND state IN ('ready','local','watched','waiting_subtitles','waiting_text_subtitles')"
+        sql = "SELECT * FROM episodes WHERE media_id=? AND state IN ('ready','local','watched','waiting_subtitles','waiting_text_subtitles','couldnt_sync')"
         params: list[object] = [media_id]
         if episode is not None:
             sql += " AND COALESCE(media_episode,episode)=?"
@@ -1725,6 +1726,35 @@ class Database:
                 ),
             )
 
+    def set_couldnt_sync_subtitle(
+        self,
+        video_path: Path,
+        subtitle_path: Path,
+        *,
+        origin: str = "",
+    ) -> None:
+        """Retain a confident raw text candidate while background sync retries.
+
+        The path is intentionally the original provider/local candidate, not a
+        cleaned or partially aligned derivative.  This makes the explicit
+        "watch raw" action safe for manual mpv timing.
+        """
+        with self.connect() as conn:
+            resolved = self._transition_episode(
+                conn, video_path, "couldnt_sync", trigger="subtitle_sync_failed"
+            )
+            conn.execute(
+                "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=NULL,subtitle_origin=?,"
+                "state=?,updated_at=? WHERE video_path=?",
+                (
+                    str(subtitle_path),
+                    str(origin or "raw_unsynced"),
+                    resolved,
+                    time.time(),
+                    str(video_path),
+                ),
+            )
+
     def restore_ready_selection_for_upgrade(
         self,
         video_path: Path,
@@ -1874,6 +1904,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT e.video_path,e.state,e.subtitle_path,e.embedded_subtitle_id,
+                       e.media_id,e.episode,
                        EXISTS(SELECT 1 FROM subtitle_jobs j WHERE j.video_path=e.video_path) AS has_job
                 FROM episodes e
                 WHERE e.subtitle_path IS NOT NULL OR e.embedded_subtitle_id IS NOT NULL
@@ -1883,15 +1914,56 @@ class Database:
                 video_path = str(row["video_path"])
                 state = str(row["state"] or "local")
                 has_job = bool(row["has_job"])
-                invalid_state = state not in {"ready", "watched", "waiting_text_subtitles"}
-                invalid_job = has_job and state != "waiting_text_subtitles" and video_path not in preserve
-                if not (invalid_state or invalid_job):
+                invalid_state = state not in {"ready", "watched", "waiting_text_subtitles", "couldnt_sync"}
+                invalid_job = (
+                    has_job
+                    and state not in {"waiting_text_subtitles", "couldnt_sync"}
+                    and video_path not in preserve
+                )
+                missing_ready_external = False
+                subtitle_raw = str(row["subtitle_path"] or "").strip()
+                if state == "ready" and subtitle_raw and row["embedded_subtitle_id"] is None:
+                    try:
+                        subtitle_file = Path(subtitle_raw)
+                        missing_ready_external = not (
+                            subtitle_file.is_file() and subtitle_file.stat().st_size > 0
+                        )
+                    except OSError:
+                        missing_ready_external = True
+                if not (invalid_state or invalid_job or missing_ready_external):
                     continue
                 conn.execute(
                     "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
                     "state='waiting_subtitles',updated_at=? WHERE video_path=?",
                     (now, video_path),
                 )
+                if missing_ready_external:
+                    resolved_video = str(Path(video_path).expanduser().resolve())
+                    digest = hashlib.sha1(resolved_video.encode("utf-8")).hexdigest()
+                    candidate_fingerprint_key = "subtitle_candidate_set:" + digest
+                    force_rebuild_key = "subtitle_force_rebuild:" + digest
+                    conn.execute("DELETE FROM state WHERE key=?", (candidate_fingerprint_key,))
+                    conn.execute(
+                        "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (force_rebuild_key, "1", now),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO subtitle_jobs(
+                            video_path,media_id,episode,state,attempts,priority,next_check,last_error,updated_at
+                        ) VALUES(?,?,?,'pending',0,260,?,'Prepared subtitle cache file is missing',?)
+                        ON CONFLICT(video_path) DO UPDATE SET
+                            media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
+                            episode=COALESCE(excluded.episode,subtitle_jobs.episode),
+                            state='pending',stage='queued',attempts=0,
+                            priority=MAX(subtitle_jobs.priority,260),
+                            next_check=excluded.next_check,lease_until=0,heartbeat_at=0,
+                            progress_json='{}',action_code='',
+                            last_error=excluded.last_error,updated_at=excluded.updated_at
+                        """,
+                        (video_path, row["media_id"], row["episode"], now, now),
+                    )
                 changed += 1
         return changed
 
@@ -1903,13 +1975,28 @@ class Database:
         error: str,
     ) -> None:
         now = time.time()
+        resolved_video = Path(video_path).expanduser().resolve()
+        digest = hashlib.sha1(str(resolved_video).encode("utf-8")).hexdigest()
+        candidate_fingerprint_key = "subtitle_candidate_set:" + digest
+        force_rebuild_key = "subtitle_force_rebuild:" + digest
         with self.connect() as conn:
-            self._ensure_anime_parent(conn, media_id, video_path.stem)
+            self._ensure_anime_parent(conn, media_id, resolved_video.stem)
+            # Invalidation means the current selection must be evaluated again,
+            # even when provider discovery returns the exact same candidates.
+            # Keeping the old fingerprint makes prepare-only skip the expensive
+            # alignment forever and strands a previously working episode in
+            # waiting_subtitles.
+            conn.execute("DELETE FROM state WHERE key=?", (candidate_fingerprint_key,))
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (force_rebuild_key, "1", now),
+            )
             conn.execute(
                 "UPDATE episodes SET subtitle_path=NULL,embedded_subtitle_id=NULL,subtitle_origin='',"
                 "state='waiting_subtitles',updated_at=? "
                 "WHERE video_path=?",
-                (now, str(video_path)),
+                (now, str(resolved_video)),
             )
             conn.execute(
                 """
@@ -1923,7 +2010,7 @@ class Database:
                     lease_until=0,heartbeat_at=0,progress_json='{}',action_code='',
                     last_error=excluded.last_error,updated_at=excluded.updated_at
                 """,
-                (str(video_path), media_id, episode, now, error[-1000:], now),
+                (str(resolved_video), media_id, episode, now, error[-1000:], now),
             )
 
     def queue_subtitle_job(
@@ -1986,7 +2073,13 @@ class Database:
                 INSERT INTO subtitle_jobs(
                     video_path,media_id,episode,state,attempts,next_check,last_error,updated_at
                 ) VALUES(?,?,?,'pending',0,?,'Waiting for Japanese subtitles',?)
-                ON CONFLICT(video_path) DO NOTHING
+                ON CONFLICT(video_path) DO UPDATE SET
+                    media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
+                    episode=CASE
+                        WHEN excluded.media_id IS NOT NULL THEN excluded.episode
+                        ELSE COALESCE(excluded.episode,subtitle_jobs.episode)
+                    END,
+                    updated_at=excluded.updated_at
                 """,
                 (str(video_path), media_id, episode, now, now),
             )
@@ -2042,9 +2135,9 @@ class Database:
                 """
                 SELECT video_path,media_id,episode
                 FROM episodes
-                WHERE state IN ('local','waiting_subtitles','waiting_text_subtitles')
+                WHERE state IN ('local','waiting_subtitles','waiting_text_subtitles','couldnt_sync')
                   AND (
-                    state='waiting_text_subtitles'
+                    state IN ('waiting_text_subtitles','couldnt_sync')
                     OR (subtitle_path IS NULL AND embedded_subtitle_id IS NULL)
                   )
                 """
@@ -2075,11 +2168,47 @@ class Database:
                 )
         return len(affected_paths)
 
+    @staticmethod
+    def _subtitle_job_order_sql(alias: str = "j") -> str:
+        """Prioritize the watchable frontier of every anime before middle episodes.
+
+        Timestamp-only ordering made a freshly discovered batch effectively random
+        from the viewer's perspective: episode 8 could be repaired before episode 1.
+        A job is a frontier when it is either AniList's next unwatched episode or
+        the earliest unresolved subtitle job for that title.  All title frontiers
+        are processed before any middle episode; normal priority/backoff then break
+        ties inside the same frontier tier.
+        """
+        return f"""
+            CASE
+              WHEN {alias}.media_id IS NOT NULL AND {alias}.episode IS NOT NULL
+               AND (
+                    {alias}.episode=COALESCE(a.progress,0)+1
+                    OR {alias}.episode=(
+                        SELECT MIN(j2.episode) FROM subtitle_jobs j2
+                        WHERE j2.media_id={alias}.media_id
+                          AND j2.episode IS NOT NULL
+                          AND j2.state IN ('pending','processing')
+                    )
+               ) THEN 0
+              ELSE 1
+            END,
+            {alias}.priority DESC,
+            CASE
+              WHEN {alias}.episode IS NOT NULL
+              THEN ABS({alias}.episode-(COALESCE(a.progress,0)+1))
+              ELSE 2147483647
+            END,
+            {alias}.next_check,
+            {alias}.updated_at DESC
+        """
     def due_subtitle_jobs(self, limit: int = 10) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM subtitle_jobs WHERE state='pending' AND next_check<=? "
-                "ORDER BY priority DESC,next_check,updated_at DESC LIMIT ?",
+                "SELECT j.* FROM subtitle_jobs j LEFT JOIN anime a ON a.media_id=j.media_id "
+                "WHERE j.state='pending' AND j.next_check<=? ORDER BY "
+                + self._subtitle_job_order_sql("j")
+                + " LIMIT ?",
                 (time.time(), limit),
             ).fetchall()
 
@@ -2094,10 +2223,11 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                "SELECT * FROM subtitle_jobs "
-                "WHERE (state='pending' AND next_check<=?) "
-                "OR (state='processing' AND next_check<=?) "
-                "ORDER BY priority DESC,next_check,updated_at DESC LIMIT ?",
+                "SELECT j.* FROM subtitle_jobs j LEFT JOIN anime a ON a.media_id=j.media_id "
+                "WHERE (j.state='pending' AND j.next_check<=?) "
+                "OR (j.state='processing' AND j.next_check<=?) ORDER BY "
+                + self._subtitle_job_order_sql("j")
+                + " LIMIT ?",
                 (now, now, limit),
             ).fetchall()
             if rows:
@@ -2127,10 +2257,12 @@ class Database:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
-                f"SELECT * FROM subtitle_jobs WHERE video_path IN ({placeholders}) "
-                "AND ((state='pending' AND next_check<=?) "
-                "OR (state='processing' AND next_check<=?)) "
-                "ORDER BY priority DESC,next_check,updated_at DESC LIMIT ?",
+                f"SELECT j.* FROM subtitle_jobs j LEFT JOIN anime a ON a.media_id=j.media_id "
+                f"WHERE j.video_path IN ({placeholders}) "
+                "AND ((j.state='pending' AND j.next_check<=?) "
+                "OR (j.state='processing' AND j.next_check<=?)) ORDER BY "
+                + self._subtitle_job_order_sql("j")
+                + " LIMIT ?",
                 (*paths, now, now, max(1, int(limit))),
             ).fetchall()
             if rows:
@@ -2158,6 +2290,15 @@ class Database:
             )
             conn.execute(
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
+                (now, str(video_path)),
+            )
+
+    def reset_subtitle_job_attempts(self, video_path: Path) -> None:
+        """Reset failure backoff after the discoverable candidate set changes."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE subtitle_jobs SET attempts=0,updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
 

@@ -78,7 +78,7 @@ def test_shared_reader_renders_pitch_diagrams_and_status_themes() -> None:
     reading_css = (ROOT / "pudge/web/reading_tools.css").read_text(encoding="utf-8")
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
 
-    assert "renderPitchAccent(card)" in reading_tools
+    assert "${renderPitchAccent(card)}" in reading_tools
     assert "card.pitchAccents" in reading_tools
     assert "pitchMorae" in reading_tools and "pitchPattern" in reading_tools
     assert "applyAppearance: applyStudyAppearance" in reading_tools

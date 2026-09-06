@@ -301,6 +301,29 @@ def test_nyaa_proxy_url_normalization() -> None:
     assert NyaaClient(proxy_url="socks://127.0.0.1:1080").proxy_url == "socks5://127.0.0.1:1080"
 
 
+def test_nyaa_search_can_request_descending_seeder_order() -> None:
+    from pudge.providers.nyaa import NyaaClient
+
+    requested: list[str] = []
+    client = NyaaClient("https://nyaa.invalid", proxy_mode="direct")
+    client._get = lambda url, _proxy: requested.append(url) or RSS
+    try:
+        releases = client.search(
+            "Erai NF 720",
+            category="1_0",
+            filter_id=0,
+            sort_by="seeders",
+            order="desc",
+        )
+    finally:
+        client.close()
+
+    assert len(releases) == 1
+    assert requested == [
+        "https://nyaa.invalid/?page=rss&q=Erai+NF+720&c=1_0&f=0&s=seeders&o=desc"
+    ]
+
+
 def test_library_scan_marks_embedded_japanese_subtitles_ready(tmp_path: Path, monkeypatch) -> None:
     from pudge.library import scan_library
 
@@ -1461,7 +1484,7 @@ def test_manager_generation_five_requeues_old_piecewise_outputs(tmp_path: Path) 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 
 def test_sync_anilist_undoes_local_watched_marker(monkeypatch, tmp_path: Path) -> None:
@@ -1634,7 +1657,7 @@ def test_manager_generation_seven_requeues_generated_playback_outputs(tmp_path: 
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 05.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 06.mkv").subtitle_path is None
     assert manager.db.episode_by_path(cfg.library.root_dir / "Anime - 07.mkv").subtitle_path is not None
-    assert manager.db.get_state("subtitle_validation_generation", "") == "16"
+    assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 
 def test_ready_notification_uses_episode_then_full_anime(tmp_path: Path, monkeypatch) -> None:

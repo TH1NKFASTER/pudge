@@ -37,7 +37,7 @@ from .episode_numbering import (
 from .language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_japanese_subtitle
 from .llm import OllamaClient
 from .local_search import find_local_subtitles
-from .logging_utils import StageTimer, configure_logging, timed_step
+from .logging_utils import StageTimer, configure_logging, debug_log_dir, timed_step
 from .media import MediaProbeError, TEXT_CODECS, find_embedded_japanese_subtitles
 from .models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
 from .ocr import OCRConversionError, OCRUnavailableError, image_subtitle_to_srt
@@ -61,6 +61,7 @@ from .subtitles.pipeline import (
     optimize_subtitle,
     subtitle_quality_accepted,
 )
+from .subtitles.source_repairs import apply_known_source_repair
 
 
 
@@ -111,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-format", default="", help=argparse.SUPPRESS)
     parser.add_argument("--episode-hint", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--skip-airing-lookup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--previous-candidate-fingerprint", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--anilist-correct",
         metavar="ID_OR_URL",
@@ -121,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anilist-id", help=argparse.SUPPRESS)
     parser.add_argument("--manual", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--playback-save", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--export-episode-debug", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--playback-video", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--playback-position", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--playback-duration", type=float, default=0.0, help=argparse.SUPPRESS)
@@ -190,6 +193,41 @@ def _choose_with_optional_llm(
     return candidates[0]
 
 
+def _confident_raw_unsynced_candidate(
+    candidates: list[SubtitleCandidate],
+    *,
+    expected_episode: int | None,
+    manually_selected: bool,
+    minimum_score: float,
+) -> SubtitleCandidate | None:
+    """Return a text candidate safe to expose *raw* after sync failure.
+
+    This does not claim the timing is good.  It only claims we are confident
+    enough about the subtitle identity that offering it for manual mpv timing is
+    preferable to hiding it completely.
+    """
+    for candidate in candidates:
+        if candidate.path.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS:
+            continue
+        if not candidate.path.is_file():
+            continue
+        if manually_selected:
+            return candidate
+        if not candidate.verified_japanese:
+            continue
+        if expected_episode is None or candidate.episode != int(expected_episode):
+            continue
+        if float(candidate.score) < float(minimum_score):
+            continue
+        if str(candidate.details.get("episode_match") or "") in {
+            "mismatch",
+            "range_mismatch",
+        }:
+            continue
+        return candidate
+    return None
+
+
 def _subtitle_content_fingerprint(
     candidate: SubtitleCandidate,
     cache_dir: Path,
@@ -229,6 +267,40 @@ def _deduplicate_subtitle_candidates(
 ) -> tuple[list[SubtitleCandidate], int]:
     # Compatibility wrapper for callers/tests from the pre-package pipeline.
     return deduplicate_candidates(candidates, cache_dir, ffmpeg_path=ffmpeg_path)
+
+
+def _subtitle_candidate_set_fingerprint(candidates: list[SubtitleCandidate]) -> str:
+    """Stable, cheap identity for the currently discoverable subtitle set."""
+    rows: list[dict[str, object]] = []
+    for candidate in candidates:
+        details = candidate.details if isinstance(candidate.details, dict) else {}
+        path = Path(candidate.path)
+        content_hash = ""
+        size = 0
+        try:
+            size = int(path.stat().st_size)
+            if path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS and size <= 10 * 1024 * 1024:
+                content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            pass
+        rows.append(
+            {
+                "source": str(candidate.source or ""),
+                "name": str(candidate.name or ""),
+                "episode": candidate.episode,
+                "url": str(details.get("url") or ""),
+                "suffix": path.suffix.casefold(),
+                "size": size,
+                "content": content_hash,
+            }
+        )
+    payload = json.dumps(
+        sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, ensure_ascii=False)),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _choose_anilist(
@@ -1529,6 +1601,7 @@ def process_video(
     embedded_bitmap_fallback = None
     bitmap_candidate_fallback: SubtitleCandidate | None = None
     selected_candidate: SubtitleCandidate | None = None
+    raw_unsynced_candidate: SubtitleCandidate | None = None
     selected_source = ""
     alignment_result: dict[str, object] = {}
     generated_by_ocr = False
@@ -1701,6 +1774,7 @@ def process_video(
             len(candidates),
             content_duplicates,
         )
+        candidate_fingerprint_inputs = list(candidates)
         text_candidates = [
             candidate
             for candidate in candidates
@@ -1738,6 +1812,29 @@ def process_video(
             candidates=len(candidates),
             duplicates=content_duplicates,
         )
+        candidate_fingerprint = _subtitle_candidate_set_fingerprint(candidate_fingerprint_inputs)
+        print(f"SUBTITLE_CANDIDATE_FINGERPRINT={candidate_fingerprint}")
+        print(f"SUBTITLE_CANDIDATE_COUNT={len(candidate_fingerprint_inputs)}")
+        previous_candidate_fingerprint = str(
+            getattr(args, "previous_candidate_fingerprint", "") or ""
+        ).strip()
+        if (
+            args.prepare_only
+            and previous_candidate_fingerprint
+            and candidate_fingerprint == previous_candidate_fingerprint
+            and not args.force_search
+            and not args.resync
+            and args.sub is None
+        ):
+            logger.info(
+                "SKIP step=subtitle.alignment video=%s reason=candidate_set_unchanged fingerprint=%s candidates=%s",
+                video.name,
+                candidate_fingerprint[:12],
+                len(candidate_fingerprint_inputs),
+            )
+            print("Subtitle candidates unchanged; expensive alignment skipped")
+            print("PREPARE_STATUS=waiting_unchanged_candidates")
+            return 4
 
         if (
             config.matching.evaluate_all_jimaku
@@ -1822,6 +1919,20 @@ def process_video(
                     print(f"Скачаны субтитры: {subtitle}")
                 else:
                     print(f"Локальные субтитры: {subtitle} (score={chosen.score:.1f})")
+
+        raw_unsynced_candidate = _confident_raw_unsynced_candidate(
+            candidates,
+            expected_episode=(
+                int(args.episode_hint)
+                if args.episode_hint is not None
+                else identity.episode
+            ),
+            manually_selected=bool(args.sub is not None),
+            minimum_score=max(
+                float(config.matching.local_min_score),
+                float(config.matching.jimaku_min_score),
+            ),
+        )
 
         pipeline_timer.mark("candidate_selection", selected=subtitle or "")
 
@@ -1969,6 +2080,35 @@ def process_video(
             )
         pipeline_timer.mark("subtitle_conversion", reason=conversion_result.get("reason"))
 
+    if (
+        subtitle is not None
+        and subtitle.suffix.casefold() == ".srt"
+        and selected_candidate is not None
+        and not args.fast_play
+    ):
+        timing_reference_raw = str(alignment_result.get("timing_reference") or "").strip()
+        timing_reference = Path(timing_reference_raw).expanduser() if timing_reference_raw else None
+        repaired_subtitle, source_repair = apply_known_source_repair(
+            subtitle,
+            config.paths.cache_dir,
+            media_id=(int(args.media_id) if args.media_id is not None else None),
+            episode=(int(args.episode_hint) if args.episode_hint is not None else None),
+            candidate_name=selected_candidate.name,
+            timing_reference=timing_reference,
+            force=args.resync,
+        )
+        if repaired_subtitle != subtitle:
+            subtitle = repaired_subtitle
+            alignment_result["source_repair"] = source_repair
+            logger.info(
+                "REPAIR step=subtitle.known_source source=%s rule=%s output=%s",
+                selected_candidate.name,
+                source_repair.get("rule"),
+                subtitle,
+            )
+            if not args.prepare_only:
+                print("Исправлен известный неполный источник японских субтитров")
+
     if subtitle is not None and subtitle.suffix.casefold() == ".srt":
         reporter.update(SubtitleJobStage.SELECTING, video=video.name)
         source_subtitle = subtitle
@@ -2008,6 +2148,33 @@ def process_video(
 
     if subtitle is None and subtitle_id is None:
         if args.prepare_only:
+            if raw_unsynced_candidate is not None:
+                metadata = {
+                    "source": raw_unsynced_candidate.source,
+                    "name": raw_unsynced_candidate.name,
+                    "filename_score": raw_unsynced_candidate.score,
+                    "candidate_path": str(raw_unsynced_candidate.path),
+                    "raw_unsynced_path": str(raw_unsynced_candidate.path),
+                    "final_path": "",
+                    "details": raw_unsynced_candidate.details,
+                    "alignment": alignment_result,
+                    "quality": {"accepted": False, "reason": "couldnt_sync"},
+                }
+                reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
+                print(
+                    "Субтитры уверенно относятся к этой серии, но автоматический "
+                    "тайминг не прошёл проверку"
+                )
+                print(
+                    "PREPARED_RAW_SUBTITLE="
+                    + str(raw_unsynced_candidate.path)
+                )
+                print(
+                    "PREPARED_SUBTITLE_META="
+                    + json.dumps(metadata, ensure_ascii=False, default=str)
+                )
+                print("PREPARE_STATUS=couldnt_sync")
+                return 4
             reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
             print("Японские субтитры пока не найдены")
             print("PREPARE_STATUS=waiting_subtitles")
@@ -2338,6 +2505,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     config = load_config(args.config)
+    if args.export_episode_debug:
+        if args.playback_video is None:
+            print("Episode debug export requires --playback-video", file=sys.stderr)
+            return 1
+        from .debug_snapshot import DebugSnapshotService
+        from .manager import AnimeManager
+
+        video = args.playback_video.expanduser().resolve()
+        manager = AnimeManager(config)
+        episode = manager.db.episode_by_path(video)
+        if episode is None or episode.media_id is None:
+            print(f"Episode is not present in the local library: {video}", file=sys.stderr)
+            return 1
+        payload = DebugSnapshotService(
+            manager, cache_dir=config.paths.cache_dir
+        ).snapshot(episode.media_id, episode.media_episode)
+        target = debug_log_dir() / (
+            f"pudge-debug-{int(episode.media_id)}"
+            f"-ep{episode.media_episode if episode.media_episode is not None else 'movie'}"
+            f"-{int(time.time())}.json"
+        )
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", str(target)], check=False)
+        print(f"PUDGE_EPISODE_DEBUG={target}")
+        return 0
     if args.subtitle_prewarm_file:
         from .mpv_study import SubtitleStudyApi
 

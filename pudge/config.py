@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
+import threading
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +19,7 @@ APP_DIR = CONFIG_DIR
 DEFAULT_CONFIG_PATH = APP_DIR / "config.toml"
 DEFAULT_CACHE_DIR = CACHE_DIR
 _SECRET_STORE = SecretStore()
+_CONFIG_FILE_LOCK = threading.RLock()
 
 
 @dataclass(slots=True)
@@ -214,6 +218,7 @@ class AniListConfig:
 @dataclass(slots=True)
 class LLMConfig:
     enabled: bool = False
+    provider: str = "ollama"
     base_url: str = "http://127.0.0.1:11434"
     api_key: str = ""
     model: str = "qwen3.5:9b-q8_0"
@@ -221,6 +226,7 @@ class LLMConfig:
     think: bool = False
     keep_alive: str = "10m"
     temperature: float = 0.0
+    reasoning_effort: str = "low"
     num_ctx: int = 8192
     timeout_seconds: float = 90.0
     # Subtitle processing is deterministic by default. The local LLM remains
@@ -280,6 +286,10 @@ class SyncConfig:
     pgs_onset_min_improvement: float = 0.08
     use_container_chapters: bool = True
     japanese_stt_fallback: bool = True
+    # Internal A/B switch used by the local alignment comparator. Production
+    # keeps the text clock enabled; disabling it reproduces the pre-v138 STT
+    # fallback while leaving every other alignment heuristic unchanged.
+    japanese_stt_text_clock: bool = True
     japanese_stt_model: str = "mlx-community/whisper-tiny"
     japanese_stt_timeout_seconds: float = 600.0
     japanese_stt_min_activity: float = 0.55
@@ -563,6 +573,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         llm=LLMConfig(
             enabled=bool(llm.get("enabled", False)),
+            provider=str(llm.get("provider", "ollama")).strip().lower() or "ollama",
             base_url=str(llm.get("base_url", "http://127.0.0.1:11434")).rstrip("/"),
             api_key=_SECRET_STORE.resolve(
                 "llm-api-key",
@@ -575,6 +586,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             think=bool(llm.get("think", False)),
             keep_alive=str(llm.get("keep_alive", "10m")),
             temperature=float(llm.get("temperature", 0.0)),
+            reasoning_effort=str(llm.get("reasoning_effort", "low")).strip().lower() or "low",
             num_ctx=int(llm.get("num_ctx", 8192)),
             timeout_seconds=float(llm.get("timeout_seconds", 90.0)),
             validate_embedded_reference=bool(llm.get("subtitle_semantic_checks", False)),
@@ -668,6 +680,88 @@ def _toml_string_list(values: list[str | Path]) -> str:
 def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
 
+
+
+def _atomic_config_text_write(destination: Path, text: str) -> Path:
+    """Replace config.toml atomically, serialized with narrow hot-path updates."""
+    destination = destination.expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    with _CONFIG_FILE_LOCK:
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, destination)
+            destination.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return destination
+
+
+def write_torrents_enabled(
+    config: AppConfig,
+    destination: Path | None = None,
+) -> Path:
+    """Persist only ``nyaa.torrents_enabled`` without touching Keychain secrets.
+
+    Torrent On/Off is a latency-sensitive control.  Calling ``write_config`` here
+    used to rewrite every Keychain-backed secret and could spend several seconds
+    in macOS ``security`` subprocesses (or raise TimeoutExpired), making a
+    successful-looking optimistic On click fall back to Off.  This narrow writer
+    keeps the toggle independent from unrelated secret persistence.
+    """
+
+    destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
+    if not destination.exists():
+        return write_config(config, destination)
+
+    with _CONFIG_FILE_LOCK:
+        text = destination.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        section_start = None
+        section_end = len(lines)
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == "[nyaa]":
+                section_start = index
+                continue
+            if section_start is not None and index > section_start and re.fullmatch(r"\[[^]]+\]", stripped):
+                section_end = index
+                break
+
+        value = _toml_bool(bool(config.nyaa.torrents_enabled))
+        replacement = f"torrents_enabled = {value}"
+        if section_start is None:
+            suffix = "" if not text or text.endswith("\n") else "\n"
+            updated = text + suffix + f"\n[nyaa]\n{replacement}\n"
+        else:
+            key_index = None
+            for index in range(section_start + 1, section_end):
+                if re.match(r"^\s*torrents_enabled\s*=", lines[index]):
+                    key_index = index
+                    break
+            if key_index is None:
+                newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
+                lines.insert(section_start + 1, replacement + newline)
+            else:
+                newline = "\r\n" if lines[key_index].endswith("\r\n") else ("\n" if lines[key_index].endswith("\n") else "")
+                indent = lines[key_index][: len(lines[key_index]) - len(lines[key_index].lstrip())]
+                lines[key_index] = indent + replacement + newline
+            updated = "".join(lines)
+
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(updated, encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, destination)
+            destination.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return destination
 
 def write_config(config: AppConfig, destination: Path | None = None) -> Path:
     destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
@@ -827,6 +921,7 @@ relations_by_release_date = {_toml_bool(config.anilist.relations_by_release_date
 
 [llm]
 enabled = {_toml_bool(config.llm.enabled)}
+provider = {_toml_string(config.llm.provider)}
 base_url = {_toml_string(config.llm.base_url)}
 api_key = {_toml_string(llm_api_key)}
 model = {_toml_string(config.llm.model)}
@@ -834,6 +929,7 @@ ambiguity_margin = {config.llm.ambiguity_margin}
 think = {_toml_bool(config.llm.think)}
 keep_alive = {_toml_string(config.llm.keep_alive)}
 temperature = {config.llm.temperature}
+reasoning_effort = {_toml_string(config.llm.reasoning_effort)}
 num_ctx = {config.llm.num_ctx}
 timeout_seconds = {config.llm.timeout_seconds}
 subtitle_semantic_checks = {_toml_bool(config.llm.validate_embedded_reference)}
@@ -888,9 +984,7 @@ japanese_stt_model = {_toml_string(config.sync.japanese_stt_model)}
 japanese_stt_timeout_seconds = {config.sync.japanese_stt_timeout_seconds}
 japanese_stt_min_activity = {config.sync.japanese_stt_min_activity}
 '''
-    destination.write_text(text, encoding="utf-8")
-    destination.chmod(0o600)
-    return destination
+    return _atomic_config_text_write(destination, text)
 
 
 def write_default_config(destination: Path | None = None) -> Path:

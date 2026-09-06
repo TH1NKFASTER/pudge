@@ -96,3 +96,42 @@ def test_cold_start_accepts_modest_but_clear_two_cue_improvement() -> None:
     assert segments[0]["kind"] == "cold_start"
     assert segments[0]["offset_seconds"] == 9.589
     assert boundaries
+
+
+
+def test_cold_start_rejects_bleach_sized_reedited_opening() -> None:
+    cues = [
+        (15.082, 18.085, "a"),
+        (18.085, 20.053, "b"),
+        (129.162, 131.765, "c"),
+        (131.765, 135.569, "d"),
+    ]
+    onsets = [row[0] for row in cues]
+    reference = [17.590, 21.770, 28.010, 31.360, 147.0, 149.7]
+    base = [
+        {
+            "first_center": 129.0,
+            "last_center": 500.0,
+            "offset_seconds": 18.0,
+            "support": 13,
+            "mean_score": 3.0,
+            "mean_coverage": 0.9,
+            "windows": [],
+        }
+    ]
+
+    segments, boundaries, _payload, diagnostics = _cold_start_refinement(
+        cues,
+        onsets,
+        reference,
+        base,
+        [],
+        [],
+        (2.508, 23.34),
+    )
+
+    assert diagnostics["applied"] is False
+    assert diagnostics["reason"] == "edge_hint_not_local"
+    assert diagnostics["delta_seconds"] == -15.492
+    assert segments == base
+    assert boundaries == []

@@ -23,6 +23,9 @@ EPISODE_LABEL_RE = re.compile(
 )
 DASH_EP_RE = re.compile(r"(?i)\s[-–—]\s*0*(?P<episode>\d{1,4})(?:v\d+)?(?=\s|$)")
 TRAILING_EP_RE = re.compile(r"(?i)(?:^|\s)0*(?P<episode>\d{1,3})(?:v\d+)?$")
+ARCHIVE_BDSUP_EP_RE = re.compile(
+    r"(?i)(?:^|\s)0*(?P<episode>\d{1,3})(?:v\d+)?\s+(?:BD\s*SUP|BDSUP)$"
+)
 SEASON_LABEL_RE = re.compile(r"(?i)(?:season|saison)\s*(?P<season>\d{1,2})")
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 
@@ -125,7 +128,14 @@ def parse_anime_filename(path_or_name: str | Path) -> VideoIdentity:
         episode = int(match.group("episode"))
         episode_match = match
     else:
-        for pattern in (EPISODE_LABEL_RE, DASH_EP_RE, TRAILING_EP_RE):
+        patterns = [EPISODE_LABEL_RE, DASH_EP_RE, TRAILING_EP_RE]
+        # Jimaku commonly stores bitmap subtitle packs as archives named like
+        # ``Rakudai Kishi no Cavalry 02 BDSUP.7z``.  The bare number is an
+        # episode only in this narrow archive convention; treating arbitrary
+        # trailing release numbers this way would confuse years/resolutions.
+        if source_path.suffix.casefold() in {".zip", ".7z", ".rar"}:
+            patterns.insert(0, ARCHIVE_BDSUP_EP_RE)
+        for pattern in patterns:
             match = pattern.search(cleaned)
             if match:
                 episode = int(match.group("episode"))

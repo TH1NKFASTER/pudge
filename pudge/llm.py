@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -19,6 +20,12 @@ from .subtitle_formats import parse_srt
 SEMANTIC_CACHE_SCHEMA = "semantic-v4"
 SEMANTIC_CACHE_ACCEPTED_TTL_SECONDS = 30 * 24 * 3600
 SEMANTIC_CACHE_REJECTED_TTL_SECONDS = 6 * 3600
+OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
+
+
+def _openai_reasoning_effort(value: Any) -> str:
+    effort = str(value or "low").strip().lower()
+    return effort if effort in OPENAI_REASONING_EFFORTS else "low"
 
 
 def build_chat_payload(config: LLMConfig, system: str, user: str) -> dict[str, Any]:
@@ -39,24 +46,145 @@ def build_chat_payload(config: LLMConfig, system: str, user: str) -> dict[str, A
     }
 
 
+def build_openai_chat_payload(config: LLMConfig, system: str, user: str) -> dict[str, Any]:
+    """Build an OpenAI-compatible chat payload with optional reasoning.
+
+    GPT-5-class models reject sampling controls such as ``temperature`` when
+    reasoning is enabled. Pudge defaults OpenAI-compatible providers to ``low``
+    reasoning, so only send temperature when reasoning is explicitly ``none``.
+    Gateways that do not understand ``reasoning_effort`` are retried once by
+    :class:`OllamaClient` without that field.
+    """
+    effort = _openai_reasoning_effort(getattr(config, "reasoning_effort", "low"))
+    payload: dict[str, Any] = {
+        "model": config.model,
+        "stream": False,
+        "reasoning_effort": effort,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if effort == "none":
+        payload["temperature"] = config.temperature
+    return payload
+
+
+def _response_error_detail(response: Any) -> str:
+    """Return a useful provider error without leaking request credentials."""
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "").strip()
+            code = str(error.get("code") or "").strip()
+            if message and code:
+                return f"{message} (code={code})"
+            if message:
+                return message
+        detail = payload.get("detail")
+        if detail:
+            return str(detail).strip()
+    try:
+        text = str(response.text or "").strip()
+    except Exception:
+        text = ""
+    return text[:1200]
+
+
+def _reasoning_parameter_unsupported(response: Any) -> bool:
+    try:
+        status = int(response.status_code)
+    except Exception:
+        return False
+    if status not in {400, 404, 422}:
+        return False
+    detail = _response_error_detail(response).casefold()
+    if "reasoning_effort" not in detail and "reasoning effort" not in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "unsupported",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unexpected",
+            "extra",
+            "invalid parameter",
+        )
+    )
+
+
 def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
 
-def list_models(base_url: str, api_key: str = "", timeout: float = 8.0) -> list[str]:
+def _openai_url(base_url: str, endpoint: str) -> str:
+    """Accept both provider roots and OpenAI-style base URLs ending in /v1."""
+    base = str(base_url or "").strip().rstrip("/")
+    suffix = str(endpoint or "").strip().lstrip("/")
+    if base.casefold().endswith("/v1"):
+        return f"{base}/{suffix}"
+    return f"{base}/v1/{suffix}"
+
+
+def _decode_json_content(content: Any) -> dict[str, Any] | None:
+    if isinstance(content, dict):
+        return content
+    text = str(content or "").strip()
+    if not text:
+        return None
+    fenced = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    fenced = re.sub(r"\s*```$", "", fenced).strip()
+    for candidate in (text, fenced):
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            return value
+    left, right = fenced.find("{"), fenced.rfind("}")
+    if 0 <= left < right:
+        try:
+            value = json.loads(fenced[left : right + 1])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def list_models(
+    base_url: str,
+    api_key: str = "",
+    timeout: float = 8.0,
+    provider: str = "ollama",
+) -> list[str]:
+    kind = str(provider or "ollama").strip().lower()
+    endpoint = _openai_url(base_url, "models") if kind == "openai" else f"{base_url.rstrip('/')}/api/tags"
     response = httpx.get(
-        f"{base_url.rstrip('/')}/api/tags",
+        endpoint,
         headers=_headers(api_key),
         timeout=timeout,
         follow_redirects=True,
     )
     response.raise_for_status()
     payload = response.json()
-    models = payload.get("models", []) if isinstance(payload, dict) else []
+    models = (
+        payload.get("data", [])
+        if kind == "openai" and isinstance(payload, dict)
+        else payload.get("models", []) if isinstance(payload, dict) else []
+    )
     result = []
     for item in models:
-        if isinstance(item, dict) and item.get("name"):
-            result.append(str(item["name"]))
+        if not isinstance(item, dict):
+            continue
+        name = item.get("id") if kind == "openai" else item.get("name")
+        if name:
+            result.append(str(name))
     return sorted(set(result), key=str.casefold)
 
 
@@ -167,6 +295,7 @@ class OllamaClient:
         self.logger = configure_logging()
         self.base_url = config.base_url.rstrip("/")
         self.model = config.model
+        self.last_error = ""
         self.client = httpx.Client(
             timeout=config.timeout_seconds,
             follow_redirects=True,
@@ -178,14 +307,19 @@ class OllamaClient:
 
     def available(self) -> bool:
         try:
-            response = self.client.get(f"{self.base_url}/api/tags")
+            provider = str(getattr(self.config, "provider", "ollama") or "ollama").lower()
+            endpoint = _openai_url(self.base_url, "models") if provider == "openai" else f"{self.base_url}/api/tags"
+            response = self.client.get(endpoint)
             if not response.is_success:
+                # /v1/models is common but not mandatory for compatible gateways.
+                # A reachable 404/405 should not disable chat completions globally.
+                if provider == "openai" and int(response.status_code) in {404, 405}:
+                    return bool(self.model)
                 return False
-            names = {
-                str(item.get("name"))
-                for item in response.json().get("models", [])
-                if isinstance(item, dict) and item.get("name")
-            }
+            payload = response.json()
+            rows = payload.get("data", []) if provider == "openai" else payload.get("models", [])
+            field = "id" if provider == "openai" else "name"
+            names = {str(item.get(field)) for item in rows if isinstance(item, dict) and item.get(field)}
             return not names or self.model in names
         except (httpx.HTTPError, TypeError, ValueError):
             return False
@@ -198,15 +332,51 @@ class OllamaClient:
                 model=self.model,
                 request_chars=len(user),
             ):
-                response = self.client.post(
-                    f"{self.base_url}/api/chat",
-                    json=build_chat_payload(self.config, system, user),
-                )
+                provider = str(getattr(self.config, "provider", "ollama") or "ollama").lower()
+                if provider == "openai":
+                    endpoint = _openai_url(self.base_url, "chat/completions")
+                    request_payload = build_openai_chat_payload(self.config, system, user)
+                    response = self.client.post(endpoint, json=request_payload)
+                    if _reasoning_parameter_unsupported(response):
+                        # Preserve broad OpenAI-compatible support: older gateways
+                        # may reject the OpenAI reasoning knob entirely.
+                        fallback_payload = dict(request_payload)
+                        fallback_payload.pop("reasoning_effort", None)
+                        fallback_payload.setdefault("temperature", self.config.temperature)
+                        response = self.client.post(endpoint, json=fallback_payload)
+                else:
+                    response = self.client.post(
+                        f"{self.base_url}/api/chat",
+                        json=build_chat_payload(self.config, system, user),
+                    )
                 response.raise_for_status()
-                content = response.json()["message"]["content"]
-                return json.loads(content)
-        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                payload = response.json()
+                content = (
+                    payload["choices"][0]["message"]["content"]
+                    if provider == "openai"
+                    else payload["message"]["content"]
+                )
+                if isinstance(content, list):
+                    content = "".join(
+                        str(part.get("text") or "") if isinstance(part, dict) else str(part)
+                        for part in content
+                    )
+                decoded = _decode_json_content(content)
+                self.last_error = ""
+                if decoded is None:
+                    self.last_error = "LLM returned non-JSON content"
+                return decoded
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                detail = _response_error_detail(exc.response)
+                status = getattr(exc.response, "status_code", None)
+                self.last_error = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+            else:
+                self.last_error = str(exc).strip() or exc.__class__.__name__
             return None
+
+    def json_chat(self, system: str, user: str) -> dict[str, Any] | None:
+        return self._json_chat(system, user)
 
 
     def compare_subtitle_semantics(
@@ -235,6 +405,7 @@ class OllamaClient:
                 en_stat = english_path.stat()
                 raw = (
                     f"{SEMANTIC_CACHE_SCHEMA}:{self.model}:{self.config.think}:{self.config.temperature}:"
+                    f"{getattr(self.config, 'reasoning_effort', 'low')}:"
                     f"{self.config.num_ctx}:{effective_sample_count}:{effective_phrases}:"
                     f"{effective_threshold}:{alignment_mode}:"
                     f"{japanese_path.resolve()}:{ja_stat.st_size}:{ja_stat.st_mtime_ns}:"
@@ -465,7 +636,8 @@ class OllamaClient:
                 digest = hashlib.sha256(
                     (
                         f"anchor-regions-v1:{self.model}:{self.config.think}:"
-                        f"{self.config.temperature}:{self.config.num_ctx}:{raw}"
+                        f"{self.config.temperature}:{getattr(self.config, 'reasoning_effort', 'low')}:"
+                        f"{self.config.num_ctx}:{raw}"
                     ).encode("utf-8")
                 ).hexdigest()[:32]
                 cache_path = self.cache_dir / "llm-anchor-alignment" / f"{digest}.json"

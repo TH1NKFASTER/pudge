@@ -106,7 +106,7 @@ def test_write_srt_separates_exactly_touching_cues(tmp_path):
     assert "00:00:42,476 --> 00:00:47,080" in text
 
 
-def test_write_srt_removes_real_overlaps_for_mpv(tmp_path):
+def test_write_srt_preserves_real_overlaps_for_mpv(tmp_path):
     from pudge.subtitle_formats import write_srt
 
     output = tmp_path / "overlap.srt"
@@ -119,7 +119,7 @@ def test_write_srt_removes_real_overlaps_for_mpv(tmp_path):
     )
 
     text = output.read_text(encoding="utf-8")
-    assert "00:00:10,000 --> 00:00:14,400" in text
+    assert "00:00:10,000 --> 00:00:15,000" in text
     assert "00:00:14,500 --> 00:00:18,000" in text
 
 

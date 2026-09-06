@@ -92,15 +92,111 @@
   function rubyReading(value) {
     const text = String(value || '');
     let out = '', last = 0;
-    const pattern = /([\u3400-\u9fff々〆ヵヶ])\[([^\]\r\n]+)\]/g;
+    const pattern = /([\u3400-\u9fff々〆ヵヶ]+)\[([^\]\r\n]+)\]/g;
     let match;
     while ((match = pattern.exec(text)) !== null) {
       out += esc(text.slice(last, match.index));
-      out += `<ruby>${esc(match[1])}<rt>${esc(match[2])}</rt></ruby>`;
+      out += `<ruby class="pudge-study-term-ruby"><span>${esc(match[1])}</span><rt>${esc(match[2])}</rt></ruby>`;
       last = pattern.lastIndex;
     }
     out += esc(text.slice(last));
     return out || esc(text);
+  }
+
+  function annotatedStudySpelling(value) {
+    return String(value || '').replace(/([\u3400-\u9fff々〆ヵヶ]+)\[[^\]\r\n]+\]/g, '$1').replace(/\s+/g, '');
+  }
+
+  function kanjiOnlyStudyTerm(spelling, reading) {
+    const text = String(spelling || '').trim();
+    const kanaReading = plainStudyReading(reading || '');
+    if (!text || !kanaReading || !/[\u3400-\u9fff々〆ヵヶ]/u.test(text)) return esc(text);
+    const segments = text.match(/[\u3400-\u9fff々〆ヵヶ]+|[ぁ-ゟ゠-ヿー]+|[^\u3400-\u9fff々〆ヵヶぁ-ゟ゠-ヿー]+/gu) || [];
+    const normalizedReading = normalizedKana(kanaReading);
+    let readingPos = 0;
+    let out = '';
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      if (/^[\u3400-\u9fff々〆ヵヶ]+$/u.test(segment)) {
+        const nextKana = segments.slice(index + 1).find(part => /^[ぁ-ゟ゠-ヿー]+$/u.test(part));
+        const end = nextKana ? normalizedReading.indexOf(normalizedKana(nextKana), readingPos + 1) : kanaReading.length;
+        if (end < readingPos) return esc(text);
+        const ruby = kanaReading.slice(readingPos, end);
+        if (!ruby) return esc(text);
+        out += `<ruby class="pudge-study-term-ruby"><span>${esc(segment)}</span><rt>${esc(ruby)}</rt></ruby>`;
+        readingPos = end;
+        continue;
+      }
+      out += esc(segment);
+      if (/^[ぁ-ゟ゠-ヿー]+$/u.test(segment)) {
+        const kana = normalizedKana(segment);
+        if (!normalizedReading.startsWith(kana, readingPos)) return esc(text);
+        readingPos += segment.length;
+      }
+    }
+    return readingPos === kanaReading.length ? out : esc(text);
+  }
+
+  function plainStudyReading(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    const replaced = text.replace(/[\u3400-\u9fff々〆ヵヶ]+\[([^\]\r\n]+)\]/g, (_match, reading) => reading);
+    return replaced.replace(/\s+/g, '');
+  }
+
+  function studyTerm(card = {}, token = {}) {
+    const spelling = String(card.spelling || token.surface || '').trim();
+    const rawReading = String(card.rawReading || card.reading || token.reading || '');
+    const reading = plainStudyReading(rawReading);
+    if (!spelling) return '';
+    if (!reading || normalizedKana(spelling) === normalizedKana(reading) || !/[\u3400-\u9fff々〆ヵヶ]/u.test(spelling)) {
+      return `<span class="pudge-study-term-text">${esc(spelling)}</span>`;
+    }
+    if (/([\u3400-\u9fff々〆ヵヶ]+)\[[^\]\r\n]+\]/u.test(rawReading) && annotatedStudySpelling(rawReading) === spelling) {
+      return `<span class="pudge-study-term-mixed">${rubyReading(rawReading)}</span>`;
+    }
+    return `<span class="pudge-study-term-mixed">${kanjiOnlyStudyTerm(spelling, reading)}</span>`;
+  }
+
+  function sentenceSpans(text) {
+    const raw = String(text || '');
+    const spans = [];
+    let start = 0;
+    for (let index = 0; index < raw.length; index += 1) {
+      const ch = raw[index];
+      if (!'。！？!?\n'.includes(ch)) continue;
+      const end = index + 1;
+      if (raw.slice(start, end).trim()) spans.push({start, end});
+      start = end;
+    }
+    if (raw.slice(start).trim()) spans.push({start, end: raw.length});
+    return spans;
+  }
+
+  function studyContext(text, token = {}) {
+    const raw = String(text || '');
+    if (!raw.trim()) return '';
+    const spans = sentenceSpans(raw);
+    if (!spans.length) return raw.replace(/\s+/g, ' ').trim().slice(0, 420);
+    const surface = String(token.surface || cardSpelling(token.card) || '').trim();
+    let point = Number(token.contextStart ?? token.start);
+    if (!Number.isFinite(point) || point < 0 || point >= raw.length) {
+      const found = surface ? raw.indexOf(surface) : -1;
+      point = found >= 0 ? found : 0;
+    }
+    let index = spans.findIndex(span => point >= span.start && point < span.end);
+    if (index < 0) index = 0;
+    let first = index, last = index;
+    const current = raw.slice(spans[index].start, spans[index].end).replace(/\s+/g, '').length;
+    if (current < 28) {
+      if (index > 0) first = index - 1;
+      if (index + 1 < spans.length) last = index + 1;
+    }
+    return raw.slice(spans[first].start, spans[last].end).replace(/\s+/g, ' ').trim().slice(0, 420);
+  }
+
+  function cardSpelling(card = {}) {
+    return String(card.spelling || '');
   }
 
   function pitchMorae(reading) {
@@ -207,7 +303,7 @@
       const type = pitchClass(accent, morae.length);
       return `<div class="pudge-pitch-row pitch-${type}" title="${esc(type)}"><span class="pudge-pitch-number">${accent}</span><span class="pudge-pitch-track">${nodes}</span></div>`;
     }).join('');
-    return `<div class="pudge-study-pitch"><span class="pudge-study-pitch-label">${ru() ? 'Акцент' : 'Pitch accent'}</span>${rows}</div>`;
+    return `<div class="pudge-study-pitch">${rows}</div>`;
   }
 
   function renderInlinePitch(card = {}) {
@@ -244,6 +340,25 @@
     return renderInlinePitch({...card, reading:text});
   }
 
+  function sizeStudyCard(el) {
+    if (!el) return;
+    el.style.removeProperty('--pudge-study-width');
+    if (window.matchMedia?.('(max-width:520px)').matches) return;
+    const head = el.querySelector('.pudge-study-head');
+    const term = el.querySelector('.pudge-study-term');
+    const actions = el.querySelector('.pudge-study-head-actions');
+    if (!head || !term || !actions) return;
+    const headStyle = getComputedStyle(head);
+    const cardStyle = getComputedStyle(el);
+    const number = value => Number.parseFloat(value || '0') || 0;
+    const gap = number(headStyle.columnGap || headStyle.gap);
+    const chrome = number(cardStyle.paddingLeft) + number(cardStyle.paddingRight)
+      + number(cardStyle.borderLeftWidth) + number(cardStyle.borderRightWidth);
+    const required = Math.ceil(term.scrollWidth + actions.getBoundingClientRect().width + gap + chrome);
+    const width = Math.max(440, Math.min(620, required));
+    el.style.setProperty('--pudge-study-width', `${width}px`);
+  }
+
   function position(el, rect) {
     requestAnimationFrame(() => {
       const r = el.getBoundingClientRect();
@@ -271,56 +386,81 @@
     return API().light_novel_translate(text, context, targetLanguage, mediaId);
   }
 
+  function studyTokenIdentity(token, backend = 'jiten') {
+    if (!token) return '';
+    const card = token.card || {};
+    return [String(backend || 'jiten'), String(token.wordId ?? token.word_id ?? card.wordId ?? card.word_id ?? ''), String(token.readingIndex ?? token.reading_index ?? card.readingIndex ?? card.reading_index ?? ''), String(token.surface || token.text || card.spelling || card.word || ''), plainStudyReading(card.reading || token.reading || '')].join('\u0001');
+  }
+
   async function openStudyCard({token, target, backend = 'jiten', sentence = '', actions = []}) {
     if (!token || !target) return;
+    const identity = studyTokenIdentity(token, backend);
     const {card: pop} = ensureUi();
+    if (pop.classList.contains('open') && activeToken?.identity === identity) {
+      closeStudyCard();
+      return;
+    }
     // Manga replaces the OCR region DOM when it becomes active. Keep the
     // original on-screen anchor so the async deck request cannot move the card
     // to (0, 0) after the clicked word has been detached.
     const anchorRect = target.getBoundingClientRect();
-    const card = token.card || {};
-    const extraActions = new Map(
-      (Array.isArray(actions) ? actions : [])
-        .filter(action => action && action.id && typeof action.run === 'function')
-        .map(action => [String(action.id), action])
-    );
+    const card = {...(token.card || {})};
+    card.rawReading = String(card.reading || token.reading || '');
+    card.reading = plainStudyReading(card.rawReading);
+    const actionRows = (Array.isArray(actions) ? actions : [])
+      .filter(action => action && action.id && typeof action.run === 'function');
+    const extraActions = new Map(actionRows.map(action => [String(action.id), action]));
+    const headerActions = actionRows.filter(action => action.placement === 'header' || String(action.id) === 'bookmark-here');
+    const footerActions = actionRows.filter(action => !headerActions.includes(action));
     activeToken = {
       token,
       backend: String(backend || 'jiten'),
-      sentence: String(sentence || token.sentence || ''),
+      sentence: studyContext(String(sentence || token.sentence || ''), token),
       extraActions,
+      identity,
     };
     const meaningsRaw = card.meanings || card.meaningsChunks || [];
     const meanings = Array.isArray(meaningsRaw) ? meaningsRaw.flat?.() || meaningsRaw : [];
+    const state = normalizeState(card);
     const status = stateLabel(card);
+    const fallbackOnly = Boolean(token.fallback);
     pop.innerHTML = `
       <div class="pudge-study-head">
-        <div>
-          <h3>${esc(card.spelling || token.surface || '')}</h3>
-          <div class="pudge-study-reading">${rubyReading(card.reading || '')}</div>
+        <div class="pudge-study-term">${studyTerm(card, token)}</div>
+        <div class="pudge-study-head-actions">
+          ${headerActions.map(action =>
+            `<button class="pudge-study-header-action" data-pudge-study-action-tone="${String(action.tone || '') === 'listen' || String(action.id) === 'paired-audio-here' ? 'listen' : ''}" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
+          ).join('')}
+          <button class="pudge-study-close" data-pudge-study-close aria-label="Close">×</button>
         </div>
-        <button data-pudge-study-close aria-label="Close">×</button>
       </div>
-      <div class="pudge-study-subtle">${esc(status)}${card.frequencyRank ? ` • Frequency #${Number(card.frequencyRank)}` : ''}</div>
+      ${fallbackOnly ? '' : `
+      <div class="pudge-study-subtle"><span class="pudge-study-state state-${esc(state)}">${esc(status)}</span>${card.frequencyRank ? ` <span aria-hidden="true">•</span> Frequency #${Number(card.frequencyRank)}` : ''}</div>
       ${renderPitchAccent(card)}
       <ol class="pudge-study-meanings">
         ${meanings.length
           ? meanings.slice(0, 8).map(x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')
           : `<li class="pudge-study-subtle">${ru() ? 'Нет значений' : 'No meanings returned'}</li>`}
       </ol>
-      <select id="pudgeStudyDeck"><option value="">${ru() ? 'Колода…' : 'Study deck…'}</option></select>
-      <div class="pudge-study-actions">
-        <button data-pudge-study-review="again">${ru() ? 'Снова' : 'Again'}</button>
-        <button data-pudge-study-review="hard">${ru() ? 'Трудно' : 'Hard'}</button>
-        <button data-pudge-study-review="good">${ru() ? 'Хорошо' : 'Good'}</button>
-        <button data-pudge-study-review="easy">${ru() ? 'Легко' : 'Easy'}</button>
-        <button data-pudge-study-add>${ru() ? 'Добавить' : 'Add'}</button>
-        ${[...extraActions.entries()].map(([id, action]) =>
-          `<button class="pudge-study-extra-action" data-pudge-study-extra-action="${esc(id)}">${esc(action.label || id)}</button>`
-        ).join('')}
-      </div>`;
+      <div class="pudge-study-controls">
+        <select id="pudgeStudyDeck"><option value="">${ru() ? 'Колода…' : 'Study deck…'}</option></select>
+        <div class="pudge-study-action-row">
+          <div class="pudge-study-review-actions" role="group" aria-label="Review">
+            <button class="pudge-study-grade grade-again" data-pudge-study-review="again">${ru() ? 'Снова' : 'Again'}</button>
+            <button class="pudge-study-grade grade-hard" data-pudge-study-review="hard">${ru() ? 'Трудно' : 'Hard'}</button>
+            <button class="pudge-study-grade grade-good" data-pudge-study-review="good">${ru() ? 'Хорошо' : 'Good'}</button>
+            <button class="pudge-study-grade grade-easy" data-pudge-study-review="easy">${ru() ? 'Легко' : 'Easy'}</button>
+          </div>
+          <div class="pudge-study-add-wrap"><button class="pudge-study-add" data-pudge-study-add>${ru() ? 'Добавить' : 'Add'}</button></div>
+        </div>
+        ${footerActions.length ? `<div class="pudge-study-secondary-actions">${footerActions.map(action =>
+          `<button class="pudge-study-extra-action" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
+        ).join('')}</div>` : ''}
+      </div>`}`;
     pop.classList.add('open');
+    sizeStudyCard(pop);
     position(pop, anchorRect);
+    if (fallbackOnly) return;
     try {
       const decks = await apiDecks(activeToken.backend);
       if (activeToken?.token !== token) return;
@@ -414,7 +554,7 @@
     return id;
   }
 
-  function renderParsedParagraph(payload, paragraphIndex, {backend = 'jiten'} = {}) {
+  function renderParsedParagraph(payload, paragraphIndex, {backend = 'jiten', contextText = '', contextOffset = 0} = {}) {
     if (payload?.settings) applyStudyAppearance(payload.settings);
     const paragraphs = payload?.paragraphs || [];
     const text = String(paragraphs[Number(paragraphIndex)] || '');
@@ -438,7 +578,9 @@
       if (!surface) continue;
       const card = token.card || vocab.get(`${token.wordId}:${token.readingIndex}`) || {};
       const state = normalizeState(card);
-      const id = registerToken({...token, card, surface, sentence:text, backend});
+      const sentence = String(contextText || text);
+      const offset = contextText ? Number(contextOffset || 0) : 0;
+      const id = registerToken({...token, card, surface, sentence, contextStart:start + offset, backend});
       out += `<span class="pudge-study-word state-${esc(state)}" data-pudge-study-token="${id}">${esc(surface)}</span>`;
       pos = end;
     }
@@ -446,11 +588,11 @@
     return `<p>${out}</p>`;
   }
 
-  function renderParsedText(payload, {backend = 'jiten'} = {}) {
+  function renderParsedText(payload, {backend = 'jiten', contextText = '', contextOffset = 0} = {}) {
     if (payload?.settings) applyStudyAppearance(payload.settings);
     const paragraphs = payload?.paragraphs || [];
     return paragraphs.map((_, paragraphIndex) =>
-      renderParsedParagraph(payload, paragraphIndex, {backend})
+      renderParsedParagraph(payload, paragraphIndex, {backend, contextText, contextOffset})
     ).join('');
   }
 

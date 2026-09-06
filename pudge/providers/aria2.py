@@ -553,7 +553,8 @@ class Aria2Client:
         category: str,
         tags: list[str],
         paused: bool = False,
-    ) -> None:
+        stop_at_metadata: bool = False,
+    ) -> str:
         del category
         self._run_hook()
         self.ensure_running()
@@ -565,13 +566,20 @@ class Aria2Client:
             if wanted_hash and str(meta.get("info_hash") or "").lower() == wanted_hash:
                 try:
                     self._rpc_raw("aria2.tellStatus", [gid, ["gid", "status"]])
-                    return
+                    return wanted_hash or gid
                 except Aria2Error:
                     pass
         gid = self._safe_gid(release.info_hash, release.magnet)
+        torrent_payload = self._torrent_payload(release.torrent_url)
+        pause_initial = bool(paused or self.paused_on_add)
+        if stop_at_metadata and not torrent_payload:
+            # A magnet/remote source must run long enough to obtain metadata;
+            # pause-metadata then pauses the actual BitTorrent payload.
+            pause_initial = False
         options = {
             "dir": str(target),
-            "pause": "true" if (paused or self.paused_on_add) else "false",
+            "pause": "true" if pause_initial else "false",
+            "pause-metadata": "true" if stop_at_metadata else "false",
             "gid": gid,
             "bt-save-metadata": "true",
             "bt-load-saved-metadata": "true",
@@ -579,7 +587,7 @@ class Aria2Client:
             **self._seed_options(),
         }
         try:
-            returned_gid = self._add_source(release, options)
+            returned_gid = self._add_source(release, options, torrent_payload=torrent_payload)
         except Aria2Error as exc:
             if "GID" not in str(exc).upper() and "duplicate" not in str(exc).lower():
                 raise
@@ -620,6 +628,7 @@ class Aria2Client:
             "is_batch": bool(is_batch),
             "anime_title": anime_title,
             "release_score": float(score),
+            "expected_size_bytes": max(0, int(release.size_bytes or 0)),
             "source_url": str(release.torrent_url or release.link or ""),
             "magnet": self._richest_magnet(release.magnet, release.torrent_url),
             "listed_seeders": max(0, int(release.seeders or 0)),
@@ -628,6 +637,7 @@ class Aria2Client:
             "completed_on": 0,
         }
         self._save_metadata(metadata)
+        return wanted_hash or returned_gid
 
     def start(self, torrent_hash: str) -> None:
         self.ensure_running()
@@ -962,6 +972,7 @@ class Aria2Client:
                 "magnet": str(release.magnet or meta.get("magnet") or ""),
                 "listed_seeders": max(0, int(release.seeders or 0)),
                 "listed_leechers": max(0, int(release.leechers or 0)),
+                "expected_size_bytes": max(0, int(release.size_bytes or 0)),
             }
         )
         metadata[returned_gid] = meta
@@ -1022,6 +1033,17 @@ class Aria2Client:
             size = max(1, int(content.stat().st_size))
         except OSError:
             return None
+        try:
+            expected_size = max(0, int(meta.get("expected_size_bytes") or 0))
+        except (TypeError, ValueError):
+            expected_size = 0
+        if expected_size > 0:
+            size_ratio = size / max(1, expected_size)
+            # Nyaa size strings are rounded, so this is deliberately broad.
+            # It only rejects obvious orphan placeholders/wrong payloads; a
+            # normal completed torrent remains well inside this range.
+            if size_ratio < 0.65 or size_ratio > 1.35:
+                return None
         media_id = meta.get("media_id")
         media_episode = meta.get("episode")
         if media_id is None:
@@ -1231,6 +1253,32 @@ class Aria2Client:
                 "priority": 1 if entry.get("selected") != "false" else 0,
             })
         return result
+
+    def set_file_priority(
+        self,
+        torrent_hash: str,
+        file_indices: list[int],
+        priority: int,
+    ) -> None:
+        """Select files through aria2's 1-based ``select-file`` option."""
+        wanted = {int(index) for index in file_indices if int(index) >= 0}
+        if not wanted:
+            return
+        rows = self.files(torrent_hash)
+        selected = {
+            int(row.get("index") or 0)
+            for row in rows
+            if int(row.get("priority") or 0) > 0
+        }
+        if int(priority) > 0:
+            selected.update(wanted)
+        else:
+            selected.difference_update(wanted)
+        if not selected:
+            raise Aria2Error("aria2 selective download must keep at least one file selected")
+        value = ",".join(str(index + 1) for index in sorted(selected))
+        gid = self._resolve_gid(torrent_hash)
+        self._rpc_raw("aria2.changeOption", [gid, {"select-file": value}])
 
     def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
         self.ensure_running()

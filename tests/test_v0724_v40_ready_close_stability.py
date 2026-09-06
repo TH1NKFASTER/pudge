@@ -117,7 +117,7 @@ def test_akiba_v39_demotions_are_restored_from_upgrade_markers(tmp_path: Path) -
     assert len(manager.db.subtitle_jobs()) == 2
 
 
-def test_ocr_fallback_is_not_ready_by_default_and_is_reconciled(tmp_path: Path) -> None:
+def test_ocr_fallback_uses_timing_uncertain_group_and_policy_is_reversible(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     video, subtitle = _ready_episode(
         manager, title="Mugenjou-hen Movie 1 - Akaza Sairai", episode=1, origin="ocr"
@@ -127,12 +127,27 @@ def test_ocr_fallback_is_not_ready_by_default_and_is_reconciled(tmp_path: Path) 
     assert manager._reconcile_ocr_readiness_policy() == 1
     item = manager.db.episode_by_path(video)
     assert item is not None
-    assert item.state == "waiting_text_subtitles"
+    assert item.state == "couldnt_sync"
     assert item.subtitle_origin == "ocr"
     assert item.subtitle_path == subtitle
     jobs = manager.db.subtitle_jobs()
     assert len(jobs) == 1
-    assert "verified Japanese text" in str(jobs[0]["last_error"])
+    assert "timing confidence" in str(jobs[0]["last_error"])
+    first_next_check = float(jobs[0]["next_check"])
+
+    assert manager._reconcile_ocr_readiness_policy() == 0
+    jobs = manager.db.subtitle_jobs()
+    assert len(jobs) == 1
+    assert float(jobs[0]["next_check"]) == first_next_check
+
+    manager.config.matching.ocr_counts_as_ready = True
+    assert manager._reconcile_ocr_readiness_policy() == 1
+    item = manager.db.episode_by_path(video)
+    assert item is not None
+    assert item.state == "ready"
+    assert item.subtitle_origin == "ocr"
+    assert item.subtitle_path == subtitle
+    assert manager.db.subtitle_jobs() == []
 
 
 def test_ocr_ready_policy_is_separate_from_ocr_generation_setting(tmp_path: Path) -> None:

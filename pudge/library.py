@@ -362,7 +362,7 @@ def scan_library(
         )
         existing_selection_valid = bool(
             existing is not None
-            and existing.state in {"ready", "watched", "waiting_text_subtitles"}
+            and existing.state in {"ready", "watched", "waiting_text_subtitles", "couldnt_sync"}
             and (existing_external_valid or existing.embedded_subtitle_id is not None)
         )
         if existing is not None and existing.state == "ready" and existing_is_bitmap:
@@ -392,6 +392,8 @@ def scan_library(
                 subtitle_source = (
                     "external_bitmap" if subtitle is not None else "embedded_bitmap"
                 )
+            elif existing.state == "couldnt_sync":
+                subtitle_source = "raw_unsynced"
             else:
                 subtitle_source = "external" if subtitle is not None else "embedded"
         elif sidecar is not None:
@@ -430,6 +432,8 @@ def scan_library(
             )
         if existing is not None and existing.state == "watched":
             state = "watched"
+        elif existing is not None and existing.state == "couldnt_sync" and subtitle_source == "raw_unsynced":
+            state = "couldnt_sync"
         elif subtitle_source in {"external", "embedded"}:
             state = "ready"
         elif subtitle_source in {"external_bitmap", "embedded_bitmap"}:
@@ -463,7 +467,7 @@ def scan_library(
         )
         db.upsert_episode(item)
         persisted = db.episode_by_path(resolved) or item
-        if persisted.state in {"local", "waiting_subtitles", "waiting_text_subtitles"}:
+        if persisted.state in {"local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
             db.ensure_subtitle_job(
                 resolved,
                 persisted.media_id,

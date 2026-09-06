@@ -26,7 +26,8 @@ def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active():
     assert "activeDownloads().length>0||dueForegroundSubtitleJobs().length>0" in html
     assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
     assert "hasActiveForegroundWork()||foregroundSubtitleJobs().length||ui.emptyPolls<2" in html
-    assert "if(dueForegroundSubtitleJobs().length)return document.hidden||!ui.windowActive?5000:1000" in html
+    assert "if(ui.subtitleForegroundBlocked)return document.hidden||!ui.windowActive?15000:5000" in html
+    assert "return document.hidden||!ui.windowActive?5000:1000" in html
     assert "function ensureForegroundPollScheduled()" in html
 
 

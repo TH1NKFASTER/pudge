@@ -1,110 +1,110 @@
 # Algorithms and state model
 
-This document explains the rules behind results users can see. Pudge prefers to
-leave an uncertain item alone instead of making a confident-looking wrong match.
+This document describes the decisions behind what Pudge shows. It intentionally
+stays at product level: exact thresholds and implementation details belong in
+tests and source code.
 
-## Episode state machine
+Pudge generally prefers to leave an uncertain item waiting instead of showing a
+confident but wrong match.
 
-The implementation is centralized in `pudge/episode_state.py`; database mutations record accepted transitions in `episode_state_history`.
+## Episode readiness
 
-```mermaid
-stateDiagram-v2
-    [*] --> local: video scan
-    local --> waiting_subtitles: prepare
-    waiting_subtitles --> waiting_text_subtitles: bitmap detected
-    waiting_subtitles --> ready: text validated
-    waiting_text_subtitles --> ready: OCR or text replacement validated
-    ready --> watched: playback threshold
-    watched --> ready: explicit progress reset
-    local --> dropped: drop title
-    waiting_subtitles --> dropped: drop title
-    waiting_text_subtitles --> dropped: drop title
-    ready --> dropped: drop title
-    dropped --> local: explicit restore
-```
+An anime episode moves through a small set of useful states: found locally,
+preparing subtitles, waiting for text subtitles, Ready, and Watched. Dropped is
+explicit user intent and is not changed by a normal scan.
 
-Steps such as discovery, extraction, OCR, alignment, and validation belong to a
-background job, not to the episode itself. If one of those jobs stops, the
-library still remembers the last valid episode state.
+**Ready means usable now**, not merely "a subtitle used to exist". Pudge checks
+that the video still exists and that the selected subtitle file or embedded text
+track is still available. If a prepared subtitle disappears, Refresh can move
+the episode back to preparation and queue a repair.
 
-`transition_episode_state(current, requested, trigger)` enforces three rules:
+A normal scan does not erase watched progress. Resetting watched progress is an
+explicit action.
 
-1. scans cannot erase terminal/user states (`watched`, `dropped`);
-2. scans cannot demote `ready` or the bitmap fallback `waiting_text_subtitles`;
-3. only explicit repair triggers may move a valid episode backwards.
+## Subtitle preparation and repair
 
-When duplicate paths are merged, `stronger_episode_state` chooses the state with the greatest evidence in the order `dropped < local < waiting_subtitles < waiting_text_subtitles < ready < watched`. The special scan rules protect `dropped`, which is user intent rather than preparation strength.
+Pudge tries several kinds of subtitle evidence in increasing order of cost:
 
-## Subtitle selection
+1. local and embedded tracks;
+2. downloaded subtitle candidates such as Jimaku;
+3. ordinary timing checks and alignment;
+4. speech recognition only when simpler evidence is not enough.
 
-Subtitle preparation is a staged pipeline:
+Candidates are checked for language, title/episode identity, usable text, and
+reasonable timing. Pudge keeps the evidence behind a selection so Diagnostics
+can explain what happened later.
 
-1. discover embedded/external/Jimaku candidates;
-2. reject wrong languages and implausible episode identities;
-3. normalize text and timing;
-4. evaluate deterministic timing hypotheses (embedded reference, constant offset, ALASS, container chapters/transitions, audio activity);
-5. use cached tiny Japanese STT only after ordinary methods fail;
-6. validate language, coverage, timing and optional semantic evidence;
-7. select the best validated candidate and transition to `ready`.
+Accepted prepared subtitles are copied to Pudge's persistent data rather than
+left only in a disposable macOS cache. If an older Ready entry points to a
+missing cached file, Pudge treats that as a real repair case and rebuilds the
+subtitle even when the available candidate list has not changed.
 
-Bitmap subtitles enter OCR only when enabled. They remain evidence for `waiting_text_subtitles` but never masquerade as selectable text. FFT energy/spectral-flux regions gate spoken intervals for audiobook and fallback timing so highlights pause during silence.
+When many episodes need repair, each title's next unwatched or earliest blocked
+episode is treated as its frontier. Frontier episodes are handled before middle
+or later episodes so the library becomes watchable as soon as possible.
 
-### Sparse spoken prologues
+CPU-heavy subtitle work may pause while media is actively playing. The queued
+work stays persisted and resumes afterward.
 
-Some broadcast Japanese captions contain three to six spoken cues, then music/SFX cues throughout the opening, while the embedded translation is silent until the main dialogue. A broad activity window cannot isolate the prologue and may invent a wrong neighbouring offset.
+## Downloads and release choice
 
-After ALASS, Pudge can apply a rigid local correction only when all of these checks pass:
+Pudge is local-first. Before searching the network it checks the database and
+local media folders so an existing episode is not downloaded again.
 
-1. the spoken prologue starts in the first 45 seconds and is followed by at least 45 seconds without another dialogue cue;
-2. its onset-gap fingerprint has one stable match before the embedded track's main dialogue;
-3. start/end offsets agree within 0.8 seconds and the corrected onset error is at most 0.65 seconds;
-4. the first main-dialogue cue is already aligned within 0.9 seconds;
-5. shifting every cue in the pre-main block cannot reorder cues or overlap the main dialogue.
+Release ranking considers the requested title and episode, release group,
+resolution/source, Japanese audio evidence, size, seeders, and user preferences.
+Automatic download requires enough evidence to be confident. An existing
+completed download is kept unless a replacement is clearly better under the
+configured upgrade rules.
 
-The correction never shifts the already aligned main episode. Diagnostics keeps
-the evidence needed to explain why the correction was accepted.
+Torrent metadata is provenance, not episode identity. If two completed download
+records point to the same local episode, they must not make that episode bounce
+between states or repeatedly recreate subtitle jobs.
 
-## Nyaa ranking and automatic episode runs
+## Light Novels, manga, and audiobook series
 
-Before network search, Pudge builds local episode evidence from the database and a fresh scan. Automatic Planning runs skip every local episode. Search expands title aliases while retaining the requested episode or batch constraint.
+Libraries are grouped by a normalized series identity and volume number. Pudge
+uses explicit volume metadata when available and can also infer common forms
+such as `Volume 2`, `Vol. 2`, or Japanese volume labels.
 
-Release score combines title/episode identity, trusted/preferred/blocked group rules, resolution, codec, source, Japanese-audio evidence, size plausibility, seeders and explicit penalties such as upscales. Automatic selection requires the configured minimum score. Release upgrades additionally require `new score - old score >= Minimum release score gain` and obey the configured interval and per-run maximum.
+For audiobooks, a linked Light Novel can supply the missing volume identity.
+Inside a recognized series the UI uses simple `Volume N` labels even when the
+original filenames are inconsistent.
 
-## Inflected-form pitch accent
+Automatic LN/audiobook linking is conservative. A clear shared identity and
+compatible volume can produce a link; ambiguous candidates are left for manual
+selection. Existing manual links are never replaced automatically.
 
-For surface text `S`, token ruby ranges `(start, end, reading)` replace their exact slices to construct reading `R`. If uncovered kanji remain, Pudge falls back to the parser's token reading. Mora segmentation treats small kana as part of the preceding mora and the long-vowel mark as its own timing unit.
+## Paired reading and highlighting
 
-Accent selection is:
+Paired Light Novel/audiobook reading is based on text/audio anchors. Strong word
+or phrase anchors are preferred. Between them, Pudge interpolates progress and
+uses speech activity so highlighting does not race through silence.
 
-1. use token/surface accents when Jiten supplies them;
-2. otherwise take the dictionary card downstep;
-3. keep heiban `0`, or clamp a positive downstep to `len(morae(R))`;
-4. label the result `pitchDerived` when `R` differs from the dictionary reading.
+Near chapter starts or sparse passages, Pudge can use finer speech recognition
+and reading information to add more anchors. If the evidence is not precise
+enough, it falls back to a smoother coarse mapping rather than inventing exact
+word timings.
 
-A derived accent is a display fallback; it does not claim that the conjugated
-form has its own verified dictionary entry. The UI marks that distinction.
+## Dictionary readings and pitch accent
 
-## LN/audiobook automatic linking
+Pudge prefers reading and accent information supplied for the exact token or
+surface form. When only dictionary-form information is available, it may show a
+derived display fallback. Derived information is marked as such and is not
+presented as a separately verified dictionary entry.
 
-Titles are Unicode NFKC-normalized, HTML-decoded, case-folded and stripped of file extensions, media words, punctuation and volume markers. Volume is extracted from `vol`, `volume`, `v`, `第N巻` or `N巻`.
+## Background work
 
-For each unlinked audiobook and LN:
+Long-running imports, OCR, transcription, subtitle repair, and similar work is
+stored as resumable jobs. Jobs retain progress and retry information across UI
+refreshes and app restarts. Cancellation happens at safe boundaries rather than
+leaving half-written library state.
 
-- conflicting explicit volumes reject the candidate;
-- normalized title similarity uses RapidFuzz ratio;
-- equal explicit volumes add 8 points;
-- an equal AniList ID raises the score to at least 120;
-- the best candidate must score at least 90;
-- it must beat the runner-up by at least 8 points, including when several local volumes share one series-level AniList ID.
+## Companion sync
 
-An existing link is never overwritten. Identity propagation fills only a missing identity. These constraints make automatic linking useful for clean filenames while leaving genuinely ambiguous libraries for manual selection.
+The desktop remains the source of truth for local files and completed anime
+progress. Companion devices exchange progress events instead of opening the
+library database directly. Older offline progress cannot reopen an episode that
+was already completed on the desktop.
 
-## Background job persistence
-
-Every operation writes an `app_jobs` row with immutable ID, kind, retry payload, attempt parent, timestamps and mutable state/progress. Valid states are `queued`, `running`, `cancel_requested`, `succeeded`, `failed`, `cancelled`.
-
-Cancellation is cooperative at safe boundaries; subprocess-backed STT/OCR also receives termination. Retry creates a new attempt instead of erasing history. On startup, jobs left active are marked failed as interrupted. JSON payloads contain paths and local IDs needed for retry but no integration credentials.
-
-## Jimaku bundled trial
-
-The release workflow writes `PUDGE_TRIAL_JIMAKU_API_KEY` to a temporary package asset while building the archive and removes the source asset on exit. Runtime uses the bundled key for 48 hours after first use unless a personal key is configured. The bundled key is never persisted to the user's config.
+The wire-level details are documented in [MOBILE_SYNC_PROTOCOL.md](../MOBILE_SYNC_PROTOCOL.md).

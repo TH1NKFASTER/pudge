@@ -28,15 +28,22 @@ def test_audiobook_pause_uses_explicit_mpv_property(tmp_path: Path, monkeypatch)
     assert service.is_paused(7) is True
 
 
-def test_live_player_never_falls_back_to_reader_progress() -> None:
+def test_live_player_resume_keeps_player_but_forced_reader_start_restarts() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
 
-    marker = "if(state.alignment?.ready&&state.player_running&&state.audiobook_id){"
+    marker = "if(!forceReaderStart&&state.alignment?.ready&&state.player_running&&state.audiobook_id){"
     assert marker in html
+    assert "const forceReaderStart=wanted&&Number(ui.lnPairedStartFromReaderGeneration||0)===generation;" in html
     assert "if(appliedDesired!==wanted){" in html
     running_branch = html.split(marker, 1)[1].split("}else{", 1)[0]
     assert "light_novel_play_paired(" not in running_branch
     assert "lnReaderAudioProgress()" not in running_branch
+
+    force_marker = "if(wanted&&forceReaderStart){"
+    assert force_marker in html
+    force_branch = html.split(force_marker, 1)[1].split("}else{", 1)[0]
+    assert "light_novel_play_paired(" in force_branch
+    assert "lnReaderAudioProgress()" in force_branch
     assert "ui.lnPairedTransportPromise" in html
 
 

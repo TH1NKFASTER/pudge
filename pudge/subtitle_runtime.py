@@ -200,7 +200,7 @@ def repair_episode_subtitle(
             return False
         state = str(row["state"] or "local")
         next_state = state
-        if selection.is_text and state in {"local", "waiting_subtitles", "waiting_text_subtitles"}:
+        if selection.is_text and state in {"local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
             next_state = "ready"
         changed = (
             str(row["subtitle_path"] or "") != str(path_value or "")

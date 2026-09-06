@@ -242,6 +242,7 @@ def test_anilist_character_glossary_includes_unambiguous_short_names(
                     "edges": [
                         {
                             "node": {
+                                "id": 1234,
                                 "name": {
                                     "first": "Kazuto",
                                     "middle": None,
@@ -264,6 +265,8 @@ def test_anilist_character_glossary_includes_unambiguous_short_names(
     assert glossary["桐ヶ谷"] == "Kirigaya"
     assert glossary["和人"] == "Kazuto"
     assert glossary["キリト"] == "Kazuto Kirigaya"
+    rows = service.character_glossary(11757)
+    assert all(item.get("character_id") == 1234 for item in rows)
 
 
 def test_update_jiten_and_manga_cover_frontend_contracts() -> None:

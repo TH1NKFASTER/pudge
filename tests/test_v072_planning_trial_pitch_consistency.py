@@ -228,7 +228,7 @@ def test_inline_pitch_and_background_planning_frontend_contracts() -> None:
 
     assert "renderInlinePitch" in reading
     assert "inlinePitch: renderInlinePitch" in reading
-    assert "ln-pitch-ruby" in html and "lnrPitchAccent" in html
+    assert "lnrPitchAccent" not in html
     assert ".ln-reader.hide-pitch-accent" in css
     assert "planning_episode_download_status" in html
     assert "resumePlanningEpisodeDownload" in html

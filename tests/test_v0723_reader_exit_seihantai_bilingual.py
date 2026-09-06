@@ -144,7 +144,7 @@ def test_same_cue_japanese_chinese_second_line_is_removed_and_cache_is_new(tmp_p
     cleaned, result = clean_srt_for_playback(source, tmp_path / "cache")
     payload = cleaned.read_text(encoding="utf-8")
 
-    assert cleaned.name.startswith("v14-")
+    assert cleaned.name.startswith("v15-")
     assert "这是中文翻译台词" not in payload
     assert "我们继续说话" not in payload
     assert "これは日本語の台詞です" in payload

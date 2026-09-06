@@ -52,7 +52,7 @@ def test_weighted_highlight_finishes_word_before_switch() -> None:
     assert "lnPairedOffsetAtTime(state,estimatedTime)" in block
     assert "lnPairedOffsetAtTime(state,position)" in block
     assert "{reason:'poll',speechActive:true,previewOffset}" in block
-    assert "clamp_backward" in block
+    assert "clock_rebase_backward" in block
 
 
 def test_ln_audio_trace_exports_to_internal_debug_dir_and_reveals_file() -> None:

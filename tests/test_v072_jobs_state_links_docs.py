@@ -186,8 +186,8 @@ def test_frontend_bundled_key_and_documentation_contracts() -> None:
     assert ".form-grid > .setting-divider-title { grid-column:1 / -1" in html
     assert "job_center_cancel" not in html and "job_center_retry" not in html
     assert 'id="openJobCenter"' not in html and 'id="jobs"' not in html
-    assert "if(!book.linked_light_novel)" in media
-    assert "Find LN on Nyaa" in media and "audiobook_search_light_novel_nyaa" in media
+    assert "Find LN on Nyaa" not in media
+    assert "audiobook_search_light_novel_nyaa" in media
     assert "jimaku-trial-key" in trial + build
     assert "PUDGE_TRIAL_JIMAKU_API_KEY" in build
     assert "secrets.PUDGE_TRIAL_JIMAKU_API_KEY" in workflow

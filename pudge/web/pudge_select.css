@@ -5,7 +5,7 @@
 .pudge-select-button:disabled{opacity:.55;cursor:default}
 .pudge-select-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pudge-select-chevron{flex:0 0 auto;color:var(--muted);font-size:11px}
-.pudge-select-menu{position:fixed;z-index:12060;display:none;max-height:min(360px,55vh);overflow:auto;padding:5px;border:1px solid #4b6485;border-radius:9px;background:rgba(8,18,31,.985);box-shadow:0 14px 42px rgba(0,0,0,.55)}
+.pudge-select-menu{position:fixed;z-index:14060;display:none;max-height:min(360px,55vh);overflow:auto;padding:5px;border:1px solid #4b6485;border-radius:9px;background:rgba(8,18,31,.985);box-shadow:0 14px 42px rgba(0,0,0,.55)}
 .pudge-select-menu.open{display:grid;gap:3px}
 .pudge-select-option{width:100%;display:flex;align-items:center;min-height:31px;padding:6px 9px;border:0;border-radius:6px;background:transparent;color:var(--text);text-align:left;white-space:normal}
 .pudge-select-option:hover,.pudge-select-option.focused{background:#233d5e}

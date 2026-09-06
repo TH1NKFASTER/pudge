@@ -105,12 +105,12 @@ console.log(JSON.stringify({{initial,resumed,active,classes}}));
     assert result["active"] == "Pause"
 
 
-def test_live_mpv_transition_never_restarts_from_reader_progress() -> None:
+def _transport_case(*, started: bool) -> dict[str, object]:
     source = HTML.read_text(encoding="utf-8")
     toggle = _function(source, "toggleLnPairedPlayback")
     script = f"""
-const calls=[];
-global.ui={{lnBook:{{id:6,paired_audio:{{}}}},lnChapter:{{chapter_index:1}},lnPairedState:{{audiobook_id:75,alignment:{{ready:true}},playing:false,player_running:true,paused:false,speed:1}},lnPairedStarted:false,lnPairedExpanded:false}};
+const calls=[]; let livePlaying=false;
+global.ui={{lnBook:{{id:6,paired_audio:{{}}}},lnChapter:{{chapter_index:1}},lnPairedState:{{audiobook_id:75,alignment:{{ready:true}},playing:false,player_running:true,paused:true,speed:1}},lnPairedStarted:{str(started).lower()},lnPairedExpanded:false}};
 global.invalidateLnPairedPoll=()=>calls.push('invalidate');
 global.syncLnPairedTray=state=>calls.push(['sync',state.playing,state.player_running]);
 global.applyLnPairedPosition=async()=>calls.push('apply');
@@ -119,21 +119,30 @@ global.stopLnPairedPoll=()=>calls.push('stopPoll');
 global.lnReaderAudioProgress=()=>.42;
 global.$=()=>({{value:'1'}});
 global.pywebview={{api:{{
-  audiobook_set_paused:async()=>{{calls.push('unpause');return {{ok:true}};}},
-  light_novel_paired_state:async()=>{{calls.push('state');return {{audiobook_id:75,alignment:{{ready:true}},playing:true,player_running:true,paused:false,speed:1}};}},
-  light_novel_play_paired:async()=>{{calls.push('restart');return {{audiobook_id:75,alignment:{{ready:true}},playing:true,player_running:true,paused:false,speed:1}};}},
+  audiobook_set_paused:async()=>{{livePlaying=true;calls.push('unpause');return {{ok:true}};}},
+  light_novel_paired_state:async()=>{{calls.push('state');return {{audiobook_id:75,alignment:{{ready:true}},playing:livePlaying,player_running:true,paused:!livePlaying,speed:1}};}},
+  light_novel_play_paired:async(_book,_chapter,progress)=>{{livePlaying=true;calls.push(['restart',progress]);return {{audiobook_id:75,alignment:{{ready:true}},playing:true,player_running:true,paused:false,speed:1}};}},
   audiobook_stop:async()=>calls.push('stop'),
   light_novel_prepare_audio_alignment:async()=>{{}},
 }}}};
 {toggle}
 (async()=>{{const result=await toggleLnPairedPlayback();console.log(JSON.stringify({{calls,result,started:ui.lnPairedStarted}}));}})().catch(error=>{{console.error(error);process.exit(1);}});
 """
-    result = _run_node(script)
+    return _run_node(script)
+
+
+def test_first_listen_with_stale_live_mpv_restarts_from_reader_progress() -> None:
+    result = _transport_case(started=False)
+    assert ["restart", 0.42] in result["calls"]
+    assert "unpause" not in result["calls"]
+    assert result["result"]["playing"] is True
+    assert result["started"] is True
+
+
+def test_established_live_mpv_resume_unpauses_without_restart() -> None:
+    result = _transport_case(started=True)
     assert "unpause" in result["calls"]
-    assert "restart" not in result["calls"]
-    assert "state" in result["calls"]
-    assert "apply" in result["calls"]
-    assert "poll" in result["calls"]
+    assert not any(isinstance(call, list) and call and call[0] == "restart" for call in result["calls"])
     assert result["result"]["playing"] is True
     assert result["started"] is True
 

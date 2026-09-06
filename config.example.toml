@@ -140,6 +140,7 @@ ambiguity_margin = 8.0
 think = false
 keep_alive = "10m"
 temperature = 0.0
+reasoning_effort = "low"
 num_ctx = 8192
 timeout_seconds = 90.0
 subtitle_semantic_checks = false

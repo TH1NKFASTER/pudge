@@ -101,6 +101,13 @@ def test_audiobook_state_resumes_an_interrupted_queued_job(
         ],
         chapters=[{"index": 0, "title": "Book", "start": 0.0, "end": 3600.0}],
     )
+    # v158: background STT is only meaningful for audiobooks explicitly linked
+    # to a light novel.  An unlinked library book must stay idle.
+    with service.db.connect() as conn:
+        conn.execute(
+            "INSERT INTO reading_audio_links(ln_book_id,audiobook_id,alignment_mode,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (7001, int(book["id"]), "chapter", 1.0, 1.0),
+        )
     resumed: list[int] = []
     monkeypatch.setattr(
         service,

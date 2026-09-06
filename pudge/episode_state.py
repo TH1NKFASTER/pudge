@@ -12,6 +12,7 @@ class EpisodeState(StrEnum):
 
     LOCAL = "local"
     WAITING_SUBTITLES = "waiting_subtitles"
+    COULDNT_SYNC = "couldnt_sync"
     WAITING_TEXT_SUBTITLES = "waiting_text_subtitles"
     READY = "ready"
     WATCHED = "watched"
@@ -22,9 +23,10 @@ EPISODE_STATE_ORDER: dict[str, int] = {
     EpisodeState.DROPPED: 0,
     EpisodeState.LOCAL: 1,
     EpisodeState.WAITING_SUBTITLES: 2,
-    EpisodeState.WAITING_TEXT_SUBTITLES: 3,
-    EpisodeState.READY: 4,
-    EpisodeState.WATCHED: 5,
+    EpisodeState.COULDNT_SYNC: 3,
+    EpisodeState.WAITING_TEXT_SUBTITLES: 4,
+    EpisodeState.READY: 5,
+    EpisodeState.WATCHED: 6,
 }
 
 _ALLOWED: dict[str, set[str]] = {
@@ -37,6 +39,15 @@ _ALLOWED: dict[str, set[str]] = {
     },
     EpisodeState.WAITING_SUBTITLES: {
         EpisodeState.LOCAL,
+        EpisodeState.COULDNT_SYNC,
+        EpisodeState.WAITING_TEXT_SUBTITLES,
+        EpisodeState.READY,
+        EpisodeState.WATCHED,
+        EpisodeState.DROPPED,
+    },
+    EpisodeState.COULDNT_SYNC: {
+        EpisodeState.LOCAL,
+        EpisodeState.WAITING_SUBTITLES,
         EpisodeState.WAITING_TEXT_SUBTITLES,
         EpisodeState.READY,
         EpisodeState.WATCHED,
@@ -44,6 +55,7 @@ _ALLOWED: dict[str, set[str]] = {
     },
     EpisodeState.WAITING_TEXT_SUBTITLES: {
         EpisodeState.WAITING_SUBTITLES,
+        EpisodeState.COULDNT_SYNC,
         EpisodeState.READY,
         EpisodeState.WATCHED,
         EpisodeState.DROPPED,
@@ -91,6 +103,11 @@ def transition_episode_state(
         }:
             return old
         if old == EpisodeState.WAITING_TEXT_SUBTITLES and new in {
+            EpisodeState.LOCAL,
+            EpisodeState.WAITING_SUBTITLES,
+        }:
+            return old
+        if old == EpisodeState.COULDNT_SYNC and new in {
             EpisodeState.LOCAL,
             EpisodeState.WAITING_SUBTITLES,
         }:

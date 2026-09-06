@@ -226,21 +226,44 @@ class DebugSnapshotService:
         rows = list(self.manager.db.episodes(int(media_id)))
         if not rows:
             return None
+        anime = self.manager.db.get_anime(int(media_id))
+        is_movie = bool(
+            anime is not None
+            and str(getattr(anime, "format", "") or "").upper() == "MOVIE"
+        )
+        if is_movie:
+            return next((item for item in rows if item.episode is None), rows[0])
         if episode is not None:
             return next((item for item in rows if item.episode == int(episode)), None)
-        anime = self.manager.db.get_anime(int(media_id))
         if anime is not None:
             target = int(anime.next_episode)
             return next((item for item in rows if item.episode == target), None)
         return None
 
     def _target_episode(self, media_id: int, episode: int | None) -> int | None:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is not None and str(getattr(anime, "format", "") or "").upper() == "MOVIE":
+            return None
         if episode is not None:
             return int(episode)
-        anime = self.manager.db.get_anime(int(media_id))
-        if anime is None or str(getattr(anime, "format", "") or "").upper() == "MOVIE":
+        if anime is None:
             return None
         return max(1, int(anime.next_episode))
+
+    def _runtime_lines(self, *, per_file_limit: int = 2500) -> list[str]:
+        """Read current and rotated runtime logs, oldest first."""
+        base = self.runtime_log_path
+        rotated = []
+        for path in base.parent.glob(base.name + ".*"):
+            suffix = path.name[len(base.name) + 1 :]
+            if suffix.isdigit():
+                rotated.append((int(suffix), path))
+        lines: list[str] = []
+        # Higher numeric suffixes are older for RotatingFileHandler.
+        for _index, path in sorted(rotated, reverse=True):
+            lines.extend(tail_log(path, limit=per_file_limit))
+        lines.extend(tail_log(base, limit=per_file_limit))
+        return lines
 
     def snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
         media_id = int(media_id)
@@ -248,17 +271,37 @@ class DebugSnapshotService:
         if anime is None:
             raise ValueError(f"AniList id={media_id} is not in the local database")
         selected_episode = self._target_episode(media_id, episode)
+        # A debug snapshot must describe one coherent state. Diagnosis performs
+        # safe reconciliation, so run the same repairs before capturing the
+        # episode list instead of returning a pre-repair list next to a
+        # post-repair diagnosis.
+        self.manager.reconcile_prepared_subtitle_rows(media_id)
+        self.manager.reconcile_completed_download_rows(media_id, selected_episode)
         selected = self._selected_episode(media_id, selected_episode)
-        available_episodes = [
-            {
-                "episode": int(item.episode),
-                "state": str(item.state or ""),
-                "video_path": str(item.video_path),
-                "has_subtitles": bool(item.subtitle_path or item.embedded_subtitle_id is not None),
-            }
-            for item in self.manager.db.episodes(media_id)
-            if item.episode is not None
-        ]
+        available_episodes = []
+        for item in self.manager.db.episodes(media_id):
+            if item.episode is None:
+                continue
+            external_ready = False
+            if item.subtitle_path is not None:
+                try:
+                    external_ready = (
+                        item.subtitle_path.is_file()
+                        and item.subtitle_path.stat().st_size > 0
+                    )
+                except OSError:
+                    external_ready = False
+            available_episodes.append(
+                {
+                    "episode": int(item.episode),
+                    "state": str(item.state or ""),
+                    "video_path": str(item.video_path),
+                    "has_subtitles": bool(
+                        external_ready or item.embedded_subtitle_id is not None
+                    ),
+                    "subtitle_path_exists": external_ready,
+                }
+            )
         if (
             selected_episode is not None
             and not any(int(item["episode"]) == int(selected_episode) for item in available_episodes)
@@ -326,7 +369,7 @@ class DebugSnapshotService:
             / f"{media_id}-{selected_episode if selected_episode is not None else 'batch'}.json"
         )
         video_selection = _read_json(video_debug_path)
-        runtime_lines = tail_log(self.runtime_log_path, limit=2500)
+        runtime_lines = self._runtime_lines(per_file_limit=2500)
         needles = {str(media_id)}
         if video is not None:
             needles.add(video.name)
@@ -384,6 +427,11 @@ class DebugSnapshotService:
             "subtitle_selection": {
                 "selected": {
                     "path": str(selected.subtitle_path) if selected is not None and selected.subtitle_path else "",
+                    "path_exists": bool(
+                        selected is not None
+                        and selected.subtitle_path is not None
+                        and selected.subtitle_path.is_file()
+                    ),
                     "embedded_sid": selected.embedded_subtitle_id if selected is not None else None,
                     "origin": selected.subtitle_origin if selected is not None else "",
                     "state": selected.state if selected is not None else "",

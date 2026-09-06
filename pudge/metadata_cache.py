@@ -80,3 +80,24 @@ class MetadataCache:
             except OSError:
                 continue
         return removed
+
+    def clear(self) -> int:
+        """Remove every cached entry in this namespace.
+
+        Metadata caches are explicitly disposable, so callers that need a
+        manual refresh should invalidate the namespace instead of inventing a
+        second cache-busting key.
+        """
+        removed = 0
+        try:
+            rows = list(self.root.glob("*.json"))
+        except OSError:
+            return 0
+        for path in rows:
+            try:
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+        return removed

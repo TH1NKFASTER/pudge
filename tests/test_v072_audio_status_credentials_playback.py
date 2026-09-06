@@ -37,14 +37,15 @@ def test_jimaku_account_link_and_automatic_anilist_step_are_current() -> None:
     assert "updates AniList data automatically" in readme
 
 
-def test_transcription_runs_use_isolated_work_directories() -> None:
+def test_transcription_runs_use_fingerprint_isolated_resumable_chunk_directories() -> None:
     source = (ROOT / "pudge/audiobooks.py").read_text(encoding="utf-8")
-    worker = source[source.index("def _transcribe_worker"):source.index("def prepare_transcription")]
+    worker = source[source.index("def _transcription_checkpoint_dir"):source.index("def prepare_transcription")]
 
-    assert "tempfile.mkdtemp" in worker
-    assert 'prefix=f".{output.stem}-work-"' in worker
-    assert 'temporary = work_dir / f"{output.name}.tmp"' in worker
-    assert 'output.parent / f".{output.stem}-work"' not in worker
+    assert 'return output.with_name(f".{output.stem}-chunks")' in worker
+    assert 'chunk-{chunk_number:05d}.json' in worker
+    assert 'self._valid_stt_chunk_result(result_path)' in worker
+    assert 'temporary=output.with_suffix(output.suffix+".tmp")' in worker
+    assert "tempfile.mkdtemp" not in worker
 
 
 def test_long_countdowns_hide_hours_and_playback_defaults_live_in_advanced() -> None:

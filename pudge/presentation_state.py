@@ -135,6 +135,12 @@ def derive_episode_presentation(
             "ready": False,
             "action_code": action_code,
         }
+    if local_exists and local_state == "couldnt_sync":
+        return {
+            "status": "couldnt_sync",
+            "ready": False,
+            "action_code": "",
+        }
     if local_exists:
         return {
             "status": "waiting_subtitles",

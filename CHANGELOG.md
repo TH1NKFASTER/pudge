@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v0.7.26
+
+- Made Ready subtitles durable: Pudge now keeps accepted prepared subtitles outside disposable macOS caches, rechecks missing files on Refresh, and automatically repairs stale Ready entries.
+- Prioritized subtitle repair around what can be watched next. The next unwatched or earliest blocked episode of each title is repaired before later episodes, while heavy work still waits during active playback and resumes afterward.
+- Fixed Ready/Completed presentation so a later downloaded episode cannot hide a broken earlier unwatched episode.
+- Prevented repeated subtitle jobs caused by duplicate completed torrent records, and forced a real rebuild when an older prepared subtitle is missing even if the candidate list has not changed.
+- Improved Light Novel/audiobook paired highlighting around chapter starts and sparse anchor regions, and restored compact study cards that expand only when their content needs more space.
+- Grouped audiobooks by series and volume, normalized grouped labels to `Volume N`, kept the nearest unfinished volumes visible, and added series/volume selection for bulk actions.
+- Recovered selective LN audiobook downloads after restarts and kept audiobook search/download views local-first while network enrichment runs.
+- Updated backup handling so Pudge-managed prepared subtitles remain included after the new durable subtitle storage change.
+- Refreshed the README, user guide, algorithms overview, development notes, companion protocol, and release instructions for the 0.7.26 behavior.
+
 ## v0.7.25
 
 - Made the macOS window lifecycle behave like a native Mac app: the red close button and `Cmd+W` hide the window without stopping Pudge, reopening from the Dock restores the same live session, and `Cmd+Q` remains the explicit full quit path; also fixed the PyObjC shutdown crash seen on window close.
