@@ -20,21 +20,31 @@ def test_manga_ocr_cache_status_uses_only_region_artifacts(tmp_path: Path) -> No
             (book_id, now),
         )
     service = MangaService(db, cache_dir=tmp_path / "cache", python="/bin/false")
-    assert service.ocr_cache_status(book_id) == {
-        "book_id": book_id, "cached_pages": 0, "total_pages": 3, "complete": False
-    }
+    status = service.ocr_cache_status(book_id)
+    assert status["book_id"] == book_id
+    assert status["cached_pages"] == 0
+    assert status["ready_pages"] == 0
+    assert status["empty_pages"] == 0
+    assert status["partial_pages"] == 0
+    assert status["unknown_pages"] == 0
+    assert status["total_pages"] == 3
+    assert status["complete"] is False
     with db.connect() as conn:
         assert conn.execute(
             "SELECT COUNT(*) FROM manga_ocr_cache WHERE region_key='full'"
         ).fetchone()[0] == 0
         conn.execute(
             "INSERT INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-            "VALUES(?,1,'pudge-manga-regions-v5','[]',?)",
+            "VALUES(?,1,'pudge-manga-regions-v59-layout-token-geometry','[]',?)",
             (book_id, now),
         )
-    assert service.ocr_cache_status(book_id)["cached_pages"] == 1
+    status = service.ocr_cache_status(book_id)
+    assert status["cached_pages"] == 0
+    assert status["unknown_pages"] == 1
     service.invalidate_region_cache(book_id)
-    assert service.ocr_cache_status(book_id)["cached_pages"] == 0
+    status = service.ocr_cache_status(book_id)
+    assert status["cached_pages"] == 0
+    assert status["unknown_pages"] == 0
 
 
 def test_manga_ui_guards_page_identity_and_supports_whole_book_ocr() -> None:

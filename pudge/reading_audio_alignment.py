@@ -1361,6 +1361,146 @@ def _prune_unreachable_leading_anchors(
     return output
 
 
+def _prune_rejoining_local_rate_outliers(
+    anchors: list[dict[str, Any]],
+    *,
+    max_rate: float,
+    preferred_rate: float | None = None,
+    max_offset_exclusive: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Drop transient dense-clock anchors that exceed a verified local rate.
+
+    The leading-prefix verifier already derives a chapter-specific maximum
+    bridge rate from real matched speech.  Dense paired clocks can still carry
+    an intermediate edge that races above that envelope and then rejoins it a
+    fraction of a second later.  Only prune such *rejoining* outliers: if no
+    later anchor is reachable from the last accepted point, preserve the tail
+    unchanged rather than inventing a new clock.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for row in anchors:
+        if isinstance(row, dict):
+            rows.append(dict(row))
+    if len(rows) < 3:
+        return rows, {"dropped": 0, "max_rate": round(float(max_rate), 3)}
+
+    # This guard exists for the verified leading-prefix clock only. Applying
+    # the same bootstrap envelope to the whole chapter can delete legitimate
+    # later dense-word anchors.
+    tail: list[dict[str, Any]] = []
+    if max_offset_exclusive is not None:
+        cutoff = max(0.0, float(max_offset_exclusive))
+        split_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if float(row.get("offset") or 0.0) >= cutoff - 1e-6
+            ),
+            len(rows),
+        )
+        tail = rows[split_index:]
+        rows = rows[:split_index]
+        if len(rows) < 3:
+            return [*rows, *tail], {
+                "dropped": 0,
+                "max_rate": round(float(max_rate), 3),
+                "max_offset_exclusive": round(cutoff, 3),
+            }
+
+    limit = max(1.0, float(max_rate))
+    preferred_limit = None
+    if preferred_rate is not None and float(preferred_rate) > 0.0:
+        # max_rate is a hard safety ceiling.  When the chapter verifier gives
+        # us a real local speaking rate, prefer a rejoin close to that rate
+        # instead of the first merely-legal point under the broad ceiling.
+        preferred_limit = min(limit, max(1.0, float(preferred_rate) * 1.20))
+    output = [rows[0]]
+    dropped: list[dict[str, float]] = []
+    index = 1
+    while index < len(rows):
+        previous = output[-1]
+        previous_offset = float(previous.get("offset") or 0.0)
+        previous_time = float(previous.get("time") or 0.0)
+        row = rows[index]
+        offset = float(row.get("offset") or previous_offset)
+        time_value = float(row.get("time") or previous_time)
+        characters = offset - previous_offset
+        seconds = time_value - previous_time
+
+        if characters < -1e-6 or seconds < -1e-6:
+            # The helper is only allowed to prune a transient fast-forward
+            # spike. Preserve any non-monotonic tail for the existing alignment
+            # safeguards instead of silently deleting unrelated anchors.
+            output.extend(rows[index:])
+            break
+        rate = characters / max(0.02, seconds)
+        if characters <= 0.0 or rate <= limit + 1e-9:
+            output.append(row)
+            index += 1
+            continue
+
+        # Do not delete an unsupported tail.  A bad intermediate anchor is safe
+        # to remove only when the existing clock itself supplies a later point
+        # that rejoins the verified envelope from the last accepted anchor.
+        rejoin_index = None
+        fallback_rejoin_index = None
+        for candidate_index in range(index + 1, len(rows)):
+            candidate = rows[candidate_index]
+            candidate_offset = float(candidate.get("offset") or previous_offset)
+            candidate_time = float(candidate.get("time") or previous_time)
+            candidate_chars = candidate_offset - previous_offset
+            candidate_seconds = candidate_time - previous_time
+            if candidate_chars < -1e-6 or candidate_seconds <= 0.0:
+                continue
+            candidate_rate = candidate_chars / max(0.02, candidate_seconds)
+            if candidate_rate <= limit + 1e-9 and fallback_rejoin_index is None:
+                fallback_rejoin_index = candidate_index
+            if preferred_limit is not None and candidate_rate <= preferred_limit + 1e-9:
+                rejoin_index = candidate_index
+                break
+            if preferred_limit is None and fallback_rejoin_index is not None:
+                rejoin_index = fallback_rejoin_index
+                break
+
+        if rejoin_index is None:
+            rejoin_index = fallback_rejoin_index
+        if rejoin_index is None:
+            output.extend(rows[index:])
+            break
+
+        for skipped in rows[index:rejoin_index]:
+            skipped_offset = float(skipped.get("offset") or previous_offset)
+            skipped_time = float(skipped.get("time") or previous_time)
+            dropped.append({
+                "offset": round(skipped_offset, 4),
+                "time": round(skipped_time, 3),
+                "rate": round(
+                    (skipped_offset - previous_offset)
+                    / max(0.02, skipped_time - previous_time),
+                    3,
+                ),
+            })
+        # The rejoin intentionally borrows wall-clock silence to slow a
+        # transient fast prefix edge.  Mark that segment so the runtime
+        # activity clock does not immediately compress the borrowed pause away
+        # and recreate the exact same visual runaway.
+        rows[rejoin_index]["wall_clock_from_previous"] = True
+        index = rejoin_index
+
+    debug = {
+        "dropped": len(dropped),
+        "max_rate": round(limit, 3),
+        "anchors": dropped,
+    }
+    if preferred_limit is not None:
+        debug["preferred_rate"] = round(float(preferred_rate), 3)
+        debug["preferred_max_rate"] = round(preferred_limit, 3)
+    if max_offset_exclusive is not None:
+        debug["max_offset_exclusive"] = round(float(max_offset_exclusive), 3)
+    return [*output, *tail], debug
+
+
 def _unsafe_leading_anchor_jump(
     anchors: list[dict[str, Any]],
 ) -> dict[str, float] | None:
@@ -3192,6 +3332,31 @@ def align_light_novel_to_transcript(
                 chapter.pop("punctuation_boundaries", []),
                 chapter["speech_regions"],
             )
+
+        # Punctuation/VAD enrichment can itself create a transient fast edge
+        # inside the recovered prose prefix (real S&W v1: 8->19.999 and
+        # 25->32.999). Run the verified-rate guard after that enrichment and
+        # only before the verifier endpoint. The old pre-enrichment,
+        # whole-chapter pass missed these synthetic anchors and pruned
+        # thousands of legitimate anchors later in the chapter.
+        leading_debug = chapter.get("leading_prefix_debug")
+        if isinstance(leading_debug, dict) and leading_debug.get("recovered"):
+            max_bridge_rate = float(leading_debug.get("max_bridge_rate") or 0.0)
+            verified_through_offset = float(
+                leading_debug.get("verified_through_offset") or 0.0
+            )
+            if max_bridge_rate > 0.0 and verified_through_offset > 0.0:
+                chapter["anchors"], local_rate_debug = _prune_rejoining_local_rate_outliers(
+                    list(chapter["anchors"]),
+                    max_rate=max_bridge_rate,
+                    preferred_rate=float(leading_debug.get("verified_rate") or 0.0),
+                    max_offset_exclusive=verified_through_offset,
+                )
+                chapter["leading_prefix_debug"] = {
+                    **leading_debug,
+                    "local_rate_prune": local_rate_debug,
+                }
+
         chapter["punctuation_pause_count"] = pause_count
         for key in ("first_anchor_time", "last_anchor_time", "estimated_start", "estimated_end", "leading_prefix_start"):
             chapter.pop(key, None)

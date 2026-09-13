@@ -6,21 +6,14 @@ import shutil
 import sqlite3
 import time
 from pathlib import Path
+
+from .process_utils import pid_alive
 from typing import Any
 
 from .app_session import SESSION_PATH
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+_pid_alive = pid_alive
 
 
 class SafeModeController:

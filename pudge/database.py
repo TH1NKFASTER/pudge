@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -99,6 +100,8 @@ CREATE TABLE IF NOT EXISTS subtitle_jobs (
     heartbeat_at REAL NOT NULL DEFAULT 0,
     progress_json TEXT NOT NULL DEFAULT '{}',
     action_code TEXT NOT NULL DEFAULT '',
+    generation INTEGER NOT NULL DEFAULT 0,
+    owner_token TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL,
     FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
@@ -177,6 +180,7 @@ CREATE TABLE IF NOT EXISTS subtitle_history (
     status TEXT NOT NULL DEFAULT 'selected',
     reason TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
+    video_fingerprint TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     FOREIGN KEY(media_id) REFERENCES anime(media_id) ON DELETE SET NULL
 );
@@ -533,6 +537,14 @@ class Database:
                 "UPDATE manga_books SET read_pages="
                 "CASE WHEN position>0 THEN MIN(page_count,position+1) ELSE 0 END"
             )
+        self._ensure_column(conn, "subtitle_jobs", "generation", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "subtitle_jobs", "owner_token", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column(
+            conn,
+            "subtitle_history",
+            "video_fingerprint",
+            "TEXT NOT NULL DEFAULT ''",
+        )
         self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
         self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")
@@ -1021,6 +1033,43 @@ class Database:
     def delete_state(self, key: str) -> None:
         with self.connect() as conn:
             conn.execute("DELETE FROM state WHERE key=?", (key,))
+
+    def set_state_if_subtitle_job_owned(
+        self,
+        key: str,
+        value: str,
+        *,
+        video_path: Path,
+        generation: int,
+        owner_token: str,
+    ) -> bool:
+        with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(
+                conn, video_path, generation, owner_token
+            ):
+                return False
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, value, time.time()),
+            )
+            return True
+
+    def delete_state_if_subtitle_job_owned(
+        self,
+        key: str,
+        *,
+        video_path: Path,
+        generation: int,
+        owner_token: str,
+    ) -> bool:
+        with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(
+                conn, video_path, generation, owner_token
+            ):
+                return False
+            conn.execute("DELETE FROM state WHERE key=?", (key,))
+            return True
 
 
     def relation_graph_for_media(self, media_id: int) -> dict[str, object] | None:
@@ -1643,6 +1692,48 @@ class Database:
             ).fetchone()
         return bool(row)
 
+    @staticmethod
+    def _subtitle_job_owner_matches(
+        conn: sqlite3.Connection,
+        video_path: Path,
+        generation: int | None,
+        owner_token: str | None,
+    ) -> bool:
+        if generation is None:
+            return True
+        row = conn.execute(
+            "SELECT generation,owner_token FROM subtitle_jobs WHERE video_path=?",
+            (str(video_path),),
+        ).fetchone()
+        return bool(
+            row is not None
+            and int(row["generation"] or 0) == int(generation)
+            and str(row["owner_token"] or "") == str(owner_token or "")
+        )
+
+    def subtitle_job_owned(
+        self, video_path: Path, generation: int, owner_token: str
+    ) -> bool:
+        with self.connect() as conn:
+            return self._subtitle_job_owner_matches(
+                conn, video_path, int(generation), str(owner_token)
+            )
+
+    @classmethod
+    def _lock_subtitle_job_owner(
+        cls,
+        conn: sqlite3.Connection,
+        video_path: Path,
+        generation: int | None,
+        owner_token: str | None,
+    ) -> bool:
+        """Serialize an owner check with the mutation that follows it."""
+        if generation is not None:
+            conn.execute("BEGIN IMMEDIATE")
+        return cls._subtitle_job_owner_matches(
+            conn, video_path, generation, owner_token
+        )
+
     def set_subtitle_ready(
         self,
         video_path: Path,
@@ -1650,8 +1741,15 @@ class Database:
         embedded_subtitle_id: int | None = None,
         *,
         origin: str = "",
-    ) -> None:
+        generation: int | None = None,
+        owner_token: str | None = None,
+        clear_state_keys: Iterable[str] = (),
+    ) -> bool:
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(
+                conn, video_path, generation, owner_token
+            ):
+                return False
             previous = conn.execute(
                 "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
             ).fetchone()
@@ -1671,7 +1769,16 @@ class Database:
                     str(video_path),
                 ),
             )
-            conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),))
+            for key in clear_state_keys:
+                if str(key):
+                    conn.execute("DELETE FROM state WHERE key=?", (str(key),))
+            if generation is None:
+                conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),))
+            else:
+                conn.execute(
+                    "DELETE FROM subtitle_jobs WHERE video_path=? AND generation=? AND owner_token=?",
+                    (str(video_path), int(generation), str(owner_token or "")),
+                )
             if previous is not None and str(previous["state"] or "") != resolved and resolved == "ready":
                 version = str(time.time_ns())
                 conn.execute(
@@ -1679,6 +1786,7 @@ class Database:
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
                     ("ready_state_version", version, now),
                 )
+            return True
 
 
     def set_waiting_text_subtitles(
@@ -1686,9 +1794,14 @@ class Database:
         video_path: Path,
         subtitle_path: Path | None = None,
         embedded_subtitle_id: int | None = None,
-    ) -> None:
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Keep a bitmap fallback for Library-only playback and retry text subs."""
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             resolved = self._transition_episode(
                 conn, video_path, "waiting_text_subtitles", trigger="bitmap_detected"
             )
@@ -1703,15 +1816,21 @@ class Database:
                     str(video_path),
                 ),
             )
+            return True
 
 
     def set_ocr_fallback_not_ready(
         self,
         video_path: Path,
         subtitle_path: Path | None,
-    ) -> None:
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Keep a cached OCR SRT playable without treating it as verified Ready."""
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             resolved = self._transition_episode(
                 conn, video_path, "waiting_text_subtitles", trigger="ocr_fallback"
             )
@@ -1725,6 +1844,7 @@ class Database:
                     str(video_path),
                 ),
             )
+            return True
 
     def set_couldnt_sync_subtitle(
         self,
@@ -1732,14 +1852,13 @@ class Database:
         subtitle_path: Path,
         *,
         origin: str = "",
-    ) -> None:
-        """Retain a confident raw text candidate while background sync retries.
-
-        The path is intentionally the original provider/local candidate, not a
-        cleaned or partially aligned derivative.  This makes the explicit
-        "watch raw" action safe for manual mpv timing.
-        """
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
+        """Retain a confident raw text candidate while background sync retries."""
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             resolved = self._transition_episode(
                 conn, video_path, "couldnt_sync", trigger="subtitle_sync_failed"
             )
@@ -1754,6 +1873,7 @@ class Database:
                     str(video_path),
                 ),
             )
+            return True
 
     def restore_ready_selection_for_upgrade(
         self,
@@ -1792,9 +1912,17 @@ class Database:
                 ),
             )
             return resolved == "ready"
-    def clear_subtitle_selection(self, video_path: Path) -> None:
+    def clear_subtitle_selection(
+        self,
+        video_path: Path,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Drop a stale prepared subtitle while keeping the retry job intact."""
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             resolved = self._transition_episode(
                 conn, video_path, "waiting_subtitles", trigger="subtitle_invalidated"
             )
@@ -1803,6 +1931,7 @@ class Database:
                 "state=?,updated_at=? WHERE video_path=?",
                 (resolved, time.time(), str(video_path)),
             )
+            return True
 
     def repair_bitmap_ready_rows(self) -> int:
         """Move legacy image-subtitle rows back to text-subtitle preparation."""
@@ -2008,6 +2137,7 @@ class Database:
                     episode=COALESCE(excluded.episode,subtitle_jobs.episode),
                     state='pending',stage='queued',attempts=0,next_check=excluded.next_check,
                     lease_until=0,heartbeat_at=0,progress_json='{}',action_code='',
+                    generation=subtitle_jobs.generation+1,owner_token='',
                     last_error=excluded.last_error,updated_at=excluded.updated_at
                 """,
                 (str(resolved_video), media_id, episode, now, error[-1000:], now),
@@ -2051,12 +2181,24 @@ class Database:
                 ),
             )
 
-    def delete_subtitle_job(self, video_path: Path) -> None:
+    def delete_subtitle_job(
+        self,
+        video_path: Path,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         with self.connect() as conn:
-            conn.execute(
-                "DELETE FROM subtitle_jobs WHERE video_path=?",
-                (str(video_path),),
-            )
+            if generation is None:
+                cursor = conn.execute(
+                    "DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),)
+                )
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM subtitle_jobs WHERE video_path=? AND generation=? AND owner_token=?",
+                    (str(video_path), int(generation), str(owner_token or "")),
+                )
+            return bool(cursor.rowcount)
 
     def ensure_subtitle_job(
         self,
@@ -2218,8 +2360,9 @@ class Database:
         *,
         lease_seconds: float = 25 * 60,
     ) -> list[sqlite3.Row]:
-        """Atomically claim pending jobs so two refresh threads cannot run them twice."""
+        """Atomically claim pending jobs and stamp this worker as the owner."""
         now = time.time()
+        owner_token = secrets.token_hex(16)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
@@ -2230,16 +2373,22 @@ class Database:
                 + " LIMIT ?",
                 (now, now, limit),
             ).fetchall()
-            if rows:
-                paths = [str(row["video_path"]) for row in rows]
-                placeholders = ",".join("?" for _ in paths)
-                conn.execute(
-                    f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
-                    f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',updated_at=? "
-                    f"WHERE video_path IN ({placeholders})",
-                    (now + lease_seconds, now + lease_seconds, now, now, *paths),
-                )
-        return rows
+            if not rows:
+                return []
+            paths = [str(row["video_path"]) for row in rows]
+            placeholders = ",".join("?" for _ in paths)
+            conn.execute(
+                f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
+                f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',owner_token=?,updated_at=? "
+                f"WHERE video_path IN ({placeholders})",
+                (now + lease_seconds, now + lease_seconds, now, owner_token, now, *paths),
+            )
+            refreshed = conn.execute(
+                f"SELECT * FROM subtitle_jobs WHERE video_path IN ({placeholders})",
+                tuple(paths),
+            ).fetchall()
+            by_path = {str(row["video_path"]): row for row in refreshed}
+            return [by_path[path] for path in paths if path in by_path]
 
     def claim_subtitle_jobs_for_paths(
         self,
@@ -2248,11 +2397,12 @@ class Database:
         limit: int = 10,
         lease_seconds: float = 25 * 60,
     ) -> list[sqlite3.Row]:
-        """Claim due jobs only for the supplied newly completed videos."""
+        """Claim due jobs only for supplied paths and stamp this worker as owner."""
         paths = list(dict.fromkeys(str(Path(path)) for path in video_paths if str(path)))
         if not paths or limit <= 0:
             return []
         now = time.time()
+        owner_token = secrets.token_hex(16)
         placeholders = ",".join("?" for _ in paths)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2265,21 +2415,37 @@ class Database:
                 + " LIMIT ?",
                 (*paths, now, now, max(1, int(limit))),
             ).fetchall()
-            if rows:
-                claimed = [str(row["video_path"]) for row in rows]
-                claimed_placeholders = ",".join("?" for _ in claimed)
-                conn.execute(
-                    f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
-                    f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',updated_at=? "
-                    f"WHERE video_path IN ({claimed_placeholders})",
-                    (now + lease_seconds, now + lease_seconds, now, now, *claimed),
-                )
-        return rows
+            if not rows:
+                return []
+            claimed = [str(row["video_path"]) for row in rows]
+            claimed_placeholders = ",".join("?" for _ in claimed)
+            conn.execute(
+                f"UPDATE subtitle_jobs SET state='processing',stage='discovering',"
+                f"next_check=?,lease_until=?,heartbeat_at=?,action_code='',owner_token=?,updated_at=? "
+                f"WHERE video_path IN ({claimed_placeholders})",
+                (now + lease_seconds, now + lease_seconds, now, owner_token, now, *claimed),
+            )
+            refreshed = conn.execute(
+                f"SELECT * FROM subtitle_jobs WHERE video_path IN ({claimed_placeholders})",
+                tuple(claimed),
+            ).fetchall()
+            by_path = {str(row["video_path"]): row for row in refreshed}
+            return [by_path[path] for path in claimed if path in by_path]
 
-    def defer_subtitle_job(self, video_path: Path, error: str, delay_seconds: float) -> None:
+    def defer_subtitle_job(
+        self,
+        video_path: Path,
+        error: str,
+        delay_seconds: float,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Return a claimed job to pending without counting a media/preparation failure."""
         now = time.time()
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             conn.execute(
                 """
                 UPDATE subtitle_jobs SET state='pending',stage='retry_scheduled',priority=0,
@@ -2292,41 +2458,63 @@ class Database:
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
+            return True
 
-    def reset_subtitle_job_attempts(self, video_path: Path) -> None:
+    def reset_subtitle_job_attempts(
+        self, video_path: Path, *, generation: int | None = None, owner_token: str | None = None
+    ) -> bool:
         """Reset failure backoff after the discoverable candidate set changes."""
         now = time.time()
         with self.connect() as conn:
-            conn.execute(
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
+            cursor = conn.execute(
                 "UPDATE subtitle_jobs SET attempts=0,updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
+            return bool(cursor.rowcount)
 
-    def postpone_subtitle_job(self, video_path: Path, error: str, delay_seconds: float) -> None:
+    def postpone_subtitle_job(
+        self,
+        video_path: Path,
+        error: str,
+        delay_seconds: float,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
+        now = time.time()
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             conn.execute(
                 """
-                UPDATE subtitle_jobs SET attempts=attempts+1,stage='retry_scheduled',priority=0,
+                UPDATE subtitle_jobs SET attempts=attempts+1,state='pending',stage='retry_scheduled',priority=0,
                 lease_until=0,next_check=?,last_error=?,updated_at=?
                 WHERE video_path=?
                 """,
-                (time.time() + delay_seconds, error[-1000:], time.time(), str(video_path)),
-            )
-            conn.execute(
-                "UPDATE subtitle_jobs SET state='pending' WHERE video_path=?",
-                (str(video_path),),
+                (now + delay_seconds, error[-1000:], now, str(video_path)),
             )
             conn.execute(
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
-                (time.time(), str(video_path)),
+                (now, str(video_path)),
             )
+            return True
 
     def postpone_bitmap_ocr_job(
-        self, video_path: Path, error: str, delay_seconds: float
-    ) -> None:
+        self,
+        video_path: Path,
+        error: str,
+        delay_seconds: float,
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Retry bitmap OCR without discarding the already prepared PGS source."""
         now = time.time()
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             conn.execute(
                 """
                 UPDATE subtitle_jobs SET attempts=attempts+1,stage='retry_scheduled',priority=0,
@@ -2340,6 +2528,7 @@ class Database:
                 "WHERE video_path=?",
                 (now, str(video_path)),
             )
+            return True
 
     def update_subtitle_job_stage(
         self,
@@ -2348,11 +2537,15 @@ class Database:
         *,
         progress: dict[str, object] | None = None,
         lease_seconds: float = 25 * 60,
-    ) -> None:
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         """Persist worker progress and renew its processing lease."""
         now = time.time()
         with self.connect() as conn:
-            conn.execute(
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
+            cursor = conn.execute(
                 """
                 UPDATE subtitle_jobs
                 SET state='processing',stage=?,heartbeat_at=?,lease_until=?,next_check=?,
@@ -2369,15 +2562,21 @@ class Database:
                     str(video_path),
                 ),
             )
+            return bool(cursor.rowcount)
 
     def mark_subtitle_job_needs_action(
         self,
         video_path: Path,
         error: str,
         action_code: str,
-    ) -> None:
+        *,
+        generation: int | None = None,
+        owner_token: str | None = None,
+    ) -> bool:
         now = time.time()
         with self.connect() as conn:
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
+                return False
             conn.execute(
                 """
                 UPDATE subtitle_jobs
@@ -2391,6 +2590,7 @@ class Database:
                 "UPDATE episodes SET state='waiting_subtitles',updated_at=? WHERE video_path=?",
                 (now, str(video_path)),
             )
+            return True
 
     def priority_subtitle_job_count(self, *, min_priority: int = 200) -> int:
         """Count manual/high-priority subtitle jobs still awaiting an attempt."""
@@ -2691,6 +2891,33 @@ class Database:
                 (time.time(), new_info_hash.lower()),
             )
 
+    @staticmethod
+    def _sampled_video_fingerprint(
+        video_path: Path, *, chunk_size: int = 128 * 1024
+    ) -> str | None:
+        """Path-independent identity for safe subtitle-history recovery."""
+
+        path = Path(video_path)
+        try:
+            size = path.stat().st_size
+            digest = hashlib.sha256()
+            digest.update(str(size).encode("ascii"))
+            with path.open("rb") as handle:
+                offsets = sorted(
+                    {
+                        0,
+                        max(0, size // 2 - chunk_size // 2),
+                        max(0, size - chunk_size),
+                    }
+                )
+                for offset in offsets:
+                    handle.seek(offset)
+                    digest.update(offset.to_bytes(8, "big", signed=False))
+                    digest.update(handle.read(chunk_size))
+            return digest.hexdigest()
+        except OSError:
+            return None
+
     def record_subtitle_history(
         self,
         *,
@@ -2706,14 +2933,18 @@ class Database:
         details: dict[str, object] | None = None,
     ) -> int:
         now = time.time()
+        detail_payload = dict(details or {})
+        video_fingerprint = ""
+        if str(status or "").casefold() in {"selected", "upgraded", "manual", "legacy"}:
+            video_fingerprint = self._sampled_video_fingerprint(Path(video_path)) or ""
         with self.connect() as conn:
             self._ensure_anime_parent(conn, media_id, video_path.stem)
             cursor = conn.execute(
                 """
                 INSERT INTO subtitle_history(
                     video_path,media_id,episode,source,candidate_name,candidate_path,
-                    score,status,reason,details_json,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    score,status,reason,details_json,video_fingerprint,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     str(video_path),
@@ -2725,7 +2956,8 @@ class Database:
                     score,
                     str(status or "selected"),
                     str(reason or ""),
-                    json.dumps(details or {}, ensure_ascii=False),
+                    json.dumps(detail_payload, ensure_ascii=False),
+                    video_fingerprint,
                     now,
                 ),
             )
@@ -2799,56 +3031,103 @@ class Database:
         media_id: int | None,
         episode: int | None,
     ) -> dict[str, object] | None:
-        """Find the most recent successful subtitle selection after path/brand moves.
+        """Recover a selection after a path move only when video identity matches.
 
-        Brand migrations can move both the managed video root and cache root, so
-        an exact historical ``video_path`` is not always available anymore.
-        Prefer the current AniList identity and fall back to the exact video
-        filename, which is stable across a root-directory rename.
+        Exact-path history remains compatible with legacy rows.  Any recovery
+        across a different path (AniList identity or basename) requires the
+        sampled content fingerprint recorded when the selection was created.
         """
-        clauses: list[tuple[str, tuple[object, ...]]] = [
-            ("video_path=?", (str(video_path),)),
-        ]
-        if media_id is not None:
-            if episode is None:
-                clauses.append(("media_id=? AND episode IS NULL", (int(media_id),)))
-            else:
-                clauses.append(("media_id=? AND episode=?", (int(media_id), int(episode))))
-        suffix = "%/" + video_path.name.replace("%", "\\%").replace("_", "\\_")
-        clauses.append(("video_path LIKE ? ESCAPE '\\'", (suffix,)))
+
+        video_path = Path(video_path)
+        current_fingerprint = self._sampled_video_fingerprint(video_path)
+
+        def payload_for_row(
+            row: sqlite3.Row | None, *, require_fingerprint: bool
+        ) -> dict[str, object] | None:
+            if row is None:
+                return None
+            try:
+                details = json.loads(str(row["details_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {}
+            if not isinstance(details, dict):
+                details = {}
+            # Keep caller-provided ``details`` stable.  The ownership fingerprint
+            # is internal metadata stored in its own column.  The details fallback
+            # accepts rows written by an aborted/local v8.6 attempt.
+            historical_fingerprint = str(
+                row["video_fingerprint"]
+                or details.get("video_content_fingerprint")
+                or ""
+            ).strip()
+            if historical_fingerprint:
+                if (
+                    not current_fingerprint
+                    or historical_fingerprint != current_fingerprint
+                ):
+                    return None
+            elif require_fingerprint:
+                return None
+            return {
+                "id": int(row["id"]),
+                "video_path": str(row["video_path"] or ""),
+                "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
+                "episode": int(row["episode"]) if row["episode"] is not None else None,
+                "source": str(row["source"] or ""),
+                "candidate_name": str(row["candidate_name"] or ""),
+                "candidate_path": str(row["candidate_path"] or ""),
+                "score": float(row["score"]) if row["score"] is not None else None,
+                "status": str(row["status"] or ""),
+                "details": details,
+                "created_at": float(row["created_at"] or 0),
+            }
 
         with self.connect() as conn:
-            row = None
+            exact = conn.execute(
+                """
+                SELECT * FROM subtitle_history
+                WHERE video_path=? AND status IN ('selected','upgraded','manual','legacy')
+                ORDER BY created_at DESC,id DESC LIMIT 1
+                """,
+                (str(video_path),),
+            ).fetchone()
+            exact_payload = payload_for_row(exact, require_fingerprint=False)
+            if exact_payload is not None:
+                return exact_payload
+
+            if not current_fingerprint:
+                return None
+
+            clauses: list[tuple[str, tuple[object, ...]]] = []
+            if media_id is not None:
+                if episode is None:
+                    clauses.append(
+                        ("media_id=? AND episode IS NULL", (int(media_id),))
+                    )
+                else:
+                    clauses.append(
+                        (
+                            "media_id=? AND episode=?",
+                            (int(media_id), int(episode)),
+                        )
+                    )
+            suffix = "%/" + video_path.name.replace("%", "\\%").replace("_", "\\_")
+            clauses.append(("video_path LIKE ? ESCAPE '\\'", (suffix,)))
+
             for where, args in clauses:
-                row = conn.execute(
+                rows = conn.execute(
                     f"""
                     SELECT * FROM subtitle_history
                     WHERE ({where}) AND status IN ('selected','upgraded','manual','legacy')
-                    ORDER BY created_at DESC,id DESC LIMIT 1
+                    ORDER BY created_at DESC,id DESC LIMIT 50
                     """,
                     args,
-                ).fetchone()
-                if row is not None:
-                    break
-        if row is None:
-            return None
-        try:
-            details = json.loads(str(row["details_json"] or "{}"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            details = {}
-        return {
-            "id": int(row["id"]),
-            "video_path": str(row["video_path"] or ""),
-            "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
-            "episode": int(row["episode"]) if row["episode"] is not None else None,
-            "source": str(row["source"] or ""),
-            "candidate_name": str(row["candidate_name"] or ""),
-            "candidate_path": str(row["candidate_path"] or ""),
-            "score": float(row["score"]) if row["score"] is not None else None,
-            "status": str(row["status"] or ""),
-            "details": details if isinstance(details, dict) else {},
-            "created_at": float(row["created_at"] or 0),
-        }
+                ).fetchall()
+                for row in rows:
+                    candidate = payload_for_row(row, require_fingerprint=True)
+                    if candidate is not None:
+                        return candidate
+        return None
 
     def create_playlist(
         self,

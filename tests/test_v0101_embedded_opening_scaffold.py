@@ -1208,3 +1208,186 @@ def test_optimize_candidates_rejects_hyakkano_bad_stt_map_and_repairs_embedded_b
     assert abs(cues[8][0] - 140.0) < 0.02
     assert abs((cues[1][0] - 69.5) - (-51.1)) < 0.02
     assert abs((cues[4][0] - 79.8) - (-50.0)) < 0.02
+
+
+def test_large_alass_opening_collapse_restores_only_preopening_clock(tmp_path: Path) -> None:
+    aligned = tmp_path / "collapsed-opening.srt"
+    # The source cold-open cues were approximately 5..70s, but a two-block
+    # ALASS map moved that whole plateau about +105s. The post-opening clock is
+    # already correct at roughly -10s, so the long OP gap collapses to ~10s in
+    # this bad aligned file.
+    pre_aligned = [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 175.0]
+    post_aligned = [187.0, 197.0, 207.0, 217.0, 227.0, 237.0, 247.0, 257.0]
+    write_srt(
+        [
+            (value, value + 1.5, f"c{index}")
+            for index, value in enumerate(pre_aligned + post_aligned)
+        ],
+        aligned,
+    )
+
+    embedded = {
+        "timeline_segments": [
+            {
+                "offset_seconds": 0.0,
+                "support": 1,
+                "mean_score": 3.2985,
+                "mean_coverage": 0.9091,
+                "kind": "stable",
+            },
+            {
+                "offset_seconds": -10.0,
+                "support": 21,
+                "mean_score": 3.1373,
+                "mean_coverage": 0.9216,
+                "kind": "stable",
+            },
+        ],
+        "timeline_early_edit_audio_verification": {
+            "required": True,
+            "reasons": [
+                "early_path_clock_change",
+                "early_boundary_delayed_for_monotonicity",
+            ],
+            "early_offset_span_seconds": 10.0,
+            "early_max_jump_seconds": 10.0,
+        },
+        "timeline_edge_hints_seconds": [0.175, 6.416],
+        "timeline_validation": {
+            "after": {"f1": 0.8016},
+            "activity_f1": 0.833,
+            "holdout": {
+                "p90_abs_residual_seconds": 1.25,
+                "mean_coverage": 0.8433,
+            },
+        },
+    }
+    speech = {
+        "offset_seconds": -9.874,
+        "stt_opening_plateau_refinement": {
+            "applied": True,
+            "pre_shift_seconds": 0.0,
+            "post_shift_seconds": 0.5,
+        },
+        "stt_alass_transition_safety": {
+            "accepted": True,
+            "reason": "ok",
+            "transitions": [
+                {
+                    "cue_index": len(pre_aligned),
+                    "source_time": 197.097,
+                    "jump_seconds": -115.327,
+                    "nearby_gap_seconds": 124.958,
+                    "nearby_gap_time": 134.618,
+                    "gap_supported": True,
+                }
+            ],
+        },
+    }
+
+    output, result = _restore_embedded_opening_clock_scaffold(
+        aligned,
+        embedded,
+        speech,
+        tmp_path / "cache",
+    )
+
+    assert result["applied"] is True
+    assert result["large_alass_opening_clock_recovery"] is True
+    assert result["single_window_evidence"]["evidence_mode"] == (
+        "catastrophic_alass_preopening_recovery"
+    )
+    assert float(result["alass_relative_clock_seconds"]) == 115.327
+    assert abs(float(result["correction_seconds"]) - (-104.827)) < 1e-6
+
+    repaired = parse_srt(output)
+    # Pre-opening cues move ~105s earlier, while the already-correct post-OP
+    # plateau is byte-for-clock unchanged.
+    assert abs(repaired[0][0] - 5.173) < 0.002
+    assert abs(repaired[len(pre_aligned) - 1][0] - 70.173) < 0.002
+    assert repaired[len(pre_aligned)][0] == post_aligned[0]
+    assert repaired[-1][0] == post_aligned[-1]
+
+def test_large_alass_opening_collapse_with_two_early_windows_restores_preopening_clock(
+    tmp_path: Path,
+) -> None:
+    aligned = tmp_path / "tenmaku-style-collapsed-opening.srt"
+    pre_aligned = [82.0, 92.0, 102.0, 112.0, 122.0, 132.0, 142.0, 152.0]
+    post_aligned = [165.0, 175.0, 185.0, 195.0, 205.0, 215.0, 225.0, 235.0]
+    write_srt(
+        [
+            (value, value + 1.5, f"c{index}")
+            for index, value in enumerate(pre_aligned + post_aligned)
+        ],
+        aligned,
+    )
+
+    embedded = {
+        "timeline_segments": [
+            {
+                "offset_seconds": 1.0,
+                "support": 2,
+                "mean_score": 3.3143,
+                "mean_coverage": 0.875,
+                "kind": "stable",
+            },
+            {
+                "offset_seconds": -7.0,
+                "support": 21,
+                "mean_score": 3.2281,
+                "mean_coverage": 0.9544,
+                "kind": "stable",
+            },
+        ],
+        "timeline_early_edit_audio_verification": {
+            "required": True,
+            "reasons": ["early_path_clock_change"],
+            "early_offset_span_seconds": 8.0,
+            "early_max_jump_seconds": 8.0,
+        },
+        "timeline_validation": {
+            "after": {"f1": 0.8744},
+            "activity_f1": 0.8469,
+            "holdout": {
+                "p90_abs_residual_seconds": 0.75,
+                "mean_coverage": 0.9419,
+            },
+        },
+    }
+    speech = {
+        "offset_seconds": -6.891,
+        "stt_alass_transition_safety": {
+            "accepted": True,
+            "reason": "ok",
+            "transitions": [
+                {
+                    "cue_index": len(pre_aligned),
+                    "source_time": 206.073,
+                    "jump_seconds": -79.812,
+                    "nearby_gap_seconds": 91.992,
+                    "nearby_gap_time": 160.077,
+                    "gap_supported": True,
+                }
+            ],
+        },
+    }
+
+    output, result = _restore_embedded_opening_clock_scaffold(
+        aligned,
+        embedded,
+        speech,
+        tmp_path / "cache",
+    )
+
+    assert result["applied"] is True
+    assert result["large_alass_opening_clock_recovery"] is True
+    assert result["single_window_evidence"]["evidence_mode"] == (
+        "catastrophic_alass_multi_window_preopening_recovery"
+    )
+    assert abs(float(result["correction_seconds"]) - (-71.812)) < 1e-6
+
+    repaired = parse_srt(output)
+    assert abs(repaired[0][0] - 10.188) < 0.002
+    assert abs(repaired[len(pre_aligned) - 1][0] - 80.188) < 0.002
+    assert repaired[len(pre_aligned)][0] == post_aligned[0]
+    assert repaired[-1][0] == post_aligned[-1]

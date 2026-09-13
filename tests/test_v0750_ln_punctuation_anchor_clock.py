@@ -107,5 +107,5 @@ def test_frontend_supports_equal_offset_pause_segments() -> None:
 def test_alignment_fingerprint_rebuilds_old_cached_clock() -> None:
     source = AUDIOBOOKS.read_text(encoding="utf-8")
 
-    assert "reading-audio-v3-leading-prefix-v18" in source
+    assert "reading-audio-v3-leading-prefix-v22" in source
     assert "reading-audio-v3-acoustic" not in source

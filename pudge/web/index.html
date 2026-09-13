@@ -908,7 +908,7 @@ async function torrentToggleHttpCapture(){
   const button=$('torrentToggleButton');if(!button)return;
   const previous=torrentToggleUiEnabled(),desired=!previous;
   ui.torrentToggleCaptureInFlight=true;ui.torrentToggleDesired=desired;
-  button.disabled=true;refreshTorrentToggle();
+  button.disabled=true;refreshTorrentToggle();if(desired===false)renderSafely('current',renderCurrent);
   try{
     const result=await Promise.race([
       torrentHttpJson('/api/torrents/enabled',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:desired})}),
@@ -923,7 +923,7 @@ async function torrentToggleHttpCapture(){
     ui.torrentTraffic=null;toast(t('error.generic',{error:error?.message||error}));
   }finally{
     ui.torrentToggleDesired=null;ui.torrentToggleCaptureInFlight=false;button.disabled=false;
-    refreshTorrentToggle();scheduleTorrentTrafficPoll(0);renderDownloads();
+    refreshTorrentToggle();scheduleTorrentTrafficPoll(0);renderDownloads();renderSafely('current',renderCurrent);
   }
 }
 document.addEventListener('click',event=>{
@@ -1398,7 +1398,7 @@ function downloadAvailableHomeCard(a){
   const url=a.site_url||`https://anilist.co/anime/${a.media_id}`;
   const download=a.download||null;
   const action=download
-    ?`<span class="download-card-state" title="${escapeHtml(download.name||'')}">${Number(download.progress||0)<.999?t('label.downloading',{progress:Math.max(0,Math.min(100,Math.round(Number(download.progress||0)*100)))}):t('label.waitingSubs')}</span>`
+    ?`<span class="download-card-state" title="${escapeHtml(download.name||'')}">${/paused|stopped/i.test(String(download.effective_state||download.state||''))?compactDownloadStatus(download):(Number(download.progress||0)<.999?t('label.downloading',{progress:Math.max(0,Math.min(100,Math.round(Number(download.progress||0)*100)))}):t('label.waitingSubs'))}</span>`
     :`<button class="download-card-button" data-action="release" data-id="${a.media_id}" data-batch="1">${t('action.downloadAnime')}</button>`;
   return `<article class="airing-card download-available-card" data-media-id="${a.media_id}" data-site-url="${escapeHtml(url)}" data-title="${escapeHtml(a.title)}">${cover(a,'airing-cover',false,url)}<div class="airing-meta"><strong data-full-title="${escapeHtml(a.title)}" title="${escapeHtml(a.title)}">${escapeHtml(a.title)}</strong>${action}</div></article>`;
 }
@@ -3470,9 +3470,16 @@ function refreshTorrentToggle(){
   const down=liveFresh?Number(live.download_speed||0):downloads.reduce((sum,row)=>sum+Number(row.download_speed||0),0);
   const up=liveFresh?Number(live.upload_speed||0):downloads.reduce((sum,row)=>sum+Number(row.upload_speed||0),0);
   const fallbackWaiting=Math.max(Number(ui.state?.torrent_waiting_count||0),downloads.filter(row=>/waiting|queued|stalled/i.test(String(row.state||''))).length);
-  const waiting=liveFresh?Math.max(fallbackWaiting,Number(live.waiting||0)):fallbackWaiting;
+  const waiting=liveFresh?Math.max(0,Number(live.waiting||0)):fallbackWaiting;
+  const fallbackPaused=downloads.filter(row=>/paused|stopped/i.test(String(row.state||''))&&Number(row.progress||0)<.999).length;
+  const paused=liveFresh?Math.max(fallbackPaused,Number(live.paused||0)):fallbackPaused;
   const title=enabled?(ui.lang==='ru'?'Торренты: вкл':'Torrents: on'):(ui.lang==='ru'?'Торренты: выкл':'Torrents: off');
-  const detail=enabled?`↓ ${torrentRate(down)} · ↑ ${torrentRate(up)}`:(ui.lang==='ru'?`${waiting} ждут`:`${waiting} waiting`);
+  const offDetail=paused&&waiting
+    ?(ui.lang==='ru'?`${paused} на паузе · ${waiting} ждут`:`${paused} paused · ${waiting} waiting`)
+    :paused
+      ?(ui.lang==='ru'?`${paused} на паузе`:`${paused} paused`)
+      :(ui.lang==='ru'?`${waiting} ждут`:`${waiting} waiting`);
+  const detail=enabled?`↓ ${torrentRate(down)} · ↑ ${torrentRate(up)}`:offDetail;
   button.classList.toggle('torrent-on',enabled);button.classList.toggle('torrent-off',!enabled);
   button.innerHTML=`<span>${title}</span><small>${detail}</small>`;
   button.title=enabled?(ui.lang==='ru'?'Нажмите, чтобы выключить торрент-трафик':'Click to turn torrent traffic off'):(ui.lang==='ru'?'Торренты выключены по умолчанию':'Torrents are off by default');

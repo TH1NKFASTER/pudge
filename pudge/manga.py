@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import io
 import json
@@ -28,10 +29,11 @@ from .manga_ocr_artifact import (
     write_artifact,
 )
 from .runtime import python_executable
+from .work_scheduler import WorkPriority
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-_REGION_CACHE_KEY = "pudge-manga-regions-v5"
+_REGION_CACHE_KEY = "pudge-manga-regions-v59-layout-token-geometry"
 
 
 def _natural_key(value: str) -> list[object]:
@@ -221,6 +223,334 @@ def _normalize_region_orientation(region: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _finalize_recognized_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Apply output invariants after the OCR worker has returned.
+
+    Worker-side cluster cleanup runs before the result crosses the subprocess
+    boundary.  Some recalled clusters become fully self-describing only in the
+    final worker payload, so run the deterministic post-cluster amalgam cleanup
+    once more on exactly the list that will be cached/serialized by MangaService.
+    This pass performs no OCR and never needs manga-ocr in the app process.
+    """
+    normalized = [
+        _normalize_region_orientation(item)
+        for item in regions
+        if str(item.get("text") or "").strip()
+    ]
+    if not normalized:
+        return normalized
+
+    # Import lazily: manga_ocr_worker itself only imports MangaOCR inside its CLI
+    # entry points, so this keeps the GUI process free of model initialization.
+    from .manga_ocr_worker import (
+        _suppress_complete_post_cluster_amalgams,
+        _suppress_short_raw_empty_rectangle_art_noise,
+    )
+
+    normalized = _suppress_complete_post_cluster_amalgams(normalized)
+    return _suppress_short_raw_empty_rectangle_art_noise(normalized)
+
+
+
+
+def _latin_only_title_surface(value: object) -> str:
+    """Return a compact Latin-only title candidate, or empty for mixed text."""
+    surface = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not surface:
+        return ""
+    letters = "".join(character for character in surface if character.isascii() and character.isalpha())
+    if len(letters) < 8:
+        return ""
+    residue = re.sub(r"[A-Za-z\s\-—–ー―_.:·・]+", "", surface)
+    if residue:
+        return ""
+    return letters.upper()
+
+
+def _latin_title_candidates_from_region(value: object) -> list[str]:
+    """Extract long Latin title phrases from an arbitrary OCR region."""
+    surface = unicodedata.normalize("NFKC", str(value or ""))
+    output: list[str] = []
+    for match in re.finditer(r"[A-Za-z]{3,}(?:[\s\-—–ー―]+[A-Za-z]{2,})*", surface):
+        compact = "".join(character for character in match.group(0) if character.isascii() and character.isalpha()).upper()
+        if len(compact) >= 8:
+            output.append(compact)
+    return output
+
+
+def _union_segment_geometry(items: list[dict[str, Any]]) -> dict[str, float]:
+    left = min(float(item.get("x") or 0.0) for item in items)
+    bottom = min(float(item.get("y") or 0.0) for item in items)
+    right = max(float(item.get("x") or 0.0) + float(item.get("width") or 0.0) for item in items)
+    top = max(float(item.get("y") or 0.0) + float(item.get("height") or 0.0) for item in items)
+    return {
+        "x": round(left, 6),
+        "y": round(bottom, 6),
+        "width": round(max(0.0, right - left), 6),
+        "height": round(max(0.0, top - bottom), 6),
+    }
+
+
+def _remap_latin_consensus_segments(
+    region: dict[str, Any],
+    current: str,
+    target: str,
+) -> list[dict[str, Any]] | None:
+    segments = [dict(item) for item in region.get("segments") or [] if isinstance(item, dict)]
+    if not segments:
+        return None
+    stream = "".join(
+        unicodedata.normalize("NFKC", str(item.get("text") or ""))
+        for item in segments
+    )
+    stream = "".join(character for character in stream if character.isascii() and character.isalpha()).upper()
+    if stream != current or len(segments) != len(current):
+        return None
+
+    mapped: list[dict[str, Any]] = []
+    matcher = difflib.SequenceMatcher(a=current, b=target, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        source = segments[i1:i2]
+        target_part = target[j1:j2]
+        if tag == "equal":
+            for segment, character in zip(source, target_part):
+                updated = dict(segment)
+                updated["text"] = character
+                mapped.append(updated)
+            continue
+        if tag == "replace":
+            if len(source) == len(target_part):
+                for segment, character in zip(source, target_part):
+                    updated = dict(segment)
+                    updated["text"] = character
+                    updated["recognition_correction"] = "book-latin-consensus-v1"
+                    mapped.append(updated)
+                continue
+            if target_part and len(target_part) == 1 and source:
+                merged = dict(source[0])
+                merged.update(_union_segment_geometry(source))
+                merged["text"] = target_part
+                merged["source"] = "book-latin-consensus-v1"
+                merged["recognition_correction"] = "book-latin-consensus-v1"
+                mapped.append(merged)
+                continue
+            return None
+        if tag == "delete":
+            continue
+        # Inserting a new glyph without observed geometry would fabricate a
+        # hitbox, so reject the whole repair.
+        return None
+    return mapped if "".join(str(item.get("text") or "") for item in mapped) == target else None
+
+
+def _repair_repeated_latin_page_titles(
+    regions: list[dict[str, Any]],
+    peer_pages: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Repair one noisy Latin-only title from repeated same-book page evidence.
+
+    A candidate must be independently present on at least two peer pages.  This
+    intentionally does not use a title dictionary and refuses repairs that
+    would require inventing glyph geometry.
+    """
+    support: dict[str, set[int]] = {}
+    for page_number, peer_regions in enumerate(peer_pages):
+        seen: set[str] = set()
+        for peer in peer_regions:
+            for candidate in _latin_title_candidates_from_region(peer.get("text")):
+                seen.add(candidate)
+        for candidate in seen:
+            support.setdefault(candidate, set()).add(page_number)
+
+    repeated = {
+        candidate: len(pages)
+        for candidate, pages in support.items()
+        if len(pages) >= 2
+    }
+    if not repeated:
+        return [dict(region) for region in regions]
+
+    output: list[dict[str, Any]] = []
+    for original in regions:
+        region = dict(original)
+        if str(region.get("orientation") or "") != "horizontal":
+            output.append(region)
+            continue
+        current = _latin_only_title_surface(region.get("text"))
+        if not current:
+            output.append(region)
+            continue
+
+        scored: list[tuple[float, int, str]] = []
+        for candidate, count in repeated.items():
+            if candidate == current or abs(len(candidate) - len(current)) > 2:
+                continue
+            similarity = difflib.SequenceMatcher(a=current, b=candidate, autojunk=False).ratio()
+            minimum_similarity = 0.78 if count >= 3 else 0.84
+            if similarity >= minimum_similarity:
+                scored.append((similarity, count, candidate))
+        if not scored:
+            output.append(region)
+            continue
+        scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        best_similarity, best_count, target = scored[0]
+        if len(scored) > 1 and best_similarity - scored[1][0] < 0.06:
+            output.append(region)
+            continue
+
+        mapped = _remap_latin_consensus_segments(region, current, target)
+        if mapped is None:
+            output.append(region)
+            continue
+        region["text"] = target
+        region["raw_text"] = target
+        region["segments"] = mapped
+        region["book_latin_consensus"] = {
+            "from": current,
+            "to": target,
+            "peer_pages": best_count,
+            "similarity": round(best_similarity, 4),
+            "source": "same-book-repeated-latin-v1",
+        }
+        output.append(region)
+    return output
+
+
+
+def _normalized_vision_rect(rect: Any) -> tuple[float, float, float, float] | None:
+    try:
+        width = max(0.0, min(1.0, float(rect.size.width)))
+        height = max(0.0, min(1.0, float(rect.size.height)))
+        x = max(0.0, min(1.0 - width, float(rect.origin.x)))
+        y = max(0.0, min(1.0 - height, float(rect.origin.y)))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return (x, y, width, height) if width > 0.001 and height > 0.001 else None
+
+
+def _vision_character_box_rows(observation: Any) -> list[tuple[float, float, float, float]]:
+    getter = getattr(observation, "characterBoxes", None)
+    if not callable(getter):
+        return []
+    try:
+        characters = getter() or []
+    except Exception:
+        return []
+    rows: list[tuple[float, float, float, float]] = []
+    for character in characters:
+        try:
+            rect = character.boundingBox()
+        except (AttributeError, TypeError):
+            continue
+        row = _normalized_vision_rect(rect)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _vision_observation_bounds(observation: Any) -> tuple[float, float, float, float, str]:
+    base = _normalized_vision_rect(observation.boundingBox())
+    if base is None:
+        return 0.0, 0.0, 0.0, 0.0, "invalid"
+    character_rows = _vision_character_box_rows(observation)
+    if len(character_rows) < 2:
+        return *base, "observation-bounds"
+    x1 = min(row[0] for row in character_rows)
+    y1 = min(row[1] for row in character_rows)
+    x2 = max(row[0] + row[2] for row in character_rows)
+    y2 = max(row[1] + row[3] for row in character_rows)
+    union = (x1, y1, min(1.0 - x1, x2 - x1), min(1.0 - y1, y2 - y1))
+    if union[2] > base[2] * 1.18 or union[3] > base[3] * 1.18:
+        return *union, "character-box-union"
+    return *base, "observation-bounds"
+
+
+# pudge-v0.7.27-manga-vision-character-geometry-v1
+# pudge-v0.7.27-manga-horizontal-main-segments-v14
+# pudge-v0.7.27-manga-accurate-range-geometry-v15
+# pudge-v0.7.27-manga-horizontal-alignment-v16
+# pudge-manga-recovery-phase2-layout-v1
+# pudge-manga-recovery-phase2.1-dual-pass-v2
+# pudge-manga-recovery-phase2.2-line-promotion-v11
+# pudge-manga-recovery-phase2.3-precision-v15
+# pudge-manga-recovery-phase2.4-geometry-v17
+# pudge-manga-recovery-phase2.5-layout-token-geometry-v19
+def _vision_recognized_text_segments(recognized_text: Any, text: str) -> list[dict[str, Any]]:
+    """Return exact VNRecognizedText character boxes when Vision exposes them."""
+    if recognized_text is None or not str(text or ""):
+        return []
+    getter = getattr(recognized_text, "boundingBoxForRange_error_", None)
+    if not callable(getter):
+        return []
+    try:
+        from Foundation import NSMakeRange  # type: ignore
+    except ImportError:
+        NSMakeRange = None  # type: ignore[assignment]
+
+    segments: list[dict[str, Any]] = []
+    utf16_offset = 0
+    for character in str(text):
+        utf16_length = max(1, len(character.encode("utf-16-le")) // 2)
+        if character.isspace():
+            utf16_offset += utf16_length
+            continue
+        ns_range = (
+            NSMakeRange(utf16_offset, utf16_length)
+            if NSMakeRange is not None
+            else (utf16_offset, utf16_length)
+        )
+        try:
+            result = getter(ns_range, None)
+        except Exception:
+            utf16_offset += utf16_length
+            continue
+        observation = result[0] if isinstance(result, tuple) else result
+        if observation is None:
+            utf16_offset += utf16_length
+            continue
+        try:
+            rect = observation.boundingBox()
+        except (AttributeError, TypeError):
+            rect = observation
+        row = _normalized_vision_rect(rect)
+        if row is not None:
+            segments.append({
+                "text": character,
+                "orientation": "horizontal",
+                "x": round(row[0], 6),
+                "y": round(row[1], 6),
+                "width": round(row[2], 6),
+                "height": round(row[3], 6),
+                "source": "vision-accurate-range-v2",
+            })
+        utf16_offset += utf16_length
+    return segments
+
+def _vision_observation_segments(observation: Any) -> list[dict[str, Any]]:
+    x, y, width, height, source = _vision_observation_bounds(observation)
+    if source != "character-box-union":
+        return []
+    rows = _vision_character_box_rows(observation)
+    vertical = height > width * 1.05
+    rows.sort(
+        key=(lambda row: (-row[0], -row[1]))
+        if vertical
+        else (lambda row: (-row[1], row[0]))
+    )
+    return [
+        {
+            "text": "",
+            "orientation": "vertical" if vertical else "horizontal",
+            "x": round(row[0], 6),
+            "y": round(row[1], 6),
+            "width": round(row[2], 6),
+            "height": round(row[3], 6),
+            "source": "vision-character-box",
+        }
+        for row in rows
+    ]
+
+
 def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: list[list[dict[str, Any]]] = []
     for region in regions:
@@ -265,17 +595,24 @@ def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "height": round(min(1.0 - max(0.0, y1 - 0.006), y2 - y1 + 0.012), 6),
                 "confidence": round(max(float(item.get("confidence") or 0.0) for item in group), 4),
                 "detector": "+".join(sorted({str(item.get("detector") or "vision") for item in group})),
+                "recognizer": "+".join(sorted({str(item.get("recognizer") or "apple-vision") for item in group})),
                 "raw_text": text.strip(),
                 "segments": [
                     {
-                        "text": str(item.get("text") or "").strip(),
-                        "orientation": str(item.get("orientation") or ("vertical" if float(item.get("height") or 0.0) > float(item.get("width") or 0.0) * 1.05 else "horizontal")),
-                        "x": round(float(item.get("x") or 0.0), 6),
-                        "y": round(float(item.get("y") or 0.0), 6),
-                        "width": round(float(item.get("width") or 0.0), 6),
-                        "height": round(float(item.get("height") or 0.0), 6),
+                        "text": str(segment.get("text") or "").strip(),
+                        "orientation": str(segment.get("orientation") or ("vertical" if float(segment.get("height") or 0.0) > float(segment.get("width") or 0.0) * 1.05 else "horizontal")),
+                        "x": round(float(segment.get("x") or 0.0), 6),
+                        "y": round(float(segment.get("y") or 0.0), 6),
+                        "width": round(float(segment.get("width") or 0.0), 6),
+                        "height": round(float(segment.get("height") or 0.0), 6),
+                        "source": str(segment.get("source") or ""),
                     }
                     for item in ordered
+                    for segment in (
+                        item.get("segments")
+                        if isinstance(item.get("segments"), list) and item.get("segments")
+                        else [item]
+                    )
                 ],
             }
         )
@@ -288,6 +625,14 @@ def _merge_text_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else (lambda item: (-float(item["y"]), float(item["x"]))),
     )
     return merged
+
+
+class MangaOcrDeferred(RuntimeError):
+    pass
+
+
+class MangaOcrWorkerError(RuntimeError):
+    pass
 
 
 class MangaService:
@@ -306,6 +651,8 @@ class MangaService:
         self.python = str(python or python_executable())
         self.work_scheduler = work_scheduler
         self._ocr_lock = threading.Lock()
+        self._ocr_publish_locks_guard = threading.Lock()
+        self._ocr_publish_locks: dict[int, threading.RLock] = {}
         self._ocr_available_cache: tuple[float, bool] | None = None
         self._cover_cache_lock = threading.Lock()
         self._cover_cache_inflight: set[str] = set()
@@ -479,8 +826,14 @@ class MangaService:
             f"manga-v2:{path}:{stat.st_size}:{stat.st_mtime_ns}:{'|'.join(pages)}".encode("utf-8")
         ).hexdigest()[:24]
         now = time.time()
+        stale_artifact_path: Path | None = None
         with self.db.connect() as conn:
-            previous = conn.execute("SELECT id,source_fingerprint FROM manga_books WHERE path=?", (str(path),)).fetchone()
+            previous = conn.execute(
+                "SELECT id,source_fingerprint FROM manga_books WHERE path=?", (str(path),)
+            ).fetchone()
+            previous_fingerprint = (
+                str(previous["source_fingerprint"] or "") if previous is not None else ""
+            )
             conn.execute(
                 """
                 INSERT INTO manga_books(path,title,page_count,position,reading_direction,source_fingerprint,created_at,updated_at)
@@ -491,8 +844,23 @@ class MangaService:
                 (str(path), path.stem, len(pages), 0, "rtl", fingerprint, now, now),
             )
             row = conn.execute("SELECT * FROM manga_books WHERE path=?", (str(path),)).fetchone()
-            if previous is not None and str(previous["source_fingerprint"] or "") != fingerprint:
-                conn.execute("DELETE FROM manga_ocr_cache WHERE book_id=?", (int(previous["id"]),))
+            if previous is not None and previous_fingerprint != fingerprint:
+                book_id = int(previous["id"])
+                conn.execute("DELETE FROM manga_ocr_cache WHERE book_id=?", (book_id,))
+                conn.execute(
+                    "DELETE FROM state WHERE key LIKE ?",
+                    (f"manga_ocr_page_status:v18:{book_id}:%",),
+                )
+                self._bump_ocr_generation_in_conn(conn, book_id)
+                if previous_fingerprint:
+                    stale_artifact_path = (
+                        self.cache_dir
+                        / "manga-ocr"
+                        / "artifacts"
+                        / f"{previous_fingerprint}-regions-v59.json"
+                    )
+        if stale_artifact_path is not None:
+            stale_artifact_path.unlink(missing_ok=True)
         assert row is not None
         self._inherit_series_anilist(int(row["id"]))
         return self._payload(self._book(int(row["id"])))
@@ -891,22 +1259,102 @@ class MangaService:
         return self._payload(self._book(int(book_id)))
 
     def ocr_cache_status(self, book_id: int) -> dict[str, Any]:
+        """Return persisted, loadable OCR page state for one volume.
+
+        ``completed_pages`` is deliberately stricter than the legacy
+        ``cached_pages`` counter: only ready/verified-empty pages count as
+        completed. Partial/failed pages remain retryable failures, and a failed
+        page is visible even when no cache row was written.
+        """
         row = self._book(int(book_id))
-        total = int(row["page_count"] or 0)
+        total = max(0, int(row["page_count"] or 0))
+        status_prefix = f"manga_ocr_page_status:v18:{int(book_id)}:"
         with self.db.connect() as conn:
-            cached = int(
-                conn.execute(
-                    "SELECT COUNT(DISTINCT page_index) FROM manga_ocr_cache "
-                    "WHERE book_id=? AND region_key=?",
-                    (int(book_id), _REGION_CACHE_KEY),
-                ).fetchone()[0]
+            current_fingerprint = str(row["source_fingerprint"] or "")
+            current_generation = self._state_int_from_conn(
+                conn, self._ocr_generation_state_key(int(book_id))
             )
-        cached = max(0, min(cached, total))
+            cache_rows = conn.execute(
+                "SELECT page_index,text FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                (int(book_id), _REGION_CACHE_KEY),
+            ).fetchall()
+            status_rows = conn.execute(
+                "SELECT key,value FROM state WHERE key LIKE ?",
+                (f"{status_prefix}%",),
+            ).fetchall()
+        cache_by_page = {int(item["page_index"]): item for item in cache_rows}
+        status_by_page: dict[int, dict[str, Any]] = {}
+        for item in status_rows:
+            try:
+                page_index = int(str(item["key"])[len(status_prefix):])
+                payload = json.loads(str(item["value"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                payload_fingerprint = str(payload.get("source_fingerprint") or "")
+                payload_generation = payload.get("generation")
+                if payload_fingerprint and payload_fingerprint != current_fingerprint:
+                    continue
+                if payload_generation is not None:
+                    try:
+                        if int(payload_generation) != current_generation:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                elif current_generation > 0:
+                    continue
+                status_by_page[page_index] = dict(payload)
+
+        ready_pages = 0
+        empty_pages = 0
+        partial_pages = 0
+        failed_pages = 0
+        unknown_pages = 0
+        for page_index in range(total):
+            item = cache_by_page.get(page_index)
+            page_state = status_by_page.get(page_index, {})
+            status = str(page_state.get("status") or "")
+            if not status and item is not None:
+                try:
+                    legacy_regions = json.loads(str(item["text"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    legacy_regions = []
+                status = "ready" if isinstance(legacy_regions, list) and legacy_regions else "unknown"
+            if status in {"ready", "empty_verified"} and item is None:
+                status = "unknown"
+            if not status:
+                continue
+            if status == "ready":
+                ready_pages += 1
+            elif status == "empty_verified":
+                empty_pages += 1
+            elif status == "partial":
+                partial_pages += 1
+            elif status == "failed":
+                failed_pages += 1
+            else:
+                unknown_pages += 1
+
+        completed_pages = max(0, min(ready_pages + empty_pages, total))
+        failed_total = max(0, min(partial_pages + failed_pages, total - completed_pages))
+        not_started_pages = max(0, total - completed_pages - failed_total)
+        # Compatibility field used by older UI/tests. A partial result exists in
+        # cache, but is intentionally *not* counted as completed_pages.
+        cached_pages = max(0, min(completed_pages + partial_pages, total))
+        complete = bool(total > 0 and completed_pages >= total)
         return {
             "book_id": int(book_id),
-            "cached_pages": cached,
+            "cached_pages": cached_pages,
+            "completed_pages": completed_pages,
+            "ready_pages": ready_pages,
+            "empty_pages": empty_pages,
+            "partial_pages": partial_pages,
+            "failed_pages": failed_total,
+            "hard_failed_pages": failed_pages,
+            "unknown_pages": unknown_pages,
+            "not_started_pages": not_started_pages,
             "total_pages": total,
-            "complete": bool(total > 0 and cached >= total),
+            "complete": complete,
         }
 
     def set_mean_scores(self, scores: dict[int, float]) -> int:
@@ -994,6 +1442,16 @@ class MangaService:
                 (max(0, int(page_index)), time.time(), int(book_id)),
             )
 
+    def reset_progress(self, book_id: int) -> dict[str, Any]:
+        """Reset reading progress only; preserve AniList/library metadata."""
+        self._book(int(book_id))
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE manga_books SET position=0,read_pages=0,updated_at=? WHERE id=?",
+                (time.time(), int(book_id)),
+            )
+        return self._payload(self._book(int(book_id)))
+
     def mark_read(self, book_id: int, page_index: int) -> dict[str, Any]:
         """Mark pages through page_index completed without ever regressing."""
         row = self._book(int(book_id))
@@ -1046,12 +1504,18 @@ class MangaService:
             text: str,
             confidence: float,
             detector: str,
+            recognized_text: Any | None = None,
         ) -> None:
-            box = observation.boundingBox()
-            width = max(0.0, min(1.0, float(box.size.width)))
-            height = max(0.0, min(1.0, float(box.size.height)))
-            x = max(0.0, min(1.0 - width, float(box.origin.x)))
-            y = max(0.0, min(1.0 - height, float(box.origin.y)))
+            x, y, width, height, geometry_source = _vision_observation_bounds(observation)
+            geometry_segments = (
+                _vision_recognized_text_segments(recognized_text, text)
+                if recognized_text is not None and width >= height * 1.05
+                else []
+            )
+            if geometry_segments:
+                geometry_source = "accurate-range-boxes-v2"
+            else:
+                geometry_segments = _vision_observation_segments(observation)
             if width <= 0.001 or height <= 0.001:
                 return
             candidate = {
@@ -1059,11 +1523,15 @@ class MangaService:
                 "raw_text": str(text or "").strip(),
                 "confidence": round(max(0.0, min(1.0, float(confidence))), 4),
                 "detector": detector,
+                "recognizer": "apple-vision",
+                "geometry_source": geometry_source,
                 "x": round(x, 6),
                 "y": round(y, 6),
                 "width": round(width, 6),
                 "height": round(height, 6),
             }
+            if geometry_segments:
+                candidate["segments"] = geometry_segments
             overlap = next(
                 (item for item in regions if _box_overlap(candidate, item) >= 0.78),
                 None,
@@ -1071,6 +1539,18 @@ class MangaService:
             if overlap is None:
                 regions.append(candidate)
                 return
+            if geometry_segments:
+                overlap.update(
+                    {
+                        "x": candidate["x"],
+                        "y": candidate["y"],
+                        "width": candidate["width"],
+                        "height": candidate["height"],
+                        "geometry_source": geometry_source,
+                    }
+                )
+                if geometry_segments:
+                    overlap["segments"] = geometry_segments
             if candidate["confidence"] > float(overlap.get("confidence") or 0.0):
                 overlap.update(candidate)
             elif candidate["text"] and not str(overlap.get("text") or ""):
@@ -1115,6 +1595,7 @@ class MangaService:
                         text=text,
                         confidence=confidence,
                         detector=detector_name,
+                        recognized_text=candidate,
                     )
 
             # The geometry-only request catches boxes whose provisional text
@@ -1122,20 +1603,30 @@ class MangaService:
             # MangaOCR fill the text from the resulting crops.
             detector_class = getattr(Vision, "VNDetectTextRectanglesRequest", None)
             if detector_class is not None and temporary_paths:
-                detector = detector_class.alloc().init()
-                if hasattr(detector, "setReportCharacterBoxes_"):
-                    detector.setReportCharacterBoxes_(True)
-                handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
-                    NSURL.fileURLWithPath_(str(temporary_paths[0])), None
-                )
-                success, _error = handler.performRequests_error_([detector], None)
-                if success:
+                # Geometry-only detection used to run only on the original page.
+                # That misses white-on-black narration boxes and low-contrast
+                # bubbles even though the recognition pass already has contrast
+                # and inverted variants. Run the same rectangle detector on all
+                # prepared variants and merge/dedupe their geometry afterwards.
+                for rectangle_index, rectangle_path in enumerate(temporary_paths):
+                    detector = detector_class.alloc().init()
+                    if hasattr(detector, "setReportCharacterBoxes_"):
+                        detector.setReportCharacterBoxes_(True)
+                    handler = Vision.VNImageRequestHandler.alloc().initWithURL_options_(
+                        NSURL.fileURLWithPath_(str(rectangle_path)), None
+                    )
+                    success, _error = handler.performRequests_error_([detector], None)
+                    if not success:
+                        continue
+                    rectangle_detector = (
+                        f"vision-rectangles-{variants[rectangle_index][0].removeprefix('vision-')}"
+                    )
                     for observation in detector.results() or []:
                         append_box(
                             observation,
                             text="",
                             confidence=0.25,
-                            detector="vision-rectangles",
+                            detector=rectangle_detector,
                         )
         finally:
             for path in temporary_paths:
@@ -1144,89 +1635,538 @@ class MangaService:
         merged = _merge_text_regions(regions)
         if merged:
             return merged
-        # Never turn a detector miss into a completely unusable page.  MangaOCR
-        # supports multi-line input, so a full-page fallback still yields text
-        # and is explicitly marked for later replacement or manual correction.
-        return [
+        # Detector miss is a verified empty region set; never OCR the whole artwork.
+        return []
+
+    @staticmethod
+    def _ocr_generation_state_key(book_id: int) -> str:
+        return f"manga_ocr_generation:v1:{int(book_id)}"
+
+    @staticmethod
+    def _ocr_revision_state_key(book_id: int) -> str:
+        return f"manga_ocr_revision:v1:{int(book_id)}"
+
+    def _ocr_publish_lock(self, book_id: int) -> threading.RLock:
+        key = int(book_id)
+        with self._ocr_publish_locks_guard:
+            lock = self._ocr_publish_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._ocr_publish_locks[key] = lock
+            return lock
+
+    @staticmethod
+    def _state_int_from_conn(conn: Any, key: str) -> int:
+        row = conn.execute("SELECT value FROM state WHERE key=?", (str(key),)).fetchone()
+        if row is None:
+            return 0
+        try:
+            return max(0, int(str(row["value"] or "0")))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _set_state_in_conn(conn: Any, key: str, value: str) -> None:
+        conn.execute(
+            "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            (str(key), str(value), time.time()),
+        )
+
+    def _ocr_context_from_conn(
+        self, conn: Any, book_id: int
+    ) -> tuple[str, int, int]:
+        row = conn.execute(
+            "SELECT source_fingerprint FROM manga_books WHERE id=?", (int(book_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Unknown manga id={int(book_id)}")
+        fingerprint = str(row["source_fingerprint"] or "")
+        generation = self._state_int_from_conn(
+            conn, self._ocr_generation_state_key(int(book_id))
+        )
+        revision = self._state_int_from_conn(
+            conn, self._ocr_revision_state_key(int(book_id))
+        )
+        return fingerprint, generation, revision
+
+    def _ocr_context(self, book_id: int) -> tuple[str, int, int]:
+        with self.db.connect() as conn:
+            return self._ocr_context_from_conn(conn, int(book_id))
+
+    def _bump_ocr_generation_in_conn(self, conn: Any, book_id: int) -> tuple[int, int]:
+        generation = self._state_int_from_conn(
+            conn, self._ocr_generation_state_key(int(book_id))
+        ) + 1
+        revision = self._state_int_from_conn(
+            conn, self._ocr_revision_state_key(int(book_id))
+        ) + 1
+        self._set_state_in_conn(
+            conn, self._ocr_generation_state_key(int(book_id)), str(generation)
+        )
+        self._set_state_in_conn(
+            conn, self._ocr_revision_state_key(int(book_id)), str(revision)
+        )
+        return generation, revision
+
+    def _commit_ocr_page_updates(
+        self,
+        book_id: int,
+        *,
+        source_fingerprint: str,
+        generation: int,
+        updates: list[tuple[int, list[dict[str, Any]] | None, str, str, bool]],
+    ) -> bool:
+        """Atomically publish cache rows and page statuses for one OCR generation."""
+
+        book_id = int(book_id)
+        if not updates:
+            return True
+        with self._ocr_publish_lock(book_id):
+            with self.db.connect() as conn:
+                current_fingerprint, current_generation, current_revision = (
+                    self._ocr_context_from_conn(conn, book_id)
+                )
+                if (
+                    current_fingerprint != str(source_fingerprint)
+                    or current_generation != int(generation)
+                ):
+                    return False
+
+                now = time.time()
+                for page_index, regions, status, reason, retryable in updates:
+                    if regions is not None:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO manga_ocr_cache"
+                            "(book_id,page_index,region_key,text,updated_at) VALUES(?,?,?,?,?)",
+                            (
+                                book_id,
+                                int(page_index),
+                                _REGION_CACHE_KEY,
+                                json.dumps(regions, ensure_ascii=False),
+                                now,
+                            ),
+                        )
+                    payload = json.dumps(
+                        {
+                            "status": str(status),
+                            "reason": str(reason),
+                            "retryable": bool(retryable),
+                            "source_fingerprint": current_fingerprint,
+                            "generation": current_generation,
+                            "updated_at": now,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    self._set_state_in_conn(
+                        conn,
+                        self._ocr_page_status_state_key(book_id, int(page_index)),
+                        payload,
+                    )
+
+                revision = current_revision + 1
+                self._set_state_in_conn(
+                    conn, self._ocr_revision_state_key(book_id), str(revision)
+                )
+
+            incremental = False
+            if len(updates) == 1 and updates[0][1] is not None:
+                page_index, regions, _status, _reason, _retryable = updates[0]
+                incremental = self._update_ocr_artifact_page(
+                    book_id,
+                    page_index=int(page_index),
+                    regions=[
+                        dict(item) for item in (regions or []) if isinstance(item, dict)
+                    ],
+                    source_fingerprint=current_fingerprint,
+                    generation=int(generation),
+                    revision=int(revision),
+                )
+            if not incremental:
+                self._rebuild_ocr_artifact(
+                    book_id,
+                    expected_generation=int(generation),
+                    expected_revision=int(revision),
+                )
+            return True
+
+    def _update_ocr_artifact_page(
+        self,
+        book_id: int,
+        *,
+        page_index: int,
+        regions: list[dict[str, Any]],
+        source_fingerprint: str,
+        generation: int,
+        revision: int,
+    ) -> bool:
+        """Publish one OCR page without rereading every cached archive page."""
+
+        book_id = int(book_id)
+        artifact_path = self._ocr_artifact_path(book_id)
+        previous = read_artifact(artifact_path)
+        if previous is None or previous.get("migrated_from_schema"):
+            return False
+        source = previous.get("source") if isinstance(previous.get("source"), dict) else {}
+        try:
+            previous_generation = int(previous.get("generation"))
+            previous_revision = int(previous.get("revision"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            str(source.get("fingerprint") or "") != str(source_fingerprint)
+            or previous_generation != int(generation)
+            or previous_revision != int(revision) - 1
+        ):
+            return False
+
+        row = self._book(book_id)
+        archive_path = Path(str(row["path"]))
+        page_names = self._pages(archive_path)
+        if not 0 <= int(page_index) < len(page_names):
+            return False
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                with Image.open(
+                    io.BytesIO(archive.read(page_names[int(page_index)]))
+                ) as source_image:
+                    width, height = source_image.size
+        except (OSError, ValueError, KeyError):
+            width, height = 0, 0
+
+        pages_by_index = {
+            int(page.get("page_index") or 0): dict(page)
+            for page in previous.get("pages") or []
+            if isinstance(page, dict)
+        }
+        pages_by_index[int(page_index)] = normalize_page(
+            int(page_index),
+            regions,
+            name=page_names[int(page_index)],
+            width=width,
+            height=height,
+        )
+        pages = [pages_by_index[index] for index in sorted(pages_by_index)]
+        detector_names = sorted(
             {
-                "text": "",
-                "raw_text": "",
-                "orientation": "mixed",
-                "confidence": 0.0,
-                "detector": "full-page-fallback",
-                "fallback": True,
-                "x": 0.0,
-                "y": 0.0,
-                "width": 1.0,
-                "height": 1.0,
+                str(region.get("detector") or "unknown")
+                for page in pages
+                for region in page.get("regions") or []
+                if isinstance(region, dict)
             }
-        ]
+        )
+        recognizer_names = sorted(
+            {
+                str(region.get("recognizer") or "unknown")
+                for page in pages
+                for region in page.get("regions") or []
+                if isinstance(region, dict)
+            }
+        )
+        artifact = build_artifact(
+            source_fingerprint=str(source_fingerprint),
+            title=str(row["title"] or ""),
+            page_count=int(row["page_count"] or 0),
+            pages=pages,
+            detector="+".join(detector_names) or "unknown",
+            recognizer="+".join(recognizer_names) or "unknown",
+        )
+        artifact["generation"] = int(generation)
+        artifact["revision"] = int(revision)
+
+        current_fingerprint, current_generation, current_revision = self._ocr_context(
+            book_id
+        )
+        if (
+            current_fingerprint != str(source_fingerprint)
+            or current_generation != int(generation)
+            or current_revision != int(revision)
+        ):
+            return False
+        write_artifact(artifact_path, artifact)
+        return True
 
     def _ocr_artifact_path(self, book_id: int) -> Path:
         row = self._book(int(book_id))
         fingerprint = str(row["source_fingerprint"] or f"book-{int(book_id)}")
-        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}.json"
+        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}-regions-v59.json"
 
     def _load_ocr_artifact(self, book_id: int) -> dict[str, Any] | None:
-        return read_artifact(self._ocr_artifact_path(int(book_id)))
-
-    def _rebuild_ocr_artifact(self, book_id: int) -> dict[str, Any]:
-        row = self._book(int(book_id))
-        archive_path = Path(str(row["path"]))
-        page_names = self._pages(archive_path)
-        with self.db.connect() as conn:
-            cache_rows = conn.execute(
-                "SELECT page_index,text FROM manga_ocr_cache "
-                "WHERE book_id=? AND region_key=? ORDER BY page_index",
-                (int(book_id), _REGION_CACHE_KEY),
-            ).fetchall()
-        by_index = {int(item["page_index"]): str(item["text"] or "[]") for item in cache_rows}
-        pages: list[dict[str, Any]] = []
-        with zipfile.ZipFile(archive_path) as archive:
-            for page_index, encoded in sorted(by_index.items()):
-                try:
-                    regions = json.loads(encoded)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    regions = []
-                if not isinstance(regions, list) or not 0 <= page_index < len(page_names):
-                    continue
-                try:
-                    with Image.open(io.BytesIO(archive.read(page_names[page_index]))) as source_image:
-                        width, height = source_image.size
-                except (OSError, ValueError, KeyError):
-                    width, height = 0, 0
-                pages.append(
-                    normalize_page(
-                        page_index,
-                        [dict(item) for item in regions if isinstance(item, dict)],
-                        name=page_names[page_index],
-                        width=width,
-                        height=height,
-                    )
-                )
-        artifact = build_artifact(
-            source_fingerprint=str(row["source_fingerprint"] or ""),
-            title=str(row["title"] or ""),
-            page_count=int(row["page_count"] or 0),
-            pages=pages,
-            detector="apple-vision-multipass",
-            recognizer="manga-ocr",
+        book_id = int(book_id)
+        artifact = read_artifact(self._ocr_artifact_path(book_id))
+        if artifact is None:
+            return None
+        fingerprint, generation, revision = self._ocr_context(book_id)
+        source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
+        artifact_fingerprint = str(source.get("fingerprint") or "")
+        artifact_generation = artifact.get("generation")
+        artifact_revision = artifact.get("revision")
+        generation_matches = (
+            artifact_generation is None and generation == 0
+        ) or (
+            artifact_generation is not None
+            and int(artifact_generation) == int(generation)
         )
-        write_artifact(self._ocr_artifact_path(int(book_id)), artifact)
-        return artifact
+        revision_matches = (
+            artifact_revision is None and revision == 0
+        ) or (
+            artifact_revision is not None
+            and int(artifact_revision) == int(revision)
+        )
+        if (
+            artifact_fingerprint != fingerprint
+            or not generation_matches
+            or not revision_matches
+        ):
+            return self._rebuild_ocr_artifact(book_id)
+        if not artifact.get("migrated_from_schema"):
+            return artifact
+        with self.db.connect() as conn:
+            cached = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                    (book_id, _REGION_CACHE_KEY),
+                ).fetchone()[0]
+            )
+        if cached <= 0:
+            return artifact
+        return self._rebuild_ocr_artifact(book_id)
+
+    def _rebuild_ocr_artifact(
+        self,
+        book_id: int,
+        *,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        book_id = int(book_id)
+        with self._ocr_publish_lock(book_id):
+            last_artifact: dict[str, Any] | None = None
+            for _attempt in range(2):
+                row = self._book(book_id)
+                archive_path = Path(str(row["path"]))
+                page_names = self._pages(archive_path)
+                with self.db.connect() as conn:
+                    fingerprint, generation, revision = self._ocr_context_from_conn(
+                        conn, book_id
+                    )
+                    if (
+                        expected_generation is not None
+                        and generation != int(expected_generation)
+                    ) or (
+                        expected_revision is not None
+                        and revision != int(expected_revision)
+                    ):
+                        current = read_artifact(self._ocr_artifact_path(book_id))
+                        return current if current is not None else (last_artifact or {})
+                    cache_rows = conn.execute(
+                        "SELECT page_index,text FROM manga_ocr_cache "
+                        "WHERE book_id=? AND region_key=? ORDER BY page_index",
+                        (book_id, _REGION_CACHE_KEY),
+                    ).fetchall()
+                by_index = {
+                    int(item["page_index"]): str(item["text"] or "[]")
+                    for item in cache_rows
+                }
+                pages: list[dict[str, Any]] = []
+                with zipfile.ZipFile(archive_path) as archive:
+                    for page_index, encoded in sorted(by_index.items()):
+                        try:
+                            regions = json.loads(encoded)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            regions = []
+                        if (
+                            not isinstance(regions, list)
+                            or not 0 <= page_index < len(page_names)
+                        ):
+                            continue
+                        try:
+                            with Image.open(
+                                io.BytesIO(archive.read(page_names[page_index]))
+                            ) as source_image:
+                                width, height = source_image.size
+                        except (OSError, ValueError, KeyError):
+                            width, height = 0, 0
+                        pages.append(
+                            normalize_page(
+                                page_index,
+                                [
+                                    dict(item)
+                                    for item in regions
+                                    if isinstance(item, dict)
+                                ],
+                                name=page_names[page_index],
+                                width=width,
+                                height=height,
+                            )
+                        )
+                detector_names = sorted(
+                    {
+                        str(region.get("detector") or "unknown")
+                        for page in pages
+                        for region in page.get("regions") or []
+                        if isinstance(region, dict)
+                    }
+                )
+                recognizer_names = sorted(
+                    {
+                        str(region.get("recognizer") or "unknown")
+                        for page in pages
+                        for region in page.get("regions") or []
+                        if isinstance(region, dict)
+                    }
+                )
+                artifact = build_artifact(
+                    source_fingerprint=fingerprint,
+                    title=str(row["title"] or ""),
+                    page_count=int(row["page_count"] or 0),
+                    pages=pages,
+                    detector="+".join(detector_names) or "unknown",
+                    recognizer="+".join(recognizer_names) or "unknown",
+                )
+                artifact["generation"] = int(generation)
+                artifact["revision"] = int(revision)
+                last_artifact = artifact
+
+                # A commit/invalidation that happened while the JSON projection
+                # was built makes this snapshot stale.  Do not publish it.
+                current_fingerprint, current_generation, current_revision = (
+                    self._ocr_context(book_id)
+                )
+                if (
+                    current_fingerprint == fingerprint
+                    and current_generation == generation
+                    and current_revision == revision
+                ):
+                    write_artifact(self._ocr_artifact_path(book_id), artifact)
+                    return artifact
+                if expected_generation is not None or expected_revision is not None:
+                    return artifact
+            return last_artifact or {}
 
     def ocr_artifact(self, book_id: int) -> dict[str, Any]:
-        return self._load_ocr_artifact(int(book_id)) or self._rebuild_ocr_artifact(int(book_id))
+        return self._load_ocr_artifact(int(book_id)) or self._rebuild_ocr_artifact(
+            int(book_id)
+        )
 
     def invalidate_region_cache(self, book_id: int) -> None:
-        """Discard all visual OCR for the book before rebuilding the region artifact."""
+        """Discard current OCR generation atomically before rebuilding."""
 
-        with self.db.connect() as conn:
-            conn.execute(
-                "DELETE FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
-                (int(book_id), _REGION_CACHE_KEY),
-            )
-        self._ocr_artifact_path(int(book_id)).unlink(missing_ok=True)
+        book_id = int(book_id)
+        with self._ocr_publish_lock(book_id):
+            artifact_path = self._ocr_artifact_path(book_id)
+            with self.db.connect() as conn:
+                conn.execute(
+                    "DELETE FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                    (book_id, _REGION_CACHE_KEY),
+                )
+                conn.execute(
+                    "DELETE FROM state WHERE key LIKE ?",
+                    (f"manga_ocr_page_status:v18:{book_id}:%",),
+                )
+                self._bump_ocr_generation_in_conn(conn, book_id)
+            artifact_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _ocr_page_status_state_key(book_id: int, page_index: int) -> str:
+        return f"manga_ocr_page_status:v18:{int(book_id)}:{int(page_index)}"
+
+    def _ocr_page_status(self, book_id: int, page_index: int) -> dict[str, Any]:
+        book_id = int(book_id)
+        raw = self.db.get_state(
+            self._ocr_page_status_state_key(book_id, page_index), ""
+        ).strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        fingerprint, generation, _revision = self._ocr_context(book_id)
+        payload_fingerprint = str(payload.get("source_fingerprint") or "")
+        payload_generation = payload.get("generation")
+        if payload_fingerprint and payload_fingerprint != fingerprint:
+            return {}
+        if payload_generation is not None:
+            try:
+                if int(payload_generation) != generation:
+                    return {}
+            except (TypeError, ValueError):
+                return {}
+        elif generation > 0:
+            # Legacy statuses predate generation ownership.  Once the source has
+            # been invalidated, such rows must never become authoritative again.
+            return {}
+        return dict(payload)
+
+    def _set_ocr_page_status(
+        self,
+        book_id: int,
+        page_index: int,
+        *,
+        status: str,
+        reason: str = "",
+        retryable: bool = False,
+    ) -> None:
+        book_id = int(book_id)
+        fingerprint, generation, _revision = self._ocr_context(book_id)
+        self.db.set_state(
+            self._ocr_page_status_state_key(book_id, page_index),
+            json.dumps(
+                {
+                    "status": str(status),
+                    "reason": str(reason),
+                    "retryable": bool(retryable),
+                    "source_fingerprint": fingerprint,
+                    "generation": generation,
+                    "updated_at": time.time(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    def _cached_ocr_payload(
+        self,
+        book_id: int,
+        page_index: int,
+        regions: list[dict[str, Any]],
+        *,
+        artifact: bool = False,
+        cached_only: bool = False,
+    ) -> dict[str, Any] | None:
+        state = self._ocr_page_status(book_id, page_index)
+        status = str(state.get("status") or "")
+        reason = str(state.get("reason") or "")
+        retryable = bool(state.get("retryable"))
+        if not status:
+            if regions:
+                status = "ready"
+                reason = "legacy_nonempty_cache"
+            else:
+                status = "unknown_cached_empty"
+                reason = "legacy_empty_cache_requires_retry"
+                retryable = True
+        if not regions and status not in {"empty_verified"} and not cached_only:
+            return None
+        return {
+            "book_id": int(book_id),
+            "page_index": int(page_index),
+            "regions": [
+                _normalize_region_orientation(dict(item))
+                for item in regions
+                if isinstance(item, dict)
+            ],
+            "available": True,
+            "cached": True,
+            "artifact": bool(artifact),
+            "status": status,
+            "reason": reason,
+            "retryable": retryable,
+        }
 
     def text_regions(
         self,
@@ -1237,24 +2177,19 @@ class MangaService:
         cached_only: bool = False,
     ) -> dict[str, Any]:
         row = self._book(int(book_id))
+        source_fingerprint, generation, _revision = self._ocr_context(int(book_id))
         pages = self._pages(Path(str(row["path"])))
         index = max(0, min(int(page_index), max(0, len(pages) - 1)))
         region_key = _REGION_CACHE_KEY
         if not refresh:
             page = artifact_page(self._load_ocr_artifact(int(book_id)), index)
             if page is not None:
-                return {
-                    "book_id": int(book_id),
-                    "page_index": index,
-                    "regions": [
-                        _normalize_region_orientation(dict(item))
-                        for item in page.get("regions") or []
-                        if isinstance(item, dict)
-                    ],
-                    "available": True,
-                    "cached": True,
-                    "artifact": True,
-                }
+                regions = [dict(item) for item in page.get("regions") or [] if isinstance(item, dict)]
+                cached_payload = self._cached_ocr_payload(
+                    int(book_id), index, regions, artifact=True, cached_only=cached_only
+                )
+                if cached_payload is not None:
+                    return cached_payload
             with self.db.connect() as conn:
                 cached = conn.execute(
                     "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? AND region_key=?",
@@ -1266,17 +2201,14 @@ class MangaService:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     regions = []
                 if isinstance(regions, list):
-                    return {
-                        "book_id": int(book_id),
-                        "page_index": index,
-                        "regions": [
-                            _normalize_region_orientation(dict(item))
-                            for item in regions
-                            if isinstance(item, dict)
-                        ],
-                        "available": True,
-                        "cached": True,
-                    }
+                    cached_payload = self._cached_ocr_payload(
+                        int(book_id),
+                        index,
+                        [dict(item) for item in regions if isinstance(item, dict)],
+                        cached_only=cached_only,
+                    )
+                    if cached_payload is not None:
+                        return cached_payload
 
         if cached_only:
             return {
@@ -1285,6 +2217,9 @@ class MangaService:
                 "regions": [],
                 "available": sys.platform == "darwin",
                 "cached": False,
+                "status": "missing",
+                "reason": "not_cached",
+                "retryable": True,
             }
 
         if sys.platform != "darwin":
@@ -1294,33 +2229,123 @@ class MangaService:
                 "regions": [],
                 "available": False,
                 "cached": False,
+                "status": "failed",
+                "reason": "macos_required",
+                "retryable": False,
             }
         path = Path(str(row["path"]))
         with zipfile.ZipFile(path) as archive:
             image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
+
         try:
-            regions = self._vision_text_regions(image)
-            if regions and self.ocr_available():
+            detected = self._vision_text_regions(image)
+        except Exception as exc:
+            return {
+                "book_id": int(book_id),
+                "page_index": index,
+                "regions": [],
+                "available": True,
+                "cached": False,
+                "status": "failed",
+                "reason": f"detector_error:{type(exc).__name__}",
+                "retryable": True,
+            }
+
+        regions = detected
+        recognizer_ran = False
+        if regions and self.ocr_available():
+            try:
+                recognizer_ran = True
                 regions = self._ocr_regions(image, regions)
-            regions = [
-                _normalize_region_orientation(item)
-                for item in regions
-                if str(item.get("text") or "").strip()
-            ]
-        except Exception:
-            regions = []
-        with self.db.connect() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) VALUES(?,?,?,?,?)",
-                (int(book_id), index, region_key, json.dumps(regions, ensure_ascii=False), time.time()),
-            )
-        self._rebuild_ocr_artifact(int(book_id))
+            except MangaOcrDeferred as exc:
+                provisional = [
+                    _normalize_region_orientation(item)
+                    for item in detected
+                    if str(item.get("text") or "").strip()
+                ]
+                return {
+                    "book_id": int(book_id),
+                    "page_index": index,
+                    "regions": provisional,
+                    "available": True,
+                    "cached": False,
+                    "status": "deferred",
+                    "reason": str(exc),
+                    "retryable": True,
+                }
+            except MangaOcrWorkerError as exc:
+                provisional = [
+                    _normalize_region_orientation(item)
+                    for item in detected
+                    if str(item.get("text") or "").strip()
+                ]
+                return {
+                    "book_id": int(book_id),
+                    "page_index": index,
+                    "regions": provisional,
+                    "available": True,
+                    "cached": False,
+                    "status": "failed",
+                    "reason": str(exc),
+                    "retryable": True,
+                }
+
+        normalized = _finalize_recognized_regions(
+            [dict(item) for item in regions if isinstance(item, dict)]
+        )
+        normalized = _repair_repeated_latin_page_titles(
+            normalized,
+            self._cached_peer_region_pages(int(book_id), exclude_page=index),
+        )
+        detector_fallback = bool(detected) and all(bool(item.get("fallback")) for item in detected)
+        partial = any(bool(item.get("error")) for item in normalized)
+        if not normalized:
+            if not detected:
+                status, reason, retryable = "empty_verified", "successful_detector_no_text", False
+            elif recognizer_ran and not detector_fallback:
+                status, reason, retryable = "empty_verified", "successful_ocr_no_text", False
+            else:
+                return {
+                    "book_id": int(book_id),
+                    "page_index": index,
+                    "regions": [],
+                    "available": True,
+                    "cached": False,
+                    "status": "failed",
+                    "reason": "detector_miss_or_recognizer_unavailable",
+                    "retryable": True,
+                }
+        elif partial or not recognizer_ran:
+            status, reason, retryable = "partial", "fallback_text_or_partial_ocr", True
+        else:
+            status, reason, retryable = "ready", "", False
+
+        committed = self._commit_ocr_page_updates(
+            int(book_id),
+            source_fingerprint=source_fingerprint,
+            generation=generation,
+            updates=[(index, normalized, status, reason, retryable)],
+        )
+        if not committed:
+            return {
+                "book_id": int(book_id),
+                "page_index": index,
+                "regions": [],
+                "available": True,
+                "cached": False,
+                "status": "stale",
+                "reason": "source_changed_during_ocr",
+                "retryable": True,
+            }
         return {
             "book_id": int(book_id),
             "page_index": index,
-            "regions": regions,
+            "regions": normalized,
             "available": True,
             "cached": False,
+            "status": status,
+            "reason": reason,
+            "retryable": retryable,
         }
 
     def _ocr_regions(self, image: Image.Image, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1328,11 +2353,14 @@ class MangaService:
         work_dir.mkdir(parents=True, exist_ok=True)
         heavy_lease = None
         if self.work_scheduler is not None:
+            # pudge-v0.7.27-manga-foreground-mangaocr-v1
+            # Direct page OCR is user-requested foreground work. Serialize it,
+            # but do not reject it because the manga reader itself is foreground.
             heavy_lease = self.work_scheduler.acquire_heavy(
-                "manga-ocr-region", blocking=False, foreground_sensitive=True
+                "manga-ocr-region", blocking=True, foreground_sensitive=False
             )
             if heavy_lease is None:
-                return regions
+                raise MangaOcrDeferred("heavy_work_deferred")
         with self._ocr_lock:
             input_path: Path | None = None
             manifest_path: Path | None = None
@@ -1362,16 +2390,47 @@ class MangaService:
                     timeout=240,
                 )
                 if completed.returncode != 0 or output_path is None or not output_path.is_file():
-                    return regions
-                payload = json.loads(output_path.read_text(encoding="utf-8"))
+                    detail = (completed.stderr or completed.stdout or "manga OCR worker failed").strip()
+                    raise MangaOcrWorkerError(detail[-1000:])
+                try:
+                    payload = json.loads(output_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    raise MangaOcrWorkerError(f"invalid_worker_output:{type(exc).__name__}") from exc
                 recognized = payload.get("regions") if isinstance(payload, dict) else None
-                return [dict(item) for item in recognized or [] if isinstance(item, dict)] or regions
+                if not isinstance(recognized, list):
+                    raise MangaOcrWorkerError("invalid_worker_regions")
+                return [dict(item) for item in recognized if isinstance(item, dict)]
+            except subprocess.TimeoutExpired as exc:
+                raise MangaOcrWorkerError("manga_ocr_timeout") from exc
             finally:
                 for path in (input_path, manifest_path, output_path):
                     if path is not None:
                         path.unlink(missing_ok=True)
                 if heavy_lease is not None:
                     heavy_lease.release()
+    def _cached_peer_region_pages(
+        self,
+        book_id: int,
+        *,
+        exclude_page: int | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT page_index,text FROM manga_ocr_cache "
+                "WHERE book_id=? AND region_key=? ORDER BY page_index",
+                (int(book_id), _REGION_CACHE_KEY),
+            ).fetchall()
+        pages: list[list[dict[str, Any]]] = []
+        for row in rows:
+            if exclude_page is not None and int(row["page_index"]) == int(exclude_page):
+                continue
+            try:
+                regions = json.loads(str(row["text"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(regions, list):
+                pages.append([dict(item) for item in regions if isinstance(item, dict)])
+        return pages
 
     def cached_region_texts(self, book_id: int) -> list[tuple[int, str]]:
         """Return recognized bubbles in reading order for background study parsing."""
@@ -1400,25 +2459,81 @@ class MangaService:
         self,
         book_id: int,
         *,
-        progress: Callable[[int, int, int | None], None] | None = None,
+        progress: Callable[..., None] | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         if not self.ocr_available():
             raise RuntimeError("MangaOCR is not installed. Install it from Settings → Essential.")
         row = self._book(int(book_id))
+        source_fingerprint, generation, _revision = self._ocr_context(int(book_id))
+
+        def emit_progress(done: int, total: int, page_index: int | None, phase: str) -> None:
+            if progress is None:
+                return
+            try:
+                progress(int(done), int(total), page_index, str(phase))
+            except TypeError:
+                # Compatibility with older callers/tests that still provide the
+                # original three-argument callback.
+                progress(int(done), int(total), page_index)
+
+        def wait_for_manual_priority() -> bool:
+            scheduler = self.work_scheduler
+            should_yield = getattr(scheduler, "should_yield_to_higher_priority", None)
+            while callable(should_yield) and should_yield(WorkPriority.BACKGROUND):
+                if cancelled is not None and cancelled():
+                    return False
+                time.sleep(0.10)
+            return True
+
         archive_path = Path(str(row["path"]))
         pages = self._pages(archive_path)
         total = len(pages)
         with self.db.connect() as conn:
             cached_rows = conn.execute(
-                "SELECT page_index FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
+                "SELECT page_index,text FROM manga_ocr_cache WHERE book_id=? AND region_key=?",
                 (int(book_id), _REGION_CACHE_KEY),
             ).fetchall()
-        cached = {int(item["page_index"]) for item in cached_rows}
+        cached: set[int] = set()
+        legacy_ready: list[int] = []
+        for item in cached_rows:
+            page_index_value = int(item["page_index"])
+            status = str(self._ocr_page_status(int(book_id), page_index_value).get("status") or "")
+            if status in {"ready", "empty_verified"}:
+                cached.add(page_index_value)
+                continue
+            if status == "partial":
+                continue
+            try:
+                legacy_regions = json.loads(str(item["text"] or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                legacy_regions = []
+            if isinstance(legacy_regions, list) and legacy_regions:
+                cached.add(page_index_value)
+                legacy_ready.append(page_index_value)
+        for page_index_value in legacy_ready:
+            self._set_ocr_page_status(
+                int(book_id),
+                page_index_value,
+                status="ready",
+                reason="legacy_nonempty_cache",
+                retryable=False,
+            )
         missing = [index for index in range(total) if index not in cached]
         done_before = total - len(missing)
-        if progress is not None:
-            progress(done_before, total, None)
+        if not wait_for_manual_priority():
+            return {
+                **self.ocr_cache_status(int(book_id)),
+                "ok": False,
+                "cancelled": True,
+                "errors": [],
+            }
+        emit_progress(
+            done_before,
+            total,
+            None,
+            "detecting" if missing else "ocr",
+        )
         if not missing:
             return {**self.ocr_cache_status(int(book_id)), "ok": True, "errors": []}
 
@@ -1428,6 +2543,9 @@ class MangaService:
         manifest_path = job_dir / f"{token}.manifest.json"
         output_path = job_dir / f"{token}.results.jsonl"
         progress_path = job_dir / f"{token}.progress.json"
+        stop_path = job_dir / f"{token}.stop"
+        stdout_path = job_dir / f"{token}.stdout"
+        stderr_path = job_dir / f"{token}.stderr"
         if self.work_scheduler is not None:
             if not self.work_scheduler.wait_until_background(
                 cancel_check=cancelled, poll_seconds=0.5
@@ -1438,7 +2556,14 @@ class MangaService:
                 }
         page_regions: dict[int, list[dict[str, Any]]] = {}
         with zipfile.ZipFile(archive_path) as archive:
-            for index in missing:
+            for prepared_offset, index in enumerate(missing, start=1):
+                if not wait_for_manual_priority():
+                    return {
+                        **self.ocr_cache_status(int(book_id)),
+                        "ok": False,
+                        "cancelled": True,
+                        "errors": [],
+                    }
                 if cancelled is not None and cancelled():
                     return {
                         **self.ocr_cache_status(int(book_id)),
@@ -1448,6 +2573,12 @@ class MangaService:
                     }
                 image = Image.open(io.BytesIO(archive.read(pages[index]))).convert("RGB")
                 page_regions[index] = self._vision_text_regions(image)
+                emit_progress(
+                    min(total, done_before + prepared_offset),
+                    total,
+                    index,
+                    "detecting",
+                )
         manifest_path.write_text(
             json.dumps(
                 {
@@ -1463,6 +2594,9 @@ class MangaService:
         )
         process: subprocess.Popen[str] | None = None
         errors: list[str] = []
+        preempted = False
+        cancelled_requested = False
+        stop_requested_at: float | None = None
         heavy_lease = None
         if self.work_scheduler is not None:
             heavy_lease = self.work_scheduler.acquire_heavy(
@@ -1471,6 +2605,7 @@ class MangaService:
                 foreground_sensitive=True,
                 wait_for_foreground=True,
                 cancel_check=cancelled,
+                priority=WorkPriority.BACKGROUND,
             )
             if heavy_lease is None:
                 return {
@@ -1480,84 +2615,177 @@ class MangaService:
                     "errors": [],
                 }
         try:
-            process = subprocess.Popen(
-                [
-                    self.python,
-                    "-m",
-                    "pudge.manga_ocr_worker",
-                    "--batch",
-                    str(manifest_path),
-                    str(output_path),
-                    str(progress_path),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            last_reported = -1
-            while process.poll() is None:
-                if cancelled is not None and cancelled():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
-                    return {
-                        **self.ocr_cache_status(int(book_id)),
-                        "ok": False,
-                        "cancelled": True,
-                        "errors": [],
-                    }
-                try:
-                    payload = json.loads(progress_path.read_text(encoding="utf-8"))
-                    processed = max(0, int(payload.get("done") or 0))
-                    current = payload.get("page_index")
-                    current_index = int(current) if current is not None else None
-                except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                    processed = 0
-                    current_index = None
-                absolute_done = min(total, done_before + processed)
-                if progress is not None and absolute_done != last_reported:
-                    progress(absolute_done, total, current_index)
-                    last_reported = absolute_done
-                time.sleep(0.35)
-            stdout, stderr = process.communicate()
-            if stderr.strip():
-                errors.append(stderr.strip()[-2000:])
-            if output_path.is_file():
-                with self.db.connect() as conn:
-                    for line in output_path.read_text(encoding="utf-8").splitlines():
+            stop_path.unlink(missing_ok=True)
+            with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_handle:
+                process = subprocess.Popen(
+                    [
+                        self.python,
+                        "-m",
+                        "pudge.manga_ocr_worker",
+                        "--batch",
+                        str(manifest_path),
+                        str(output_path),
+                        str(progress_path),
+                        str(stop_path),
+                    ],
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    text=True,
+                )
+                last_reported = -1
+                while process.poll() is None:
+                    now = time.monotonic()
+                    wants_cancel = bool(cancelled is not None and cancelled())
+                    should_yield = getattr(
+                        self.work_scheduler, "should_yield_to_higher_priority", None
+                    )
+                    wants_preempt = bool(
+                        callable(should_yield)
+                        and should_yield(WorkPriority.BACKGROUND)
+                    )
+                    if (wants_cancel or wants_preempt) and stop_requested_at is None:
+                        cancelled_requested = wants_cancel
+                        preempted = wants_preempt and not wants_cancel
+                        stop_requested_at = now
                         try:
-                            item = json.loads(line)
-                            page_index_value = int(item["page_index"])
-                        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-                            continue
-                        error = str(item.get("error") or "").strip()
-                        if error:
-                            errors.append(f"page {page_index_value + 1}: {error}")
-                            continue
-                        regions = item.get("regions") if isinstance(item, dict) else []
-                        conn.execute(
-                            "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-                            "VALUES(?,?,?,?,?)",
-                            (
-                                int(book_id),
-                                page_index_value,
-                                _REGION_CACHE_KEY,
-                                json.dumps(regions if isinstance(regions, list) else [], ensure_ascii=False),
-                                time.time(),
-                            ),
+                            stop_path.write_text("stop\n", encoding="utf-8")
+                        except OSError:
+                            pass
+                    if stop_requested_at is not None and now - stop_requested_at >= 45.0:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                        break
+                    try:
+                        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+                        processed = max(0, int(payload.get("done") or 0))
+                        current = payload.get("page_index")
+                        current_index = int(current) if current is not None else None
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        processed = 0
+                        current_index = None
+                    absolute_done = min(total, done_before + processed)
+                    if absolute_done != last_reported:
+                        emit_progress(absolute_done, total, current_index, "ocr")
+                        last_reported = absolute_done
+                    time.sleep(0.10 if stop_requested_at is not None else 0.35)
+                if process.poll() is None:
+                    process.wait(timeout=5)
+
+            stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.is_file() else ""
+            stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
+            if stderr.strip() and not preempted and not cancelled_requested:
+                errors.append(stderr.strip()[-2000:])
+            page_updates: list[
+                tuple[int, list[dict[str, Any]] | None, str, str, bool]
+            ] = []
+            if output_path.is_file():
+                cached_peer_pages = self._cached_peer_region_pages(int(book_id))
+                batch_peer_pages: list[list[dict[str, Any]]] = []
+                for line in output_path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        item = json.loads(line)
+                        page_index_value = int(item["page_index"])
+                    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                        continue
+                    error = str(item.get("error") or "").strip()
+                    if error:
+                        errors.append(f"page {page_index_value + 1}: {error}")
+                        page_updates.append(
+                            (page_index_value, None, "failed", error, True)
                         )
-            self._rebuild_ocr_artifact(int(book_id))
+                        continue
+                    regions = item.get("regions") if isinstance(item, dict) else []
+                    normalized_regions = _finalize_recognized_regions(
+                        [dict(region) for region in regions if isinstance(region, dict)]
+                    ) if isinstance(regions, list) else []
+                    normalized_regions = _repair_repeated_latin_page_titles(
+                        normalized_regions,
+                        cached_peer_pages + batch_peer_pages,
+                    )
+                    batch_peer_pages.append(
+                        [dict(region) for region in normalized_regions]
+                    )
+                    partial = any(
+                        isinstance(region, dict) and bool(region.get("error"))
+                        for region in normalized_regions
+                    )
+                    status_name = (
+                        "partial"
+                        if partial
+                        else "ready"
+                        if normalized_regions
+                        else "empty_verified"
+                    )
+                    page_updates.append(
+                        (
+                            page_index_value,
+                            normalized_regions,
+                            status_name,
+                            "batch_partial" if partial else "",
+                            bool(partial),
+                        )
+                    )
+            committed = self._commit_ocr_page_updates(
+                int(book_id),
+                source_fingerprint=source_fingerprint,
+                generation=generation,
+                updates=page_updates,
+            )
             status = self.ocr_cache_status(int(book_id))
-            if progress is not None:
-                progress(int(status["cached_pages"]), total, None)
-            if process.returncode not in {0, None} and not errors:
+            if page_updates and not committed:
+                errors.append("source_changed_during_ocr")
+                emit_progress(int(status["cached_pages"]), total, None, "ocr")
+                return {
+                    **status,
+                    "ok": False,
+                    "stale": True,
+                    "errors": errors,
+                }
+            emit_progress(int(status["cached_pages"]), total, None, "ocr")
+            if (
+                process.returncode not in {0, None, 75}
+                and not errors
+                and not preempted
+                and not cancelled_requested
+            ):
                 errors.append(stdout.strip()[-1000:] or f"worker exited with {process.returncode}")
+            if cancelled_requested:
+                return {
+                    **status,
+                    "ok": False,
+                    "cancelled": True,
+                    "errors": errors,
+                }
+            if preempted:
+                return {
+                    **status,
+                    "ok": False,
+                    "preempted": True,
+                    "errors": errors,
+                }
             return {**status, "ok": not errors and bool(status["complete"]), "errors": errors}
         finally:
-            for path in (manifest_path, output_path, progress_path):
+            for path in (
+                manifest_path,
+                output_path,
+                progress_path,
+                stop_path,
+                stdout_path,
+                stderr_path,
+            ):
                 path.unlink(missing_ok=True)
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
             if heavy_lease is not None:
                 heavy_lease.release()

@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import argparse
 import hashlib
-import re
 import json
 import os
 import shutil
@@ -51,8 +50,8 @@ from .pipeline_cache import (
 from .player import build_mpv_command, run_mpv
 from .providers.anilist import AniListClient, AniListError
 from .providers.jimaku import JimakuClient, JimakuError, find_7zip, materialize_jimaku_files
-from .subtitle_formats import clean_srt_for_playback, convert_to_plain_srt, parse_srt
-from .subtitles.discovery import deduplicate_candidates
+from .subtitle_formats import clean_srt_for_playback, convert_to_plain_srt
+from .subtitles.discovery import content_fingerprint, deduplicate_candidates
 from .subtitles.jobs import SubtitleJobReporter
 from .subtitles.models import SubtitleJobStage
 from .subtitles.validation import quality_from_result
@@ -234,29 +233,9 @@ def _subtitle_content_fingerprint(
     *,
     ffmpeg_path: str,
 ) -> str | None:
-    path = candidate.path
-    if path.suffix.casefold() in {".ass", ".ssa"}:
-        path, _ = convert_to_plain_srt(
-            path,
-            cache_dir,
-            ffmpeg_path=ffmpeg_path,
-            force=False,
-            verbose=False,
-        )
-    if path.suffix.casefold() != ".srt":
-        return None
-    try:
-        cues = parse_srt(path)
-    except OSError:
-        return None
-    if not cues:
-        return None
-    normalized = []
-    for start, end, text in cues:
-        clean_text = re.sub(r"\s+", "", text).casefold()
-        clean_text = re.sub(r"<[^>]+>|\{\\[^}]+\}", "", clean_text)
-        normalized.append(f"{round(start, 2):.2f}|{round(end, 2):.2f}|{clean_text}")
-    return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
+    """Compatibility wrapper around the shared subtitle content identity."""
+
+    return content_fingerprint(candidate, cache_dir, ffmpeg_path=ffmpeg_path)
 
 
 def _deduplicate_subtitle_candidates(

@@ -148,7 +148,7 @@ def _fingerprint(video: Path, subtitle: Path, config: SyncConfig, *, tag: str = 
     video_stat = video.stat()
     subtitle_stat = subtitle.stat()
     raw = (
-        f"syncing-v0.3.46-tri-modal-cold-open:{tag}:"
+        f"syncing-v0.3.47-embedded-rank-regression-guard:{tag}:"
         f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
         f"{subtitle.resolve()}:{subtitle_stat.st_size}:{subtitle_stat.st_mtime_ns}:"
         f"{config.max_offset_seconds}:{config.quality_max_offset_seconds}:"
@@ -6732,7 +6732,7 @@ def _restore_embedded_opening_clock_scaffold(
     stable = [
         row for row in segments
         if isinstance(row, dict)
-        and str(row.get("kind") or "stable") == "stable"
+        and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
     ]
     if len(stable) < 2:
         return aligned, _result(
@@ -6772,8 +6772,62 @@ def _restore_embedded_opening_clock_scaffold(
             pre_refinement = 0.0
             post_refinement = 0.0
 
-    existing_relative_clock = pre_refinement - post_refinement
+    # ALASS can itself be piecewise around an opening edit.  The local plateau
+    # refinement above only describes the *extra* micro-adjustment and must not
+    # erase that base clock jump. A large early edit can otherwise collapse a
+    # long opening gap with a huge transition, leaving the
+    # pre-opening dialogue roughly +105s late while the post-opening clock was
+    # already correct.
+    opening_alass_transition: dict[str, object] | None = None
+    alass_relative_clock = 0.0
+    transition_safety = speech_result.get("stt_alass_transition_safety")
+    transition_rows = (
+        transition_safety.get("transitions")
+        if isinstance(transition_safety, dict)
+        else None
+    )
+    opening_transition_candidates: list[dict[str, object]] = []
+    if isinstance(transition_rows, list):
+        for row in transition_rows:
+            if not isinstance(row, dict) or not bool(row.get("gap_supported")):
+                continue
+            try:
+                jump = float(row.get("jump_seconds") or 0.0)
+                source_time = float(row.get("source_time") or 0.0)
+                nearby_gap_seconds = float(row.get("nearby_gap_seconds") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if (
+                abs(jump) >= 20.0
+                and nearby_gap_seconds >= 45.0
+                and 0.0 < source_time <= 300.0
+            ):
+                opening_transition_candidates.append(row)
+    if opening_transition_candidates:
+        opening_alass_transition = max(
+            opening_transition_candidates,
+            key=lambda row: abs(float(row.get("jump_seconds") or 0.0)),
+        )
+        # transition jump = post_shift - pre_shift, therefore the existing
+        # pre-vs-post relative clock contributed by ALASS is -jump.
+        alass_relative_clock = -float(
+            opening_alass_transition.get("jump_seconds") or 0.0
+        )
+
+    existing_relative_clock = (
+        alass_relative_clock + pre_refinement - post_refinement
+    )
     correction = target_relative_clock - existing_relative_clock
+
+    speech_post_error = abs(speech_offset - post_offset)
+    large_alass_opening_clock = bool(
+        opening_alass_transition is not None
+        and abs(alass_relative_clock) >= 60.0
+        and abs(correction) >= 40.0
+        and abs(target_relative_clock) <= 20.0
+        and post_support >= 12
+        and speech_post_error <= 0.75
+    )
 
     risk_reasons_raw = risk.get("reasons")
     risk_reasons = (
@@ -6852,15 +6906,32 @@ def _restore_embedded_opening_clock_scaffold(
     # Japanese STT, allow a smaller 2s scaffold delta; the local speech stage
     # below must still verify the residual before it becomes authoritative.
     minimum_scaffold_delta = 2.0 if cold_overlap_ambiguity else 4.0
-    if not (minimum_scaffold_delta <= abs(correction) <= 20.0):
+    maximum_scaffold_delta = 150.0 if large_alass_opening_clock else 20.0
+    if not (minimum_scaffold_delta <= abs(correction) <= maximum_scaffold_delta):
         return aligned, _result(
             "opening_scaffold_unavailable",
             applied=False,
             reason_detail="clock_delta_out_of_range",
             correction_seconds=round(correction, 3),
             cold_overlap_ambiguity=cold_overlap_ambiguity,
+            alass_relative_clock_seconds=round(alass_relative_clock, 3),
+            opening_alass_transition=opening_alass_transition,
         )
-    strong_single_window_early_clock = tri_modal_cold_open_authoritative
+    opening_reacquire = embedded_result.get("timeline_opening_gap_reacquire")
+    dominant_opening_reacquire = bool(
+        isinstance(opening_reacquire, dict)
+        and bool(opening_reacquire.get("applied"))
+        and str(opening_reacquire.get("reason") or "")
+        == "dominant_clock_reacquired_after_opening_gap"
+        and "early_path_clock_change" in risk_reasons
+        and "opening_gap_clock_ambiguity" in risk_reasons
+        and first_support >= 1
+        and post_support >= 6
+        and abs(speech_offset - post_offset) <= 2.5
+    )
+    strong_single_window_early_clock = bool(
+        tri_modal_cold_open_authoritative or dominant_opening_reacquire
+    )
     single_window_evidence: dict[str, object] = (
         {
             "accepted": True,
@@ -6868,6 +6939,12 @@ def _restore_embedded_opening_clock_scaffold(
             "tri_modal": dict(tri_modal_cold_open),
         }
         if tri_modal_cold_open_authoritative
+        else {
+            "accepted": True,
+            "evidence_mode": "dominant_post_opening_reacquire",
+            "opening_reacquire": dict(opening_reacquire),
+        }
+        if dominant_opening_reacquire
         else {}
     )
     if first_support == 1 and post_support >= 12:
@@ -6944,7 +7021,6 @@ def _restore_embedded_opening_clock_scaffold(
             if edge_hints
             else float("inf")
         )
-        speech_post_error = abs(speech_offset - post_offset)
         edge_confirmed_single_window = bool(
             first_score >= 3.0
             and first_coverage >= 0.85
@@ -6987,11 +7063,28 @@ def _restore_embedded_opening_clock_scaffold(
             and holdout_coverage >= 0.84
             and speech_post_error <= 0.75
         )
+        # A huge gap-supported ALASS transition can collapse the OP gap and
+        # make the early dialogue land inside the opening.  Recover the
+        # one-window embedded early clock only when the main/post clock is
+        # independently very strong and agrees with Japanese speech.  This is
+        # intentionally narrower than the ordinary single-window path.
+        catastrophic_alass_preopening_recovery = bool(
+            large_alass_opening_clock
+            and first_score >= 3.0
+            and first_coverage >= 0.85
+            and first_hint_error <= 2.0
+            and after_f1 >= 0.78
+            and activity_f1 >= 0.80
+            and holdout_p90 <= 1.50
+            and holdout_coverage >= 0.84
+            and speech_post_error <= 0.75
+        )
         if not strong_single_window_early_clock:
             strong_single_window_early_clock = bool(
                 edge_confirmed_single_window
                 or validation_confirmed_single_window
                 or speech_verified_cold_ambiguity
+                or catastrophic_alass_preopening_recovery
             )
             single_window_evidence = {
                 "accepted": strong_single_window_early_clock,
@@ -7002,6 +7095,8 @@ def _restore_embedded_opening_clock_scaffold(
                     if validation_confirmed_single_window
                     else "speech_verified_cold_ambiguity"
                     if speech_verified_cold_ambiguity
+                    else "catastrophic_alass_preopening_recovery"
+                    if catastrophic_alass_preopening_recovery
                     else "rejected"
                 ),
                 "first_score": round(first_score, 4),
@@ -7027,6 +7122,75 @@ def _restore_embedded_opening_clock_scaffold(
                 "early_offset_span_seconds": round(early_span, 4),
                 "early_max_jump_seconds": round(early_jump, 4),
                 "speech_post_error_seconds": round(speech_post_error, 4),
+                "alass_relative_clock_seconds": round(alass_relative_clock, 4),
+                "opening_alass_transition": opening_alass_transition,
+                "correction_seconds": round(correction, 4),
+            }
+
+    if (
+        large_alass_opening_clock
+        and first_support >= 2
+        and post_support >= 12
+        and not strong_single_window_early_clock
+    ):
+        validation = embedded_result.get("timeline_validation")
+        after_validation = (
+            validation.get("after")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("after"), dict)
+            else {}
+        )
+        holdout = (
+            validation.get("holdout")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("holdout"), dict)
+            else {}
+        )
+        try:
+            first_score = float(first.get("mean_score") or 0.0)
+            first_coverage = float(first.get("mean_coverage") or 0.0)
+            after_f1 = float(after_validation.get("f1") or 0.0)
+            activity_f1 = (
+                float(validation.get("activity_f1") or 0.0)
+                if isinstance(validation, dict)
+                else 0.0
+            )
+            holdout_p90 = float(holdout.get("p90_abs_residual_seconds"))
+            holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
+        except (TypeError, ValueError):
+            first_score = 0.0
+            first_coverage = 0.0
+            after_f1 = 0.0
+            activity_f1 = 0.0
+            holdout_p90 = float("inf")
+            holdout_coverage = 0.0
+
+        multi_window_catastrophic_recovery = bool(
+            first_score >= 3.0
+            and first_coverage >= 0.85
+            and after_f1 >= 0.78
+            and activity_f1 >= 0.80
+            and holdout_p90 <= 1.50
+            and holdout_coverage >= 0.84
+            and speech_post_error <= 0.75
+        )
+        if multi_window_catastrophic_recovery:
+            strong_single_window_early_clock = True
+            single_window_evidence = {
+                "accepted": True,
+                "evidence_mode": "catastrophic_alass_multi_window_preopening_recovery",
+                "first_support": first_support,
+                "post_support": post_support,
+                "first_score": round(first_score, 4),
+                "first_coverage": round(first_coverage, 4),
+                "after_f1": round(after_f1, 4),
+                "activity_f1": round(activity_f1, 4),
+                "holdout_p90_seconds": round(holdout_p90, 4),
+                "holdout_mean_coverage": round(holdout_coverage, 4),
+                "speech_post_error_seconds": round(speech_post_error, 4),
+                "alass_relative_clock_seconds": round(alass_relative_clock, 4),
+                "opening_alass_transition": opening_alass_transition,
+                "correction_seconds": round(correction, 4),
             }
 
     if (
@@ -7075,13 +7239,38 @@ def _restore_embedded_opening_clock_scaffold(
         if gap >= 45.0 and midpoint - timeline_origin <= 240.0:
             gaps.append((gap, index, midpoint))
     if not gaps:
-        return aligned, _result(
-            "opening_scaffold_unavailable",
-            applied=False,
-            reason_detail="opening_gap_not_found",
-        )
-
-    gap_seconds, split_index, gap_midpoint = max(gaps)
+        if (
+            large_alass_opening_clock
+            and strong_single_window_early_clock
+            and isinstance(opening_alass_transition, dict)
+        ):
+            try:
+                split_index = int(opening_alass_transition.get("cue_index"))
+                gap_seconds = float(
+                    opening_alass_transition.get("nearby_gap_seconds") or 0.0
+                )
+                gap_midpoint = float(
+                    opening_alass_transition.get("nearby_gap_time") or 0.0
+                )
+            except (TypeError, ValueError):
+                split_index = 0
+                gap_seconds = 0.0
+                gap_midpoint = 0.0
+            if not 1 <= split_index < len(cues):
+                return aligned, _result(
+                    "opening_scaffold_unavailable",
+                    applied=False,
+                    reason_detail="opening_transition_index_invalid",
+                    opening_alass_transition=opening_alass_transition,
+                )
+        else:
+            return aligned, _result(
+                "opening_scaffold_unavailable",
+                applied=False,
+                reason_detail="opening_gap_not_found",
+            )
+    else:
+        gap_seconds, split_index, gap_midpoint = max(gaps)
     repaired = []
     for index, (start, end, cue_text) in enumerate(cues):
         shift = correction if index < split_index else 0.0
@@ -7461,7 +7650,7 @@ def _restore_embedded_opening_clock_scaffold(
     stat = aligned.stat()
     digest = hashlib.sha1(
         (
-            f"embedded-opening-scaffold-v2-sparse-two-plateau:"
+            f"embedded-opening-scaffold-v3-alass-relative-clock:"
             f"{aligned.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
             f"{first_offset:.3f}:{post_offset:.3f}:{speech_offset:.3f}:"
             f"{split_index}:{correction:.3f}:"
@@ -7494,6 +7683,9 @@ def _restore_embedded_opening_clock_scaffold(
         first_offset_seconds=round(first_offset, 3),
         post_offset_seconds=round(post_offset, 3),
         speech_offset_seconds=round(speech_offset, 3),
+        alass_relative_clock_seconds=round(alass_relative_clock, 3),
+        opening_alass_transition=opening_alass_transition,
+        large_alass_opening_clock_recovery=large_alass_opening_clock,
         first_support=first_support,
         post_support=post_support,
         early_support_override=strong_single_window_early_clock,
@@ -10230,6 +10422,68 @@ def _exact_jimaku_audio_clock_consensus(
     return (selected[1], selected[2], selected[3]), payload
 
 
+
+def _embedded_rank_regression_guard(
+    sorted_prealigned: list[tuple[object, ...]],
+    risky_candidate: SubtitleCandidate,
+    speech_activity: dict[str, object],
+    *,
+    minimum_embedded_activity: float = 0.92,
+    minimum_regression: float = 0.10,
+) -> tuple[tuple[object, ...] | None, dict[str, object]]:
+    """Reject a speech fallback that is a large regression from another exact winner.
+
+    The speech path is an arbiter for risky early edits, not permission to throw
+    away a substantially stronger exact-video subtitle candidate. This guard is
+    intentionally narrow: it only compares a *different* exact Jimaku episode
+    whose structure is intact and whose embedded-reference activity is already
+    very high.
+    """
+    if not sorted_prealigned:
+        return None, {"accepted": False, "reason": "no_embedded_candidates"}
+    winner = sorted_prealigned[0]
+    if len(winner) < 6:
+        return None, {"accepted": False, "reason": "invalid_embedded_candidate"}
+    _rank, candidate, _aligned, result, activity, structure = winner[:6]
+    if not isinstance(candidate, SubtitleCandidate):
+        return None, {"accepted": False, "reason": "invalid_candidate"}
+    if candidate.path == risky_candidate.path:
+        return None, {"accepted": False, "reason": "same_candidate"}
+    details = candidate.details if isinstance(candidate.details, dict) else {}
+    exact = bool(
+        candidate.source == "jimaku"
+        and details.get("episode_match") == "exact"
+        and _candidate_has_exact_anilist_identity(candidate)
+    )
+    try:
+        embedded_weighted = float(activity.get("weighted") or 0.0)
+        speech_weighted = float(speech_activity.get("weighted") or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return None, {"accepted": False, "reason": "activity_unavailable"}
+    structure_ok = isinstance(structure, dict) and structure.get("reason") == "ok"
+    synchronized = isinstance(result, dict) and bool(result.get("sync_was_successful"))
+    regression = embedded_weighted - speech_weighted
+    accepted = bool(
+        exact
+        and structure_ok
+        and synchronized
+        and embedded_weighted >= float(minimum_embedded_activity)
+        and bool(speech_activity.get("available"))
+        and regression >= float(minimum_regression)
+    )
+    meta = {
+        "accepted": accepted,
+        "reason": "embedded_exact_winner_materially_stronger" if accepted else "guard_threshold_not_met",
+        "embedded_candidate": candidate.name,
+        "risky_candidate": risky_candidate.name,
+        "embedded_activity": round(embedded_weighted, 4),
+        "speech_activity": round(speech_weighted, 4),
+        "activity_regression": round(regression, 4),
+        "minimum_embedded_activity": float(minimum_embedded_activity),
+        "minimum_regression": float(minimum_regression),
+    }
+    return (winner if accepted else None), meta
+
 def optimize_candidates(
     video: Path,
     candidates: Iterable[SubtitleCandidate],
@@ -10781,7 +11035,72 @@ def optimize_candidates(
                             )
                             return risky_candidate, _embedded_aligned, final_result
 
+                        speech_activity = compare_timing_activity(
+                            speech_aligned,
+                            timing_reference,
+                        )
+                        protected_item, regression_guard = (
+                            _embedded_rank_regression_guard(
+                                sorted_prealigned,
+                                risky_candidate,
+                                speech_activity,
+                            )
+                        )
+                        if protected_item is not None:
+                            (
+                                _protected_rank,
+                                protected_candidate,
+                                protected_aligned,
+                                protected_result,
+                                protected_activity,
+                                protected_structure,
+                            ) = protected_item
+                            final_result = dict(protected_result)
+                            final_result.update(
+                                {
+                                    "reason": "applied",
+                                    "sync_was_successful": True,
+                                    "engine": "embedded-reference+alass+activity-regression-guard",
+                                    "output": str(protected_aligned),
+                                    "timing_reference": str(timing_reference),
+                                    "timing_reference_language": timing_reference_result.get("language"),
+                                    "timing_reference_title": timing_reference_result.get("title"),
+                                    "reference_activity": protected_activity,
+                                    "reference_output_structure": protected_structure,
+                                    "reference_alignment_reliable": True,
+                                    "selection_reason": "embedded_rank_over_weaker_speech",
+                                    "speech_regression_guard": regression_guard,
+                                    "speech_verification": {
+                                        "candidate": risky_candidate.name,
+                                        "engine": speech_result.get("engine"),
+                                        "offset_seconds": speech_result.get("offset_seconds"),
+                                        "reference_activity": speech_activity,
+                                        "opening_scaffold": opening_scaffold,
+                                    },
+                                    "candidate_selection": {
+                                        "mode": "embedded_rank_over_weaker_speech",
+                                        "candidate_count": len(candidate_list),
+                                        "prealigned_count": len(prealigned),
+                                        "prefer_srt": prefer_srt,
+                                        "embedded_reference_ranking": embedded_rank_meta,
+                                    },
+                                }
+                            )
+                            configure_logging().warning(
+                                "REJECT step=subtitle.early_edit_speech_regression "
+                                "video=%s speech_candidate=%r protected_candidate=%r "
+                                "speech_activity=%s embedded_activity=%s regression=%s",
+                                video.name,
+                                risky_candidate.name,
+                                protected_candidate.name,
+                                regression_guard.get("speech_activity"),
+                                regression_guard.get("embedded_activity"),
+                                regression_guard.get("activity_regression"),
+                            )
+                            return protected_candidate, protected_aligned, final_result
+
                         final_result = dict(speech_result)
+                        final_result["reference_activity"] = speech_activity
                         if opening_scaffold.get("applied"):
                             final_result["engine"] = (
                                 f"{final_result.get('engine') or 'japanese-stt+alass'}"

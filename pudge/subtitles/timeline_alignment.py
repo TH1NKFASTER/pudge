@@ -10,7 +10,7 @@ from pathlib import Path
 from ..subtitle_formats import parse_srt, write_srt
 
 
-_ALGORITHM_VERSION = "timeline-v6.9-cold-overlap-verification"
+_ALGORITHM_VERSION = "timeline-v6.14-opening-preclock-holdout"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -65,6 +65,8 @@ def _early_edit_audio_verification_risk(
     path: list[_WindowMatch],
     cold_start: dict[str, object],
     monotonic_refinements: list[dict[str, object]],
+    *,
+    resolved_by: str | None = None,
 ) -> dict[str, object]:
     """Flag early clock ambiguity that should be verified against Japanese speech.
 
@@ -134,7 +136,7 @@ def _early_edit_audio_verification_risk(
     ):
         reasons.append("opening_gap_clock_ambiguity")
 
-    return {
+    payload = {
         "required": bool(reasons),
         "reasons": reasons,
         "early_window_count": len(early),
@@ -145,6 +147,16 @@ def _early_edit_audio_verification_risk(
         "cold_start_gap_seconds": round(cold_gap, 3),
         "cold_start_boundary_seconds": round(cold_boundary, 3),
     }
+    if resolved_by:
+        payload.update(
+            {
+                "required": False,
+                "reasons": [],
+                "resolved_reasons": reasons,
+                "resolved_by": resolved_by,
+            }
+        )
+    return payload
 
 
 def _merge_activity(cues: list[tuple[float, float, str]]) -> list[tuple[float, float]]:
@@ -472,6 +484,126 @@ def _smooth_offsets(path: list[_WindowMatch]) -> list[float]:
         if abs(values[index] - median) > 2.0:
             smoothed[index] = median
     return smoothed
+
+
+def _suppress_weak_opening_path_excursion(
+    source_cues: list[tuple[float, float, str]],
+    path: list[_WindowMatch],
+    edge_hints: tuple[float, float],
+) -> tuple[list[_WindowMatch], dict[str, object]]:
+    """Drop a short false clock excursion that straddles a long opening gap.
+
+    Work at the raw window-path level before segment clustering.  This avoids
+    letting a two-window phase mistake become a stable middle segment that
+    later monotonic repair stretches across real dialogue.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if len(path) < 10 or len(source_cues) < 4:
+        return path, diagnostics
+
+    try:
+        hints = [float(value) for value in edge_hints]
+    except (TypeError, ValueError):
+        diagnostics["reason"] = "edge_hints_unavailable"
+        return path, diagnostics
+
+    source_start = min(float(start) for start, _end, _text in source_cues)
+    source_end = max(float(end) for _start, end, _text in source_cues)
+    source_duration = max(0.001, source_end - source_start)
+    long_gaps: list[tuple[float, float, float, float]] = []
+    for previous, current in zip(source_cues, source_cues[1:]):
+        gap_start = float(previous[1])
+        gap_end = float(current[0])
+        gap = gap_end - gap_start
+        if gap < 45.0:
+            continue
+        midpoint = (gap_start + gap_end) / 2.0
+        if midpoint - source_start > 600.0 or (midpoint - source_start) / source_duration > 0.50:
+            continue
+        long_gaps.append((gap, gap_start, gap_end, midpoint))
+    if not long_gaps:
+        diagnostics["reason"] = "no_long_early_gap"
+        return path, diagnostics
+
+    for run_length in (2, 1):
+        for start_index in range(3, len(path) - run_length - 5):
+            end_index = start_index + run_length
+            left_rows = path[max(0, start_index - 4):start_index]
+            middle_rows = path[start_index:end_index]
+            right_rows = path[end_index:min(len(path), end_index + 8)]
+            if len(left_rows) < 3 or len(right_rows) < 6:
+                continue
+
+            left_values = [float(row.offset) for row in left_rows]
+            middle_values = [float(row.offset) for row in middle_rows]
+            right_values = [float(row.offset) for row in right_rows]
+            left_clock = float(statistics.median(left_values))
+            middle_clock = float(statistics.median(middle_values))
+            right_clock = float(statistics.median(right_values))
+
+            if max(left_values) - min(left_values) > 2.5:
+                continue
+            if max(right_values) - min(right_values) > 2.5:
+                continue
+            if max(middle_values) - min(middle_values) > 3.0:
+                continue
+
+            neighbor_delta = abs(left_clock - right_clock)
+            left_excursion = abs(middle_clock - left_clock)
+            right_excursion = abs(middle_clock - right_clock)
+            left_hint_error = min(abs(left_clock - hint) for hint in hints)
+            right_hint_error = min(abs(right_clock - hint) for hint in hints)
+            middle_hint_error = min(abs(middle_clock - hint) for hint in hints)
+            middle_score = statistics.fmean(row.score for row in middle_rows)
+            flank_score = min(
+                statistics.fmean(row.score for row in left_rows),
+                statistics.fmean(row.score for row in right_rows),
+            )
+
+            if not (
+                neighbor_delta <= 15.0
+                and min(left_excursion, right_excursion) >= 25.0
+                and left_hint_error <= 3.0
+                and right_hint_error <= 4.0
+                and middle_hint_error >= 20.0
+                and middle_score + 0.15 <= flank_score
+            ):
+                continue
+
+            left_center = float(left_rows[-1].center)
+            right_center = float(right_rows[0].center)
+            matching_gap = next(
+                (
+                    row for row in long_gaps
+                    if left_center - 18.0 <= row[3] <= right_center + 18.0
+                ),
+                None,
+            )
+            if matching_gap is None:
+                continue
+
+            gap, gap_start, gap_end, gap_midpoint = matching_gap
+            filtered = path[:start_index] + path[end_index:]
+            diagnostics.update(
+                {
+                    "applied": True,
+                    "reason": "weak_opening_path_excursion",
+                    "removed_window_count": run_length,
+                    "removed_centers": [round(float(row.center), 3) for row in middle_rows],
+                    "removed_offsets": [round(float(row.offset), 3) for row in middle_rows],
+                    "left_clock_seconds": round(left_clock, 3),
+                    "right_clock_seconds": round(right_clock, 3),
+                    "middle_clock_seconds": round(middle_clock, 3),
+                    "gap_seconds": round(gap, 3),
+                    "gap_start_seconds": round(gap_start, 3),
+                    "gap_end_seconds": round(gap_end, 3),
+                    "gap_midpoint_seconds": round(gap_midpoint, 3),
+                }
+            )
+            return filtered, diagnostics
+
+    diagnostics["reason"] = "no_weak_opening_path_excursion"
+    return path, diagnostics
 
 
 def _segments(path: list[_WindowMatch]) -> list[dict[str, object]]:
@@ -1773,6 +1905,195 @@ def _post_opening_gap_reacquire(
     diagnostics["reason"] = "dominant_clock_reacquired_after_opening_gap"
     return new_segments, new_boundaries, diagnostics
 
+def _suppress_weak_opening_bridge_excursion(
+    source_cues: list[tuple[float, float, str]],
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+    edge_hints: tuple[float, float],
+) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
+    """Collapse a weak false clock excursion immediately before a long OP gap.
+
+    Subtitle-only onset matching can occasionally lock two windows onto the
+    wrong phase just before a long opening gap.  The resulting middle segment
+    can be tens of seconds away from both the stable pre-OP and post-OP clocks;
+    monotonic repair then stretches that bad clock across many real dialogue
+    cues.
+
+    Only collapse this very specific shape when independent edge hints support
+    both surrounding clocks, the middle segment is weak and lower quality, and
+    its exit boundary lands at a long early/mid-episode subtitle silence.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if len(segments) < 3 or len(boundaries) != len(segments) - 1 or len(source_cues) < 4:
+        return segments, boundaries, diagnostics
+
+    try:
+        hints = [float(value) for value in edge_hints]
+    except (TypeError, ValueError):
+        diagnostics["reason"] = "edge_hints_unavailable"
+        return segments, boundaries, diagnostics
+    if len(hints) < 2:
+        diagnostics["reason"] = "edge_hints_unavailable"
+        return segments, boundaries, diagnostics
+
+    source_start = min(float(start) for start, _end, _text in source_cues)
+    source_end = max(float(end) for _start, end, _text in source_cues)
+    source_duration = max(0.001, source_end - source_start)
+    long_gaps: list[tuple[float, float, float, float]] = []
+    for previous, current in zip(source_cues, source_cues[1:]):
+        previous_end = float(previous[1])
+        current_start = float(current[0])
+        gap = current_start - previous_end
+        if gap < 45.0:
+            continue
+        midpoint = (previous_end + current_start) / 2.0
+        # Openings can start surprisingly late (around 5-7 minutes), but this
+        # guard must not reinterpret late previews/endings as an OP bridge.
+        if midpoint - source_start > 600.0 or (midpoint - source_start) / source_duration > 0.50:
+            continue
+        long_gaps.append((gap, previous_end, current_start, midpoint))
+    for index in range(1, len(segments) - 1):
+        left = segments[index - 1]
+        middle = segments[index]
+        right = segments[index + 1]
+        try:
+            left_offset = float(left["offset_seconds"])
+            middle_offset = float(middle["offset_seconds"])
+            right_offset = float(right["offset_seconds"])
+            left_support = int(left.get("support") or 0)
+            middle_support = int(middle.get("support") or 0)
+            right_support = int(right.get("support") or 0)
+            left_score = float(left.get("mean_score") or 0.0)
+            middle_score = float(middle.get("mean_score") or 0.0)
+            right_score = float(right.get("mean_score") or 0.0)
+            left_coverage = float(left.get("mean_coverage") or 0.0)
+            middle_coverage = float(middle.get("mean_coverage") or 0.0)
+            right_coverage = float(right.get("mean_coverage") or 0.0)
+            left_boundary = float(boundaries[index - 1])
+            right_boundary = float(boundaries[index])
+        except (TypeError, ValueError, KeyError):
+            continue
+
+        neighbor_delta = abs(left_offset - right_offset)
+        left_excursion = abs(middle_offset - left_offset)
+        right_excursion = abs(middle_offset - right_offset)
+        left_hint_error = min(abs(left_offset - hint) for hint in hints)
+        right_hint_error = min(abs(right_offset - hint) for hint in hints)
+        middle_hint_error = min(abs(middle_offset - hint) for hint in hints)
+        middle_duration = max(0.0, right_boundary - left_boundary)
+
+        structural_match = bool(
+            str(middle.get("kind") or "stable") == "stable"
+            and left_support >= max(3, middle_support * 2)
+            and right_support >= max(6, middle_support * 4)
+            and 1 <= middle_support <= 2
+            and neighbor_delta <= 15.0
+            and min(left_excursion, right_excursion) >= 25.0
+            and left_hint_error <= 3.0
+            and right_hint_error <= 4.0
+            and middle_hint_error >= 20.0
+            and middle_duration <= 180.0
+            and middle_score + 0.20 <= min(left_score, right_score)
+            and middle_coverage + 0.02 <= max(left_coverage, right_coverage)
+        )
+        if not structural_match:
+            continue
+
+        matching_gap = None
+        for gap, gap_start, gap_end, gap_midpoint in long_gaps:
+            # Prefer a real subtitle silence when one cleanly brackets the
+            # inferred crossover.  Some releases still carry OP/sign/title
+            # cues, though, so a clean source-cue gap is useful evidence but
+            # cannot be mandatory.
+            if gap_start - 18.0 <= right_boundary <= gap_end + 8.0:
+                matching_gap = (gap, gap_start, gap_end, gap_midpoint)
+                break
+
+        transition_boundary = right_boundary
+        evidence = "structural_crossover"
+        gap_payload: dict[str, object] = {}
+        if matching_gap is not None:
+            gap, gap_start, gap_end, gap_midpoint = matching_gap
+            transition_boundary = gap_midpoint
+            evidence = "long_subtitle_gap"
+            gap_payload = {
+                "gap_seconds": round(gap, 3),
+                "gap_start_seconds": round(gap_start, 3),
+                "gap_end_seconds": round(gap_end, 3),
+            }
+        else:
+            # Without a clean gap, demand an even stronger sandwich: the weak
+            # bridge must be only two windows, both surrounding clocks must be
+            # independently supported by edge hints, and the right clock must
+            # dominate the rest of the episode.  This is the real Slime E22
+            # shape (-32 / weak -92 / -41), but it avoids collapsing ordinary
+            # mid-episode master changes.
+            boundary_ratio = (right_boundary - source_start) / source_duration
+            strict_structural_fallback = bool(
+                middle_support == 2
+                and left_support >= 4
+                and right_support >= 12
+                and neighbor_delta <= 12.0
+                and left_hint_error <= 1.5
+                and right_hint_error <= 3.5
+                and middle_hint_error >= 30.0
+                and middle_score + 0.35 <= min(left_score, right_score)
+                and middle_coverage + 0.02 <= min(left_coverage, right_coverage)
+                and right_boundary - source_start <= 600.0
+                and boundary_ratio <= 0.50
+            )
+            if not strict_structural_fallback:
+                continue
+            gap_payload = {
+                "boundary_ratio": round(boundary_ratio, 4),
+                "clean_long_gap_available": bool(long_gaps),
+            }
+
+        new_left = dict(left)
+        new_right = dict(right)
+        new_left["last_center"] = transition_boundary
+        new_right["first_center"] = transition_boundary
+        if str(new_right.get("kind") or "stable") == "stable":
+            new_right["kind"] = "post_opening_reacquire"
+
+        new_segments = (
+            [dict(segment) for segment in segments[: index - 1]]
+            + [new_left, new_right]
+            + [dict(segment) for segment in segments[index + 2 :]]
+        )
+        new_boundaries = (
+            list(boundaries[: index - 1])
+            + [transition_boundary]
+            + list(boundaries[index + 1 :])
+        )
+        diagnostics.update(
+            {
+                "applied": True,
+                "reason": "weak_opening_bridge_excursion",
+                "removed_segment_index": index,
+                "removed_offset_seconds": round(middle_offset, 3),
+                "left_offset_seconds": round(left_offset, 3),
+                "right_offset_seconds": round(right_offset, 3),
+                "left_support": left_support,
+                "middle_support": middle_support,
+                "right_support": right_support,
+                "neighbor_clock_delta_seconds": round(neighbor_delta, 3),
+                "middle_excursion_left_seconds": round(left_excursion, 3),
+                "middle_excursion_right_seconds": round(right_excursion, 3),
+                "left_hint_error_seconds": round(left_hint_error, 3),
+                "right_hint_error_seconds": round(right_hint_error, 3),
+                "middle_hint_error_seconds": round(middle_hint_error, 3),
+                "evidence": evidence,
+                "boundary_source_time": round(transition_boundary, 3),
+                **gap_payload,
+            }
+        )
+        return new_segments, new_boundaries, diagnostics
+
+    diagnostics["reason"] = "no_weak_opening_bridge_excursion"
+    return segments, boundaries, diagnostics
+
+
 def _stabilize_decreasing_boundaries(
     source_cues: list[tuple[float, float, str]],
     segments: list[dict[str, object]],
@@ -1893,6 +2214,85 @@ def _stabilize_decreasing_boundaries(
         )
 
     diagnostics.append({"applied": False, "reason": "monotonic_stabilization_iteration_limit"})
+    return adjusted_segments, adjusted_boundaries, diagnostics
+
+
+def _anchor_opening_path_gap_boundary(
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+    path_guard: dict[str, object],
+) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
+    """Anchor a repaired pre/post opening clock switch inside its proven gap.
+
+    The raw-path sandwich guard can remove false windows that straddle a long
+    opening silence.  After that removal the generic fixed-offset crossover can
+    still find a spurious early crossover because the two clocks differ only by
+    a few seconds.  Reuse the *same* long gap that justified removing the
+    excursion: there are no dialogue cues inside it, so any boundary inside the
+    gap is playback-equivalent and avoids monotonic repair dragging the switch
+    back through real pre-opening dialogue.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if not bool(path_guard.get("applied")) or len(segments) < 2 or not boundaries:
+        return segments, boundaries, diagnostics
+
+    try:
+        gap_start = float(path_guard["gap_start_seconds"])
+        gap_end = float(path_guard["gap_end_seconds"])
+        gap_midpoint = float(path_guard["gap_midpoint_seconds"])
+        left_clock = float(path_guard["left_clock_seconds"])
+        right_clock = float(path_guard["right_clock_seconds"])
+    except (KeyError, TypeError, ValueError):
+        diagnostics["reason"] = "path_guard_gap_metadata_unavailable"
+        return segments, boundaries, diagnostics
+
+    if gap_end - gap_start < 45.0 or not (gap_start < gap_midpoint < gap_end):
+        diagnostics["reason"] = "path_guard_gap_not_usable"
+        return segments, boundaries, diagnostics
+
+    matches = [
+        index
+        for index, (left, right) in enumerate(zip(segments, segments[1:]))
+        if abs(float(left["offset_seconds"]) - left_clock) <= 2.5
+        and abs(float(right["offset_seconds"]) - right_clock) <= 2.5
+    ]
+    if len(matches) != 1:
+        diagnostics["reason"] = "repaired_clock_boundary_not_unique"
+        diagnostics["candidate_count"] = len(matches)
+        return segments, boundaries, diagnostics
+
+    boundary_index = matches[0]
+    old_boundary = float(boundaries[boundary_index])
+    diagnostics.update(
+        {
+            "boundary_index": boundary_index,
+            "old_source_time": round(old_boundary, 3),
+            "gap_start_seconds": round(gap_start, 3),
+            "gap_end_seconds": round(gap_end, 3),
+            "gap_midpoint_seconds": round(gap_midpoint, 3),
+            "left_offset_seconds": round(left_clock, 3),
+            "right_offset_seconds": round(right_clock, 3),
+        }
+    )
+
+    # If the generic boundary already landed inside the proven silence there is
+    # nothing to repair.  Keeping it avoids unnecessary cache churn.
+    if gap_start <= old_boundary <= gap_end:
+        diagnostics["reason"] = "already_inside_proven_opening_gap"
+        return segments, boundaries, diagnostics
+
+    adjusted_segments = [dict(segment) for segment in segments]
+    adjusted_boundaries = list(boundaries)
+    adjusted_boundaries[boundary_index] = gap_midpoint
+    adjusted_segments[boundary_index]["last_center"] = gap_midpoint
+    adjusted_segments[boundary_index + 1]["first_center"] = gap_midpoint
+    diagnostics.update(
+        {
+            "applied": True,
+            "reason": "opening_path_gap_boundary_anchor",
+            "new_source_time": round(gap_midpoint, 3),
+        }
+    )
     return adjusted_segments, adjusted_boundaries, diagnostics
 
 
@@ -2130,6 +2530,127 @@ def _mapped_activity_f1(
     return (2.0 * overlap) / (len(mapped_bins) + len(reference_bins))
 
 
+def _refine_opening_preclock_from_holdout(
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+    holdout: dict[str, object],
+    opening_path_boundary_anchor: dict[str, object],
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Recenter a stable pre-opening clock from independent holdout windows.
+
+    The opening-path repair intentionally uses fit windows to recover the coarse
+    piecewise clock and a long subtitle gap to place the boundary.  Once that
+    structure is stable, independent holdout windows can safely correct a small
+    (<= ~1s) residual bias on the pre-opening plateau without touching the
+    already-good post-opening clock.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if not bool(opening_path_boundary_anchor.get("applied")):
+        return segments, diagnostics
+    if len(segments) < 2 or not boundaries:
+        diagnostics["reason"] = "mapping_too_small"
+        return segments, diagnostics
+
+    try:
+        boundary_index = int(opening_path_boundary_anchor.get("boundary_index") or 0)
+    except (TypeError, ValueError):
+        diagnostics["reason"] = "boundary_index_unavailable"
+        return segments, diagnostics
+    if boundary_index < 0 or boundary_index >= len(boundaries):
+        diagnostics["reason"] = "boundary_index_out_of_range"
+        return segments, diagnostics
+
+    left = segments[boundary_index]
+    if str(left.get("kind") or "stable") != "stable":
+        diagnostics["reason"] = "preopening_segment_not_stable"
+        return segments, diagnostics
+    if int(left.get("support") or 0) < 3:
+        diagnostics["reason"] = "preopening_support_too_low"
+        return segments, diagnostics
+
+    old_offset = float(left["offset_seconds"])
+    boundary = float(boundaries[boundary_index])
+    segment_start = 0.0 if boundary_index == 0 else float(boundaries[boundary_index - 1])
+    rows = []
+    for row in holdout.get("windows") or []:
+        try:
+            center = float(row["center"])
+            expected = float(row["expected_offset_seconds"])
+            best = float(row["best_offset_seconds"])
+            coverage = float(row.get("coverage") or 0.0)
+            score = float(row.get("score") or 0.0)
+            matched = int(row.get("matched") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if center < segment_start or center >= boundary:
+            continue
+        if abs(expected - old_offset) > 0.25:
+            continue
+        if coverage < 0.75 or score < 3.0 or matched < 8:
+            continue
+        rows.append((center, best, best - old_offset))
+
+    if len(rows) < 2:
+        diagnostics["reason"] = "insufficient_high_quality_holdout"
+        diagnostics["holdout_count"] = len(rows)
+        return segments, diagnostics
+
+    residuals = [row[2] for row in rows]
+    median_residual = float(statistics.median(residuals))
+    if abs(median_residual) < 0.50:
+        diagnostics["reason"] = "residual_too_small"
+        diagnostics["median_residual_seconds"] = round(median_residual, 3)
+        return segments, diagnostics
+    if abs(median_residual) > 1.25:
+        diagnostics["reason"] = "residual_too_large_for_micro_refinement"
+        diagnostics["median_residual_seconds"] = round(median_residual, 3)
+        return segments, diagnostics
+    if max(residuals) - min(residuals) > 0.50:
+        diagnostics["reason"] = "holdout_residuals_disagree"
+        return segments, diagnostics
+    if any(value == 0.0 or math.copysign(1.0, value) != math.copysign(1.0, median_residual) for value in residuals):
+        diagnostics["reason"] = "holdout_residual_sign_disagrees"
+        return segments, diagnostics
+
+    # Coarse timeline plateaus are intentionally integral-second clocks.  Use
+    # fine holdout search only to decide which neighboring coarse clock is
+    # better, rather than introducing a fractional plateau that fit windows did
+    # not independently support.
+    median_best = float(statistics.median(row[1] for row in rows))
+    target_offset = float(round(median_best))
+    correction = target_offset - old_offset
+    if abs(correction) < 0.50 or abs(correction) > 1.25:
+        diagnostics["reason"] = "rounded_correction_not_safe"
+        diagnostics["candidate_offset_seconds"] = round(target_offset, 3)
+        return segments, diagnostics
+
+    before_error = statistics.fmean(abs(row[1] - old_offset) for row in rows)
+    after_error = statistics.fmean(abs(row[1] - target_offset) for row in rows)
+    if before_error - after_error < 0.35:
+        diagnostics["reason"] = "holdout_improvement_too_small"
+        return segments, diagnostics
+
+    adjusted = [dict(segment) for segment in segments]
+    adjusted[boundary_index]["offset_seconds"] = target_offset
+    diagnostics.update(
+        {
+            "applied": True,
+            "reason": "opening_preclock_holdout_recenter",
+            "boundary_index": boundary_index,
+            "boundary_source_time": round(boundary, 3),
+            "old_offset_seconds": round(old_offset, 3),
+            "new_offset_seconds": round(target_offset, 3),
+            "correction_seconds": round(correction, 3),
+            "median_best_offset_seconds": round(median_best, 3),
+            "holdout_centers": [round(row[0], 3) for row in rows],
+            "holdout_best_offsets": [round(row[1], 3) for row in rows],
+            "holdout_mean_abs_error_before": round(before_error, 3),
+            "holdout_mean_abs_error_after": round(after_error, 3),
+        }
+    )
+    return adjusted, diagnostics
+
+
 def _holdout_validation(
     all_windows: list[tuple[float, list[_WindowMatch]]],
     segments: list[dict[str, object]],
@@ -2296,6 +2817,11 @@ def align_subtitle_timelines(
         if index % 3 != 1
     ]
     path = _best_path(fit_windows)
+    path, weak_opening_path_guard = _suppress_weak_opening_path_excursion(
+        source_cues,
+        path,
+        edge_hints,
+    )
     if len(path) < 4:
         return source, _result(
             "timeline_insufficient_windows",
@@ -2374,6 +2900,15 @@ def align_subtitle_timelines(
         source_bins,
         reference_bins,
     )
+    segments, boundaries, opening_path_boundary_anchor = (
+        _anchor_opening_path_gap_boundary(
+            segments,
+            boundaries,
+            weak_opening_path_guard,
+        )
+    )
+    if opening_path_boundary_anchor.get("applied"):
+        boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
     boundary_refinements = [
         row.get("refinement")
         for row in boundary_payload
@@ -2410,6 +2945,16 @@ def align_subtitle_timelines(
     )
     if opening_gap_reacquire.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
+    segments, boundaries, weak_opening_bridge_guard = (
+        _suppress_weak_opening_bridge_excursion(
+            source_cues,
+            segments,
+            boundaries,
+            edge_hints,
+        )
+    )
+    if weak_opening_bridge_guard.get("applied"):
+        boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
     segments, boundaries, monotonic_refinements = _stabilize_decreasing_boundaries(
         source_cues,
         segments,
@@ -2442,6 +2987,25 @@ def align_subtitle_timelines(
     )
     if weak_post_opening_tail_guard.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
+    provisional_holdout = _holdout_validation(
+        all_windows,
+        segments,
+        boundaries,
+        source_onsets=source_onsets,
+        reference_onsets=reference_onsets,
+        source_bins=source_bins,
+        reference_bins=reference_bins,
+        edge_hints=edge_hints,
+    )
+    segments, opening_preclock_refinement = _refine_opening_preclock_from_holdout(
+        segments,
+        boundaries,
+        provisional_holdout,
+        opening_path_boundary_anchor,
+    )
+    if opening_preclock_refinement.get("applied"):
+        boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
+
     mapped_offsets = [
         _offset_for_time(onset, segments, boundaries)
         for onset in source_onsets
@@ -2555,6 +3119,11 @@ def align_subtitle_timelines(
         path,
         cold_start,
         monotonic_refinements,
+        resolved_by=(
+            "weak_opening_bridge_excursion"
+            if weak_opening_bridge_guard.get("applied")
+            else None
+        ),
     )
 
     repaired: list[tuple[float, float, str]] = []
@@ -2581,6 +3150,8 @@ def align_subtitle_timelines(
                 ],
                 timeline_boundaries=boundary_payload,
                 timeline_monotonic_refinements=monotonic_refinements,
+                timeline_weak_opening_path_guard=weak_opening_path_guard,
+        timeline_weak_opening_bridge_guard=weak_opening_bridge_guard,
             )
         repaired.append((new_start, new_end, text))
         previous_start = new_start
@@ -2654,7 +3225,11 @@ def align_subtitle_timelines(
         timeline_cold_start=cold_start,
         timeline_transition_refinements=transition_refinements,
         timeline_opening_gap_reacquire=opening_gap_reacquire,
+        timeline_weak_opening_path_guard=weak_opening_path_guard,
+        timeline_opening_path_boundary_anchor=opening_path_boundary_anchor,
+        timeline_opening_preclock_refinement=opening_preclock_refinement,
         timeline_monotonic_refinements=monotonic_refinements,
+        timeline_weak_opening_bridge_guard=weak_opening_bridge_guard,
         timeline_sparse_edge_guard=sparse_edge_guard,
         timeline_weak_tail_guard=weak_tail_guard,
         timeline_weak_post_opening_tail_guard=weak_post_opening_tail_guard,

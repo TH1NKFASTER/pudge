@@ -15,6 +15,7 @@ import time
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
@@ -1000,8 +1001,15 @@ class LightNovelService:
         self.cover_cache_dir = Path(config.library.cover_cache_dir)
         self.cover_cache_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logger
-        self._parse_lock = threading.Lock()
         self._last_parse_at = 0.0
+        self._parse_rate_lock = threading.Lock()
+        self._parse_admission = threading.Condition()
+        self._parse_active_requests = 0
+        self._parse_waiting_interactive = 0
+        self._parse_waiting_background = 0
+        self._parse_max_requests = 2
+        self._parse_flights_lock = threading.Lock()
+        self._parse_flights: dict[str, threading.Event] = {}
         self._parse_inflight: set[str] = set()
         self._parse_inflight_lock = threading.Lock()
         self._anilist_cache: tuple[float, list[dict[str, Any]]] | None = None
@@ -1032,10 +1040,23 @@ class LightNovelService:
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
+    @contextmanager
+    def _connection(self):
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _ensure_schema(self) -> None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS ln_books (
@@ -1132,7 +1153,7 @@ class LightNovelService:
 
     def settings(self) -> LightNovelSettings:
         values: dict[str, str] = {}
-        with self._connect() as conn:
+        with self._connection() as conn:
             for row in conn.execute("SELECT key,value FROM ln_settings"):
                 values[str(row["key"])] = str(row["value"])
         return LightNovelSettings(
@@ -1347,7 +1368,7 @@ class LightNovelService:
             payload["study_card_mode"] = "button"
         if payload["word_color_theme"] not in self.WORD_COLOR_THEMES:
             payload["word_color_theme"] = "balanced"
-        with self._connect() as conn:
+        with self._connection() as conn:
             for key, value in payload.items():
                 if key in allowed:
                     conn.execute("INSERT INTO ln_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
@@ -1410,7 +1431,7 @@ class LightNovelService:
         key = _series_key(str(book.get("title") or Path(str(book.get("file_path") or "")).stem))
         if not key:
             return False
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM ln_books WHERE id<>? AND anilist_id IS NOT NULL ORDER BY updated_at DESC",
                 (int(book_id),),
@@ -1436,7 +1457,7 @@ class LightNovelService:
         if not media_id or not key:
             return 0
         changed = 0
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute("SELECT id,title FROM ln_books WHERE id<>?", (int(book_id),)).fetchall()
             for row in rows:
                 if _series_key(str(row["title"] or "")) != key:
@@ -1453,7 +1474,7 @@ class LightNovelService:
         return changed
 
     def _deleted_source_paths(self) -> set[str]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             return {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_deleted_sources")}
 
     def is_deleted_source(self, source: Path) -> bool:
@@ -1461,7 +1482,7 @@ class LightNovelService:
             resolved = str(Path(source).expanduser().resolve())
         except (OSError, RuntimeError):
             return False
-        with self._connect() as conn:
+        with self._connection() as conn:
             return conn.execute(
                 "SELECT 1 FROM ln_deleted_sources WHERE file_path=?",
                 (resolved,),
@@ -1472,7 +1493,7 @@ class LightNovelService:
             resolved = str(Path(source).expanduser().resolve())
         except (OSError, RuntimeError):
             return
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT INTO ln_deleted_sources(file_path,deleted_at) VALUES(?,?) "
                 "ON CONFLICT(file_path) DO UPDATE SET deleted_at=excluded.deleted_at",
@@ -1484,7 +1505,7 @@ class LightNovelService:
             resolved = str(Path(source).expanduser().resolve())
         except (OSError, RuntimeError):
             return
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM ln_deleted_sources WHERE file_path=?", (resolved,))
 
     @staticmethod
@@ -1513,7 +1534,7 @@ class LightNovelService:
         """Move legacy EPUB data URLs out of SQLite/WebKit into the cover cache."""
         migrated = 0
         while True:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 row = conn.execute(
                     "SELECT id,cover_url FROM ln_books WHERE cover_url LIKE 'data:%;base64,%' LIMIT 1"
                 ).fetchone()
@@ -1533,7 +1554,7 @@ class LightNovelService:
                 # Corrupt historical inline data must not keep being shipped to
                 # WebKit forever. The AniList/local refresh can repopulate it.
                 cover_url = ""
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("UPDATE ln_books SET cover_url=?,updated_at=? WHERE id=?", (cover_url, time.time(), book_id))
             migrated += 1
         if migrated:
@@ -1632,7 +1653,7 @@ class LightNovelService:
             shutil.copy2(source, target)
         if explicit:
             self._clear_deleted_source(target)
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("DELETE FROM ln_scan_rejections WHERE file_path=?", (str(target),))
         cover_url = ""
         if cover_blob is not None:
@@ -1642,11 +1663,11 @@ class LightNovelService:
         if explicit_volume is None:
             series_key = _series_key(title or source.stem)
             if series_key:
-                with self._connect() as conn:
+                with self._connection() as conn:
                     siblings = conn.execute("SELECT id,title,file_path,volume FROM ln_books").fetchall()
                 used = {int(row['volume'] or 0) for row in siblings if str(row['file_path'] or '') != str(target) and _series_key(str(row['title'] or Path(str(row['file_path'] or '')).stem)) == series_key and int(row['volume'] or 0) > 0}
                 volume = next((candidate for candidate in range(1, 301) if candidate not in used), 1)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 """INSERT INTO ln_books(title,file_path,file_type,volume,cover_url,content_schema,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(file_path) DO UPDATE SET title=excluded.title,file_type=excluded.file_type,volume=excluded.volume,cover_url=CASE WHEN excluded.cover_url<>'' THEN excluded.cover_url ELSE ln_books.cover_url END,content_schema=excluded.content_schema,updated_at=excluded.updated_at""",
@@ -1675,7 +1696,7 @@ class LightNovelService:
         Re-import is local-only and preserves the book id, AniList link, reading
         position and finished state.
         """
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT id,file_path,file_type FROM ln_books WHERE COALESCE(content_schema,1)<? ORDER BY id",
                 (self.CONTENT_SCHEMA,),
@@ -1694,7 +1715,7 @@ class LightNovelService:
         return changed
 
     def scan_downloaded(self) -> int:
-        with self._connect() as conn:
+        with self._connection() as conn:
             known = {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_books")}
             deleted = {str(row[0]) for row in conn.execute("SELECT file_path FROM ln_deleted_sources")}
             rejected = {
@@ -1717,7 +1738,7 @@ class LightNovelService:
                 continue
             try:
                 if not self.is_probably_japanese_source(path):
-                    with self._connect() as conn:
+                    with self._connection() as conn:
                         conn.execute(
                             "INSERT INTO ln_scan_rejections(file_path,mtime_ns,size,checked_at) VALUES(?,?,?,?) "
                             "ON CONFLICT(file_path) DO UPDATE SET mtime_ns=excluded.mtime_ns,size=excluded.size,checked_at=excluded.checked_at",
@@ -1727,7 +1748,7 @@ class LightNovelService:
                     self._log("LN auto-import rejected non-Japanese source path=%s", path)
                     continue
                 self.import_file(path, explicit=False)
-                with self._connect() as conn:
+                with self._connection() as conn:
                     conn.execute("DELETE FROM ln_scan_rejections WHERE file_path=?", (resolved,))
                 known.add(resolved)
                 added += 1
@@ -1737,7 +1758,7 @@ class LightNovelService:
 
     def _repair_missing_volumes(self) -> int:
         repaired = 0
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute("SELECT id,title,file_path,volume,created_at FROM ln_books ORDER BY created_at,id").fetchall()
             groups: dict[str, list[Any]] = {}
             for row in rows:
@@ -1779,7 +1800,7 @@ class LightNovelService:
 
     def books(self) -> list[dict[str, Any]]:
         self._repair_missing_volumes()
-        with self._connect() as conn:
+        with self._connection() as conn:
             book_columns = self._book_select_columns(conn)
             rows = conn.execute(
                 f"""SELECT {book_columns},bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
@@ -1837,7 +1858,7 @@ class LightNovelService:
         needs enough data to paint/focus the new card; the normal library state
         refresh can fill the cover and AniList decoration later.
         """
-        with self._connect() as conn:
+        with self._connection() as conn:
             book_columns = self._book_select_columns(conn)
             row = conn.execute(
                 f"""SELECT {book_columns},bm.source AS bookmark_source,bm.updated_at AS bookmark_updated_at,
@@ -1884,7 +1905,7 @@ class LightNovelService:
         return item
 
     def book(self, book_id: int) -> dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             book_columns = self._book_select_columns(conn)
             row = conn.execute(
                 f"""SELECT {book_columns},bm.source AS bookmark_source,
@@ -1911,7 +1932,7 @@ class LightNovelService:
         book = self.book(int(book_id))
         path = Path(str(book.get("file_path") or "")).expanduser()
         self._mark_deleted_source(path)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM ln_chapters WHERE book_id=?", (int(book_id),))
             conn.execute("DELETE FROM ln_books WHERE id=?", (int(book_id),))
         if delete_file:
@@ -1932,6 +1953,37 @@ class LightNovelService:
     def _jpdb_headers(token: str) -> dict[str, str]:
         return {"Content-Type": "application/json", "Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": APP_SLUG}
 
+    def _reserve_parse_request_start(self) -> None:
+        with self._parse_rate_lock:
+            now = time.monotonic()
+            start_at = max(now, self._last_parse_at + 0.65)
+            self._last_parse_at = start_at
+        wait = start_at - now
+        if wait > 0:
+            time.sleep(wait)
+
+    @contextmanager
+    def _parse_request_slot(self, *, interactive: bool):
+        waiting_attr = (
+            "_parse_waiting_interactive" if interactive else "_parse_waiting_background"
+        )
+        with self._parse_admission:
+            setattr(self, waiting_attr, int(getattr(self, waiting_attr)) + 1)
+            try:
+                while self._parse_active_requests >= self._parse_max_requests or (
+                    not interactive and self._parse_waiting_interactive > 0
+                ):
+                    self._parse_admission.wait()
+                self._parse_active_requests += 1
+            finally:
+                setattr(self, waiting_attr, int(getattr(self, waiting_attr)) - 1)
+        try:
+            yield
+        finally:
+            with self._parse_admission:
+                self._parse_active_requests -= 1
+                self._parse_admission.notify_all()
+
     def _jiten_request(self, action: str, payload: dict[str, Any] | None = None) -> Any:
         token = self.settings().jiten_api_key
         if not token:
@@ -1939,12 +1991,10 @@ class LightNovelService:
         url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
         last: Exception | None = None
         for attempt in range(3):
-            wait = max(0.0, 0.65 - (time.monotonic() - self._last_parse_at)) if action == "reader/parse" else 0.0
-            if wait:
-                time.sleep(wait)
+            if action == "reader/parse":
+                self._reserve_parse_request_start()
             try:
                 response = httpx.post(url, headers=self._jiten_headers(token), json=payload, timeout=30)
-                self._last_parse_at = time.monotonic()
                 if response.status_code == 429 or response.status_code >= 500:
                     if attempt < 2:
                         time.sleep(0.6 * (2 ** attempt))
@@ -2269,7 +2319,7 @@ class LightNovelService:
 
     def jiten_unparsed_chapters(self) -> list[tuple[str, str]]:
         """Return local LN chapter texts that do not have a Jiten parse yet."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT text,text_hash FROM ln_chapters ORDER BY book_id,chapter_index"
             ).fetchall()
@@ -2292,7 +2342,7 @@ class LightNovelService:
 
     def tts_source(self, book_id: int) -> dict[str, Any]:
         """Return stable local text/chapter data for optional TTS backends."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             book = conn.execute("SELECT * FROM ln_books WHERE id=?", (int(book_id),)).fetchone()
             if book is None:
                 raise LightNovelError("Light novel was not found")
@@ -2339,7 +2389,7 @@ class LightNovelService:
         return {"ok": True, "backend": backend}
 
     def _cached_parse(self, text_hash: str) -> dict[str, Any] | None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT parsed_json FROM ln_parse_cache WHERE text_hash=?", (text_hash,)).fetchone()
         if row is None:
             return None
@@ -2349,42 +2399,93 @@ class LightNovelService:
             return None
         return data if isinstance(data, dict) else None
 
-    def _parse_text(self, text: str, text_hash: str) -> dict[str, Any]:
-        cached = self._cached_parse(text_hash)
-        if cached is not None:
-            return cached
-        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-        text_paragraphs = [p for p in paragraphs if not _is_ln_image_paragraph(p)]
-        # Keep payloads moderately sized while still making very few requests.
-        batches: list[list[str]] = []
-        current: list[str] = []
-        size = 0
-        for paragraph in text_paragraphs:
-            if current and size + len(paragraph) > 14000:
+    def _parse_text(
+        self,
+        text: str,
+        text_hash: str,
+        *,
+        interactive: bool = True,
+    ) -> dict[str, Any]:
+        while True:
+            cached = self._cached_parse(text_hash)
+            if cached is not None:
+                return cached
+            with self._parse_flights_lock:
+                flight = self._parse_flights.get(text_hash)
+                if flight is None:
+                    flight = threading.Event()
+                    self._parse_flights[text_hash] = flight
+                    owns_flight = True
+                else:
+                    owns_flight = False
+            if owns_flight:
+                break
+            flight.wait()
+
+        try:
+            # A cache writer may have completed between the first lookup and flight ownership.
+            cached = self._cached_parse(text_hash)
+            if cached is not None:
+                return cached
+            paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+            text_paragraphs = [p for p in paragraphs if not _is_ln_image_paragraph(p)]
+            # Keep payloads moderately sized while still making very few requests.
+            batches: list[list[str]] = []
+            current: list[str] = []
+            size = 0
+            for paragraph in text_paragraphs:
+                if current and size + len(paragraph) > 14000:
+                    batches.append(current)
+                    current, size = [], 0
+                current.append(paragraph)
+                size += len(paragraph)
+            if current:
                 batches.append(current)
-                current, size = [], 0
-            current.append(paragraph)
-            size += len(paragraph)
-        if current:
-            batches.append(current)
-        all_tokens: list[Any] = []
-        vocabulary: dict[tuple[int, int], Any] = {}
-        with self._parse_lock:
+            all_tokens: list[Any] = []
+            vocabulary: dict[tuple[int, int], Any] = {}
             for batch in batches:
-                result = self._jiten_request("reader/parse", {"text": batch})
-                all_tokens.extend(result.get("tokens") or [])
+                with self._parse_request_slot(interactive=interactive):
+                    result = self._jiten_request("reader/parse", {"text": batch})
+                batch_tokens = result.get("tokens") or []
+                if len(batch_tokens) != len(batch):
+                    raise LightNovelError(
+                        "Jiten parse returned a token-row count that does not match the request"
+                    )
+                all_tokens.extend(batch_tokens)
                 for item in result.get("vocabulary") or []:
                     if isinstance(item, dict):
                         try:
                             vocabulary[(int(item.get("wordId")), int(item.get("readingIndex")))] = item
                         except (TypeError, ValueError):
                             pass
-        token_rows = iter(all_tokens)
-        display_tokens = [([] if _is_ln_image_paragraph(paragraph) else next(token_rows, [])) for paragraph in paragraphs]
-        parsed = {"tokens": display_tokens, "vocabulary": list(vocabulary.values()), "paragraphs": paragraphs}
-        with self._connect() as conn:
-            conn.execute("INSERT OR REPLACE INTO ln_parse_cache(text_hash,parsed_json,parser_schema,created_at) VALUES(?,?,?,?)", (text_hash, json.dumps(parsed, ensure_ascii=False), "jiten-v1", time.time()))
-        return parsed
+            token_rows = iter(all_tokens)
+            display_tokens = [
+                [] if _is_ln_image_paragraph(paragraph) else next(token_rows)
+                for paragraph in paragraphs
+            ]
+            parsed = {
+                "tokens": display_tokens,
+                "vocabulary": list(vocabulary.values()),
+                "paragraphs": paragraphs,
+            }
+            with self._connection() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO ln_parse_cache("
+                    "text_hash,parsed_json,parser_schema,created_at) VALUES(?,?,?,?)",
+                    (
+                        text_hash,
+                        json.dumps(parsed, ensure_ascii=False),
+                        "jiten-v1",
+                        time.time(),
+                    ),
+                )
+            return parsed
+        finally:
+            with self._parse_flights_lock:
+                current_flight = self._parse_flights.get(text_hash)
+                if current_flight is flight:
+                    self._parse_flights.pop(text_hash, None)
+                    flight.set()
 
     @staticmethod
     def _normalized_state(states: list[str]) -> str:
@@ -2415,7 +2516,7 @@ class LightNovelService:
         return out
 
     def _chapter_row(self, book_id: int, chapter_index: int, *, touch: bool = False) -> sqlite3.Row:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT * FROM ln_chapters WHERE book_id=? AND chapter_index=?", (int(book_id), int(chapter_index))).fetchone()
             if row is None:
                 raise LightNovelError("Chapter not found")
@@ -2570,7 +2671,7 @@ class LightNovelService:
             generation = self._prefetch_generation
         if mode == "current":
             return
-        with self._connect() as conn:
+        with self._connection() as conn:
             if mode == "book":
                 rows = conn.execute("SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index>? ORDER BY chapter_index", (book_id, chapter_index)).fetchall()
             else:
@@ -2588,7 +2689,7 @@ class LightNovelService:
                         continue
                     self._parse_inflight.add(digest)
                 try:
-                    self._parse_text(text, digest)
+                    self._parse_text(text, digest, interactive=False)
                 except Exception as exc:
                     self._log("LN parse-ahead failed: %s", exc)
                     return
@@ -2776,7 +2877,7 @@ class LightNovelService:
     def character_glossary_overrides(self, media_id: int | None) -> list[dict[str, str]]:
         if not media_id:
             return []
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT source,preferred FROM character_name_overrides WHERE media_id=? "
                 "ORDER BY length(source) DESC,source", (int(media_id),)
@@ -2787,7 +2888,7 @@ class LightNovelService:
         source_text, preferred_text = str(source or "").strip(), str(preferred or "").strip()
         if not source_text or not preferred_text:
             raise LightNovelError("Both the source name and preferred name are required")
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT INTO character_name_overrides(media_id,source,preferred,updated_at) VALUES(?,?,?,?) "
                 "ON CONFLICT(media_id,source) DO UPDATE SET preferred=excluded.preferred,updated_at=excluded.updated_at",
@@ -2796,7 +2897,7 @@ class LightNovelService:
         return self.character_glossary(int(media_id))
 
     def delete_character_glossary_override(self, media_id: int, source: str) -> list[dict[str, str]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("DELETE FROM character_name_overrides WHERE media_id=? AND source=?", (int(media_id), str(source or "").strip()))
         return self.character_glossary(int(media_id))
 
@@ -2946,7 +3047,7 @@ class LightNovelService:
         cache_key = hashlib.sha256(
             f"{target}\0{preceding}\0{selected}\0{glossary_key}".encode("utf-8")
         ).hexdigest()
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT translation,provider FROM ln_translation_cache WHERE cache_key=?", (cache_key,)).fetchone()
         if row is not None:
             return {
@@ -2978,7 +3079,7 @@ class LightNovelService:
                     translated = self._translate_local_llm(selected, preceding, target, glossary)
             except Exception as fallback_exc:
                 raise LightNovelError(f"Translation failed: {fallback_exc}") from fallback_exc
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO ln_translation_cache(cache_key,target_language,source_text,context_text,translation,provider,created_at) VALUES(?,?,?,?,?,?,?)",
                 (cache_key, target, selected, preceding, translated, provider, time.time()),
@@ -3009,7 +3110,7 @@ class LightNovelService:
         position = max(0.0, min(1.0, float(offset)))
         kind = "auto" if str(source).casefold() == "auto" else "manual"
         now = time.time()
-        with self._connect() as conn:
+        with self._connection() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)
             ).fetchone()
@@ -3036,7 +3137,7 @@ class LightNovelService:
 
     def progress_summary(self, book_id: int) -> dict[str, Any]:
         """Return exact character-weighted local reading progress for one book."""
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 """SELECT b.current_chapter,b.current_offset,b.finished,
                           COALESCE(SUM(LENGTH(c.text)),0) AS character_count,
@@ -3075,7 +3176,7 @@ class LightNovelService:
         }
 
     def reset_position(self, book_id: int) -> dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM ln_books WHERE id=?", (int(book_id),)
             ).fetchone()
@@ -3336,7 +3437,7 @@ class LightNovelService:
             margin = best_score - (scored[1][0] if len(scored) > 1 else 0.0)
             if best_score < 82.0 or (best_score < 95.0 and margin < 8.0):
                 continue
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute(
                     "UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,anilist_total_volumes=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?",
                     (int(best["media_id"]), str(best.get("status") or ""), int(best.get("progress_volumes") or 0), best.get("volumes"), str(best.get("cover") or ""), time.time(), int(book["id"])),
@@ -3348,7 +3449,7 @@ class LightNovelService:
         item = dict(selection or {})
         if int(item.get("media_id") or 0) != int(media_id):
             item = self._anilist_novel_by_id(int(media_id))
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,anilist_total_volumes=?,anilist_user_score=?,cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?", (int(media_id), str(item.get("status") or ""), int(item.get("progress_volumes") or 0), item.get("volumes"), item.get("user_score"), str(item.get("cover") or ""), time.time(), int(book_id)))
         self._propagate_series_anilist(int(book_id))
         return self.book(book_id)
@@ -3358,7 +3459,7 @@ class LightNovelService:
         series_key = str(book.get("series_key") or _series_key(str(book.get("title") or "")))
         ids = [int(item["id"]) for item in self.books() if str(item.get("series_key") or "") == series_key] or [int(book_id)]
         placeholders = ",".join("?" for _ in ids)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 f"UPDATE ln_books SET anilist_id=NULL,anilist_status='',anilist_progress_volumes=0,anilist_total_volumes=NULL,anilist_user_score=NULL,updated_at=? WHERE id IN ({placeholders})",
                 (time.time(), *ids),
@@ -3368,7 +3469,7 @@ class LightNovelService:
     def set_score(self, book_id: int, score: float) -> dict[str, Any]:
         # pudge-v0.7.23-ln-series-score-v1
         now = time.time()
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT anilist_id FROM ln_books WHERE id=?",
                 (int(book_id),),
@@ -3405,15 +3506,15 @@ class LightNovelService:
             # effect, not a gate for local reading.  Optimistically expose
             # CURRENT and roll back only if the background mutation fails.
             book["anilist_status"] = "CURRENT"
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute("UPDATE ln_books SET anilist_status='CURRENT',updated_at=? WHERE id=?", (time.time(), int(book_id)))
             def worker() -> None:
                 try:
                     entry = self._save_anilist_volume(int(media_id), int(book.get("anilist_progress_volumes") or 0), "CURRENT")
-                    with self._connect() as conn:
+                    with self._connection() as conn:
                         conn.execute("UPDATE ln_books SET anilist_status=?,updated_at=? WHERE id=?", (str(entry.get("status") or "CURRENT"), time.time(), int(book_id)))
                 except Exception as exc:
-                    with self._connect() as conn:
+                    with self._connection() as conn:
                         conn.execute("UPDATE ln_books SET anilist_status=?,updated_at=? WHERE id=?", (old_status, time.time(), int(book_id)))
                     self._log("LN AniList CURRENT update failed: %s", exc)
             threading.Thread(target=worker, name="ln-anilist-current", daemon=True).start()
@@ -3427,7 +3528,7 @@ class LightNovelService:
         if media_id and self.config.anilist.enabled and self.config.anilist.access_token:
             entry = self._save_anilist_volume(int(media_id), volume, status)
             status = str(entry.get("status") or status)
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute("UPDATE ln_books SET finished=1,anilist_status=?,anilist_progress_volumes=MAX(anilist_progress_volumes,?),updated_at=? WHERE id=?", (status, volume, time.time(), int(book_id)))
         return self.book(book_id)
 
@@ -3436,7 +3537,7 @@ class LightNovelService:
 
         if bool(finished):
             return self.finish_volume(int(book_id))
-        with self._connect() as conn:
+        with self._connection() as conn:
             conn.execute(
                 "UPDATE ln_books SET finished=0,updated_at=? WHERE id=?",
                 (time.time(), int(book_id)),

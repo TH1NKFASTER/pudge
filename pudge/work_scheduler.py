@@ -70,6 +70,11 @@ class WorkScheduler:
         self._queue_condition = threading.Condition()
         self._waiters: list[tuple[int, int, object]] = []
         self._sequence = 0
+        # Local-process priority intent is separate from the cross-process file
+        # lock. A manual UI action can request the next heavy slot immediately;
+        # cooperative background workers then yield at a safe boundary.
+        self._active_priority: WorkPriority | None = None
+        self._priority_requests: list[tuple[int, int, object, str]] = []
         self._resource_cache: tuple[float, dict[str, Any]] = (0.0, {})
 
     def _log(self, message: str, *args: Any) -> None:
@@ -87,7 +92,59 @@ class WorkScheduler:
             handle.close()
             self._local_lock.release()
             with self._queue_condition:
+                self._active_priority = None
                 self._queue_condition.notify_all()
+
+    def begin_priority_request(
+        self,
+        priority: WorkPriority | int,
+        *,
+        name: str = "user-action",
+    ) -> object:
+        """Publish immediate intent for a higher-priority local heavy task."""
+        requested = WorkPriority(int(priority))
+        token = object()
+        with self._queue_condition:
+            self._sequence += 1
+            self._priority_requests.append(
+                (int(requested), self._sequence, token, str(name))
+            )
+            self._queue_condition.notify_all()
+        self._log(
+            "REQUEST step=work_scheduler.priority name=%s priority=%s",
+            name,
+            requested.name.casefold(),
+        )
+        return token
+
+    def end_priority_request(self, token: object) -> None:
+        with self._queue_condition:
+            removed = [row for row in self._priority_requests if row[2] is token]
+            self._priority_requests = [
+                row for row in self._priority_requests if row[2] is not token
+            ]
+            self._queue_condition.notify_all()
+        if removed:
+            self._log(
+                "DONE step=work_scheduler.priority name=%s",
+                removed[0][3],
+            )
+
+    def should_yield_to_higher_priority(
+        self,
+        priority: WorkPriority | int = WorkPriority.BACKGROUND,
+    ) -> bool:
+        """Whether local work at *priority* should cooperatively yield now."""
+        requested = int(WorkPriority(int(priority)))
+        with self._queue_condition:
+            if (
+                self._active_priority is not None
+                and int(self._active_priority) < requested
+            ):
+                return True
+            if any(row[0] < requested for row in self._priority_requests):
+                return True
+            return any(row[0] < requested for row in self._waiters)
 
     def resource_status(self, *, refresh: bool = False) -> dict[str, Any]:
         now = time.monotonic()
@@ -220,6 +277,17 @@ class WorkScheduler:
             if (cancel_event is not None and cancel_event.is_set()) or (callable(cancel_check) and cancel_check()):
                 remove_waiter()
                 return None
+            if self.should_yield_to_higher_priority(requested_priority):
+                if not blocking:
+                    remove_waiter()
+                    self._log(
+                        "SKIP step=work_scheduler.heavy name=%s reason=higher_priority_requested",
+                        name,
+                    )
+                    return None
+                with self._queue_condition:
+                    self._queue_condition.wait(timeout=max(0.05, float(poll_seconds)))
+                continue
             if waiter is not None:
                 with self._queue_condition:
                     first = min(self._waiters, default=(0, 0, waiter), key=lambda row: (row[0], row[1]))
@@ -240,17 +308,28 @@ class WorkScheduler:
                     time.sleep(max(0.05, float(poll_seconds)))
                 continue
 
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            handle = (self.cache_dir / "heavy-work.lock").open("a+", encoding="utf-8")
-            if fcntl is None:
-                locked = True
-            else:
-                flags = fcntl.LOCK_EX | fcntl.LOCK_NB
-                try:
-                    fcntl.flock(handle.fileno(), flags)
+            handle = None
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                handle = (self.cache_dir / "heavy-work.lock").open("a+", encoding="utf-8")
+                if fcntl is None:
                     locked = True
-                except BlockingIOError:
-                    locked = False
+                else:
+                    flags = fcntl.LOCK_EX | fcntl.LOCK_NB
+                    try:
+                        fcntl.flock(handle.fileno(), flags)
+                        locked = True
+                    except BlockingIOError:
+                        locked = False
+            except BaseException:
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+                self._local_lock.release()
+                remove_waiter()
+                raise
 
             if locked:
                 if foreground_sensitive and not self.background_allowed(
@@ -281,6 +360,9 @@ class WorkScheduler:
                 except OSError:
                     pass
                 remove_waiter()
+                with self._queue_condition:
+                    self._active_priority = requested_priority
+                    self._queue_condition.notify_all()
                 self._log(
                     "START step=work_scheduler.heavy name=%s priority=%s resource=%s",
                     name,

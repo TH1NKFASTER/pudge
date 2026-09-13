@@ -40,11 +40,17 @@ def test_debug_exports_are_internal_and_expire_after_two_hours() -> None:
     assert ' / "Downloads"' not in WEB_APP[WEB_APP.index("def manga_export_ocr_debug"):WEB_APP.index("def audiobook_state")]
 
 
-def test_manga_clicks_use_raw_image_geometry_and_2d_vertical_grid() -> None:
+def test_manga_clicks_use_raw_image_geometry_without_synthetic_word_grid() -> None:
     assert "data-raw-x" in MANGA_JS
     assert "function rawRegionRect" in MANGA_JS
     assert "function mangaTokenAtPoint" in MANGA_JS
-    assert "const column =" in MANGA_JS and "const row =" in MANGA_JS
+    assert "function mangaMapTokenSurfaces(stream, surfaces)" in MANGA_JS
+    start = MANGA_JS.index("function mangaTokenHitboxes(regionNode, region)")
+    end = MANGA_JS.index("function mangaTokenBoxClientRect", start)
+    body = MANGA_JS[start:end]
+    assert "vertical-grid-fallback" not in body
+    assert "horizontal-region-fallback" not in body
+    assert "region-single-token" in body
     assert '"segments": [' in MANGA_PY
     assert "mangaVerticalTokenAtPoint" not in MANGA_JS
 

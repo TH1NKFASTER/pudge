@@ -3,6 +3,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+from pudge import __version__
 from pudge.backup import create_backup, restore_backup
 from pudge.database import Database
 from pudge.manager_models import LibraryEpisode
@@ -84,14 +85,15 @@ def test_release_docs_are_0726_and_product_level() -> None:
     development = (ROOT / "DEVELOPMENT.md").read_text(encoding="utf-8")
     config_example = (ROOT / "config.example.toml").read_text(encoding="utf-8")
 
-    assert "Current version: **0.7.26**." in readme
-    assert "pudge-macos-v0.7.26.zip" in readme
-    assert "## v0.7.26" in changelog
+    assert f"Current version: **{__version__}**." in readme
+    assert f"pudge-macos-v{__version__}.zip" in readme
+    assert f"## v{__version__}" in changelog
     assert "Ready means usable now" in algorithms
     assert "next unwatched episode" in guide
     assert "Click the background of a volume card" in guide
     assert "## Current behavior" in vn
-    assert "ScreenCaptureKit" not in vn and "**0.8.0:**" not in vn
+    current_behavior = vn.split("## Current behavior", 1)[1].split("\n## ", 1)[0]
+    assert "ScreenCaptureKit" not in current_behavior
     assert "make build-release" in development
     assert 'reasoning_effort = "low"' in config_example
     assert config_example == (ROOT / "pudge/config.example.toml").read_text(encoding="utf-8")

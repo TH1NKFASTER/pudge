@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.26"
+version = "0.7.27"
 description = "A local-first Mac app for anime, Japanese subtitles, manga, Light Novels, and audiobooks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ dependencies = [
   "pyobjc-core>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Cocoa>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Quartz>=10.3; sys_platform == 'darwin'",
+  "pyobjc-framework-ScreenCaptureKit>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Vision>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-WebKit>=10.3; sys_platform == 'darwin'",
   "pyobjc-framework-Security>=10.3; sys_platform == 'darwin'",

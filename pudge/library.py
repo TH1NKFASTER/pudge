@@ -140,6 +140,8 @@ def japanese_subtitle_details(
     *,
     ffprobe: str = "ffprobe",
     ffmpeg: str = "ffmpeg",
+    strict_probe_errors: bool = False,
+    ignore_sidecars: bool = False,
 ) -> tuple[str, Path | None, int | None]:
     """Return subtitle source, path and embedded mpv subtitle id.
 
@@ -147,14 +149,15 @@ def japanese_subtitle_details(
     an explicit ``*_bitmap`` source so callers can keep them available for
     Library-only playback without marking the anime ready.
     """
-    sidecar = sidecar_subtitle(video)
-    if sidecar is not None:
-        source = (
-            "external_bitmap"
-            if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
-            else "external"
-        )
-        return source, sidecar.resolve(), None
+    if not ignore_sidecars:
+        sidecar = sidecar_subtitle(video)
+        if sidecar is not None:
+            source = (
+                "external_bitmap"
+                if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
+                else "external"
+            )
+            return source, sidecar.resolve(), None
     try:
         candidates = find_embedded_japanese_subtitles(
             video,
@@ -163,6 +166,8 @@ def japanese_subtitle_details(
             verbose=False,
         )
     except MediaProbeError:
+        if strict_probe_errors:
+            raise
         candidates = []
     embedded = next(
         (candidate for candidate in candidates if candidate.codec in TEXT_CODECS),

@@ -1,10 +1,13 @@
 /* Home/download status presentation. */
 function compactDownloadStatus(download){
-  const progress=Math.max(0,Math.min(100,Math.round(Number(download?.progress||0)*100))),finished=progress>=100||/complete|completed|seeding|uploading/i.test(String(download?.state||''));
+  const state=String(download?.effective_state||download?.state||'');
+  const progress=Math.max(0,Math.min(100,Math.round(Number(download?.progress||0)*100))),finished=progress>=100||/complete|completed|seeding|uploading/i.test(state);
   if(finished)return t('label.waitingSubs');
-  const parts=[ui.lang==='ru'?`Загрузка ${progress}%`:`Downloading ${progress}%`];
+  if(/paused|stopped/i.test(state))return ui.lang==='ru'?`Пауза ${progress}%`:`Paused ${progress}%`;
+  const parts=[`${progress}%`];
   const eta=Number(download?.eta_seconds||0);
-  if(Number.isFinite(eta)&&eta>0)parts.push(`ETA ${torrentEta(eta)}`);
+  const torrentTrafficActive=ui.torrentToggleDesired===false?false:Boolean(ui.state?.settings?.torrents_enabled&&ui.torrentTraffic?.enabled!==false);
+  if(torrentTrafficActive&&Number.isFinite(eta)&&eta>0)parts.push(`ETA ${torrentEta(eta)}`);
   return parts.join(' · ');
 }
 function episodePresentationStatus(a,episode){
@@ -20,6 +23,7 @@ function episodePresentationStatus(a,episode){
   if(p.status==='couldnt_sync')return ui.lang==='ru'?"Couldn't sync — можно смотреть сырые":'Couldn\'t sync — raw subtitles available';
   if(p.status==='waiting_text_subtitles')return t('label.waitingTextSubs');
   if(p.status==='waiting_subtitles'||p.status==='waiting_preparation')return t('label.waitingSubs');
+  if(p.status==='paused_download')return a?.download?compactDownloadStatus({...a.download,state:'paused'}):(ui.lang==='ru'?'Пауза загрузки':'Download paused');
   if(p.status==='waiting_download'||p.status==='downloading')return a?.download?compactDownloadStatus(a.download):(ui.lang==='ru'?'Ожидание загрузки':'Waiting for download');
   if(p.status==='download_error')return ui.lang==='ru'?'Ошибка загрузки':'Download error';
   if(p.status==='ready'||p.status==='watched')return t('label.readyAll');

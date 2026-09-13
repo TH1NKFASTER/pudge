@@ -9,6 +9,8 @@
   let audioState = {books: []};
   let audioImportBusy = '';
   let audioPollTimer = null;
+  let audioControlMutation = 0;
+  let audioControlEngagedUntil = 0;
   let activeAudioBookId = null;
   let mangaAniListBookId = null;
   let mangaAniListResults = [];
@@ -53,6 +55,27 @@
       ? `${hours}:${String(minutes).padStart(2,'0')}:${String(seconds).padStart(2,'0')}`
       : `${minutes}:${String(seconds).padStart(2,'0')}`;
   };
+  const updateAudioLiveFields = () => {
+    for(const book of audioState.books||[]){
+      const id=Number(book.id);
+      const card=document.querySelector(`.audiobook-card[data-audiobook-id="${id}"]`);
+      if(!card)continue;
+      const duration=Math.max(0,Number(book.duration||0));
+      const position=Math.max(0,Math.min(Number(book.position||0),duration||Number(book.position||0)));
+      const pct=duration?Math.min(100,position/duration*100):0;
+      const remaining=Math.max(0,duration-position);
+      const summary=card.querySelector(`[data-audio-live-summary="${id}"]`);
+      if(summary){
+        summary.textContent=`${formatAudioTime(position)} / ${formatAudioTime(duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${String(book.current_chapter.title||'')}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}`;
+      }
+      const scrubber=card.querySelector(`[data-audio-position][data-id="${id}"]`);
+      if(scrubber&&document.activeElement!==scrubber){
+        scrubber.max=String(Math.max(1,duration||1));
+        scrubber.value=String(position);
+      }
+    }
+  };
+
   const formatBookmarkDate = value => {
     const seconds=Number(value||0);
     if(!Number.isFinite(seconds)||seconds<=0)return '';
@@ -175,7 +198,7 @@
       const selected=audioSelection.has(Number(book.id));
       const volume=Number(book.volume||0);
       const displayTitle=grouped&&volume>0?(ru()?`Том ${volume}`:`Volume ${volume}`):String(book.title||'');
-      return `<article class="audiobook-card ${book.playing?'playing':''} ${selected?'selected':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong title="${esc(String(book.title||''))}">${esc(displayTitle)}</strong>${book.metadata_pending?`<span class="audiobook-metadata-pending">${ru()?'Метаданные…':'Metadata…'}</span>`:''}${book.tts_generated?`<span class="audiobook-tts-badge" title="${ru()?'Создано TTS':'TTS-generated'}" aria-label="${ru()?'Создано TTS':'TTS-generated'}">🤖</span>`:''}${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span>${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"><span class="audiobook-chapter-hover" aria-hidden="true"></span></div></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">+15s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`;
+      return `<article class="audiobook-card ${book.playing?'playing':''} ${selected?'selected':''}" data-audiobook-id="${Number(book.id)}"><div class="audiobook-main"><div class="audiobook-title-row"><strong title="${esc(String(book.title||''))}">${esc(displayTitle)}</strong>${book.metadata_pending?`<span class="audiobook-metadata-pending">${ru()?'Метаданные…':'Metadata…'}</span>`:''}${book.tts_generated?`<span class="audiobook-tts-badge" title="${ru()?'Создано TTS':'TTS-generated'}" aria-label="${ru()?'Создано TTS':'TTS-generated'}">🤖</span>`:''}${book.playing?`<span class="audiobook-live"><i></i>${ru()?'Играет':'Playing'}</span>`:''}</div><span data-audio-live-summary="${Number(book.id)}">${formatAudioTime(book.position)} / ${formatAudioTime(book.duration)} · ${Math.round(pct)}%${remaining>0?` · ${ru()?'осталось':'left'} ${formatAudioTime(remaining)}`:''}${book.current_chapter?` · ${esc(book.current_chapter.title)}`:''}${book.multi_file?` · ${book.file_count} ${ru()?'файлов':'files'}`:''}</span><div class="audiobook-scrubber-shell" data-audio-timeline data-id="${book.id}" data-duration="${Math.max(1,Number(book.duration||1))}"><input class="audiobook-scrubber" type="range" min="0" max="${Math.max(1,Number(book.duration||1))}" step="1" value="${Number(book.position||0)}" data-audio-position data-id="${book.id}" aria-label="${ru()?'Позиция':'Position'}"><span class="audiobook-chapter-hover" aria-hidden="true"></span></div></div>${audioPreparation(book.transcription||{})}<div class="audiobook-controls">${play}<button data-media-action="seek-audio" data-id="${book.id}" data-seconds="-15">−15s</button><button data-media-action="seek-audio" data-id="${book.id}" data-seconds="15">+15s</button><button data-media-action="bookmark-audio" data-id="${book.id}">${ru()?'Закладка':'Bookmark'}</button><label class="audiobook-speed"><span>${ru()?'Скорость':'Speed'}</span><select data-audio-speed data-id="${book.id}">${speeds}</select></label><label class="audiobook-speed"><span>${ru()?'Таймер':'Sleep'}</span><select data-audio-sleep data-id="${book.id}"><option value="off">—</option><option value="15">15m</option><option value="30">30m</option><option value="45">45m</option><option value="60">60m</option><option value="chapter">${ru()?'До конца главы':'End of chapter'}</option></select></label><button data-media-action="finish-audio" data-id="${book.id}" data-finished="${book.finished?'0':'1'}">${book.finished?(ru()?'Сбросить':'Reset'):(ru()?'Завершить':'Finish')}</button><button class="danger-action" data-media-action="delete-audio" data-id="${book.id}">${ru()?'Удалить':'Remove'}</button></div>${bookmarks?`<div class="audiobook-bookmarks">${bookmarks}</div>`:''}${(book.chapters||[]).length?`<details class="audiobook-chapters" data-book-id="${Number(book.id)}" ${openChapterBooks.has(Number(book.id))?'open':''}><summary><span class="audiobook-chapters-label"><i>›</i>${ru()?'Главы':'Chapters'}</span><b>${book.chapters.length}</b><span class="audiobook-chapters-open">${ru()?'Показать':'Show'}</span><span class="audiobook-chapters-close">${ru()?'Скрыть':'Hide'}</span></summary><div class="chapter-list">${book.chapters.map((chapter,index,chapters)=>{const chapterStart=Math.max(0,Number(chapter.start||0)),chapterEnd=Math.max(chapterStart,Number(chapters[index+1]?.start??book.duration??chapterStart));return `<button data-media-action="play-audio" data-id="${book.id}" data-start="${chapterStart}" data-audio-chapter-start="${chapterStart}" data-audio-chapter-end="${chapterEnd}">${esc(chapter.title)}</button>`;}).join('')}</div></details>`:''}</article>`;
     };
     const groups=[];
     for(const book of booksForRender){
@@ -218,7 +241,13 @@
     const playingBook=(audioState.books||[]).find(book=>book.playing);
     if(playingBook)activeAudioBookId=Number(playingBook.id);
     else if(activeAudioBookId==null&&(audioState.books||[]).length)activeAudioBookId=Number(audioState.books[0].id);
-    renderAudio();
+    const focusedAudioControl=document.activeElement?.closest?.('[data-audio-speed],[data-audio-position],[data-audio-sleep]');
+    const livePlayback=(audioState.books||[]).some(book=>book.playing);
+    const controlEngaged=Date.now()<audioControlEngagedUntil;
+    if(audioControlMutation===0&&!focusedAudioControl&&!controlEngaged){
+      if(livePlayback)updateAudioLiveFields();
+      else renderAudio();
+    }
     window.updateCount?.();
     if (audioPollTimer) clearTimeout(audioPollTimer);
     const active=document.querySelector('.nav button[data-page="audiobooks"]')?.classList.contains('active');
@@ -685,6 +714,11 @@
     event.preventDefault();event.stopImmediatePropagation();
   },true);
 
+  document.addEventListener('pointerdown', event => {
+    const control=event.target.closest?.('[data-audio-speed],[data-audio-position],[data-audio-sleep]');
+    if(control)audioControlEngagedUntil=Date.now()+15000;
+  },true);
+
   document.addEventListener('change', async event => {
     const position=event.target.closest?.('[data-audio-position]');
     if(position){const result=await pywebview.api.audiobook_seek_to(Number(position.dataset.id),Number(position.value||0));applyAudioActionResult(result);renderAudio();return;}
@@ -693,8 +727,16 @@
     const control=event.target.closest?.('[data-audio-speed]');
     if(!control)return;
     const id=Number(control.dataset.id),speed=Number(control.value||1);
+    audioControlMutation+=1;
+    audioControlEngagedUntil=0;
     control.blur();
-    const result=await pywebview.api.audiobook_set_speed(id,speed);applyAudioActionResult(result);renderAudio();
+    try{
+      const result=await pywebview.api.audiobook_set_speed(id,speed);
+      applyAudioActionResult(result);
+      renderAudio();
+    }finally{
+      audioControlMutation=Math.max(0,audioControlMutation-1);
+    }
   });
 
   document.addEventListener('keydown', event => {

@@ -261,7 +261,7 @@ def test_schema_and_frontend_contracts_cover_v072_features() -> None:
     assert "pollCurrentBookPreparation" in manga
     assert "function mangaRegionReadingOrder(regions)" in manga
     assert "PAGE_CACHE_LIMIT = 8" in manga
-    assert "pudge-manga-regions-v5" in (root / "pudge/manga.py").read_text(encoding="utf-8")
+    assert "pudge-manga-regions-v59-layout-token-geometry" in (root / "pudge/manga.py").read_text(encoding="utf-8")
     assert "if (content) content.remove()" not in manga
     assert "if (target) renderRegionContent(target, region, payload);" in manga
     assert "showLiteratureScoreModal" in html

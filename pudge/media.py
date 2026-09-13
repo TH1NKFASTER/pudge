@@ -35,9 +35,9 @@ def probe_media(video: Path, ffprobe: str) -> dict[str, Any]:
         str(video),
     ]
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=20)
         return json.loads(completed.stdout)
-    except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as exc:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
         raise MediaProbeError(f"Не удалось прочитать контейнер через ffprobe: {exc}") from exc
 
 

@@ -6,6 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from .process_utils import pid_alive
+
 _MARKER_NAME = "foreground-work.json"
 _MAX_AGE_SECONDS = 6 * 3600
 
@@ -14,16 +16,7 @@ def _marker(cache_dir: Path) -> Path:
     return cache_dir / _MARKER_NAME
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+_pid_alive = pid_alive
 
 
 def _pid_command(pid: int) -> str:

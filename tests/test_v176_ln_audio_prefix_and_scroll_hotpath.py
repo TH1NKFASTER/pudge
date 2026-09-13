@@ -150,4 +150,4 @@ def test_scroll_does_not_recreate_bookmark_and_settle_timers_per_event() -> None
 
 def test_alignment_revision_bumped_to_v17() -> None:
     source = AUDIOBOOKS.read_text(encoding="utf-8")
-    assert 'reading-audio-v3-leading-prefix-v18' in source
+    assert 'reading-audio-v3-leading-prefix-v22' in source

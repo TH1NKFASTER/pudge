@@ -81,11 +81,23 @@ def test_cmd_shift_l_routes_to_active_debug_context_without_ui_buttons() -> None
     assert "self.diagnostics_controller.export(" in web_app
 
 
-def test_ocr_status_uses_processed_without_page_counter() -> None:
+def test_ocr_status_reports_real_volume_progress() -> None:
     source = MANGA.read_text(encoding="utf-8")
-    assert source.count("ru() ? 'Обработалось' : 'Processed'") == 2
-    assert "'Распознаю' : 'Recognizing'" not in source
+    progress_start = source.index("function mangaOcrProgressText(status)")
+    progress_end = source.index("async function pollCurrentBookPreparation", progress_start)
+    progress = source[progress_start:progress_end]
+    recognize_start = source.index("async function recognizeWholeBook()")
+    recognize_end = source.index("function closeMangaContextMenu", recognize_start)
+    recognize = source[recognize_start:recognize_end]
 
+    assert "cached_pages" in progress
+    assert "total_pages" in progress
+    assert "OCR · ${pages}" in progress
+    assert "OCR queued" in progress
+    assert "OCR ready" in progress
+    assert "syncMangaOcrUi(started)" in recognize
+    assert "syncMangaOcrUi(status)" in recognize
+    assert "ru() ? 'Обработалось' : 'Processed'" not in source
 
 def test_rapid_space_toggles_are_coalesced_to_final_intent() -> None:
     source = HTML.read_text(encoding="utf-8")

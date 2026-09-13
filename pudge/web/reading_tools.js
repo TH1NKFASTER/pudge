@@ -702,6 +702,19 @@
     return true;
   }
 
+
+  // pudge-study-escape-card-v1
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    const card = document.getElementById('pudgeStudyCard');
+    if (!card?.classList.contains('open')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    closeStudyCard();
+  }, true);
+
+
   document.addEventListener('click', async event => {
     const close = event.target.closest?.('[data-pudge-study-close]');
     if (close) {

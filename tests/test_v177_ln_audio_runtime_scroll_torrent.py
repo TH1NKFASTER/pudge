@@ -120,6 +120,6 @@ def test_v177_runtime_diagnostics_and_report_cache_contract() -> None:
     assert "perf_revision:'ln-paired-v178'" in html
     assert "backend_lookup_ms:Number(state.position_lookup_ms||0)" in html
     audio = AUDIOBOOKS.read_text(encoding="utf-8")
-    assert 'reading-audio-v3-leading-prefix-v18' in audio
+    assert 'reading-audio-v3-leading-prefix-v22' in audio
     assert "self._alignment_report_cache" in audio
     assert '"position_lookup_ms": position_lookup_ms' in audio

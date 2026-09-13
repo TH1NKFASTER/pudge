@@ -8,7 +8,7 @@ from ..models import SubtitleCandidate
 from ..subtitle_formats import convert_to_plain_srt, parse_srt
 
 
-def _content_fingerprint(
+def content_fingerprint(
     candidate: SubtitleCandidate,
     cache_dir: Path,
     *,
@@ -39,6 +39,17 @@ def _content_fingerprint(
     return hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()
 
 
+def _content_fingerprint(
+    candidate: SubtitleCandidate,
+    cache_dir: Path,
+    *,
+    ffmpeg_path: str,
+) -> str | None:
+    """Compatibility wrapper for the pre-consolidation private helper."""
+
+    return content_fingerprint(candidate, cache_dir, ffmpeg_path=ffmpeg_path)
+
+
 def deduplicate_candidates(
     candidates: list[SubtitleCandidate],
     cache_dir: Path,
@@ -56,7 +67,7 @@ def deduplicate_candidates(
     selected: dict[str, SubtitleCandidate] = {}
     passthrough: list[SubtitleCandidate] = []
     for candidate in by_path.values():
-        fingerprint = _content_fingerprint(candidate, cache_dir, ffmpeg_path=ffmpeg_path)
+        fingerprint = content_fingerprint(candidate, cache_dir, ffmpeg_path=ffmpeg_path)
         if fingerprint is None:
             passthrough.append(candidate)
             continue

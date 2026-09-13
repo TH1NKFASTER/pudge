@@ -25,6 +25,7 @@
   let coverCache = loadJson(COVER_CACHE_KEY, {});
   let state = {books: []};
   let currentBook = null;
+  let currentBookOcrStatus = null;
   let currentPage = 0;
   let currentPageCount = 0;
   let pageCache = new Map();
@@ -32,6 +33,8 @@
   let textRegionResultCache = new Map();
   let textParseCache = new Map();
   let textParseInflight = new Map();
+  const textForegroundOcrInflight = new Set();
+  // pudge-v0.7.27-manga-cold-cache-foreground-runtime-v1
   let mangaDebugEvents = [];
   let mangaDebugSelectionKey = '';
   let mangaLastSelection = null;
@@ -407,7 +410,10 @@
       <header class="manga-v2-toolbar">
         <button data-manga-v2-action="close">← ${ru() ? 'Библиотека' : 'Library'}</button>
         <strong id="mangaV2Title"></strong>
-        <span id="mangaV2PageLabel"></span>
+        <div class="manga-v2-page-picker-shell">
+          <button id="mangaV2PageLabel" class="manga-v2-page-label" data-manga-v2-action="page-picker" aria-haspopup="listbox" aria-expanded="false"></button>
+          <div id="mangaV2PagePicker" class="manga-v2-page-picker" role="listbox" hidden></div>
+        </div>
         <div id="mangaV2OcrProgress" class="manga-v2-ocr-progress" aria-live="polite"></div>
         <span class="spacer"></span>
         <button data-manga-v2-action="ocr-book">${ru() ? 'OCR тома' : 'OCR volume'}</button>
@@ -632,6 +638,10 @@
         parsed_token_count: content?.querySelectorAll?.('[data-pudge-study-token]')?.length || 0,
         effective_orientation: String(node.dataset.effectiveOrientation || ''),
         orientation_reason: String(node.dataset.orientationReason || ''),
+        source: String(node.dataset.regionSource || ''),
+        recognizer: String(node.dataset.regionOcrBackend || ''),
+        detector: String(node.dataset.regionDetector || ''),
+        geometry_source: String(node.dataset.geometrySource || ''),
         css: {
           left: node.style.left,
           top: node.style.top,
@@ -775,14 +785,12 @@
       // MangaOCR received or merging neighbouring bubbles.
       const orientation = effectiveRegionOrientation(region, rawWidth, rawHeight);
       const isVertical = orientation.vertical;
-      const padX = isVertical
-        ? Math.max(.034, Math.min(.075, rawWidth * 1.1))
-        : .018;
-      const padY = isVertical ? .024 : .016;
-      const x = Math.max(0, rawX - padX);
-      const y = Math.max(0, rawY - padY);
-      const width = Math.min(1 - x, rawWidth + padX * 2);
-      const height = Math.min(1 - y, rawHeight + padY * 2);
+      // Token layout must stay on the geometry used for OCR. Click forgiveness
+      // is handled separately by mangaRegionAtPoint against rawRegionRect.
+      const x = rawX;
+      const y = rawY;
+      const width = rawWidth;
+      const height = rawHeight;
       const top = Math.max(0, 1 - y - height);
       const edge = x > .58 ? ' edge-right' : '';
       const vertical = isVertical ? ' vertical-text' : '';
@@ -790,6 +798,10 @@
         data-page-index="${Number(pageIndex)}" data-region-index="${regionIndex}"
         data-effective-orientation="${isVertical ? 'vertical' : 'horizontal'}"
         data-orientation-reason="${esc(orientation.reason)}"
+        data-region-source="${esc(region.source || '')}"
+        data-region-ocr-backend="${esc(region.recognizer || '')}"
+        data-region-detector="${esc(region.detector || '')}"
+        data-geometry-source="${esc(region.geometry_source || '')}"
         data-raw-x="${rawX}" data-raw-y="${rawY}" data-raw-width="${rawWidth}" data-raw-height="${rawHeight}"
         data-pudge-translate-root
         data-pudge-media-id="${Number(currentBook.anilist_id || 0)}"
@@ -797,6 +809,9 @@
         aria-label="${esc(region.text || '')}"
         style="left:${x * 100}%;top:${top * 100}%;width:${width * 100}%;height:${height * 100}%">
           <div class="manga-v2-region-content">${esc(region.text || '')}</div>
+          <div class="manga-v2-selection-content"
+            data-manga-copy-surface="${esc(region.text || '')}"
+            title="${esc(ru() ? 'Выделение OCR-текста; тройной клик — весь бабл' : 'Select OCR text; triple-click selects the whole bubble')}">${esc(region.text || '')}</div>
         </div>`;
     }).join('');
     // renderTextLayer is called repeatedly while background OCR preparation is
@@ -859,11 +874,21 @@
     {refresh = false, showProgress = false, parse = false, cachedOnly = false} = {},
   ) {
     if (!currentBook || !API()?.manga_text_regions) return null;
+    // Volume OCR is atomic from the reader's point of view.  Batch OCR may
+    // persist individual page caches as it advances, but exposing those pages
+    // immediately makes overlays appear/disappear while the user is reading.
+    // Keep every page visually raw until the whole volume reaches complete.
+    if (!currentBook.ocr_complete) {
+      const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
+      textRegionCache.delete(textKey(Number(currentBook.id), index));
+      const frame = $('mangaV2Pages')?.querySelector(`[data-page-index="${index}"]`);
+      frame?.querySelector('.manga-v2-text-layer')?.replaceChildren();
+      return {regions: [], cached: false, suppressed_until_volume_complete: true};
+    }
     const generation = textGeneration;
     const bookId = Number(currentBook.id);
     const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
     const key = textKey(bookId, index);
-    const progress = $('mangaV2OcrProgress');
     if (!refresh && textRegionCache.has(key)) {
       mangaDebugRecord('ocr_memory_cache', {page_index:index, region_count:(textRegionCache.get(key) || []).length});
       const frame = $('mangaV2Pages')?.querySelector(`[data-page-index="${index}"]`);
@@ -872,7 +897,6 @@
       if (parse) await parseRegionsSequentially(index, regions, generation);
       return {regions, cached:true};
     }
-    if (showProgress && progress) progress.textContent = `OCR · ${index + 1}/${currentPageCount}…`;
     try {
       const result = await API().manga_text_regions(
         bookId,
@@ -884,6 +908,34 @@
       const regions = mangaRegionReadingOrder(
         Array.isArray(result?.regions) ? result.regions : [],
       );
+      // pudge-v0.7.27-manga-visible-page-foreground-ocr-v1
+      // Cached-only polling is intentionally cheap for preloaded/background
+      // pages. The page the user is actually reading must not wait for the
+      // whole-volume batch to finish its all-pages Vision detection phase.
+      const foregroundRetry = Boolean(
+        cachedOnly &&
+        index === Number(currentPage) &&
+        result?.available &&
+        !result?.cached &&
+        regions.length === 0
+      );
+      if (foregroundRetry && !textForegroundOcrInflight.has(key)) {
+        textForegroundOcrInflight.add(key);
+        mangaDebugRecord('ocr_foreground_retry', {
+          page_index:index,
+          reason:'visible-cache-miss',
+        });
+        try {
+          return await loadTextRegions(index, {
+            refresh:false,
+            showProgress:true,
+            parse,
+            cachedOnly:false,
+          });
+        } finally {
+          textForegroundOcrInflight.delete(key);
+        }
+      }
       textRegionResultCache.set(key, {
         book_id: Number(result?.book_id || bookId),
         page_index: Number(result?.page_index ?? index),
@@ -915,7 +967,8 @@
       console.debug?.('Manga OCR regions unavailable:', error);
       return null;
     } finally {
-      if (showProgress && progress) setTimeout(() => { progress.textContent = ''; }, 650);
+      // Volume-level progress owns the toolbar status.  Per-page fetches must
+      // never clear it while a background OCR job is running.
     }
   }
 
@@ -931,12 +984,107 @@
     preparationPollTimer = null;
   }
 
+  function suppressPartialVolumeOcr() {
+    if (!currentBook || currentBook.ocr_complete) return;
+    textGeneration += 1;
+    textRegionCache.clear();
+    textRegionResultCache.clear();
+    textParseCache.clear();
+    textParseInflight.clear();
+    for (const layer of $('mangaV2Pages')?.querySelectorAll('.manga-v2-text-layer') || []) {
+      layer.replaceChildren();
+    }
+  }
+
   async function refreshVisibleTextRegions() {
+    if (!currentBook?.ocr_complete) {
+      suppressPartialVolumeOcr();
+      return;
+    }
     const indices = visiblePageIndices();
     await Promise.all(indices.map(index => loadTextRegions(index, {
       cachedOnly: true,
       parse: true,
     })));
+  }
+
+  function mangaOcrProgressText(status) {
+    const stateName = String(status?.state || '');
+    const active = Boolean(status?.running);
+    const total = Math.max(0, Number(status?.total_pages || 0));
+    const cached_pages = Math.max(0, Number(status?.cached_pages || 0));
+    const completed = Math.max(0, Number(
+      status?.completed ?? ((status?.ready_pages || 0) + (status?.empty_pages || 0))
+    ));
+    const failed = Math.max(0, Number(status?.failed || status?.failed_pages || 0));
+    const queued = Math.max(0, Number(status?.queued || 0));
+    const processing = Math.max(0, Number(status?.processing || 0));
+    const processed = Math.max(
+      completed,
+      Math.max(0, Number(status?.processed_pages ?? completed)),
+    );
+    const prepared = Math.max(
+      processed,
+      Math.max(0, Number(status?.prepared_pages ?? processed)),
+    );
+    const phase = String(status?.phase || '');
+    const pages = total > 0 ? `${Math.min(processed, total)}/${total}` : String(processed || cached_pages);
+    const preparedPages = total > 0 ? `${Math.min(prepared, total)}/${total}` : String(prepared);
+    if (active && phase === 'detecting') {
+      return `${ru() ? 'Ищу области текста' : 'Detecting text'} · ${preparedPages} · OCR ${pages}`;
+    }
+    if (active && phase === 'yielded') {
+      return `${ru() ? 'OCR уступил ручной задаче' : 'OCR yielded to manual task'} · ${pages}`;
+    }
+    if (active && stateName === 'parsing') {
+      return `${ru() ? 'Готовлю Jiten' : 'Preparing Jiten'} ${Number(status?.parsed_regions || 0)}/${Number(status?.total_regions || 0)} · OCR ${pages}`;
+    }
+    if (active && (processing > 0 || stateName === 'running')) {
+      const page = Number(status?.current_page || 0);
+      return `OCR · ${pages}${page > 0 ? ` · ${ru() ? 'страница' : 'page'} ${page} ${ru() ? 'обрабатывается…' : 'processing…'}` : ''}`;
+    }
+    if (active && (queued > 0 || stateName === 'queued')) {
+      return `${ru() ? 'OCR в очереди' : 'OCR queued'} · ${pages}${queued > 0 ? ` · ${queued}` : ''}`;
+    }
+    if (failed > 0 || stateName === 'failed') {
+      return `${ru() ? 'OCR ошибок' : 'OCR failed'} · ${pages}${failed > 0 ? ` · ${failed}` : ''}`;
+    }
+    if (status?.complete || stateName === 'ready' || (total > 0 && completed >= total)) {
+      return `${ru() ? 'OCR готов' : 'OCR ready'} · ${pages}`;
+    }
+    // An incomplete volume with no live worker is idle and not implicitly queued.
+    // The explicit OCR Volume button remains available.
+    return '';
+  }
+
+  function mangaOcrJobActive(status) {
+    return Boolean(status?.running);
+  }
+
+  function syncMangaOcrUi(status) {
+    currentBookOcrStatus = status ? {...status} : null;
+    if (currentBook && status) {
+      currentBook.ocr_cached_pages = Number(status.cached_pages || 0);
+      currentBook.ocr_complete = Boolean(status.complete);
+    }
+    const progress = $('mangaV2OcrProgress');
+    if (progress) {
+      const text = mangaOcrProgressText(status);
+      progress.textContent = text;
+      progress.hidden = !text;
+    }
+    const button = document.querySelector('[data-manga-v2-action="ocr-book"]');
+    if (button) {
+      const active = mangaOcrJobActive(status);
+      button.disabled = active;
+      button.classList.toggle('busy', active);
+      button.setAttribute('aria-disabled', active ? 'true' : 'false');
+      button.textContent = active
+        ? (ru() ? 'OCR идёт…' : 'OCR running…')
+        : (currentBook?.ocr_complete
+          ? (ru() ? 'Повторить OCR' : 'Rebuild OCR')
+          : (ru() ? 'OCR тома' : 'OCR volume'));
+    }
   }
 
   async function pollCurrentBookPreparation(bookId) {
@@ -946,22 +1094,22 @@
     try {
       const status = await API().manga_ocr_book_status(Number(bookId));
       if (!currentBook || Number(currentBook.id) !== Number(bookId)) return;
-      currentBook.ocr_cached_pages = Number(status.cached_pages || 0);
-      currentBook.ocr_complete = Boolean(status.complete);
-      await refreshVisibleTextRegions();
-      const progress = $('mangaV2OcrProgress');
-      if (progress && status.running) {
-        progress.textContent = status.state === 'parsing'
-          ? `${ru() ? 'Готовлю Jiten' : 'Preparing Jiten'} ${Number(status.parsed_regions || 0)}/${Number(status.total_regions || 0)}`
-          : ru() ? 'Обработалось' : 'Processed';
+      const wasComplete = Boolean(currentBook.ocr_complete);
+      syncMangaOcrUi(status);
+      if (!currentBook.ocr_complete) {
+        suppressPartialVolumeOcr();
+      } else if (!wasComplete) {
+        textRegionCache.clear();
+        textRegionResultCache.clear();
+        textParseCache.clear();
+        textParseInflight.clear();
+        await refreshVisibleTextRegions();
       }
-      if (status.running) {
+      if (mangaOcrJobActive(status)) {
         preparationPollTimer = setTimeout(
           () => void pollCurrentBookPreparation(Number(bookId)),
           750,
         );
-      } else if (progress) {
-        progress.textContent = '';
       }
     } catch (error) {
       console.debug?.('Manga preparation status unavailable:', error);
@@ -974,8 +1122,14 @@
     if (!currentBook || !state.ocr_available) return;
     const bookId = Number(currentBook.id);
     try {
-      if (!currentBook.ocr_complete) await API().start_manga_ocr_book(bookId);
-      await pollCurrentBookPreparation(bookId);
+      // Opening a volume is read-only with respect to OCR scheduling. Only the
+      // explicit OCR Volume action may create a new batch. If a batch that the
+      // user already started is still alive, reconnect the UI to that job.
+      const status = await API().manga_ocr_book_status(bookId);
+      if (!currentBook || Number(currentBook.id) !== bookId) return;
+      syncMangaOcrUi(status);
+      if (!currentBook.ocr_complete) suppressPartialVolumeOcr();
+      if (mangaOcrJobActive(status)) await pollCurrentBookPreparation(bookId);
     } catch (error) {
       console.debug?.('Manga background preparation unavailable:', error);
     }
@@ -987,25 +1141,35 @@
     stopPreparationPoll();
     const progress = $('mangaV2OcrProgress');
     const button = document.querySelector('[data-manga-v2-action="ocr-book"]');
-    button?.classList.add('busy');
+    if (button) { button.disabled = true; button.classList.add('busy'); }
     try {
-      await API().start_manga_ocr_book(bookId);
+      // Explicit toolbar action means rebuild, not "fill only missing pages".
+      // Passing refresh=true invalidates the current generation before the
+      // background worker starts, so a complete/stale cache cannot make this
+      // button finish instantly without traversing the volume.
+      const started = await API().start_manga_ocr_book(bookId, true);
+      syncMangaOcrUi(started);
+      suppressPartialVolumeOcr();
       while (currentBook && Number(currentBook.id) === bookId) {
         const status = await API().manga_ocr_book_status(bookId);
-        if (progress) {
-          progress.textContent = status.state === 'parsing'
-            ? `${ru() ? 'Готовлю Jiten' : 'Preparing Jiten'} ${Number(status.parsed_regions || 0)}/${Number(status.total_regions || 0)}`
-            : ru() ? 'Обработалось' : 'Processed';
-        }
-        if (!status.running) break;
+        syncMangaOcrUi(status);
+        if (!currentBook.ocr_complete) suppressPartialVolumeOcr();
+        if (!mangaOcrJobActive(status)) break;
         await new Promise(resolve => setTimeout(resolve, 800));
       }
       textRegionCache.clear();
+      textRegionResultCache.clear();
       textParseCache.clear();
-      if (currentBook && Number(currentBook.id) === bookId) await refreshVisibleTextRegions();
+      textParseInflight.clear();
+      if (currentBook && Number(currentBook.id) === bookId && currentBook.ocr_complete) {
+        await refreshVisibleTextRegions();
+      }
     } finally {
-      button?.classList.remove('busy');
-      if (progress) setTimeout(() => { progress.textContent = ''; }, 650);
+      if (currentBook && Number(currentBook.id) === bookId) {
+        try { syncMangaOcrUi(await API().manga_ocr_book_status(bookId)); } catch (_) {
+          if (button) { button.disabled = false; button.classList.remove('busy'); }
+        }
+      }
     }
   }
 
@@ -1048,6 +1212,7 @@
       ${select}<button data-manga-context-action="read">${ru() ? 'Читать' : 'Read'}</button>
       ${openAniList}${link}${names}
       <button data-manga-context-action="ocr-book">${ocr}</button>
+      <button data-manga-context-action="reset-progress">${ru() ? 'Сбросить прогресс чтения' : 'Reset reading progress'}</button>
       <button class="danger-action" data-manga-context-action="remove-series">${ru() ? 'Удалить из Pudge' : 'Remove from Pudge'}</button>`;
     positionMangaContextMenu(menu, x, y);
   }
@@ -1079,6 +1244,7 @@
       ${select}<button data-manga-context-action="read-series">${ru() ? 'Читать' : 'Read'}</button>
       ${openAniList}${score}${link}
       <button data-manga-context-action="ocr-series">${ocr}</button>
+      <button data-manga-context-action="reset-progress-series">${ru() ? 'Сбросить прогресс серии' : 'Reset series progress'}</button>
       <button class="danger-action" data-manga-context-action="remove-series">${ru() ? 'Удалить из Pudge' : 'Remove from Pudge'}</button>`;
     positionMangaContextMenu(menu, x, y);
   }
@@ -1138,6 +1304,52 @@
     return Boolean(match && Number(match[2]) === Number(match[1]) + 1);
   }
 
+  function renderPagePicker() {
+    const picker = $('mangaV2PagePicker');
+    if (!picker) return;
+    const current = Math.max(0, Math.min(currentPage, Math.max(0, currentPageCount - 1)));
+    picker.innerHTML = Array.from({length: Math.max(0, currentPageCount)}, (_, index) =>
+      `<button type="button" role="option" aria-selected="${index === current ? 'true' : 'false'}" class="${index === current ? 'active' : ''}" data-manga-v2-page-option="${index + 1}">${index + 1}</button>`
+    ).join('');
+  }
+
+  function updatePageLabel() {
+    const label = $('mangaV2PageLabel');
+    if (!label) return;
+    label.textContent = `${Math.min(currentPageCount, currentPage + 1)} / ${currentPageCount}`;
+    if (!$('mangaV2PagePicker')?.hidden) renderPagePicker();
+  }
+
+  function closePagePicker() {
+    const picker = $('mangaV2PagePicker');
+    if (picker) picker.hidden = true;
+    $('mangaV2PageLabel')?.setAttribute('aria-expanded', 'false');
+  }
+
+  function togglePagePicker() {
+    const picker = $('mangaV2PagePicker');
+    if (!picker) return;
+    const opening = picker.hidden;
+    if (!opening) { closePagePicker(); return; }
+    renderPagePicker();
+    picker.hidden = false;
+    $('mangaV2PageLabel')?.setAttribute('aria-expanded', 'true');
+    requestAnimationFrame(() => picker.querySelector('.active')?.scrollIntoView({block: 'center'}));
+  }
+
+  async function goToPage(pageNumber) {
+    if (!currentBook || currentPageCount <= 0) return false;
+    const requested = Math.trunc(Number(pageNumber));
+    if (!Number.isFinite(requested) || requested < 1 || requested > currentPageCount) return false;
+    clearMangaTransientOverlays();
+    currentPage = requested - 1;
+    await showCurrent();
+    await setResumePage(currentPage);
+    updatePageLabel();
+    closePagePicker();
+    return true;
+  }
+
   async function renderPaged() {
     if (!currentBook) return;
     clearMangaTransientOverlays();
@@ -1158,10 +1370,10 @@
         <img src="${page.data_uri}" alt="${esc(page.name || '')}">
         <div class="manga-v2-text-layer"></div>
       </figure>`).join('');
-    $('mangaV2PageLabel').textContent =
-      settings.mode === 'double' && loaded.length > 1
-        ? `${loaded[0].page_index + 1}–${loaded[loaded.length - 1].page_index + 1} / ${currentPageCount}`
-        : `${currentPage + 1} / ${currentPageCount}`;
+    updatePageLabel();
+    if (settings.mode === 'double' && loaded.length > 1) {
+      $('mangaV2PageLabel').textContent = `${loaded[0].page_index + 1}–${loaded[loaded.length - 1].page_index + 1} / ${currentPageCount}`;
+    }
     for (const page of loaded) void loadTextRegions(Number(page.page_index), {
       cachedOnly: true,
       parse: true,
@@ -1208,7 +1420,7 @@
         if (best.index !== currentPage) clearMangaTransientOverlays();
         if (best.index > currentPage) void markReadThrough(best.index - 1);
         currentPage = best.index;
-        $('mangaV2PageLabel').textContent = `${currentPage + 1} / ${currentPageCount}`;
+        updatePageLabel();
         for (const frame of pages.querySelectorAll('.manga-v2-page-frame[data-loaded="1"]')) {
           const index = Number(frame.dataset.pageIndex);
           if (Math.abs(index - currentPage) <= 3) continue;
@@ -1256,10 +1468,34 @@
     textGeneration += 1;
     pageRenderGeneration += 1;
     const reader = buildReader();
+    currentBookOcrStatus = null;
     $('mangaV2Title').textContent = `${seriesTitle(currentBook)} · ${volumeLabel(currentBook, 0)}`;
+    const ocrButton = document.querySelector('[data-manga-v2-action="ocr-book"]');
+    if (ocrButton) {
+      // Opening a book is not an OCR job. Keep the action usable until the
+      // backend proves that this exact volume has a live worker.
+      ocrButton.disabled = false;
+      ocrButton.classList.remove('busy');
+      ocrButton.setAttribute('aria-disabled', 'false');
+    }
     reader.classList.add('open');
     document.body.classList.add('manga-v2-reading');
+    // Start status reconciliation immediately. Page rendering must never be a
+    // prerequisite for re-enabling the OCR action.
+    const ocrStatusPromise = (async () => {
+      try {
+        const status = await API().manga_ocr_book_status(Number(bookId));
+        if (currentBook && Number(currentBook.id) === Number(bookId)) syncMangaOcrUi(status);
+      } catch (_) {
+        if (ocrButton) {
+          ocrButton.disabled = false;
+          ocrButton.classList.remove('busy');
+          ocrButton.setAttribute('aria-disabled', 'false');
+        }
+      }
+    })();
     await showCurrent();
+    void ocrStatusPromise;
     void ensureCurrentBookPrepared();
   }
 
@@ -1267,6 +1503,7 @@
     textGeneration += 1;
     pageRenderGeneration += 1;
     stopPreparationPoll();
+    closePagePicker();
     if (toolbarPeekTimer) clearTimeout(toolbarPeekTimer);
     if (verticalObserver) verticalObserver.disconnect();
     verticalObserver = null;
@@ -1284,6 +1521,11 @@
     $('mangaReaderV2')?.classList.remove('open', 'toolbar-peek');
     document.body.classList.remove('manga-v2-reading');
     currentBook = null;
+    currentBookOcrStatus = null;
+    const ocrProgress = $('mangaV2OcrProgress');
+    if (ocrProgress) { ocrProgress.textContent = ''; ocrProgress.hidden = true; }
+    const ocrButton = document.querySelector('[data-manga-v2-action="ocr-book"]');
+    if (ocrButton) { ocrButton.disabled = false; ocrButton.classList.remove('busy'); }
     currentPageCount = 0;
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
     void renderLibrary();
@@ -1370,10 +1612,60 @@
     }
   }
 
-  function setZoom(value, {persist = true} = {}) {
+  function captureMangaZoomAnchor(clientX = null, clientY = null, target = null) {
+    const viewport = $('mangaV2Viewport');
+    if (!viewport) return null;
+    const rect = viewport.getBoundingClientRect();
+    const x = Number.isFinite(Number(clientX)) ? Number(clientX) : rect.left + rect.width / 2;
+    const y = Number.isFinite(Number(clientY)) ? Number(clientY) : rect.top + rect.height / 2;
+    let image = target?.closest?.('.manga-v2-page-frame img') || null;
+    if (!image && document.elementFromPoint) {
+      image = document.elementFromPoint(x, y)?.closest?.('.manga-v2-page-frame img') || null;
+    }
+    if (image) {
+      const imageRect = image.getBoundingClientRect();
+      if (imageRect.width > 0 && imageRect.height > 0) {
+        return {
+          kind:'image', image, clientX:x, clientY:y,
+          u:(x-imageRect.left)/imageRect.width,
+          v:(y-imageRect.top)/imageRect.height,
+        };
+      }
+    }
+    return {
+      kind:'viewport', clientX:x, clientY:y,
+      localX:x-rect.left, localY:y-rect.top,
+      contentX:viewport.scrollLeft+(x-rect.left),
+      contentY:viewport.scrollTop+(y-rect.top),
+      oldScrollWidth:Math.max(1,viewport.scrollWidth),
+      oldScrollHeight:Math.max(1,viewport.scrollHeight),
+    };
+  }
+
+  function restoreMangaZoomAnchor(anchor) {
+    const viewport = $('mangaV2Viewport');
+    if (!viewport || !anchor) return;
+    if (anchor.kind === 'image' && anchor.image?.isConnected) {
+      const rect = anchor.image.getBoundingClientRect();
+      const nextX = rect.left + Number(anchor.u || 0) * rect.width;
+      const nextY = rect.top + Number(anchor.v || 0) * rect.height;
+      viewport.scrollLeft += nextX - Number(anchor.clientX || 0);
+      viewport.scrollTop += nextY - Number(anchor.clientY || 0);
+      return;
+    }
+    const ratioX = Math.max(1,viewport.scrollWidth) / Math.max(1,Number(anchor.oldScrollWidth || 1));
+    const ratioY = Math.max(1,viewport.scrollHeight) / Math.max(1,Number(anchor.oldScrollHeight || 1));
+    viewport.scrollLeft = Number(anchor.contentX || 0) * ratioX - Number(anchor.localX || 0);
+    viewport.scrollTop = Number(anchor.contentY || 0) * ratioY - Number(anchor.localY || 0);
+  }
+
+  function setZoom(value, {persist = true, anchor = null} = {}) {
+    const captured = captureMangaZoomAnchor(anchor?.clientX, anchor?.clientY, anchor?.target);
     settings.zoom = Math.max(50, Math.min(250, Math.round(Number(value || 100) / 5) * 5));
     if (persist) saveSettings();
-    applyReaderSettings();
+    applyPageSizing();
+    syncSettingsControls();
+    requestAnimationFrame(() => restoreMangaZoomAnchor(captured));
   }
 
   function toggleToolbar(force = null) {
@@ -1401,7 +1693,14 @@
     viewport?.addEventListener('wheel', event => {
       if (gestureActive || !(event.ctrlKey || event.metaKey || event.altKey)) return;
       event.preventDefault();
-      setZoom(Number(settings.zoom || 100) + (event.deltaY < 0 ? 10 : -10));
+      setZoom(Number(settings.zoom || 100) + (event.deltaY < 0 ? 10 : -10), {anchor:event});
+    }, {passive:false});
+
+    viewport?.addEventListener('dblclick', event => {
+      if (!event.target?.closest?.('.manga-v2-page-frame img')) return;
+      event.preventDefault();
+      const next = Number(settings.zoom || 100) >= 200 ? 100 : Number(settings.zoom || 100) + 50;
+      setZoom(next, {anchor:event});
     }, {passive:false});
 
     reader.addEventListener('gesturestart', event => {
@@ -1411,7 +1710,7 @@
     }, {passive:false});
     reader.addEventListener('gesturechange', event => {
       event.preventDefault();
-      setZoom(gestureBaseZoom * Number(event.scale || 1), {persist:false});
+      setZoom(gestureBaseZoom * Number(event.scale || 1), {persist:false, anchor:event});
     }, {passive:false});
     reader.addEventListener('gestureend', event => {
       event.preventDefault();
@@ -1422,6 +1721,11 @@
 
     reader.addEventListener('pointermove', event => {
       if (!settings.toolbar && event.clientY <= 20) peekToolbar();
+      scheduleMangaStudyCursor(event);
+    });
+    reader.addEventListener('pointerleave', () => {
+      mangaCursorRegion?.classList?.remove('study-hit');
+      mangaCursorRegion = null;
     });
   }
 
@@ -1509,6 +1813,9 @@
   document.addEventListener('selectionchange', () => {
     if (!currentBook || !$('mangaReaderV2')?.classList.contains('open')) return;
     const selection = window.getSelection?.();
+    document.querySelectorAll('.manga-v2-text-region.bubble-selected').forEach(node => {
+      if (!mangaOverlaySelectionInRegion(node)) node.classList.remove('bubble-selected');
+    });
     const text = String(selection?.toString?.() || '').trim();
     if (!text) return;
     const anchor = selection?.anchorNode?.parentElement?.closest?.('.manga-v2-text-region');
@@ -1575,55 +1882,401 @@
     return candidates[0]?.node || null;
   }
 
-  function mangaTokenAtPoint(frame, regionNode, region, clientX, clientY) {
-    if (!frame || !regionNode || !region) return null;
-    const tokens = [...regionNode.querySelectorAll('[data-pudge-study-token]')];
-    if (!tokens.length) return null;
-    const rawRect = rawRegionRect(frame, regionNode);
-    if (!rawRect) return null;
-    const totalChars = tokens.reduce((sum, token) => sum + Math.max(1, [...String(token.textContent || '').trim()].length), 0);
-    const vertical = String(regionNode.dataset.effectiveOrientation || '') === 'vertical';
-    const segments = Array.isArray(region.segments) ? region.segments.filter(item => item && Number(item.width) > 0 && Number(item.height) > 0) : [];
-    if (segments.length > 1) {
-      const imageRect = rawRect.imageRect;
-      const px = (clientX - imageRect.left) / Math.max(1, imageRect.width);
-      const pyBottom = 1 - (clientY - imageRect.top) / Math.max(1, imageRect.height);
-      const weighted = segments.map(segment => {
-        const textWeight = [...String(segment.text || '').replace(/\s+/g, '')].length;
-        const geometryWeight = vertical ? Number(segment.height || 0) : Number(segment.width || 0);
-        return {segment, weight:Math.max(1, textWeight || Math.round(geometryWeight * 100))};
-      });
-      const nearest = weighted.map((item, index) => {
-        const s = item.segment;
-        const left = Number(s.x || 0), right = left + Number(s.width || 0);
-        const bottom = Number(s.y || 0), top = bottom + Number(s.height || 0);
-        const dx = px < left ? left - px : (px > right ? px - right : 0);
-        const dy = pyBottom < bottom ? bottom - pyBottom : (pyBottom > top ? pyBottom - top : 0);
-        return {...item, index, distance:Math.hypot(dx, dy)};
-      }).sort((a,b)=>a.distance-b.distance)[0];
-      if (nearest) {
-        const totalWeight = weighted.reduce((sum,item)=>sum+item.weight,0);
-        const before = weighted.slice(0, nearest.index).reduce((sum,item)=>sum+item.weight,0);
-        const s = nearest.segment;
-        const local = vertical
-          ? Math.max(0, Math.min(.999, (clientY - (imageRect.top + (1 - Number(s.y || 0) - Number(s.height || 0)) * imageRect.height)) / Math.max(1, Number(s.height || 0) * imageRect.height)))
-          : Math.max(0, Math.min(.999, (clientX - (imageRect.left + Number(s.x || 0) * imageRect.width)) / Math.max(1, Number(s.width || 0) * imageRect.width)));
-        return tokenForCharacterOffset(tokens, (before + local * nearest.weight) / Math.max(1, totalWeight) * totalChars);
+  // pudge-v0.7.27-manga-exact-hitboxes-v2
+  const MANGA_TOKEN_HIT_SLOP_PX = 8;
+
+  function mangaTokenWeight(token) {
+    return Math.max(1, [...String(token?.textContent || '').trim()].length);
+  }
+
+  function mangaTokenIntervals(tokens) {
+    let cursor = 0;
+    return tokens.map((token, tokenIndex) => {
+      const weight = mangaTokenWeight(token);
+      const row = {token, tokenIndex, start:cursor, end:cursor + weight, weight};
+      cursor += weight;
+      return row;
+    });
+  }
+
+  function pushMangaTokenBox(boxes, interval, geometry, source) {
+    const x = Math.max(0, Math.min(1, Number(geometry.x || 0)));
+    const y = Math.max(0, Math.min(1, Number(geometry.y || 0)));
+    const width = Math.max(0, Math.min(1 - x, Number(geometry.width || 0)));
+    const height = Math.max(0, Math.min(1 - y, Number(geometry.height || 0)));
+    if (width <= 0.0001 || height <= 0.0001) return;
+    boxes.push({
+      token:interval.token,
+      tokenIndex:Number(interval.tokenIndex),
+      text:String(interval.token?.textContent || '').trim(),
+      x, y, width, height,
+      source:String(source || 'fallback'),
+    });
+  }
+
+  // pudge-v0.7.27-manga-exact-surface-map-v1
+  function mangaHitSurface(value) {
+    return String(value || '').normalize('NFKC').replace(/\s+/g, '');
+  }
+
+  function mangaFindCharacterSequence(haystack, needle, start = 0) {
+    if (!needle.length || needle.length > haystack.length) return -1;
+    for (let index = Math.max(0, Number(start || 0)); index <= haystack.length - needle.length; index++) {
+      let matches = true;
+      for (let offset = 0; offset < needle.length; offset++) {
+        if (haystack[index + offset] !== needle[offset]) { matches = false; break; }
       }
+      if (matches) return index;
     }
-    if (!vertical) {
-      const ratio = Math.max(0, Math.min(.999, (clientX - rawRect.left) / Math.max(1, rawRect.width)));
-      return tokenForCharacterOffset(tokens, ratio * totalChars);
+    return -1;
+  }
+
+  // pudge-manga-recovery-hitbox-contract-v2
+  const MANGA_STUDY_TRAILING_DECORATION = new Set([
+    '！','!','？','?','。','…','‥','〜','～','ー','―','—','−','・','、',',','．','.'
+  ]);
+
+  function mangaStudySurfaceCandidates(value) {
+    const exact = [...mangaHitSurface(value)];
+    if (!exact.length) return [];
+    const candidates = [exact];
+    let end = exact.length;
+    while (end > 1 && MANGA_STUDY_TRAILING_DECORATION.has(exact[end - 1])) end -= 1;
+    if (end < exact.length) candidates.push(exact.slice(0, end));
+    return candidates;
+  }
+
+  function mangaMapTokenSurfaces(stream, surfaces) {
+    let cursor = 0;
+    return (surfaces || []).map(surfaceValue => {
+      const candidates = mangaStudySurfaceCandidates(surfaceValue);
+      if (!candidates.length) return null;
+      for (const surface of candidates) {
+        const found = mangaFindCharacterSequence(stream, surface, cursor);
+        if (found < 0) continue;
+        cursor = found + surface.length;
+        return {
+          start:found,
+          end:cursor,
+          surface:surface.join(''),
+          strippedTrailingDecoration:surface.length < candidates[0].length,
+        };
+      }
+      return null;
+    });
+  }
+
+  function mangaExtendEmphaticSmallTsu(stream, mappings) {
+    const punctuation = new Set(['！','!','？','?','。','…','‥','〜','～']);
+    return (mappings || []).map((mapping, index) => {
+      if (!mapping) return mapping;
+      const next = (mappings || []).slice(index + 1).find(Boolean);
+      const limit = next ? Number(next.start) : stream.length;
+      const end = Number(mapping.end || 0);
+      if (end >= limit || !['っ','ッ'].includes(stream[end])) return mapping;
+      const tail = stream.slice(end + 1, limit);
+      if (tail.every(character => punctuation.has(character))) {
+        return {...mapping, end:end + 1, visualSuffix:stream[end]};
+      }
+      return mapping;
+    });
+  }
+
+  function mangaGeometryStatus(region, segments) {
+    const explicit = String(region?.geometry_status || '').toLowerCase();
+    if (['observed','approximate','synthetic','unknown','unavailable'].includes(explicit)) return explicit;
+    if (!segments?.length) return 'unavailable';
+    if (segments.some(segment => !mangaHitSurface(segment?.text))) return 'unknown';
+    const synthetic = new Set(['ink-grid-v1','ink-columns-v2','dark-columns-v1','vertical-grid-fallback','horizontal-region-fallback']);
+    if (segments.some(segment => synthetic.has(String(segment?.source || '')))) return 'synthetic';
+    if (segments.some(segment => String(segment?.source || '').startsWith('vision-'))) return 'observed';
+    return 'approximate';
+  }
+
+  function mangaSegmentCharacters(segments, vertical) {
+    const characters = [];
+    for (const segment of segments) {
+      const surface = [...mangaHitSurface(segment?.text)];
+      if (!surface.length) continue;
+      const sx = Number(segment.x || 0), sy = Number(segment.y || 0);
+      const sw = Number(segment.width || 0), sh = Number(segment.height || 0);
+      if (!(sw > 0 && sh > 0)) continue;
+      surface.forEach((character, characterIndex) => {
+        let geometry;
+        if (surface.length === 1) {
+          geometry = {x:sx, y:sy, width:sw, height:sh};
+        } else if (vertical) {
+          const unit = sh / surface.length;
+          geometry = {
+            x:sx,
+            y:sy + sh - unit * (characterIndex + 1),
+            width:sw,
+            height:unit,
+          };
+        } else {
+          const unit = sw / surface.length;
+          geometry = {x:sx + unit * characterIndex, y:sy, width:unit, height:sh};
+        }
+        characters.push({
+          character,
+          geometry,
+          source:String(segment.source || ''),
+        });
+      });
     }
-    // Cached OCR artifacts from older versions do not have per-column segments.
-    // Reconstruct a compact vertical reading grid from the raw OCR rectangle so
-    // x chooses the right-to-left column and y chooses the character within it.
-    const aspect = Math.max(.15, rawRect.width / Math.max(1, rawRect.height));
-    const columns = Math.max(1, Math.min(totalChars, Math.round(Math.sqrt(totalChars * aspect * .72))));
-    const rows = Math.max(1, Math.ceil(totalChars / columns));
-    const column = Math.max(0, Math.min(columns - 1, Math.floor((rawRect.right - clientX) / Math.max(1, rawRect.width) * columns)));
-    const row = Math.max(0, Math.min(rows - 1, Math.floor((clientY - rawRect.top) / Math.max(1, rawRect.height) * rows)));
-    return tokenForCharacterOffset(tokens, Math.min(totalChars - .001, column * rows + row));
+    return characters;
+  }
+
+  function mangaGeometryUnion(items) {
+    if (!items.length) return null;
+    const x1 = Math.min(...items.map(item => Number(item.geometry.x || 0)));
+    const y1 = Math.min(...items.map(item => Number(item.geometry.y || 0)));
+    const x2 = Math.max(...items.map(item => Number(item.geometry.x || 0) + Number(item.geometry.width || 0)));
+    const y2 = Math.max(...items.map(item => Number(item.geometry.y || 0) + Number(item.geometry.height || 0)));
+    return {x:x1, y:y1, width:Math.max(0, x2-x1), height:Math.max(0, y2-y1)};
+  }
+
+  function mangaTokenCharacterRuns(items, vertical) {
+    const runs = [];
+    for (const item of items) {
+      const previous = runs[runs.length - 1];
+      if (!previous) { runs.push([item]); continue; }
+      const last = previous[previous.length - 1];
+      const a = last.geometry, b = item.geometry;
+      const sameTrack = vertical
+        ? Math.abs((a.x + a.width/2) - (b.x + b.width/2)) <= Math.max(a.width, b.width) * .55
+        : Math.abs((a.y + a.height/2) - (b.y + b.height/2)) <= Math.max(a.height, b.height) * .55;
+      if (sameTrack) previous.push(item);
+      else runs.push([item]);
+    }
+    return runs;
+  }
+
+  // pudge-v0.7.27-manga-dark-shape-hitboxes-v2
+  function mangaPageImageForHitboxes(regionNode) {
+    return regionNode?.closest?.('.manga-v2-page-frame')?.querySelector?.('img') || null;
+  }
+
+  function mangaHitboxPixelContext(image) {
+    if (!image?.naturalWidth || !image?.naturalHeight) return null;
+    const cached = image.__pudgeMangaHitboxPixelContext;
+    if (cached && cached.width === image.naturalWidth && cached.height === image.naturalHeight) {
+      return cached.ctx;
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const ctx = canvas.getContext('2d', {willReadFrequently:true});
+    if (!ctx) return null;
+    try {
+      ctx.drawImage(image, 0, 0, image.naturalWidth, image.naturalHeight);
+    } catch (_) {
+      return null;
+    }
+    image.__pudgeMangaHitboxPixelContext = {
+      ctx,
+      width:image.naturalWidth,
+      height:image.naturalHeight,
+    };
+    return ctx;
+  }
+
+  function mangaDarkSupportForHitbox(image, box) {
+    const ctx = mangaHitboxPixelContext(image);
+    if (!ctx || !box) return null;
+
+    const naturalWidth = Number(image.naturalWidth || 0);
+    const naturalHeight = Number(image.naturalHeight || 0);
+    if (!(naturalWidth > 0 && naturalHeight > 0)) return null;
+
+    const x = Number(box.x || 0);
+    const y = Number(box.y || 0);
+    const width = Number(box.width || 0);
+    const height = Number(box.height || 0);
+
+    // White glyphs in narration boxes must be surrounded by the black panel.
+    // False geometry in an L-shaped white cut-out fails this support check.
+    const padX = Math.max(2 / naturalWidth, width * .35);
+    const padY = Math.max(2 / naturalHeight, height * .25);
+    const left = Math.max(0, Math.floor((x - padX) * naturalWidth));
+    const right = Math.min(naturalWidth, Math.ceil((x + width + padX) * naturalWidth));
+    const topNorm = Math.min(1, y + height + padY);
+    const bottomNorm = Math.max(0, y - padY);
+    const top = Math.max(0, Math.floor((1 - topNorm) * naturalHeight));
+    const bottom = Math.min(naturalHeight, Math.ceil((1 - bottomNorm) * naturalHeight));
+    const sampleWidth = Math.max(1, right - left);
+    const sampleHeight = Math.max(1, bottom - top);
+
+    let pixels;
+    try {
+      pixels = ctx.getImageData(left, top, sampleWidth, sampleHeight).data;
+    } catch (_) {
+      return null;
+    }
+    let dark = 0;
+    let light = 0;
+    let total = 0;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const luma = (pixels[index] * 299 + pixels[index + 1] * 587 + pixels[index + 2] * 114) / 1000;
+      if (luma <= 72) dark += 1;
+      if (luma >= 180) light += 1;
+      total += 1;
+    }
+    if (!total) return null;
+    return {dark:dark / total, light:light / total};
+  }
+
+  function mangaFinalizeTokenHitboxes(regionNode, region, boxes) {
+    if (!Array.isArray(boxes) || !boxes.length) return boxes || [];
+    if (String(region?.source || '') !== 'dark-block-proposal') return boxes;
+    const image = mangaPageImageForHitboxes(regionNode);
+    if (!image) return boxes;
+
+    return boxes.filter(box => {
+      const support = mangaDarkSupportForHitbox(image, box);
+      // Canvas failure preserves behaviour. A real sampled target must sit on
+      // the black panel and include at least a trace of the white glyph.
+      return support == null || (support.dark >= .45 && support.light >= .01);
+    });
+  }
+
+  function mangaAddChapterPrefixFallbackHitbox(boxes, region, segmentCharacters) {
+    const surface = mangaHitSurface(region?.text || region?.raw_text || '');
+    if (!/^第[0-9０-９一二三四五六七八九十百千]+話/.test(surface)) return;
+    if (boxes.some(box => mangaHitSurface(box?.text || '') === '第')) return;
+    const character = segmentCharacters.find(item => item?.character === '第');
+    if (!character?.geometry) return;
+    const geometry = character.geometry;
+    const x = Math.max(0, Math.min(1, Number(geometry.x || 0)));
+    const y = Math.max(0, Math.min(1, Number(geometry.y || 0)));
+    const width = Math.max(0, Math.min(1-x, Number(geometry.width || 0)));
+    const height = Math.max(0, Math.min(1-y, Number(geometry.height || 0)));
+    if (!(width > .0001 && height > .0001)) return;
+    boxes.unshift({
+      token:null,
+      tokenIndex:-1,
+      text:'第',
+      virtualText:'第',
+      x, y, width, height,
+      source:'chapter-prefix-fallback-v1',
+    });
+  }
+
+  function mangaTokenHitboxes(regionNode, region) {
+    if (!regionNode || !region) return [];
+    const tokens = [...regionNode.querySelectorAll('[data-pudge-study-token]')];
+    if (!tokens.length) return [];
+
+    const rawX = Number(regionNode.dataset.rawX || 0);
+    const rawY = Number(regionNode.dataset.rawY || 0);
+    const rawWidth = Number(regionNode.dataset.rawWidth || 0);
+    const rawHeight = Number(regionNode.dataset.rawHeight || 0);
+    const vertical = String(regionNode.dataset.effectiveOrientation || '') === 'vertical';
+    const segments = Array.isArray(region.segments)
+      ? region.segments.filter(item => item && Number(item.width) > 0 && Number(item.height) > 0)
+      : [];
+    const boxes = [];
+    const regionSource = String(region.source || '');
+    const generatedVerticalSource = ['expanded-vision-rectangle', 'expanded-vertical-seed', 'dark-block-proposal']
+      .includes(regionSource);
+
+    // return null; // do not invent token geometry
+    if (vertical && generatedVerticalSource && segments.length <= 1) return [];
+
+    if (segments.length > 1) {
+      const segmentCharacters = mangaSegmentCharacters(segments, vertical);
+      if (!segmentCharacters.length) return [];
+      const stream = segmentCharacters.map(item => item.character);
+      const mappings = mangaExtendEmphaticSmallTsu(
+        stream,
+        mangaMapTokenSurfaces(stream, tokens.map(token => token?.textContent)),
+      );
+      tokens.forEach((token, tokenIndex) => {
+        const mapping = mappings[tokenIndex];
+        if (!mapping) return;
+        const matched = segmentCharacters.slice(mapping.start, mapping.end);
+        const interval = {token, tokenIndex};
+        for (const run of mangaTokenCharacterRuns(matched, vertical)) {
+          const geometry = mangaGeometryUnion(run);
+          if (!geometry) continue;
+          pushMangaTokenBox(
+            boxes,
+            interval,
+            geometry,
+            run.map(item => item.source).find(Boolean) || region.geometry_source || 'segment-surface-map',
+          );
+        }
+      });
+      mangaAddChapterPrefixFallbackHitbox(boxes, region, segmentCharacters);
+      if (boxes.length || generatedVerticalSource) {
+        const filteredBoxes = mangaFinalizeTokenHitboxes(regionNode, region, boxes);
+        boxes.splice(0, boxes.length, ...filteredBoxes);
+      }
+      if (boxes.length || generatedVerticalSource) return boxes;
+    }
+
+    if (segments.length) return [];
+
+    const regionSurface = mangaHitSurface(region?.text || region?.raw_text || '');
+    const onlyTokenSurface = tokens.length === 1 ? mangaHitSurface(tokens[0]?.textContent) : '';
+    if (tokens.length === 1 && regionSurface && regionSurface === onlyTokenSurface && rawWidth > 0 && rawHeight > 0) {
+      pushMangaTokenBox(boxes, {token:tokens[0], tokenIndex:0}, {
+        x:rawX, y:rawY, width:rawWidth, height:rawHeight,
+      }, 'region-single-token');
+      return boxes;
+    }
+    return [];
+  }
+
+  function mangaTokenBoxClientRect(box, imageRect, slop = 0) {
+    if (!box || !imageRect) return null;
+    const left = imageRect.left + Number(box.x || 0) * imageRect.width;
+    const right = imageRect.left + (Number(box.x || 0) + Number(box.width || 0)) * imageRect.width;
+    const top = imageRect.top + (1 - Number(box.y || 0) - Number(box.height || 0)) * imageRect.height;
+    const bottom = imageRect.top + (1 - Number(box.y || 0)) * imageRect.height;
+    return {left:left-slop, right:right+slop, top:top-slop, bottom:bottom+slop};
+  }
+
+  function mangaTokenHitAtPoint(frame, regionNode, region, clientX, clientY) {
+    if (!frame || !regionNode || !region) return null;
+    const imageRect = frame.querySelector('img')?.getBoundingClientRect?.();
+    if (!imageRect) return null;
+    const boxes = mangaTokenHitboxes(regionNode, region);
+    if (!boxes.length) return null;
+    const ranked = boxes.map(box => {
+      const core = mangaTokenBoxClientRect(box, imageRect, 0);
+      const insideCore = Boolean(core) && clientX >= core.left && clientX <= core.right && clientY >= core.top && clientY <= core.bottom;
+      const expanded = mangaTokenBoxClientRect(box, imageRect, MANGA_TOKEN_HIT_SLOP_PX);
+      const insideSlop = Boolean(expanded) && clientX >= expanded.left && clientX <= expanded.right && clientY >= expanded.top && clientY <= expanded.bottom;
+      const dx = core ? (clientX < core.left ? core.left-clientX : (clientX > core.right ? clientX-core.right : 0)) : Infinity;
+      const dy = core ? (clientY < core.top ? core.top-clientY : (clientY > core.bottom ? clientY-core.bottom : 0)) : Infinity;
+      const area = core ? Math.max(1, (core.right-core.left) * (core.bottom-core.top)) : Infinity;
+      return {box, insideCore, insideSlop, distance:Math.hypot(dx,dy), area};
+    }).filter(item => item.insideCore || item.insideSlop)
+      .sort((a,b) => Number(b.insideCore)-Number(a.insideCore) || a.distance-b.distance || a.area-b.area);
+    return ranked[0]?.box || null;
+  }
+
+  function mangaTokenAtPoint(frame, regionNode, region, clientX, clientY) {
+    return mangaTokenHitAtPoint(frame, regionNode, region, clientX, clientY)?.token || null;
+  }
+
+  async function dispatchMangaVirtualStudyHit(hit, frame) {
+    const text = String(hit?.virtualText || '').trim();
+    if (!text) return false;
+    const imageRect = frame?.querySelector?.('img')?.getBoundingClientRect?.();
+    const core = mangaTokenBoxClientRect(hit, imageRect, 0);
+    if (!core) return false;
+    const openText = window.PudgeReadingTools?.study?.openText;
+    if (typeof openText !== 'function') return false;
+    const rect = typeof DOMRect === 'function'
+      ? new DOMRect(core.left, core.top, core.right-core.left, core.bottom-core.top)
+      : {left:core.left, top:core.top, right:core.right, bottom:core.bottom, width:core.right-core.left, height:core.bottom-core.top};
+    try {
+      return Boolean(await openText(text, rect, {backend:currentStudyBackend()}));
+    } catch (_) {
+      return false;
+    }
   }
 
   async function dispatchMangaStudyClick(token, sourceEvent) {
@@ -1687,6 +2340,71 @@
   }
 
 
+  function mangaOverlaySelectionInRegion(regionNode) {
+    const selection = window.getSelection?.();
+    if (!selection || selection.isCollapsed || !selection.rangeCount || !regionNode) return false;
+    const anchor = selection.anchorNode?.nodeType === Node.TEXT_NODE ? selection.anchorNode.parentElement : selection.anchorNode;
+    const focus = selection.focusNode?.nodeType === Node.TEXT_NODE ? selection.focusNode.parentElement : selection.focusNode;
+    return Boolean(anchor?.closest?.('.manga-v2-text-region') === regionNode || focus?.closest?.('.manga-v2-text-region') === regionNode);
+  }
+
+  function selectWholeMangaBubble(regionNode) {
+    const surface = regionNode?.querySelector?.('.manga-v2-selection-content');
+    const selection = window.getSelection?.();
+    if (!surface || !selection || typeof document.createRange !== 'function') return false;
+    const range = document.createRange();
+    range.selectNodeContents(surface);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    regionNode.classList.add('bubble-selected');
+    mangaDebugRecord('bubble_selection', {
+      region_index:Number(regionNode.dataset.regionIndex || -1),
+      text:String(surface.dataset.mangaCopySurface || surface.textContent || '').slice(0, 500),
+    });
+    return true;
+  }
+
+  async function handleMangaRegionStudyClick(event, regionNode) {
+    if (!regionNode || !currentBook || mangaOverlaySelectionInRegion(regionNode)) return false;
+    const frame = regionNode.closest?.('.manga-v2-page-frame');
+    if (!frame) return false;
+    const pageIndex = Number(frame.dataset.pageIndex);
+    const regionIndex = Number(regionNode.dataset.regionIndex);
+    const regions = textRegionCache.get(textKey(currentBook.id, pageIndex)) || [];
+    const region = regions[regionIndex];
+    if (!region) return false;
+    await parseRegionText(pageIndex, regionIndex, region, textGeneration);
+    const tokenHit = mangaTokenHitAtPoint(frame, regionNode, region, event.clientX, event.clientY);
+    if (tokenHit?.token) return await dispatchMangaStudyClick(tokenHit.token, event);
+    if (tokenHit?.virtualText) return await dispatchMangaVirtualStudyHit(tokenHit, frame);
+    return false;
+  }
+
+  let mangaCursorRegion = null;
+  let mangaCursorFrame = 0;
+  function scheduleMangaStudyCursor(event) {
+    if (mangaCursorFrame) cancelAnimationFrame(mangaCursorFrame);
+    const clientX = Number(event.clientX || 0), clientY = Number(event.clientY || 0);
+    const frame = event.target?.closest?.('.manga-v2-page-frame');
+    mangaCursorFrame = requestAnimationFrame(() => {
+      mangaCursorFrame = 0;
+      mangaCursorRegion?.classList?.remove('study-hit');
+      mangaCursorRegion = null;
+      if (!frame || !currentBook) return;
+      const regionNode = mangaRegionAtPoint(frame, clientX, clientY);
+      if (!regionNode) return;
+      const pageIndex = Number(frame.dataset.pageIndex);
+      const regionIndex = Number(regionNode.dataset.regionIndex);
+      const region = (textRegionCache.get(textKey(currentBook.id, pageIndex)) || [])[regionIndex];
+      if (!region) return;
+      const hit = mangaTokenHitAtPoint(frame, regionNode, region, clientX, clientY);
+      if (hit?.token || hit?.virtualText) {
+        regionNode.classList.add('study-hit');
+        mangaCursorRegion = regionNode;
+      }
+    });
+  }
+
   async function handleMangaImageStudyClick(event) {
     const image = event.target?.closest?.('.manga-v2-page-frame img');
     if (!image || !$('mangaReaderV2')?.classList.contains('open')) return false;
@@ -1713,8 +2431,9 @@
     const region = regions[regionIndex];
     if (!region) return false;
     await parseRegionText(pageIndex, regionIndex, region, textGeneration);
-    const token = mangaTokenAtPoint(frame, regionNode, region, event.clientX, event.clientY);
-    if (token) return await dispatchMangaStudyClick(token, event);
+    const tokenHit = mangaTokenHitAtPoint(frame, regionNode, region, event.clientX, event.clientY);
+    if (tokenHit?.token) return await dispatchMangaStudyClick(tokenHit.token, event);
+    if (tokenHit?.virtualText) return await dispatchMangaVirtualStudyHit(tokenHit, frame);
     mangaDebugRecord('jiten_miss', {
       reason: 'region-without-token-hit',
       region_index: regionIndex,
@@ -1781,6 +2500,20 @@
         void startLibrarySeriesOcr(series.books, series.books.every(item => Boolean(item.ocr_complete)));
       } else if (type === 'ocr-book') {
         void startLibraryBookOcr(book, Boolean(book.ocr_complete));
+      } else if (type === 'reset-progress' || (type === 'reset-progress-series' && series)) {
+        const confirmed = await window.pudgeConfirm?.(
+          ru() ? 'Сбросить прогресс чтения? Настройки и привязка AniList сохранятся.' : 'Reset reading progress? Settings and AniList metadata will be preserved.',
+        );
+        if (!confirmed) return;
+        if (type === 'reset-progress-series' && series) {
+          const result = await API().manga_reset_progress_many(series.books.map(item => Number(item.id)));
+          const updated = new Map((result?.books || []).map(item => [Number(item.id), item]));
+          state.books = (state.books || []).map(item => updated.get(Number(item.id)) || item);
+        } else {
+          const updated = await API().manga_reset_progress(Number(book.id));
+          state.books = (state.books || []).map(item => Number(item.id) === Number(book.id) ? updated : item);
+        }
+        await renderLibrary(false);
       } else if (type === 'remove-series') {
         const confirmed = await window.pudgeConfirm?.(
           ru() ? 'Удалить эту мангу из Pudge? Исходные CBZ/ZIP останутся на диске.' : 'Remove this manga from Pudge? Source CBZ/ZIP files will stay on disk.',
@@ -1797,13 +2530,29 @@
       return;
     }
     if (event.target.closest?.('[data-pudge-study-token]')) return;
+    const textRegion = event.target.closest?.('.manga-v2-text-region');
+    const selectionSurface = event.target.closest?.('.manga-v2-selection-content');
+    if (selectionSurface && textRegion) {
+      if (Number(event.detail || 0) >= 3) {
+        if (selectWholeMangaBubble(textRegion)) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      if (mangaOverlaySelectionInRegion(textRegion)) return;
+      if (await handleMangaRegionStudyClick(event, textRegion)) {
+        event.preventDefault();
+        return;
+      }
+      return;
+    }
     if (event.target.closest?.('.manga-v2-page-frame img')) {
       if (await handleMangaImageStudyClick(event)) {
         event.preventDefault();
         return;
       }
     }
-    const textRegion = event.target.closest?.('.manga-v2-text-region');
     if (textRegion) return;
     if (event.target.id === 'mangaImportV2') {
       // pudge-v0.7.23-manga-folder-picker-v1
@@ -1829,13 +2578,27 @@
     else if (type === 'next') await movePage(+1);
     else if (type === 'previous') await movePage(-1);
     else if (type === 'ocr-book') await recognizeWholeBook();
+    else if (type === 'page-picker') togglePagePicker();
     else if (type === 'fullscreen') await toggleFullscreen();
     else if (type === 'toolbar-show') toggleToolbar(true);
     else if (type === 'settings') $('mangaV2Settings')?.classList.toggle('open');
   }, true);
 
+  document.addEventListener('click', event => {
+    const option = event.target?.closest?.('[data-manga-v2-page-option]');
+    if (option) {
+      event.preventDefault();
+      void goToPage(option.dataset.mangaV2PageOption);
+      return;
+    }
+    if (!$('mangaV2PagePicker')?.hidden && !event.target?.closest?.('.manga-v2-page-picker-shell')) closePagePicker();
+  }, true);
+
   document.addEventListener('keydown', event => {
     if (!$('mangaReaderV2')?.classList.contains('open')) return;
+    if (event.key === 'Escape' && !$('mangaV2PagePicker')?.hidden) {
+      event.preventDefault(); closePagePicker(); return;
+    }
     if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
 
     const nextKey = settings.direction === 'rtl' ? 'ArrowLeft' : 'ArrowRight';
@@ -1855,7 +2618,8 @@
       toggleToolbar();
     } else if (event.key.toLowerCase() === 'o' && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
       event.preventDefault();
-      void loadTextRegions(currentPage, {refresh:true, showProgress:true, parse:true});
+      if (currentBook?.ocr_complete) void loadTextRegions(currentPage, {refresh:true, showProgress:false, parse:true});
+      else window.toast?.(ru() ? 'Дождитесь OCR всего тома' : 'Wait for the whole-volume OCR to finish');
     } else if (event.key === '+' || event.key === '=') {
       event.preventDefault();
       setZoom(Number(settings.zoom || 100) + 10);
@@ -1914,4 +2678,182 @@
     },
     settings: () => ({...settings})
   };
+
+  // pudge-v0.7.27-manga-debug-overlay-v1
+  const MANGA_DEBUG_OVERLAY_KEY = 'pudge.manga.debugOverlay';
+  const MANGA_DEBUG_OVERLAY_STATES = ['off', 'regions', 'words'];
+
+  function mangaReaderNode() {
+    return document.getElementById('mangaReaderV2');
+  }
+
+  function normalizeMangaDebugOverlay(value) {
+    const mode = String(value || 'off').toLowerCase();
+    return MANGA_DEBUG_OVERLAY_STATES.includes(mode) ? mode : 'off';
+  }
+
+  let mangaDebugOverlayMode = (() => {
+    try {
+      return normalizeMangaDebugOverlay(localStorage.getItem(MANGA_DEBUG_OVERLAY_KEY));
+    } catch (_) {
+      return 'off';
+    }
+  })();
+
+  function mangaDebugOverlayLabel(mode = mangaDebugOverlayMode) {
+    if (mode === 'regions') return 'OCR Debug: Regions';
+    if (mode === 'words') return 'OCR Debug: Words';
+    return 'OCR Debug: Off';
+  }
+
+  function mangaDebugRegionText(region) {
+    const tokens = [...region.querySelectorAll('[data-pudge-study-token]')]
+      .map(node => String(node.textContent || '').trim())
+      .filter(Boolean);
+    if (tokens.length) return tokens.join(' | ');
+    return String(region.querySelector('.manga-v2-region-content')?.textContent || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function annotateMangaDebugRegion(region) {
+    if (!region) return;
+    const text = mangaDebugRegionText(region);
+    const regionIndex = String(region.dataset.regionIndex || '?');
+    const provenance = [
+      String(region.dataset.regionOcrBackend || ''),
+      String(region.dataset.regionSource || ''),
+      String(region.dataset.geometrySource || ''),
+    ].filter(Boolean).filter((value, index, rows) => rows.indexOf(value) === index).join('/');
+    region.dataset.debugTokens = text.slice(0, 220);
+    region.dataset.debugLabel = (`R${regionIndex}${provenance ? ` · ${provenance}` : ''}${text ? ` · ${text}` : ''}`).slice(0, 260);
+  }
+
+  function ensureMangaDebugOverlayButton(reader) {
+    const toolbar = reader?.querySelector?.('.manga-v2-toolbar');
+    if (!toolbar) return null;
+    let button = toolbar.querySelector('[data-manga-v2-action="toggle-debug-overlay"]');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'secondary';
+      button.dataset.mangaV2Action = 'toggle-debug-overlay';
+      button.title = 'Cycle visible OCR overlay (Shift+D)';
+      const spacer = toolbar.querySelector('.spacer');
+      if (spacer?.parentNode === toolbar) toolbar.insertBefore(button, spacer);
+      else toolbar.appendChild(button);
+    }
+    button.textContent = mangaDebugOverlayLabel();
+    button.classList.toggle('active', mangaDebugOverlayMode !== 'off');
+    return button;
+  }
+
+
+  function clearMangaDebugHitboxes(reader = mangaReaderNode()) {
+    reader?.querySelectorAll?.('.manga-v2-debug-hitbox-layer')?.forEach?.(node => node.remove());
+  }
+
+  function renderMangaDebugHitboxes(frame) {
+    if (!frame || !currentBook || mangaDebugOverlayMode !== 'words') return;
+    const image = frame.querySelector('img');
+    if (!image?.naturalWidth) return;
+    const pageIndex = Number(frame.dataset.pageIndex);
+    const regions = textRegionCache.get(textKey(currentBook.id, pageIndex)) || [];
+    let layer = frame.querySelector('.manga-v2-debug-hitbox-layer');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.className = 'manga-v2-debug-hitbox-layer';
+      frame.appendChild(layer);
+    }
+    layer.replaceChildren();
+    const padX = MANGA_TOKEN_HIT_SLOP_PX / Math.max(1, image.clientWidth || image.naturalWidth);
+    const padY = MANGA_TOKEN_HIT_SLOP_PX / Math.max(1, image.clientHeight || image.naturalHeight);
+    regions.forEach((region, regionIndex) => {
+      const regionNode = frame.querySelector(`.manga-v2-text-region[data-region-index="${Number(regionIndex)}"]`);
+      if (!regionNode) return;
+      const boxes = mangaTokenHitboxes(regionNode, region);
+      boxes.forEach((box, pieceIndex) => {
+        const core = document.createElement('div');
+        core.className = 'manga-v2-debug-token-hitbox manga-v2-debug-token-core';
+        core.dataset.word = String(box.text || '?');
+        core.dataset.source = String(box.source || '');
+        core.dataset.geometryStatus = mangaGeometryStatus(region, Array.isArray(region.segments) ? region.segments : []);
+        core.dataset.regionIndex = String(regionIndex);
+        core.dataset.tokenIndex = String(box.tokenIndex);
+        core.dataset.pieceIndex = String(pieceIndex);
+        core.style.left = `${box.x * 100}%`;
+        core.style.top = `${(1 - box.y - box.height) * 100}%`;
+        core.style.width = `${box.width * 100}%`;
+        core.style.height = `${box.height * 100}%`;
+        layer.appendChild(core);
+
+        const slop = document.createElement('div');
+        slop.className = 'manga-v2-debug-token-hitbox manga-v2-debug-token-slop';
+        slop.dataset.word = String(box.text || '?');
+        slop.style.left = `${Math.max(0, box.x-padX) * 100}%`;
+        slop.style.top = `${Math.max(0, 1-box.y-box.height-padY) * 100}%`;
+        slop.style.width = `${Math.min(1-Math.max(0, box.x-padX), box.width + padX*2) * 100}%`;
+        slop.style.height = `${Math.min(1-Math.max(0, 1-box.y-box.height-padY), box.height + padY*2) * 100}%`;
+        layer.appendChild(slop);
+      });
+    });
+  }
+
+  function syncMangaDebugHitboxes(reader = mangaReaderNode()) {
+    if (!reader) return;
+    if (mangaDebugOverlayMode !== 'words') {
+      clearMangaDebugHitboxes(reader);
+      return;
+    }
+    reader.querySelectorAll('.manga-v2-page-frame').forEach(renderMangaDebugHitboxes);
+  }
+
+  function syncMangaDebugOverlayUi(reader = mangaReaderNode()) {
+    if (!reader) return;
+    reader.dataset.debugOverlay = mangaDebugOverlayMode;
+    ensureMangaDebugOverlayButton(reader);
+    reader.querySelectorAll('.manga-v2-text-region').forEach(annotateMangaDebugRegion);
+    syncMangaDebugHitboxes(reader);
+  }
+
+  function setMangaDebugOverlay(mode) {
+    mangaDebugOverlayMode = normalizeMangaDebugOverlay(mode);
+    try { localStorage.setItem(MANGA_DEBUG_OVERLAY_KEY, mangaDebugOverlayMode); } catch (_) {}
+    syncMangaDebugOverlayUi();
+  }
+
+  function cycleMangaDebugOverlay() {
+    const index = MANGA_DEBUG_OVERLAY_STATES.indexOf(mangaDebugOverlayMode);
+    setMangaDebugOverlay(MANGA_DEBUG_OVERLAY_STATES[(index + 1) % MANGA_DEBUG_OVERLAY_STATES.length]);
+  }
+
+  document.addEventListener('click', event => {
+    const button = event.target.closest?.('[data-manga-v2-action="toggle-debug-overlay"]');
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    cycleMangaDebugOverlay();
+  }, true);
+
+  document.addEventListener('keydown', event => {
+    const reader = mangaReaderNode();
+    if (!reader?.classList.contains('open')) return;
+    if (!event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+    if (event.key !== 'D' && event.key !== 'd') return;
+    event.preventDefault();
+    cycleMangaDebugOverlay();
+  }, true);
+
+  const mangaDebugOverlayObserver = new MutationObserver(() => {
+    if (mangaDebugOverlayMode === 'off') return;
+    syncMangaDebugOverlayUi();
+  });
+
+  queueMicrotask(() => {
+    const reader = mangaReaderNode();
+    if (!reader) return;
+    mangaDebugOverlayObserver.observe(reader, {subtree:true, childList:true, attributes:true, attributeFilter:['class']});
+    syncMangaDebugOverlayUi(reader);
+  });
+
 })();

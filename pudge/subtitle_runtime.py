@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,6 +102,26 @@ def _probe_embedded(
     return int(candidate.subtitle_id), int(candidate.stream_index), str(candidate.codec or "")
 
 
+
+def _explicit_subtitle_rebuild_active(database: Database, video_path: Path) -> bool:
+    """True while an explicit Fresh/Debug rebuild owns this video's selection.
+
+    During that window the old DB path/history is deliberately stale. Playback
+    must not resurrect it and make a still-running Fresh look like it failed.
+    """
+    get_state = getattr(database, "get_state", None)
+    if not callable(get_state):
+        return False
+    video = Path(video_path).expanduser().resolve()
+    digest = hashlib.sha1(str(video).encode("utf-8")).hexdigest()
+    for prefix in ("subtitle_force_rebuild:", "debug_force_subtitle:"):
+        try:
+            if str(get_state(prefix + digest, "") or "").strip() == "1":
+                return True
+        except Exception:
+            continue
+    return False
+
 def resolve_episode_subtitle(
     database: Database,
     *,
@@ -116,7 +137,9 @@ def resolve_episode_subtitle(
 ) -> ResolvedSubtitle:
     video = Path(video_path).expanduser().resolve()
 
-    direct = _usable_path(stored_path, allow_bitmap=allow_bitmap)
+    explicit_rebuild = _explicit_subtitle_rebuild_active(database, video)
+
+    direct = None if explicit_rebuild else _usable_path(stored_path, allow_bitmap=allow_bitmap)
     if direct is not None:
         is_text = direct.suffix.casefold() not in _IMAGE_SUBTITLE_SUFFIXES
         return ResolvedSubtitle(
@@ -128,22 +151,23 @@ def resolve_episode_subtitle(
         )
 
     histories: list[dict[str, Any]] = []
-    try:
-        exact = database.latest_selected_subtitle(video)
-        if isinstance(exact, dict):
-            histories.append(exact)
-    except Exception:
-        pass
-    try:
-        fallback = database.latest_selected_subtitle_for_media_or_filename(
-            video_path=video,
-            media_id=media_id,
-            episode=episode,
-        )
-        if isinstance(fallback, dict) and fallback not in histories:
-            histories.append(fallback)
-    except Exception:
-        pass
+    if not explicit_rebuild:
+        try:
+            exact = database.latest_selected_subtitle(video)
+            if isinstance(exact, dict):
+                histories.append(exact)
+        except Exception:
+            pass
+        try:
+            fallback = database.latest_selected_subtitle_for_media_or_filename(
+                video_path=video,
+                media_id=media_id,
+                episode=episode,
+            )
+            if isinstance(fallback, dict) and fallback not in histories:
+                histories.append(fallback)
+        except Exception:
+            pass
 
     for history in histories:
         for value in _history_candidates(history):

@@ -2,242 +2,774 @@
 
 ## Unreleased
 
-## v0.7.26
+## v0.7.27 — Manga OCR, runtime hardening, and more accurate synchronization
 
-- Made Ready subtitles durable: Pudge now keeps accepted prepared subtitles outside disposable macOS caches, rechecks missing files on Refresh, and automatically repairs stale Ready entries.
-- Prioritized subtitle repair around what can be watched next. The next unwatched or earliest blocked episode of each title is repaired before later episodes, while heavy work still waits during active playback and resumes afterward.
-- Fixed Ready/Completed presentation so a later downloaded episode cannot hide a broken earlier unwatched episode.
-- Prevented repeated subtitle jobs caused by duplicate completed torrent records, and forced a real rebuild when an older prepared subtitle is missing even if the candidate list has not changed.
-- Improved Light Novel/audiobook paired highlighting around chapter starts and sparse anchor regions, and restored compact study cards that expand only when their content needs more space.
-- Grouped audiobooks by series and volume, normalized grouped labels to `Volume N`, kept the nearest unfinished volumes visible, and added series/volume selection for bulk actions.
-- Recovered selective LN audiobook downloads after restarts and kept audiobook search/download views local-first while network enrichment runs.
-- Updated backup handling so Pudge-managed prepared subtitles remain included after the new durable subtitle storage change.
-- Refreshed the README, user guide, algorithms overview, development notes, companion protocol, and release instructions for the 0.7.26 behavior.
+Range: [v0.7.26 → v0.7.27](https://github.com/TH1NKFASTER/pudge/compare/v0.7.26...v0.7.27).
 
-## v0.7.25
+This changelog is derived from the actual Git diff against tag `v0.7.26`, not from chat memory.
 
-- Made the macOS window lifecycle behave like a native Mac app: the red close button and `Cmd+W` hide the window without stopping Pudge, reopening from the Dock restores the same live session, and `Cmd+Q` remains the explicit full quit path; also fixed the PyObjC shutdown crash seen on window close.
-- Stabilized Ready state during background subtitle upgrades and repaired episodes that had been demoted by stale upgrade jobs, including the Akiba Meido Sensou recovery case.
-- Separated bitmap OCR preparation from readiness policy: OCR results can be cached and used for playback without counting as Ready unless `ocr_counts_as_ready` is explicitly enabled.
-- Made startup Home updates atomic across AniList sync and maintenance so cards no longer jump between sections while the initial refresh is still running.
-- Reworked PGS/SUP OCR into a streaming pipeline that no longer retains thousands of decoded subtitle images in memory, added an OCR worker RSS safety guard, and added progress diagnostics.
-- Added persistent Jimaku archive/materialization and bitmap OCR caches so already extracted or synchronized `.sup` subtitles are reused without repeating Jimaku lookup, 7-Zip extraction, alignment, or OCR.
-- Added persistent library fingerprint caching and heavy-work coordination to avoid repeated full rescans of an unchanged library and to keep library scans from overlapping CPU-heavy OCR work.
-- Expanded energy diagnostics with per-role CPU/RSS accounting and 5/15/60-minute summaries, and removed the duplicate library scan from a single manual Refresh cycle.
-- Hardened local-download recovery for stale aria2 `paused 0/0` rows and legacy episode identity corruption, preventing an older episode from claiming a newer sibling video while preserving recoverable completed files.
-- Polished Planning/global-search behavior, local-media selection rules, ready labels, and `Cmd+F` handling while keeping completed/downloaded state stable across refreshes.
+### Manga OCR and text geometry
+- Significantly expanded layout-aware OCR with candidates from binary components, vertical-line structure, raw layout, and dark text blocks, merged with OCR output.
+- Vertical columns and complex text blocks now use stripe geometry, gaps, expected glyph counts, kinsoku boundaries, and neighboring layout candidates instead of treating one OCR rectangle as one line.
+- Added multiple recovery stages for missed text: raw-gap augmentation, contextual recall, post-cluster recall, and bounded local consensus for weak regions.
+- Tightened filters for ruby/noise/art regions, duplicate text, and accidental merges between neighboring columns, including dedicated handling for small kana, punctuation, wide/cropped SFX, and short dark rectangles.
+- Apple Vision now exposes range-level geometry. Segments marked `accurate-range-boxes-v2` use actual character bounds instead of evenly splitting the whole OCR box.
+- The OCR artifact moved to schema `pudge-manga-ocr-v3` with explicit status and geometry-source metadata; old v1/v2 artifacts are upgraded when read.
+- Repeated Latin page headings can be repaired by cross-page consensus while preserving existing segment geometry rather than inventing glyph boxes.
+- The region-cache key moved to `v59-layout-token-geometry` so incompatible older results are not reused as current output.
 
-## v0.7.24
+### Manga runtime and reader
+- Volume OCR now has generation/revision ownership plus a source fingerprint, preventing stale workers from publishing after rebuilds, source replacement, or a newer OCR generation.
+- Page status, region cache, and OCR artifacts are written atomically and incrementally; a completed page can be published without unsafe whole-state rewrites.
+- Added explicit volume OCR progress/state, including current page, prepared/processed pages, failures, and yielding to higher-priority interactive work.
+- Merely opening a volume no longer has to start full-volume batch OCR. Dedicated `OCR volume` / `Rebuild OCR` actions control full processing.
+- The currently visible page can receive foreground OCR without waiting for the background volume pass; background OCR yields through the shared scheduler.
+- The reader now has a selectable text layer. Word hitboxes come from OCR segments and accurate geometry, while text selection and whole-bubble selection are separate from study-card clicks.
+- Added region/word/hitbox debug overlays plus `scripts/replay_manga_surface_map.js` for replaying surface maps without reproducing the whole reader session manually.
+- Added quick page selection, improved cursor/viewport anchoring during zoom, and stabilized page virtualization.
+- `Reset reading progress` resets the reading position without deleting AniList linkage or library metadata and is available for both individual volumes and series.
 
-- Added global local-media search, recently watched history, and sidebar context
-  actions for subtitle discovery, AniList refresh, local rescans, and new releases.
-- Improved subtitle synchronization around pre-opening discontinuities by using
-  embedded dialogue references without disturbing the stable main-episode timeline.
-- Reworked Manga and Light Novel libraries around series-level selection, context
-  actions, Jiten metadata, AniList scores, recursive Manga imports, and cleaner cards.
-- Added robust Manga volume normalization and physical-spread handling, including
-  nested Manga-Zip layouts and preserved page names for future imports.
-- Made Manga reading progress explicit: preloading no longer marks pages read,
-  forward page turns do, the final page completes on display, and progress tooltips
-  show read pages out of total pages.
-- Stabilized Manga library rendering and series scrolling, and clear Manga/LN
-  selections automatically when leaving their page.
-- Simplified Light Novel preparation to always parse the current and next chapter,
-  and enabled low-overhead macOS energy diagnostics automatically at a 30-second
-  sampling interval.
-- Reconciled managed local anime behind AniList progress so already-watched episodes
-  do not remain incorrectly ready for playback.
+### Subtitles and timeline alignment
+- Timeline alignment now handles weak false opening excursions: a short clock outlier can be removed when stronger clocks on both sides and independent long-gap evidence agree.
+- After that repair, the transition between the two clocks can be anchored inside the proven opening gap so monotonic repair cannot drag the post-OP offset backward through real dialogue.
+- Added a narrow holdout-based recenter for the pre-OP plateau: high-quality independent windows may select the neighboring whole-second clock while leaving a stable post-OP plateau untouched.
+- Expanded the embedded opening scaffold for cases where a large gap-supported ALASS transition collapses the opening gap; the relative ALASS clock is now handled separately from local refinement.
+- Added more guards against degrading a strong embedded timeline and richer diagnostics for opening-clock recovery and rejection decisions.
+- The timeline algorithm key is now `timeline-v6.14-opening-preclock-holdout`, so older cached timing results are not treated as equivalent.
+- Subtitle jobs gained `generation` and `owner_token`; defer/reset/postpone/ready/delete operations and state publication can be bound to the owning attempt.
+- A stale worker after Fresh/rebuild or a new claim can no longer overwrite the state of the newer attempt; the manager validates ownership before publishing results.
+- Cross-path subtitle-history recovery now requires a sampled content fingerprint of the video. Legacy history without a fingerprint is accepted only for the exact original path.
+- Manual Fresh is scheduled as priority user work and can preempt/yield heavy background OCR.
 
-## v0.7.23
+### Visual Novel reader
+- macOS selected-window capture now uses explicit ScreenCaptureKit (`SCShareableContent` / `SCScreenshotManager`) instead of desktop-capture behavior.
+- Real ScreenCaptureKit errors are authoritative for permission/backend state; a false TCC preflight result alone no longer blocks capture attempts.
+- Added configurable dialogue ROI plus a separate speaker region above it, with several ready-made dialogue-area presets in the UI.
+- OCR scores the dialogue ROI first and uses a bounded full-frame fallback only when it produces better text; speaker OCR runs separately and only with sufficient contrast.
+- Frame fingerprints are computed over the working ROIs, reducing unnecessary full OCR on unchanged frames while still allowing retries after empty results.
+- Capture/session generation prevents late callbacks from an old run from mutating the current transcript/UI; vanished windows and permission/backend failures receive distinct recovery codes/actions.
+- Asynchronous text parsing in the web UI is also bound to the current render/session generation so stale responses cannot replace newer dialogue.
 
-- Matched Ready and Continue Watching with AniList progress, so episodes already
-  watched elsewhere no longer reappear on the Mac or in the mobile companion.
-- Preserved completed episodes when stale mobile progress arrives and refreshed
-  the companion library when it becomes active again.
-- Fixed audiobook highlighting after `-5`, `+5`, `-15`, and `+15` second seeks
-  while keeping the crisp linear highlighting used during normal playback.
-- Checked exact AniList and title matches beyond Jimaku's first four entries,
-  fixing missed subtitles when duplicate listings hide the correct release.
-- Prevented planned updates from enabling Safe Mode and stopped download and
-  subtitle monitoring whenever Safe Mode is active.
-- Added a two-step in-app uninstaller that removes Pudge and its own data while
-  leaving external media folders and third-party applications untouched.
-- Made background resource probes non-fatal and rewrote the user-facing
-  documentation in direct, ordinary language.
+### Light Novels and audiobooks
+- Jiten parsing is single-flight by text hash: identical concurrent requests share one execution and result/cache entry.
+- Parse admission limits concurrency, prioritizes interactive reading over background parsing, and spaces requests over time.
+- Light Novel SQLite access gained an explicit context-managed connection lifecycle with commit/rollback/close while keeping raw `_connect()` compatibility for existing callers.
+- Paired-reading alignment now removes short rejoining local-rate outliers when they imply unrealistic local speed and then return to the established clock.
+- Audiobook playback gained a unique session identity and per-run IPC socket. A stale monitor can no longer stop playback, delete the socket, or persist position for a newer session.
+- Audiobook-service `close()` tracks worker threads/processes, cancels background work, and reports workers that fail to terminate instead of silently exiting.
+- LN↔audiobook alignment generation now has generation/cancellation ownership and unique temporary outputs, preventing stale attempts from publishing after a newer run or cancellation.
 
-## v0.7.22
+### State, backups, shutdown, and downloads
+- Backup restore now fully extracts and validates into staging first, including SQLite integrity checks, before committing live files.
+- Rollback copies of the database, config, and restored cache files are created before replacement; commit failures restore them.
+- During restore, the web runtime stops owned OCR/audiobook/supervisor work, blocks conflicting maintenance threads, and recreates runtime services after commit or rollback.
+- `TaskSupervisor` gained suspend/resume/quiesce/shutdown with waiting for owned tasks/processes; clean shutdown is not reported while owned work remains alive.
+- Download intents now use atomic read-modify-write mutation with revision semantics so late completion from an older generation cannot close a newer intent.
+- Added shared `process_utils.pid_alive` to avoid divergent PID-liveness logic across subsystems.
+- Disabling global torrent traffic now presents unfinished downloads as paused; re-enabling first resumes existing backend jobs instead of requiring a new torrent.
+- Home/compact status distinguishes paused downloads from active traffic, so ETA/status no longer imply progress while torrent traffic is disabled.
+- Full application shutdown waits for manga OCR, audiobook workers, and TaskSupervisor. Red close/Cmd+W still hides the window, while detached playback can continue independently of the GUI process session.
 
-- Fixed large cold-open timing edits by applying a validated local subtitle
-  offset only before the opening gap, while preserving the stable main-episode
-  timeline; affected cached selections are re-prepared once.
-- Stopped aria2 verification progress from publishing incomplete video as ready,
-  and made stalled reconnects verification-aware with a 15-minute progress
-  window and 30-minute cooldown instead of interrupting the task every 5 minutes.
-- Normalized base32 SubsPlease magnet hashes to canonical hex so aria2 additions
-  can be verified and found immediately after JSON-RPC accepts them.
-- Added per-episode Anime Debug for multi-episode titles.
-- Fixed exact Jimaku candidates being rejected when several independent
-  Japanese releases share one clock but the embedded English reference is noisy.
-- Kept up to sixteen preceding Japanese subtitle lines as translation context,
-  with secondary English text used only as supporting context; removed the old
-  separate subtitle-study window.
-- Made qBittorrent and aria2 coexist safely, with backend-aware actions and one
-  button to stop all Pudge torrent downloading and seeding.
-- Broadened jpdb-mpv-plugin discovery to standard macOS/Linux mpv directories
-  and versioned installer layouts.
-- Reduced background heat by skipping incomplete torrent video and backing off
-  deterministic subtitle-validation retries for six hours.
-- Added a mutually exclusive JitenMPV / jpdb-mpv-plugin selector; the official
-  jpdb plugin is selectable as soon as its installed script is detected because
-  it manages its own authorization.
-- Added direct translation of the visible subtitle inside mpv.
-- Added automatic and manual aria2 reconnect for downloads with no live peers,
-  without deleting verified partial data.
-- Added low-priority contextual translation prewarming for prepared SRT cues
-  while an episode is playing, backed by the normal translation cache.
-- Avoided aria2's default RPC upload limit for large torrent metadata, reduced
-  resume rechecking heat, and isolated installer test output from runtime logs.
+### Test runner and CI
+- Reworked the batch runner so every test file executes in an isolated subprocess with its own `PUDGE_HOME`, temp directory, and pytest basetemp.
+- A failing file no longer hides results from later files in the batch; stdout/stderr, JUnit, runtime log, and JSON summary are retained per test file.
+- Added per-file timeouts and machine-readable totals for passed/failed/skipped/xfail/errors/timeouts.
+- Batch-result fingerprints now include source/test-tree contents, dependency versions, Git commit, and tracked working-tree state, preventing result reuse across different implementations.
+- CI always uploads batch-result artifacts, and the Makefile creates distinct result directories for parallel batches.
+- The diff adds a large regression suite for Manga OCR/geometry, subtitle timing, lifecycle ownership, backup restore, torrent state, LN/audio alignment, and Visual Novel capture. The presence of tests in the diff is not a claim that they passed on a particular machine.
 
-## v0.7.21
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.26...v0.7.27).
 
-- Added authenticated companion anime playback with HLS, subtitles and local progress sync.
 
-## v0.7.20
+## v0.7.26 — Durable subtitles, audiobooks, and paired-reading accuracy
 
-- Added the local-first companion protocol, paired-device management and incremental media progress exchange.
+Range: [v0.7.25 → v0.7.26](https://github.com/TH1NKFASTER/pudge/compare/v0.7.25...v0.7.26). Status: published GitHub Release.
 
-## v0.7.19
+### Ready state and subtitle queue
+- Accepted prepared text subtitles are persisted in a managed durable directory outside disposable macOS caches; existing valid files migrate into the new storage.
+- Refresh and integrity checks detect missing selected-subtitle files, clear false Ready state, and start recovery. History is used only when a usable prepared result still exists.
+- Losing a previously accepted result forces a full rebuild even when the candidate set is unchanged; legacy records without the new force-processing marker can still recover.
+- The queue prefers each title’s next unwatched or first blocking episode rather than later episodes with a higher internal priority.
+- A later downloaded episode no longer hides a problem on the nearest unwatched episode in Ready/Completed. Heavy work waits for active playback and resumes afterward.
+- Duplicate completed torrent records no longer repeatedly register the same local video and create endless subtitle jobs.
+- Added a per-title setting for requiring Japanese subtitles without deleting already present files. Resetting progress no longer automatically moves a new/planned title into Watching.
 
-- Hardened subtitle preparation recovery, runtime diagnostics and media identity repair.
+### Synchronization and sources
+- Expanded episode-start refinement, sparse pre-OP lines, and post-OP timing reacquisition using agreement between STT text, acoustic onsets, and the embedded track.
+- Strong embedded timelines are protected from degrading STT results; weak isolated late transitions and unsupported edge jumps are suppressed.
+- Real simultaneous cues are preserved when preparing playback SRTs; touching sequential cues still account for mpv rendering behavior.
+- Added a narrow correction for the known incomplete Nanako source for Bleach S01E45. It requires exact identity and a verified embedded-reference structure; this is source-specific repair, not general missing-text generation.
+- Improved episode-number recognition in BDSUP archives and recovery of prepared results from Jimaku history.
+- STT selects Japanese audio and rejects ambiguous dual-audio; caches depend less on filesystem location for identical content. Added MLX memory limits and transient-error handling.
+- Nyaa search gained stricter season, related-title, title-plausibility, and size checks, plus broader proxy handling and torrent-file metadata retrieval.
 
-## v0.7.18
+### LN and paired listening
+- Reworked chapter-start recovery using spoken chapter number/title, introductory boilerplate, weak early anchors, and regions where narration has not yet reached the main text.
+- Added precise local chapter-onset recognition, readings from parsed text, and phonetic anchors. When precise evidence is insufficient, bounded transitions across Japanese reading units are used.
+- Fixed highlight movement while paused, recovery after start/seek, premature highlighting of opening words, and jumps in sparse regions.
+- Reworked runtime position indices and active-fragment scrolling; refinement parsing can update alignment without repeating compatible work from scratch.
+- Furigana and word cards now cooperate with paired reading, vertical mode, and native selection. Text without a Jiten result gets a generic fallback card and reading interpolation.
+- EPUB import better handles tables of contents, fragment links, repeated headings, technical sections, and image pages, including ttsu-like markup.
+- Images no longer add false textual length to the audio scale. Added inline rendering, blur, and opening images without unintentionally changing reading position.
+- Refined Read up to here, Play from here, card sizing/re-closing, search, Escape behavior, selection, and bulk library actions.
 
-- Improved audiobook and Light Novel paired-reading stability and release metadata checks.
+### Audiobook library and downloads
+- Audiobooks are grouped by series and volume with Volume N labels; added series/volume selection for bulk deletion and display of the nearest unfinished volumes.
+- Collection import distinguishes volume, disc, and chapter directories and no longer lets a nested chapter number replace the volume number.
+- Added audiobook search for LN, including works inside compilation Nyaa torrents; file selection uses series path and volume number.
+- Selective volume downloads support qBittorrent and aria2. Selection manifests allow import recovery after restart and prevent linking a volume to the wrong series.
+- Search and download views use local information first and enrich it with network metadata afterward. Cover and audio-file metadata extraction runs in the background.
+- Audiobook STT is now a queued process with partial checkpoints and reuse of completed fragments; stale workers and leftover audio players are cleaned up.
 
-## v0.7.17
+### Audiobook generation and LLM
+- Added optional audiobook generation from LN using managed Irodori-TTS or a configured compatible service, including Irodori install/check support and logs.
+- Long chapters are split into bounded requests and parts are merged; progress is based on processed text and persisted in a manifest.
+- Added pause, resume, cancel, and regenerate actions while preserving visible failed state for retry.
+- Added speaker annotation and character voices with stable profiles by series and AniList character identity.
+- Annotation can be exported as an archive across local series volumes and imported back without requiring an LLM; source-text hashes prevent applying annotations to changed chapters.
+- The LLM client gained OpenAI-compatible API support, configurable reasoning effort, incompatible-parameter handling, and clearer provider errors.
+- Added explicit Jiten data refresh and preparation of chapters not yet parsed.
 
-- Expanded initial dependency setup, torrent recovery and per-episode diagnostics.
+### Download control and installation
+- The global torrent toggle is synchronized through protected config writes, with optimistic UI confirmation and a fallback local HTTP control path.
+- Recovery of damaged/orphaned downloads clears completed intents before reselection; disabled torrent traffic leaves jobs waiting instead of downloading immediately.
+- Empty tasks for already watched and deleted media are removed while unconfirmed unwatched jobs are preserved.
+- Installation from current sources supports Git worktrees and explicit `PUDGE_BUILD_CURRENT_TREE`; stale `build/lib` output is isolated during builds.
+- The package is installed without leftovers from the previous version and then byte-compared against the wheel, exposing stale runtime files even when the version number is unchanged.
+- Backups include the new durable prepared-subtitle directory; Apple Vision OCR uses a scoped autorelease pool.
 
-## v0.7.16
+### Verification tools
+- Added a subtitle benchmark CLI and corpus using an embedded Japanese track as ground truth, with timing-error metrics, segment reports, and replay of saved cases.
+- Added scripts for algorithm comparison and ten levels of STT influence with checkpoints, partial results, and exported comparisons.
+- Stress/benchmark media is isolated from normal library scanning; source-identity and previously acquired-case recovery checks were expanded.
+- Updated documentation and many regression tests. The presence of these tests in the diff is not a claim that they were executed successfully while preparing this changelog.
 
-- Added aria2 download management, guided initial setup and safer episode identity handling.
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.25...v0.7.26) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/744e8b3f0c8ebb9bf738fbe9af69b87bfd58460f).
 
-## v0.7.15
 
-- Release validation update for the exact-process in-app restart fix.
+## v0.7.25 — Window lifecycle, durable Ready state, and OCR memory
 
-## v0.7.14
+Range: [v0.7.24 → v0.7.25](https://github.com/TH1NKFASTER/pudge/compare/v0.7.24...v0.7.25). Status: published GitHub Release.
 
-- Fixed update restarts to terminate the exact running Pudge process before installing and reopening the app.
+### macOS and interface
+- The red close button and Cmd+W hide the window while keeping the session alive; reopening from the Dock restores it, while Cmd+Q remains a full quit.
+- Added a macOS delegate proxy for termination/reopen behavior and fixed a PyObjC crash path when closing the window.
+- Initial Home refresh now combines AniList synchronization and maintenance, reducing intermediate card jumps between sections.
+- Refined Planning, global search, Cmd+F, local-media highlighting rules, and readiness labels.
 
-## v0.7.13
+### Subtitles and OCR
+- Background subtitle upgrades preserve an already confirmed Ready state; added recovery for records downgraded by stale upgrade jobs.
+- Prepared bitmap OCR can be used for playback but counts as Ready only when the `ocr_counts_as_ready` policy allows it.
+- PGS/SUP decoding now streams compositions instead of keeping all images in memory.
+- Added OCR-worker RSS monitoring and diagnostic progress; heavy library scanning is coordinated with OCR through the scheduler.
+- Added persistent Jimaku unpack manifests and reuse of bitmap/OCR outputs, reducing repeated unpacking, synchronization, and recognition.
 
-- Release validation update for the improved in-app restart flow.
+### Library, audio, and resources
+- Added a fingerprint cache for library scans so unchanged roots do not require another full traversal. Removed duplicate scanning during one manual Refresh.
+- Improved recovery of aria2 `paused 0/0` records and episode ownership checks so stale rows do not assign a neighboring episode’s file.
+- Audiobook bookmarks gained rename, reorder, and post-deletion restoration; source actions and cover preview were added.
+- CPU/RSS diagnostics are split by process role and include 5-, 15-, and 60-minute summaries.
 
-## v0.7.12
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.24...v0.7.25) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/58bda4bfd565703be7777bc3a04cb64707578a9a).
 
-- Fixed app updates leaving the previous Pudge window running after the new version opened.
 
-## v0.7.11
+## v0.7.24 — Unified search and series-level libraries
 
-- Fixed automatic updates launched from the macOS app failing to find an existing Homebrew installation.
+Range: [v0.7.23 → v0.7.24](https://github.com/TH1NKFASTER/pudge/compare/v0.7.23...v0.7.24). Status: published GitHub Release.
 
-## v0.7.10
+### Search and Home
+- Added global search across local media with normalized titles and AniList aliases, plus recently viewed history.
+- Sidebar context actions can search for new subtitles/releases, refresh AniList, and scan local files.
+- Managed local episodes are reconciled with already reached AniList progress so watched content does not remain Ready.
 
-- Made app updates retry transient download failures automatically instead of requiring repeated manual attempts.
-- Made update restarts wait for the previous Pudge process to exit before reopening the updated app, preventing duplicate windows.
-- Removed the native WebView update confirmation dialog that appeared with the Python host icon.
+### Manga and LN
+- Libraries were reworked around series/volume selection, context actions, Jiten metadata, and AniList ratings.
+- Added recursive manga-image import with folder grouping, normalized volume numbers, and nested Manga-Zip layout handling.
+- Improved physical spread handling and preservation of original page names for later imports.
+- Page loading/prefetching is separate from marking content read: forward progress updates reading progress and the last displayed page completes the volume.
+- Tooltips show read pages out of the total; library redraw and series scrolling were stabilized.
+- LN/Manga selection is cleared when leaving the section; LN preparation always covers the current and next chapter.
 
-## v0.7.9
+### Synchronization and diagnostics
+- Extended pre-OP timing-gap refinement using embedded lines while preserving the stable main portion of the episode.
+- Low-frequency macOS energy diagnostics now enable automatically with a 30-second sampling interval.
 
-- Fixed the macOS application icon when Pudge runs through the managed Python environment, avoiding the default Python launcher icon during application startup.
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.23...v0.7.24) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/4276286dcdef1f81af6d3de499e46448bfa8fcb7).
 
-## v0.7.8
 
-- Fixed release updates so extracted installers do not depend on executable file permissions.
-- Isolated post-install package verification from the current working directory and Python environment, preventing valid updates from being mistaken for stale installations.
+## v0.7.23 — Progress reconciliation, Safe Mode, and technical stabilization
 
-## v0.7.7
+Range: [v0.7.22 → v0.7.23](https://github.com/TH1NKFASTER/pudge/compare/v0.7.22...v0.7.23). Status: published GitHub Release.
 
-- Fixed in-app updates for the native managed-environment launcher so the running Pudge process is stopped correctly and the updated app can reopen automatically.
+### Progress and playback
+- Ready and Continue Watching are reconciled with AniList progress so episodes already watched on another device do not reappear as next on the Mac or companion.
+- Stale mobile progress cannot un-complete an episode; the companion refreshes the library when returning to the foreground.
+- Added viewing/resolving mobile-sync conflicts, bounded event history, and revoking a device’s stream access.
+- Compatible companion video may be served without transcoding; streaming-cache cleanup and reuse were improved.
+- Fixed LN highlight position after ±5s and ±15s seeks.
 
-## v0.7.6
+### Sources and recovery
+- Jimaku search now considers exact AniList/title matches beyond the first four entries when duplicates hide the desired source.
+- Added Safe Mode after abnormal termination, with database diagnostics and backup access; a planned update is not treated as a crash.
+- Safe Mode disables download monitoring and subtitle preparation and offers restart into normal mode.
+- Added a two-stage uninstaller that computes Pudge-owned paths. External media folders and third-party applications are excluded from its plan.
 
-- Replaced the frozen PyInstaller application runtime with a lightweight native macOS launcher that always executes the managed Pudge environment, so in-app updates immediately run the newly installed package.
-- Preserved fast updates without reinstalling MangaOCR, Torch or other heavy dependencies and kept package/app rollback on failed updates.
-- Added native notification handling directly to the macOS launcher so notification identity remains Pudge while the main application continues to run from the managed Python environment.
-- Removed the duplicated bundled Pudge runtime, reducing the installed app bundle to a lightweight launcher while keeping the full application and dependencies in the managed environment.
+### Data and internal services
+- Added shared identity, diagnostics, cache-artifact accounting, and background task/process control services; Job Center checkpoints were expanded.
+- A backup is created before database migration, and migration/data-link execution was reworked.
+- Supported secrets can now be stored in macOS Keychain for standard user configuration. Environment variables retain priority; configuration fallback remains when storage is unavailable.
+- Added secret masking in UI and diagnostic cleanup, versioned state snapshots, and dedicated controllers for several web operations.
+- The scheduler considers resource, power, and thermal constraints; failure of an auxiliary resource probe must not stop core work.
+- Added a dependency lockfile, release-metadata/config-example consistency checks, property/performance tests, and torrent-history analysis tools.
 
-## v0.7.5
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.22...v0.7.23) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/d5fb1c3907f39a7a917ada1a8fec550dea912df8).
 
-- Reworked in-app updates to preserve the existing runtime environment, safely roll back failed package/app changes, sanitize inherited Python/Tcl/Tk environment variables and reuse a versioned native launcher runtime.
-- Made repeat updates much faster by replacing the Pudge wheel without rebuilding the native PyInstaller runtime or reinstalling heavy dependencies such as MangaOCR and Torch when the launcher runtime has not changed.
-- Fixed ready RELEASING anime so available episodes appear under New episodes ready rather than Completed and ready, including titles outside the AniList CURRENT list.
 
-## v0.7.4
+## v0.7.22 — Recovering ready subtitles without requiring ffmpeg
 
-- Added batch-first anime download selection, stricter episode/season identity checks, saturated seeder scoring and short qBittorrent candidate races for fresher, safer release selection.
-- Hardened Jimaku subtitle identity matching so explicit AniList mismatches and season markers such as `S3 - 13` cannot be mistaken for the requested episode, while preserving exact-title special overrides.
-- Expanded the Light Novel reader with native Jiten study controls, persisted deck selection, configurable study triggers, state-filtered furigana/underlines, word-color vs underline modes and local-LLM reader CSS generation.
-- Improved Light Novel furigana handling for inflected words and kept ruby annotations out of selection translation and copied text.
-- Fixed Light Novel reader UI regressions around inline JavaScript parsing, state-menu visibility/stacking, trackpad secondary-click handling, menu dismissal and filtered underline rendering.
-- Hid redundant Planning download actions once an episode is complete or already downloading, while keeping stalled/error states retryable.
+Range: [v0.7.21 → v0.7.22](https://github.com/TH1NKFASTER/pudge/compare/v0.7.21...v0.7.22). Status: published GitHub Release.
 
-## v0.7.3
+### Companion
+- Recovering an already existing SRT/VTT no longer requires ffmpeg merely to resolve its source.
+- When conversion or extraction is actually needed, Pudge uses the discovered or configured ffmpeg path; those operations still require a converter.
 
-- Added Jiten filters and sorts to Planning; enriched compact and full Light Novel cards with progress, AniList and Jiten facts; and restored wide audiobook playback cards with linked covers.
-- Kept reader color controls and custom CSS in sync, added a separate pitch-accent color, rendered matching-kana pitch directly in the word, and limited pitch accent to horizontal reading.
-- Moved character-name cues to the Light Novel context menu, aligned chapter selection beside the title, numbered dictionary definitions, and disabled unavailable dependent controls.
-- Changed Light Novel Nyaa searches to Literature / Raw title searches, recognizes volume ranges, selects only the requested volume from batch torrents and removes the completed torrent while keeping that volume.
-- Reworked Planning per-episode downloads as a persistent background job: local files are checked first, user-requested searches use the complete alias budget, and results appear only after the whole run finishes.
-- Fixed Planning episode controls so the automatic-download action and per-episode status labels use stable, non-overlapping rows.
-- Added an optional Jimaku key from GitHub Actions for the first 48 hours; it is not persisted to user config, and personal keys take priority.
-- Added a persistent Job Center with cancellation, retry and history for Nyaa episode runs, OCR, audiobook STT and imports.
-- Formalized video/subtitle/OCR/Ready transitions and records accepted state changes so scans cannot demote validated or user-controlled states.
-- Added inflected-form pitch diagrams in the Light Novel reader, two-click Finish Volume, and a local Remove Finished action that does not reduce AniList progress.
-- Added conservative LN/audiobook auto-linking, AniList identity propagation and Find LN on Nyaa from an audiobook.
-- Added detailed user-scenario and algorithm documentation, including Jimaku trial and state-machine behavior.
-- Made bitmap-subtitle states deterministic across library scans and exposes Enable OCR immediately when OCR is disabled.
-- Audiobook Stop now pauses mpv before reading the final position, and the forward seek control is consistently +15 seconds.
-- Added full-text inline Jiten pitch-accent diagrams to the Light Novel reader with an independent appearance toggle.
-- Exposed automatic per-episode downloads directly on Planning anime cards when released episodes are available.
-- Added cached acoustic speech timing using waveform energy and FFT spectral flux so paired-reading highlights pause between spoken phrases.
-- Made Light Novel word-color choices visible as persistent swatches with their exact hex values.
-- Added shared Jiten word-color presets and custom state colors for Light Novels, Manga and Visual Novels, plus mora-level pitch-accent diagrams in word cards.
-- Simplified audiobook-analysis status to a percentage, isolated each STT run's temporary files, refreshed AniList automatically after credential changes, and moved playback controls into Advanced settings.
-- Corrected the Jimaku account link, removed the technical API-reference shortcut, and omitted hours from countdowns longer than one day.
-- Preserved expanded audiobook chapter lists during live polling, passed the configured ffmpeg location to MLX Whisper, and resumed incomplete audiobook STT immediately at app startup.
-- Moved Planning search suggestions below existing entries, fixed the in-reader Names editor stacking, and consolidated paired-audio controls into the Light Novel toolbar.
-- Audiobook STT now exposes live percentage progress in both the audiobook library and paired reader.
-- Added step-by-step Jimaku and AniList credential guides with direct registration, account, developer and OAuth links.
-- Added a manual in-app updater with app-bundle rollback: release installs download the matching GitHub Release ZIP and verify SHA-256, while development checkouts allow only clean fast-forward updates from the official origin.
-- Enriched finished Planning cards with lazily loaded Jiten length, difficulty and, when a Jiten API key is configured, known-word coverage.
-- Expanded the AniList character glossary with unambiguous Japanese first/last-name variants so selection translation preserves short character references more reliably.
-- Clicking a linked manga cover now opens its AniList page while the rest of the series card continues to open the reader.
-- Added cached Japanese STT alignment for linked Light Novels and audiobooks, including real chapter boundaries, word-level reader highlighting and synchronized seek/speed controls in the reader tray.
-- EPUB reindexing now removes copyright, colophon and short author-metadata sections that are not reading chapters.
-- Expanded manga text-region detection for vertical/stylized text and fixed empty hover stickers remaining after the pointer leaves.
+### Development
+- The Makefile now prefers `.venv-test/bin/python` when available and otherwise falls back to `python3`.
+- Updated release-command and runtime-recovery checks along with version metadata.
 
-## v0.7.2
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.21...v0.7.22) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/de0d9d2fc4e718b3b36091f230d08df8c2286e4f).
 
-- Reworked manga preparation into bubble-sized Apple Vision regions followed by MangaOCR crops, with persistent overlays and background Jiten/JPDB parsing.
-- Stabilized bubble overlays across every page, close-on-leave behavior, zoomed-page scrolling and cached background preparation; manga actions and volume OCR now share the standard context menu.
-- Added manga and Light Novel scoring from the cover context menu, plus AniList-backed Planning search suggestions.
-- Expanded audiobooks with a scrubber, bookmarks, sleep timers, persisted speed, smart rewind, completion controls and lower-frequency position writes.
-- Added chapter-aligned Light Novel/audiobook paired reading with audio playback, proportional passage highlighting and optional auto-scroll.
-- AniList character names now form a cached translation glossary for online translation and the optional local LLM.
-- Fixed context menus on Continue Watching cards while playback is starting/already open, and removed duplicate manga reader event registration.
-- Re-selecting the active Light Novels or Manga tab no longer reloads and flashes the page.
-- Added replaceable metadata caches for ffprobe and AniList lookups plus the isolated VN reader architecture for the 0.8 series.
 
-## v0.7.1
+## v0.7.21 — Browser companion and anime playback
 
-- Split subtitle preparation into explicit discovery, normalization, alignment, validation and selection stages with persisted worker progress and leases.
-- Subtitle upgrades now compare final validated alignment quality; container chapters help anchor opening/transition edits, and cached tiny Japanese STT is available only as a last resort.
-- Local LLM subtitle checks are off by default. Backups redact credentials and retain current secrets during restore.
-- Added categorized Settings, a shorter profile-based onboarding flow and a focused Home section for genuine user-action blockers. Activity remains intentionally hidden.
-- Added initial CBZ/ZIP manga reading with lazy MangaOCR and audiobook playback with chapters and saved mpv position.
-- Added versioned SQLite migrations, external UI modules, integration tests and public project/security/contribution documentation.
+Range: [v0.7.20 → v0.7.21](https://github.com/TH1NKFASTER/pudge/compare/v0.7.20...v0.7.21). Status: tag without a published GitHub Release.
+
+### Companion
+- Added an installable browser companion UI: landing page, manifest, service worker, and resources packaged with the app.
+- The library groups content by series and can open LN, manga pages, and audiobooks, including covers and a hidden-image placeholder.
+- Added enabling the local server from settings, LAN-address discovery, and access management for connected devices.
+- Anime is served as HLS with ffmpeg preparation, job state, caching, and temporary access tickets for segments.
+- Subtitles are converted to WebVTT; the web player gained text interaction and local progress exchange.
+
+### Recovery and release
+- Added a shared subtitle resolver that checks the current path, selection history, and embedded tracks when recovering playback.
+- Refined subtitle path/permission handling and runtime-state reset.
+- Added a release-preparation script that validates version, Git state, and tags; release and mobile-protocol documentation was updated.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.20...v0.7.21) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/a3e652c7e30e8036f40ff406cc7e34af95a9c72f).
+
+
+## v0.7.20 — Media libraries, LN highlighting, and the mobile-sync foundation
+
+Range: [v0.7.19 → v0.7.20](https://github.com/TH1NKFASTER/pudge/compare/v0.7.19...v0.7.20). Status: published GitHub Release.
+
+### Import and library
+- Added shared drag-and-drop import and watching of configured media folders with source-change detection.
+- Removed LN sources are remembered so automatic scans do not immediately re-add them. Batch actions, series deletion, and library-view restoration were expanded.
+- LN covers moved from large inline fields to file-backed storage, with migration and lighter card queries.
+- Improved Japanese LN-source detection, background AniList linking, and Jiten data retrieval for series and individual volumes.
+- Anime gained additional Shana/SubsPlease search sources and local release history; completed-download reconciliation with real files was improved.
+
+### LN and audiobooks
+- Reworked the highlight scale so dense text anchors, Japanese reading-unit weights, punctuation, and speech pauses all contribute to position.
+- Added alignment quality reports, reprocessing, and paired-reading trace export.
+- Pause, stop, and time jumps are faster; audio control is coordinated between library and reader, while audiobooks use isolated mpv control.
+- Fixed multi-file audiobook transitions, position restoration, word skipping after seek, and seek-arrow behavior.
+- Refined furigana toggling, reserved layout space, and the point at which furigana hides during listening.
+
+### Manga and subtitles
+- Added a versioned manga OCR artifact containing normalized pages, regions, and geometry; incompatible old cache results are cleared.
+- Expanded direct text overlays, vertical-text detection, text selection, and Jiten-card opening. OCR diagnostics can export backend/frontend geometry.
+- Subtitle priority now accounts for language in both content and filename; removal of Chinese lines from bilingual CJK subtitles was improved.
+- Refined post-OP shift reacquisition and protected strong embedded timelines from contradictory speech results.
+
+### Mobile sync and resources
+- Added the companion server foundation: pairing, device tokens, access revocation, library snapshots, a change journal, and progress exchange for anime, manga, LN, and audiobooks.
+- Added the protocol HTTP server and paired-reading link storage. The full browser companion arrives in the next tag.
+- Improved global torrent-traffic control, managed aria2 shutdown, and coordination between the background agent and the active app session.
+- Added cleanup for temporary audio cache and diagnostic logs, refreshed selection controls, and runtime-diagnostic export.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.19...v0.7.20) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/1b51114b43403d93229570fea0d63f0941545fff).
+
+
+## v0.7.19 — Pudge dialogs and JitenMPV permissions
+
+Range: [v0.7.18 → v0.7.19](https://github.com/TH1NKFASTER/pudge/compare/v0.7.18...v0.7.19). Status: published GitHub Release.
+
+### Interface
+- Hovering an audiobook chapter highlights its range on the timeline.
+- Added an asynchronous branded confirmation dialog with the Pudge logo; native `confirm` calls were replaced in the web UI.
+- Native Cocoa dialogs now use the Pudge icon; the pywebview requirement was updated.
+
+### JitenMPV on macOS
+- Onboarding and settings now explain the Developer Tools permissions required for Pudge and mpv.
+- The app can open the relevant System Settings pane, and completing the step is persisted in configuration.
+- Starting playback without confirmed permission records a clear diagnostic warning.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.18...v0.7.19) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/9cb579be83b10cb69065ff94d3176daf8c534107).
+
+
+## v0.7.18 — Unified states, heavy-work coordination, and episode-start protection
+
+Range: [v0.7.17 → v0.7.18](https://github.com/TH1NKFASTER/pudge/compare/v0.7.17...v0.7.18). Status: tag without a published GitHub Release.
+
+### Architecture and downloads
+- Seasonal/absolute episode-number resolution moved into `episode_numbering.py` and is shared by the CLI, manager, and UI.
+- Episode-card state now comes from the shared `presentation_state` layer; a ready local file should not be hidden by stale transport state.
+- Added a download-intent journal recording candidate, backend, selection progress, and winner. aria2 candidate switching and queue-priority control were expanded.
+- Destructive switching to another release is restricted once downloaded bytes exist.
+- Added a shared heavy-work scheduler with interprocess locking. New OCR/STT/alignment jobs wait for resources and for priority playback to finish.
+
+### Subtitles
+- Ambiguous large episode-start corrections are sent to Japanese-speech verification; stable timelines retain the fast path.
+- Added limits for dangerous ALASS/STT maps, especially when multiple large jumps could move dialogue into the OP.
+- Opening lines are matched to STT sequentially so one speech segment cannot be reused for multiple cues.
+- Pre/post-OP refinement is reconciled with the embedded reference; added idempotence, order, duration, shift-invariance, and noise-stability checks.
+- Rechecking for improved subtitles uses increasing backoff after completed checks.
+
+### LN, settings, and release
+- LN progress is based on character count rather than chapter fraction; the tooltip shows exact values.
+- Paired-reading highlighting no longer pre-highlights the next word while paused. Default styling and selected-theme persistence were refined.
+- Policy/playback settings were simplified and unavailable controls now explain why. MangaOCR is included in initial dependency installation.
+- Release builds export dependencies through uv with hashes; Python and JavaScript syntax checks were expanded across app sources and scripts.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.17...v0.7.18) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/04a0cfc373ffa32673b64b8ec058ff01ba5fb35f).
+
+
+## v0.7.17 — Removing stale downloads and numbering through AniList relations
+
+Range: [v0.7.16 → v0.7.17](https://github.com/TH1NKFASTER/pudge/compare/v0.7.16...v0.7.17). Status: published GitHub Release.
+
+### aria2 and Home
+- Empty recovery magnet helper jobs are removed when the exact video file for that download already exists locally. Without a confirmed file, the helper job is preserved.
+- Metadata-only recovery prefers magnets with a more complete tracker set; zero-size jobs participate in stall detection.
+- Seed-only jobs no longer consume active-download slots. Removing stale legacy info-hash entries tolerates a missing job but does not hide real client errors.
+- A locally ready episode takes precedence over stale transport state on Home; states that require enabling OCR survive intermediate refreshes.
+- Compact cards keep percentage and ETA while detailed network metrics move to the download center.
+
+### Subtitles and AniList
+- The final path returned by subtitle preparation is treated as the authoritative selection result.
+- Absolute-numbering offsets now use the complete cached franchise graph, including intermediate OVA/bridge entries. Stale partial estimates can be refreshed.
+- The internal minimum release-selection score is hidden from user settings.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.16...v0.7.17) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/8c944758d0e0bc6b9a617da0b2abcd2fbade5716).
+
+
+## v0.7.16 — Torrent backend control and translation in mpv
+
+Range: [v0.7.15 → v0.7.16](https://github.com/TH1NKFASTER/pudge/compare/v0.7.15...v0.7.16). Status: published GitHub Release.
+
+### Downloads
+- qBittorrent and aria2 are handled concurrently: actions route to the owning backend and global torrent-traffic control was added.
+- Added manual and automatic recovery for aria2 downloads with no live peers while preserving verified partial data.
+- aria2 verification state is separate from file readiness. Stall recovery uses a 15-minute progress window and 30-minute cooldown.
+- Base32 magnet hashes are normalized to hex; large torrent-metadata addition, newly added job discovery, and control-file recovery were improved.
+- Incomplete torrent videos are excluded from heavy processing; deterministic subtitle-validation failures receive a longer retry delay.
+
+### Subtitles and mpv
+- Large local episode-start corrections can apply only before the OP without shifting an already stable main timeline; affected cached results are queued for rebuild.
+- Exact Jimaku candidates may be accepted when independent Japanese sources agree on one clock and the embedded English reference is noisy.
+- Added translation of the currently visible line inside mpv with up to 16 previous Japanese lines as context; the English track is additional context.
+- Added low-priority translation-cache warming during playback and removed the previous separate subtitle-study window.
+
+### Initial setup and reading
+- Added dependency checks and guided initial setup for media and language-study tools.
+- Added mutually exclusive JitenMPV / jpdb-mpv-plugin selection; jpdb-plugin discovery covers standard mpv directories and versioned installs.
+- Anime Debug can be opened for a specific episode of a multi-episode title.
+- Expanded LN bookmark saving and position reset; test logs are separated from runtime logs.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.15...v0.7.16) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/1d3063d7c71fafcfcefd5674525100f659e9df7e).
+
+
+## v0.7.15 — Maintenance release after the PID fix
+
+Range: [v0.7.14 → v0.7.15](https://github.com/TH1NKFASTER/pudge/compare/v0.7.14...v0.7.15). Status: published GitHub Release.
+
+### Release contents
+- Updated package version, README, and CHANGELOG entry to validate the preceding updater fix.
+- Application code and tests are unchanged from v0.7.14.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.14...v0.7.15) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/e3c8bb7c689ed1ef3dc77709ebe437280a0ce940).
+
+
+## v0.7.14 — Stopping the exact PID during updates
+
+Range: [v0.7.13 → v0.7.14](https://github.com/TH1NKFASTER/pudge/compare/v0.7.13...v0.7.14). Status: published GitHub Release.
+
+### Fix
+- The updater receives the PID of the exact process that initiated the update via `os.getpid()`.
+- Shutdown and follow-up verification use that PID instead of broad command-line process matching.
+- If the original process survives, the updater reports its PID and aborts installation. Lifecycle tests were updated.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.13...v0.7.14) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/02e0d94d390f6d05f4ee6a8cf86491a4674c65ed).
+
+
+## v0.7.13 — Maintenance release for update verification
+
+Range: [v0.7.12 → v0.7.13](https://github.com/TH1NKFASTER/pudge/compare/v0.7.12...v0.7.13). Status: published GitHub Release.
+
+### Release contents
+- Updated the package version, README version, and CHANGELOG entry.
+- Application code and tests are unchanged from v0.7.12. The previous restart fix is not introduced again in this release.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.12...v0.7.13) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/2bf4eed964c0bc9ead3b843bd03eb45e6cf4b879).
+
+
+## v0.7.12 — Verifying the old window has exited before update
+
+Range: [v0.7.11 → v0.7.12](https://github.com/TH1NKFASTER/pudge/compare/v0.7.11...v0.7.12). Status: published GitHub Release.
+
+### Updates
+- Before installation, the old launcher and `pudge.app_entry` are force-terminated and process presence is checked again.
+- If the old session remains active after the bounded wait, the updater fails before invoking the installer.
+- Tightened the process-search pattern so it does not match the search command itself; added old-window regression coverage.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.11...v0.7.12) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/71bacb6ad19a91627c9227a67383c26776725af9).
+
+
+## v0.7.11 — Homebrew discovery from the GUI
+
+Range: [v0.7.10 → v0.7.11](https://github.com/TH1NKFASTER/pudge/compare/v0.7.10...v0.7.11). Status: published GitHub Release.
+
+### Fix
+- The installer now checks standard Apple Silicon and Intel Homebrew locations first, then falls back to `PATH`.
+- The discovered directory is prepended to `PATH`, so in-app installation finds the same brew tools as Terminal launches.
+- The Homebrew-required message remains for systems where no installation is actually found.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.10...v0.7.11) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/51fc7f85f063d0ea75a6593674e2eb2236b9f748).
+
+
+## v0.7.10 — Update-download retries and waiting for the old process
+
+Range: [v0.7.9 → v0.7.10](https://github.com/TH1NKFASTER/pudge/compare/v0.7.9...v0.7.10). Status: published GitHub Release.
+
+### Updates
+- Transport failures while downloading an update are retried automatically with increasing delays; partial files are removed before retry and SHA-256 is recalculated.
+- Before installation, old Pudge processes are asked to exit and waited for within a bounded timeout; remaining processes are force-terminated.
+- Removed the native WebView update confirmation that was shown with the Python host icon.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.9...v0.7.10) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/b9ca399db1bacee0517dea36b91ebfd199201764).
+
+
+## v0.7.9 — Pudge icon when launched through Python
+
+Range: [v0.7.8 → v0.7.9](https://github.com/TH1NKFASTER/pudge/compare/v0.7.8...v0.7.9). Status: published GitHub Release.
+
+### Fix
+- The native launcher passes the `AppIcon.icns` path, and the entry point sets the application icon through AppKit before starting the GUI.
+- Fixed the default Python icon appearing instead of Pudge. Icon-load failure does not block application startup.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.8...v0.7.9) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/7b55ea902f52f9f1d4e7c52036142e77673460f6).
+
+
+## v0.7.8 — Running the installer from ZIPs and isolating version checks
+
+Range: [v0.7.7 → v0.7.8](https://github.com/TH1NKFASTER/pudge/compare/v0.7.7...v0.7.8). Status: published GitHub Release.
+
+### Fixes
+- Extracted `install.sh` is invoked explicitly through `/bin/zsh`, so updates no longer depend on the executable bit surviving ZIP extraction.
+- Installed-package verification runs with `-I`; the current directory and Python environment variables can no longer shadow the installed version being checked.
+- Added regression coverage for both scenarios.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.7...v0.7.8) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/34e862413be24a205bad6df7e54126d45e8cc7f0).
+
+
+## v0.7.7 — Relaunching the app after updates
+
+Range: [v0.7.6 → v0.7.7](https://github.com/TH1NKFASTER/pudge/compare/v0.7.6...v0.7.7). Status: published GitHub Release.
+
+### Fix
+- The installer and updater now account for the `pudge.app_entry` process introduced by the native launcher when stopping the old version.
+- This prevents a live GUI session from being missed before replacement and reopening.
+- Added tests that the new process name is wired into both update paths.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.6...v0.7.7) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/cf970be8de43b76dad6c77fced7c2d77ca0d37ec).
+
+
+## v0.7.6 — Lightweight native macOS launcher
+
+Range: [v0.7.5 → v0.7.6](https://github.com/TH1NKFASTER/pudge/compare/v0.7.5...v0.7.6). Status: published GitHub Release.
+
+### Launch and updates
+- Replaced the frozen PyInstaller runtime with a small native launcher that starts `pudge.app_entry` from the managed Python environment.
+- The app bundle no longer duplicates Pudge, the Python standard library, or third-party packages; after updates, the installed wheel is executed.
+- Preserved fast update mode and rollback for failed package/bundle replacement.
+- The native launcher owns Pudge notifications, passes tool paths, and removes environment variables from the previous frozen runtime.
+- Updated macOS bundle metadata, icon handling, and installer checks.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.5...v0.7.6) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/dc738823cb07cc8c7d319e2a43d51dd421a609c8).
+
+
+## v0.7.5 — Fast updates with package rollback
+
+Range: [v0.7.4 → v0.7.5](https://github.com/TH1NKFASTER/pudge/compare/v0.7.4...v0.7.5). Status: published GitHub Release.
+
+### Updates
+- `--update` preserves the existing Python environment and backs up the installed Pudge package before replacement.
+- Package and app-bundle rollback are available on failure. The new bundle is prepared before the live application is replaced.
+- Added reuse of a compatible launcher runtime and skipped reinstalling heavy OCR dependencies during fast updates.
+- Cleared inherited Python/Tcl/Tk environment variables that could point builds at files from the old bundle.
+
+### Home
+- Ready episodes of currently airing titles now appear in New episodes ready, including titles outside the AniList CURRENT list, instead of incorrectly falling into Completed and ready.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.4...v0.7.5) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/f699386121ae14faafb524663b90bfdc70e5dab5).
+
+
+## v0.7.4 — Torrent selection and native Jiten actions
+
+Range: [v0.7.3 → v0.7.4](https://github.com/TH1NKFASTER/pudge/compare/v0.7.3...v0.7.4). Status: published GitHub Release.
+
+### Anime and subtitle sources
+- Added preference for suitable batch releases with stricter season and episode validation.
+- Reworked seeder/leecher contribution to ranking so very large counts cannot overwhelm match quality without bound.
+- Added a short qBittorrent candidate race that observes activity, chooses a winner, and cleans up losing jobs.
+- Jimaku candidates with explicit AniList-ID or season/episode conflicts are rejected; special exact matches are preserved.
+- Planning retry-download buttons are hidden for already-ready or actively downloading episodes but remain available for stalled and failed states.
+
+### Light Novels
+- Added Jiten study actions directly in the reader, persistence of the selected deck, and configurable study triggers.
+- Furigana and underline visibility can be restricted by word state; text color and underline mode are configurable.
+- Improved readings for inflected word forms; furigana is excluded from copied text and the main text sent for translation.
+- Added local-LLM generation of reader styling CSS with result validation.
+- Fixed secondary-click/trackpad context menus, stacking order, menu closing, filtered-marker visibility, and embedded JavaScript syntax.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.3...v0.7.4) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/ba200f83d97345ee3e24c99e007f85ae8e493ea5).
+
+
+## v0.7.3 — Job Center, study tools, and initial Visual Novel support
+
+Range: [v0.7.2 → v0.7.3](https://github.com/TH1NKFASTER/pudge/compare/v0.7.2...v0.7.3). Status: published GitHub Release.
+
+### Background jobs and downloads
+- Added Job Center with persisted history plus cancel/retry support for OCR, STT, import, and episode-search jobs.
+- Downloading individual Planning episodes is now a background job: local files are checked first, then search uses available title variants.
+- LN Nyaa search targets Literature / Raw, recognizes volume ranges, and selects the requested volume from batch torrents. After the selected volume is moved, the torrent is removed while keeping the needed file.
+- Formalized episode-state transitions and their history so scans cannot downgrade already confirmed or user-managed states.
+- Added optional built-in trial Jimaku key support for the first 48 hours. It applies only to builds that ship such a key; a personal key takes precedence.
+
+### Reading and audio
+- Added Planning filters/sorting based on Jiten data, expanded LN metadata, and wider audiobook playback cards.
+- Added shared Jiten study-state color themes for LN, Manga, and VN, a dedicated pitch-accent color, and mora diagrams in word cards.
+- LN gained inline pitch-accent diagrams, a visibility setting, numbered readings, and a character-name editor from the context menu.
+- Added confirmed volume completion and local removal of completed volumes; local removal does not reduce AniList progress.
+- LN and audiobooks auto-link on sufficiently reliable matches; audiobook entries can search for the corresponding LN.
+- Paired-reading highlighting uses acoustic activity to account for pauses between phrases. Paired-audio controls moved into the reader toolbar.
+- STT now exposes progress percentage, uses isolated temp files and the configured ffmpeg, and resumes unfinished jobs on startup.
+- Fixed final-position persistence on Stop by pausing mpv first. Expanded chapter lists remain expanded during state refresh.
+
+### Visual Novels and setup
+- Added the initial VN subsystem: select a macOS window, start/stop capture, OCR text, and send recognized text to study tools.
+- Added a Screen Recording permission shortcut and separate VN web modules. This is an initial implementation, not a claim of broad game compatibility.
+- Added step-by-step Jimaku/AniList setup explanations; AniList refresh runs after credentials change.
+- Fixed character-name editor overlap, search-suggestion placement, dependent-setting availability, and bitmap-subtitle state rendering.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.2...v0.7.3) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/d83752b0fe88fb2a36c28d56102fa2c1a09c109c).
+
+
+## v0.7.2 — Paired reading, region OCR, and in-app updates
+
+Range: [v0.7.1 → v0.7.2](https://github.com/TH1NKFASTER/pudge/compare/v0.7.1...v0.7.2). Status: published GitHub Release.
+
+### Manga
+- Reworked recognition into an “Apple Vision regions → MangaOCR crops” pipeline with nearby-rectangle merging and per-region result storage.
+- Improved vertical and stylized text handling, overlay persistence across pages, tooltip closing on pointer exit, and scrolling while zoomed.
+- Unified volume preparation and context actions into a shared menu and removed duplicate reader-handler registration.
+- Added title rating, AniList relinking, and opening AniList from the linked cover.
+
+### Light Novels and audiobooks
+- Added LN↔audiobook linkage and paired reading with text/audio jumps, fragment highlighting, speed controls, and seeking.
+- Japanese STT transcripts provide text anchors and chapter boundaries; alignment results are cached.
+- Audiobooks gained a position bar, bookmarks, sleep timer, persistent speed, completion marking, and resume-with-rewind.
+- EPUB import filters technical sections such as short colophons and author information that are not reading chapters.
+- AniList character-name dictionaries help preserve names during translation, including unambiguous short forms.
+
+### Planning and updates
+- Added AniList search suggestions, LN/Manga ratings, and lazily loaded Jiten metadata for length, difficulty, and known-word coverage when a key is configured.
+- Added manual updates from the UI: release installs download the requested version ZIP and verify SHA-256, with app-bundle rollback on failure.
+- Development-checkout updates are allowed only from the official origin with a clean tree and a fast-forward path.
+- Added replaceable ffprobe/AniList caches; reselecting an already open LN or Manga tab no longer reloads it unnecessarily.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.1...v0.7.2) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/d507cfbe27cbfe4662406a04d3392f0449329170).
+
+
+## v0.7.1 — Small timeline cleanup
+
+Range: [v0.7.0 → v0.7.1](https://github.com/TH1NKFASTER/pudge/compare/v0.7.0...v0.7.1). Status: published GitHub Release.
+
+### Changes
+- Removed the unused intermediate `new_boundaries` calculation from `_insert_override_segment`. The active boundary recomputation from segment ends remains unchanged.
+- Updated the version number, README, and version assertion in tests.
+- The v0.7.0 → v0.7.1 diff does not add a new subtitle pipeline or new readers; those larger changes belong to earlier tags.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.7.0...v0.7.1) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/0da50bbd7579307d67a4ea43f31219a2c5d18a88).
+
+
+## v0.7.0 — Migration to the `pudge` package and expanded readers
+
+Range: [v0.6.77 → v0.7.0](https://github.com/TH1NKFASTER/pudge/compare/v0.6.77...v0.7.0). Status: tag without a published GitHub Release.
+
+### Package and installation
+- Renamed the Python package from `anime_mpv` to `pudge`; imports, entry points, resources, build logic, and checks were updated. Pure file moves without content changes are not treated as new functionality.
+- Updated branded paths and cleanup of artifacts left by the previous application name.
+
+### Subtitles and anime
+- Added a dedicated timeline-alignment algorithm that evaluates local windows, finds a sequential path, builds segments, and determines shift-change boundaries.
+- Added separate refinement for episode start, the first line after a pause, and short transition regions; cue ordering and held-out-window behavior are validated.
+- Added early rejection of dangerous ALASS discontinuities against the embedded track so expensive later processing cannot hide an already detected failure.
+- Fixed absolute episode numbering sent to AniList: progress is mapped to the concrete season/cour entry, and AniList’s published episode count takes precedence over stale local hints.
+- Added stage traces, a selected-episode diagnostic snapshot, and forced fresh subtitle selection.
+
+### Manga, LN, and Audiobooks
+- Added Manga Reader v2 with Apple Vision text regions, background volume OCR, cached results, and study tools for selected text.
+- Manga is grouped by series and volume; AniList linkage propagates within the series. MangaOCR can be installed from the app with log viewing.
+- Audiobooks can be imported from multi-file folders and mapped onto a shared timeline. Added stop, seek, speed changes, and record deletion.
+- Shared reading tools support text parsing and study actions; LN translation language follows the application language.
+- Expanded library context actions and tests for reading, audio, OCR, and timeline transitions.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.77...v0.7.0) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/5ff48bc0f09caea5c37415db9cb69cd5d7a47dd3).
+
+
+## v0.6.77 — Preparation stages, first Manga support, and Audiobooks
+
+Range: [v0.6.76 → v0.6.77](https://github.com/TH1NKFASTER/pudge/compare/v0.6.76...v0.6.77). Status: published GitHub Release.
+
+### Subtitles
+- Preparation is split into explicit discovery, normalization, synchronization, validation, and selection stages. Worker progress and job state are persisted for display and recovery.
+- Subtitle upgrades are judged by the quality of the already prepared result; source filename ranking remains a discovery signal.
+- Container chapters are used as additional edit boundaries. Added cacheable Japanese STT as a fallback timing reference.
+- Local-LLM semantic subtitle validation is disabled by default; the main path relies on deterministic processing.
+- Semantic anchors now include validation on held-out examples to reduce self-confirmation of the selected shift.
+
+### Media and interface
+- Added initial CBZ/ZIP manga import and reading with page persistence and lazy MangaOCR startup.
+- Added audiobook import, chapter listing, and mpv playback with saved position.
+- Settings are split into categories; initial setup and the Home attention block are simplified. Media and settings web modules were moved into separate files.
+
+### Data and development
+- Added versioned SQLite migrations and stage-state fields for background jobs.
+- Backups scrub secrets from config and database data; restore preserves the user’s current secrets. Database pages are rebuilt after secret removal.
+- Added license, development/security docs, CI checks, and integration tests for the new subsystems.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.76...v0.6.77) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/cccdf3314d5000d83ad403dfdfb884e88bfd6d72).
+
+
+## v0.6.76 — Embedded-subtitle anchor lines
+
+Range: [v0.6.75 → v0.6.76](https://github.com/TH1NKFASTER/pudge/compare/v0.6.75...v0.6.76). Status: published GitHub Release.
+
+### Synchronization
+- Added matching of Japanese lines against dialogue from the embedded English track to recover timing before the OP, after the OP, in the middle, and near the end of an episode.
+- Matching allows unmatched English-only lines such as song lyrics; they are not forced to pair with Japanese cues.
+- Timing corrections are applied in stable regions. A transition across the OP is constrained to the corresponding interval without Japanese dialogue.
+- Corrections are validated by anchor support, residual error, cue-order preservation, and the absence of a meaningful degradation in global activity.
+- The method is integrated into ALASS and constant-offset recovery, with diagnostics reporting which strategy was used.
+
+### Interface
+- Removed the repeated explanation of randomized rating order from the normal rating-dialog flow.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.75...v0.6.76) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/d7ff56658110d5eba449b32b136ac8e16b8b1969).
+
+
+## v0.6.75 — Jimaku rate limiting and two timing plateaus around the OP
+
+Range: [v0.6.74 → v0.6.75](https://github.com/TH1NKFASTER/pudge/compare/v0.6.74...v0.6.75). Status: published GitHub Release.
+
+### Jimaku
+- Added a process-shared request budget: an initial burst of four requests followed by replenishment at 20 requests per minute.
+- Concurrent calls reserve different future slots, reducing the chance of synchronized retries hitting the API at once.
+- Changing the API key resets the previous key’s budget; a damaged budget file no longer blocks the provider entirely.
+
+### Synchronization
+- Added detection of stable shift clusters before and after the opening, allowing the two regions to be corrected independently.
+- Noisy, weakly supported, or nearly identical regions are discarded so the algorithm does not invent an artificial timing jump.
+- Updated the synchronization fingerprint so rebuilt results use the new algorithm.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.74...v0.6.75) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/42a145f590a5aed5849803b7bab7dee9ec5f41c6).
+
+
+## v0.6.74 — Consistent semantic validation
+
+Range: [v0.6.73 → v0.6.74](https://github.com/TH1NKFASTER/pudge/compare/v0.6.73...v0.6.74). Status: published GitHub Release.
+
+### Subtitles
+- Semantic validation now considers per-example scores when aggregate fields returned by the local model contradict each other.
+- Unanimous, near-unanimous, and weaker example agreement are distinguished, with different temporal-activity requirements for each level.
+- Strong text agreement may pass with moderate activity agreement, but partial semantic agreement does not bypass stricter timing validation.
+- Bumped the semantic-cache version.
+
+### Diagnostics
+- Preparation and synchronization messages now follow the selected UI language, including English diagnostic reasons.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.73...v0.6.74) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/eb8f1f35558a60881e1b4c68e4d4a6408a8a66e3).
+
+
+## v0.6.73 — LN position persistence and Jimaku rate-limit handling
+
+Range: [v0.6.72 → v0.6.73](https://github.com/TH1NKFASTER/pudge/compare/v0.6.72...v0.6.73). Status: published GitHub Release.
+
+### Reader
+- LN position is saved before closing the reader or changing chapters, then restored after the page is built.
+- Both vertical scrolling and horizontal paged reading are covered. Scroll saves are debounced to coalesce frequent events.
+- Increased the maximum text width to 2400 px; dictionary cards now use clearer study-state names and ruby markup for readings.
+
+### Jimaku
+- HTTP 429 establishes a shared cooldown persisted on disk; new requests respect it instead of retrying immediately.
+- During a rate limit, a previously saved response is used when available. `Retry-After` is honored with a bounded maximum wait.
+- A job deferred because of the service limit is returned to the queue without increasing the media-preparation failure count.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.72...v0.6.73) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/e4f6d0d4585c9ce9c80204330b640c19b37fcbff).
+
+
+## v0.6.72 — qBittorrent paths and persisted synchronization results
+
+Range: [v0.6.71 → v0.6.72](https://github.com/TH1NKFASTER/pudge/compare/v0.6.71...v0.6.72). Status: published GitHub Release.
+
+### Downloads and subtitles
+- Added recovery for qBittorrent downloads in `missingFiles` state when files moved under the new library root after the Anime MPV → Pudge rename. Pudge points qBittorrent at the existing new location and requests a recheck.
+- Added location changes and forced file verification to the qBittorrent provider.
+- Extended migration of previously synchronized Jimaku subtitles: selection history can now identify a stale intermediate result even after the original alignment cache has been removed.
+
+### Light Novels and settings
+- Linked LN cards now include an AniList action and a revised metadata/action layout.
+- Clarified AniList, Jimaku, LLM, and qBittorrent explanations and grouped related settings more consistently.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.71...v0.6.72) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/ac683525577c89e838d733446fa5a7056a7e5c1c).
+
+
+## v0.6.71 — Preparation recovery and installing the current source tree
+
+Range: [v0.6.69 → v0.6.71](https://github.com/TH1NKFASTER/pudge/compare/v0.6.69...v0.6.71). Status: published GitHub Release.
+
+### Fixes
+- qBittorrent Web API failures or temporary unavailability no longer prevent ready-to-run subtitle jobs from being processed.
+- Failure to show the native “preparation completed” notification is logged without invalidating the job result.
+- Added selective rebuilding of stale playback SRTs originating from synchronization caches. The final pipeline result is cleared as well, while manually selected subtitles are protected from this migration.
+- Simplified the explanation in the rating dialog.
+
+### Installation and development
+- Installing from a Git checkout now builds a wheel from the current source tree in a temporary directory. An old wheel next to the installer no longer determines what code gets installed.
+- Added a pre-push hook that runs tests in four batches and rejects the push if any batch fails; `.venv-test` is ignored by Git.
+- Fixed v0.6.71 version metadata and the corresponding checks.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.69...v0.6.71) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/32f46a90501beb3a98adc59ba332a7044cd8a6c9).
+
+
+## v0.6.69 — Subtitle waiting and constant-offset search
+
+Range: [v0.6.68 → v0.6.69](https://github.com/TH1NKFASTER/pudge/compare/v0.6.68...v0.6.69). Status: tag without a published GitHub Release.
+
+### Subtitles and performance
+- Reworked constant-shift search: coarse hypotheses are evaluated first, then only the best sufficiently distinct candidates are refined. Duplicate evaluations of the same shift are eliminated.
+- Reduced the number of initial hypotheses and added the `candidate_evaluations` counter to expose the real cost of the search.
+- Bumped the synchronization cache key so results from the previous algorithm cannot masquerade as new ones.
+
+### Interface
+- Deferred subtitle jobs no longer keep the UI in an active Checking state until their retry time arrives.
+- Background polling now takes the nearest scheduled retry into account; manual refresh remains available when jobs are only waiting for their scheduled time.
+
+[Source diff](https://github.com/TH1NKFASTER/pudge/compare/v0.6.68...v0.6.69) · [Version commit](https://github.com/TH1NKFASTER/pudge/commit/c77b259782ef84f9b19a05d5bb3fd2c7f9d51c4e).
+
 
 ## v0.6.68
 
@@ -376,14 +908,14 @@ GitHub Actions runs the full test suite in four deterministic macOS batches. Pus
 
 ## v0.6.36
 
-- Piecewise-синхронизация больше не интерполирует cold-open offset через длинный разрыв без реплик; после opening/title card сразу используется следующий стабильный clock.
-- Исправлен Hyakkano S03E05: первая реплика после 106-секундного разрыва получает +0.35 с вместо ложных +2.26 с.
-- Старые playback-SRT автоматически переподготавливаются.
+- Piecewise synchronization no longer interpolates the cold-open offset across a long gap without dialogue; the next stable clock is used immediately after the opening/title card.
+- Fixed Hyakkano S03E05: the first line after a 106-second gap now receives +0.35s instead of an incorrect +2.26s.
+- Existing playback SRTs are automatically rebuilt.
 
-- Исправлена групповая синхронизация `1–3 ↔ 1–3`: английская длинная реплика больше не растягивает и не сжимает внутренние границы японских SRT-cues.
-- Split/merge-группа теперь передаёт только общий локальный сдвиг, сохраняя исходные длительности и паузы японских субтитров.
-- Добавлен quality gate: коррекция отклоняется, если почти не улучшает timing activity или заметно меняет длительности cues.
-- Ранее подготовленные playback-SRT автоматически ставятся на повторную проверку.
+- Fixed grouped `1–3 ↔ 1–3` synchronization: a long English cue no longer stretches or compresses the internal boundaries of Japanese SRT cues.
+- A split/merge group now transfers only the shared local shift, preserving the original durations and pauses of the Japanese subtitles.
+- Added a quality gate: a correction is rejected when it barely improves timing activity or materially changes cue durations.
+- Previously prepared playback SRTs are automatically queued for revalidation.
 
 ## v0.6.34
 

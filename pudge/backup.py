@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -210,12 +211,47 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
     }
 
 
+def _atomic_copy(source: Path, target: Path) -> None:
+    target = target.expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_temp = tempfile.mkstemp(
+        prefix=f".{target.name}.restore-",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    temporary = Path(raw_temp)
+    try:
+        shutil.copy2(source, temporary)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path, cache_dir: Path) -> dict[str, Any]:
+    """Validate completely in staging, then replace live files with rollback.
+
+    Callers that own long-lived services should quiesce their writers before this
+    function enters its commit phase.  The function itself guarantees that an
+    invalid archive never touches live files and that a commit failure restores
+    the previous database/config/cached subtitle set.
+    """
+
     archive_path = archive_path.expanduser()
+    config_path = config_path.expanduser()
+    database_path = database_path.expanduser()
+    cache_dir = cache_dir.expanduser()
     if not archive_path.is_file():
         raise FileNotFoundError(archive_path)
+
     with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-restore-") as raw_tmp:
         tmp = Path(raw_tmp)
+        restored_db = tmp / "library.sqlite3"
+        restored_config = tmp / "config.toml"
+        staged_cached_dir = tmp / "cached"
+        staged_cached_dir.mkdir(parents=True, exist_ok=True)
+
+        staged_cached: list[tuple[str, Path, Path]] = []
+        restored_paths: dict[str, str] = {}
         with zipfile.ZipFile(archive_path) as archive:
             names = set(archive.namelist())
             if "manifest.json" not in names or "library.sqlite3" not in names:
@@ -224,11 +260,14 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
             backup_format = int(manifest.get("format", 0))
             if manifest.get("app") != BACKUP_APP_ID or backup_format not in {1, BACKUP_FORMAT}:
                 raise ValueError(f"Unsupported {APP_NAME} backup format")
-            archive.extract("library.sqlite3", tmp)
+
+            with archive.open("library.sqlite3") as source, restored_db.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
             if "config.toml" in names:
-                archive.extract("config.toml", tmp)
-            restored_paths: dict[str, str] = {}
-            for item in manifest.get("cached_files", []):
+                with archive.open("config.toml") as source, restored_config.open("wb") as destination:
+                    shutil.copyfileobj(source, destination)
+
+            for index, item in enumerate(manifest.get("cached_files", []), start=1):
                 if not isinstance(item, dict):
                     continue
                 member = str(item.get("archive") or "")
@@ -237,16 +276,18 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                     continue
                 storage = str(item.get("storage") or "")
                 if storage == "durable" or member.startswith("prepared-subtitles/"):
-                    target = database_path.expanduser().parent / "prepared-subtitles" / Path(member).name
+                    target = database_path.parent / "prepared-subtitles" / Path(member).name
                 else:
-                    target = cache_dir.expanduser() / "restored-subtitles" / Path(member).name
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(member) as source, target.open("wb") as destination:
+                    target = cache_dir / "restored-subtitles" / Path(member).name
+                staged = staged_cached_dir / f"{index:04d}-{Path(member).name}"
+                with archive.open(member) as source, staged.open("wb") as destination:
                     shutil.copyfileobj(source, destination)
+                staged_cached.append((original, staged, target))
                 restored_paths[original] = str(target)
 
-        existing_database_secrets = _read_database_secrets(database_path.expanduser())
-        restored_db = tmp / "library.sqlite3"
+        # Everything below this line works only with staged files until all
+        # validation and path rewrites have succeeded.
+        existing_database_secrets = _read_database_secrets(database_path)
         with sqlite3.connect(restored_db) as conn:
             conn.execute("PRAGMA journal_mode=DELETE")
             integrity = conn.execute("PRAGMA integrity_check").fetchone()
@@ -269,25 +310,74 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                             (key, value),
                         )
             conn.commit()
+            final_integrity = conn.execute("PRAGMA integrity_check").fetchone()
+            if final_integrity is None or str(final_integrity[0]).casefold() != "ok":
+                raise ValueError("Prepared backup database failed integrity check")
 
-        database_path = database_path.expanduser()
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        for suffix in ("-wal", "-shm"):
-            Path(str(database_path) + suffix).unlink(missing_ok=True)
-        shutil.copy2(restored_db, database_path)
-        restored_config = tmp / "config.toml"
+        staged_config: Path | None = None
         if restored_config.exists():
-            config_path = config_path.expanduser()
-            config_path.parent.mkdir(parents=True, exist_ok=True)
+            staged_config = tmp / "config.final.toml"
             if backup_format >= 2 and config_path.is_file():
                 merged = _merge_config_secrets(
                     restored_config.read_text(encoding="utf-8"),
                     config_path.read_text(encoding="utf-8"),
                 )
-                config_path.write_text(merged, encoding="utf-8")
+                staged_config.write_text(merged, encoding="utf-8")
             else:
-                shutil.copy2(restored_config, config_path)
-            config_path.chmod(0o600)
+                shutil.copy2(restored_config, staged_config)
+
+        rollback_dir = tmp / "rollback"
+        rollback_dir.mkdir(parents=True, exist_ok=True)
+        rollback_db = rollback_dir / "library.sqlite3"
+        database_existed = database_path.is_file()
+        if database_existed:
+            _sqlite_snapshot(database_path, rollback_db)
+
+        rollback_config = rollback_dir / "config.toml"
+        config_existed = config_path.is_file()
+        if config_existed:
+            shutil.copy2(config_path, rollback_config)
+
+        cache_rollbacks: list[tuple[Path, Path | None]] = []
+        for index, (_original, _staged, target) in enumerate(staged_cached, start=1):
+            if target.is_file():
+                backup_target = rollback_dir / f"cached-{index:04d}-{target.name}"
+                shutil.copy2(target, backup_target)
+                cache_rollbacks.append((target, backup_target))
+            else:
+                cache_rollbacks.append((target, None))
+
+        try:
+            # No writer may be active while WAL/SHM are removed. WebApp owns
+            # that lifecycle guarantee before calling restore_backup().
+            for suffix in ("-wal", "-shm"):
+                Path(str(database_path) + suffix).unlink(missing_ok=True)
+            _atomic_copy(restored_db, database_path)
+            if staged_config is not None:
+                _atomic_copy(staged_config, config_path)
+                config_path.chmod(0o600)
+            for _original, staged, target in staged_cached:
+                _atomic_copy(staged, target)
+        except Exception:
+            for target, backup_target in reversed(cache_rollbacks):
+                if backup_target is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    _atomic_copy(backup_target, target)
+            if staged_config is not None:
+                if config_existed:
+                    _atomic_copy(rollback_config, config_path)
+                    config_path.chmod(0o600)
+                else:
+                    config_path.unlink(missing_ok=True)
+            for suffix in ("-wal", "-shm"):
+                Path(str(database_path) + suffix).unlink(missing_ok=True)
+            if database_existed:
+                _atomic_copy(rollback_db, database_path)
+            else:
+                database_path.unlink(missing_ok=True)
+            raise
+
     return {
         "path": str(archive_path),
         "restored_cached_files": len(restored_paths),

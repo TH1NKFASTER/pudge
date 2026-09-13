@@ -12,13 +12,15 @@ test:
 	PUDGE_HOME="$$runtime/home" PUDGE_RUNTIME_LOG_PATH="$$runtime/runtime.log" $(PYTHON) -m pytest -q
 
 test-batches:
-	@runtime=$$(mktemp -d "$${TMPDIR:-/tmp}/pudge-pytest-runtime.XXXXXX"); \
-	trap 'rm -rf "$$runtime"' EXIT; \
-	i=0; while [ $$i -lt $(BATCHES) ]; do \
+	@results=$${PUDGE_TEST_RESULTS_DIR:-"$${TMPDIR:-/tmp}/pudge-test-batches.$$$$"}; \
+	mkdir -p "$$results"; \
+	status=0; i=0; while [ $$i -lt $(BATCHES) ]; do \
 		echo "== Test batch $$((i+1))/$(BATCHES) =="; \
-		PUDGE_HOME="$$runtime/home" PUDGE_RUNTIME_LOG_PATH="$$runtime/runtime.log" $(PYTHON) scripts/run_test_batch.py --batch $$i --batches $(BATCHES) || exit $$?; \
+		$(PYTHON) scripts/run_test_batch.py --batch $$i --batches $(BATCHES) --results-dir "$$results/batch-$$i" || status=$$?; \
 		i=$$((i+1)); \
-	done
+	done; \
+	echo "Test results: $$results"; \
+	exit $$status
 
 bump:
 	@test -n "$(VERSION)" || (echo "Usage: make bump VERSION=0.6.69" && exit 2)

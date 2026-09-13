@@ -46,7 +46,7 @@ from .diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
 from .episode_state import watched_by_anilist_progress
 from .episode_numbering import resolve_episode_numbering
-from .presentation_state import derive_episode_presentation
+from .presentation_state import derive_episode_presentation, download_complete
 from .first_experience import (
     configure_mpv_study_keys,
     dependency_status,
@@ -82,6 +82,7 @@ from .task_supervisor import TaskSupervisor
 from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
 from .visual_novels import VisualNovelService
+from .work_scheduler import WorkPriority
 from .web_controllers import CompanionController, DiagnosticsController
 from .web_state import UIStateSnapshotCache
 
@@ -327,6 +328,7 @@ class WebAppApi:
         self._play_lock = threading.Lock()
         self._anilist_sync_lock = threading.Lock()
         self._local_refresh_lock = threading.Lock()
+        self._restore_lock = threading.Lock()
         self._startup_maintenance_lock = threading.Lock()
         self._download_poll_lock = threading.Lock()
         self._torrent_traffic_lock = threading.Lock()
@@ -622,6 +624,75 @@ class WebAppApi:
         )
         return torrent_result
 
+    def _quiesce_manga_ocr(self, *, timeout: float = 5.0) -> list[str]:
+        lock = getattr(self, "_manga_book_ocr_lock", None)
+        if lock is None:
+            return []
+        with lock:
+            for event in getattr(self, "_manga_ocr_cancel_events", {}).values():
+                event.set()
+            threads = [
+                thread for thread in getattr(self, "_manga_book_ocr_threads", {}).values()
+                if thread.is_alive() and thread is not threading.current_thread()
+            ]
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        return sorted(thread.name for thread in threads if thread.is_alive())
+
+    def _restore_background_blockers(self) -> list[str]:
+        blockers: list[threading.Thread] = []
+        for name in (
+            "_startup_maintenance_thread",
+            "_planning_episode_download_thread",
+            "_jiten_refresh_thread",
+            "_irodori_install_thread",
+        ):
+            thread = getattr(self, name, None)
+            if isinstance(thread, threading.Thread) and thread.is_alive():
+                blockers.append(thread)
+        with self._irodori_tts_lock:
+            blockers.extend(
+                thread for thread in self._irodori_tts_threads.values()
+                if thread.is_alive()
+            )
+        return sorted({thread.name for thread in blockers})
+
+    def _reload_runtime_services_after_restore(self) -> None:
+        self.config = load_config(self.config_path)
+        self.manager = AnimeManager(self.config, log=self.logger.info)
+        self._configure_database_services()
+        self.light_novels = LightNovelService(self.config, logger=self.logger)
+        self.manga = MangaService(
+            self.manager.db,
+            cache_dir=self.config.paths.cache_dir,
+            python=python_executable(),
+            work_scheduler=self.manager.work_scheduler,
+        )
+        self.audiobooks = AudiobookService(
+            self.manager.db,
+            ffprobe=self.config.tools.ffprobe,
+            mpv=self.config.tools.mpv,
+            cache_dir=self.config.paths.cache_dir,
+            cover_cache_dir=self.config.library.cover_cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
+            python=python_executable(),
+            stt_model=self.config.sync.japanese_stt_model,
+            job_center=self.job_center,
+            work_scheduler=self.manager.work_scheduler,
+        )
+        self._ui_state_cache.invalidate()
+        self._planning_search_cache = MetadataCache(
+            self.config.paths.cache_dir,
+            "anilist-planning-search",
+            schema="v2",
+        )
+        self.debug_snapshots = DebugSnapshotService(
+            self.manager,
+            cache_dir=self.config.paths.cache_dir,
+            runtime_log_path=DEFAULT_LOG_PATH,
+        )
+
     def close(self) -> None:
         # Cmd+Q means Pudge goes fully idle: no scheduled maintenance and no
         # detached torrent sidecar continuing to download or seed in the background.
@@ -641,13 +712,26 @@ class WebAppApi:
         if streaming is not None:
             streaming.close()
         self.energy_monitor.stop()
-        self.audiobooks.stop_all()
+        manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
+        audiobook_close = getattr(self.audiobooks, "close", None)
+        if callable(audiobook_close):
+            audiobook_lingering = list(audiobook_close(timeout=5.0) or [])
+        else:
+            self.audiobooks.stop_all()
+            audiobook_lingering = []
         self.visual_novels.stop()
         supervisor = getattr(self, "task_supervisor", None)
-        if supervisor is not None:
-            supervisor.shutdown(timeout=5.0)
+        supervisor_lingering = list(
+            (supervisor.shutdown(timeout=5.0) if supervisor is not None else []) or []
+        )
+        lingering = [*manga_lingering, *audiobook_lingering, *supervisor_lingering]
+        if lingering:
+            self.logger.warning(
+                "WAIT step=app.shutdown lingering=%s",
+                ",".join(sorted(set(lingering))),
+            )
         safe_mode = getattr(self, "safe_mode", None)
-        if safe_mode is not None:
+        if safe_mode is not None and not lingering:
             safe_mode.finish_cleanly()
 
     def _close_window_for_uninstall(self) -> None:
@@ -822,6 +906,11 @@ class WebAppApi:
 
     def visual_novel_stop(self) -> dict[str, Any]:
         return self.visual_novels.stop()
+
+    def visual_novel_set_dialogue_region(
+        self, x: float, y: float, width: float, height: float
+    ) -> dict[str, Any]:
+        return self.visual_novels.set_dialogue_region(x, y, width, height)
 
     def visual_novel_parse(self, text: str) -> dict[str, Any]:
         return self.light_novels.parse_study_text(str(text or ""))
@@ -2282,10 +2371,15 @@ class WebAppApi:
                     # is attached so the UI cannot offer another duplicate download.
                     download = home_download(anime.media_id, anime.next_episode)
                     if download is not None:
+                        raw_state = str(download.state or "")
+                        effective_state = raw_state
+                        if not download_complete(download) and not self._torrent_enabled_state():
+                            effective_state = "paused"
                         base["download"] = {
                             "torrent_hash": download.torrent_hash,
                             "name": download.name,
-                            "state": download.state,
+                            "state": raw_state,
+                            "effective_state": effective_state,
                             "progress": download.progress,
                             "is_batch": download.is_batch,
                         }
@@ -2402,6 +2496,7 @@ class WebAppApi:
                     download=download,
                     action_job=action_job,
                     allow_ocr_ready=bool(self.config.matching.ocr_counts_as_ready),
+                    downloads_enabled=self._torrent_enabled_state(),
                 )
         return sections
 
@@ -2415,7 +2510,8 @@ class WebAppApi:
             # stubs intentionally provide only qBittorrent/aria2 config, though.
             # Preserve their pre-session semantics instead of crashing while
             # still making the explicit Nyaa toggle authoritative in runtime.
-            nyaa = getattr(self.config, "nyaa", None)
+            config = getattr(self, "config", None)
+            nyaa = getattr(config, "nyaa", None)
             if nyaa is not None and hasattr(nyaa, "torrents_enabled"):
                 enabled = bool(nyaa.torrents_enabled)
             else:
@@ -2424,9 +2520,12 @@ class WebAppApi:
                     try:
                         enabled = bool(checker())
                     except Exception:
-                        enabled = self._downloads_configured()
+                        enabled = True
                 else:
-                    enabled = self._downloads_configured()
+                    # Lightweight callers may construct WebAppApi without a
+                    # config object only to serialize an already-running job.
+                    # Missing configuration is not an explicit Torrent Off.
+                    enabled = True
             self._torrent_session_enabled = enabled
         if not hasattr(self, "_torrent_session_authoritative"):
             self._torrent_session_authoritative = False
@@ -2436,7 +2535,8 @@ class WebAppApi:
         lock = self._torrent_state_guard()
         with lock:
             if not bool(self._torrent_session_authoritative):
-                nyaa = getattr(self.config, "nyaa", None)
+                config = getattr(self, "config", None)
+                nyaa = getattr(config, "nyaa", None)
                 if nyaa is not None and hasattr(nyaa, "torrents_enabled"):
                     self._torrent_session_enabled = bool(nyaa.torrents_enabled)
             return bool(self._torrent_session_enabled)
@@ -2643,12 +2743,21 @@ class WebAppApi:
             str(value) for value in raw.get("_backends", []) if str(value).strip()
         ]
         primary_backend = str(raw.get("backend") or self.manager.torrent_backend_name())
+        state = str(getattr(item, "state", "") or "")
+        effective_state = state
+        if (
+            not download_complete(item)
+            and state.casefold() not in {"error", "missingfiles", "unknown"}
+            and not self._torrent_enabled_state()
+        ):
+            effective_state = "paused"
         return {
             "hash": item.torrent_hash,
             "torrent_hash": item.torrent_hash,
             "name": item.name,
             "anime_title": str(anime.title) if anime is not None else "",
-            "state": item.state,
+            "state": state,
+            "effective_state": effective_state,
             "progress": item.progress,
             "media_id": item.media_id,
             "episode": item.episode,
@@ -2860,7 +2969,12 @@ class WebAppApi:
             "episodes": episodes,
             "library": self._library_payloads(anime_by_id),
             "downloads": downloads,
-            "torrent_waiting_count": self.manager.download_intents.waiting_count(),
+            "torrent_waiting_count": sum(
+                1
+                for item in downloads
+                if str(item.get("state") or "").casefold()
+                in {"waiting", "queued", "stalled"}
+            ),
             "subtitle_jobs": jobs,
             "release_upgrades": self.manager.db.upgrade_jobs(limit=50),
             "subtitle_history": self.manager.db.subtitle_history(limit=80),
@@ -2971,12 +3085,19 @@ class WebAppApi:
         if manager_config is not None and getattr(manager_config, "nyaa", None) is not None:
             manager_config.nyaa.torrents_enabled = bool(enabled)
         if not enabled:
+            paused = self._paused_torrent_count()
+            # Torrent traffic status is about backend jobs, not logical
+            # download intents. A stale intent can legitimately survive after
+            # discovery concludes that there is nothing to start; surfacing it
+            # here as `waiting` makes Torrent Off claim traffic is pending when
+            # no backend job exists.
             result = {
                 "enabled": False,
                 "download_speed": 0,
                 "upload_speed": 0,
                 "active": 0,
-                "waiting": self.manager.download_intents.waiting_count(),
+                "waiting": 0,
+                "paused": paused,
                 "updated_at": time.time(),
             }
             self._last_torrent_traffic = result
@@ -2988,7 +3109,7 @@ class WebAppApi:
             down = 0
             up = 0
             active = 0
-            waiting = self.manager.download_intents.waiting_count()
+            waiting = 0
             for backend, client in self.manager.torrent_clients():
                 try:
                     if backend == "aria2" and isinstance(client, Aria2Client):
@@ -3029,6 +3150,7 @@ class WebAppApi:
                 "upload_speed": up,
                 "active": active,
                 "waiting": waiting,
+                "paused": 0,
                 "updated_at": time.time(),
             }
             self._last_torrent_traffic = result
@@ -3036,8 +3158,64 @@ class WebAppApi:
         finally:
             self._torrent_traffic_lock.release()
 
+    def _paused_torrent_count(self) -> int:
+        db = getattr(getattr(self, "manager", None), "db", None)
+        loader = getattr(db, "downloads", None)
+        if not callable(loader):
+            return 0
+        try:
+            return sum(1 for item in loader() if not download_complete(item))
+        except Exception:
+            return 0
+
+    def _resume_incomplete_torrent_jobs(self) -> int:
+        db = getattr(getattr(self, "manager", None), "db", None)
+        loader = getattr(db, "downloads", None)
+        clients = getattr(getattr(self, "manager", None), "torrent_clients", None)
+        if not callable(loader) or not callable(clients):
+            return 0
+        try:
+            rows = [item for item in loader() if not download_complete(item)]
+        except Exception:
+            return 0
+        if not rows:
+            return 0
+
+        resumed = 0
+        for backend, client in clients():
+            try:
+                for item in rows:
+                    torrent_hash = str(getattr(item, "torrent_hash", "") or "").strip()
+                    if not torrent_hash:
+                        continue
+                    raw = dict(getattr(item, "raw", {}) or {})
+                    declared = {
+                        str(value).casefold()
+                        for value in raw.get("_backends", [])
+                        if str(value).strip()
+                    }
+                    primary = str(raw.get("backend") or "").casefold()
+                    if declared and str(backend).casefold() not in declared:
+                        continue
+                    if not declared and primary and str(backend).casefold() != primary:
+                        continue
+                    try:
+                        client.start(torrent_hash)
+                        resumed += 1
+                    except Exception as exc:
+                        self.logger.debug(
+                            "Torrent resume skipped backend=%s hash=%s error=%s",
+                            backend,
+                            torrent_hash,
+                            exc,
+                        )
+            finally:
+                client.close()
+        return resumed
+
     def _torrent_toggle_auto_search(self) -> None:
         started = 0
+        resumed = 0
         try:
             # UI-state versioning is cache bookkeeping, not part of enabling
             # torrent traffic. Keep SQLite entirely off the acknowledgement
@@ -3048,6 +3226,9 @@ class WebAppApi:
                 self.logger.warning(
                     "RETRY step=torrent.toggle_ui_version error=%r", str(exc)
                 )
+            # Resume retained jobs first. This never submits a new torrent and
+            # keeps an off -> on transition from duplicating unfinished work.
+            resumed = int(self._resume_incomplete_torrent_jobs() or 0)
             # Discovery is follow-up work as well.
             started = int(self.manager.auto_search_current() or 0)
         except Exception as exc:
@@ -3056,7 +3237,11 @@ class WebAppApi:
             ui_state_cache = getattr(self, "_ui_state_cache", None)
             if ui_state_cache is not None:
                 ui_state_cache.invalidate()
-            self.logger.info("EVENT torrent.toggle_search finished started=%s", started)
+            self.logger.info(
+                "EVENT torrent.toggle_search finished resumed=%s started=%s",
+                resumed,
+                started,
+            )
 
     def set_torrents_enabled(self, enabled: bool) -> dict[str, Any]:
         requested = bool(enabled)
@@ -4316,23 +4501,106 @@ class WebAppApi:
             running = bool(thread is not None and thread.is_alive())
         if not state:
             state = {"state": "ready" if cache["complete"] else "idle", "errors": []}
+        live_processed_raw = state.get("processed_pages", state.get("cached_pages"))
         state.update(cache)
         state["running"] = running
         if cache["complete"] and not running:
             state["state"] = "ready"
+
+        total = max(0, int(cache.get("total_pages") or 0))
+        completed = max(0, min(total, int(cache.get("completed_pages") or 0)))
+        try:
+            live_processed = (
+                max(0, min(total, int(live_processed_raw)))
+                if live_processed_raw is not None
+                else completed
+            )
+        except (TypeError, ValueError):
+            live_processed = completed
+        processed = max(completed, live_processed) if running else completed
+        failed = max(0, min(total - completed, int(cache.get("failed_pages") or 0)))
+        pending = max(0, total - completed - failed)
+        state_name = str(state.get("state") or "idle")
+        current_raw = state.get("page_index")
+        try:
+            current_index = int(current_raw) if current_raw is not None else None
+        except (TypeError, ValueError):
+            current_index = None
+
+        processing = 0
+        queued = 0
+        if running and state_name == "queued":
+            queued = pending
+        elif running and state_name == "running":
+            processing = 1 if pending > 0 and current_index is not None else 0
+            queued = max(0, pending - processing)
+        # ``parsing`` is post-OCR Jiten preparation. It must not make a persisted
+        # OCR page look queued/processing again.
+        not_started = max(0, total - completed - failed - queued - processing)
+        state.update(
+            {
+                "completed": completed,
+                "processed_pages": processed,
+                "queued": queued,
+                "processing": processing,
+                "failed": failed,
+                "not_started": not_started,
+                "current_page_index": current_index if processing else None,
+                "current_page": (current_index + 1) if processing and current_index is not None else None,
+                "page_state_consistent": (
+                    completed + queued + processing + failed + not_started == total
+                ),
+            }
+        )
         return state
 
     def _run_manga_book_ocr(self, book_id: int) -> None:
-        def on_progress(done: int, total: int, page_index: int | None) -> None:
+        def on_progress(
+            done: int,
+            total: int,
+            page_index: int | None,
+            phase: str = "ocr",
+        ) -> None:
+            phase_name = str(phase or "ocr")
             with self._manga_book_ocr_lock:
+                previous = dict(self._manga_book_ocr_state.get(book_id, {}))
+                previous_processed = max(
+                    0, int(previous.get("processed_pages") or previous.get("cached_pages") or 0)
+                )
+                previous_prepared = max(
+                    previous_processed,
+                    int(previous.get("prepared_pages") or previous_processed),
+                )
+                if phase_name == "detecting":
+                    processed = previous_processed
+                    prepared = max(previous_prepared, int(done))
+                    cached = max(0, int(previous.get("cached_pages") or 0))
+                    state_name = "preparing"
+                else:
+                    processed = max(previous_processed, int(done))
+                    prepared = max(previous_prepared, processed)
+                    cached = int(done)
+                    state_name = "running"
                 self._manga_book_ocr_state[book_id] = {
-                    "state": "running",
+                    "state": state_name,
+                    "phase": phase_name,
                     "running": True,
-                    "cached_pages": int(done),
+                    "cached_pages": cached,
+                    "processed_pages": processed,
+                    "prepared_pages": prepared,
                     "total_pages": int(total),
                     "page_index": page_index,
                     "errors": [],
                 }
+            self.logger.info(
+                "EVENT manga_ocr.progress book_id=%s phase=%s processed=%s prepared=%s total=%s current_page=%s",
+                book_id,
+                phase_name,
+                processed,
+                prepared,
+                int(total),
+                (int(page_index) + 1) if page_index is not None else None,
+            )
             job_id = self._manga_ocr_job_ids.get(book_id, "")
             if job_id:
                 self.job_center.update(
@@ -4345,11 +4613,32 @@ class WebAppApi:
 
         try:
             cancel_event = self._manga_ocr_cancel_events.get(book_id)
-            result = self.manga.ocr_book(
-                book_id,
-                progress=on_progress,
-                cancelled=cancel_event.is_set if cancel_event is not None else None,
-            )
+            while True:
+                result = self.manga.ocr_book(
+                    book_id,
+                    progress=on_progress,
+                    cancelled=cancel_event.is_set if cancel_event is not None else None,
+                )
+                if not result.get("preempted"):
+                    break
+                self.logger.info(
+                    "YIELD step=manga_ocr.book book_id=%s reason=higher_priority_user_work cached=%s",
+                    book_id,
+                    result.get("cached_pages", 0),
+                )
+                with self._manga_book_ocr_lock:
+                    previous = dict(self._manga_book_ocr_state.get(book_id, {}))
+                    self._manga_book_ocr_state[book_id] = {
+                        **previous,
+                        **result,
+                        "state": "queued",
+                        "phase": "yielded",
+                        "running": True,
+                    }
+                if cancel_event is not None and cancel_event.is_set():
+                    result = {**result, "cancelled": True, "preempted": False}
+                    break
+                time.sleep(0.05)
             if result.get("cancelled"):
                 with self._manga_book_ocr_lock:
                     self._manga_book_ocr_state[book_id] = {
@@ -4662,6 +4951,13 @@ class WebAppApi:
     def manga_set_position(self, book_id: int, page_index: int) -> dict[str, Any]:
         self.manga.set_position(int(book_id), int(page_index))
         return {"book_id": int(book_id), "page_index": int(page_index)}
+
+    def manga_reset_progress(self, book_id: int) -> dict[str, Any]:
+        return self.manga.reset_progress(int(book_id))
+
+    def manga_reset_progress_many(self, book_ids: list[int]) -> dict[str, Any]:
+        books = [self.manga.reset_progress(int(book_id)) for book_id in book_ids]
+        return {"ok": True, "books": books}
 
     def manga_mark_read(self, book_id: int, page_index: int) -> dict[str, Any]:
         return self.manga.mark_read(int(book_id), int(page_index))
@@ -5250,12 +5546,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         target_language: str = "",
         media_id: int | None = None,
     ) -> dict[str, Any]:
-        return self.light_novels.translate_selection(
-            str(text or ""),
-            str(context or ""),
-            str(target_language or "") or None,
-            int(media_id) if media_id else None,
-        )
+        return self.translate_text(text, context, target_language, media_id)
 
     def choose_light_novel_file(self) -> dict[str, Any]:
         if self.window is None:
@@ -5983,16 +6274,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.light_novels.decks(str(backend or "jiten"))
 
     def light_novel_study_action(self, payload: dict[str, Any]) -> dict[str, Any]:
-        payload = payload or {}
-        return self.light_novels.study_action(
-            str(payload.get("backend") or self.light_novels.settings().study_backend),
-            str(payload.get("action") or "review"),
-            int(payload.get("word_id") or 0),
-            int(payload.get("reading_index") or 0),
-            grade=str(payload.get("grade") or "good"),
-            sentence=str(payload.get("sentence") or ""),
-            deck_id=payload.get("deck_id"),
-        )
+        return self.study_action(payload)
 
     def light_novel_search_nyaa(
         self,
@@ -11149,18 +11431,37 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def debug_reselect_subtitles(self, video_path: str) -> dict[str, Any]:
         video = Path(str(video_path)).expanduser().resolve()
         result = self.manager.force_fresh_subtitle_selection(video)
+        priority_token = self.manager.work_scheduler.begin_priority_request(
+            WorkPriority.USER,
+            name="subtitle-debug-fresh",
+        )
         def worker() -> None:
             try:
-                with maintenance_lock(self.config.paths.cache_dir, blocking=True) as acquired:
-                    if acquired:
-                        self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
+                # Manual UI work must enter the priority queue immediately.
+                # The heavy scheduler, not maintenance.lock, serializes the
+                # expensive preparation against background OCR.
+                self.manager.process_subtitle_jobs(
+                    limit=1,
+                    preferred_paths=[video],
+                    wait_for_slot=True,
+                )
             except Exception as exc:
-                self.logger.exception("FAIL step=subtitle.debug_fresh_background video=%r error=%r", str(video), str(exc))
-        self.task_supervisor.start(
-            name=f"{APP_SLUG}-debug-fresh-subtitles",
-            target=worker,
-            replace=True,
-        )
+                self.logger.exception(
+                    "FAIL step=subtitle.debug_fresh_background video=%r error=%r",
+                    str(video),
+                    str(exc),
+                )
+            finally:
+                self.manager.work_scheduler.end_priority_request(priority_token)
+        try:
+            self.task_supervisor.start(
+                name=f"{APP_SLUG}-debug-fresh-subtitles",
+                target=worker,
+                replace=True,
+            )
+        except Exception:
+            self.manager.work_scheduler.end_priority_request(priority_token)
+            raise
         return result
 
     def export_anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
@@ -11451,54 +11752,85 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not result:
                 return {"ok": False, "cancelled": True}
             selected = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
-            restored = restore_backup(
-                archive_path=selected,
-                config_path=self.config_path,
-                database_path=self.config.library.database_path,
-                cache_dir=self.config.paths.cache_dir,
-            )
-            self.audiobooks.stop_all()
-            self.config = load_config(self.config_path)
-            self.manager = AnimeManager(self.config, log=self.logger.info)
-            self._configure_database_services()
-            self.light_novels = LightNovelService(self.config, logger=self.logger)
-            self.manga = MangaService(
-                self.manager.db,
-                cache_dir=self.config.paths.cache_dir,
-                python=python_executable(),
-                work_scheduler=self.manager.work_scheduler,
-            )
-            self.audiobooks = AudiobookService(
-                self.manager.db,
-                ffprobe=self.config.tools.ffprobe,
-                mpv=self.config.tools.mpv,
-                cache_dir=self.config.paths.cache_dir,
-                cover_cache_dir=self.config.library.cover_cache_dir,
-                ffmpeg=self.config.tools.ffmpeg,
-                python=python_executable(),
-                stt_model=self.config.sync.japanese_stt_model,
-                job_center=self.job_center,
-                work_scheduler=self.manager.work_scheduler,
-            )
-            if not self.safe_mode.active:
-                self.task_supervisor.start(
-                    name="audiobook-stt-resume",
-                    target=self.audiobooks.resume_pending_transcriptions,
-                    replace=True,
-                )
-            self._ui_state_cache.invalidate()
-            self._planning_search_cache = MetadataCache(
-                self.config.paths.cache_dir,
-                "anilist-planning-search",
-                schema="v2",
-            )
-            self.debug_snapshots = DebugSnapshotService(
-                self.manager,
-                cache_dir=self.config.paths.cache_dir,
-                runtime_log_path=DEFAULT_LOG_PATH,
-            )
-            self.logger.info("DONE step=backup.restore path=%r", str(selected))
-            return {"ok": True, **restored, "state": self.get_state()}
+
+            with self._restore_lock:
+                blockers = self._restore_background_blockers()
+                if blockers:
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": "Background work is still active",
+                        "workers": blockers,
+                    }
+                with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
+                    if not acquired:
+                        return {
+                            "ok": False,
+                            "busy": True,
+                            "error": "Maintenance is active; retry restore after it finishes",
+                        }
+
+                    self._stop_scheduled_agent()
+                    supervisor = self.task_supervisor
+                    supervisor_lingering = supervisor.quiesce(timeout=5.0)
+                    if supervisor_lingering:
+                        supervisor.resume()
+                        self._start_scheduled_agent()
+                        return {
+                            "ok": False,
+                            "busy": True,
+                            "error": "Background tasks did not quiesce",
+                            "workers": supervisor_lingering,
+                        }
+
+                    manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
+                    if manga_lingering:
+                        supervisor.resume()
+                        self._start_scheduled_agent()
+                        return {
+                            "ok": False,
+                            "busy": True,
+                            "error": "Manga OCR is still stopping",
+                            "workers": manga_lingering,
+                        }
+
+                    audiobook_lingering = self.audiobooks.close(timeout=5.0)
+                    if audiobook_lingering:
+                        supervisor.resume()
+                        self._start_scheduled_agent()
+                        return {
+                            "ok": False,
+                            "busy": True,
+                            "error": "Audiobook workers did not stop",
+                            "workers": audiobook_lingering,
+                            "restart_required": True,
+                        }
+
+                    try:
+                        restored = restore_backup(
+                            archive_path=selected,
+                            config_path=self.config_path,
+                            database_path=self.config.library.database_path,
+                            cache_dir=self.config.paths.cache_dir,
+                        )
+                        self._reload_runtime_services_after_restore()
+                    except Exception:
+                        # restore_backup rolls live files back atomically. Rebind
+                        # services to that rolled-back state before surfacing error.
+                        self._reload_runtime_services_after_restore()
+                        raise
+                    finally:
+                        supervisor.resume()
+                        self._start_scheduled_agent()
+
+                    if not self.safe_mode.active:
+                        self.task_supervisor.start(
+                            name="audiobook-stt-resume",
+                            target=self.audiobooks.resume_pending_transcriptions,
+                            replace=True,
+                        )
+                    self.logger.info("DONE step=backup.restore path=%r", str(selected))
+                    return {"ok": True, **restored, "state": self.get_state()}
         except Exception as exc:
             self.logger.exception("FAIL step=backup.restore")
             return {"ok": False, "cancelled": False, "error": str(exc)}

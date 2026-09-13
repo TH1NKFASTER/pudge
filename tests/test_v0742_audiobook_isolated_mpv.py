@@ -12,7 +12,7 @@ SOURCE = SOURCE_PATH.read_text(encoding="utf-8")
 def _play_command_literals() -> list[str]:
     tree = ast.parse(SOURCE)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name != "play":
+        if not isinstance(node, ast.FunctionDef) or node.name not in {"play", "_play_locked"}:
             continue
         for child in ast.walk(node):
             if not isinstance(child, ast.Assign):
@@ -32,7 +32,7 @@ def _play_command_literals() -> list[str]:
             ]
             if "--no-video" in values:
                 return values
-    raise AssertionError("Audiobook mpv command was not found")
+    raise AssertionError("Audiobook mpv command was not found in play/_play_locked")
 
 
 def test_audiobook_mpv_ignores_all_user_config_and_scripts() -> None:

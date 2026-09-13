@@ -83,7 +83,7 @@ def test_manga_service_reader_prefers_artifact_over_database_cache(tmp_path: Pat
     with db.connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-            "VALUES(?,0,'pudge-manga-regions-v5',?,1)",
+            "VALUES(?,0,'pudge-manga-regions-v59-layout-token-geometry',?,1)",
             (
                 book_id,
                 json.dumps(
@@ -154,7 +154,7 @@ def test_backend_exposes_reversible_alignment_and_manga_artifact_contracts() -> 
     assert "vision-original" in manga
     assert "vision-contrast" in manga
     assert "vision-inverted" in manga
-    assert "full-page-fallback" in manga
+    assert "full-page-fallback" not in manga
     assert "def ocr_artifact(" in manga
     assert "pudge-alignment-pipeline-v1" in audiobooks
     assert "def alignment_report(" in audiobooks

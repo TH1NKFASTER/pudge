@@ -99,6 +99,7 @@ def derive_episode_presentation(
     action_job: Any = None,
     watched_externally: bool = False,
     allow_ocr_ready: bool = True,
+    downloads_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Return one canonical user-facing episode status.
 
@@ -167,7 +168,9 @@ def derive_episode_presentation(
         )
         if error:
             status = "download_error"
-        elif state in {"paused", "stopped", "waiting", "queued"} and progress <= 0:
+        elif downloads_enabled is False or state in {"paused", "stopped"}:
+            status = "paused_download"
+        elif state in {"waiting", "queued"} and progress <= 0:
             status = "waiting_download"
         else:
             status = "downloading"

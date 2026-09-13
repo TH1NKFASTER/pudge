@@ -15,6 +15,7 @@ class ManagedTask:
     started_at: float = field(default_factory=time.time)
     finished_at: float = 0.0
     error: str = ""
+    cooperative_cancel: bool = False
 
     @property
     def running(self) -> bool:
@@ -30,6 +31,7 @@ class TaskSupervisor:
         self._tasks: dict[str, ManagedTask] = {}
         self._processes: dict[str, subprocess.Popen[Any]] = {}
         self._closed = False
+        self._suspended = False
 
     def _log(self, level: str, message: str, *args: object) -> None:
         callback = getattr(self.logger, level, None)
@@ -55,11 +57,20 @@ class TaskSupervisor:
         with self._lock:
             if self._closed:
                 raise RuntimeError("task supervisor is closed")
+            if self._suspended:
+                raise RuntimeError("task supervisor is suspended")
             existing = self._tasks.get(task_name)
             if existing is not None and existing.running:
                 if not replace:
                     return existing
                 existing.cancel_event.set()
+                if not existing.cooperative_cancel:
+                    self._log(
+                        "warning",
+                        "SKIP step=task_supervisor.replace name=%s reason=non_cooperative",
+                        task_name,
+                    )
+                    return existing
             cancel_event = threading.Event()
             arguments = tuple(args)
             holder: dict[str, ManagedTask] = {}
@@ -78,7 +89,7 @@ class TaskSupervisor:
                     task.finished_at = time.time()
 
             thread = threading.Thread(target=runner, name=task_name, daemon=daemon)
-            task = ManagedTask(task_name, thread, cancel_event)
+            task = ManagedTask(task_name, thread, cancel_event, cooperative_cancel=pass_cancel_event)
             holder["task"] = task
             self._tasks[task_name] = task
             thread.start()
@@ -104,35 +115,68 @@ class TaskSupervisor:
         cancel_event: threading.Event | None = None,
         timeout: float | None = None,
         **kwargs: Any,
-    ) -> tuple[int, bytes, bytes]:
-        """Run a cancellable child process without an unbounded communicate()."""
+    ) -> tuple[int, Any, Any]:
+        """Run a cancellable child while continuously draining stdout/stderr.
+
+        Repeated ``communicate(timeout=...)`` calls keep pipe reader threads active,
+        so a verbose child cannot deadlock on a full PIPE before it exits.
+        """
 
         started = time.monotonic()
-        process = subprocess.Popen(list(command), **kwargs)
         with self._lock:
             if self._closed:
-                process.terminate()
                 raise RuntimeError("task supervisor is closed")
+            if self._suspended:
+                raise RuntimeError("task supervisor is suspended")
+        process = subprocess.Popen(list(command), **kwargs)
+        with self._lock:
+            if self._closed or self._suspended:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+                state = "closed" if self._closed else "suspended"
+                raise RuntimeError(f"task supervisor is {state}")
             self._processes[str(name)] = process
         try:
-            while process.poll() is None:
-                if cancel_event is not None and cancel_event.wait(0.1):
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=0.10)
+                    return int(process.returncode or 0), stdout or b"", stderr or b""
+                except subprocess.TimeoutExpired:
+                    pass
+
+                if cancel_event is not None and cancel_event.is_set():
                     process.terminate()
-                    break
+                    try:
+                        stdout, stderr = process.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, stderr = process.communicate()
+                    return int(process.returncode or 0), stdout or b"", stderr or b""
+
                 if timeout is not None and time.monotonic() - started >= float(timeout):
                     process.terminate()
+                    try:
+                        process.communicate(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.communicate()
                     raise subprocess.TimeoutExpired(list(command), timeout)
-                if cancel_event is None:
-                    time.sleep(0.1)
-            try:
-                stdout, stderr = process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
-            return int(process.returncode or 0), stdout or b"", stderr or b""
         finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
             with self._lock:
-                self._processes.pop(str(name), None)
+                current = self._processes.get(str(name))
+                if current is process:
+                    self._processes.pop(str(name), None)
 
     def status(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -148,25 +192,67 @@ class TaskSupervisor:
                 for task in self._tasks.values()
             ]
 
-    def shutdown(self, *, timeout: float = 5.0) -> None:
+    def suspend(self) -> None:
         with self._lock:
-            self._closed = True
-            tasks = list(self._tasks.values())
-            processes = list(self._processes.values())
+            if self._closed:
+                raise RuntimeError("task supervisor is closed")
+            self._suspended = True
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("task supervisor is closed")
+            self._suspended = False
+
+    def _quiesce_owned(self, *, timeout: float) -> list[str]:
+        with self._lock:
+            tasks = [task for task in self._tasks.values() if task.running]
+            processes = [
+                (name, process) for name, process in self._processes.items() if process.poll() is None
+            ]
             for task in tasks:
                 task.cancel_event.set()
-            for process in processes:
-                if process.poll() is None:
+            for _name, process in processes:
+                try:
                     process.terminate()
+                except OSError:
+                    pass
+
         deadline = time.monotonic() + max(0.0, float(timeout))
         for task in tasks:
-            remaining = max(0.0, deadline - time.monotonic())
-            if task.thread is not threading.current_thread():
-                task.thread.join(remaining)
-        for process in processes:
+            if task.thread is threading.current_thread():
+                continue
+            task.thread.join(max(0.0, deadline - time.monotonic()))
+
+        for _name, process in processes:
             if process.poll() is not None:
                 continue
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                process.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
-                process.kill()
+                try:
+                    process.kill()
+                    process.wait(timeout=1.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+        lingering: list[str] = []
+        with self._lock:
+            for task in tasks:
+                if task.running:
+                    lingering.append(task.name)
+            for name, process in processes:
+                if process.poll() is None:
+                    lingering.append(f"process:{name}")
+        return lingering
+
+    def quiesce(self, *, timeout: float = 5.0) -> list[str]:
+        self.suspend()
+        return self._quiesce_owned(timeout=timeout)
+
+    def shutdown(self, *, timeout: float = 5.0) -> list[str]:
+        with self._lock:
+            self._closed = True
+            self._suspended = True
+        return self._quiesce_owned(timeout=timeout)

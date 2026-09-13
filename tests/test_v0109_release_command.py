@@ -7,7 +7,7 @@ RELEASE = ROOT / "scripts" / "release.py"
 
 def test_make_release_requires_version_and_uses_release_helper() -> None:
     source = MAKEFILE.read_text(encoding="utf-8")
-    assert 'Usage: make release VERSION=0.7.23' in source
+    assert 'Usage: make release VERSION=' in source
     assert 'scripts/release.py "$(VERSION)" --python "$(PYTHON)"' in source
     assert ".venv-test/bin/python" in source.splitlines()[0]
     assert "build-release:" in source
