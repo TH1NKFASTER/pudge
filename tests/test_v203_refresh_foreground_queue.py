@@ -57,5 +57,6 @@ def test_refresh_ui_forces_state_render_and_explains_playback_block() -> None:
     assert "renderDataPages(true)" in html
     assert "ui.currentRenderSignature=''" in html
     assert "ui.subtitleForegroundBlocked?5000:500" in html
-    assert "15000:5000" in html
+    assert "if(hidden)return 60000" in html
+    assert "if(ui.subtitleForegroundBlocked)return 5000" in html
     assert "Ремонт субтитров поставлен в очередь; жду окончания воспроизведения…" in html

@@ -26,6 +26,7 @@ from .anilist_tracking import (
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config, write_default_config
 from .branding import APP_CLI, APP_NAME
 from .database import Database
+from .consumption import ConsumptionLedger
 from .filename import fold_search_title, normalize_title, parse_anime_filename
 from .episode_numbering import (
     aliases_from_offset,
@@ -452,7 +453,20 @@ def _run_playback_save(args: argparse.Namespace, config: AppConfig) -> int:
         return 2
     video = args.playback_video.expanduser().resolve()
     try:
-        Database(config.library.database_path).record_playback(
+        database = Database(config.library.database_path)
+        # Record the bounded active interval before mutating resume progress so
+        # the ledger can retain the previous media-clock locator. Ledger
+        # failures must never block ordinary resume-position persistence.
+        try:
+            ConsumptionLedger(database).record_anime_playback(
+                video,
+                position=args.playback_position,
+                duration=args.playback_duration,
+                active_seconds=args.playback_active_seconds,
+            )
+        except Exception as exc:
+            print(f"Consumption ledger warning: {exc}", file=sys.stderr)
+        database.record_playback(
             video,
             args.playback_position,
             args.playback_duration,

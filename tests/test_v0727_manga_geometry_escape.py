@@ -54,12 +54,12 @@ class _Observation:
 
 
 def test_manga_geometry_generation_invalidates_old_regions_and_artifact(tmp_path: Path) -> None:
-    assert _REGION_CACHE_KEY == "pudge-manga-regions-v59-layout-token-geometry"
+    assert _REGION_CACHE_KEY == "pudge-manga-regions-v96p27-orphan-vertical-ink"
     service = object.__new__(MangaService)
     service.cache_dir = tmp_path
     service._book = lambda _book_id: {"source_fingerprint": "source-123"}  # type: ignore[method-assign]
     path = service._ocr_artifact_path(1)
-    assert path.name == "source-123-regions-v59.json"
+    assert path.name == "source-123-regions-v96p27.json"
 
 
 def test_vision_rectangle_uses_character_box_union_when_it_recovers_vertical_extent() -> None:
@@ -159,11 +159,16 @@ def test_manga_token_layout_uses_ocr_geometry_and_keeps_separate_hit_slop() -> N
 def test_escape_closes_shared_jiten_card_before_reader_shortcuts() -> None:
     root = Path(__file__).resolve().parents[1]
     js = (root / "pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    marker = "event.key !== 'Escape'"
-    assert marker in js
-    start = js.index(marker)
-    block = js[start : start + 650]
-    assert "pudgeStudyCard" in block
-    assert "classList.contains('open')" in block
-    assert "event.stopImmediatePropagation();" in block
-    assert "closeStudyCard();" in block
+    html = (root / "pudge/web/index.html").read_text(encoding="utf-8")
+
+    # Escape is owned by the global capture dispatcher. Reading tools expose a
+    # synchronous close API so the dispatcher can close the shared Jiten card
+    # before the manga reader handles its own local surface.
+    assert "closeIfOpen()" in js
+    assert "closeStudyCard(); return true;" in js
+    dispatcher = html.split("// pudge-r1-escape-dispatch-start", 1)[1].split(
+        "// pudge-r1-escape-dispatch-end", 1
+    )[0]
+    assert dispatcher.index("window.PudgeReadingTools?.closeIfOpen?.()") < dispatcher.index(
+        "window.PudgeMangaReaderV2?.closeEscapeSurface?.()"
+    )

@@ -148,6 +148,7 @@ def test_scheduled_agent_runs_due_subtitle_job_without_general_poll(monkeypatch,
     )
     monkeypatch.setattr(agent, "load_config", lambda _path: config)
     monkeypatch.setattr(agent, "app_session_active", lambda: True)
+    monkeypatch.setattr(agent, "app_session_window_active", lambda: False)
     monkeypatch.setattr(agent, "AnimeManager", FakeManager)
     monkeypatch.setattr(agent.time, "time", lambda: now)
 

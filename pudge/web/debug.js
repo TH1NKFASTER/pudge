@@ -151,10 +151,5 @@
     window.toast?.(`${labels().exported}: ${result.path||''}`);
   };
 
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && document.getElementById('pudgeDebugOverlay')?.classList.contains('open')) {
-      event.preventDefault(); close();
-    }
-  });
   window.PudgeDebug = {open, close, exportCurrent: exportJson};
 })();

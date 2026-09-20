@@ -284,7 +284,10 @@ class AnimeManager:
         self.logger = configure_logging()
         self.log = log or self.logger.info
         self.work_scheduler = WorkScheduler(
-            config.paths.cache_dir, logger=self.logger
+            config.paths.cache_dir,
+            logger=self.logger,
+            power_manual_enabled=config.power.manual_energy_saving,
+            power_auto_enabled=config.power.auto_battery_energy_saving,
         )
         self.identity_resolver = IdentityResolver(self.db)
         self.release_telemetry = ReleaseTelemetryService(self.db)
@@ -390,22 +393,52 @@ class AnimeManager:
             if media_id is not None and episode is not None
             else f"ready_notification:file:{hashlib.sha256(str(video).encode()).hexdigest()}"
         )
-        if self.db.get_state(episode_key, ""):
-            return
 
         anime = self.db.get_anime(media_id) if media_id is not None else None
+        schedule_loader = getattr(self.db, "personal_release_schedule", None)
+        personal_schedule = (
+            schedule_loader(int(media_id))
+            if media_id is not None and callable(schedule_loader) else None
+        )
         if anime is not None and episode is not None:
-            next_episode = int(anime.next_episode)
-            if int(episode) != next_episode:
-                self.logger.info(
-                    "SKIP step=notification.ready media_id=%s episode=%s "
-                    "reason=not_next_unwatched next_episode=%s",
-                    media_id,
-                    episode,
-                    next_episode,
-                )
-                return
-        full_ready = bool(anime is not None and self._anime_is_fully_ready(anime))
+            if personal_schedule is not None and personal_schedule.enabled:
+                next_item = next((item for item in personal_schedule.items if item.watched_at is None), None)
+                if next_item is None or int(episode) != int(next_item.episode) or not next_item.unlocked:
+                    self.logger.info(
+                        "SKIP step=notification.ready media_id=%s episode=%s reason=personal_schedule_locked next_episode=%s unlock_at=%s",
+                        media_id, episode,
+                        int(next_item.episode) if next_item is not None else None,
+                        float(next_item.unlock_at_utc) if next_item is not None else None,
+                    )
+                    return
+                episode_key = f"personal_schedule_notification:{personal_schedule.schedule_id}:{int(episode)}:ready"
+                if self.db.get_state(episode_key, ""):
+                    return
+            else:
+                next_episode = int(anime.next_episode)
+                if int(episode) != next_episode:
+                    self.logger.info(
+                        "SKIP step=notification.ready media_id=%s episode=%s "
+                        "reason=not_next_unwatched next_episode=%s",
+                        media_id,
+                        episode,
+                        next_episode,
+                    )
+                    return
+        # Choose the dedupe key only after personal-schedule routing. A title may
+        # already have an old normal ready-notification key from its first watch;
+        # that must not suppress a later scheduled rewatch unlock.
+        if self.db.get_state(episode_key, ""):
+            return
+        scheduled_release = bool(personal_schedule is not None and personal_schedule.enabled)
+        # A completed rewatch may already have every file/subtitle locally ready.
+        # The personal overlay unlocks one episode at a time, so never collapse it
+        # into the legacy "all episodes ready" notification.
+        full_ready = bool(
+            not scheduled_release
+            and anime is not None
+            and self._anime_is_fully_ready(anime)
+        )
         full_key = (
             f"ready_notification:anime:{anime.media_id}:{anime.episodes or anime.format or 'unknown'}"
             if anime is not None
@@ -3793,11 +3826,23 @@ class AnimeManager:
         limit_bytes = int(status["limit_bytes"])
 
         downloads = {item.torrent_hash.lower(): item for item in self.db.downloads()}
+        for item in self.db.episodes():
+            if (
+                item.state == "watched"
+                and item.video_path.is_file()
+                and self.db.personal_release_item_retained(item.media_id, item.episode)
+            ):
+                self.logger.info(
+                    "SKIP step=storage.limit_delete reason=personal_schedule_retention media_id=%s episode=%s video=%r",
+                    item.media_id, item.episode, str(item.video_path),
+                )
         candidates = sorted(
             (
                 item
                 for item in self.db.episodes()
-                if item.state == "watched" and item.video_path.is_file()
+                if item.state == "watched"
+                and item.video_path.is_file()
+                and not self.db.personal_release_item_retained(item.media_id, item.episode)
             ),
             key=lambda item: (item.watched_at or 0.0, str(item.video_path)),
         )
@@ -6683,11 +6728,15 @@ class AnimeManager:
         wait_for_slot: bool = False,
     ) -> int:
         apply_jimaku_trial(self.config)
-        if not wait_for_slot and not self.work_scheduler.background_allowed():
-            self.logger.info(
-                "SKIP step=subtitle.process reason=foreground_active limit=%s", limit
-            )
-            return 0
+        if not wait_for_slot:
+            block_reason = self.work_scheduler.background_wait_reason()
+            if block_reason is not None:
+                self.logger.info(
+                    "SKIP step=subtitle.process reason=%s limit=%s",
+                    block_reason,
+                    limit,
+                )
+                return 0
         ready = 0
         if preferred_paths:
             jobs = self.db.claim_subtitle_jobs_for_paths(
@@ -6725,12 +6774,19 @@ class AnimeManager:
                 runnable_jobs.append(queued)
             jobs = runnable_jobs
 
-        def requeue_unstarted(start_index: int) -> None:
+        def scheduler_wait_detail(reason: str) -> str:
+            return {
+                "energy_saving": "Paused: energy saving",
+                "thermal": "Paused: thermal limit",
+                "foreground": "Foreground playback requested",
+            }.get(str(reason), "Background work deferred")
+
+        def requeue_unstarted(start_index: int, reason: str = "foreground") -> None:
             for queued in jobs[start_index:]:
                 queued_video = Path(str(queued["video_path"]))
                 self.db.postpone_subtitle_job(
                     queued_video,
-                    "Foreground playback requested",
+                    scheduler_wait_detail(reason),
                     60,
                     generation=int(queued["generation"] or 0),
                     owner_token=str(queued["owner_token"] or ""),
@@ -6756,14 +6812,18 @@ class AnimeManager:
                     media_id, episode, video.name,
                 )
                 continue
-            if not wait_for_slot and not self.work_scheduler.background_allowed():
-                self.db.postpone_subtitle_job(video, "Foreground playback requested", 60, **owner_kwargs)
-                self.logger.info(
-                    "RETRY step=subtitle.prepare reason=foreground_active media_id=%s episode=%s video=%s delay_s=60",
-                    job["media_id"], job["episode"], video.name,
-                )
-                requeue_unstarted(job_index + 1)
-                break
+            if not wait_for_slot:
+                block_reason = self.work_scheduler.background_wait_reason()
+                if block_reason is not None:
+                    self.db.postpone_subtitle_job(
+                        video, scheduler_wait_detail(block_reason), 60, **owner_kwargs
+                    )
+                    self.logger.info(
+                        "RETRY step=subtitle.prepare reason=%s media_id=%s episode=%s video=%s delay_s=60",
+                        block_reason, job["media_id"], job["episode"], video.name,
+                    )
+                    requeue_unstarted(job_index + 1, block_reason)
+                    break
             if not video.is_file():
                 self.logger.info(
                     "RETRY step=subtitle.prepare reason=video_missing media_id=%s episode=%s video=%s delay_s=%s",
@@ -7057,7 +7117,7 @@ class AnimeManager:
                 self.db.postpone_subtitle_job(
                     video, "Heavy media work is busy", 60, **owner_kwargs
                 )
-                requeue_unstarted(job_index + 1)
+                requeue_unstarted(job_index + 1, "heavy_busy")
                 break
             try:
                 with timed_step(
@@ -7082,7 +7142,7 @@ class AnimeManager:
                         stderr_handle.close()
                         raise
                     deadline = time.monotonic() + 20 * 60
-                    cancelled_for_foreground = False
+                    cancelled_for_policy: str | None = None
                     memory_guard_triggered = False
                     memory_guard_limit_mb = 4096.0
                     next_memory_check = time.monotonic() + 5.0
@@ -7139,8 +7199,9 @@ class AnimeManager:
                                     process.kill()
                                     process.wait(timeout=5)
                                 break
-                        if not self.work_scheduler.background_allowed():
-                            cancelled_for_foreground = True
+                        policy_reason = self.work_scheduler.background_wait_reason()
+                        if policy_reason is not None:
+                            cancelled_for_policy = policy_reason
                             process.terminate()
                             try:
                                 process.wait(timeout=5)
@@ -7209,22 +7270,32 @@ class AnimeManager:
                             video.name,
                             30 * 60,
                         )
-                        requeue_unstarted(job_index + 1)
+                        requeue_unstarted(job_index + 1, "heavy_busy")
                         break
-                    if cancelled_for_foreground:
-                        if not restore_upgrade_selection("Foreground playback requested"):
+                    if cancelled_for_policy is not None:
+                        wait_messages = {
+                            "energy_saving": "Paused: energy saving",
+                            "thermal": "Paused: thermal limit",
+                            "foreground": "Foreground playback requested",
+                        }
+                        wait_message = wait_messages.get(
+                            cancelled_for_policy,
+                            f"Paused: {cancelled_for_policy}",
+                        )
+                        if not restore_upgrade_selection(wait_message):
                             self.db.clear_subtitle_selection(video, **owner_kwargs)
                             self.db.postpone_subtitle_job(
                                 video,
-                                "Foreground playback requested",
+                                wait_message,
                                 60,
                                 **owner_kwargs,
                             )
                         self.logger.info(
-                            "RETRY step=subtitle.prepare reason=foreground_preempted media_id=%s episode=%s video=%s delay_s=60",
+                            "RETRY step=subtitle.prepare reason=%s media_id=%s episode=%s video=%s delay_s=60",
+                            cancelled_for_policy,
                             job["media_id"], job["episode"], video.name,
                         )
-                        requeue_unstarted(job_index + 1)
+                        requeue_unstarted(job_index + 1, cancelled_for_policy)
                         break
             except (OSError, subprocess.TimeoutExpired) as exc:
                 if not restore_upgrade_selection(str(exc)):
@@ -7916,6 +7987,17 @@ class AnimeManager:
                 "REPAIR step=cleanup.anilist_progress rows=%s",
                 progress_repairs,
             )
+        now = time.time()
+        for item in self.db.episodes():
+            if (
+                item.delete_after is not None
+                and float(item.delete_after) <= now
+                and self.db.personal_release_item_retained(item.media_id, item.episode)
+            ):
+                self.logger.info(
+                    "SKIP step=cleanup.item reason=personal_schedule_retention media_id=%s episode=%s video=%r",
+                    item.media_id, item.episode, str(item.video_path),
+                )
         due = self.db.due_cleanup()
         watched_due = [row for row in due if str(row["state"] or "") == "watched"]
         if (

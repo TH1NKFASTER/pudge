@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from . import __version__
-from .app_session import mark_app_running, mark_app_stopped
+from .app_session import mark_app_running, mark_app_stopped, set_app_window_active
 from .cache_management import cleanup_segment_audio_cache
 from .audiobooks import (
     AUDIOBOOK_EXTENSIONS,
@@ -41,12 +41,15 @@ from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG, DATA_DIR
 from .cache_registry import CacheRegistry
 from .config import load_config, write_config, write_torrents_enabled
 from .companion_streaming import CompanionStreamingService
+from .consumption import ConsumptionLedger
+from .consumption_statistics import ConsumptionStatistics
 from .debug_snapshot import DebugSnapshotService
 from .diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
 from .episode_state import watched_by_anilist_progress
 from .episode_numbering import resolve_episode_numbering
 from .presentation_state import derive_episode_presentation, download_complete
+from .personal_schedule import local_iso_from_epoch, preview_weekly_dates
 from .first_experience import (
     configure_mpv_study_keys,
     dependency_status,
@@ -75,6 +78,8 @@ from .providers.aria2 import Aria2Client
 from .providers.nyaa import NyaaClient
 from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
+from .review_gate import EpisodeReviewIdentity, ReviewGateStore, review_card_key
+from .review_providers import ReviewOutcomeUnknown
 from .safe_mode import SafeModeController
 from .secrets_store import keep_masked_secret, masked_secret
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
@@ -211,12 +216,32 @@ def _global_search_score(
     return best_score, best_name
 
 
+_MEDIA_IDENTITY_ANILIST_KINDS = frozenset({
+    "novel",
+    "light_novel",
+    "ln",
+    "audiobook",
+    "manga",
+})
+
+
+def _media_identity_anilist_kind(kind: str) -> str:
+    normalized = str(kind or "").strip().lower()
+    if normalized == "visual_novel":
+        raise ValueError("AniList identity is not supported for visual novels")
+    if normalized not in _MEDIA_IDENTITY_ANILIST_KINDS:
+        raise ValueError(f"Unsupported AniList media identity kind: {normalized or '<empty>'}")
+    return normalized
+
+
 class WebAppApi:
     """Local bridge used by the WKWebView application.
 
     Read methods only access SQLite and the filesystem. AniList is synchronized
     once after the window opens and can also be refreshed explicitly in Settings.
     """
+
+    PLAY_STARTUP_TIMEOUT_SECONDS = 10.0
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path.expanduser()
@@ -290,6 +315,16 @@ class WebAppApi:
         # overriding an explicit click later in the session.
         self._torrent_session_authoritative = False
         self.visual_novels = VisualNovelService(logger=self.logger)
+        self._vn_consumption_session_id = ""
+        self._vn_title_id = ""
+        self._consumption_runtime_last_audio: dict[int, dict[str, float | bool]] = {}
+        self._consumption_runtime_last_vn: dict[str, float | bool | int] = {}
+        if not self.safe_mode.active:
+            self.task_supervisor.start(
+                name="consumption-runtime-recorder",
+                target=self._consumption_runtime_loop,
+                pass_cancel_event=True,
+            )
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
@@ -323,9 +358,36 @@ class WebAppApi:
         self._play_processes: dict[str, subprocess.Popen[Any]] = {}
         self._play_started_at: dict[str, float] = {}
         self._play_exit_codes: dict[str, tuple[int, float]] = {}
+        self._play_last_logged_status: dict[str, str] = {}
         self._play_registry_path = self.config.paths.cache_dir / "active-playbacks.json"
         self._play_registry: dict[str, dict[str, Any]] = self._load_play_registry()
         self._play_lock = threading.Lock()
+        self._schedule_play_sessions: dict[str, dict[str, Any]] = {}
+        self._review_gate_lock = threading.RLock()
+        self._review_gate_store = ReviewGateStore(self.manager.db)
+        self._review_gate_candidates: dict[str, set[str]] = {}
+        self._review_gate_pending: set[str] = set()
+        self._review_gate_prefetch_cards: list[dict[str, Any]] = []
+        self._review_gate_prefetch_account_key = ""
+        self._review_gate_prefetch_session_id = ""
+        self._review_gate_prefetch_fetched_at = 0.0
+        self._review_gate_prefetch_error = ""
+        self._review_gate_prefetch_thread: threading.Thread | None = None
+        # Cards with proven review history can skip repeated history lookups during
+        # minute refreshes. Every actual mutation is still revalidated immediately
+        # before POST, so this cache is a latency optimization, not an authorization
+        # decision.
+        self._review_gate_verified_keys: set[str] = set()
+        self._review_gate_prefetch_target_count = 0
+        self._review_gate_prefetch_fetched_target = 0
+        self._review_gate_ready_anime_count = 0
+        self._review_gate_prefetch_provider_available: int | None = None
+        self._review_gate_prefetch_retry_at = 0.0
+        self._review_gate_prefetch_no_progress = 0
+        # Start warming review cards as soon as the backend exists, before the
+        # WebView is interactive enough for the user to click an episode.
+        if self.config.ui.review_gate_enabled:
+            self.review_gate_prefetch()
         self._anilist_sync_lock = threading.Lock()
         self._local_refresh_lock = threading.Lock()
         self._restore_lock = threading.Lock()
@@ -366,6 +428,10 @@ class WebAppApi:
         self._jiten_refresh_lock = threading.Lock()
         self._jiten_refresh_thread: threading.Thread | None = None
         self._jiten_refresh_job_id = ""
+        self._jiten_state_prefetch_lock = threading.Lock()
+        self._jiten_state_prefetch_thread: threading.Thread | None = None
+        self._jiten_state_prefetch_cancel_event = threading.Event()
+        self._jiten_state_prefetch_stats: dict[str, Any] = {}
         self._irodori_tts_lock = threading.RLock()
         self._irodori_tts_threads: dict[int, threading.Thread] = {}
         self._irodori_tts_job_ids: dict[int, str] = {}
@@ -411,6 +477,7 @@ class WebAppApi:
         self._ensure_energy_monitor(reason="startup")
         if not self.safe_mode.active:
             self._start_scheduled_agent()
+            self.jiten_state_prefetch()
 
     def _configure_database_services(self) -> None:
         """Rebind small controllers whenever configuration replaces the database."""
@@ -426,6 +493,8 @@ class WebAppApi:
             pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
             max_events_per_request=self.config.companion.max_events_per_request,
         )
+        self.consumption = ConsumptionLedger(self.manager.db, logger=self.logger)
+        self.consumption_statistics = ConsumptionStatistics(self.manager.db, logger=self.logger)
         self.companion_streaming = CompanionStreamingService(
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
@@ -646,6 +715,7 @@ class WebAppApi:
             "_startup_maintenance_thread",
             "_planning_episode_download_thread",
             "_jiten_refresh_thread",
+            "_jiten_state_prefetch_thread",
             "_irodori_install_thread",
         ):
             thread = getattr(self, name, None)
@@ -696,6 +766,12 @@ class WebAppApi:
     def close(self) -> None:
         # Cmd+Q means Pudge goes fully idle: no scheduled maintenance and no
         # detached torrent sidecar continuing to download or seed in the background.
+        cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
+        if isinstance(cancel, threading.Event):
+            cancel.set()
+        prefetch_thread = getattr(self, "_jiten_state_prefetch_thread", None)
+        if isinstance(prefetch_thread, threading.Thread) and prefetch_thread.is_alive():
+            prefetch_thread.join(timeout=2.0)
         self._enter_background_quiet(reason="close")
         cache_cleanup = {"removed_files": 0}
         config = getattr(self, "config", None)
@@ -713,13 +789,21 @@ class WebAppApi:
             streaming.close()
         self.energy_monitor.stop()
         manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
+        supervisor = getattr(self, "task_supervisor", None)
+        cancel_task = getattr(supervisor, "cancel", None) if supervisor is not None else None
+        if callable(cancel_task):
+            cancel_task("consumption-runtime-recorder")
         audiobook_close = getattr(self.audiobooks, "close", None)
         if callable(audiobook_close):
             audiobook_lingering = list(audiobook_close(timeout=5.0) or [])
         else:
             self.audiobooks.stop_all()
             audiobook_lingering = []
-        self.visual_novels.stop()
+        try:
+            self.visual_novel_stop()
+        except Exception as exc:
+            self.logger.warning("FAIL consumption.vn_stop_on_close error=%r", str(exc))
+            self.visual_novels.stop()
         supervisor = getattr(self, "task_supervisor", None)
         supervisor_lingering = list(
             (supervisor.shutdown(timeout=5.0) if supervisor is not None else []) or []
@@ -895,17 +979,193 @@ class WebAppApi:
     def companion_library_snapshot(self) -> dict[str, Any]:
         return self.mobile_sync.library_snapshot()
 
+    def _consumption_runtime_loop(self, cancel_event: threading.Event) -> None:
+        """Record background audio and VN runtime in bounded monotonic chunks."""
+        poll_seconds = 5.0
+        while not cancel_event.is_set():
+            monotonic_now = time.monotonic()
+            wall_now = time.time()
+            try:
+                observations = self.audiobooks.consumption_playback_observations()
+            except Exception as exc:
+                observations = []
+                self.logger.debug("SKIP consumption.audio_runtime error=%r", str(exc))
+            seen: set[int] = set()
+            for observation in observations:
+                book_id = int(observation.get("book_id") or 0)
+                if book_id <= 0:
+                    continue
+                seen.add(book_id)
+                active = bool(observation.get("active"))
+                position = float(observation.get("position") or 0.0)
+                speed = float(observation.get("speed") or 1.0)
+                previous = self._consumption_runtime_last_audio.get(book_id)
+                if previous and active and bool(previous.get("active")):
+                    mono_delta = monotonic_now - float(previous.get("monotonic") or monotonic_now)
+                    wall_delta = wall_now - float(previous.get("wall") or wall_now)
+                    # A large poll gap or wall/monotonic disagreement is sleep/wake,
+                    # scheduler starvation or a clock change. Never bill that gap.
+                    if 0.05 <= mono_delta <= 15.0 and abs(wall_delta - mono_delta) <= 2.5:
+                        try:
+                            self.consumption.record_audiobook_activity(
+                                book_id=book_id,
+                                active_seconds=mono_delta,
+                                position_start=float(previous.get("position") or position),
+                                position_end=position,
+                                speed=speed,
+                            )
+                        except Exception as exc:
+                            self.logger.warning(
+                                "FAIL consumption.audio_runtime book_id=%s error=%r", book_id, str(exc)
+                            )
+                self._consumption_runtime_last_audio[book_id] = {
+                    "monotonic": monotonic_now, "wall": wall_now, "position": position,
+                    "speed": speed, "active": active,
+                }
+            for book_id in list(self._consumption_runtime_last_audio):
+                if book_id not in seen:
+                    self._consumption_runtime_last_audio.pop(book_id, None)
+
+            session_id = str(getattr(self, "_vn_consumption_session_id", "") or "")
+            try:
+                vn_state = self.visual_novels.state() if session_id else {}
+            except Exception:
+                vn_state = {}
+            running = bool(vn_state.get("running")) and bool(session_id)
+            previous_vn = self._consumption_runtime_last_vn if self._consumption_runtime_last_vn.get("session_id") == session_id else {}
+            if running and previous_vn and bool(previous_vn.get("running")):
+                mono_delta = monotonic_now - float(previous_vn.get("monotonic") or monotonic_now)
+                wall_delta = wall_now - float(previous_vn.get("wall") or wall_now)
+                if 0.05 <= mono_delta <= 15.0 and abs(wall_delta - mono_delta) <= 2.5:
+                    try:
+                        self.consumption.record_vn_runtime(
+                            session_id, active_seconds=mono_delta,
+                            capture_count=int(vn_state.get("capture_count") or 0),
+                        )
+                    except Exception as exc:
+                        self.logger.warning("FAIL consumption.vn_runtime error=%r", str(exc))
+            self._consumption_runtime_last_vn = {
+                "session_id": session_id, "monotonic": monotonic_now, "wall": wall_now,
+                "running": running, "capture_count": int(vn_state.get("capture_count") or 0),
+            } if session_id else {}
+            cancel_event.wait(poll_seconds)
+
+    def consumption_reader_observation(
+        self, kind: str, local_id: int, active_seconds: float,
+        locator_start: dict[str, Any] | None = None, locator_end: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        seconds = max(0.0, min(15.0, float(active_seconds or 0.0)))
+        results = self.consumption.record_reader_activity(
+            kind=str(kind or ""), local_id=int(local_id), active_seconds=seconds,
+            locator_start=locator_start or {}, locator_end=locator_end or {},
+            payload=payload or {},
+        )
+        return {"ok": True, "events": len(results)}
+
+    def consumption_statistics_query(self, scope: dict[str, Any] | None = None, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+        return self.consumption_statistics.query(scope or {}, journal_limit=int(limit), journal_offset=int(offset))
+
+    def consumption_statistics_correct(
+        self, target_type: str, target_id: str, expected_revision: int = 0,
+        excluded: bool = False, start_utc: float | None = None, end_utc: float | None = None,
+        duration_seconds: float | None = None, reason: str = "",
+    ) -> dict[str, Any]:
+        return self.consumption_statistics.correction(
+            target_type=target_type, target_id=target_id, expected_revision=int(expected_revision),
+            excluded=bool(excluded), start_utc=start_utc, end_utc=end_utc,
+            duration_seconds=duration_seconds, reason=reason,
+        )
+
+    def consumption_statistics_add_manual(
+        self, kind: str, duration_seconds: float, started_at_utc: float | None = None,
+        media_uuid: str = "", title: str = "", note: str = "",
+    ) -> dict[str, Any]:
+        return self.consumption_statistics.add_manual(
+            kind=kind, duration_seconds=float(duration_seconds), started_at_utc=started_at_utc,
+            media_uuid=media_uuid, title=title, note=note,
+        )
+
+    def consumption_statistics_export(self, scope: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = self.consumption_statistics.export_csv(scope or {})
+        if sys.platform == "darwin" and result.get("path"):
+            try:
+                subprocess.Popen(["open", "-R", str(result["path"])])
+            except OSError:
+                pass
+        return result
+
+    def consumption_statistics_rebuild_rollups(self) -> dict[str, Any]:
+        return self.consumption_statistics.rebuild_daily_rollups()
+
+    def consumption_statistics_delete_history(self) -> dict[str, Any]:
+        return self.consumption_statistics.delete_history()
+
     def visual_novel_windows(self) -> list[dict[str, Any]]:
         return self.visual_novels.windows()
 
     def visual_novel_state(self) -> dict[str, Any]:
-        return self.visual_novels.state()
+        state = self.visual_novels.state()
+        state["vn_title_id"] = str(self._vn_title_id or "")
+        return state
 
-    def visual_novel_start(self, window_id: int, title: str = "") -> dict[str, Any]:
-        return self.visual_novels.start(int(window_id), str(title or ""))
+    def visual_novel_start(
+        self, window_id: int, title: str = "", executable_hint: str = ""
+    ) -> dict[str, Any]:
+        # End a previous capture session first; window IDs are ephemeral and
+        # must never become the game identity.
+        if self._vn_consumption_session_id:
+            try:
+                self.consumption.end_vn_capture(self._vn_consumption_session_id)
+            finally:
+                self._vn_consumption_session_id = ""
+        state = self.visual_novels.start(int(window_id), str(title or ""))
+        try:
+            capture = self.consumption.begin_vn_capture(
+                title=str(title or state.get("window_title") or "Visual Novel"),
+                executable_hint=str(executable_hint or ""),
+                window_id=int(window_id),
+                generation=int(state.get("generation") or 0),
+            )
+            self._vn_consumption_session_id = str(capture["session_id"])
+            self._vn_title_id = str(capture["vn_title_id"])
+            self.logger.info(
+                "EVENT consumption.vn_start vn_title_id=%s session_id=%s window_id=%s generation=%s",
+                self._vn_title_id, self._vn_consumption_session_id, int(window_id),
+                int(state.get("generation") or 0),
+            )
+        except Exception as exc:
+            # Identity/statistics must never make the reader unusable. The
+            # capture continues and diagnostics make the missing ledger fact visible.
+            self._vn_consumption_session_id = ""
+            self._vn_title_id = ""
+            self.logger.warning("FAIL consumption.vn_start error=%r", str(exc))
+        state["vn_title_id"] = self._vn_title_id
+        return state
 
     def visual_novel_stop(self) -> dict[str, Any]:
-        return self.visual_novels.stop()
+        raw_state = self.visual_novels.stop()
+        # Shutdown tests and restore paths can hold a deliberately partial
+        # WebAppApi created via __new__.  Consumption bookkeeping must remain
+        # optional there: stopping the VN service is the lifecycle operation.
+        state = raw_state if isinstance(raw_state, dict) else {}
+        session_id = str(getattr(self, "_vn_consumption_session_id", "") or "")
+        if session_id:
+            consumption = getattr(self, "consumption", None)
+            try:
+                if consumption is not None:
+                    consumption.end_vn_capture(session_id)
+                    self.logger.info(
+                        "EVENT consumption.vn_stop vn_title_id=%s session_id=%s",
+                        str(getattr(self, "_vn_title_id", "") or ""), session_id,
+                    )
+            finally:
+                self._vn_consumption_session_id = ""
+        state["vn_title_id"] = str(getattr(self, "_vn_title_id", "") or "")
+        return state
+
+    def consumption_ledger_status(self) -> dict[str, Any]:
+        return {"schema": 1, **self.consumption.ledger_counts()}
 
     def visual_novel_set_dialogue_region(
         self, x: float, y: float, width: float, height: float
@@ -939,6 +1199,17 @@ class WebAppApi:
 
     def set_window(self, window: Any) -> None:
         self.window = window
+
+    def set_window_activity(self, active: bool) -> dict[str, Any]:
+        """Publish interactive-window state for the scheduled agent.
+
+        The browser already owns the authoritative focus/visibility signal.
+        Persisting just that boolean lets the separate LaunchAgent defer CPU-
+        heavy maintenance while the user is actively navigating Pudge.
+        """
+
+        updated = set_app_window_active(bool(active))
+        return {"ok": True, "active": bool(active), "updated": bool(updated)}
 
     def bind_drop_import(self) -> dict[str, Any]:
         """Bind Finder drops only after JS reports that the DOM is ready.
@@ -1389,6 +1660,122 @@ class WebAppApi:
                 local_numbers.add(int(display_episode))
         return all(number in local_numbers for number in range(1, target + 1))
 
+    def _personal_schedule_episode_order(self, anime: LibraryAnime) -> tuple[list[int], str]:
+        if str(anime.format or "").upper() == "MOVIE":
+            return [], "Movies do not use episodic weekly schedules."
+        if str(anime.media_status or "").upper() != "FINISHED":
+            return [], "Weekly personal schedules are available for fully released anime."
+        total = int(anime.episodes or 0)
+        if total < 2:
+            return [], "A known episodic order is required."
+        mapped: set[int] = set()
+        for item in self.manager.db.episodes(anime.media_id):
+            display = self._display_episode_number(anime, item.episode)
+            if display is None:
+                continue
+            value = int(display)
+            if value < 1 or value > total:
+                return [], "Local episode numbering does not match AniList; fix the match first."
+            mapped.add(value)
+        # AniList provides the canonical sequential episode count for ordinary
+        # episodic titles. Local rows are used as a guard against absolute/special
+        # numbering mismatches rather than blindly trusting filenames.
+        return list(range(1, total + 1)), ""
+
+    def _personal_schedule_snapshot(self, anime: LibraryAnime, *, now: float | None = None) -> dict[str, Any]:
+        current = time.time() if now is None else float(now)
+        order, reason = self._personal_schedule_episode_order(anime)
+        schedule = self.manager.db.personal_release_schedule(anime.media_id, now=current)
+        payload: dict[str, Any] = {
+            "eligible": bool(order),
+            "eligibility_reason": reason,
+            "enabled": bool(schedule and schedule.enabled),
+            "anime_id": int(anime.media_id),
+            "timezone_iana": schedule.timezone_iana if schedule else "",
+            "start_local_datetime": schedule.start_local_datetime if schedule else "",
+            "first_episode": schedule.first_episode if schedule else (order[0] if order else None),
+            "revision": schedule.revision if schedule else 0,
+            "rewatch": bool(schedule and schedule.rewatch),
+            "status": "disabled",
+            "next_episode": None,
+            "next_unlock_at": None,
+            "next_unlock_local": "",
+            "watched_count": 0,
+            "total_count": len(schedule.items) if schedule else len(order),
+            "unlocked_count": 0,
+        }
+        if not schedule or not schedule.enabled:
+            return payload
+        watched = [item for item in schedule.items if item.watched_at is not None]
+        unlocked = [item for item in schedule.items if item.unlocked]
+        payload["watched_count"] = len(watched)
+        payload["unlocked_count"] = len(unlocked)
+        next_item = next((item for item in schedule.items if item.watched_at is None), None)
+        if next_item is None:
+            payload["status"] = "completed"
+            return payload
+        payload["next_episode"] = int(next_item.episode)
+        payload["next_unlock_at"] = float(next_item.unlock_at_utc)
+        payload["next_unlock_local"] = local_iso_from_epoch(
+            float(next_item.unlock_at_utc), schedule.timezone_iana
+        )
+        if not next_item.unlocked:
+            payload["status"] = "caught_up"
+            return payload
+        local = self._local_episode_for_relative(anime, int(next_item.episode))
+        if local is None or not local.video_path.is_file():
+            payload["status"] = "download_available"
+            return payload
+        japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
+        local_state = str(local.state or "")
+        if schedule.rewatch and local_state == "watched":
+            # Rewatch has its own progress ledger; old AniList/local watched state
+            # must not make a newly unlocked personal-release item disappear.
+            local_state = "ready"
+        if not japanese_subtitles_required and local_state != "watched":
+            local_state = "ready"
+        if local_state == "ready" and japanese_subtitles_required and not self._ready_subtitle_is_usable(local):
+            local_state = "waiting_subtitles"
+        if local_state == "ready" and str(local.subtitle_origin or "").casefold() == "ocr" and not self.config.matching.ocr_counts_as_ready:
+            local_state = "waiting_text_subtitles"
+        payload["local_state"] = local_state
+        payload["video_path"] = str(local.video_path)
+        payload["status"] = "new_ready" if local_state == "ready" else "waiting"
+        return payload
+
+    def _apply_personal_schedule_to_payload(self, anime: LibraryAnime, payload: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self._personal_schedule_snapshot(anime)
+        payload["personal_schedule"] = snapshot
+        if not snapshot.get("enabled"):
+            return payload
+        payload["availability_section"] = snapshot.get("status")
+        episode = snapshot.get("next_episode")
+        if episode is not None:
+            payload["next_episode"] = int(episode)
+            payload["is_final_episode"] = bool(anime.episodes and int(episode) >= int(anime.episodes))
+            local = self._local_episode_for_relative(anime, int(episode))
+            if local is not None and local.video_path.is_file():
+                state = str(snapshot.get("local_state") or local.state or "")
+                payload["local"] = {
+                    "episode": int(episode),
+                    "video_path": str(local.video_path),
+                    "subtitle_path": str(local.subtitle_path) if local.subtitle_path else "",
+                    "subtitle_source": (
+                        "image" if state == "waiting_text_subtitles" and (local.subtitle_path is not None or local.embedded_subtitle_id is not None)
+                        else "external" if local.subtitle_path
+                        else "embedded" if state in {"ready", "watched"} and local.embedded_subtitle_id is not None
+                        else "none"
+                    ),
+                    "subtitle_origin": str(local.subtitle_origin or ""),
+                    "original_state": str(local.state or ""),
+                    "state": state,
+                }
+            else:
+                payload["local"] = None
+        payload["next_airing_at"] = snapshot.get("next_unlock_at")
+        payload["remaining_seconds"] = self._remaining(snapshot.get("next_unlock_at"))
+        return payload
+
     def _anime_payload(self, anime: LibraryAnime) -> dict[str, Any]:
         japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
         released = anime.released_episodes
@@ -1420,7 +1807,7 @@ class WebAppApi:
             and not self.config.matching.ocr_counts_as_ready
         ):
             local_state = "waiting_text_subtitles"
-        return {
+        payload = {
             "media_id": anime.media_id,
             "japanese_subtitles_required": japanese_subtitles_required,
             "title": anime.title,
@@ -1480,7 +1867,7 @@ class WebAppApi:
                 else None
             ),
         }
-
+        return self._apply_personal_schedule_to_payload(anime, payload)
     def _continue_payloads(
         self,
         anime_by_id: dict[int, LibraryAnime],
@@ -1494,7 +1881,17 @@ class WebAppApi:
             ):
                 continue
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
-            if self._watched_on_anilist(anime, item.episode):
+            schedule_item = None
+            schedule = None
+            if anime is not None:
+                schedule = self.manager.db.personal_release_schedule(anime.media_id)
+                if schedule is not None and schedule.enabled:
+                    display_episode = self._display_episode_number(anime, item.episode)
+                    next_item = next((row for row in schedule.items if row.watched_at is None), None)
+                    if display_episode is None or next_item is None or int(display_episode) != int(next_item.episode) or not next_item.unlocked:
+                        continue
+                    schedule_item = next_item
+            if schedule_item is None and self._watched_on_anilist(anime, item.episode):
                 continue
             position = float(item.playback_position or 0.0)
             duration = float(item.playback_duration or 0.0)
@@ -1513,6 +1910,11 @@ class WebAppApi:
                     "resume_start": max(0.0, position - self.config.playback.rewind_seconds),
                     "progress_percent": (position / duration * 100.0) if duration > 0 else None,
                     "updated_at": item.playback_updated_at,
+                    "personal_schedule": (
+                        self._personal_schedule_snapshot(anime)
+                        if anime is not None and schedule_item is not None
+                        else {"enabled": False}
+                    ),
                 }
             )
         return payloads
@@ -1541,6 +1943,9 @@ class WebAppApi:
                     "title": anime.title if anime is not None else item.title,
                     "cover": self._cover_uri(anime) if anime is not None else "",
                     "site_url": anime.site_url if anime is not None else "",
+                    "media_status": anime.media_status if anime is not None else "",
+                    "list_status": anime.status if anime is not None else "",
+                    "personal_schedule": self._personal_schedule_snapshot(anime) if anime is not None else {"eligible": False, "enabled": False},
                     "total_episodes": anime.episodes if anime is not None else None,
                     "episode_duration_minutes": anime.duration if anime is not None else None,
                     "watched_folder": False,
@@ -2308,7 +2713,49 @@ class WebAppApi:
             "dropped": [],
         }
 
+        active_schedules = {
+            int(schedule.anime_id): schedule
+            for schedule in self.manager.db.active_personal_release_schedules()
+        }
+
+        def append_personal_schedule(anime: LibraryAnime) -> bool:
+            schedule = active_schedules.get(int(anime.media_id))
+            if schedule is None:
+                return False
+            card = self._anime_payload(anime)
+            snapshot = card.get("personal_schedule") if isinstance(card.get("personal_schedule"), dict) else {}
+            status = str(snapshot.get("status") or "")
+            if status == "new_ready" and isinstance(card.get("local"), dict):
+                card["ready_episodes"] = [int(snapshot["next_episode"])]
+                card["ready_count"] = 1
+                card["all_episodes_ready"] = False
+                sections["new_ready"].append(card)
+            elif status == "waiting":
+                sections["waiting"].append(card)
+            elif status == "download_available":
+                download = home_download(anime.media_id, snapshot.get("next_episode"))
+                if download is not None:
+                    raw_state = str(download.state or "")
+                    effective_state = raw_state if download_complete(download) or self._torrent_enabled_state() else "paused"
+                    card["download"] = {
+                        "torrent_hash": download.torrent_hash,
+                        "name": download.name,
+                        "state": raw_state,
+                        "effective_state": effective_state,
+                        "progress": download.progress,
+                        "is_batch": download.is_batch,
+                    }
+                sections["download_available"].append(card)
+            elif status == "caught_up":
+                sections["caught_up"].append(card)
+            # completed schedules deliberately fall back to normal completed/recent
+            # history rather than manufacturing another actionable section.
+            handled_media.add(int(anime.media_id))
+            return True
+
         for anime in current_anime:
+            if append_personal_schedule(anime):
+                continue
             handled_media.add(anime.media_id)
             if self._is_future_unreleased(anime):
                 # A local file cannot make an AniList title available before its
@@ -2384,6 +2831,16 @@ class WebAppApi:
                             "is_batch": download.is_batch,
                         }
                     sections["download_available"].append(base)
+
+        # Active personal schedules are independent of the AniList list status,
+        # so a COMPLETED title can behave like a local weekly release without
+        # silently changing COMPLETED -> CURRENT.
+        for media_id in sorted(active_schedules):
+            if media_id in handled_media:
+                continue
+            anime = anime_by_id.get(media_id)
+            if anime is not None:
+                append_personal_schedule(anime)
 
         # Keep downloaded movies, PLANNING titles and locally matched files that
         # are not in the CURRENT AniList list accessible on the main page.
@@ -2589,6 +3046,25 @@ class WebAppApi:
             jpdb_api_token=str(getattr(ln_settings, "jpdb_api_token", "") or ""),
             selected_plugin=cfg.tools.mpv_study_plugin,
         )
+        scheduler = getattr(self.manager, "work_scheduler", None)
+        snapshot_reader = getattr(scheduler, "power_snapshot", None)
+        if callable(snapshot_reader):
+            power_policy = snapshot_reader()
+        else:
+            manual_power = bool(cfg.power.manual_energy_saving)
+            power_policy = {
+                "mode": "energy_saving" if manual_power else "normal",
+                "reasons": ["manual"] if manual_power else [],
+                "on_battery": None,
+                "battery_percent": None,
+                "observed_at": 0.0,
+                "stale": True,
+                "revision": 0,
+                "thermal_limited": False,
+                "manual_enabled": manual_power,
+                "auto_enabled": bool(cfg.power.auto_battery_energy_saving),
+                "auto_latched": False,
+            }
         return {
             "version": __version__,
             "language": cfg.ui.language,
@@ -2597,6 +3073,8 @@ class WebAppApi:
             "notifications_enabled": cfg.ui.notifications_enabled,
             "permissions_requested": cfg.ui.permissions_requested,
             "jiten_developer_tools_confirmed": cfg.ui.jiten_developer_tools_confirmed,
+            "review_gate_enabled": cfg.ui.review_gate_enabled,
+            "review_gate_count": max(1, min(50, int(cfg.ui.review_gate_count))),
             "library_root": str(cfg.library.root_dir),
             "watched_folders": "\n".join(str(path) for path in cfg.paths.download_dirs),
             "subtitle_folders": "\n".join(str(path) for path in cfg.paths.subtitle_dirs),
@@ -2688,8 +3166,14 @@ class WebAppApi:
             "energy_monitoring_enabled": cfg.diagnostics.energy_monitoring_enabled,
             "energy_sample_seconds": cfg.diagnostics.energy_sample_seconds,
             "energy_log_path": str(ENERGY_LOG_PATH),
+            "power_manual_energy_saving": cfg.power.manual_energy_saving,
+            "power_auto_battery_energy_saving": cfg.power.auto_battery_energy_saving,
+            "power_policy": power_policy,
             "light_novels": self.light_novels.settings_payload() if hasattr(self, "light_novels") else {},
         }
+
+    def power_status(self, refresh: bool = False) -> dict[str, Any]:
+        return self.manager.work_scheduler.power_snapshot(refresh=bool(refresh))
 
     def _storage_payload(self, *, refresh: bool) -> dict[str, int | float | bool]:
         if refresh or self._last_storage_status is None:
@@ -2784,6 +3268,13 @@ class WebAppApi:
         }
 
     def _get_state(self, *, refresh_storage: bool) -> dict[str, Any]:
+        # A Home snapshot fans out through many repository helpers. Reusing one
+        # per-thread SQLite connection avoids reparsing the full schema for every
+        # helper while keeping ordinary DB calls independently transactional.
+        with self.manager.db.connection_scope():
+            return self._get_state_scoped(refresh_storage=refresh_storage)
+
+    def _get_state_scoped(self, *, refresh_storage: bool) -> dict[str, Any]:
         all_anime = self.manager.db.anime_list()
         current_anime = [anime for anime in all_anime if anime.status == "CURRENT"]
         planned_anime = [anime for anime in all_anime if anime.status == "PLANNING"]
@@ -3002,12 +3493,15 @@ class WebAppApi:
         }
 
     def get_state(self) -> dict[str, Any]:
-        # Reconciliation is a write operation, so it only runs on explicit full
-        # refreshes and never in the one-second UI polling path.
+        # Reconciliation may write durable rows, so preserve its normal short
+        # transaction boundaries. The expensive read-heavy Home snapshot that
+        # follows reuses one SQLite connection instead of reopening/reparsing the
+        # schema for every repository helper.
         self.manager.reconcile_completed_download_rows()
         self.manager.reconcile_prepared_subtitle_rows()
-        payload = self._get_state(refresh_storage=True)
-        return self._store_ui_state_snapshot(payload)
+        with self.manager.db.connection_scope():
+            payload = self._get_state(refresh_storage=True)
+            return self._store_ui_state_snapshot(payload)
 
     def get_state_fast(self) -> dict[str, Any]:
         """Return UI state without recursively scanning the video library.
@@ -3016,17 +3510,21 @@ class WebAppApi:
         can move to the Ready section immediately. Disk usage is reused from the
         most recent full state and is refreshed when maintenance finishes.
         """
-        lock = self._torrent_state_guard()
-        with lock:
-            version = self.manager.db.get_state("ui_state_version", "")
-            cached = self._ui_state_cache.get(version)
-            if cached is not None:
-                settings = cached.get("settings")
-                if isinstance(settings, dict):
-                    settings["torrents_enabled"] = bool(self._torrent_session_enabled)
-                return cached
-        payload = self._get_state(refresh_storage=False)
-        return self._store_ui_state_snapshot(payload)
+        # Keep the cheap version lookup and an occasional cold cache rebuild in
+        # one connection. The torrent lock is still held only around cache state,
+        # never around the expensive snapshot build.
+        with self.manager.db.connection_scope():
+            lock = self._torrent_state_guard()
+            with lock:
+                version = self.manager.db.get_state("ui_state_version", "")
+                cached = self._ui_state_cache.get(version)
+                if cached is not None:
+                    settings = cached.get("settings")
+                    if isinstance(settings, dict):
+                        settings["torrents_enabled"] = bool(self._torrent_session_enabled)
+                    return cached
+            payload = self._get_state(refresh_storage=False)
+            return self._store_ui_state_snapshot(payload)
 
     def get_state_delta(self, ui_state_version: str = "") -> dict[str, Any]:
         version = self.manager.db.get_state("ui_state_version", "")
@@ -3634,12 +4132,17 @@ class WebAppApi:
                     else 0
                 )
                 scheduler = getattr(self.manager, "work_scheduler", None)
-                if (
-                    queued_manual
-                    and scheduler is not None
-                    and not scheduler.background_allowed()
-                ):
-                    stats["subtitle_waiting_for_foreground"] = queued_manual
+                if queued_manual and scheduler is not None:
+                    block_reason = scheduler.background_wait_reason()
+                    if block_reason is not None:
+                        stats["subtitle_waiting_for_policy"] = {
+                            "count": queued_manual,
+                            "reason": block_reason,
+                        }
+                        # Keep the old scalar key for older frontends when the
+                        # actual blocker is foreground playback.
+                        if block_reason == "foreground":
+                            stats["subtitle_waiting_for_foreground"] = queued_manual
             return {"skipped": False, "stats": stats, "state": self.get_state()}
         finally:
             self._local_refresh_lock.release()
@@ -3833,35 +4336,87 @@ class WebAppApi:
             "state": self.get_state_fast() if running else self.get_state(),
         }
 
-    def poll_downloads_and_subtitles(self) -> dict[str, Any]:
+    def _foreground_poll_state_payload(self, known_ui_state_version: str = "") -> dict[str, Any]:
+        """Return a full Home snapshot only when the caller is actually stale.
+
+        pywebview serializes return values through JSON. The R11 macOS profile
+        showed that shipping the same large cached Home payload every 1-5 seconds
+        was itself a measurable CPU cost even though rebuilding the snapshot had
+        already been avoided. Keep legacy Python callers compatible by returning
+        state when they do not provide a known version.
+        """
+        known = str(known_ui_state_version or "")
+        if not known:
+            # Preserve the exact legacy response shape for Python callers/tests.
+            return {"state": self.get_state_fast()}
+        current_version = self.manager.db.get_state("ui_state_version", "")
+        if known == str(current_version):
+            return {"ui_state_version": str(current_version), "state": None}
+        state = self.get_state_fast()
+        return {
+            "ui_state_version": str(state.get("ui_state_version", current_version) or current_version),
+            "state": state,
+        }
+
+    def poll_downloads_and_subtitles(
+        self,
+        known_ui_state_version: str = "",
+        has_active_downloads: bool = True,
+        window_active: bool = True,
+    ) -> dict[str, Any]:
         """Energy-efficient foreground poll.
 
-        Ordinary polling remains lightweight. When a torrent has just completed,
-        only that video's high-priority subtitle job is started immediately if no
-        full maintenance refresh currently owns the shared lock.
+        R13 also returns a tiny authoritative subtitle scheduling hint.  The UI
+        can therefore sleep until the real next_check instead of hot-looping on
+        a stale subtitle_jobs snapshot after a worker reschedules a retry.
+        Filesystem inbox scans and qBittorrent tag cleanup are independently
+        throttled because neither belongs on a one-second status path.
         """
+
+        def subtitle_hint() -> dict[str, float | int]:
+            try:
+                return self.manager.db.subtitle_job_poll_hint()
+            except Exception:
+                return {
+                    "active_count": 0,
+                    "due_count": 0,
+                    "priority_count": 0,
+                    "priority_due_count": 0,
+                    "next_check": 0.0,
+                }
+
         if bool(getattr(getattr(self, "safe_mode", None), "active", False)):
             return {
                 "skipped": True,
                 "safe_mode": True,
                 "stats": {},
-                "state": self.get_state_fast(),
+                **self._foreground_poll_state_payload(known_ui_state_version),
             }
         if not self._download_poll_lock.acquire(blocking=False):
-            return {"skipped": True, "stats": {}, "state": self.get_state()}
+            return {
+                "skipped": True,
+                "stats": {},
+                **self._foreground_poll_state_payload(known_ui_state_version),
+            }
         stats = {"downloads": 0, "subs": 0}
         try:
             with timed_step(self.logger, "foreground.poll", mode="downloads-only"):
                 try:
                     completed_paths: tuple[Path, ...] = ()
+                    qbt_synced = False
+                    now_mono = time.monotonic()
                     try:
-                        now_mono = time.monotonic()
                         last_qbt = float(getattr(self, "_last_foreground_qbt_sync", 0.0) or 0.0)
-                        if now_mono - last_qbt >= 15.0:
+                        # If the UI already knows there are no active downloads,
+                        # qBittorrent does not need a network round-trip every 15s.
+                        # User-visible active downloads retain the old cadence.
+                        qbt_interval = 15.0 if bool(has_active_downloads) else 60.0
+                        if now_mono - last_qbt >= qbt_interval:
                             with timed_step(self.logger, "foreground.qbittorrent"):
                                 stats["downloads"] = self.manager.sync_downloads()
                             self._last_foreground_qbt_sync = time.monotonic()
                             completed_paths = self.manager.last_completed_video_paths
+                            qbt_synced = True
                         else:
                             stats["qbittorrent_throttled"] = 1
                     except Exception as exc:
@@ -3873,13 +4428,32 @@ class WebAppApi:
                             "FALLBACK step=foreground.qbittorrent reason=unavailable continue=subtitles error=%r",
                             str(exc),
                         )
+
                     with maintenance_lock(
                         self.config.paths.cache_dir,
                         blocking=False,
                     ) as maintenance_acquired:
-                        inbox = self.manager.scan_subtitle_inbox()
+                        # Subtitle folders can contain thousands of files. R12 was
+                        # walking them every second while a retry row looked due in
+                        # stale frontend state.  Manual Refresh still performs an
+                        # immediate full inbox scan through AnimeManager.run_once().
+                        inbox_interval = 30.0 if bool(window_active) else 120.0
+                        last_inbox = float(
+                            getattr(self, "_last_foreground_subtitle_inbox_scan", 0.0) or 0.0
+                        )
+                        inbox: dict[str, Any] = {"requeued": 0}
+                        if now_mono - last_inbox >= inbox_interval:
+                            inbox = self.manager.scan_subtitle_inbox()
+                            self._last_foreground_subtitle_inbox_scan = time.monotonic()
+                        else:
+                            stats["subtitle_inbox_throttled"] = 1
                         if int(inbox.get("requeued", 0) or 0):
                             stats["inbox_requeued"] = int(inbox.get("requeued", 0) or 0)
+
+                        hint = subtitle_hint()
+                        due_count = int(hint.get("due_count", 0) or 0)
+                        priority_due_count = int(hint.get("priority_due_count", 0) or 0)
+
                         if completed_paths and maintenance_acquired:
                             with timed_step(
                                 self.logger,
@@ -3901,35 +4475,58 @@ class WebAppApi:
                                 "reason=maintenance_active priority=100",
                                 len(completed_paths),
                             )
-                        elif maintenance_acquired and self.manager.db.priority_subtitle_job_count(min_priority=200):
-                            manual_count = self.manager.db.priority_subtitle_job_count(min_priority=200)
-                            if not self.manager.work_scheduler.background_allowed():
-                                stats["subtitle_waiting_for_foreground"] = manual_count
+                        elif maintenance_acquired and priority_due_count:
+                            block_reason = self.manager.work_scheduler.background_wait_reason()
+                            if block_reason is not None:
+                                stats["subtitle_waiting_for_policy"] = {
+                                    "count": priority_due_count,
+                                    "reason": block_reason,
+                                }
+                                if block_reason == "foreground":
+                                    stats["subtitle_waiting_for_foreground"] = priority_due_count
                                 self.logger.info(
-                                    "WAIT step=foreground.subtitle_manual_refresh reason=foreground_active jobs=%s",
-                                    manual_count,
+                                    "WAIT step=foreground.subtitle_manual_refresh reason=%s jobs=%s",
+                                    block_reason,
+                                    priority_due_count,
                                 )
                             else:
                                 with timed_step(
                                     self.logger,
                                     "foreground.subtitle_manual_refresh",
-                                    jobs=manual_count,
+                                    jobs=priority_due_count,
                                 ):
                                     stats["subs"] = self.manager.process_subtitle_jobs(
-                                        limit=min(8, max(1, manual_count))
+                                        limit=min(8, max(1, priority_due_count))
                                     )
-                        elif maintenance_acquired and self.manager.db.subtitle_jobs():
-                            if not self.manager.work_scheduler.background_allowed():
-                                stats["subtitle_due_waiting_for_foreground"] = len(
-                                    self.manager.db.subtitle_jobs()
-                                )
+                        elif maintenance_acquired and due_count:
+                            block_reason = self.manager.work_scheduler.background_wait_reason()
+                            if block_reason is not None:
+                                stats["subtitle_due_waiting_for_policy"] = {
+                                    "count": due_count,
+                                    "reason": block_reason,
+                                }
+                                if block_reason == "foreground":
+                                    stats["subtitle_due_waiting_for_foreground"] = due_count
                             else:
                                 with timed_step(self.logger, "foreground.subtitle_due_jobs"):
-                                    stats["subs"] = self.manager.process_subtitle_jobs(limit=2)
-                        queued_manual = self.manager.db.priority_subtitle_job_count(min_priority=200)
+                                    stats["subs"] = self.manager.process_subtitle_jobs(
+                                        limit=min(2, max(1, due_count))
+                                    )
+
+                        post_hint = subtitle_hint()
+                        queued_manual = int(post_hint.get("priority_count", 0) or 0)
                         if queued_manual:
                             stats["subtitle_check_queued"] = queued_manual
-                        if maintenance_acquired:
+
+                        # Tag cleanup is maintenance, not a status poll.  Run it
+                        # after an actual qBittorrent sync or at a low fixed cadence.
+                        tag_interval = 60.0 if bool(window_active) else 120.0
+                        last_tags = float(
+                            getattr(self, "_last_foreground_qbt_tag_cleanup", 0.0) or 0.0
+                        )
+                        if maintenance_acquired and (
+                            qbt_synced or now_mono - last_tags >= tag_interval
+                        ):
                             with timed_step(self.logger, "foreground.qbittorrent_tag_cleanup"):
                                 tag_stats = self.manager.cleanup_qbittorrent_tags()
                                 stats.update(
@@ -3939,6 +4536,10 @@ class WebAppApi:
                                         if int(value or 0) > 0
                                     }
                                 )
+                            self._last_foreground_qbt_tag_cleanup = time.monotonic()
+                        else:
+                            stats["qbittorrent_tag_cleanup_throttled"] = 1
+
                     missing_rows = int(self.manager._last_missing_episode_rows or 0)
                     if missing_rows:
                         # An externally deleted torrent/file used to leave a stale
@@ -3955,7 +4556,17 @@ class WebAppApi:
                             stats["downloads_after_auto"] = self.manager.sync_downloads()
                 except Exception as exc:
                     self.manager.log(str(exc))
-            return {"skipped": False, "stats": stats, "state": self.get_state()}
+            # Foreground polling is frequent and already mutates ui_state_version
+            # whenever meaningful state changes. Reuse the versioned snapshot on
+            # no-op polls instead of running reconciliation and rebuilding the full
+            # Home payload every time. The tiny scheduling hint is authoritative
+            # even when the cached Home snapshot intentionally remains unchanged.
+            return {
+                "skipped": False,
+                "stats": stats,
+                "subtitle_poll_hint": subtitle_hint(),
+                **self._foreground_poll_state_payload(known_ui_state_version),
+            }
         finally:
             self._download_poll_lock.release()
 
@@ -4312,11 +4923,35 @@ class WebAppApi:
         return self._backfill_manga_mean_scores(self.manga.state())
 
     def manga_remove_series(self, book_id: int) -> dict[str, Any]:
-        removed = self.manga.remove_series(int(book_id))
+        target_id = int(book_id)
+        ids = [target_id]
+        try:
+            with self.manager.db.connect() as conn:
+                selected = conn.execute("SELECT title,path FROM manga_books WHERE id=?", (target_id,)).fetchone()
+                if selected is not None:
+                    selected_key = MangaService.series_key(
+                        str(selected["title"] or Path(str(selected["path"] or "")).stem)
+                    )
+                    rows = conn.execute("SELECT id,title,path FROM manga_books").fetchall()
+                    ids = [
+                        int(row["id"])
+                        for row in rows
+                        if MangaService.series_key(
+                            str(row["title"] or Path(str(row["path"] or "")).stem)
+                        ) == selected_key
+                    ] or [target_id]
+        except Exception:
+            ids = [target_id]
+        removed = self.manga.remove_series(target_id)
+        for local_id in ids:
+            self.consumption.detach_library_media(kind="manga", local_id=str(local_id))
         return {"removed": removed}
 
     def manga_remove_books(self, book_ids: list[int]) -> dict[str, Any]:
-        removed = self.manga.remove_books([int(value) for value in (book_ids or [])])
+        ids = [int(value) for value in (book_ids or [])]
+        removed = self.manga.remove_books(ids)
+        for local_id in ids:
+            self.consumption.detach_library_media(kind="manga", local_id=str(local_id))
         return {"removed": removed}
 
     @staticmethod
@@ -4332,7 +4967,7 @@ class WebAppApi:
         if not cleaned:
             return []
         gql = """
-        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status meanScore title{userPreferred romaji english native}coverImage{large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
+        query($search:String!){Page(page:1,perPage:12){media(search:$search,type:MANGA,sort:SEARCH_MATCH){id format chapters volumes status meanScore title{userPreferred romaji english native}coverImage{extraLarge large}siteUrl mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self.light_novels._anilist_post(gql, {"search": cleaned})
         rows: list[dict[str, Any]] = []
@@ -4354,7 +4989,7 @@ class WebAppApi:
                     "list_status": entry.get("status") or "",
                     "progress": entry.get("progress") or 0,
                     "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
-                    "cover": (media.get("coverImage") or {}).get("large") or "",
+                    "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "",
                     "site_url": media.get("siteUrl") or f"https://anilist.co/manga/{int(media.get('id'))}",
                 }
             )
@@ -4529,11 +5164,23 @@ class WebAppApi:
 
         processing = 0
         queued = 0
+        wait_reason = ""
         if running and state_name == "queued":
             queued = pending
         elif running and state_name == "running":
             processing = 1 if pending > 0 and current_index is not None else 0
             queued = max(0, pending - processing)
+        waiting_for_background = running and (
+            state_name == "queued"
+            or (state_name == "preparing" and current_index is None)
+        )
+        if waiting_for_background:
+            scheduler = getattr(self.manga, "work_scheduler", None)
+            if scheduler is not None:
+                try:
+                    wait_reason = str(scheduler.background_wait_reason() or "")
+                except Exception:
+                    wait_reason = ""
         # ``parsing`` is post-OCR Jiten preparation. It must not make a persisted
         # OCR page look queued/processing again.
         not_started = max(0, total - completed - failed - queued - processing)
@@ -4547,6 +5194,7 @@ class WebAppApi:
                 "not_started": not_started,
                 "current_page_index": current_index if processing else None,
                 "current_page": (current_index + 1) if processing and current_index is not None else None,
+                "wait_reason": wait_reason,
                 "page_state_consistent": (
                     completed + queued + processing + failed + not_started == total
                 ),
@@ -4945,8 +5593,67 @@ class WebAppApi:
             "state": self.manga.state(),
         }
 
+    def cover_preview_resolve(
+        self,
+        media_kind: str,
+        local_id: int,
+        dpr: float = 1.0,
+        viewport_width: int = 0,
+        viewport_height: int = 0,
+    ) -> dict[str, Any]:
+        kind = str(media_kind or "").strip().casefold()
+        if kind == "manga":
+            ref = self.manga.cover_ref(int(local_id), asset_base=self.asset_base)
+        elif kind in {"novel", "light_novel", "ln"}:
+            ref = self.light_novels.cover_ref(int(local_id), asset_base=self.asset_base)
+        else:
+            raise ValueError(f"Unsupported cover preview kind: {media_kind}")
+        payload = ref.payload()
+        payload["requested_dpr"] = max(1.0, min(4.0, float(dpr or 1.0)))
+        payload["viewport_width"] = max(0, int(viewport_width or 0))
+        payload["viewport_height"] = max(0, int(viewport_height or 0))
+        payload["variant"] = "original"
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.debug(
+                "EVENT cover.preview_resolve kind=%s local_id=%s source=%s revision=%s thumbnail=%s preview=%s",
+                kind,
+                int(local_id),
+                payload.get("source_kind"),
+                payload.get("source_revision"),
+                bool(payload.get("thumbnail_url")),
+                bool(payload.get("preview_url")),
+            )
+        return payload
+
+    def _consumption_media_ref(self, kind: str, local_id: int) -> Any | None:
+        ledger = getattr(self, "consumption", None)
+        if ledger is None:
+            return None
+        try:
+            normalized = str(kind or "").casefold()
+            if normalized == "manga":
+                return ledger.manga_media(int(local_id))
+            if normalized in {"light_novel", "ln", "novel"}:
+                return ledger.light_novel_media(int(local_id))
+            if normalized == "audiobook":
+                return ledger.audiobook_media(int(local_id))
+        except Exception as exc:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning(
+                    "FAIL consumption.media_identity kind=%s local_id=%s error=%r",
+                    kind, int(local_id), str(exc),
+                )
+        return None
+
     def manga_page(self, book_id: int, page_index: int) -> dict[str, Any]:
-        return self.manga.page(int(book_id), int(page_index))
+        payload = self.manga.page(int(book_id), int(page_index))
+        media = self._consumption_media_ref("manga", int(book_id))
+        if media is not None:
+            payload["media_uuid"] = media.media_uuid
+            payload["source_revision"] = media.source_revision
+        return payload
 
     def manga_set_position(self, book_id: int, page_index: int) -> dict[str, Any]:
         self.manga.set_position(int(book_id), int(page_index))
@@ -5326,7 +6033,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return payload
 
     def audiobook_play(self, book_id: int, start: float | None = None, speed: float = 1.0) -> dict[str, Any]:
-        return self.audiobooks.play(int(book_id), None if start is None else float(start), float(speed or 1.0))
+        result = self.audiobooks.play(int(book_id), None if start is None else float(start), float(speed or 1.0))
+        media = self._consumption_media_ref("audiobook", int(book_id))
+        if media is not None and isinstance(result, dict):
+            result["media_uuid"] = media.media_uuid
+            result["source_revision"] = media.source_revision
+        return result
 
     def audiobook_set_speed(self, book_id: int, speed: float) -> dict[str, Any]:
         # Point actions return only the changed book. Rebuilding a 200-book
@@ -5409,10 +6121,17 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.audiobooks.mark_finished(int(book_id), bool(finished))
 
     def audiobook_delete(self, book_id: int) -> dict[str, Any]:
-        return self.audiobooks.delete(int(book_id), delete_files=False)
+        local_id = int(book_id)
+        result = self.audiobooks.delete(local_id, delete_files=False)
+        self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
+        return result
 
     def audiobook_delete_many(self, book_ids: list[int]) -> dict[str, Any]:
-        return self.audiobooks.delete_many([int(value) for value in book_ids], delete_files=False)
+        ids = [int(value) for value in book_ids]
+        result = self.audiobooks.delete_many(ids, delete_files=False)
+        for local_id in ids:
+            self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
+        return result
 
     def light_novel_audiobook_candidates(self, book_id: int, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
         return self.audiobooks.link_candidates_for_light_novel(int(book_id), str(query or ""), int(limit or 50))
@@ -5513,16 +6232,940 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def study_decks(self, backend: str) -> list[dict[str, Any]]:
         return self.light_novels.decks(str(backend or "jiten"))
 
+    def study_state(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = payload or {}
+        backend = str(data.get("backend") or self.light_novels.settings().study_backend or "jiten").casefold()
+        if backend != "jiten":
+            return {"ok": False, "provider": backend, "unsupported": True}
+        return self.light_novels.jiten_live_state(
+            int(data.get("word_id") or data.get("wordId") or 0),
+            int(data.get("reading_index") or data.get("readingIndex") or 0),
+            force=bool(data.get("force")),
+        )
+
+    def study_states(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = payload or {}
+        backend = str(data.get("backend") or self.light_novels.settings().study_backend or "jiten").casefold()
+        if backend != "jiten":
+            return {"ok": False, "provider": backend, "unsupported": True, "states": []}
+        raw_words = data.get("words") or data.get("pairs") or []
+        pairs: list[tuple[int, int]] = []
+        for row in raw_words if isinstance(raw_words, list) else []:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                try:
+                    pairs.append((int(row[0]), int(row[1])))
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(row, dict):
+                try:
+                    pairs.append((
+                        int(row.get("word_id") or row.get("wordId") or 0),
+                        int(row.get("reading_index") if row.get("reading_index") is not None else row.get("readingIndex") or 0),
+                    ))
+                except (TypeError, ValueError):
+                    continue
+            if len(pairs) >= 500:
+                break
+        states = self.light_novels.jiten_live_states(
+            pairs,
+            force=bool(data.get("force")),
+        )
+        result = {
+            "ok": True,
+            "provider": "jiten",
+            "states": states,
+        }
+        if hasattr(self.light_novels, "jiten_optimal_word_stats"):
+            try:
+                result.update(self.light_novels.jiten_optimal_word_stats())
+            except Exception:
+                pass
+        return result
+
+    def study_provider_capabilities(self, backend: str = "") -> dict[str, Any]:
+        return self.light_novels.study_provider_capabilities(
+            str(backend or self.light_novels.settings().study_backend)
+        )
+
+    def _ensure_review_gate_runtime(self) -> None:
+        # A few legacy tests (and some lightweight embedding paths) construct WebAppApi
+        # with __new__ and inject only the dependencies they exercise. Keep the review
+        # gate additive: lazily initialize its runtime state instead of making unrelated
+        # playback depend on __init__ having run.
+        if not hasattr(self, "_review_gate_lock"):
+            self._review_gate_lock = threading.RLock()
+        if not hasattr(self, "_review_gate_store"):
+            self._review_gate_store = ReviewGateStore(self.manager.db)
+        if not hasattr(self, "_review_gate_candidates"):
+            self._review_gate_candidates = {}
+        if not hasattr(self, "_review_gate_pending"):
+            self._review_gate_pending = set()
+        if not hasattr(self, "_review_gate_prefetch_cards"):
+            self._review_gate_prefetch_cards = []
+        if not hasattr(self, "_review_gate_prefetch_account_key"):
+            self._review_gate_prefetch_account_key = ""
+        if not hasattr(self, "_review_gate_prefetch_session_id"):
+            self._review_gate_prefetch_session_id = ""
+        if not hasattr(self, "_review_gate_prefetch_fetched_at"):
+            self._review_gate_prefetch_fetched_at = 0.0
+        if not hasattr(self, "_review_gate_prefetch_error"):
+            self._review_gate_prefetch_error = ""
+        if not hasattr(self, "_review_gate_prefetch_thread"):
+            self._review_gate_prefetch_thread = None
+        if not hasattr(self, "_review_gate_verified_keys"):
+            self._review_gate_verified_keys = set()
+        if not hasattr(self, "_review_gate_prefetch_target_count"):
+            self._review_gate_prefetch_target_count = 0
+        if not hasattr(self, "_review_gate_prefetch_fetched_target"):
+            self._review_gate_prefetch_fetched_target = 0
+        if not hasattr(self, "_review_gate_ready_anime_count"):
+            self._review_gate_ready_anime_count = 0
+        if not hasattr(self, "_review_gate_prefetch_provider_available"):
+            self._review_gate_prefetch_provider_available = None
+        if not hasattr(self, "_review_gate_prefetch_retry_at"):
+            self._review_gate_prefetch_retry_at = 0.0
+        if not hasattr(self, "_review_gate_prefetch_no_progress"):
+            self._review_gate_prefetch_no_progress = 0
+
+    def _review_gate_count_ready_anime(self) -> int:
+        """Count distinct anime that currently have a playable Ready item.
+
+        This deliberately mirrors the local Ready admission rules instead of
+        rebuilding the entire Home payload. It is cheap enough to run once per
+        minute and gives review prefetch the requested x*y target, where x is
+        reviews per episode and y is distinct Ready anime.
+        """
+        try:
+            anime_by_id = {
+                int(anime.media_id): anime
+                for anime in self.manager.db.anime_list()
+                if anime.media_id is not None
+            }
+            incomplete: tuple[Path, ...] = ()
+            if hasattr(self.manager, "incomplete_download_paths"):
+                try:
+                    incomplete = tuple(self.manager.incomplete_download_paths())
+                except Exception:
+                    incomplete = ()
+            ready_media: set[int] = set()
+            schedule_cache = {
+                int(schedule.anime_id): schedule
+                for schedule in self.manager.db.active_personal_release_schedules()
+            }
+            for item in self.manager.db.episodes():
+                if item.media_id is None:
+                    continue
+                media_id = int(item.media_id)
+                anime = anime_by_id.get(media_id)
+                schedule = schedule_cache.get(media_id)
+                scheduled_target = False
+                if anime is not None and schedule is not None:
+                    next_item = next((row for row in schedule.items if row.watched_at is None), None)
+                    display_episode = self._display_episode_number(anime, item.episode)
+                    scheduled_target = bool(
+                        next_item is not None
+                        and next_item.unlocked
+                        and display_episode is not None
+                        and int(display_episode) == int(next_item.episode)
+                    )
+                    if not scheduled_target:
+                        continue
+                if anime is not None and schedule is None and self._watched_on_anilist(anime, item.episode):
+                    continue
+                knows_subtitle_policy = hasattr(self.manager, "japanese_subtitles_required")
+                subtitle_optional = False
+                if knows_subtitle_policy:
+                    try:
+                        subtitle_optional = not bool(
+                            self.manager.japanese_subtitles_required(media_id)
+                        )
+                    except Exception:
+                        subtitle_optional = False
+                effective_state = "ready" if scheduled_target and item.state == "watched" else item.state
+                if effective_state != "ready" and not subtitle_optional:
+                    continue
+                if (
+                    knows_subtitle_policy
+                    and not subtitle_optional
+                    and effective_state == "ready"
+                    and not self._ready_subtitle_is_usable(item)
+                ):
+                    continue
+                if (
+                    not subtitle_optional
+                    and str(item.subtitle_origin or "").casefold() == "ocr"
+                    and not self.config.matching.ocr_counts_as_ready
+                ):
+                    continue
+                try:
+                    if not item.video_path.is_file():
+                        continue
+                except OSError:
+                    continue
+                if incomplete and hasattr(self.manager, "_path_within"):
+                    try:
+                        if self.manager._path_within(item.video_path, incomplete):
+                            continue
+                    except Exception:
+                        pass
+                ready_media.add(media_id)
+            return len(ready_media)
+        except Exception as exc:
+            self.logger.info("EVENT review_gate.ready_count_failed error=%s", exc)
+            return 0
+
+    def _review_gate_prefetch_target(self) -> int:
+        required = max(1, min(50, int(self.config.ui.review_gate_count)))
+        ready_anime = self._review_gate_count_ready_anime()
+        self._review_gate_ready_anime_count = ready_anime
+        # Jiten currently exposes at most 500 extra reviews in one study-batch
+        # request, so 500 is the useful provider-bound ceiling.
+        target = min(500, required * ready_anime)
+        self._review_gate_prefetch_target_count = target
+        return target
+
+    def _review_gate_prefetch_snapshot(self, account_key: str) -> dict[str, Any]:
+        self._ensure_review_gate_runtime()
+        cards = (
+            list(self._review_gate_prefetch_cards)
+            if self._review_gate_prefetch_account_key == account_key
+            else []
+        )
+        age = max(0.0, time.time() - float(self._review_gate_prefetch_fetched_at or 0.0))
+        thread = self._review_gate_prefetch_thread
+        return {
+            "account_key": account_key,
+            "cards": cards,
+            "available": len(cards),
+            "target": int(self._review_gate_prefetch_target_count or 0),
+            "fetched_target": int(self._review_gate_prefetch_fetched_target or 0),
+            "ready_anime": int(self._review_gate_ready_anime_count or 0),
+            "provider_available": self._review_gate_prefetch_provider_available,
+            "effective_target": min(
+                int(self._review_gate_prefetch_target_count or 0),
+                int(self._review_gate_prefetch_provider_available),
+            ) if self._review_gate_prefetch_provider_available is not None else int(self._review_gate_prefetch_target_count or 0),
+            "session_id": self._review_gate_prefetch_session_id if cards else "",
+            "fetched_at": float(self._review_gate_prefetch_fetched_at or 0.0),
+            "age_seconds": age if self._review_gate_prefetch_fetched_at else None,
+            "inflight": bool(thread is not None and thread.is_alive()),
+            "retry_after_seconds": max(
+                0.0, float(self._review_gate_prefetch_retry_at or 0.0) - time.time()
+            ),
+            "error": str(self._review_gate_prefetch_error or ""),
+        }
+
+    def _review_gate_prefetch_worker(self, account_key: str, target: int) -> None:
+        started = time.perf_counter()
+
+        def commit(result: dict[str, Any], fetched_target: int, *, phase: str) -> list[dict[str, Any]]:
+            incoming = [card for card in (result.get("cards") or []) if isinstance(card, dict)]
+            with self._review_gate_lock:
+                caps = self.light_novels.study_provider_capabilities("jiten")
+                current_account = (
+                    str(caps.get("account_key") or "") if bool(caps.get("configured")) else ""
+                )
+                if current_account != account_key:
+                    return []
+                if self._review_gate_prefetch_account_key not in {"", account_key}:
+                    self._review_gate_verified_keys.clear()
+                    self._review_gate_prefetch_provider_available = None
+                    self._review_gate_prefetch_retry_at = 0.0
+                    self._review_gate_prefetch_no_progress = 0
+                    existing: list[dict[str, Any]] = []
+                else:
+                    existing = list(self._review_gate_prefetch_cards)
+                previous_available = len(existing)
+
+                # Keep already-warm cards stable and merge new provider results in.
+                # A card is revalidated immediately before POST, so preserving a
+                # warm card across a background refresh cannot create a new card or
+                # make an unsafe mutation; it only avoids UI cache churn/stalls.
+                merged: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for card in [*existing, *incoming]:
+                    key = str(card.get("pudgeCardKey") or "")
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(card)
+                    if len(merged) >= max(1, int(fetched_target)):
+                        break
+
+                self._review_gate_prefetch_cards = merged
+                self._review_gate_prefetch_account_key = account_key
+                if result.get("session_id"):
+                    self._review_gate_prefetch_session_id = str(result.get("session_id") or "")
+                self._review_gate_prefetch_fetched_at = time.time()
+                self._review_gate_prefetch_fetched_target = max(
+                    int(self._review_gate_prefetch_fetched_target or 0),
+                    int(fetched_target),
+                )
+                if "provider_available_estimate" in result:
+                    try:
+                        self._review_gate_prefetch_provider_available = max(
+                            0, int(result.get("provider_available_estimate") or 0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                self._review_gate_verified_keys.update(
+                    str(card.get("pudgeCardKey") or "")
+                    for card in incoming
+                    if str(card.get("pudgeCardKey") or "")
+                )
+                self._review_gate_prefetch_error = ""
+                available = len(merged)
+                if phase == "full":
+                    provider_cap = self._review_gate_prefetch_provider_available
+                    effective_target = min(int(fetched_target), int(provider_cap)) if provider_cap is not None else int(fetched_target)
+                    if available >= effective_target:
+                        self._review_gate_prefetch_no_progress = 0
+                        self._review_gate_prefetch_retry_at = 0.0
+                    elif not incoming and available <= previous_available:
+                        # Some Jiten sessions do not expose an explicit
+                        # reviewsRemaining cap. When repeated randomized batches
+                        # find no new safe cards, retrying every minute only wakes
+                        # the network/CPU without improving the warm pool. Keep
+                        # force=True immediate for episode completion/refill.
+                        self._review_gate_prefetch_no_progress = min(4, int(self._review_gate_prefetch_no_progress or 0) + 1)
+                        delay = min(900.0, 120.0 * (2 ** (self._review_gate_prefetch_no_progress - 1)))
+                        self._review_gate_prefetch_retry_at = time.time() + delay
+                    else:
+                        self._review_gate_prefetch_no_progress = 0
+                        self._review_gate_prefetch_retry_at = 0.0
+            self.logger.info(
+                "EVENT review_gate.prefetch_%s account=%s available=%s incoming=%s target=%s ready_anime=%s rounds=%s duration_ms=%.1f",
+                phase,
+                account_key,
+                available,
+                len(incoming),
+                fetched_target,
+                self._review_gate_ready_anime_count,
+                int(result.get("batch_rounds") or 0),
+                (time.perf_counter() - started) * 1000.0,
+            )
+            return merged
+
+        try:
+            with self._review_gate_lock:
+                same_account = self._review_gate_prefetch_account_key in {"", account_key}
+                trusted = set(self._review_gate_verified_keys) if same_account else set()
+                already_warm = bool(
+                    self._review_gate_prefetch_account_key == account_key
+                    and self._review_gate_prefetch_cards
+                )
+                existing_keys = {
+                    str(card.get("pudgeCardKey") or "")
+                    for card in self._review_gate_prefetch_cards
+                    if self._review_gate_prefetch_account_key == account_key
+                    and str(card.get("pudgeCardKey") or "")
+                }
+
+            # On cold process startup, publish one episode quota first. This gives
+            # the WebView enough verified cards for an instant first launch while
+            # the rest of x*y continues warming in the same background thread.
+            per_episode = max(1, min(50, int(self.config.ui.review_gate_count)))
+            quick_target = min(int(target), per_episode)
+            if not already_warm and 0 < quick_target < int(target):
+                quick = self.light_novels.strict_review_candidates(
+                    required=quick_target,
+                    exclude_keys=set(),
+                    trusted_previous_keys=trusted,
+                )
+                quick_cards = commit(quick, quick_target, phase="quick")
+                trusted.update(
+                    str(card.get("pudgeCardKey") or "")
+                    for card in quick_cards
+                    if str(card.get("pudgeCardKey") or "")
+                )
+                existing_keys.update(
+                    str(card.get("pudgeCardKey") or "")
+                    for card in quick_cards
+                    if str(card.get("pudgeCardKey") or "")
+                )
+
+            # Ask for the full target while excluding the cards already held by
+            # Pudge. Jiten's own batch is often only 8 cards; the provider adapter
+            # collects several randomized batches, and this merge lets the warm pool
+            # grow toward min(provider-available, X * ready-anime-count).
+            remaining_target = max(0, int(target) - len(existing_keys))
+            if remaining_target > 0:
+                result = self.light_novels.strict_review_candidates(
+                    required=remaining_target,
+                    exclude_keys=existing_keys,
+                    trusted_previous_keys=trusted,
+                )
+            else:
+                result = {"cards": [], "batch_rounds": 0}
+            cards = commit(result, target, phase="full")
+            self.logger.info(
+                "EVENT review_gate.prefetch account=%s available=%s target=%s ready_anime=%s trusted=%s duration_ms=%.1f",
+                account_key,
+                len(cards),
+                target,
+                self._review_gate_ready_anime_count,
+                len(trusted),
+                (time.perf_counter() - started) * 1000.0,
+            )
+        except Exception as exc:
+            # Preserve the last good cache. A transient provider failure should not
+            # make the next click slower than it was before the refresh attempt.
+            with self._review_gate_lock:
+                self._review_gate_prefetch_error = str(exc)
+            self.logger.info(
+                "EVENT review_gate.prefetch_failed account=%s duration_ms=%.1f error=%s",
+                account_key,
+                (time.perf_counter() - started) * 1000.0,
+                exc,
+            )
+        finally:
+            with self._review_gate_lock:
+                if self._review_gate_prefetch_thread is threading.current_thread():
+                    self._review_gate_prefetch_thread = None
+
+    def review_gate_prefetch(self, force: bool = False) -> dict[str, Any]:
+        """Warm strict Jiten review cards in the background without blocking UI startup."""
+        self._ensure_review_gate_runtime()
+        if not bool(self.config.ui.review_gate_enabled) or not hasattr(self, "light_novels"):
+            return {"started": False, "reason": "disabled", "available": 0}
+        backend = str(self.light_novels.settings().study_backend or "jiten").casefold()
+        caps = self.light_novels.study_provider_capabilities(backend)
+        account_key = str(caps.get("account_key") or "")
+        if backend != "jiten" or not bool(caps.get("configured")) or not bool(caps.get("strict_gate_supported")) or not account_key:
+            return {
+                "started": False,
+                "reason": str(caps.get("strict_gate_reason") or "unsupported"),
+                "available": 0,
+            }
+        target = self._review_gate_prefetch_target()
+        with self._review_gate_lock:
+            snapshot = self._review_gate_prefetch_snapshot(account_key)
+            if target <= 0:
+                return {"started": False, "reason": "no_ready_anime", **snapshot}
+            checked_this_target = int(self._review_gate_prefetch_fetched_target or 0) >= target
+            effective_target = target
+            if checked_this_target and self._review_gate_prefetch_provider_available is not None:
+                effective_target = min(target, int(self._review_gate_prefetch_provider_available))
+            satisfied = (
+                self._review_gate_prefetch_account_key == account_key
+                and checked_this_target
+                and len(self._review_gate_prefetch_cards) >= effective_target
+            )
+            if satisfied and not force:
+                # The minute UI tick still recomputes X*ready-anime above, but a
+                # full warm pool does not hit Jiten again just because 60 seconds
+                # elapsed. This removes background request bursts that could make
+                # an ordinary Jiten card randomly slow. Every mutation is still
+                # revalidated immediately before POST.
+                return {"started": False, "reason": "satisfied", **snapshot}
+            if not force and time.time() < float(self._review_gate_prefetch_retry_at or 0.0):
+                return {"started": False, "reason": "backoff", **self._review_gate_prefetch_snapshot(account_key)}
+            fresh = (
+                self._review_gate_prefetch_account_key == account_key
+                and self._review_gate_prefetch_fetched_at > 0
+                and time.time() - self._review_gate_prefetch_fetched_at < 55.0
+                and int(self._review_gate_prefetch_fetched_target or 0) >= target
+            )
+            if fresh and not force:
+                return {"started": False, "reason": "fresh", **snapshot}
+            if self._review_gate_prefetch_thread is not None and self._review_gate_prefetch_thread.is_alive():
+                return {"started": False, "reason": "inflight", **snapshot}
+            thread = threading.Thread(
+                target=self._review_gate_prefetch_worker,
+                args=(account_key, target),
+                name="pudge-review-prefetch",
+                daemon=True,
+            )
+            self._review_gate_prefetch_thread = thread
+            thread.start()
+            return {"started": True, "reason": "scheduled", **self._review_gate_prefetch_snapshot(account_key)}
+
+    def _review_gate_cached_cards(
+        self, account_key: str, *, exclude_keys: set[str]
+    ) -> tuple[list[dict[str, Any]], str, float | None]:
+        self._ensure_review_gate_runtime()
+        if self._review_gate_prefetch_account_key != account_key:
+            return [], "", None
+        cards = [
+            card
+            for card in self._review_gate_prefetch_cards
+            if str(card.get("pudgeCardKey") or "") not in exclude_keys
+        ]
+        age = (
+            max(0.0, time.time() - self._review_gate_prefetch_fetched_at)
+            if self._review_gate_prefetch_fetched_at
+            else None
+        )
+        return cards, self._review_gate_prefetch_session_id, age
+
+    def _review_gate_evict_prefetched(self, account_key: str, card_key: str) -> None:
+        if self._review_gate_prefetch_account_key != account_key:
+            return
+        self._review_gate_prefetch_cards = [
+            card
+            for card in self._review_gate_prefetch_cards
+            if str(card.get("pudgeCardKey") or "") != card_key
+        ]
+
+    def _review_gate_refill_if_needed(self, account_key: str, *, episode_completed: bool = False) -> None:
+        target = self._review_gate_prefetch_target()
+        if target <= 0:
+            return
+        per_episode = max(1, min(50, int(self.config.ui.review_gate_count)))
+        # Do not launch a network refresh after every single grade. That was a
+        # source of apparently random Jiten latency because study-batch/history
+        # traffic competed with the next interactive card. Refill once an episode
+        # quota is completed, once a full episode worth of reserve has been spent,
+        # or via the normal minute timer.
+        low_water = max(per_episode, target - per_episode)
+        with self._review_gate_lock:
+            if self._review_gate_prefetch_account_key != account_key:
+                needs_refill = True
+            else:
+                needs_refill = episode_completed or len(self._review_gate_prefetch_cards) < low_water
+        if needs_refill:
+            self.review_gate_prefetch(force=True)
+
+    def _review_gate_identity(self, video_path: str) -> EpisodeReviewIdentity | None:
+        try:
+            path = Path(self._play_key(video_path))
+        except Exception:
+            return None
+        episode = self.manager.db.episode_by_path(path)
+        if episode is None or episode.media_id is None:
+            return None
+        logical_episode = int(episode.episode) if episode.episode is not None else 0
+        return EpisodeReviewIdentity(int(episode.media_id), logical_episode)
+
+    @staticmethod
+    def _review_gate_scope(account_key: str, identity: EpisodeReviewIdentity) -> str:
+        return f"{account_key}:{identity.logical_id}"
+
+    def _review_gate_local_status(self, video_path: str) -> dict[str, Any]:
+        self._ensure_review_gate_runtime()
+        required = max(1, min(50, int(self.config.ui.review_gate_count)))
+        enabled = bool(self.config.ui.review_gate_enabled)
+        payload: dict[str, Any] = {
+            "enabled": enabled,
+            "supported": False,
+            "blocking": False,
+            "granted": True,
+            "required": required,
+            "completed": 0,
+            "remaining": 0,
+            "provider": "",
+            "reason": "",
+        }
+        # Keep the disabled gate a zero-dependency fast path. Playback existed long
+        # before LightNovelService and lightweight embedding/tests may omit it.
+        if not enabled:
+            payload["reason"] = "disabled"
+            return payload
+        if not hasattr(self, "light_novels"):
+            payload["reason"] = "review service is unavailable"
+            return payload
+        payload["provider"] = str(self.light_novels.settings().study_backend or "jiten").casefold()
+        identity = self._review_gate_identity(video_path)
+        if identity is None:
+            payload["reason"] = "logical episode identity is unavailable"
+            return payload
+        caps = self.light_novels.study_provider_capabilities(str(payload["provider"]))
+        payload["capabilities"] = caps
+        if not bool(caps.get("configured")):
+            payload["reason"] = f"{payload['provider']} credentials are not configured"
+            return payload
+        if not bool(caps.get("strict_gate_supported")):
+            payload["reason"] = str(caps.get("strict_gate_reason") or "provider does not support strict review gating")
+            return payload
+        account_key = str(caps.get("account_key") or "")
+        if not account_key:
+            payload["reason"] = "review provider account identity is unavailable"
+            return payload
+        progress = self._review_gate_store.status(account_key, identity, required=required)
+        payload.update(
+            {
+                "supported": True,
+                "blocking": not progress.granted,
+                "granted": progress.granted,
+                "completed": progress.completed,
+                "remaining": progress.remaining,
+                "confirmed_card_keys": list(progress.confirmed_card_keys),
+                "unknown_card_keys": list(progress.unknown_card_keys),
+                "account_key": account_key,
+                "media_id": identity.media_id,
+                "episode": identity.episode,
+                "reason": "granted" if progress.granted else "reviews_required",
+            }
+        )
+        return payload
+
+    def review_gate_status(self, video_path: str) -> dict[str, Any]:
+        with self._review_gate_lock:
+            return self._review_gate_local_status(video_path)
+
+    def review_gate_ui_event(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Record lightweight WebView state transitions for review-gate diagnosis.
+
+        Keep this intentionally bounded and content-free: card identity, timings and
+        state flags are enough to explain disabled controls or latency without
+        logging definitions/sentences from Jiten.
+        """
+        data = payload if isinstance(payload, dict) else {}
+        clean = lambda value, limit=120: re.sub(r"[\r\n\t]+", " " , str(value or ""))[:limit]
+        self.logger.info(
+            "EVENT review_gate.ui event=%s card=%s reason=%s grade=%s enabled=%s revealed=%s busy=%s authorizing=%s saving=%s queue=%s warm_queue=%s warm_total=%s warm_eligible=%s authorized=%s available=%s issued=%s prefetched=%s candidate_fetch_ms=%s duration_ms=%s outcome=%s completed=%s remaining=%s granted=%s error=%s",
+            clean(data.get("event"), 64),
+            clean(data.get("card"), 64),
+            clean(data.get("reason"), 64),
+            clean(data.get("grade"), 32),
+            data.get("enabled"),
+            data.get("revealed"),
+            data.get("busy"),
+            data.get("authorizing"),
+            data.get("saving"),
+            data.get("queue"),
+            data.get("warm_queue"),
+            data.get("warm_total"),
+            data.get("warm_eligible"),
+            data.get("authorized"),
+            data.get("available"),
+            data.get("issued"),
+            data.get("prefetched"),
+            data.get("candidate_fetch_ms"),
+            data.get("duration_ms"),
+            clean(data.get("outcome"), 64),
+            data.get("completed"),
+            data.get("remaining"),
+            data.get("granted"),
+            clean(data.get("error"), 160),
+        )
+        return {"ok": True}
+
+    def review_gate_begin(self, video_path: str) -> dict[str, Any]:
+        begin_started = time.perf_counter()
+        with self._review_gate_lock:
+            status = self._review_gate_local_status(video_path)
+            if not status.get("blocking"):
+                return status
+            identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
+            account_key = str(status["account_key"])
+            exclude = set(status.get("confirmed_card_keys") or []) | set(status.get("unknown_card_keys") or [])
+            cached_cards, cached_session_id, cache_age = self._review_gate_cached_cards(
+                account_key, exclude_keys=exclude
+            )
+            if cached_cards:
+                # Issue the whole remaining gate quota from the already-verified
+                # warm pool. The WebView can advance to card N+1 immediately while
+                # card N is being committed to Jiten; strict_review_submit still
+                # revalidates each card immediately before the mutation.
+                issue_count = max(1, min(len(cached_cards), int(status.get("remaining") or 1)))
+                issued = [dict(card) for card in cached_cards[:issue_count]]
+                issued_keys = {
+                    str(card.get("pudgeCardKey") or "")
+                    for card in issued
+                    if str(card.get("pudgeCardKey") or "")
+                }
+                scope = self._review_gate_scope(account_key, identity)
+                self._review_gate_candidates[scope] = issued_keys
+                status["cards"] = issued
+                status["available"] = len(cached_cards)
+                status["issued"] = len(issued)
+                status["session_id"] = cached_session_id
+                status["prefetched"] = True
+                status["prefetch_age_seconds"] = cache_age
+                status["candidate_fetch_ms"] = 0.0
+                status["begin_ms"] = round((time.perf_counter() - begin_started) * 1000.0, 1)
+                self.logger.info(
+                    "EVENT review_gate.begin media_id=%s episode=%s prefetched=1 available=%s issued=%s cache_age_ms=%.1f begin_ms=%.1f",
+                    identity.media_id,
+                    identity.episode,
+                    len(cached_cards),
+                    len(issued),
+                    (cache_age or 0.0) * 1000.0,
+                    status["begin_ms"],
+                )
+                if len(cached_cards) - len(issued) < 2:
+                    self.review_gate_prefetch(force=True)
+                return status
+
+        # Cold-start fallback only. Never make the click path wait for the full
+        # x*y warm-pool target: fetch at most the current episode quota, return it,
+        # then refill the account-wide pool asynchronously. The steady-state worker
+        # is responsible for x*y; interaction latency stays bounded by x.
+        started = time.perf_counter()
+        pool_target = self._review_gate_prefetch_target()
+        episode_target = max(
+            1,
+            min(
+                50,
+                int(status.get("remaining") or status.get("required") or self.config.ui.review_gate_count),
+            ),
+        )
+        candidates = self.light_novels.strict_review_candidates(
+            required=episode_target,
+            exclude_keys=exclude,
+        )
+        candidate_fetch_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        cards = [card for card in (candidates.get("cards") or []) if isinstance(card, dict)]
+        scope = self._review_gate_scope(account_key, identity)
+        with self._review_gate_lock:
+            refreshed = self._review_gate_local_status(video_path)
+            if not refreshed.get("blocking"):
+                return refreshed
+            # Store the whole verified batch account-wide. Per-episode progress is
+            # filtered each time a card is issued.
+            self._review_gate_prefetch_cards = cards
+            self._review_gate_prefetch_account_key = account_key
+            self._review_gate_prefetch_session_id = str(candidates.get("session_id") or "")
+            self._review_gate_prefetch_fetched_at = time.time()
+            self._review_gate_prefetch_fetched_target = episode_target
+            self._review_gate_verified_keys.update(
+                str(card.get("pudgeCardKey") or "")
+                for card in cards
+                if str(card.get("pudgeCardKey") or "")
+            )
+            self._review_gate_prefetch_error = ""
+            visible = [
+                card for card in cards
+                if str(card.get("pudgeCardKey") or "") not in exclude
+            ]
+            issue_count = max(1, min(len(visible), int(refreshed.get("remaining") or 1))) if visible else 0
+            issued = [dict(card) for card in visible[:issue_count]]
+            issued_keys = {
+                str(card.get("pudgeCardKey") or "")
+                for card in issued
+                if str(card.get("pudgeCardKey") or "")
+            }
+            self._review_gate_candidates[scope] = issued_keys
+            refreshed["cards"] = issued
+            refreshed["available"] = len(visible)
+            refreshed["issued"] = len(issued)
+            refreshed["session_id"] = self._review_gate_prefetch_session_id
+            refreshed["prefetched"] = False
+            refreshed["prefetch_age_seconds"] = 0.0
+            refreshed["candidate_fetch_ms"] = candidate_fetch_ms
+            refreshed["begin_ms"] = round((time.perf_counter() - begin_started) * 1000.0, 1)
+            self.logger.info(
+                "EVENT review_gate.candidate media_id=%s episode=%s available=%s duration_ms=%.1f begin_ms=%.1f cold_start=1",
+                identity.media_id,
+                identity.episode,
+                len(visible),
+                candidate_fetch_ms,
+                refreshed["begin_ms"],
+            )
+            if not issued:
+                refreshed["reason"] = "no_eligible_existing_reviews"
+                refreshed["message"] = (
+                    "Jiten returned no previously reviewed cards. New cards are never created by the gate."
+                )
+            # Do not hold up this response for the desired x*y pool. Scheduling is
+            # cheap; the worker performs provider I/O after the click path returns.
+            if pool_target > episode_target:
+                self.review_gate_prefetch(force=True)
+            return refreshed
+
+    def review_gate_review(
+        self,
+        video_path: str,
+        word_id: int,
+        reading_index: int,
+        grade: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        card_key = review_card_key(int(word_id), int(reading_index))
+        with self._review_gate_lock:
+            status = self._review_gate_local_status(video_path)
+            if not status.get("blocking"):
+                return {**status, "ok": True, "outcome": "already_granted"}
+            identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
+            account_key = str(status["account_key"])
+            scope = self._review_gate_scope(account_key, identity)
+            if card_key in set(status.get("confirmed_card_keys") or []):
+                return {**status, "ok": True, "outcome": "already_counted"}
+            if card_key in set(status.get("unknown_card_keys") or []):
+                return {
+                    **status,
+                    "ok": False,
+                    "outcome": "unknown",
+                    "message": "This card has an ambiguous previous attempt and cannot be retried automatically.",
+                }
+            if card_key not in self._review_gate_candidates.get(scope, set()):
+                raise ValueError("Review card is stale or was not issued by the current gate batch")
+            pending_key = f"{scope}:{card_key}"
+            if pending_key in self._review_gate_pending:
+                self.logger.info(
+                    "EVENT review_gate.submit_blocked media_id=%s episode=%s card=%s reason=pending",
+                    identity.media_id, identity.episode, card_key,
+                )
+                return {**status, "ok": False, "outcome": "pending"}
+            self._review_gate_pending.add(pending_key)
+        submit_started = time.perf_counter()
+        self.logger.info(
+            "EVENT review_gate.submit_start media_id=%s episode=%s card=%s grade=%s attempt=%s",
+            identity.media_id, identity.episode, card_key, str(grade), str(attempt_id)[:80],
+        )
+        try:
+            result = self.light_novels.strict_review_submit(
+                int(word_id),
+                int(reading_index),
+                str(grade),
+                attempt_id=str(attempt_id),
+            )
+        except LightNovelError as exc:
+            self.logger.info(
+                "EVENT review_gate.submit_error media_id=%s episode=%s card=%s outcome=rejected provider_ms=%.1f error=%s",
+                identity.media_id, identity.episode, card_key,
+                (time.perf_counter() - submit_started) * 1000.0, exc,
+            )
+            # The provider deterministically rejected/reclassified the card (for example
+            # it was suspended between batch issue and submit). Do not keep offering a
+            # stale candidate; unlike an unknown transport outcome it is safe to fetch a
+            # replacement card on the next begin.
+            with self._review_gate_lock:
+                self._review_gate_candidates.get(scope, set()).discard(card_key)
+                self._review_gate_evict_prefetched(account_key, card_key)
+            self._review_gate_refill_if_needed(account_key)
+            raise
+        except ReviewOutcomeUnknown as exc:
+            with self._review_gate_lock:
+                progress = self._review_gate_store.mark_unknown(
+                    account_key,
+                    identity,
+                    required=max(1, int(status["required"])),
+                    card_key=card_key,
+                )
+                self._review_gate_candidates.get(scope, set()).discard(card_key)
+                self._review_gate_evict_prefetched(account_key, card_key)
+                updated = self._review_gate_local_status(video_path)
+            self._review_gate_refill_if_needed(account_key)
+            self.logger.info(
+                "EVENT review_gate.submit_unknown media_id=%s episode=%s card=%s provider_ms=%.1f attempt=%s",
+                identity.media_id, identity.episode, card_key,
+                (time.perf_counter() - submit_started) * 1000.0, str(exc.attempt_id)[:80],
+            )
+            return {
+                **updated,
+                "ok": False,
+                "outcome": "unknown",
+                "attempt_id": exc.attempt_id,
+                "message": str(exc),
+                "completed": progress.completed,
+                "remaining": progress.remaining,
+            }
+        finally:
+            with self._review_gate_lock:
+                self._review_gate_pending.discard(pending_key)
+        with self._review_gate_lock:
+            progress = self._review_gate_store.mark_confirmed(
+                account_key,
+                identity,
+                required=max(1, int(status["required"])),
+                card_key=card_key,
+            )
+            self._review_gate_candidates.get(scope, set()).discard(card_key)
+            self._review_gate_evict_prefetched(account_key, card_key)
+            updated = self._review_gate_local_status(video_path)
+        self._review_gate_refill_if_needed(
+            account_key,
+            episode_completed=bool(updated.get("granted")),
+        )
+        self.logger.info(
+            "EVENT review_gate.review media_id=%s episode=%s card=%s completed=%s required=%s granted=%s provider_ms=%.1f revalidate_ms=%s mutation_ms=%s",
+            identity.media_id,
+            identity.episode,
+            card_key,
+            progress.completed,
+            progress.required,
+            progress.granted,
+            (time.perf_counter() - submit_started) * 1000.0,
+            result.get("revalidate_ms") if isinstance(result, dict) else None,
+            result.get("mutation_ms") if isinstance(result, dict) else None,
+        )
+        return {**updated, "ok": True, "outcome": "confirmed", "review": result}
+
+    def _study_manga_card_image(
+        self, media_context: dict[str, Any] | None
+    ) -> tuple[bytes | None, str]:
+        context = media_context if isinstance(media_context, dict) else {}
+        if str(context.get("kind") or "").casefold() != "manga":
+            return None, ""
+        try:
+            book_id = int(context.get("book_id") or context.get("bookId") or 0)
+            page_index = int(
+                context.get("page_index")
+                if context.get("page_index") is not None
+                else context.get("pageIndex") or 0
+            )
+            if book_id <= 0 or page_index < 0:
+                return None, ""
+            page = self.manga.page(book_id, page_index)
+            data_uri = str(page.get("data_uri") or "")
+            if "," not in data_uri:
+                return None, ""
+            raw = base64.b64decode(data_uri.split(",", 1)[1], validate=False)
+            if not raw:
+                return None, ""
+            import io
+            from PIL import Image, ImageOps
+
+            with Image.open(io.BytesIO(raw)) as source:
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                image.thumbnail((1600, 1600), getattr(Image, "Resampling", Image).LANCZOS)
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=78, optimize=True, progressive=True)
+                compressed = output.getvalue()
+                if len(compressed) > 1_500_000:
+                    output = io.BytesIO()
+                    image.thumbnail((1280, 1280), getattr(Image, "Resampling", Image).LANCZOS)
+                    image.save(output, format="JPEG", quality=68, optimize=True, progressive=True)
+                    compressed = output.getvalue()
+            filename = f"pudge-manga-{book_id}-page-{page_index + 1}.jpg"
+            return compressed, filename
+        except Exception as exc:
+            try:
+                self.logger.warning("Manga card image preparation failed: %s", exc)
+            except Exception:
+                pass
+            return None, ""
+
     def study_action(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = payload or {}
+        backend = str(payload.get("backend") or self.light_novels.settings().study_backend)
+        action = str(payload.get("action") or "review")
+        media_image: bytes | None = None
+        media_filename = ""
+        if backend.casefold() == "jiten" and action == "review":
+            media_context = payload.get("media_context")
+            selected_deck = payload.get("deck_id")
+            should_prepare_media = bool(media_context) and str(selected_deck or "").isdigit()
+            if should_prepare_media:
+                try:
+                    rows = self.light_novels.jiten_live_states(
+                        [(int(payload.get("word_id") or 0), int(payload.get("reading_index") or 0))],
+                        force=False,
+                    )
+                    row = rows[0] if rows else {}
+                    deck_ids = row.get("studyDeckIds") if isinstance(row, dict) else []
+                    should_prepare_media = not isinstance(deck_ids, list) or len(deck_ids) == 0
+                except Exception:
+                    # The authoritative membership check still happens in
+                    # LightNovelService. Avoid failing review just because the
+                    # optional preflight used for image compression failed.
+                    should_prepare_media = False
+            if should_prepare_media:
+                media_image, media_filename = self._study_manga_card_image(media_context)
         return self.light_novels.study_action(
-            str(payload.get("backend") or self.light_novels.settings().study_backend),
-            str(payload.get("action") or "review"),
+            backend,
+            action,
             int(payload.get("word_id") or 0),
             int(payload.get("reading_index") or 0),
             grade=str(payload.get("grade") or "good"),
             sentence=str(payload.get("sentence") or ""),
             deck_id=payload.get("deck_id"),
+            attempt_id=str(payload.get("attempt_id") or ""),
+            id_namespace=str(payload.get("id_namespace") or ""),
+            media_image=media_image,
+            media_filename=media_filename,
         )
 
     def translate_text(
@@ -5635,6 +7278,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             book_id, len(book.get("chapters") or []), bool(book.get("paired_audio")),
             metadata_ms, audio_ms, total_ms,
         )
+        media = self._consumption_media_ref("light_novel", int(book_id))
+        if media is not None:
+            book["media_uuid"] = media.media_uuid
+            book["source_revision"] = media.source_revision
         return book
 
     def _schedule_ln_reader_parse_alignment_refresh(self, book_id: int, chapter_index: int) -> None:
@@ -5729,12 +7376,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def light_novel_delete(self, book_id: int) -> dict[str, Any]:
         # Keep the bridge call tiny. The frontend removes the card optimistically;
         # audiobook unlinking is allowed to finish after the durable LN tombstone
-        # and row deletion are committed.
-        result = self.light_novels.delete_book(int(book_id), delete_file=False)
+        # and row deletion are committed. Consumption history is detached, never deleted.
+        local_id = int(book_id)
+        result = self.light_novels.delete_book(local_id, delete_file=False)
+        self.consumption.detach_library_media(kind="light_novel", local_id=str(local_id))
         threading.Thread(
             target=self.audiobooks.unlink_light_novel,
-            args=(int(book_id),),
-            name=f"ln-unlink-delete-{int(book_id)}",
+            args=(local_id,),
+            name=f"ln-unlink-delete-{local_id}",
             daemon=True,
         ).start()
         return result
@@ -6187,7 +7836,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {"cancelled": False, **self.import_light_novel_speaker_markup(int(book_id), str(raw))}
 
     def media_identity_search(self, kind: str, query: str) -> list[dict[str, Any]]:
-        normalized = str(kind or "").strip().lower()
+        normalized = _media_identity_anilist_kind(kind)
         if normalized in {"novel", "light_novel", "ln", "audiobook"}:
             return self.light_novels.search_anilist_novels(str(query or "").strip())
         if normalized == "manga":
@@ -6195,7 +7844,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.planning_search_anilist(str(query or "").strip())
 
     def media_identity_current(self, kind: str, local_id: int) -> dict[str, Any]:
-        normalized = str(kind or "").strip().lower()
+        normalized = _media_identity_anilist_kind(kind)
         if normalized in {"novel", "light_novel", "ln"}:
             return self.light_novels.book(int(local_id))
         if normalized == "manga":
@@ -6205,7 +7854,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return dict(row) if row is not None else {"kind": normalized, "local_id": int(local_id)}
 
     def media_identity_bind(self, kind: str, local_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
-        normalized = str(kind or "").strip().lower()
+        normalized = _media_identity_anilist_kind(kind)
         item = dict(selection or {})
         if normalized in {"novel", "light_novel", "ln"}:
             result = self.light_novels.bind_anilist(int(local_id), int(media_id), item)
@@ -6224,7 +7873,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.media_identity_current(normalized, int(local_id))
 
     def media_identity_unbind(self, kind: str, local_id: int) -> dict[str, Any]:
-        normalized = str(kind or "").strip().lower()
+        normalized = _media_identity_anilist_kind(kind)
         if normalized in {"novel", "light_novel", "ln"}:
             return self.light_novels.unbind_anilist(int(local_id))
         if normalized == "manga":
@@ -6275,6 +7924,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def light_novel_study_action(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.study_action(payload)
+
+    def light_novel_study_state(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.study_state(payload)
+
+    def light_novel_study_states(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.study_states(payload)
 
     def light_novel_search_nyaa(
         self,
@@ -6943,7 +8598,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         recovered = 0
         inspected = 0
         try:
-            state = self.light_novels.state()
+            light_novels = getattr(self, "light_novels", None)
+            state_reader = getattr(light_novels, "state", None)
+            if not callable(state_reader):
+                return {"skipped": True, "reason": "light_novels_unavailable", "recovered": 0}
+            state = state_reader()
             for book in state.get("books", []):
                 try:
                     book_id = int(book.get("id") or 0)
@@ -7388,6 +9047,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 cfg.ui.jiten_developer_tools_confirmed,
             )
         )
+        cfg.ui.review_gate_enabled = bool(
+            values.get("review_gate_enabled", cfg.ui.review_gate_enabled)
+        )
+        cfg.ui.review_gate_count = max(
+            1, min(50, int(values.get("review_gate_count", cfg.ui.review_gate_count)))
+        )
         cfg.library.root_dir = Path(str(values.get("library_root", cfg.library.root_dir))).expanduser()
         def _folder_list(value: object) -> list[Path]:
             raw = str(value or "").replace(";", "\n")
@@ -7506,6 +9171,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.aria2.upload_limit_kib = max(0, int(values.get("aria2_upload_limit_kib", cfg.aria2.upload_limit_kib)))
         cfg.aria2.vpn_interface = str(values.get("aria2_vpn_interface", cfg.aria2.vpn_interface)).strip()
         cfg.aria2.vpn_kill_switch = bool(values.get("aria2_vpn_kill_switch", cfg.aria2.vpn_kill_switch))
+        cfg.power.manual_energy_saving = bool(
+            values.get("power_manual_energy_saving", cfg.power.manual_energy_saving)
+        )
+        cfg.power.auto_battery_energy_saving = bool(
+            values.get(
+                "power_auto_battery_energy_saving",
+                cfg.power.auto_battery_energy_saving,
+            )
+        )
         cfg.agent.enabled = bool(values.get("agent_enabled", cfg.agent.enabled))
         cfg.agent.poll_minutes = max(5, int(values.get("agent_poll", cfg.agent.poll_minutes)))
         cfg.agent.anilist_refresh_minutes = max(5, int(values.get("anilist_refresh_poll", cfg.agent.anilist_refresh_minutes)))
@@ -8570,13 +10244,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         query($search:String!){
           anime:Page(page:1,perPage:8){media(search:$search,type:ANIME,sort:SEARCH_MATCH){
             id format status meanScore seasonYear episodes duration genres description(asHtml:false)
-            title{userPreferred romaji english native} coverImage{large} siteUrl
+            title{userPreferred romaji english native} coverImage{extraLarge large} siteUrl
             studios(isMain:true){nodes{name}}
             mediaListEntry{status score(format:POINT_10)}
           }}
           literature:Page(page:1,perPage:8){media(search:$search,type:MANGA,sort:SEARCH_MATCH){
             id format status meanScore seasonYear chapters volumes genres description(asHtml:false)
-            title{userPreferred romaji english native} coverImage{large} siteUrl
+            title{userPreferred romaji english native} coverImage{extraLarge large} siteUrl
             mediaListEntry{status score(format:POINT_10)}
           }}
         }
@@ -8620,7 +10294,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             ),
                             "",
                         ),
-                        "cover": (media.get("coverImage") or {}).get("large") or "",
+                        "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "",
                         "site_url": media.get("siteUrl") or "",
                         "media_status": media.get("status") or "",
                         "list_status": entry.get("status") or "",
@@ -8652,6 +10326,55 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             str(media_format or ""),
             [str(value) for value in (titles or []) if str(value or "").strip()],
         )
+
+    def _jiten_state_prefetch_worker(self, cancel_event: threading.Event) -> None:
+        started_at = time.time()
+        try:
+            result = self.light_novels.jiten_prefetch_corpus_states(cancel_event=cancel_event)
+            result = {**result, "started_at": started_at, "finished_at": time.time()}
+            self._jiten_state_prefetch_stats = result
+            self.logger.info(
+                "EVENT jiten.state_prefetch reason=%s warmed=%s total=%s batches=%s",
+                result.get("reason"),
+                result.get("warmed", 0),
+                result.get("total", 0),
+                result.get("batches", 0),
+            )
+        except Exception as exc:
+            self._jiten_state_prefetch_stats = {
+                "ok": False,
+                "reason": "error",
+                "error": str(exc),
+                "started_at": started_at,
+                "finished_at": time.time(),
+            }
+            self.logger.info("Jiten state corpus prefetch skipped: %s", exc)
+        finally:
+            with self._jiten_state_prefetch_lock:
+                if self._jiten_state_prefetch_thread is threading.current_thread():
+                    self._jiten_state_prefetch_thread = None
+
+    def jiten_state_prefetch(self, force: bool = False) -> dict[str, Any]:
+        settings = self.light_novels.settings()
+        if settings.study_backend != "jiten" or not str(settings.jiten_api_key or "").strip():
+            return {"started": False, "reason": "jiten_disabled"}
+        with self._jiten_state_prefetch_lock:
+            thread = self._jiten_state_prefetch_thread
+            if thread is not None and thread.is_alive():
+                return {"started": False, "reason": "running", **self._jiten_state_prefetch_stats}
+            if not force and self._jiten_state_prefetch_stats.get("reason") == "complete":
+                return {"started": False, "reason": "complete", **self._jiten_state_prefetch_stats}
+            cancel_event = threading.Event()
+            thread = threading.Thread(
+                target=self._jiten_state_prefetch_worker,
+                args=(cancel_event,),
+                name=f"{APP_SLUG}-jiten-state-prefetch",
+                daemon=True,
+            )
+            self._jiten_state_prefetch_cancel_event = cancel_event
+            self._jiten_state_prefetch_thread = thread
+            thread.start()
+        return {"started": True, "reason": "scheduled"}
 
     def _jiten_refresh_worker(
         self,
@@ -8713,6 +10436,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if self._jiten_refresh_job_id == job_id:
                     self._jiten_refresh_thread = None
                     self._jiten_refresh_job_id = ""
+            try:
+                self.jiten_state_prefetch(force=True)
+            except Exception as exc:
+                self.logger.info("Jiten state prefetch after parse refresh skipped: %s", exc)
 
     def refresh_jiten_data(self) -> dict[str, Any]:
         """Invalidate Jiten metadata immediately and lazily parse local reading material."""
@@ -10746,6 +12473,57 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return False
         return True
 
+    @staticmethod
+    def _play_ack_payload(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+        raw = str(record.get("ack_file") or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid") or 0)
+            started_at = float(payload.get("started_at") or 0.0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        if pid <= 0:
+            return None
+        return {"pid": pid, "started_at": started_at, "ack_file": str(path)}
+
+    def _cleanup_play_ack(self, record: dict[str, Any] | None) -> None:
+        if not isinstance(record, dict):
+            return
+        raw = str(record.get("ack_file") or "").strip()
+        if not raw:
+            return
+        try:
+            Path(raw).expanduser().unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _log_play_status(self, key: str, state: dict[str, Any]) -> None:
+        status = str(state.get("status") or "")
+        reason = str(state.get("reason") or "")
+        mpv_pid = int(state.get("mpv_pid") or 0)
+        exit_code = state.get("exit_code")
+        signature = f"{status}|{reason}|{mpv_pid}|{exit_code}"
+        if self._play_last_logged_status.get(key) == signature:
+            return
+        self._play_last_logged_status[key] = signature
+        self.logger.info(
+            "EVENT play.status video=%s status=%s reason=%s launcher_pid=%s mpv_pid=%s age_ms=%.1f exit_code=%s",
+            Path(key).name,
+            status,
+            reason,
+            state.get("pid") or 0,
+            mpv_pid,
+            float(state.get("age") or 0.0) * 1000.0,
+            exit_code if exit_code is not None else "",
+        )
+
     def _restored_play_state_locked(self, key: str) -> dict[str, Any] | None:
         record = self._play_registry.get(key)
         if not isinstance(record, dict):
@@ -10757,15 +12535,50 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             pid = 0
             started_at = 0.0
         if not self._pid_is_alive(pid):
+            self._cleanup_play_ack(record)
             self._play_registry.pop(key, None)
             self._save_play_registry()
             return None
-        age = max(0.0, time.time() - started_at) if started_at else 6.0
+        age = max(0.0, time.time() - started_at) if started_at else self.PLAY_STARTUP_TIMEOUT_SECONDS
+        ack = self._play_ack_payload(record)
+        # Old registry rows from pre-v5.3 do not have an ack file. Preserve the
+        # old age heuristic for those rows so an app update cannot kill a real
+        # playback that was already running.
+        if not str(record.get("ack_file") or "").strip():
+            return {
+                "status": "starting" if age < 6.0 else "running",
+                "pid": pid,
+                "age": age,
+                "restored": True,
+                "legacy_startup_state": True,
+            }
+        if ack is not None and self._pid_is_alive(int(ack["pid"])):
+            return {
+                "status": "running",
+                "pid": pid,
+                "mpv_pid": int(ack["pid"]),
+                "age": age,
+                "restored": True,
+            }
+        if age < self.PLAY_STARTUP_TIMEOUT_SECONDS:
+            return {"status": "starting", "pid": pid, "age": age, "restored": True}
+        self.logger.error(
+            "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=True",
+            Path(key).name, pid, age * 1000.0, str(record.get("ack_file") or ""),
+        )
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        self._cleanup_play_ack(record)
+        self._play_registry.pop(key, None)
+        self._save_play_registry()
         return {
-            "status": "starting" if age < 6.0 else "running",
-            "pid": pid,
+            "status": "failed",
+            "exit_code": -1,
+            "reason": "startup_timeout",
+            "error": "mpv did not report a successful start within 10 seconds.",
             "age": age,
-            "restored": True,
         }
 
     def _active_playbacks_payload(self) -> list[dict[str, Any]]:
@@ -10781,17 +12594,49 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _play_state_locked(self, key: str) -> dict[str, Any]:
         process = self._play_processes.get(key)
+        record = self._play_registry.get(key)
         if process is not None:
             code = process.poll()
             if code is None:
                 age = max(0.0, time.time() - self._play_started_at.get(key, time.time()))
+                ack = self._play_ack_payload(record)
+                if ack is not None and self._pid_is_alive(int(ack["pid"])):
+                    return {
+                        "status": "running",
+                        "pid": process.pid,
+                        "mpv_pid": int(ack["pid"]),
+                        "age": age,
+                    }
+                if age < self.PLAY_STARTUP_TIMEOUT_SECONDS:
+                    return {"status": "starting", "pid": process.pid, "age": age}
+                self.logger.error(
+                    "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=False",
+                    Path(key).name, process.pid, age * 1000.0, str((record or {}).get("ack_file") or ""),
+                )
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                self._play_processes.pop(key, None)
+                self._play_started_at.pop(key, None)
+                self._cleanup_play_ack(record)
+                self._play_registry.pop(key, None)
+                self._save_play_registry()
+                self._play_exit_codes[key] = (-1, time.time())
                 return {
-                    "status": "starting" if age < 6.0 else "running",
-                    "pid": process.pid,
+                    "status": "failed",
+                    "exit_code": -1,
+                    "reason": "startup_timeout",
+                    "error": "mpv did not report a successful start within 10 seconds.",
                     "age": age,
                 }
+            self.logger.info(
+                "EVENT play.launcher_exit video=%s launcher_pid=%s exit_code=%s",
+                Path(key).name, process.pid, code,
+            )
             self._play_processes.pop(key, None)
             self._play_started_at.pop(key, None)
+            self._cleanup_play_ack(record)
             self._play_registry.pop(key, None)
             self._save_play_registry()
             self._play_exit_codes[key] = (int(code), time.time())
@@ -10804,9 +12649,190 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if last is not None:
             code, finished_at = last
             if time.time() - finished_at < 8.0 and code != 0:
-                return {"status": "failed", "exit_code": code}
+                return {"status": "failed", "exit_code": code, "reason": "launcher_exit"}
             self._play_exit_codes.pop(key, None)
         return {"status": "idle"}
+
+    def personal_schedule_get(self, media_id: int) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            return {"ok": False, "error": "Anime not found"}
+        snapshot = self._personal_schedule_snapshot(anime)
+        if snapshot.get("enabled") and snapshot.get("start_local_datetime") and snapshot.get("timezone_iana"):
+            snapshot["preview"] = preview_weekly_dates(
+                start_local_datetime=str(snapshot["start_local_datetime"]),
+                timezone_iana=str(snapshot["timezone_iana"]),
+                count=max(1, int(snapshot.get("total_count") or 1)),
+            )
+        else:
+            snapshot["preview"] = []
+        return {"ok": True, "schedule": snapshot}
+
+    def personal_schedule_preview(
+        self,
+        media_id: int,
+        start_local_datetime: str,
+        timezone_iana: str,
+    ) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            return {"ok": False, "error": "Anime not found"}
+        order, reason = self._personal_schedule_episode_order(anime)
+        if not order:
+            return {"ok": False, "error": reason}
+        try:
+            preview = preview_weekly_dates(
+                start_local_datetime=str(start_local_datetime),
+                timezone_iana=str(timezone_iana),
+                count=max(1, len(order)),
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        first_episode = 1 if anime.progress >= int(anime.episodes or 0) else max(1, anime.next_episode)
+        return {
+            "ok": True,
+            "preview": [
+                {**row, "episode": first_episode + int(row["ordinal"])}
+                for row in preview
+                if first_episode + int(row["ordinal"]) <= int(anime.episodes or first_episode)
+            ],
+            "rewatch": bool(anime.progress >= int(anime.episodes or 0)),
+            "first_episode": first_episode,
+        }
+
+    def personal_schedule_save(
+        self,
+        media_id: int,
+        start_local_datetime: str,
+        timezone_iana: str,
+    ) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            return {"ok": False, "error": "Anime not found"}
+        order, reason = self._personal_schedule_episode_order(anime)
+        if not order:
+            return {"ok": False, "error": reason}
+        existing = self.manager.db.personal_release_schedule(anime.media_id)
+        if existing and existing.enabled and existing.items:
+            episodes = [item.episode for item in existing.items]
+            rewatch = bool(existing.rewatch)
+        else:
+            total = int(anime.episodes or 0)
+            rewatch = bool(total and anime.progress >= total)
+            first = 1 if rewatch else max(1, int(anime.next_episode))
+            episodes = [episode for episode in order if episode >= first]
+        try:
+            schedule = self.manager.db.save_personal_release_schedule(
+                anime.media_id,
+                episodes=episodes,
+                start_local_datetime=str(start_local_datetime),
+                timezone_iana=str(timezone_iana),
+                rewatch=rewatch,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        self.logger.info(
+            "EVENT personal_schedule.saved media_id=%s revision=%s first_episode=%s items=%s timezone=%s rewatch=%s",
+            anime.media_id,
+            schedule.revision,
+            schedule.first_episode,
+            len(schedule.items),
+            schedule.timezone_iana,
+            schedule.rewatch,
+        )
+        return {"ok": True, "schedule": self._personal_schedule_snapshot(anime), "state": self._get_state(refresh_storage=False)}
+
+    def personal_schedule_tick(self) -> dict[str, Any]:
+        delivered: list[dict[str, Any]] = []
+        for schedule in self.manager.db.active_personal_release_schedules():
+            anime = self.manager.db.get_anime(schedule.anime_id)
+            if anime is None:
+                continue
+            snapshot = self._personal_schedule_snapshot(anime)
+            if snapshot.get("status") != "new_ready" or snapshot.get("next_episode") is None:
+                continue
+            episode = int(snapshot["next_episode"])
+            key = f"personal_schedule_notification:{schedule.schedule_id}:{episode}:ready"
+            if self.manager.db.get_state(key, ""):
+                continue
+            if not self.config.ui.notifications_enabled:
+                self.manager.db.set_state(key, "disabled")
+                continue
+            subtitle = "Серия по расписанию готова" if self.config.ui.language == "ru" else "Scheduled episode ready"
+            message = (
+                f"{anime.title} — серия {episode} готова к просмотру."
+                if self.config.ui.language == "ru"
+                else f"{anime.title} — episode {episode} is ready to watch."
+            )
+            try:
+                ok = bool(send_native_notification(subtitle, message))
+            except Exception as exc:
+                ok = False
+                self.logger.warning(
+                    "EVENT personal_schedule.notification_failed media_id=%s episode=%s error=%r",
+                    anime.media_id, episode, exc,
+                )
+            if ok:
+                self.manager.db.set_state(key, "delivered")
+                delivered.append({"media_id": anime.media_id, "episode": episode})
+            self.logger.info(
+                "EVENT personal_schedule.notification media_id=%s episode=%s delivered=%s",
+                anime.media_id, episode, ok,
+            )
+        return {"ok": True, "delivered": delivered, "state": self._get_state(refresh_storage=False)}
+
+    def personal_schedule_disable(self, media_id: int) -> dict[str, Any]:
+        anime = self.manager.db.get_anime(int(media_id))
+        if anime is None:
+            return {"ok": False, "error": "Anime not found"}
+        changed = self.manager.db.disable_personal_release_schedule(anime.media_id)
+        self.logger.info("EVENT personal_schedule.disabled media_id=%s changed=%s", anime.media_id, changed)
+        return {"ok": True, "changed": changed, "state": self._get_state(refresh_storage=False)}
+
+    def _personal_schedule_play_admission(self, path: Path) -> dict[str, Any]:
+        episode = self.manager.db.episode_by_path(path)
+        if episode is None or episode.media_id is None or episode.episode is None:
+            return {"allowed": True}
+        anime = self.manager.db.get_anime(int(episode.media_id))
+        if anime is None:
+            return {"allowed": True}
+        schedule = self.manager.db.personal_release_schedule(anime.media_id)
+        if schedule is None or not schedule.enabled:
+            return {"allowed": True}
+        display_episode = self._display_episode_number(anime, episode.episode)
+        if display_episode is None:
+            return {"allowed": True}
+        item = next((row for row in schedule.items if row.episode == int(display_episode)), None)
+        if item is None or item.watched_at is not None:
+            return {"allowed": True, "scheduled": item is not None, "media_id": anime.media_id, "episode": int(display_episode), "rewatch": schedule.rewatch}
+        next_item = next((row for row in schedule.items if row.watched_at is None), None)
+        if next_item is None:
+            return {"allowed": True}
+        if int(item.episode) != int(next_item.episode):
+            return {
+                "allowed": False,
+                "reason": "previous_episode_pending",
+                "media_id": anime.media_id,
+                "episode": int(display_episode),
+                "next_episode": int(next_item.episode),
+                "unlock_at": float(item.unlock_at_utc),
+            }
+        if not item.unlocked:
+            return {
+                "allowed": False,
+                "reason": "not_unlocked",
+                "media_id": anime.media_id,
+                "episode": int(display_episode),
+                "next_episode": int(next_item.episode),
+                "unlock_at": float(item.unlock_at_utc),
+            }
+        return {
+            "allowed": True,
+            "scheduled": True,
+            "media_id": anime.media_id,
+            "episode": int(display_episode),
+            "rewatch": schedule.rewatch,
+        }
 
     def play(
         self,
@@ -10824,6 +12850,32 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             state = self._play_state_locked(key)
             if state["status"] in {"starting", "running"}:
                 return {"ok": True, "duplicate": True, **state}
+            schedule_admission = self._personal_schedule_play_admission(path)
+            if not schedule_admission.get("allowed", True):
+                self.logger.info(
+                    "EVENT personal_schedule.block_play media_id=%s episode=%s reason=%s next_episode=%s unlock_at=%s",
+                    schedule_admission.get("media_id"), schedule_admission.get("episode"),
+                    schedule_admission.get("reason"), schedule_admission.get("next_episode"),
+                    schedule_admission.get("unlock_at"),
+                )
+                return {"ok": False, "personal_schedule_locked": True, "status": "schedule_locked", "personal_schedule": schedule_admission}
+            self._ensure_review_gate_runtime()
+            with self._review_gate_lock:
+                gate = self._review_gate_local_status(key)
+            if gate.get("blocking"):
+                self.logger.info(
+                    "EVENT review_gate.block_play media_id=%s episode=%s completed=%s required=%s",
+                    gate.get("media_id"),
+                    gate.get("episode"),
+                    gate.get("completed"),
+                    gate.get("required"),
+                )
+                return {
+                    "ok": False,
+                    "review_gate_required": True,
+                    "status": "review_required",
+                    "review_gate": gate,
+                }
             try:
                 episode = self.manager.db.episode_by_path(path)
                 explicit_library_embedded_sid = (
@@ -11056,9 +13108,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     episode.episode if episode else None,
                     bool(allow_image_subtitles),
                 )
+                ack_dir = self.config.paths.cache_dir / "playback-start"
+                ack_dir.mkdir(parents=True, exist_ok=True)
+                ack_path = ack_dir / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()[:20]}-{time.time_ns()}.json"
+                env = os.environ.copy()
+                env["PUDGE_MPV_START_ACK"] = str(ack_path)
                 process = subprocess.Popen(
                     command,
                     start_new_session=True,
+                    env=env,
                 )
             except OSError as exc:
                 raise RuntimeError(f"Не удалось запустить {APP_NAME}: {exc}") from exc
@@ -11067,15 +13125,31 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._play_registry[key] = {
                 "pid": int(process.pid),
                 "started_at": float(self._play_started_at[key]),
+                "ack_file": str(ack_path),
             }
+            self.logger.info(
+                "EVENT play.launcher_spawned video=%s launcher_pid=%s ack=%s",
+                path.name, process.pid, ack_path,
+            )
             self._save_play_registry()
             self._play_exit_codes.pop(key, None)
+            if schedule_admission.get("scheduled"):
+                scheduled_episode = self.manager.db.episode_by_path(path)
+                self._schedule_play_sessions[key] = {
+                    "media_id": int(schedule_admission["media_id"]),
+                    "episode": int(schedule_admission["episode"]),
+                    "rewatch": bool(schedule_admission.get("rewatch")),
+                    "started_at": time.time(),
+                    "baseline_watched_at": float(scheduled_episode.watched_at or 0.0) if scheduled_episode is not None else 0.0,
+                    "baseline_playback_updated_at": float(scheduled_episode.playback_updated_at or 0.0) if scheduled_episode is not None else 0.0,
+                }
             return {"ok": True, "duplicate": False, "status": "starting", "pid": process.pid}
 
     def play_status(self, video_path: str) -> dict[str, Any]:
         key = self._play_key(video_path)
         with self._play_lock:
             result = {"ok": True, **self._play_state_locked(key)}
+            self._log_play_status(key, result)
         episode = self.manager.db.episode_by_path(Path(key))
         if episode is not None:
             result.update(
@@ -11121,6 +13195,38 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         rating_episode is not None
                         and self.manager.db.rating_prompted(anime.media_id, rating_episode)
                     )
+        session = getattr(self, "_schedule_play_sessions", {}).get(key)
+        if session is not None and episode is not None:
+            started_at = float(session.get("started_at") or 0.0)
+            playback_updated = float(episode.playback_updated_at or 0.0)
+            watched_at = float(episode.watched_at or 0.0)
+            position = float(episode.playback_position or 0.0)
+            duration = float(episode.playback_duration or 0.0)
+            threshold = max(0.0, min(1.0, float(self.config.anilist.watched_threshold)))
+            remaining_limit = max(0.0, float(self.config.anilist.watched_max_remaining_minutes)) * 60.0
+            fresh_progress = playback_updated > max(started_at, float(session.get("baseline_playback_updated_at") or 0.0))
+            watched_evidence = watched_at > max(started_at, float(session.get("baseline_watched_at") or 0.0))
+            threshold_evidence = bool(
+                fresh_progress and duration > 0 and (position / duration >= threshold or duration - position <= remaining_limit)
+            )
+            if watched_evidence or threshold_evidence:
+                marked = self.manager.db.mark_personal_release_watched(
+                    int(session["media_id"]), int(session["episode"]), watched_at=time.time()
+                )
+                if marked:
+                    self.logger.info(
+                        "EVENT personal_schedule.watched media_id=%s episode=%s evidence=%s position=%.1f duration=%.1f",
+                        session["media_id"], session["episode"],
+                        "anilist" if watched_evidence else "playback_threshold", position, duration,
+                    )
+                self._schedule_play_sessions.pop(key, None)
+                result["personal_schedule_watched"] = True
+                result["watched"] = True
+            elif bool(session.get("rewatch")):
+                # The underlying completed AniList episode was already marked watched
+                # before this local rewatch cycle began. Do not report it as newly
+                # watched until this playback produces fresh evidence.
+                result["watched"] = False
         return result
 
     def open_library_folder(self) -> dict[str, Any]:
@@ -11430,16 +13536,57 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def debug_reselect_subtitles(self, video_path: str) -> dict[str, Any]:
         video = Path(str(video_path)).expanduser().resolve()
-        result = self.manager.force_fresh_subtitle_selection(video)
-        priority_token = self.manager.work_scheduler.begin_priority_request(
-            WorkPriority.USER,
-            name="subtitle-debug-fresh",
-        )
+        task_key = hashlib.sha256(str(video).encode("utf-8")).hexdigest()[:24]
+        task_name = f"{APP_SLUG}-debug-fresh-subtitles-{task_key}"
+        start_with_admission = getattr(self.task_supervisor, "start_with_admission", None)
+
+        # Compatibility for tiny test doubles or older embedders. Keep the
+        # priority token worker-owned so a coalesced start cannot leak intent.
+        if not callable(start_with_admission):
+            result = self.manager.force_fresh_subtitle_selection(video)
+
+            def legacy_worker() -> None:
+                priority_token = self.manager.work_scheduler.begin_priority_request(
+                    WorkPriority.USER,
+                    name=f"subtitle-debug-fresh:{task_key}",
+                )
+                try:
+                    self.manager.process_subtitle_jobs(
+                        limit=1,
+                        preferred_paths=[video],
+                        wait_for_slot=True,
+                    )
+                except Exception as exc:
+                    self.logger.exception(
+                        "FAIL step=subtitle.debug_fresh_background video=%r error=%r",
+                        str(video),
+                        str(exc),
+                    )
+                finally:
+                    self.manager.work_scheduler.end_priority_request(priority_token)
+
+            self.task_supervisor.start(
+                name=task_name,
+                target=legacy_worker,
+                replace=False,
+            )
+            return result
+
+        proceed = threading.Event()
+        abandoned = threading.Event()
+        token_holder: dict[str, object] = {}
+
         def worker() -> None:
+            proceed.wait()
+            if abandoned.is_set():
+                return
+            priority_token = token_holder.get("token")
+            if priority_token is None:
+                return
             try:
-                # Manual UI work must enter the priority queue immediately.
-                # The heavy scheduler, not maintenance.lock, serializes the
-                # expensive preparation against background OCR.
+                # Different videos own distinct supervisor tasks and queue on
+                # the heavy scheduler. Repeated clicks for the same resolved
+                # video coalesce before invalidating subtitle state again.
                 self.manager.process_subtitle_jobs(
                     limit=1,
                     preferred_paths=[video],
@@ -11453,15 +13600,30 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 )
             finally:
                 self.manager.work_scheduler.end_priority_request(priority_token)
+
+        admission = start_with_admission(
+            name=task_name,
+            target=worker,
+            replace=False,
+        )
+        if admission.admission != "started":
+            self.logger.info(
+                "COALESCE step=subtitle.debug_fresh_background video=%r",
+                str(video),
+            )
+            return {"ok": True, "already_running": True, "video_path": str(video)}
+
         try:
-            self.task_supervisor.start(
-                name=f"{APP_SLUG}-debug-fresh-subtitles",
-                target=worker,
-                replace=True,
+            result = self.manager.force_fresh_subtitle_selection(video)
+            token_holder["token"] = self.manager.work_scheduler.begin_priority_request(
+                WorkPriority.USER,
+                name=f"subtitle-debug-fresh:{task_key}",
             )
         except Exception:
-            self.manager.work_scheduler.end_priority_request(priority_token)
+            abandoned.set()
+            proceed.set()
             raise
+        proceed.set()
         return result
 
     def export_anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
@@ -12262,8 +14424,30 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_asset(self, path: Path, content_type: str, revision: str) -> None:
+            size = path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", str(content_type or "application/octet-stream"))
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.send_header("ETag", f'"{revision}"')
+            self.end_headers()
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+
         def do_GET(self) -> None:
             path = urlparse(self.path).path
+            manga_cover = re.fullmatch(r"/api/covers/manga/(\d+)/([0-9a-f]{20})", path)
+            if manga_cover:
+                try:
+                    target, content_type, revision = api.manga.cover_preview_asset(
+                        int(manga_cover.group(1)), expected_revision=manga_cover.group(2)
+                    )
+                    self._send_asset(target, content_type, revision)
+                except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                    api.logger.warning("FAIL cover.preview_asset kind=manga error=%r", str(exc))
+                    self._send_json({"ok": False, "error": "cover_not_available"}, status=404)
+                return
             if path == "/api/torrents/status":
                 try:
                     result = dict(api.torrent_traffic_status())

@@ -111,7 +111,8 @@ def test_reader_exposes_reset_status_page_picker_and_pointer_anchored_zoom() -> 
     assert "requested < 1 || requested > currentPageCount" in js
     assert "await setResumePage(currentPage)" in js
     assert 'data-manga-v2-page-option' in js
-    assert "event.key === 'Escape' && !$('mangaV2PagePicker')?.hidden" in js
+    assert "function closeEscapeSurface()" in js
+    assert "closeEscapeSurface," in js
     assert "scrollIntoView({block: 'center'})" in js
     assert ".manga-v2-page-picker[hidden]{display:none}" in css
 

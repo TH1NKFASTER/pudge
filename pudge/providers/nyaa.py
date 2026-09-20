@@ -1637,11 +1637,13 @@ def search_ranked(
         try:
             found = client.search(query)
         except NyaaError as exc:
-            # One Nyaa query may time out while a shorter alias succeeds. Do
-            # not abort the whole search on the first 5xx/timeout. Automatic
-            # background checks additionally have a wall-clock budget so a
-            # broken Nyaa route cannot block startup for several minutes.
             search_errors.append(f"{query}: {exc}")
+            if query_budget_seconds is not None:
+                # Automatic/background refresh has RSS fallbacks and must not
+                # spend the whole budget retrying aliases over the same broken
+                # Nyaa route. Manual searches keep the exhaustive alias behavior.
+                budget_exhausted = True
+                break
             continue
         for release in found:
             key = release.info_hash or release.torrent_url or release.link

@@ -184,8 +184,15 @@ def maybe_handle_notification_helper(argv: Sequence[str]) -> int | None:
         return None
     if len(argv) < 3:
         return 2
+    previous = os.environ.get(_HELPER_ACTIVE_ENV)
     os.environ[_HELPER_ACTIVE_ENV] = "1"
-    return 0 if send_native_notification_direct(argv[1], argv[2]) else 1
+    try:
+        return 0 if send_native_notification_direct(argv[1], argv[2]) else 1
+    finally:
+        if previous is None:
+            os.environ.pop(_HELPER_ACTIVE_ENV, None)
+        else:
+            os.environ[_HELPER_ACTIVE_ENV] = previous
 
 
 def _send_osascript_fallback(subtitle: str, message: str) -> bool:
@@ -205,7 +212,7 @@ def _send_osascript_fallback(subtitle: str, message: str) -> bool:
             timeout=8,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, TypeError, subprocess.TimeoutExpired):
         return False
     return completed.returncode == 0
 
@@ -237,7 +244,7 @@ def send_native_notification(subtitle: str, message: str) -> bool:
                 env={**os.environ, _HELPER_ACTIVE_ENV: "1"},
             )
             return completed.returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, TypeError, subprocess.TimeoutExpired):
             return False
 
     return _send_osascript_fallback(subtitle, message)

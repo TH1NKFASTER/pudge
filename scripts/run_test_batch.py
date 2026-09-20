@@ -190,6 +190,17 @@ def run_file(path: Path, *, results_dir: Path, timeout: float, pytest_args: list
         transient_runtime_log = isolated / "runtime.log"
         home.mkdir(parents=True)
         tmp.mkdir(parents=True)
+
+        # Tests must never steal focus by launching Finder (or xdg-open on
+        # non-macOS development hosts).  A few integration tests intentionally
+        # execute real application methods that call `open -R`; prepend a
+        # per-test no-op shim so those side effects stay inside the subprocess.
+        gui_stub_dir = isolated / "gui-stubs"
+        gui_stub_dir.mkdir()
+        open_stub = gui_stub_dir / "open"
+        open_stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        open_stub.chmod(0o755)
+
         env = os.environ.copy()
         env.update(
             {
@@ -199,6 +210,7 @@ def run_file(path: Path, *, results_dir: Path, timeout: float, pytest_args: list
                 "TEMP": str(tmp),
                 "TMP": str(tmp),
                 "PUDGE_TEST_ISOLATED": "1",
+                "PATH": str(gui_stub_dir) + os.pathsep + env.get("PATH", ""),
             }
         )
         cmd = [

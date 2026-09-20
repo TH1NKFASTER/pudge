@@ -81,12 +81,12 @@ def test_blurred_image_first_click_is_consumed() -> None:
 
 def test_escape_clears_selection_before_fullscreen_exit() -> None:
     html = INDEX.read_text(encoding="utf-8")
-    assert "function clearSelectionOnEscape()" in html
+    assert "function clearSelectionOnEscape(source='keydown')" in html
     assert "nativeSelection.removeAllRanges()" in html
-    assert "clearLnSelection();return true" in html
+    assert "clearLnSelection();record(count);return true" in html
     assert "PudgeMangaReaderV2.clearSelection" in html
     assert "PudgeAudiobookSelection.clearSelection" in html
-    assert html.index("if(clearSelectionOnEscape())return;") < html.index("pywebview.api.exit_fullscreen()")
+    assert html.index("if(clearSelectionOnEscape('keydown'))return;") < html.index("pywebview.api.exit_fullscreen()")
 
 
 def test_searches_share_common_style_and_pair_label_has_no_ellipsis() -> None:

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import Database
+from .consumption import ConsumptionConflictError, ConsumptionLedger, ConsumptionLedgerError
 from .episode_state import watched_by_anilist_progress
 
 
@@ -104,6 +105,7 @@ class MobileSyncService:
         self.database = database
         self.pairing_ttl_seconds = max(30.0, float(pairing_ttl_seconds))
         self.max_events_per_request = max(1, min(2000, int(max_events_per_request)))
+        self.consumption = ConsumptionLedger(database)
         self._ensure_server_device()
 
     def _ensure_server_device(self) -> None:
@@ -130,7 +132,15 @@ class MobileSyncService:
             "cursor": "monotonic-event-id",
             "entities": ["anime_episode", "manga", "light_novel", "audiobook"],
             "events": ["progress.updated"],
-            "capabilities": ["base_revision", "conflicts", "cursor_reset"],
+            "capabilities": ["base_revision", "conflicts", "cursor_reset", "consumption_replay"],
+            # Additive extension: old companions continue using progress sync and
+            # simply ignore this object. New companions replay raw facts instead
+            # of attempting to infer history from current progress.
+            "extensions": {"consumption_ledger": {
+                "schema": 2, "sync": True,
+                "record_types": ["event", "correction", "manual", "alias", "reset"],
+                "reset_epoch": self.consumption.history_epoch(),
+            }},
         }
 
     def start_pairing(self) -> dict[str, Any]:
@@ -701,12 +711,40 @@ class MobileSyncService:
         )
         return max(0, int(cursor.rowcount or 0))
 
+    def _consumption_media_uuid_for_entity(
+        self, kind: str, local_key: str, external_key: str, title: str, metadata: dict[str, Any]
+    ) -> str:
+        try:
+            if kind == "manga":
+                ref = self.consumption.manga_media(int(local_key))
+            elif kind == "light_novel":
+                ref = self.consumption.light_novel_media(int(local_key))
+            elif kind == "audiobook":
+                ref = self.consumption.audiobook_media(int(local_key))
+            elif kind == "anime_episode":
+                ref = self.consumption.ensure_media(
+                    kind="anime_episode", title=title,
+                    aliases=[("external", external_key), ("local", local_key)],
+                    current_library_kind="anime_episode", current_library_id=local_key,
+                    metadata={
+                        "media_id": metadata.get("media_id"),
+                        "episode": metadata.get("episode"),
+                    },
+                )
+            else:
+                ref = None
+            return str(ref.media_uuid) if ref is not None else ""
+        except (OSError, ValueError, TypeError, ConsumptionLedgerError):
+            # Ordinary progress sync must never fail merely because native-volume
+            # identity enrichment is unavailable for one library item.
+            return ""
+
     def library_snapshot(self) -> dict[str, Any]:
         self.capture_local_changes()
         with self.database.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT e.entity_id,e.kind,e.external_key,e.title,e.metadata_json,
+                SELECT e.entity_id,e.kind,e.local_key,e.external_key,e.title,e.metadata_json,
                        s.position_json,s.status,s.revision,s.event_id AS event_cursor,s.occurred_at
                 FROM sync_entities e
                 LEFT JOIN sync_snapshots s ON s.entity_id=e.entity_id
@@ -715,24 +753,32 @@ class MobileSyncService:
             ).fetchall()
             relations = self._paired_relations(conn)
             cursor_row = conn.execute("SELECT COALESCE(MAX(id),0) AS cursor FROM sync_events").fetchone()
+        entities: list[dict[str, Any]] = []
+        for row in rows:
+            kind = str(row["kind"])
+            local_key = str(row["local_key"] or "")
+            external_key = str(row["external_key"] or "")
+            title = str(row["title"] or "")
+            metadata = _json_loads(str(row["metadata_json"] or "{}"), {})
+            entities.append({
+                "entity_id": str(row["entity_id"]),
+                "kind": kind,
+                "external_key": external_key,
+                "title": title,
+                "metadata": metadata,
+                "position": _json_loads(str(row["position_json"] or "{}"), {}),
+                "status": str(row["status"] or "not_started"),
+                "revision": int(row["revision"] or 0),
+                "event_cursor": int(row["event_cursor"] or 0),
+                "occurred_at": float(row["occurred_at"] or 0.0),
+                "consumption_media_uuid": self._consumption_media_uuid_for_entity(
+                    kind, local_key, external_key, title, metadata if isinstance(metadata, dict) else {}
+                ),
+            })
         return {
             "protocol_version": PROTOCOL_VERSION,
             "cursor": int(cursor_row["cursor"] if cursor_row else 0),
-            "entities": [
-                {
-                    "entity_id": str(row["entity_id"]),
-                    "kind": str(row["kind"]),
-                    "external_key": str(row["external_key"] or ""),
-                    "title": str(row["title"] or ""),
-                    "metadata": _json_loads(str(row["metadata_json"] or "{}"), {}),
-                    "position": _json_loads(str(row["position_json"] or "{}"), {}),
-                    "status": str(row["status"] or "not_started"),
-                    "revision": int(row["revision"] or 0),
-                    "event_cursor": int(row["event_cursor"] or 0),
-                    "occurred_at": float(row["occurred_at"] or 0.0),
-                }
-                for row in rows
-            ],
+            "entities": entities,
             "relations": relations,
         }
 
@@ -955,6 +1001,33 @@ class MobileSyncService:
                 for row in visible
             ],
         }
+
+    def consumption_changes(self, *, cursor: int = 0, limit: int = 200) -> dict[str, Any]:
+        return self.consumption.sync_changes(cursor=max(0, int(cursor)), limit=max(1, min(1000, int(limit))))
+
+    def push_consumption_records(
+        self,
+        device_id: str,
+        records: Iterable[dict[str, Any]],
+        *,
+        reset_epoch: int,
+    ) -> dict[str, Any]:
+        with self.database.connect() as conn:
+            device = conn.execute(
+                "SELECT name FROM sync_devices WHERE device_id=? AND revoked_at=0",
+                (str(device_id),),
+            ).fetchone()
+        if device is None:
+            raise MobileSyncAuthenticationError("Device is not active")
+        try:
+            return self.consumption.push_sync_records(
+                str(device_id), records, reset_epoch=int(reset_epoch),
+                device_name=str(device["name"] or "Companion"),
+            )
+        except ConsumptionConflictError as exc:
+            raise MobileSyncError(str(exc)) from exc
+        except ConsumptionLedgerError as exc:
+            raise MobileSyncValidationError(str(exc)) from exc
 
     def push_events(
         self,

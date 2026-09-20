@@ -159,7 +159,9 @@ def test_cover_preview_is_global_drag_pinch_and_snap_back() -> None:
     assert "const MOUSE_OPEN_DISTANCE = 148;" in js
     assert "const PINCH_OPEN_SCALE = 1.36;" in js
     assert "Math.min(.42,distance/360)" in js
-    assert "if(coverImage(event.target))event.preventDefault();" in js
+    assert "const allowMouseDragPreview = image =>" in js
+    assert "[data-continue-card=\"1\"],.airing-card[data-action=\"play\"]" in js
+    assert "if(pressedCover&&allowMouseDragPreview(pressedCover))event.preventDefault();" in js
     assert "gesturestart" in js and "gesturechange" in js and "gestureend" in js
     assert "snap-back" in js
     assert "pudge-cover-preview-close" in js

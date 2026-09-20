@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
@@ -45,6 +46,24 @@ def build_mpv_command(
     return command
 
 
+def _write_mpv_start_ack(pid: int) -> Path | None:
+    raw = os.getenv("PUDGE_MPV_START_ACK", "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({"pid": int(pid), "started_at": time.time()}),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        return path
+    except OSError:
+        return None
+
+
 def _focus_mpv_process(pid: int) -> None:
     """Bring the newly opened mpv window to the front on macOS.
 
@@ -65,8 +84,9 @@ def _focus_mpv_process(pid: int) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=1.5,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
             return
         if result.returncode == 0:
             return
@@ -94,5 +114,22 @@ def run_mpv(
         process = subprocess.Popen(command, env=env)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Не найден mpv: {command[0]}") from exc
+    ack_path = _write_mpv_start_ack(process.pid)
+    try:
+        from .logging_utils import configure_logging
+
+        logger = configure_logging()
+        logger.info(
+            "EVENT mpv.spawned pid=%s ack=%s command=%s",
+            process.pid,
+            str(ack_path or ""),
+            command[0],
+        )
+    except Exception:
+        logger = None
     _focus_mpv_process(process.pid)
-    return process.wait()
+    if logger is None:
+        return process.wait()
+    code = process.wait()
+    logger.info("EVENT mpv.exit pid=%s exit_code=%s", process.pid, code)
+    return code

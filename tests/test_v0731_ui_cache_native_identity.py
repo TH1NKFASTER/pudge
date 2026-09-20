@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 from pathlib import Path
 
 from pudge.cache_management import cleanup_segment_audio_cache, mark_segment_audio_active
@@ -81,9 +83,24 @@ def test_multivolume_cards_are_bounded_and_focus_unfinished_volume() -> None:
 def test_manga_multivolume_has_first_paint_height_cap() -> None:
     html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     manga = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
+    shelves = (ROOT / "pudge" / "web" / "library_shelves.js").read_text(encoding="utf-8")
     assert ".ln-series-books.series-scroll{height:195px" in html
     assert "window.PudgeSeriesScroll?.focus?.(root);" in manga
-    assert "if (scrollHost && previousScrollTop != null) scrollHost.scrollTop = previousScrollTop;" in manga
+
+    script = f"""
+const source={json.dumps(shelves)};global.window=global;global.localStorage={{getItem:()=>null,setItem:()=>{{}}}};eval(source);
+const before={{dataset:{{mangaBook:'2'}},getBoundingClientRect:()=>({{top:30,bottom:130}})}};
+const after={{dataset:{{mangaBook:'2'}},getBoundingClientRect:()=>({{top:50,bottom:150}})}};
+const root={{querySelectorAll:()=>[before],querySelector:()=>after}};
+const host={{scrollTop:100,getBoundingClientRect:()=>({{top:0,bottom:500}})}};
+const anchor=PudgeLibraryShelves.captureScrollAnchor(root,host);
+PudgeLibraryShelves.restoreScrollAnchor(root,host,anchor);
+console.log(JSON.stringify({{anchor,scrollTop:host.scrollTop}}));
+"""
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    payload = json.loads(result.stdout)
+    assert payload["anchor"]["key"] == "manga-book:2"
+    assert payload["scrollTop"] == 120
 
 
 def test_native_launcher_embeds_python_in_pudge_process() -> None:

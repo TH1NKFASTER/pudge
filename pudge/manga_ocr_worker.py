@@ -395,8 +395,8 @@ _CONTEXT_LAYOUT_DETECTOR = "manga-context-gap-components-v1"
 _LAYOUT_CLUSTER_DETECTOR = "manga-layout-cluster-v1"
 _LAYOUT_PIPELINE = "manga-layout-dual-pass-v1"
 _SYNTHETIC_SEGMENT_SOURCES = {"ink-grid-v1", "ink-columns-v2", "dark-columns-v1", "layout-line-proportional-v1"}
-_PIPELINE_GENERATION = "pudge-manga-regions-v59-layout-token-geometry"
-_PIPELINE_WORKER = "pudge-manga-recovery-phase3.4-first20-recall-v59"
+_PIPELINE_GENERATION = "pudge-manga-regions-v96p27-orphan-vertical-ink"
+_PIPELINE_WORKER = "pudge-manga-recovery-phase3.4-full-volume-v96p27"
 # pudge-manga-recovery-phase2.7-dark-column-dedupe-v23
 # pudge-manga-recovery-phase2.8-dark-suffix-v24
 # pudge-manga-recovery-phase2.9-ruby-echo-suppression-v25
@@ -423,7 +423,7 @@ def _pipeline_fingerprint(image: Image.Image, model: object) -> dict[str, object
         "recognizer": f"{type(model).__module__}.{type(model).__qualname__}",
         "recognizer_version": model_version,
         "normalization": _PIPELINE_NORMALIZATION,
-        "layout_config": "dual-pass+context-gap+ruby-reject+semantic-noise+layout-token-geometry+dark-column-consensus-v3+dark-column-local-rule-v1+dark-column-glyph-center-v1+dark-column-leading-edge-refine-v1+horizontal-wide-segment-recovery-v1+small-kana-consensus-v1+layout-line-ink-v2+full-region-line-relabel-v1+vertical-leading-ink-v1+title-detector-consensus-v1+short-kanji-pair-v1+vertical-slot-ink-tighten-v1+vertical-x-context-v1+horizontal-narrow-expand-v1+weak-synthetic-coverage-v1+chapter-prefix-components-v2+leading-frame-reject-v1+strong-raw-recall-v1+single-kanji-layout-v1+synthetic-texture-reject-v1+pre-split-kanji-pair-v1+vertical-edge-context-v1+layout-cluster-context-v1+latin-detector-preserve-v1+kanji-pair-context-v2+layout-cluster-height-split-v2+layout-xy-retry-v1+horizontal-pair-lower-band-v1+cluster-square-pad-v1+cluster-member-consensus-v2+adjacent-short-raw-v1+adaptive-horizontal-line-groups-v1+latin-wide-skip-v1+layout-square-retry-v1+layout-geometry-guard-v1+cluster-member-geometry-v1+ruby-latin-letter-v2+kanji-baseline-mask-v1+wide-vertical-layout-donor-v1+cluster-dynamic-split-v1+weak-square-retry-guard-v1+cluster-consensus-only-v1+raw-gap-cluster-v1+raw-wide-donor-v1+ruby-component-crop-v1+repair-attempt-diagnostics-v1+vertical-detector-surface-v1+kanji-pair-evidence-v1+cluster-member-ensemble-v1+postmerge-wide-split-v1+ruby-isolated-components-v1+leading-prefix-center-support-v1+small-standalone-baseline-v1+partial-weak-raw-component-support-v3+leading-prefix-width-guard-v1+tall-merged-direct-square-consensus-v1+bold-adjacent-raw-line-v1+adjacent-tall-prefix-trim-v1+p09-raw-cluster-consensus-v1+bounded-local-ensemble-v1+caption-whole-region-consensus-v1+caption-suffix-anchor-cleanup-v1+dark-column-small-kana-polarity-consensus-v1+clipped-horizontal-sfx-right-context-v1+clipped-horizontal-sfx-exact-crop-v1+short-latin-case-consensus-v1+chapter-quote-segment-geometry-v1+chapter-quote-existing-text-geometry-v1+horizontal-trailing-punctuation-ink-v1+nfkc-segment-surface-relabel-v1+short-fullwidth-digit-ink-geometry-v1+short-raw-empty-rectangle-art-reject-v1+short-raw-empty-rectangle-art-output-guard-v1+short-raw-empty-rectangle-service-finalize-v1+raw-verified-segment-relabel-v1+repeated-kana-ink-split-v1",
+        "layout_config": "dual-pass+context-gap+ruby-reject+semantic-noise+layout-token-geometry+dark-column-consensus-v3+dark-column-local-rule-v1+dark-column-glyph-center-v1+dark-column-leading-edge-refine-v1+horizontal-wide-segment-recovery-v1+small-kana-consensus-v1+layout-line-ink-v2+full-region-line-relabel-v1+vertical-leading-ink-v1+title-detector-consensus-v1+short-kanji-pair-v1+vertical-slot-ink-tighten-v1+vertical-x-context-v1+horizontal-narrow-expand-v1+weak-synthetic-coverage-v1+chapter-prefix-components-v2+leading-frame-reject-v1+strong-raw-recall-v1+single-kanji-layout-v1+synthetic-texture-reject-v1+pre-split-kanji-pair-v1+vertical-edge-context-v1+layout-cluster-context-v1+latin-detector-preserve-v1+kanji-pair-context-v2+layout-cluster-height-split-v2+layout-xy-retry-v1+horizontal-pair-lower-band-v1+cluster-square-pad-v1+cluster-member-consensus-v2+adjacent-short-raw-v1+adaptive-horizontal-line-groups-v1+latin-wide-skip-v1+layout-square-retry-v1+layout-geometry-guard-v1+cluster-member-geometry-v1+ruby-latin-letter-v2+kanji-baseline-mask-v1+wide-vertical-layout-donor-v1+cluster-dynamic-split-v1+weak-square-retry-guard-v1+cluster-consensus-only-v1+raw-gap-cluster-v1+raw-wide-donor-v1+ruby-component-crop-v1+repair-attempt-diagnostics-v1+vertical-detector-surface-v1+kanji-pair-evidence-v1+cluster-member-ensemble-v1+postmerge-wide-split-v1+ruby-isolated-components-v1+leading-prefix-center-support-v1+small-standalone-baseline-v1+partial-weak-raw-component-support-v3+leading-prefix-width-guard-v1+tall-merged-direct-square-consensus-v1+bold-adjacent-raw-line-v1+adjacent-tall-prefix-trim-v1+p09-raw-cluster-consensus-v1+bounded-local-ensemble-v1+caption-whole-region-consensus-v1+caption-suffix-anchor-cleanup-v1+dark-column-small-kana-polarity-consensus-v1+clipped-horizontal-sfx-right-context-v1+clipped-horizontal-sfx-exact-crop-v1+short-latin-case-consensus-v1+chapter-quote-segment-geometry-v1+chapter-quote-existing-text-geometry-v1+horizontal-trailing-punctuation-ink-v1+nfkc-segment-surface-relabel-v1+short-fullwidth-digit-ink-geometry-v1+short-raw-empty-rectangle-art-reject-v1+short-raw-empty-rectangle-art-output-guard-v1+short-raw-empty-rectangle-service-finalize-v1+raw-verified-segment-relabel-v1+repeated-kana-ink-split-v1+partial-fullwidth-digit-ink-geometry-v1+detector-duplicate-consensus-v1+detector-duplicate-post-geometry-v2+horizontal-punctuation-crop-leak-trim-v1+horizontal-trailing-dot-ink-v1+tiny-horizontal-ruby-echo-suppression-v1+multi-segment-ruby-echo-v2+horizontal-prefix-duplicate-v1+symbol-only-art-reject-v1+detector-disagreement-art-reject-v1+contained-overlap-dedup-v1+expanded-rectangle-tight-lane-v2-late+stylized-horizontal-sfx-majority-v1+margin-page-number-cleanup-v1+detector-giant-oneglyph-art-reject-v1+empty-rectangle-overclaim-cleanup-v1+tiny-empty-horizontal-oneglyph-art-v1+page-edge-synthetic-ink-grid-art-v1+empty-multicolumn-sentence-art-v1+clipped-bottom-vertical-fragment-art-v1+large-empty-rectangle-sfx-majority-v2+component-isolated-stylized-sfx-majority-v1+component-isolated-stylized-sfx-glyph-consensus-v2+large-stylized-sfx-component-proposal-v1+speech-bubble-companion-chain-v1+vertical-ghost-prefix-main-ink-v1+expanded-seed-evidence-guard-v1+expanded-trailing-panel-rule-guard-v1+two-lane-exact-post-recall-v1+two-lane-context-residual-v1+gapped-vertical-sfx-consensus-v1+wide-donor-exact-crop-reread-v1+exact-crop-suppress-proof-v1+thin-large-sfx-core-majority-v1+thin-large-sfx-trailing-context-v1+adjacent-ruby-main-guard-v1+adjacent-ruby-preblock-v1+tall-merged-trailing-punctuation-consensus-v2+vertical-trailing-ink-ocr-v2+vertical-trailing-detector-consensus-v1+vertical-trailing-detector-anchor-consensus-v1+page-edge-narrow-square-overread-v1+wide-donor-bidirectional-peer-trim-v1+vertical-panel-rule-prefix-trim-v1+wide-donor-punctuated-right-peer-trim-v1+terminal-glyph-conflict-dedup-v1+page-edge-cluster-overread-v1+vertical-single-leading-glyph-v1+square-prefix-overread-revert-v1+exact-detector-first-glyph-consensus-v1+punctuated-bracket-overread-v1+isolated-short-bubble-consensus-v1+short-raw-trailing-misread-v1+vertical-punctuation-ink-proof-v1",
         "ocr_crop_policy": _OCR_CROP_POLICY,
         "image_sha256": digest.hexdigest(),
         "image_size": [int(image.size[0]), int(image.size[1])],
@@ -949,6 +949,546 @@ def _raw_vertical_lines(image: Image.Image) -> list[dict[str, object]]:
         if not duplicate:
             kept.append(line)
     return kept[:48]
+
+
+
+def _vertical_component_row_metrics(
+    image: Image.Image,
+    region: dict[str, object],
+) -> list[dict[str, float]]:
+    """Return physical main-ink row metrics inside one observed vertical lane."""
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+    left, top, right, bottom = _pixel_bbox(region, page_width, page_height)
+    if right <= left or bottom <= top:
+        return []
+    lane_center = (left + right) / 2.0
+    lane_half = max(6.0, (right - left) * 0.62)
+    components: list[tuple[float, float, float, float, float]] = []
+    for component in _raw_layout_component_candidates(image):
+        cx = float(component["cx"])
+        cy_top = float(component["y"])
+        cy_bottom = cy_top + float(component["height"])
+        if abs(cx - lane_center) > lane_half:
+            continue
+        if cy_bottom < top - 2.0 or cy_top > bottom + 2.0:
+            continue
+        components.append(
+            (
+                float(component["x"]),
+                cy_top,
+                float(component["x"]) + float(component["width"]),
+                cy_bottom,
+                float(component.get("density") or 0.0),
+            )
+        )
+    if not components:
+        return []
+    components.sort(key=lambda box: (box[1], box[0]))
+    rows: list[list[tuple[float, float, float, float, float]]] = []
+    for box in components:
+        matched: list[tuple[float, float, float, float, float]] | None = None
+        for row in rows[-3:]:
+            row_top = min(value[1] for value in row)
+            row_bottom = max(value[3] for value in row)
+            overlap = max(0.0, min(row_bottom, box[3]) - max(row_top, box[1]))
+            shorter = max(1.0, min(row_bottom - row_top, box[3] - box[1]))
+            center_distance = abs(
+                ((row_top + row_bottom) / 2.0) - ((box[1] + box[3]) / 2.0)
+            )
+            if overlap >= shorter * 0.20 or center_distance <= 5.0:
+                matched = row
+                break
+        if matched is None:
+            rows.append([box])
+        else:
+            matched.append(box)
+
+    metrics: list[dict[str, float]] = []
+    for row in rows:
+        row_left = min(value[0] for value in row)
+        row_top = min(value[1] for value in row)
+        row_right = max(value[2] for value in row)
+        row_bottom = max(value[3] for value in row)
+        row_height = row_bottom - row_top
+        row_width = row_right - row_left
+        if row_height < 7.0 or row_width < 5.0:
+            continue
+        ink_area = sum(
+            max(0.0, value[2] - value[0])
+            * max(0.0, value[3] - value[1])
+            * max(0.0, min(1.0, value[4]))
+            for value in row
+        )
+        metrics.append(
+            {
+                "width": row_width,
+                "height": row_height,
+                "ink_area": ink_area,
+                "top": row_top,
+                "bottom": row_bottom,
+            }
+        )
+    return metrics
+
+
+def _vertical_component_row_count(
+    image: Image.Image,
+    region: dict[str, object],
+) -> int:
+    """Count physical main-ink rows inside one observed vertical lane."""
+    return len(_vertical_component_row_metrics(image, region))
+
+
+def _trim_vertical_ghost_prefix_from_main_ink(
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Drop one impossible leading OCR kanji when physical rows prove it is extra.
+
+    This targets a common ruby leak: MangaOCR prepends one kanji inferred from
+    neighbouring furigana even though the observed main lane contains exactly
+    one fewer physical glyph row.  The rule is deliberately one-character and
+    kanji-only so it cannot rewrite ordinary uncertain dialogue wholesale.
+    """
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return item
+    compact = _compact_surface(item.get("text"))
+    if len(compact) < 6 or not _is_kanji_character(compact[0]):
+        return item
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return item
+    if int(provenance.get("component_count") or 0) < 6:
+        return item
+    if str(item.get("detector") or "") != _LAYOUT_DETECTOR:
+        return item
+    row_metrics = _vertical_component_row_metrics(image, item)
+    physical_rows = len(row_metrics)
+    if physical_rows <= 0 or len(compact) != physical_rows + 1:
+        return item
+    ink_areas = sorted(metric["ink_area"] for metric in row_metrics if metric["ink_area"] > 0)
+    if len(ink_areas) < 4:
+        return item
+    median_ink = statistics.median(ink_areas)
+    first_ink = row_metrics[0]["ink_area"]
+    # The alleged leading kanji must be physically *weaker* than an ordinary
+    # main glyph row.  Genuine leading kanji in the first-40 review are at
+    # least comparable to the median row, while the p33 ruby leak is ~0.68x.
+    if median_ink <= 0 or first_ink > median_ink * 0.90:
+        return item
+    trimmed = compact[1:]
+    if _japanese_character_count(trimmed) < 4:
+        return item
+
+    repaired = dict(item)
+    repaired["text"] = trimmed
+    repaired["ghost_prefix_trimmed"] = compact[0]
+    old_geometry_source = str(item.get("geometry_source") or "").strip()
+    repaired["geometry_source"] = "+".join(
+        value for value in (old_geometry_source, "ghost-prefix-main-ink-v1") if value
+    )
+    hypotheses = []
+    for hypothesis in item.get("hypotheses") or []:
+        if not isinstance(hypothesis, dict):
+            continue
+        updated = dict(hypothesis)
+        if bool(updated.get("selected")):
+            updated["text"] = trimmed
+        hypotheses.append(updated)
+    if hypotheses:
+        repaired["hypotheses"] = hypotheses
+    segments = _layout_line_character_segments(repaired, trimmed, image=image)
+    if segments:
+        repaired["segments"] = segments
+        repaired["word_geometry"] = "proportional-single-column-v1"
+    return repaired
+
+
+def _repair_short_punctuated_square_retry_prefix_overread(
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Revert a one-glyph prefix invented only by square-pad OCR on tiny shouts.
+
+    Square padding is a reread of the same physical detector lane, not a recall
+    mechanism.  On very short raw-component lanes the small Y context can pull
+    a bubble edge / neighbouring stroke into the padded crop and prepend one
+    plausible kana (real first-40 examples: ``ぞ！！`` -> ``べぞ！！`` and
+    ``や！！`` -> ``レや！！``).  When the original MangaOCR surface survives
+    *exactly* as the suffix, prefer it back; missing physical leading glyphs are
+    handled separately by ``vertical-single-leading-glyph-v1``.
+    """
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return item
+    if str(item.get("detector") or "") != "manga-raw-components-v1":
+        return item
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr-square-retry":
+        return item
+    if str(item.get("recognizer_retry") or "") != "vertical-square-pad-v1":
+        return item
+    if _compact_surface(item.get("raw_text")):
+        return item
+    if _number(item.get("width")) > 0.040 or _number(item.get("height")) > 0.045:
+        return item
+
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return item
+    component_count = int(_number(provenance.get("component_count")))
+    coverage = _number(provenance.get("component_coverage"))
+    if not (2 <= component_count <= 4 and coverage >= 0.85):
+        return item
+
+    direct = ""
+    square = _compact_surface(item.get("text"))
+    hypotheses = [
+        dict(hypothesis)
+        for hypothesis in item.get("hypotheses") or []
+        if isinstance(hypothesis, dict)
+    ]
+    for hypothesis in hypotheses:
+        if str(hypothesis.get("id") or "") == "manga-ocr":
+            direct = _compact_surface(hypothesis.get("text"))
+            break
+    if not direct or len(square) != len(direct) + 1 or not square.endswith(direct):
+        return item
+    if _japanese_character_count(direct) != 1:
+        return item
+    if _japanese_character_count(square[0]) != 1:
+        return item
+    normalized_direct = unicodedata.normalize("NFKC", direct)
+    if not re.search(r"[!?]{2,}$", normalized_direct):
+        return item
+
+    segments = [
+        dict(segment)
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict)
+    ]
+    stream = "".join(_compact_surface(segment.get("text")) for segment in segments)
+    if len(segments) != len(square) or stream != square:
+        return item
+
+    repaired = dict(item)
+    repaired["text"] = direct
+    repaired["selected_hypothesis_id"] = "manga-ocr"
+    repaired["recognizer_retry"] = "vertical-square-prefix-overread-revert-v1"
+    repaired["segments"] = segments[1:]
+    repaired["word_geometry"] = "square-prefix-overread-trim-v1"
+    repaired_provenance = dict(provenance)
+    repaired_provenance["square_prefix_overread_reverted"] = {
+        "removed_prefix": square[0],
+        "square_text": square,
+        "direct_text": direct,
+    }
+    repaired["provenance"] = repaired_provenance
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = str(hypothesis.get("id") or "") == "manga-ocr"
+    repaired["hypotheses"] = hypotheses
+    old_geometry_source = str(item.get("geometry_source") or "").strip()
+    repaired["geometry_source"] = "+".join(
+        value
+        for value in (old_geometry_source, "square-prefix-overread-revert-v1")
+        if value
+    )
+    return repaired
+
+
+def _speech_bubble_companion_lane_proposals(
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Find a strict two-lane companion chain beside an accepted bubble column.
+
+    One neighbouring dark lane is too easy to hallucinate from artwork.  This
+    recovery therefore requires two independent raw-component columns with a
+    stable manga-column pitch and strong vertical overlap with an already
+    accepted dialogue lane.  It is recall-only and does no recognition itself.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+    raw_components = _raw_layout_component_candidates(image)
+    if not raw_components:
+        return []
+
+    # Cluster raw glyph components by x without the wider tolerance used by the
+    # generic detector; this keeps furigana beside a main column separate.
+    x_tolerance = max(5.0, page_width * 0.0075)
+    groups: list[dict[str, object]] = []
+    for component in sorted(raw_components, key=lambda value: float(value["cx"])):
+        best: dict[str, object] | None = None
+        best_distance = float("inf")
+        for group in groups[-12:]:
+            distance = abs(float(component["cx"]) - float(group["mean_x"]))
+            if distance <= x_tolerance and distance < best_distance:
+                best = group
+                best_distance = distance
+        if best is None:
+            best = {"items": [], "mean_x": float(component["cx"])}
+            groups.append(best)
+        items = best["items"]
+        assert isinstance(items, list)
+        items.append(component)
+        best["mean_x"] = sum(float(value["cx"]) for value in items) / len(items)
+
+    existing_boxes = [_pixel_bbox(region, page_width, page_height) for region in regions]
+    proposals: list[dict[str, object]] = []
+    for anchor in regions:
+        if str(anchor.get("orientation") or "") != "vertical":
+            continue
+        if str(anchor.get("source") or "") != _LAYOUT_LINE_SOURCE:
+            continue
+        if _japanese_character_count(anchor.get("text")) < 5:
+            continue
+        provenance = anchor.get("provenance")
+        if not isinstance(provenance, dict) or int(provenance.get("component_count") or 0) < 5:
+            continue
+        anchor_box = _pixel_bbox(anchor, page_width, page_height)
+        anchor_center = (anchor_box[0] + anchor_box[2]) / 2.0
+        anchor_height = anchor_box[3] - anchor_box[1]
+        if anchor_height < 55.0:
+            continue
+
+        local: list[tuple[float, dict[str, object]]] = []
+        for group in groups:
+            raw_items = group.get("items")
+            if not isinstance(raw_items, list):
+                continue
+            ordered = sorted(raw_items, key=lambda value: float(value["y"]))
+            # Build the whole contiguous physical lane first, then require that
+            # it is actually anchored by enough ink inside the accepted lane's
+            # y-band.  Clipping components to the anchor before grouping loses
+            # legitimate trailing glyphs when a neighbouring dialogue column is
+            # longer than the already-recognized anchor column.
+            runs: list[list[dict[str, float]]] = []
+            run: list[dict[str, float]] = []
+            for component in ordered:
+                if run:
+                    previous = run[-1]
+                    gap = float(component["y"]) - (
+                        float(previous["y"]) + float(previous["height"])
+                    )
+                    if gap > 32.0:
+                        runs.append(run)
+                        run = []
+                run.append(component)
+            if run:
+                runs.append(run)
+            seeded_runs: list[tuple[int, list[dict[str, float]]]] = []
+            for candidate_run in runs:
+                seed_count = sum(
+                    1
+                    for value in candidate_run
+                    if anchor_box[1] - 8.0
+                    <= float(value["y"]) + float(value["height"])
+                    and float(value["y"]) <= anchor_box[3] + 8.0
+                )
+                if seed_count >= 4:
+                    seeded_runs.append((seed_count, candidate_run))
+            if not seeded_runs:
+                continue
+            _, active = max(seeded_runs, key=lambda value: (value[0], len(value[1])))
+            left = min(float(value["x"]) for value in active)
+            top = min(float(value["y"]) for value in active)
+            right = max(float(value["x"]) + float(value["width"]) for value in active)
+            bottom = max(float(value["y"]) + float(value["height"]) for value in active)
+            center = (left + right) / 2.0
+            distance = center - anchor_center
+            # Japanese dialogue columns preceding this lane are to its right.
+            if not (18.0 <= distance <= 90.0):
+                continue
+            box = (left, top, right, bottom)
+            if _pixel_vertical_overlap(box, anchor_box) < 0.62:
+                continue
+            lane_height = bottom - top
+            lane_width = right - left
+            if not (anchor_height * 0.60 <= lane_height <= anchor_height * 1.55):
+                continue
+            if lane_width > max(32.0, (anchor_box[2] - anchor_box[0]) * 1.55):
+                continue
+            # Do not recreate an already accepted lane.
+            if any(
+                abs(center - ((old[0] + old[2]) / 2.0)) <= 9.0
+                and _pixel_vertical_overlap(box, old) >= 0.55
+                for old in existing_boxes
+            ):
+                continue
+
+            pad_x = max(1.0, page_width * 0.0012)
+            pad_y = max(1.0, page_height * 0.0008)
+            left2 = max(0.0, left - pad_x)
+            right2 = min(float(page_width), right + pad_x)
+            top2 = max(0.0, top - pad_y)
+            bottom2 = min(float(page_height), bottom + pad_y)
+            crop = image.convert("L").crop(
+                (int(left2), int(top2), max(int(left2) + 1, int(right2)), max(int(top2) + 1, int(bottom2)))
+            )
+            try:
+                histogram = crop.histogram()
+            finally:
+                crop.close()
+            pixels = max(1, sum(histogram))
+            black_ratio = sum(histogram[:100]) / pixels
+            white_ratio = sum(histogram[220:]) / pixels
+            midtone_ratio = max(0.0, 1.0 - black_ratio - white_ratio)
+            if not (0.055 <= black_ratio <= 0.42 and white_ratio >= 0.50 and midtone_ratio <= 0.20):
+                continue
+            proposal = {
+                "text": "",
+                "raw_text": "",
+                "orientation": "vertical",
+                "orientation_reason": "speech-bubble-companion-chain",
+                "x": round(left2 / page_width, 6),
+                "y": round(1.0 - bottom2 / page_height, 6),
+                "width": round((right2 - left2) / page_width, 6),
+                "height": round((bottom2 - top2) / page_height, 6),
+                "confidence": 0.66,
+                "detector": _RAW_LAYOUT_DETECTOR,
+                "source": _LAYOUT_LINE_SOURCE,
+                "geometry_source": "speech-bubble-companion-chain-v1",
+                "geometry_status": "observed",
+                "provenance": {
+                    "proposal_kind": "speech_bubble_companion_vertical_text_line",
+                    "support_kind": "speech-bubble-companion-chain-v1",
+                    "component_count": len(active),
+                    "black_ratio": round(black_ratio, 4),
+                    "white_ratio": round(white_ratio, 4),
+                    "midtone_ratio": round(midtone_ratio, 4),
+                    "support_anchor_center_px": round(anchor_center, 2),
+                    "detector_bbox_px": [
+                        round(left2, 2), round(top2, 2), round(right2, 2), round(bottom2, 2)
+                    ],
+                },
+            }
+            local.append((center, proposal))
+
+        if len(local) < 2:
+            continue
+        local.sort(key=lambda value: value[0])
+        # Find the nearest two right-hand lanes and demand a stable chain pitch.
+        nearest = local[:2]
+        centers = [anchor_center, nearest[0][0], nearest[1][0]]
+        spacings = [centers[1] - centers[0], centers[2] - centers[1]]
+        if not all(18.0 <= spacing <= 45.0 for spacing in spacings):
+            continue
+        if abs(spacings[0] - spacings[1]) > 15.0:
+            continue
+        companion_boxes = [
+            _pixel_bbox(value[1], page_width, page_height) for value in nearest
+        ]
+        extends_anchor = any(
+            box[1] < anchor_box[1] - 16.0 or box[3] > anchor_box[3] + 16.0
+            for box in companion_boxes
+        )
+        if extends_anchor and (
+            abs(companion_boxes[0][1] - companion_boxes[1][1]) > 24.0
+            or abs(companion_boxes[0][3] - companion_boxes[1][3]) > 24.0
+        ):
+            continue
+        proposals.extend([nearest[0][1], nearest[1][1]])
+
+    # Dedupe if two anchors discover the same pair.
+    deduped: list[dict[str, object]] = []
+    for proposal in proposals:
+        box = _pixel_bbox(proposal, page_width, page_height)
+        if any(_pixel_cover(box, _pixel_bbox(old, page_width, page_height)) >= 0.70 for old in deduped):
+            continue
+        deduped.append(proposal)
+    return deduped[:6]
+
+
+
+def _recognize_vertical_companion_consensus(
+    model: object,
+    image: Image.Image,
+    proposal: dict[str, object],
+) -> str:
+    page_width, page_height = image.size
+    left, top, right, bottom = _pixel_bbox(proposal, page_width, page_height)
+    variants: list[tuple[int, int, int, int]] = []
+    for pad_x, pad_y in ((0, 0), (2, 1), (4, 2)):
+        variants.append(
+            (
+                max(0, int(left) - pad_x),
+                max(0, int(top) - pad_y),
+                min(page_width, max(int(right) + pad_x, int(left) + 1)),
+                min(page_height, max(int(bottom) + pad_y, int(top) + 1)),
+            )
+        )
+    surfaces: list[str] = []
+    for box in variants:
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        crop = image.crop(box).convert("RGB")
+        try:
+            value = str(model(crop) or "").strip()  # type: ignore[operator]
+        except Exception:
+            value = ""
+        finally:
+            crop.close()
+        compact = _compact_surface(value)
+        if compact:
+            surfaces.append(compact)
+    if len(surfaces) < 2:
+        return ""
+    counts: dict[str, int] = {}
+    for surface in surfaces:
+        counts[surface] = counts.get(surface, 0) + 1
+    winner, votes = max(counts.items(), key=lambda item: (item[1], len(item[0])))
+    if votes < 2:
+        return ""
+    if _japanese_character_count(winner) < 4:
+        return ""
+    return winner
+
+
+def _recover_missing_speech_bubble_columns(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    proposals = _speech_bubble_companion_lane_proposals(image, regions)
+    if not proposals:
+        return regions
+    recovered = [dict(item) for item in regions]
+    for proposal in proposals:
+        text = _recognize_vertical_companion_consensus(model, image, proposal)
+        if not text:
+            continue
+        if any(
+            _normalize_line_surface(existing.get("text")) == _normalize_line_surface(text)
+            and _region_coverage(existing, proposal) >= 0.25
+            for existing in recovered
+        ):
+            continue
+        item = dict(proposal)
+        item["text"] = text
+        item["raw_text"] = text
+        item["recognizer"] = "manga-ocr"
+        item["recognition_selection"] = "speech-bubble-companion-consensus-v1"
+        item["selected_hypothesis_id"] = "speech-bubble-companion-consensus-v1"
+        item["hypotheses"] = [
+            {
+                "id": "speech-bubble-companion-consensus-v1",
+                "text": text,
+                "source": "manga-ocr-3crop-majority",
+                "selected": True,
+            }
+        ]
+        segments = _layout_line_character_segments(item, text, image=image)
+        if not segments:
+            continue
+        item["segments"] = segments
+        item["word_geometry"] = "proportional-single-column-v1"
+        item["geometry_status"] = "observed"
+        recovered.append(item)
+    return recovered
 
 
 def _pixel_bbox(region: dict[str, object], page_width: int, page_height: int) -> tuple[float, float, float, float]:
@@ -1865,6 +2405,47 @@ def _split_text_across_layout_members(
     return chunks
 
 
+def _wide_vertical_promoted_chunk_borrows_peer_prefix(
+    member: dict[str, object],
+    chunk: object,
+    source_region: dict[str, object],
+    regions: list[dict[str, object]],
+) -> bool:
+    """Reject a split lane whose tail is already owned by the next left lane.
+
+    A wide OCR crop can concatenate the beginning of the adjacent vertical
+    column onto the current chunk.  Only treat this as proven cross-lane bleed
+    when an independently recognized vertical peer sits immediately to the
+    left, overlaps almost the full Y-range, and starts with the same 2-3
+    Japanese glyphs.
+    """
+    core = _vertical_trailing_retry_japanese_core(chunk)
+    if len(core) < 3:
+        return False
+    donor_center = _number(member.get("x")) + _number(member.get("width")) / 2.0
+    for peer in regions:
+        if peer is source_region or str(peer.get("orientation") or "") != "vertical":
+            continue
+        peer_core = _vertical_trailing_retry_japanese_core(peer.get("text"))
+        if len(peer_core) < 2:
+            continue
+        peer_center = _number(peer.get("x")) + _number(peer.get("width")) / 2.0
+        center_gap = donor_center - peer_center
+        if center_gap < 0.012 or center_gap > 0.075:
+            continue
+        if _layout_vertical_overlap(member, peer) < 0.75:
+            continue
+        max_tail = min(3, len(core), len(peer_core))
+        for tail_size in range(max_tail, 1, -1):
+            tail = core[-tail_size:]
+            if (
+                _japanese_character_count(tail) == tail_size
+                and peer_core.startswith(tail)
+            ):
+                return True
+    return False
+
+
 def _promote_wide_vertical_text_to_layout_lanes(
     image: Image.Image,
     regions: list[dict[str, object]],
@@ -2067,6 +2648,88 @@ def _post_cluster_member_geometry_plausible_under_exact_consensus(
     return component_count >= 2 and coverage >= 0.90 and glyphs <= component_count * 5
 
 
+def _post_cluster_two_lane_punctuation_member_plausible(
+    region: dict[str, object],
+    value: object,
+) -> bool:
+    """Allow a one-kana punctuation tail only under exact two-lane consensus.
+
+    Speech bubbles such as p030 split ``しつこい`` / ``ぞ……!!`` into two
+    physical columns.  The left tail contains only one Japanese glyph, so the
+    normal post-cluster geometry guard rejects it.  This narrow fallback is
+    intended only for callers that already proved exact whole-cluster == joined
+    per-lane OCR and that both lanes were independently observed.
+    """
+    compact = _compact_surface(value)
+    if _japanese_character_count(compact) != 1:
+        return False
+    punctuation = sum(
+        not (
+            character.isalnum()
+            or "\u3040" <= character <= "\u30ff"
+            or "\u3400" <= character <= "\u9fff"
+            or character in {"々", "〆", "ヶ", "ー"}
+        )
+        for character in compact
+    )
+    if punctuation < 2:
+        return False
+
+    width = max(1e-6, _number(region.get("width")))
+    height = max(1e-6, _number(region.get("height")))
+    pitch_ratio = height / width
+    if not (0.55 <= pitch_ratio <= 2.20):
+        return False
+
+    provenance = region.get("provenance")
+    component_count = int(region.get("component_count") or 0)
+    coverage = float(region.get("component_coverage") or 0.0)
+    if isinstance(provenance, dict):
+        component_count = component_count or int(provenance.get("component_count") or 0)
+        coverage = coverage or float(provenance.get("component_coverage") or 0.0)
+    return component_count >= 3 and coverage >= 0.80
+
+
+def _post_cluster_two_lane_context_residual(
+    cluster_text: object,
+    member_texts: list[str],
+    members: list[dict[str, object]],
+) -> tuple[str, str] | None:
+    """Recover one context-only kana from a punctuation-heavy second lane.
+
+    MangaOCR can read the semantic kana only when both physical lanes are shown
+    together (p030: ``しつこい`` / ``ぞ……!!``), while the isolated short lane
+    returns punctuation only.  Accept the whole-cluster suffix only when the
+    first lane is an exact prefix, the second direct read contains no semantic
+    characters, and the suffix itself fits the already-observed strong second
+    lane geometry.
+    """
+    if len(member_texts) != 2 or len(members) != 2:
+        return None
+    cluster = _compact_surface(cluster_text)
+    first = _compact_surface(member_texts[0])
+    second = _compact_surface(member_texts[1])
+    if not cluster or not first or not second:
+        return None
+    if not cluster.startswith(first):
+        return None
+    if _post_cluster_semantic_surface(second):
+        return None
+    if len(second) < 2:
+        return None
+
+    residual = cluster[len(first) :]
+    if not residual or len(residual) > 12:
+        return None
+    if _japanese_character_count(residual) != 1:
+        return None
+    if not set(second).issubset(set(residual)):
+        return None
+    if not _post_cluster_two_lane_punctuation_member_plausible(members[1], residual):
+        return None
+    return first, residual
+
+
 def _recognize_post_cluster_surface(
     model: object,
     image: Image.Image,
@@ -2203,6 +2866,229 @@ def _post_cluster_consensus_member_text(
     return candidate, ratio
 
 
+def _vertical_gap_sfx_surface(value: object) -> str:
+    compact = _compact_surface(value)
+    normalized = unicodedata.normalize("NFKC", compact)
+    return normalized.replace("〜", "~")
+
+
+def _recognize_vertical_gap_sfx_fragment(
+    model: object,
+    image: Image.Image,
+    region: dict[str, object],
+) -> str:
+    """OCR one observed fragment without generic neighbour padding.
+
+    The v88 evidence comes from the exact raw component boxes. Generic OCR
+    padding can include the thin wave bridge or nearby artwork and would make
+    the supposedly independent prefix/suffix reads less independent.
+    """
+    page_width, page_height = image.size
+    left, top, right, bottom = _pixel_bbox(region, page_width, page_height)
+    crop = image.crop((
+        max(0, int(math.floor(left))),
+        max(0, int(math.floor(top))),
+        min(page_width, int(math.ceil(right))),
+        min(page_height, int(math.ceil(bottom))),
+    )).convert("RGB")
+    try:
+        return _compact_surface(model(crop))  # type: ignore[operator]
+    finally:
+        crop.close()
+
+
+def _vertical_gap_sfx_merged_read(
+    model: object,
+    image: Image.Image,
+    region: dict[str, object],
+) -> tuple[str, list[str]] | None:
+    page_width, page_height = image.size
+    left, top, right, bottom = _pixel_bbox(region, page_width, page_height)
+    reads: list[str] = []
+    by_surface: dict[str, list[str]] = {}
+    for pad in (4, 8, 12):
+        crop = image.crop((
+            max(0, int(left) - pad),
+            max(0, int(top) - pad),
+            min(page_width, int(math.ceil(right)) + pad),
+            min(page_height, int(math.ceil(bottom)) + pad),
+        )).convert("RGB")
+        try:
+            text = _compact_surface(model(crop))  # type: ignore[operator]
+        finally:
+            crop.close()
+        if not text:
+            continue
+        reads.append(text)
+        key = _vertical_gap_sfx_surface(text)
+        by_surface.setdefault(key, []).append(text)
+    if not by_surface:
+        return None
+    key, values = max(
+        by_surface.items(),
+        key=lambda item: (len(item[1]), len(item[0]), item[0]),
+    )
+    if len(values) < 2:
+        return None
+    return values[0], reads
+
+
+def _recover_gapped_vertical_sfx_fragments(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Recover one vertical SFX lane split by thin wave glyphs.
+
+    p030's ``うわああ～～～っ!!`` is physically one right-edge vertical SFX,
+    but the undilated component detector emits two strong fragments because the
+    thin ``～～～`` strokes create a gap much larger than the normal text-line
+    join threshold.  Rejoin such fragments only when independent OCR of the
+    upper/lower pieces exactly anchors a majority OCR read of the merged crop,
+    and the residual between those anchors is wave punctuation only.
+    """
+    output = [dict(region) for region in regions]
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return output
+
+    raw = [
+        dict(item)
+        for item in _raw_vertical_lines(image)
+        if str(item.get("orientation") or "") == "vertical"
+    ]
+    if len(raw) < 2:
+        return output
+
+    boxes = [_pixel_bbox(item, page_width, page_height) for item in raw]
+    consumed: set[int] = set()
+    normal_gap = max(12.0, page_width * 0.025)
+    max_gap = max(72.0, page_height * 0.10)
+
+    for upper_index, upper in enumerate(raw):
+        if upper_index in consumed:
+            continue
+        ul, ut, ur, ub = boxes[upper_index]
+        upper_prov = upper.get("provenance") if isinstance(upper.get("provenance"), dict) else {}
+        upper_count = int(upper_prov.get("component_count") or 0)
+        upper_coverage = float(upper_prov.get("component_coverage") or 0.0)
+        if upper_count < 4 or upper_coverage < 0.85:
+            continue
+        upper_center = (ul + ur) / 2.0
+
+        best: tuple[float, int] | None = None
+        for lower_index, lower in enumerate(raw):
+            if lower_index == upper_index or lower_index in consumed:
+                continue
+            ll, lt, lr, lb = boxes[lower_index]
+            if lt <= ub:
+                continue
+            gap = lt - ub
+            if gap <= normal_gap or gap > max_gap:
+                continue
+            lower_prov = lower.get("provenance") if isinstance(lower.get("provenance"), dict) else {}
+            lower_count = int(lower_prov.get("component_count") or 0)
+            lower_coverage = float(lower_prov.get("component_coverage") or 0.0)
+            if lower_count < 2 or lower_coverage < 0.70:
+                continue
+            lower_center = (ll + lr) / 2.0
+            if abs(lower_center - upper_center) > max(8.0, min(ur - ul, lr - ll) * 0.35):
+                continue
+            overlap = max(0.0, min(ur, lr) - max(ul, ll))
+            if overlap < min(ur - ul, lr - ll) * 0.70:
+                continue
+            if _post_cluster_owner(output, upper) is not None or _post_cluster_owner(output, lower) is not None:
+                continue
+            score = gap + abs(lower_center - upper_center) * 3.0
+            if best is None or score < best[0]:
+                best = (score, lower_index)
+
+        if best is None:
+            continue
+        lower_index = best[1]
+        lower = raw[lower_index]
+        ll, lt, lr, lb = boxes[lower_index]
+
+        try:
+            upper_text = _recognize_vertical_gap_sfx_fragment(model, image, upper)
+            lower_text = _recognize_vertical_gap_sfx_fragment(model, image, lower)
+        except Exception:
+            continue
+        upper_surface = _vertical_gap_sfx_surface(upper_text)
+        lower_surface = _vertical_gap_sfx_surface(lower_text)
+        if _japanese_character_count(upper_text) < 3:
+            continue
+        if not lower_surface.startswith("っ") or not lower_surface[1:] or not set(lower_surface[1:]).issubset({"!", "?"}):
+            continue
+
+        left = min(_number(upper.get("x")), _number(lower.get("x")))
+        bottom_y = min(_number(upper.get("y")), _number(lower.get("y")))
+        right = max(
+            _number(upper.get("x")) + _number(upper.get("width")),
+            _number(lower.get("x")) + _number(lower.get("width")),
+        )
+        top_y = max(
+            _number(upper.get("y")) + _number(upper.get("height")),
+            _number(lower.get("y")) + _number(lower.get("height")),
+        )
+        merged = {
+            "x": left,
+            "y": bottom_y,
+            "width": max(0.0, right - left),
+            "height": max(0.0, top_y - bottom_y),
+            "orientation": "vertical",
+            "source": _LAYOUT_LINE_SOURCE,
+        }
+        recognized = _vertical_gap_sfx_merged_read(model, image, merged)
+        if recognized is None:
+            continue
+        merged_text, merged_reads = recognized
+        merged_surface = _vertical_gap_sfx_surface(merged_text)
+        if not merged_surface.startswith(upper_surface) or not merged_surface.endswith(lower_surface):
+            continue
+        residual_end = len(merged_surface) - len(lower_surface)
+        residual = merged_surface[len(upper_surface) : residual_end]
+        if not residual or len(residual) > 6 or set(residual) != {"~"}:
+            continue
+
+        donor = dict(upper)
+        donor.update(merged)
+        donor["text"] = merged_text
+        donor["raw_text"] = merged_text
+        donor["orientation_reason"] = "gapped-vertical-sfx-consensus"
+        donor["detector"] = _RAW_LAYOUT_DETECTOR
+        donor["recognizer"] = "manga-ocr"
+        donor["recognition_selection"] = "gapped-vertical-sfx-consensus-v1"
+        donor["selected_hypothesis_id"] = "manga-ocr-gapped-vertical-sfx-v1"
+        donor["geometry_source"] = "gapped-vertical-sfx-consensus-v1"
+        donor["geometry_status"] = "approximate"
+        donor["hypotheses"] = [
+            {
+                "id": "manga-ocr-gapped-vertical-sfx-v1",
+                "text": merged_text,
+                "source": "manga-ocr",
+                "selected": True,
+            }
+        ]
+        provenance = dict(upper_prov)
+        provenance.update({
+            "gapped_vertical_sfx_bridge": True,
+            "upper_direct_text": upper_text,
+            "lower_direct_text": lower_text,
+            "merged_reads": list(merged_reads),
+            "merged_residual": residual,
+            "gap_px": round(lt - ub, 2),
+            "lower_component_count": int((lower.get("provenance") or {}).get("component_count") or 0),
+            "lower_component_coverage": float((lower.get("provenance") or {}).get("component_coverage") or 0.0),
+        })
+        donor["provenance"] = provenance
+        output.append(donor)
+        consumed.add(upper_index)
+        consumed.add(lower_index)
+
+    return output
+
+
 def _post_recognition_cluster_recall(
     model: object,
     image: Image.Image,
@@ -2212,14 +3098,14 @@ def _post_recognition_cluster_recall(
 
     Initial Apple Vision observations can suppress a tighter pixel lane before
     MangaOCR runs; if that Vision observation is later rejected, the valid lane
-    never gets another chance.  Revisit only compact 3-4 lane clusters after the
+    never gets another chance.  Revisit compact 2-4 lane clusters after the
     normal pipeline has settled.  A missing lane is emitted only when direct OCR
     of every member, combined right-to-left, strongly agrees with direct OCR of
     the whole cluster.  This keeps the pass recall-only and avoids the old
     language/geometry-only fabricated-column failure mode.
     """
     output = [dict(region) for region in regions]
-    if sum(str(region.get("orientation") or "") == "vertical" for region in output) < 3:
+    if sum(str(region.get("orientation") or "") == "vertical" for region in output) < 2:
         return output
 
     primary = _layout_vertical_lines(image)
@@ -2234,8 +3120,9 @@ def _post_recognition_cluster_recall(
             for value in provenance.get("member_boxes") or []
             if isinstance(value, dict)
         ]
-        if not (3 <= len(members) <= 4):
+        if not (2 <= len(members) <= 4):
             continue
+        two_lane_cluster = len(members) == 2
 
         ordered = sorted(
             members,
@@ -2245,18 +3132,32 @@ def _post_recognition_cluster_recall(
         owners = [_post_cluster_owner(output, member) for member in ordered]
         if all(owner is not None for owner in owners):
             continue
-        # Low component counts are unsafe only for a lane we are about to invent.
-        # Already-recognized owners are independent evidence for their member
-        # geometry and may themselves come from strict merged/raw recovery paths.
-        if any(
-            owner is None
-            and (
-                int(member.get("component_count") or 0) < 2
-                or float(member.get("component_coverage") or 0.0) < 0.62
-            )
-            for member, owner in zip(ordered, owners)
-        ):
-            continue
+        if two_lane_cluster:
+            # Two-member clusters are common enough in artwork that they need a
+            # stronger admission rule than the established 3-4 lane path.  Only
+            # recover a fully-missing pair with two independently strong physical
+            # lanes; exact OCR stream consensus is required below as a second gate.
+            if any(owner is not None for owner in owners):
+                continue
+            if any(
+                int(member.get("component_count") or 0) < 3
+                or float(member.get("component_coverage") or 0.0) < 0.80
+                for member in ordered
+            ):
+                continue
+        else:
+            # Low component counts are unsafe only for a lane we are about to invent.
+            # Already-recognized owners are independent evidence for their member
+            # geometry and may themselves come from strict merged/raw recovery paths.
+            if any(
+                owner is None
+                and (
+                    int(member.get("component_count") or 0) < 2
+                    or float(member.get("component_coverage") or 0.0) < 0.62
+                )
+                for member, owner in zip(ordered, owners)
+            ):
+                continue
 
         try:
             cluster_text = _recognize_post_cluster_surface(model, image, cluster)
@@ -2362,6 +3263,18 @@ def _post_recognition_cluster_recall(
                 "views": list(local_views),
             }
 
+        two_lane_context_residual = None
+        if two_lane_cluster:
+            two_lane_context_residual = _post_cluster_two_lane_context_residual(
+                cluster_text,
+                member_texts,
+                ordered,
+            )
+            if two_lane_context_residual is not None:
+                member_texts[0], member_texts[1] = two_lane_context_residual
+                missing_reads[0] = member_texts[0]
+                missing_reads[1] = member_texts[1]
+
         joined = "".join(member_texts)
         length_delta = abs(len(joined) - len(cluster_text))
         if length_delta > max(4, int(math.ceil(len(cluster_text) * 0.24))):
@@ -2384,6 +3297,8 @@ def _post_recognition_cluster_recall(
             and semantic_joined == semantic_cluster
             and bool(cluster_text)
         )
+        if two_lane_cluster and not exact_stream_consensus:
+            continue
 
         consensus_reads: dict[int, tuple[str, float]] = {}
         bounded_exact_reads: dict[int, bool] = {}
@@ -2434,6 +3349,13 @@ def _post_recognition_cluster_recall(
                     and (exact_stream_consensus or bounded_exact_reads.get(index, False))
                     and _post_cluster_member_geometry_plausible_under_exact_consensus(member, text)
                 )
+            if (
+                not geometry_ok
+                and two_lane_cluster
+                and exact_stream_consensus
+                and local_agreement >= 0.999
+            ):
+                geometry_ok = _post_cluster_two_lane_punctuation_member_plausible(member, text)
             if not geometry_ok:
                 continue
             donor = dict(cluster)
@@ -2464,6 +3386,9 @@ def _post_recognition_cluster_recall(
             donor_provenance["cluster_member_raw_text"] = raw_text
             donor_provenance["cluster_member_consensus_text"] = text
             donor_provenance["cluster_member_local_agreement"] = round(local_agreement, 4)
+            if two_lane_context_residual is not None:
+                donor_provenance["cluster_two_lane_context_residual"] = True
+                donor_provenance["cluster_two_lane_context_residual_kind"] = "exact-prefix-punctuation-tail-v1"
             if bounded_exact_reads.get(index, False):
                 donor_provenance["cluster_member_bounded_exact_consensus"] = True
                 donor_provenance["cluster_member_bounded_exact_consensus_kind"] = "semantic-neighbours-v1"
@@ -2945,6 +3870,644 @@ def _repair_post_cluster_truncated_members(
 
 
 
+def _recover_short_wide_vertical_donor_trailing_context(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Run the existing bounded trailing recovery on late short wide donors.
+
+    Wide-layout donors are created after the normal per-region edge-recovery
+    pass.  A short merged donor can therefore preserve only the prefix seen in
+    its narrow observed box even though the same-lane trailing ink is present.
+    Reuse the existing direct/square + ink-backed two-stage recovery, but only
+    for 2-3 glyph single-component donor lanes.
+    """
+    output = [dict(region) for region in regions]
+    for index, donor in enumerate(output):
+        provenance = donor.get("provenance")
+        if not (
+            str(donor.get("orientation") or "") == "vertical"
+            and str(donor.get("source") or "") == _LAYOUT_LINE_SOURCE
+            and str(donor.get("detector") or "") == "wide-vertical-text-donor-v1"
+            and isinstance(provenance, dict)
+            and provenance.get("wide_vertical_text_donor")
+            and provenance.get("single_merged_component")
+            and int(provenance.get("component_count") or 0) <= 2
+        ):
+            continue
+
+        old = _vertical_recovery_surface(donor.get("text"))
+        old_core = _vertical_trailing_retry_japanese_core(old)
+        if not (2 <= len(old_core) <= 3):
+            continue
+
+        repaired = _recover_vertical_trailing_context(model, image, donor)
+        repaired_text = _vertical_recovery_surface(repaired.get("text"))
+        if repaired_text == old:
+            continue
+
+        # v96p11: a late wide donor may borrow the beginning of the immediately
+        # adjacent lane as its new trailing suffix (p31: ``なければ金は`` next
+        # to the independently recognized ``金は払う!!``).  Reject only when
+        # at least two newly-added Japanese glyphs exactly match the prefix of
+        # a nearby non-donor vertical peer with overlapping y coverage.  This
+        # keeps p36 (``由が``) because no adjacent lane begins with that suffix.
+        repaired_core = _vertical_trailing_retry_japanese_core(repaired_text)
+        added_core = repaired_core[len(old_core):] if repaired_core.startswith(old_core) else ""
+        suffix_conflict = False
+        if len(added_core) >= 2:
+            donor_center = _number(repaired.get("x")) + _number(repaired.get("width")) / 2.0
+            for peer_index, peer in enumerate(output):
+                if peer_index == index or str(peer.get("orientation") or "") != "vertical":
+                    continue
+                peer_core = _vertical_trailing_retry_japanese_core(peer.get("text"))
+                if len(peer_core) < 2:
+                    continue
+                peer_center = _number(peer.get("x")) + _number(peer.get("width")) / 2.0
+                center_gap = abs(peer_center - donor_center)
+                center_limit = max(
+                    0.075,
+                    (_number(repaired.get("width")) + _number(peer.get("width"))) * 1.25,
+                )
+                if center_gap > center_limit or _layout_vertical_overlap(repaired, peer) < 0.25:
+                    continue
+                max_tail = min(3, len(added_core), len(peer_core))
+                for tail_size in range(max_tail, 1, -1):
+                    tail = added_core[-tail_size:]
+                    if (
+                        _japanese_character_count(tail) == tail_size
+                        and peer_core.startswith(tail)
+                    ):
+                        suffix_conflict = True
+                        break
+                if suffix_conflict:
+                    break
+        if suffix_conflict:
+            continue
+
+        # The legacy redundancy suppressor runs immediately after this late
+        # recovery.  Make the recovered donor self-contained: its complete
+        # current text, not only the newly appended suffix, must map back to
+        # observed same-lane ink before it can be protected from suppression.
+        full_segments = _layout_line_ink_character_segments(image, repaired, repaired_text)
+        full_stream = "".join(
+            _compact_surface(segment.get("text"))
+            for segment in full_segments
+            if isinstance(segment, dict)
+        )
+        if (
+            full_stream != repaired_text
+            or len(full_segments) != len(repaired_text)
+            or any(
+                not str(segment.get("source") or "").startswith("layout-line-ink-v2")
+                for segment in full_segments
+            )
+        ):
+            continue
+
+        repaired = dict(repaired)
+        repaired["segments"] = _tighten_vertical_slot_ink_segments(image, full_segments)
+        repaired["geometry_status"] = "approximate"
+        repaired["word_geometry"] = "ink-segmented-single-column-v1"
+        repaired_provenance = dict(repaired.get("provenance") or provenance)
+        repaired_provenance["wide_vertical_trailing_recovery"] = True
+        repaired["provenance"] = repaired_provenance
+        output[index] = repaired
+
+    for order, region in enumerate(output):
+        region["order"] = order
+    return output
+
+
+def _reread_wide_vertical_layout_donors_exact_crop(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Replace truncated wide-donor text only with exact-crop MangaOCR evidence.
+
+    The legacy path accepts a bounded extension when the old semantic surface is
+    contained in the exact reread.  v96p20 adds two still-bounded forms seen on
+    real p36 speech lanes:
+
+    * a prefix-preserving extension may add four Japanese glyphs instead of
+      three, but only when a second detector-bbox view agrees exactly;
+    * one spurious leading glyph may be dropped when the remaining old suffix is
+      the exact prefix of the reread and the reread adds only 1..3 trailing
+      Japanese glyphs, again with detector-bbox consensus.
+
+    Every accepted candidate must still reconstruct completely from observed
+    same-lane page ink.  Geometry is never expanded or invented here.
+    """
+    output = [dict(region) for region in regions]
+    page_width, page_height = image.size
+    for index, donor in enumerate(output):
+        provenance = donor.get("provenance")
+        if not (
+            str(donor.get("orientation") or "") == "vertical"
+            and str(donor.get("source") or "") == _LAYOUT_LINE_SOURCE
+            and isinstance(provenance, dict)
+            and provenance.get("wide_vertical_text_donor")
+        ):
+            continue
+
+        old_text = _compact_surface(donor.get("text"))
+        old_semantic = _post_cluster_semantic_surface(old_text)
+        if len(old_semantic) < 2:
+            continue
+
+        try:
+            crop = _explicit_normalized_crop(image, donor, pad_ratio=0.0)
+            try:
+                candidate = _compact_surface(model(crop))  # type: ignore[operator]
+            finally:
+                crop.close()
+        except Exception:
+            continue
+
+        candidate_semantic = _post_cluster_semantic_surface(candidate)
+        if not candidate_semantic or candidate_semantic == old_semantic:
+            continue
+
+        old_japanese = _japanese_character_count(old_semantic)
+        candidate_japanese = _japanese_character_count(candidate_semantic)
+        if candidate_japanese < 3 or candidate_japanese > 12:
+            continue
+
+        relation = ""
+        added_japanese = candidate_japanese - old_japanese
+        requires_detector_consensus = False
+        if old_semantic in candidate_semantic and 1 <= added_japanese <= 3:
+            relation = "legacy-contained-extension"
+        elif (
+            candidate_semantic.startswith(old_semantic)
+            and added_japanese == 4
+        ):
+            relation = "prefix-extension-plus4"
+            requires_detector_consensus = True
+        elif (
+            len(old_semantic) >= 4
+            and candidate_semantic.startswith(old_semantic[1:])
+        ):
+            retained_japanese = _japanese_character_count(old_semantic[1:])
+            trailing_added = candidate_japanese - retained_japanese
+            if 1 <= trailing_added <= 3:
+                relation = "drop-one-leading-plus-trailing"
+                added_japanese = trailing_added
+                requires_detector_consensus = True
+        if not relation and 4 <= len(candidate_semantic) <= 12:
+            # A wide multi-column read can assign one or two glyphs from an
+            # independently recognized adjacent vertical lane to this donor.
+            # Only a *shorter* exact-crop reread is eligible, and the discarded
+            # glyphs must already exist at the correct neighboring physical x.
+            # The candidate is reconstructed from ink in the current detector
+            # box below; no text is assembled from the neighboring lane.
+            donor_center = _number(donor.get("x")) + _number(donor.get("width")) / 2.0
+            for peer in output:
+                if peer is donor or str(peer.get("source") or "") != _LAYOUT_LINE_SOURCE:
+                    continue
+                if str(peer.get("orientation") or "") != "vertical":
+                    continue
+                if str(peer.get("detector") or "") == "wide-vertical-text-donor-v1":
+                    continue
+                peer_text = _post_cluster_semantic_surface(_compact_surface(peer.get("text")))
+                peer_center = _number(peer.get("x")) + _number(peer.get("width")) / 2.0
+                offset = peer_center - donor_center
+                if (
+                    abs(offset) < 0.015
+                    or abs(offset) > 0.075
+                    or _layout_vertical_overlap(donor, peer) < 0.45
+                ):
+                    continue
+                # A suffix borrowed from the next (leftward) Japanese column.
+                suffix = old_semantic[len(candidate_semantic):]
+                if (
+                    offset < 0
+                    and len(suffix) == 2
+                    and old_semantic == candidate_semantic + suffix
+                    and peer_text.startswith(suffix)
+                ):
+                    relation = "exact-crop-drop-adjacent-trailing-two"
+                    requires_detector_consensus = True
+                    added_japanese = candidate_japanese - old_japanese
+                    break
+                # A prefix borrowed from the preceding (rightward) column,
+                # while the current lane's last glyph was also clipped.
+                prefix = old_semantic[:2]
+                retained = old_semantic[2:]
+                if (
+                    offset > 0
+                    and len(prefix) == 2
+                    and peer_text == prefix
+                    and len(retained) >= 3
+                    and candidate_semantic.startswith(retained)
+                    and len(candidate_semantic) == len(retained) + 1
+                ):
+                    relation = "exact-crop-drop-adjacent-leading-two-and-recover-tail"
+                    requires_detector_consensus = True
+                    added_japanese = candidate_japanese - old_japanese
+                    break
+        if not relation:
+            continue
+
+        consensus_views = [candidate]
+        if requires_detector_consensus:
+            detector_bbox = provenance.get("detector_bbox_px")
+            try:
+                raw_left, raw_top, raw_right, raw_bottom = detector_bbox  # type: ignore[misc]
+                left = max(0, min(page_width - 1, round(float(raw_left))))
+                top = max(0, min(page_height - 1, round(float(raw_top))))
+                right = max(left + 1, min(page_width, round(float(raw_right))))
+                bottom = max(top + 1, min(page_height, round(float(raw_bottom))))
+            except (TypeError, ValueError):
+                continue
+            if right - left < 8 or bottom - top < 24:
+                continue
+            exact = image.crop(
+                (
+                    max(0, left - 2),
+                    max(0, top - 2),
+                    min(page_width, right + 2),
+                    min(page_height, bottom + 2),
+                )
+            ).convert("RGB")
+            try:
+                second = _compact_surface(model(exact))  # type: ignore[operator]
+            except Exception:
+                continue
+            finally:
+                exact.close()
+            consensus_views.append(second)
+            if second != candidate:
+                continue
+            if relation.startswith("exact-crop-drop-adjacent-"):
+                all_agree = True
+                for pad in (0, 4):
+                    view = image.crop(
+                        (
+                            max(0, left - pad),
+                            max(0, top - pad),
+                            min(page_width, right + pad),
+                            min(page_height, bottom + pad),
+                        )
+                    ).convert("RGB")
+                    try:
+                        additional = _compact_surface(model(view))  # type: ignore[operator]
+                    except Exception:
+                        all_agree = False
+                        break
+                    finally:
+                        view.close()
+                    consensus_views.append(additional)
+                    if additional != candidate:
+                        all_agree = False
+                        break
+                if not all_agree:
+                    continue
+
+        segments = _layout_line_character_segments(donor, candidate, image=image)
+        segment_stream = "".join(
+            _compact_surface(segment.get("text"))
+            for segment in segments
+            if isinstance(segment, dict)
+        )
+        if segment_stream != candidate or len(segments) != len(candidate):
+            continue
+        if any(
+            not str(segment.get("source") or "").startswith("layout-line-ink-v2")
+            for segment in segments
+        ):
+            continue
+
+        repaired = dict(donor)
+        repaired["text"] = candidate
+        repaired["raw_text"] = candidate
+        repaired["segments"] = _tighten_vertical_slot_ink_segments(image, segments)
+        repaired["recognition_selection"] = "wide-vertical-layout-donor-exact-crop-v1"
+        repaired["selected_hypothesis_id"] = "wide-vertical-layout-donor-exact-crop-v1"
+        hypotheses = [
+            dict(hypothesis)
+            for hypothesis in donor.get("hypotheses") or []
+            if isinstance(hypothesis, dict)
+        ]
+        for hypothesis in hypotheses:
+            hypothesis["selected"] = False
+        hypotheses.append(
+            {
+                "id": "wide-vertical-layout-donor-exact-crop-v1",
+                "text": candidate,
+                "source": "manga-ocr-exact-layout-crop",
+                "selected": True,
+            }
+        )
+        repaired["hypotheses"] = hypotheses
+        repaired["geometry_source"] = "wide-vertical-layout-donor-exact-crop-v1"
+        repaired["geometry_status"] = "approximate"
+        repaired["word_geometry"] = "ink-segmented-single-column-v1"
+        repaired_provenance = dict(provenance)
+        repaired_provenance["wide_vertical_exact_crop_reread"] = True
+        repaired_provenance["wide_vertical_exact_crop_original_text"] = old_text
+        repaired_provenance["wide_vertical_exact_crop_text"] = candidate
+        repaired_provenance["wide_vertical_exact_crop_added_japanese"] = added_japanese
+        repaired_provenance["wide_vertical_exact_crop_relation"] = relation
+        repaired_provenance["wide_vertical_exact_crop_consensus_views"] = consensus_views
+        repaired["provenance"] = repaired_provenance
+        output[index] = repaired
+
+    for order, region in enumerate(output):
+        region["order"] = order
+    return output
+
+
+
+def _trim_vertical_prefix_above_panel_rule(
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Trim one OCR glyph that physically sits above a panel separator.
+
+    A vertical lane can start inside the page header while the real bubble text
+    starts immediately below a long horizontal panel rule.  MangaOCR then sees
+    a piece of the header/logo as the first glyph (p26: ``Ｅきたんじゃない？``
+    and ``ハルフィ``).  Remove exactly one leading segment only when a long
+    horizontal rule crosses the lane between that segment and the next one.
+    """
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return item
+    if str(item.get("detector") or "") != _LAYOUT_DETECTOR:
+        return item
+
+    text = _compact_surface(item.get("text"))
+    segments = [
+        dict(segment)
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict)
+    ]
+    stream = "".join(_compact_surface(segment.get("text")) for segment in segments)
+    if len(text) < 4 or len(segments) != len(text) or stream != text:
+        return item
+    retained_text = text[1:]
+    if _japanese_character_count(retained_text) < 3:
+        return item
+
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return item
+
+    def segment_box(segment: dict[str, object]) -> tuple[int, int, int, int]:
+        x = max(0.0, min(1.0, _number(segment.get("x"))))
+        y = max(0.0, min(1.0, _number(segment.get("y"))))
+        width = max(0.0, min(1.0 - x, _number(segment.get("width"))))
+        height = max(0.0, min(1.0 - y, _number(segment.get("height"))))
+        left = round(x * page_width)
+        right = round((x + width) * page_width)
+        top = round((1.0 - y - height) * page_height)
+        bottom = round((1.0 - y) * page_height)
+        return left, top, right, bottom
+
+    first_left, first_top, first_right, first_bottom = segment_box(segments[0])
+    second_left, second_top, second_right, second_bottom = segment_box(segments[1])
+    if first_bottom > second_top + 3:
+        return item
+    gap = second_top - first_bottom
+    if gap > 25:
+        return item
+
+    scan_left = max(0, min(first_left, second_left))
+    scan_right = min(page_width, max(first_right, second_right))
+    lane_width = scan_right - scan_left
+    if lane_width < 6:
+        return item
+
+    search_top = max(0, first_bottom - 2)
+    search_bottom = min(
+        page_height,
+        second_top + max(8, (second_bottom - second_top) // 2),
+    )
+    if search_bottom <= search_top:
+        return item
+
+    crop = image.crop((0, search_top, page_width, search_bottom)).convert("L")
+    try:
+        pixels = list(crop.getdata())
+        crop_width, crop_height = crop.size
+    finally:
+        crop.close()
+    if not pixels or crop_width <= 0:
+        return item
+
+    minimum_span = max(
+        int(round(page_width * 0.20)),
+        int(round(lane_width * 4.0)),
+    )
+    rule_row: int | None = None
+    rule_span: tuple[int, int] | None = None
+    for row in range(crop_height):
+        row_pixels = pixels[row * crop_width : (row + 1) * crop_width]
+        active = [int(value) <= 165 for value in row_pixels]
+        for start, end in _contiguous_spans(active):
+            if end < scan_left or start >= scan_right:
+                continue
+            if end - start + 1 < minimum_span:
+                continue
+            rule_row = search_top + row
+            rule_span = (start, end)
+            break
+        if rule_row is not None:
+            break
+    if rule_row is None or rule_span is None:
+        return item
+
+    retained_segments = segments[1:]
+    low_y = min(_number(segment.get("y")) for segment in retained_segments)
+    high_y = max(
+        _number(segment.get("y")) + _number(segment.get("height"))
+        for segment in retained_segments
+    )
+    if high_y <= low_y:
+        return item
+
+    repaired = dict(item)
+    repaired["text"] = retained_text
+    repaired["raw_text"] = retained_text
+    repaired["segments"] = retained_segments
+    repaired["y"] = low_y
+    repaired["height"] = high_y - low_y
+    repaired["recognition_selection"] = "vertical-panel-rule-prefix-trim-v1"
+    repaired["selected_hypothesis_id"] = "vertical-panel-rule-prefix-trim-v1"
+
+    hypotheses = [
+        dict(hypothesis)
+        for hypothesis in item.get("hypotheses") or []
+        if isinstance(hypothesis, dict)
+    ]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "vertical-panel-rule-prefix-trim-v1",
+            "text": retained_text,
+            "source": "physical-panel-separator",
+            "selected": True,
+        }
+    )
+    repaired["hypotheses"] = hypotheses
+
+    provenance = dict(item.get("provenance") or {})
+    provenance["panel_rule_prefix_trim"] = True
+    provenance["panel_rule_prefix_original_text"] = text
+    provenance["panel_rule_prefix_trimmed_text"] = text[0]
+    provenance["panel_rule_prefix_rule_y_px"] = int(rule_row)
+    provenance["panel_rule_prefix_rule_span_px"] = [int(rule_span[0]), int(rule_span[1])]
+    repaired["provenance"] = provenance
+    return repaired
+
+
+def _trim_wide_donor_punctuated_right_peer_prefix_bleed(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Trim a punctuated prefix copied from the adjacent right column.
+
+    This is intentionally narrower than the bidirectional p26 repair.  It only
+    applies when a wide donor begins with a 2-4 character suffix of the right
+    peer, that borrowed surface contains Japanese plus explicit !/? punctuation,
+    and the two lanes substantially overlap.  Plain repeated text is preserved.
+    """
+    output = [dict(region) for region in regions]
+    punctuation = set("！？!?")
+    for index, donor in enumerate(output):
+        provenance = donor.get("provenance")
+        if not (
+            str(donor.get("orientation") or "") == "vertical"
+            and isinstance(provenance, dict)
+            and provenance.get("wide_vertical_text_donor")
+        ):
+            continue
+
+        donor_text = _compact_surface(donor.get("text"))
+        if len(donor_text) < 6:
+            continue
+        segments = [
+            dict(segment)
+            for segment in donor.get("segments") or []
+            if isinstance(segment, dict)
+        ]
+        stream = "".join(_compact_surface(segment.get("text")) for segment in segments)
+        if len(segments) != len(donor_text) or stream != donor_text:
+            continue
+
+        donor_center = _number(donor.get("x")) + _number(donor.get("width")) / 2.0
+        best: tuple[int, float, int, dict[str, object]] | None = None
+        for peer_index, peer in enumerate(output):
+            if peer_index == index or str(peer.get("orientation") or "") != "vertical":
+                continue
+            if str(peer.get("source") or "") != _LAYOUT_LINE_SOURCE:
+                continue
+            peer_center = _number(peer.get("x")) + _number(peer.get("width")) / 2.0
+            if peer_center <= donor_center:
+                continue
+            gap = peer_center - donor_center
+            if gap < 0.012 or gap > 0.075:
+                continue
+            overlap = _layout_vertical_overlap(donor, peer)
+            if overlap < 0.60:
+                continue
+
+            peer_text = _compact_surface(peer.get("text"))
+            if len(peer_text) < 2:
+                continue
+            max_size = min(4, len(peer_text), len(donor_text) - 4)
+            trim_count = 0
+            for size in range(max_size, 1, -1):
+                borrowed = donor_text[:size]
+                if borrowed != peer_text[-size:]:
+                    continue
+                if _japanese_character_count(borrowed) < 1:
+                    continue
+                if not any(character in punctuation for character in borrowed):
+                    continue
+                trim_count = size
+                break
+            if trim_count < 2:
+                continue
+            score = (-trim_count, gap, peer_index)
+            if best is None or score < (best[0], best[1], best[2]):
+                best = (-trim_count, gap, peer_index, peer)
+
+        if best is None:
+            continue
+
+        trim_count = -best[0]
+        peer = best[3]
+        retained_text = donor_text[trim_count:]
+        retained_segments = segments[trim_count:]
+        if (
+            len(retained_text) < 4
+            or _japanese_character_count(retained_text) < 4
+            or len(retained_segments) != len(retained_text)
+        ):
+            continue
+        retained_stream = "".join(
+            _compact_surface(segment.get("text")) for segment in retained_segments
+        )
+        if retained_stream != retained_text:
+            continue
+
+        low_y = min(_number(segment.get("y")) for segment in retained_segments)
+        high_y = max(
+            _number(segment.get("y")) + _number(segment.get("height"))
+            for segment in retained_segments
+        )
+        if high_y <= low_y:
+            continue
+
+        repaired = dict(donor)
+        repaired["text"] = retained_text
+        repaired["raw_text"] = retained_text
+        repaired["segments"] = retained_segments
+        repaired["y"] = low_y
+        repaired["height"] = high_y - low_y
+        repaired["recognition_selection"] = (
+            "wide-vertical-layout-donor-punctuated-right-peer-trim-v1"
+        )
+        repaired["selected_hypothesis_id"] = (
+            "wide-vertical-layout-donor-punctuated-right-peer-trim-v1"
+        )
+        hypotheses = [
+            dict(hypothesis)
+            for hypothesis in donor.get("hypotheses") or []
+            if isinstance(hypothesis, dict)
+        ]
+        for hypothesis in hypotheses:
+            hypothesis["selected"] = False
+        hypotheses.append(
+            {
+                "id": "wide-vertical-layout-donor-punctuated-right-peer-trim-v1",
+                "text": retained_text,
+                "source": "adjacent-right-peer-punctuation-consensus",
+                "selected": True,
+            }
+        )
+        repaired["hypotheses"] = hypotheses
+
+        repaired_provenance = dict(provenance)
+        repaired_provenance["punctuated_right_peer_prefix_trim"] = True
+        repaired_provenance["punctuated_right_peer_prefix_original_text"] = donor_text
+        repaired_provenance["punctuated_right_peer_prefix_trimmed_text"] = donor_text[:trim_count]
+        repaired_provenance["punctuated_right_peer_prefix_gap"] = round(best[1], 6)
+        repaired_provenance["punctuated_right_peer_prefix_overlap"] = round(
+            _layout_vertical_overlap(donor, peer), 6
+        )
+        repaired["provenance"] = repaired_provenance
+        output[index] = repaired
+
+    for order, region in enumerate(output):
+        region["order"] = order
+    return output
+
 def _trim_wide_donor_adjacent_tall_prefix(
     regions: list[dict[str, object]],
 ) -> list[dict[str, object]]:
@@ -3099,6 +4662,234 @@ def _trim_wide_donor_adjacent_tall_prefix(
         region["order"] = order
     return output
 
+
+def _trim_wide_donor_bidirectional_peer_bleed(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Trim a sandwiched wide donor that borrowed text from both neighbours.
+
+    Some three-column bubbles leave a narrow middle layout lane whose wide OCR
+    donor contains the tail of the right-hand lane *and* the prefix of the
+    left-hand lane (p26: ``しら私はあんな事さ`` between ``そうかしら``
+    and ``されても``).  A one-sided textual match is intentionally
+    insufficient because legitimate adjacent columns can repeat text (p13).
+
+    Repair only when all of the following are true:
+    - the donor is a vertical wide-layout donor with an exact per-glyph segment
+      stream;
+    - an adjacent right peer overlaps the donor and its suffix of at least two
+      Japanese glyphs is exactly the donor prefix;
+    - an adjacent left peer overlaps the donor and its prefix is exactly the
+      donor suffix.  After the stronger right-side proof, one Japanese glyph on
+      the left is sufficient;
+    - at least three Japanese glyphs remain after both trims.
+    """
+    output = [dict(region) for region in regions]
+    for index, donor in enumerate(output):
+        provenance = donor.get("provenance")
+        if not (
+            str(donor.get("orientation") or "") == "vertical"
+            and isinstance(provenance, dict)
+            and provenance.get("wide_vertical_text_donor")
+        ):
+            continue
+
+        donor_text = _compact_surface(donor.get("text"))
+        if len(donor_text) < 6:
+            continue
+        segments = [
+            dict(segment)
+            for segment in donor.get("segments") or []
+            if isinstance(segment, dict)
+        ]
+        segment_stream = "".join(
+            _compact_surface(segment.get("text")) for segment in segments
+        )
+        if len(segments) != len(donor_text) or segment_stream != donor_text:
+            continue
+
+        donor_center = _number(donor.get("x")) + _number(donor.get("width")) / 2.0
+        right_match: tuple[int, float, int, dict[str, object]] | None = None
+        left_match: tuple[int, float, int, dict[str, object]] | None = None
+
+        for peer_index, peer in enumerate(output):
+            if peer_index == index or str(peer.get("orientation") or "") != "vertical":
+                continue
+            peer_text = _compact_surface(peer.get("text"))
+            if len(peer_text) < 2:
+                continue
+            peer_center = _number(peer.get("x")) + _number(peer.get("width")) / 2.0
+            overlap = _layout_vertical_overlap(donor, peer)
+            if overlap < 0.70:
+                continue
+
+            if peer_center > donor_center:
+                gap = peer_center - donor_center
+                if gap < 0.012 or gap > 0.075:
+                    continue
+                max_size = min(4, len(peer_text), len(donor_text) - 3)
+                size = 0
+                for candidate in range(max_size, 1, -1):
+                    borrowed = donor_text[:candidate]
+                    if (
+                        borrowed == peer_text[-candidate:]
+                        and _japanese_character_count(borrowed) == candidate
+                    ):
+                        size = candidate
+                        break
+                if size < 2:
+                    continue
+                score = (-size, gap, peer_index)
+                if right_match is None or score < (
+                    right_match[0], right_match[1], right_match[2]
+                ):
+                    right_match = (-size, gap, peer_index, peer)
+                continue
+
+            gap = donor_center - peer_center
+            if gap < 0.012 or gap > 0.075:
+                continue
+            max_size = min(3, len(peer_text), len(donor_text) - 3)
+            size = 0
+            for candidate in range(max_size, 0, -1):
+                borrowed = donor_text[-candidate:]
+                if (
+                    borrowed == peer_text[:candidate]
+                    and _japanese_character_count(borrowed) == candidate
+                ):
+                    size = candidate
+                    break
+            if size < 1:
+                continue
+            score = (-size, gap, peer_index)
+            if left_match is None or score < (
+                left_match[0], left_match[1], left_match[2]
+            ):
+                left_match = (-size, gap, peer_index, peer)
+
+        if right_match is None or left_match is None:
+            continue
+
+        prefix_count = -right_match[0]
+        suffix_count = -left_match[0]
+        retained_text = donor_text[prefix_count : len(donor_text) - suffix_count]
+        retained_segments = segments[prefix_count : len(segments) - suffix_count]
+        if (
+            len(retained_text) < 3
+            or _japanese_character_count(retained_text) < 3
+            or len(retained_segments) != len(retained_text)
+        ):
+            continue
+
+        retained_stream = "".join(
+            _compact_surface(segment.get("text")) for segment in retained_segments
+        )
+        if retained_stream != retained_text:
+            continue
+
+        low_y = min(_number(segment.get("y")) for segment in retained_segments)
+        high_y = max(
+            _number(segment.get("y")) + _number(segment.get("height"))
+            for segment in retained_segments
+        )
+        if high_y <= low_y:
+            continue
+
+        right_peer = right_match[3]
+        left_peer = left_match[3]
+        repaired = dict(donor)
+        repaired["text"] = retained_text
+        repaired["raw_text"] = retained_text
+        repaired["segments"] = retained_segments
+        repaired["y"] = low_y
+        repaired["height"] = high_y - low_y
+        repaired["recognition_selection"] = (
+            "wide-vertical-layout-donor-bidirectional-trim-v1"
+        )
+        repaired["selected_hypothesis_id"] = (
+            "wide-vertical-layout-donor-bidirectional-trim-v1"
+        )
+        hypotheses = [
+            dict(hypothesis)
+            for hypothesis in donor.get("hypotheses") or []
+            if isinstance(hypothesis, dict)
+        ]
+        for hypothesis in hypotheses:
+            hypothesis["selected"] = False
+        hypotheses.append(
+            {
+                "id": "wide-vertical-layout-donor-bidirectional-trim-v1",
+                "text": retained_text,
+                "source": "adjacent-bidirectional-peer-consensus",
+                "selected": True,
+            }
+        )
+        repaired["hypotheses"] = hypotheses
+
+        repaired_provenance = dict(provenance)
+        repaired_provenance["bidirectional_peer_bleed_trim"] = True
+        repaired_provenance["bidirectional_peer_bleed_trim_original_text"] = donor_text
+        repaired_provenance["bidirectional_peer_bleed_trim_right_suffix"] = donor_text[:prefix_count]
+        repaired_provenance["bidirectional_peer_bleed_trim_left_prefix"] = donor_text[-suffix_count:]
+        repaired_provenance["bidirectional_peer_bleed_trim_right_gap"] = round(
+            right_match[1], 6
+        )
+        repaired_provenance["bidirectional_peer_bleed_trim_left_gap"] = round(
+            left_match[1], 6
+        )
+        repaired_provenance["bidirectional_peer_bleed_trim_right_overlap"] = round(
+            _layout_vertical_overlap(donor, right_peer), 6
+        )
+        repaired_provenance["bidirectional_peer_bleed_trim_left_overlap"] = round(
+            _layout_vertical_overlap(donor, left_peer), 6
+        )
+        repaired["provenance"] = repaired_provenance
+        output[index] = repaired
+
+    for order, region in enumerate(output):
+        region["order"] = order
+    return output
+
+
+def _suppress_wide_vertical_promoted_chunks_borrowing_peer_prefix(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Drop only wide donors whose cross-lane suffix survives the repair pass.
+
+    Promotion must run before the existing adjacent-tall suffix trim because a
+    legitimate donor can initially contain the first glyphs of the next lane
+    (p12: ``ほらガキだおも``) and be repaired to ``ほらガキだ``.  Reject only
+    after that trim had a chance to run; p31's ``なければ金は`` remains
+    contaminated and is therefore removed here.
+    """
+    output: list[dict[str, object]] = []
+    for region in regions:
+        provenance = region.get("provenance")
+        donor_core = _vertical_trailing_retry_japanese_core(region.get("text"))
+        component_count = int(provenance.get("component_count") or 0) if isinstance(provenance, dict) else 0
+        component_coverage = float(provenance.get("component_coverage") or 0.0) if isinstance(provenance, dict) else 0.0
+        overpacked_component_evidence = (
+            len(donor_core) >= 3
+            and component_count >= len(donor_core) + 2
+            and component_coverage >= 1.40
+        )
+        if (
+            str(region.get("orientation") or "") == "vertical"
+            and isinstance(provenance, dict)
+            and provenance.get("wide_vertical_text_donor")
+            and overpacked_component_evidence
+            and _wide_vertical_promoted_chunk_borrows_peer_prefix(
+                region, region.get("text"), region, regions
+            )
+        ):
+            continue
+        output.append(dict(region))
+
+    for order, region in enumerate(output):
+        region["order"] = order
+    return output
+
+
 def _suppress_redundant_implausible_wide_vertical_donors(
     regions: list[dict[str, object]],
 ) -> list[dict[str, object]]:
@@ -3121,6 +4912,36 @@ def _suppress_redundant_implausible_wide_vertical_donors(
             continue
         if _layout_retry_acceptable(donor, donor.get("text")):
             continue
+
+        # v90: an exact-crop reread is stronger evidence than the legacy
+        # text/geometry plausibility heuristic below.  v89 could correctly
+        # recover a longer physical lane (for example 私がやり -> 私がやります)
+        # and then immediately delete it because the longer text made the old
+        # ratio look implausible next to another valid lane.  Preserve only
+        # rereads whose complete current stream is backed by observed
+        # layout-line ink; ordinary wide donors still use the legacy suppress.
+        if provenance.get("wide_vertical_exact_crop_reread") or provenance.get(
+            "wide_vertical_trailing_recovery"
+        ):
+            donor_text = _compact_surface(donor.get("text"))
+            donor_segments = [
+                segment
+                for segment in donor.get("segments") or []
+                if isinstance(segment, dict)
+            ]
+            donor_segment_stream = "".join(
+                _compact_surface(segment.get("text")) for segment in donor_segments
+            )
+            if (
+                donor_text
+                and donor_segment_stream == donor_text
+                and len(donor_segments) == len(donor_text)
+                and all(
+                    str(segment.get("source") or "").startswith("layout-line-ink-v2")
+                    for segment in donor_segments
+                )
+            ):
+                continue
 
         donor_center = _number(donor.get("x")) + _number(donor.get("width")) / 2.0
         for peer_index, peer in enumerate(regions):
@@ -3350,13 +5171,15 @@ def _ruby_like_layout_proposal(
     black_ratio = float(provenance.get("black_ratio") or 0.0)
     component_count = int(provenance.get("component_count") or 0)
     if not (
-        black_ratio < 0.09
+        black_ratio < 0.12
         and width <= 0.0325
-        and height <= 0.065
-        and component_count <= 4
+        and height <= 0.090
+        and component_count <= 6
     ):
         return False
     center = _number(candidate.get("x")) + width / 2.0
+    candidate_y1 = _number(candidate.get("y"))
+    candidate_y2 = candidate_y1 + height
     for peer in proposals:
         if peer is candidate:
             continue
@@ -3364,19 +5187,89 @@ def _ruby_like_layout_proposal(
         peer_height = _number(peer.get("height"))
         peer_center = _number(peer.get("x")) + peer_width / 2.0
         distance = abs(peer_center - center)
-        if distance < 0.010 or distance > 0.036:
-            continue
-        if _layout_vertical_overlap(candidate, peer) < 0.55:
-            continue
         peer_provenance = peer.get("provenance")
         if not isinstance(peer_provenance, dict):
             continue
         peer_black = float(peer_provenance.get("black_ratio") or 0.0)
+        peer_count = int(peer_provenance.get("component_count") or 0)
+        overlap = _layout_vertical_overlap(candidate, peer)
+        peer_y1 = _number(peer.get("y"))
+        peer_y2 = peer_y1 + peer_height
+        vertical_gap = max(0.0, max(candidate_y1, peer_y1) - min(candidate_y2, peer_y2))
+
+        # Legacy nested/adjacent ruby shape: a short low-density lane beside a
+        # clearly taller and darker main column. Keep the original candidate
+        # envelope intact even though v93 admits a wider superset below.
+        legacy_candidate = (
+            black_ratio < 0.09
+            and width <= 0.0325
+            and height <= 0.065
+            and component_count <= 4
+        )
         if (
-            peer_width >= width * 1.15
+            legacy_candidate
+            and 0.010 <= distance <= 0.036
+            and overlap >= 0.55
+            and peer_width >= width * 1.15
             and peer_height >= height * 1.25
             and peer_black >= max(0.10, black_ratio * 1.35)
         ):
+            return True
+
+        # v93: some real furigana is almost the same height as the base-kanji
+        # pair (p31 村長/そんちょう).  Require the candidate itself to have the
+        # observed ruby density band and the peer to be >2x wider/darker so a
+        # normal neighbouring dialogue lane cannot match this branch.
+        same_band_ruby = (
+            width <= 0.0205
+            and height <= 0.061
+            and 0.09 <= black_ratio <= 0.115
+            and component_count <= 3
+            and 0.018 <= distance <= 0.040
+            and overlap >= 0.88
+            and peer_width >= width * 2.05
+            and peer_height >= height * 0.88
+            and peer_black >= max(0.20, black_ratio * 2.0)
+        )
+        if same_band_ruby:
+            return True
+
+        # v93: dilation can preserve ruby while the main glyphs only survive in
+        # the independent raw-component pass (p32 不愉快極まり / ふゆかい...).
+        # This branch therefore accepts only a strong raw peer with much larger
+        # physical glyph width and darkness.
+        raw_main_ruby = (
+            str(peer.get("detector") or "") == _RAW_LAYOUT_DETECTOR
+            and width <= 0.0185
+            and height <= 0.070
+            and black_ratio <= 0.065
+            and 4 <= component_count <= 6
+            and 0.028 <= distance <= 0.048
+            and overlap >= 0.60
+            and peer_width >= width * 2.45
+            and peer_height >= height * 0.80
+            and peer_black >= max(0.16, black_ratio * 2.5)
+            and peer_count >= 4
+        )
+        if raw_main_ruby:
+            return True
+
+        # v93: ruby for a large lower base glyph can sit just beyond the bbox of
+        # the preceding main-glyph run (p36 理由/りゆう).  Permit a short vertical
+        # gap only with an exceptionally wide/dark two-component main peer.
+        continuation_ruby = (
+            width <= 0.0185
+            and height <= 0.060
+            and black_ratio <= 0.075
+            and component_count <= 3
+            and 0.025 <= distance <= 0.045
+            and 0.025 <= vertical_gap <= 0.055
+            and peer_width >= width * 3.0
+            and peer_height >= height * 1.15
+            and peer_black >= 0.25
+            and peer_count <= 2
+        )
+        if continuation_ruby:
             return True
     return False
 
@@ -3713,8 +5606,15 @@ def _manga_layout_line_proposals(
         return []
     raw_supplement = _supplemental_raw_layout_lines(image, regions, primary)
     contextual = _contextual_missing_layout_lines(image, regions, [*primary, *raw_supplement])
+    all_proposals = [*primary, *raw_supplement, *contextual]
     proposals: list[dict[str, object]] = []
-    for proposal in [*primary, *raw_supplement, *contextual]:
+    for proposal in all_proposals:
+        # v94: classify ruby against the complete physical proposal set before
+        # Vision blockers remove the stronger neighbouring main-text lane.
+        # Otherwise p32 loses the raw 不愉快… peer first and the surviving
+        # furigana lane can no longer prove that it is ruby.
+        if _ruby_like_layout_proposal(proposal, all_proposals):
+            continue
         blocked = False
         for existing in regions:
             if _horizontal_observation_blocks_layout(existing, proposal):
@@ -3732,11 +5632,6 @@ def _manga_layout_line_proposals(
                 break
         if not blocked:
             proposals.append(proposal)
-    proposals = [
-        proposal
-        for proposal in proposals
-        if not _ruby_like_layout_proposal(proposal, proposals)
-    ]
     return proposals
 
 
@@ -4047,6 +5942,1378 @@ def _recover_clipped_horizontal_sfx(
     return result
 
 
+
+_STYLIZED_SFX_TRAILING_PUNCTUATION = frozenset(".．・…⋯‥！!？?〜～ー―—")
+
+
+def _stylized_sfx_manga_prefix(value: object, length: int) -> str:
+    surface = _normalize_line_surface(value)
+    if length <= 0 or len(surface) < length:
+        return ""
+    prefix = surface[:length]
+    suffix = surface[length:]
+    if _japanese_character_count(prefix) != length:
+        return ""
+    if suffix and any(character not in _STYLIZED_SFX_TRAILING_PUNCTUATION for character in suffix):
+        return ""
+    return prefix
+
+
+def _repair_wide_stylized_horizontal_sfx_consensus(
+    model: object,
+    image: Image.Image,
+    piece: dict[str, object],
+) -> dict[str, object]:
+    """Repair a low-confidence wide SFX only with 2-of-3 per-glyph evidence.
+
+    Apple Vision can keep excellent glyph boxes while mislabeling a stylized
+    kana (real p38: ミュウツ).  Full-crop MangaOCR and one slightly padded crop
+    make complementary errors there.  Relabel the *observed* boxes only when
+    every position has a strict majority across detector / exact MangaOCR /
+    padded MangaOCR.  This is deliberately not a generic MangaOCR-wins rule.
+    """
+    if str(piece.get("orientation") or "") != "horizontal":
+        return piece
+    if str(piece.get("selected_hypothesis_id") or "") != "detector-recognition":
+        return piece
+    if _number(piece.get("confidence"), 1.0) > 0.55:
+        return piece
+
+    raw = _normalize_line_surface(piece.get("raw_text"))
+    if not (4 <= len(raw) <= 5):
+        return piece
+    if _japanese_character_count(raw) != len(raw):
+        return piece
+
+    width = _number(piece.get("width"))
+    height = _number(piece.get("height"))
+    if width < 0.18 or height < 0.055 or width / max(height, 1e-9) < 1.60:
+        return piece
+    if _exact_vision_segment_surface(piece) != raw:
+        return piece
+
+    segments = [
+        dict(segment)
+        for segment in piece.get("segments") or []
+        if isinstance(segment, dict) and str(segment.get("text") or "").strip()
+    ]
+    if len(segments) != len(raw):
+        return piece
+    if any(
+        not str(segment.get("source") or "").startswith("vision-accurate-range-v2")
+        for segment in segments
+    ):
+        return piece
+
+    hypotheses = [
+        dict(hypothesis)
+        for hypothesis in piece.get("hypotheses") or []
+        if isinstance(hypothesis, dict)
+    ]
+    exact_text = ""
+    for hypothesis in hypotheses:
+        if str(hypothesis.get("id") or "") == "manga-ocr":
+            exact_text = str(hypothesis.get("text") or "").strip()
+            break
+    exact_prefix = _stylized_sfx_manga_prefix(exact_text, len(raw))
+    if not exact_prefix:
+        return piece
+
+    expanded = dict(piece)
+    dx = 0.025
+    dy = 0.025
+    x = max(0.0, _number(piece.get("x")) - dx)
+    y = max(0.0, _number(piece.get("y")) - dy)
+    right = min(1.0, _number(piece.get("x")) + width + dx)
+    top = min(1.0, _number(piece.get("y")) + height + dy)
+    expanded.update({"x": x, "y": y, "width": max(0.0, right - x), "height": max(0.0, top - y)})
+    try:
+        padded_crop = _crop_region(image, expanded)
+        try:
+            padded_text = str(model(padded_crop) or "").strip()  # type: ignore[operator]
+        finally:
+            padded_crop.close()
+    except Exception:
+        return piece
+    padded_prefix = _stylized_sfx_manga_prefix(padded_text, len(raw))
+    if not padded_prefix:
+        return piece
+
+    corrected: list[str] = []
+    for detector_char, exact_char, padded_char in zip(raw, exact_prefix, padded_prefix):
+        if detector_char == exact_char or detector_char == padded_char:
+            corrected.append(detector_char)
+        elif exact_char == padded_char:
+            corrected.append(exact_char)
+        else:
+            return piece
+    selected = "".join(corrected)
+    changes = sum(left != right for left, right in zip(raw, selected))
+    if not (1 <= changes <= 2):
+        return piece
+    if _japanese_character_count(selected) != len(selected):
+        return piece
+
+    result = dict(piece)
+    result["text"] = selected
+    result["recognition_selection"] = "stylized-horizontal-sfx-majority-v1"
+    result["recognizer_retry"] = "stylized-horizontal-sfx-padded-v1"
+    result["stylized_sfx_exact_text"] = exact_text
+    result["stylized_sfx_padded_text"] = padded_text
+    result["stylized_sfx_detector_text"] = raw
+    result["stylized_sfx_changed_positions"] = [
+        index for index, (before, after) in enumerate(zip(raw, selected)) if before != after
+    ]
+    for index, segment in enumerate(segments):
+        segment["text"] = selected[index]
+        segment["recognition_correction"] = "stylized-horizontal-sfx-majority-v1"
+    result["segments"] = segments
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-stylized-sfx-consensus-v1",
+            "text": selected,
+            "source": "detector+manga-ocr+padded-manga-ocr",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
+    result["selected_hypothesis_id"] = "manga-ocr-stylized-sfx-consensus-v1"
+    return result
+
+
+
+_LARGE_SFX_EXTRA_CHARACTERS = frozenset(".!！?？…⋯‥・〜～―—")
+
+
+def _kana_sfx_candidate(value: object) -> str:
+    surface = _normalize_line_surface(value)
+    if not (3 <= len(surface) <= 10):
+        return ""
+    japanese = 0
+    for character in surface:
+        if "\u3040" <= character <= "\u30ff":
+            japanese += 1
+            continue
+        if character in _LARGE_SFX_EXTRA_CHARACTERS:
+            continue
+        return ""
+    if japanese < 3:
+        return ""
+    return surface
+
+
+def _explicit_normalized_crop(
+    image: Image.Image,
+    region: dict[str, object],
+    *,
+    pad_ratio: float,
+) -> Image.Image:
+    image_width, image_height = image.size
+    x = max(0.0, min(1.0, _number(region.get("x"))))
+    y = max(0.0, min(1.0, _number(region.get("y"))))
+    width = max(0.0, min(1.0 - x, _number(region.get("width"))))
+    height = max(0.0, min(1.0 - y, _number(region.get("height"))))
+    if width <= 0.0 or height <= 0.0:
+        raise ValueError("empty OCR region")
+    pad_x = max(0.0, width * pad_ratio)
+    pad_y = max(0.0, height * pad_ratio)
+    left = max(0, math.floor((x - pad_x) * image_width))
+    right = min(image_width, math.ceil((x + width + pad_x) * image_width))
+    top = max(0, math.floor((1.0 - y - height - pad_y) * image_height))
+    bottom = min(image_height, math.ceil((1.0 - y + pad_y) * image_height))
+    if right <= left or bottom <= top:
+        raise ValueError("empty OCR region")
+    return image.crop((left, top, right, bottom)).convert("RGB")
+
+
+def _sfx_majority_vote_key(value: object) -> str:
+    candidate = _kana_sfx_candidate(value)
+    if not candidate:
+        return ""
+    # MangaOCR is very stable on the p27-class crop except for dakuten on ソ/ゾ
+    # and the concrete ellipsis glyph. Treat those as the same vote without
+    # rewriting the visible winner text.
+    candidate = candidate.replace("ゾ", "ソ")
+    return re.sub(r"[.…⋯‥]+", "…", candidate)
+
+
+def _strong_sfx_majority_consensus(
+    model: object,
+    image: Image.Image,
+    geometry: dict[str, object],
+) -> tuple[str, list[str], int]:
+    outputs: list[str] = []
+
+    def recognize(crop: Image.Image) -> None:
+        outputs.append(re.sub(r"\s+", "", str(model(crop) or "").strip()))  # type: ignore[operator]
+
+    exact = _explicit_normalized_crop(image, geometry, pad_ratio=0.0)
+    try:
+        recognize(exact)
+        gray = exact.convert("L")
+        try:
+            auto = ImageOps.autocontrast(gray).convert("RGB")
+            try:
+                recognize(auto)
+            finally:
+                auto.close()
+        finally:
+            gray.close()
+    finally:
+        exact.close()
+
+    padded_15 = _explicit_normalized_crop(image, geometry, pad_ratio=0.015)
+    try:
+        recognize(padded_15)
+    finally:
+        padded_15.close()
+
+    padded_35 = _explicit_normalized_crop(image, geometry, pad_ratio=0.035)
+    try:
+        recognize(padded_35)
+        gray = padded_35.convert("L")
+        try:
+            auto = ImageOps.autocontrast(gray).convert("RGB")
+            try:
+                recognize(auto)
+            finally:
+                auto.close()
+        finally:
+            gray.close()
+    finally:
+        padded_35.close()
+
+    votes: dict[str, int] = {}
+    for output in outputs:
+        key = _sfx_majority_vote_key(output)
+        if key:
+            votes[key] = votes.get(key, 0) + 1
+    if not votes:
+        return "", outputs, 0
+    winner_key, winner_count = max(votes.items(), key=lambda item: item[1])
+    if winner_count < 4:
+        return "", outputs, winner_count
+    winner = next(
+        output for output in outputs if _sfx_majority_vote_key(output) == winner_key
+    )
+    return winner, outputs, winner_count
+
+
+def _selected_hypotheses_with_candidate(
+    piece: dict[str, object],
+    *,
+    hypothesis_id: str,
+    text: str,
+    source: str,
+) -> list[dict[str, object]]:
+    hypotheses = [
+        dict(hypothesis)
+        for hypothesis in piece.get("hypotheses") or []
+        if isinstance(hypothesis, dict)
+    ]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": hypothesis_id,
+            "text": text,
+            "source": source,
+            "selected": True,
+        }
+    )
+    return hypotheses
+
+
+def _proportional_horizontal_segments(
+    text: str,
+    geometry: dict[str, object],
+    *,
+    source: str,
+) -> list[dict[str, object]]:
+    characters = list(re.sub(r"\s+", "", str(text or "")))
+    if not characters:
+        return []
+    x = _number(geometry.get("x"))
+    y = _number(geometry.get("y"))
+    width = _number(geometry.get("width"))
+    height = _number(geometry.get("height"))
+    step = width / len(characters)
+    return [
+        {
+            "text": character,
+            "orientation": "horizontal",
+            "x": x + step * index,
+            "y": y,
+            "width": step,
+            "height": height,
+            "source": source,
+            "geometry_status": "approximate",
+            "recognition_correction": source,
+        }
+        for index, character in enumerate(characters)
+    ]
+
+
+def _repair_large_empty_rectangle_sfx_consensus(
+    model: object,
+    image: Image.Image,
+    piece: dict[str, object],
+) -> dict[str, object]:
+    """Recover SFX text from a large empty detector rectangle with 2-view OCR consensus."""
+    if str(piece.get("orientation") or "") != "horizontal":
+        return piece
+    if str(piece.get("source") or "").strip():
+        return piece
+    if str(piece.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return piece
+    if _number(piece.get("confidence"), 1.0) > 0.50:
+        return piece
+    width = _number(piece.get("width"))
+    height = _number(piece.get("height"))
+    if not (0.18 <= width <= 0.35 and 0.10 <= height <= 0.20):
+        return piece
+
+    segments = [segment for segment in piece.get("segments") or [] if isinstance(segment, dict)]
+    empty = [
+        dict(segment)
+        for segment in segments
+        if not _normalize_line_surface(segment.get("text"))
+        and _number(segment.get("width")) > 0.0
+        and _number(segment.get("height")) > 0.0
+    ]
+    if not empty:
+        return piece
+    dominant = max(
+        empty,
+        key=lambda item: _number(item.get("width")) * _number(item.get("height")),
+    )
+    region_area = width * height
+    dominant_area = _number(dominant.get("width")) * _number(dominant.get("height"))
+    if dominant_area < region_area * 0.65:
+        return piece
+    observed = "".join(
+        _normalize_line_surface(segment.get("text"))
+        for segment in segments
+        if _normalize_line_surface(segment.get("text"))
+    )
+    if _japanese_character_count(observed) > 1:
+        return piece
+
+    try:
+        candidate, retry_texts, vote_count = _strong_sfx_majority_consensus(
+            model, image, dominant
+        )
+    except Exception:
+        return piece
+    if not candidate or _sfx_majority_vote_key(candidate) == _sfx_majority_vote_key(
+        piece.get("text")
+    ):
+        return piece
+
+    source = "large-empty-rectangle-sfx-majority-v2"
+    recovered_segments = _proportional_horizontal_segments(
+        candidate,
+        dominant,
+        source=source,
+    )
+    if not recovered_segments:
+        return piece
+    result = dict(piece)
+    result.update(
+        {
+            "x": _number(dominant.get("x")),
+            "y": _number(dominant.get("y")),
+            "width": _number(dominant.get("width")),
+            "height": _number(dominant.get("height")),
+        }
+    )
+    result["text"] = candidate
+    result["source"] = "large-empty-rectangle-sfx-recovery-v2"
+    result["segments"] = recovered_segments
+    result["geometry_source"] = source
+    result["recognition_selection"] = source
+    result["recognizer_retry"] = "large-empty-rectangle-sfx-five-view-majority-v2"
+    result["large_empty_sfx_retry_texts"] = retry_texts
+    result["large_empty_sfx_vote_count"] = vote_count
+    result["hypotheses"] = _selected_hypotheses_with_candidate(
+        piece,
+        hypothesis_id="manga-ocr-large-empty-sfx-majority-v2",
+        text=candidate,
+        source="empty-rectangle-five-view-majority-manga-ocr",
+    )
+    result["selected_hypothesis_id"] = "manga-ocr-large-empty-sfx-majority-v2"
+    return result
+
+
+
+
+def _large_stylized_sfx_component_proposals(
+    image: Image.Image,
+    existing_regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Propose only clusters of physically large, thick, nearby SFX strokes.
+
+    This is intentionally a geometry-only detector.  It never emits text and is
+    allowed to contribute a final region only when the separate MangaOCR
+    multi-view recognizer reaches a strong consensus.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+    gray = image.convert("L")
+    try:
+        eroded = gray.filter(ImageFilter.MaxFilter(11))
+        try:
+            opened = eroded.filter(ImageFilter.MinFilter(11))
+        finally:
+            eroded.close()
+        try:
+            mask = opened.point(lambda value: 255 if int(value) <= 96 else 0)
+            try:
+                components = _binary_components(mask)
+            finally:
+                mask.close()
+        finally:
+            opened.close()
+    finally:
+        gray.close()
+
+    candidates: list[dict[str, object]] = []
+    page_area = float(page_width * page_height)
+    for left, top, width, height, ink in components:
+        width_ratio = width / page_width
+        height_ratio = height / page_height
+        ink_ratio = ink / page_area
+        fill = ink / max(1.0, float(width * height))
+        if not (0.03 <= width_ratio <= 0.16 and 0.07 <= height_ratio <= 0.20):
+            continue
+        if not (0.0015 <= ink_ratio <= 0.020):
+            continue
+        if fill < 0.55:
+            continue
+        if left <= 3 or top <= 3 or left + width >= page_width - 3 or top + height >= page_height - 3:
+            continue
+        candidates.append(
+            {
+                "left": left,
+                "top": top,
+                "width_px": width,
+                "height_px": height,
+                "ink": ink,
+                "fill": fill,
+            }
+        )
+    if len(candidates) < 3:
+        return []
+
+    def interval_gap(a1: float, a2: float, b1: float, b2: float) -> float:
+        if a2 < b1:
+            return b1 - a2
+        if b2 < a1:
+            return a1 - b2
+        return 0.0
+
+    adjacency: list[set[int]] = [set() for _ in candidates]
+    for left_index, left in enumerate(candidates):
+        lx1 = float(left["left"])
+        ly1 = float(left["top"])
+        lx2 = lx1 + float(left["width_px"])
+        ly2 = ly1 + float(left["height_px"])
+        lcx = (lx1 + lx2) / 2.0
+        lcy = (ly1 + ly2) / 2.0
+        for right_index in range(left_index + 1, len(candidates)):
+            right = candidates[right_index]
+            rx1 = float(right["left"])
+            ry1 = float(right["top"])
+            rx2 = rx1 + float(right["width_px"])
+            ry2 = ry1 + float(right["height_px"])
+            rcx = (rx1 + rx2) / 2.0
+            rcy = (ry1 + ry2) / 2.0
+            gap_x = interval_gap(lx1, lx2, rx1, rx2) / page_width
+            gap_y = interval_gap(ly1, ly2, ry1, ry2) / page_height
+            if (
+                gap_x <= 0.060
+                and gap_y <= 0.055
+                and abs(lcx - rcx) / page_width <= 0.22
+                and abs(lcy - rcy) / page_height <= 0.15
+            ):
+                adjacency[left_index].add(right_index)
+                adjacency[right_index].add(left_index)
+
+    proposals: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for start in range(len(candidates)):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        group_indices: list[int] = []
+        while stack:
+            current = stack.pop()
+            group_indices.append(current)
+            for peer in adjacency[current]:
+                if peer not in seen:
+                    seen.add(peer)
+                    stack.append(peer)
+        if not (3 <= len(group_indices) <= 8):
+            continue
+        group = [candidates[index] for index in group_indices]
+        common_top = max(int(item["top"]) for item in group)
+        common_bottom = min(
+            int(item["top"]) + int(item["height_px"]) for item in group
+        )
+        if common_bottom - common_top < max(12, int(round(page_height * 0.018))):
+            continue
+        left = min(int(item["left"]) for item in group)
+        top = min(int(item["top"]) for item in group)
+        right = max(int(item["left"]) + int(item["width_px"]) for item in group)
+        bottom = max(int(item["top"]) + int(item["height_px"]) for item in group)
+        union_width = right - left
+        union_height = bottom - top
+        if not (0.12 <= union_width / page_width <= 0.38):
+            continue
+        if not (0.10 <= union_height / page_height <= 0.32):
+            continue
+        x = left / page_width
+        y = 1.0 - bottom / page_height
+        width = union_width / page_width
+        height = union_height / page_height
+        proposal: dict[str, object] = {
+            "text": "",
+            "raw_text": "",
+            "orientation": "horizontal",
+            "x": round(x, 6),
+            "y": round(y, 6),
+            "width": round(width, 6),
+            "height": round(height, 6),
+            "confidence": 0.20,
+            "detector": "page-ink-large-sfx-components-v1",
+            "source": "large-stylized-sfx-component-proposal-v1",
+            "segments": [],
+        }
+        owned = False
+        for existing in existing_regions:
+            if _region_coverage(proposal, existing) >= 0.42 or _region_coverage(existing, proposal) >= 0.42:
+                owned = True
+                break
+        if owned:
+            continue
+        segments: list[dict[str, object]] = []
+        for item in sorted(group, key=lambda row: int(row["left"])):
+            component_left = int(item["left"])
+            component_top = int(item["top"])
+            component_width = int(item["width_px"])
+            component_height = int(item["height_px"])
+            segments.append(
+                {
+                    "text": "",
+                    "orientation": "horizontal",
+                    "x": round(component_left / page_width, 6),
+                    "y": round(1.0 - (component_top + component_height) / page_height, 6),
+                    "width": round(component_width / page_width, 6),
+                    "height": round(component_height / page_height, 6),
+                    "source": "page-ink-large-sfx-component-v1",
+                }
+            )
+        proposal["segments"] = segments
+        proposals.append(proposal)
+    proposals.sort(key=lambda row: (-_number(row.get("y")), _number(row.get("x"))))
+    return proposals[:4]
+
+
+
+def _thin_large_sfx_core_proposals(
+    image: Image.Image,
+    existing_regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Locate thin stylized horizontal SFX from dense stroke cores.
+
+    Unlike the v77 detector, this path does not require any single connected
+    component to be glyph-sized.  A conservative 5x5 opening is used only to
+    locate 3-6 dense cores.  The original image is retained for recognition;
+    these cores never supply text by themselves.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+
+    gray = image.convert("L")
+    try:
+        eroded = gray.filter(ImageFilter.MaxFilter(5))
+        try:
+            opened = eroded.filter(ImageFilter.MinFilter(5))
+        finally:
+            eroded.close()
+        try:
+            mask = opened.point(lambda value: 255 if int(value) <= 96 else 0)
+            try:
+                components = _binary_components(mask)
+            finally:
+                mask.close()
+        finally:
+            opened.close()
+    finally:
+        gray.close()
+
+    cores: list[dict[str, object]] = []
+    for left, top, width, height, ink in components:
+        width_ratio = width / page_width
+        height_ratio = height / page_height
+        fill = ink / max(1.0, float(width * height))
+        if not (0.008 <= width_ratio <= 0.020):
+            continue
+        if not (0.006 <= height_ratio <= 0.040):
+            continue
+        if ink < 45 or fill < 0.50:
+            continue
+        if left <= 4 or top <= 4 or left + width >= page_width - 4 or top + height >= page_height - 4:
+            continue
+        cores.append(
+            {
+                "left": int(left),
+                "top": int(top),
+                "width_px": int(width),
+                "height_px": int(height),
+                "ink": int(ink),
+                "fill": float(fill),
+            }
+        )
+    if len(cores) < 3:
+        return []
+
+    def interval_gap(a1: float, a2: float, b1: float, b2: float) -> float:
+        if a2 < b1:
+            return b1 - a2
+        if b2 < a1:
+            return a1 - b2
+        return 0.0
+
+    adjacency: list[set[int]] = [set() for _ in cores]
+    for left_index, left_core in enumerate(cores):
+        lx1 = float(left_core["left"])
+        ly1 = float(left_core["top"])
+        lx2 = lx1 + float(left_core["width_px"])
+        ly2 = ly1 + float(left_core["height_px"])
+        lcx = (lx1 + lx2) / 2.0
+        lcy = (ly1 + ly2) / 2.0
+        for right_index in range(left_index + 1, len(cores)):
+            right_core = cores[right_index]
+            rx1 = float(right_core["left"])
+            ry1 = float(right_core["top"])
+            rx2 = rx1 + float(right_core["width_px"])
+            ry2 = ry1 + float(right_core["height_px"])
+            rcx = (rx1 + rx2) / 2.0
+            rcy = (ry1 + ry2) / 2.0
+            if interval_gap(lx1, lx2, rx1, rx2) / page_width > 0.042:
+                continue
+            if abs(lcy - rcy) / page_height > 0.035:
+                continue
+            if abs(lcx - rcx) / page_width > 0.075:
+                continue
+            adjacency[left_index].add(right_index)
+            adjacency[right_index].add(left_index)
+
+    proposals: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for start in range(len(cores)):
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        group_indices: list[int] = []
+        while stack:
+            current = stack.pop()
+            group_indices.append(current)
+            for peer in adjacency[current]:
+                if peer not in seen:
+                    seen.add(peer)
+                    stack.append(peer)
+        if not (3 <= len(group_indices) <= 6):
+            continue
+        group = [cores[index] for index in group_indices]
+        left = min(int(item["left"]) for item in group)
+        top = min(int(item["top"]) for item in group)
+        right = max(int(item["left"]) + int(item["width_px"]) for item in group)
+        bottom = max(int(item["top"]) + int(item["height_px"]) for item in group)
+        union_width = right - left
+        union_height = bottom - top
+        if not (0.08 <= union_width / page_width <= 0.22):
+            continue
+        if not (0.030 <= union_height / page_height <= 0.080):
+            continue
+        if union_width / max(1.0, float(union_height)) < 1.75:
+            continue
+        if sum(float(item["height_px"]) / page_height >= 0.013 for item in group) < 2:
+            continue
+
+        pad_x = max(18, int(round(union_width * 0.36)))
+        pad_y = max(12, int(round(union_height * 0.48)))
+        # Thin-core localization intentionally ignores small trailing marks.
+        # Keep a small right-side context margin for punctuation/small kana
+        # during OCR without loosening the core-group detector itself.
+        trailing_context_px = max(8, int(round(page_width * 0.0105)))
+        crop_left = max(0, left - pad_x)
+        crop_top = max(0, top - pad_y)
+        crop_right = min(page_width, right + pad_x + trailing_context_px)
+        crop_bottom = min(page_height, bottom + pad_y)
+        crop_width = crop_right - crop_left
+        crop_height = crop_bottom - crop_top
+        if crop_width <= 0 or crop_height <= 0:
+            continue
+
+        proposal: dict[str, object] = {
+            "text": "",
+            "raw_text": "",
+            "orientation": "horizontal",
+            "x": round(crop_left / page_width, 6),
+            "y": round(1.0 - crop_bottom / page_height, 6),
+            "width": round(crop_width / page_width, 6),
+            "height": round(crop_height / page_height, 6),
+            "confidence": 0.18,
+            "detector": "page-ink-thin-large-sfx-cores-v1",
+            "source": "thin-large-sfx-core-proposal-v1",
+            "segments": [],
+            "thin_large_sfx_core_bbox_px": [left, top, right, bottom],
+            "thin_large_sfx_ocr_bbox_px": [crop_left, crop_top, crop_right, crop_bottom],
+            "thin_large_sfx_trailing_context_px": trailing_context_px,
+            "thin_large_sfx_core_count": len(group),
+        }
+        if any(
+            _region_coverage(proposal, existing) >= 0.42
+            or _region_coverage(existing, proposal) >= 0.42
+            for existing in existing_regions
+        ):
+            continue
+
+        segments: list[dict[str, object]] = []
+        for item in sorted(group, key=lambda row: int(row["left"])):
+            component_left = int(item["left"])
+            component_top = int(item["top"])
+            component_width = int(item["width_px"])
+            component_height = int(item["height_px"])
+            segments.append(
+                {
+                    "text": "",
+                    "orientation": "horizontal",
+                    "x": round(component_left / page_width, 6),
+                    "y": round(1.0 - (component_top + component_height) / page_height, 6),
+                    "width": round(component_width / page_width, 6),
+                    "height": round(component_height / page_height, 6),
+                    "source": "page-ink-thin-large-sfx-core-v1",
+                }
+            )
+        proposal["segments"] = segments
+        proposals.append(proposal)
+
+    proposals.sort(key=lambda row: (-_number(row.get("y")), _number(row.get("x"))))
+    return proposals[:4]
+
+
+def _thin_large_sfx_original_crop(
+    image: Image.Image,
+    proposal: dict[str, object],
+) -> Image.Image | None:
+    bbox = proposal.get("thin_large_sfx_ocr_bbox_px")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    try:
+        left, top, right, bottom = [int(value) for value in bbox]
+    except (TypeError, ValueError):
+        return None
+    left = max(0, min(image.width, left))
+    right = max(0, min(image.width, right))
+    top = max(0, min(image.height, top))
+    bottom = max(0, min(image.height, bottom))
+    if right - left < 24 or bottom - top < 24:
+        return None
+    return image.crop((left, top, right, bottom)).convert("RGB")
+
+def _large_sfx_candidate_surface(value: object) -> str:
+    surface = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")).strip())
+    if not (2 <= len(surface) <= 6):
+        return ""
+    kana = 0
+    katakana = 0
+    allowed = _LARGE_SFX_EXTRA_CHARACTERS | {"、", "，", "・", "…"}
+    for character in surface:
+        if "\u3040" <= character <= "\u30ff":
+            kana += 1
+            if "\u30a0" <= character <= "\u30ff":
+                katakana += 1
+            continue
+        if character in allowed:
+            continue
+        return ""
+    if kana < 2 or katakana < 1:
+        return ""
+    return surface
+
+
+def _large_sfx_component_isolated_crop(
+    image: Image.Image,
+    proposal: dict[str, object],
+) -> Image.Image | None:
+    segments = [dict(row) for row in proposal.get("segments") or [] if isinstance(row, dict)]
+    if len(segments) < 3:
+        return None
+    page_width, page_height = image.size
+    left = min(_number(row.get("x")) for row in segments)
+    right = max(_number(row.get("x")) + _number(row.get("width")) for row in segments)
+    bottom = min(_number(row.get("y")) for row in segments)
+    top = max(_number(row.get("y")) + _number(row.get("height")) for row in segments)
+    px_left = max(0, int(math.floor(left * page_width)))
+    px_right = min(page_width, int(math.ceil(right * page_width)))
+    px_top = max(0, int(math.floor((1.0 - top) * page_height)))
+    px_bottom = min(page_height, int(math.ceil((1.0 - bottom) * page_height)))
+    if px_right - px_left < 24 or px_bottom - px_top < 24:
+        return None
+    canvas = Image.new("RGB", (px_right - px_left, px_bottom - px_top), "white")
+    for segment in segments:
+        sx1 = max(0, int(math.floor(_number(segment.get("x")) * page_width)))
+        sx2 = min(page_width, int(math.ceil((_number(segment.get("x")) + _number(segment.get("width"))) * page_width)))
+        sy1 = max(0, int(math.floor((1.0 - _number(segment.get("y")) - _number(segment.get("height"))) * page_height)))
+        sy2 = min(page_height, int(math.ceil((1.0 - _number(segment.get("y"))) * page_height)))
+        if sx2 <= sx1 or sy2 <= sy1:
+            continue
+        patch = image.crop((sx1, sy1, sx2, sy2)).convert("L")
+        try:
+            binary = patch.point(lambda value: 0 if int(value) <= 128 else 255).convert("RGB")
+            try:
+                canvas.paste(binary, (sx1 - px_left, sy1 - px_top))
+            finally:
+                binary.close()
+        finally:
+            patch.close()
+    return canvas
+
+
+
+def _large_sfx_majority_consensus(
+    model: object,
+    isolated: Image.Image,
+) -> tuple[str, list[str], int]:
+    outputs: list[str] = []
+
+    def recognize(view: Image.Image) -> None:
+        outputs.append(re.sub(r"\s+", "", str(model(view) or "").strip()))  # type: ignore[operator]
+
+    recognize(isolated)
+    gray = isolated.convert("L")
+    try:
+        auto = ImageOps.autocontrast(gray).convert("RGB")
+        try:
+            recognize(auto)
+        finally:
+            auto.close()
+    finally:
+        gray.close()
+    for ratio in (0.05, 0.12):
+        border = max(3, int(round(isolated.height * ratio)))
+        padded = ImageOps.expand(isolated, border=border, fill="white")
+        try:
+            recognize(padded)
+        finally:
+            padded.close()
+    target_height = max(220, isolated.height * 2)
+    scale = target_height / max(1, isolated.height)
+    resized = isolated.resize(
+        (max(1, int(round(isolated.width * scale))), target_height),
+        Image.Resampling.LANCZOS,
+    )
+    try:
+        recognize(resized)
+    finally:
+        resized.close()
+
+    votes: dict[str, int] = {}
+    normalized: list[str] = []
+    for output in outputs:
+        candidate = _large_sfx_candidate_surface(output)
+        normalized.append(candidate)
+        if candidate:
+            votes[candidate] = votes.get(candidate, 0) + 1
+    if not votes:
+        return "", outputs, 0
+    winner, count = max(votes.items(), key=lambda item: item[1])
+    if count < 4:
+        return "", outputs, count
+    return winner, outputs, count
+
+
+def _recognize_thin_large_sfx_core_proposal(
+    model: object,
+    image: Image.Image,
+    proposal: dict[str, object],
+) -> dict[str, object] | None:
+    crop = _thin_large_sfx_original_crop(image, proposal)
+    if crop is None:
+        return None
+    try:
+        try:
+            candidate, retry_texts, vote_count = _large_sfx_majority_consensus(model, crop)
+        except Exception:
+            return None
+    finally:
+        crop.close()
+    candidate = _large_sfx_candidate_surface(candidate)
+    if not candidate or vote_count < 4:
+        return None
+
+    result = dict(proposal)
+    result.update(
+        {
+            "text": candidate,
+            "raw_text": "",
+            "confidence": min(0.84, 0.42 + 0.10 * vote_count),
+            "recognizer": "manga-ocr",
+            "source": "thin-large-sfx-core-recovery-v1",
+            "recognition_selection": "thin-large-sfx-core-majority-v1",
+            "recognizer_retry": "thin-large-sfx-core-five-view-v1",
+            "thin_large_sfx_retry_texts": retry_texts,
+            "thin_large_sfx_vote_count": vote_count,
+            "selected_hypothesis_id": "manga-ocr-thin-large-sfx-core-majority-v1",
+            "hypotheses": [
+                {
+                    "id": "manga-ocr-thin-large-sfx-core-majority-v1",
+                    "text": candidate,
+                    "source": "page-ink-thin-cores+five-view-manga-ocr",
+                    "selected": True,
+                }
+            ],
+            "segments": [
+                {
+                    "text": candidate,
+                    "orientation": "horizontal",
+                    "x": _number(proposal.get("x")),
+                    "y": _number(proposal.get("y")),
+                    "width": _number(proposal.get("width")),
+                    "height": _number(proposal.get("height")),
+                    "source": "page-ink-thin-large-sfx-core-union-v1",
+                }
+            ],
+            "geometry_source": "page-ink-thin-large-sfx-core-union-v1",
+        }
+    )
+    return result
+
+def _recognize_large_stylized_sfx_proposal(
+    model: object,
+    image: Image.Image,
+    proposal: dict[str, object],
+) -> dict[str, object] | None:
+    isolated = _large_sfx_component_isolated_crop(image, proposal)
+    if isolated is None:
+        return None
+    try:
+        try:
+            candidate, retry_texts, vote_count = _large_sfx_majority_consensus(model, isolated)
+        except Exception:
+            return None
+    finally:
+        isolated.close()
+    candidate = _large_sfx_candidate_surface(candidate)
+    if not candidate or vote_count < 4:
+        return None
+    result = dict(proposal)
+    result.update(
+        {
+            "text": candidate,
+            "raw_text": "",
+            "confidence": min(0.85, 0.45 + 0.10 * vote_count),
+            "recognizer": "manga-ocr",
+            "source": "large-stylized-sfx-component-recovery-v1",
+            "recognition_selection": "large-stylized-sfx-component-majority-v1",
+            "recognizer_retry": "large-stylized-sfx-component-five-view-v1",
+            "large_component_sfx_retry_texts": retry_texts,
+            "large_component_sfx_vote_count": vote_count,
+            "selected_hypothesis_id": "manga-ocr-large-component-sfx-majority-v1",
+            "hypotheses": [
+                {
+                    "id": "manga-ocr-large-component-sfx-majority-v1",
+                    "text": candidate,
+                    "source": "page-ink-components+five-view-manga-ocr",
+                    "selected": True,
+                }
+            ],
+            "segments": [
+                {
+                    "text": candidate,
+                    "orientation": "horizontal",
+                    "x": _number(proposal.get("x")),
+                    "y": _number(proposal.get("y")),
+                    "width": _number(proposal.get("width")),
+                    "height": _number(proposal.get("height")),
+                    "source": "page-ink-large-sfx-component-union-v1",
+                }
+            ],
+            "geometry_source": "page-ink-large-sfx-component-union-v1",
+        }
+    )
+    return result
+
+def _component_sfx_current_surface(value: object) -> str:
+    surface = _normalize_line_surface(value)
+    if not (3 <= len(surface) <= 10):
+        return ""
+    japanese = 0
+    allowed = _LARGE_SFX_EXTRA_CHARACTERS | {"、", "，"}
+    for character in surface:
+        if "\u3040" <= character <= "\u30ff":
+            japanese += 1
+            continue
+        if character in allowed:
+            continue
+        return ""
+    return surface if japanese >= 3 else ""
+
+
+def _component_isolated_stylized_sfx_crop(
+    image: Image.Image,
+    piece: dict[str, object],
+) -> tuple[Image.Image, dict[str, object], list[dict[str, object]]] | None:
+    """Isolate a broad stylized SFX to physically supported large kana boxes."""
+    if str(piece.get("orientation") or "") != "horizontal":
+        return None
+    if str(piece.get("source") or "").strip():
+        return None
+    if str(piece.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return None
+    if _number(piece.get("confidence"), 1.0) > 0.50:
+        return None
+    width = _number(piece.get("width"))
+    height = _number(piece.get("height"))
+    if not (0.35 <= width <= 0.92 and 0.08 <= height <= 0.26):
+        return None
+    current = _component_sfx_current_surface(piece.get("text"))
+    if not current:
+        return None
+
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return None
+    segments: list[dict[str, object]] = []
+    for raw in piece.get("segments") or []:
+        if not isinstance(raw, dict):
+            continue
+        surface = _normalize_line_surface(raw.get("text"))
+        if not surface or _japanese_character_count(surface) <= 0:
+            continue
+        segment_height = _number(raw.get("height"))
+        segment_width = _number(raw.get("width"))
+        if segment_height < max(0.025, height * 0.45) or segment_width < 0.018:
+            continue
+        segments.append(dict(raw))
+    if not (3 <= len(segments) <= 10):
+        return None
+
+    left = min(_number(item.get("x")) for item in segments)
+    right = max(_number(item.get("x")) + _number(item.get("width")) for item in segments)
+    bottom_y = min(_number(item.get("y")) for item in segments)
+    top_y = max(_number(item.get("y")) + _number(item.get("height")) for item in segments)
+    union_width = right - left
+    union_height = top_y - bottom_y
+    if union_width < width * 0.48 or union_height < height * 0.40:
+        return None
+
+    px_left = max(0, int(math.floor(left * page_width)))
+    px_right = min(page_width, int(math.ceil(right * page_width)))
+    px_top = max(0, int(math.floor((1.0 - top_y) * page_height)))
+    px_bottom = min(page_height, int(math.ceil((1.0 - bottom_y) * page_height)))
+    if px_right - px_left < 24 or px_bottom - px_top < 16:
+        return None
+
+    isolated = Image.new("RGB", (px_right - px_left, px_bottom - px_top), "white")
+    supported_segments: list[dict[str, object]] = []
+    try:
+        for segment in segments:
+            sx1 = max(0, int(math.floor(_number(segment.get("x")) * page_width)))
+            sx2 = min(
+                page_width,
+                int(math.ceil((_number(segment.get("x")) + _number(segment.get("width"))) * page_width)),
+            )
+            sy1 = max(
+                0,
+                int(
+                    math.floor(
+                        (1.0 - _number(segment.get("y")) - _number(segment.get("height")))
+                        * page_height
+                    )
+                ),
+            )
+            sy2 = min(page_height, int(math.ceil((1.0 - _number(segment.get("y"))) * page_height)))
+            if sx2 - sx1 < 3 or sy2 - sy1 < 3:
+                continue
+            patch = image.crop((sx1, sy1, sx2, sy2)).convert("L")
+            try:
+                pixels = [int(value) for value in patch.getdata()]
+                if not pixels:
+                    continue
+                dark = sum(value <= 210 for value in pixels)
+                min_dark = max(12, int(len(pixels) * 0.003))
+                if dark < min_dark or dark > int(len(pixels) * 0.88):
+                    continue
+                binary = patch.point(lambda value: 0 if int(value) <= 210 else 255).convert("RGB")
+                try:
+                    isolated.paste(binary, (sx1 - px_left, sy1 - px_top))
+                finally:
+                    binary.close()
+                supported_segments.append(dict(segment))
+            finally:
+                patch.close()
+        if len(supported_segments) < 3 or len(supported_segments) < math.ceil(len(segments) * 0.75):
+            isolated.close()
+            return None
+
+        # Large stylized SFX are thick. A small morphological opening removes
+        # thin panel/clothing strokes that happen to cross the Vision glyph
+        # rectangles without fabricating any new ink.
+        gray = isolated.convert("L")
+        try:
+            eroded = gray.filter(ImageFilter.MaxFilter(5))
+            try:
+                opened_gray = eroded.filter(ImageFilter.MinFilter(5))
+            finally:
+                eroded.close()
+            try:
+                opened = opened_gray.convert("RGB")
+            finally:
+                opened_gray.close()
+        finally:
+            gray.close()
+        isolated.close()
+        isolated = opened
+
+        supported_segments.sort(key=lambda item: _number(item.get("x")))
+        geometry = _geometry_union(supported_segments)
+        if geometry is None:
+            isolated.close()
+            return None
+        return isolated, geometry, supported_segments
+    except Exception:
+        isolated.close()
+        return None
+
+
+def _component_sfx_majority_consensus(
+    model: object,
+    isolated: Image.Image,
+) -> tuple[str, list[str], int]:
+    outputs: list[str] = []
+
+    def recognize(view: Image.Image) -> None:
+        outputs.append(re.sub(r"\s+", "", str(model(view) or "").strip()))  # type: ignore[operator]
+
+    recognize(isolated)
+    gray = isolated.convert("L")
+    try:
+        auto = ImageOps.autocontrast(gray).convert("RGB")
+        try:
+            recognize(auto)
+        finally:
+            auto.close()
+    finally:
+        gray.close()
+
+    for ratio in (0.04, 0.10):
+        border = max(3, int(round(isolated.height * ratio)))
+        padded = ImageOps.expand(isolated, border=border, fill="white")
+        try:
+            recognize(padded)
+        finally:
+            padded.close()
+
+    target_height = max(180, isolated.height * 2)
+    scale = target_height / max(1, isolated.height)
+    resized = isolated.resize(
+        (max(1, int(round(isolated.width * scale))), target_height),
+        Image.Resampling.LANCZOS,
+    )
+    try:
+        recognize(resized)
+    finally:
+        resized.close()
+
+    votes: dict[str, int] = {}
+    for output in outputs:
+        key = _sfx_majority_vote_key(output)
+        if key:
+            votes[key] = votes.get(key, 0) + 1
+    if not votes:
+        return "", outputs, 0
+    winner_key, winner_count = max(votes.items(), key=lambda item: item[1])
+    if winner_count < 4:
+        return "", outputs, winner_count
+    winner = next(output for output in outputs if _sfx_majority_vote_key(output) == winner_key)
+    return winner, outputs, winner_count
+
+
+
+def _component_sfx_single_glyph_surface(value: object) -> str:
+    surface = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")).strip())
+    if len(surface) != 1:
+        return ""
+    character = surface[0]
+    if "\u3040" <= character <= "\u30ff":
+        return character
+    if character in _LARGE_SFX_EXTRA_CHARACTERS | {"・", "…"}:
+        return character
+    return ""
+
+
+def _component_sfx_per_glyph_consensus(
+    model: object,
+    image: Image.Image,
+    physical_segments: list[dict[str, object]],
+) -> tuple[str, list[int], list[list[str]]]:
+    page_width, page_height = image.size
+    if not (3 <= len(physical_segments) <= 8):
+        return "", [], []
+    characters: list[str] = []
+    vote_counts: list[int] = []
+    diagnostics: list[list[str]] = []
+    for segment in physical_segments:
+        left = max(0, int(math.floor(_number(segment.get("x")) * page_width)))
+        right = min(page_width, int(math.ceil((_number(segment.get("x")) + _number(segment.get("width"))) * page_width)))
+        top = max(0, int(math.floor((1.0 - _number(segment.get("y")) - _number(segment.get("height"))) * page_height)))
+        bottom = min(page_height, int(math.ceil((1.0 - _number(segment.get("y"))) * page_height)))
+        if right - left < 3 or bottom - top < 3:
+            return "", [], diagnostics
+        crop = image.crop((left, top, right, bottom)).convert("RGB")
+        outputs: list[str] = []
+        try:
+            try:
+                outputs.append(str(model(crop) or "").strip())  # type: ignore[operator]
+                gray = crop.convert("L")
+                try:
+                    auto = ImageOps.autocontrast(gray).convert("RGB")
+                    try:
+                        outputs.append(str(model(auto) or "").strip())  # type: ignore[operator]
+                    finally:
+                        auto.close()
+                finally:
+                    gray.close()
+                side = max(crop.width, crop.height)
+                square = Image.new("RGB", (side, side), "white")
+                square.paste(crop, ((side - crop.width) // 2, (side - crop.height) // 2))
+                try:
+                    border = max(3, int(round(side * 0.08)))
+                    padded = ImageOps.expand(square, border=border, fill="white")
+                    try:
+                        outputs.append(str(model(padded) or "").strip())  # type: ignore[operator]
+                    finally:
+                        padded.close()
+                finally:
+                    square.close()
+            except Exception:
+                return "", [], diagnostics
+        finally:
+            crop.close()
+        diagnostics.append(outputs)
+        votes: dict[str, int] = {}
+        for output in outputs:
+            normalized = _component_sfx_single_glyph_surface(output)
+            if normalized:
+                votes[normalized] = votes.get(normalized, 0) + 1
+        if not votes:
+            return "", [], diagnostics
+        winner, count = max(votes.items(), key=lambda item: item[1])
+        if count < 2:
+            return "", [], diagnostics
+        characters.append(winner)
+        vote_counts.append(count)
+    return "".join(characters), vote_counts, diagnostics
+
+def _repair_component_isolated_stylized_sfx(
+    model: object,
+    image: Image.Image,
+    piece: dict[str, object],
+) -> dict[str, object]:
+    prepared = _component_isolated_stylized_sfx_crop(image, piece)
+    if prepared is None:
+        return piece
+    isolated, geometry, physical_segments = prepared
+    try:
+        try:
+            candidate, retry_texts, vote_count = _component_sfx_majority_consensus(model, isolated)
+        except Exception:
+            candidate, retry_texts, vote_count = "", [], 0
+    finally:
+        isolated.close()
+
+    glyph_vote_counts: list[int] = []
+    glyph_retry_texts: list[list[str]] = []
+    selection = "component-isolated-stylized-sfx-majority-v1"
+    hypothesis_id = "manga-ocr-component-sfx-majority-v1"
+    hypothesis_source = "component-isolated-five-view-majority-manga-ocr"
+    recognizer_retry = "component-isolated-stylized-sfx-five-view-v1"
+    if not candidate:
+        candidate, glyph_vote_counts, glyph_retry_texts = _component_sfx_per_glyph_consensus(
+            model, image, physical_segments
+        )
+        if not candidate:
+            return piece
+        vote_count = min(glyph_vote_counts) if glyph_vote_counts else 0
+        selection = "component-isolated-stylized-sfx-glyph-consensus-v2"
+        hypothesis_id = "manga-ocr-component-sfx-glyph-consensus-v2"
+        hypothesis_source = "physical-glyph-three-view-majority-manga-ocr"
+        recognizer_retry = "component-isolated-stylized-sfx-per-glyph-v2"
+
+    current = _component_sfx_current_surface(piece.get("text"))
+    if not current:
+        return piece
+    current_vote = _sfx_majority_vote_key(current)
+    if current_vote and _sfx_majority_vote_key(candidate) == current_vote:
+        return piece
+    current_kana = "".join(character for character in current if "\u3040" <= character <= "\u30ff")
+    candidate_kana = "".join(character for character in candidate if "\u3040" <= character <= "\u30ff")
+    if not current_kana or not candidate_kana:
+        return piece
+    if not (0.55 <= len(candidate_kana) / len(current_kana) <= 1.60):
+        return piece
+    if difflib.SequenceMatcher(None, current_kana, candidate_kana).ratio() < 0.35:
+        return piece
+
+    candidate_characters = list(re.sub(r"\s+", "", candidate))
+    if len(candidate_characters) != len(physical_segments):
+        return piece
+    recovered_segments: list[dict[str, object]] = []
+    for segment, character in zip(physical_segments, candidate_characters):
+        recovered = dict(segment)
+        recovered["text"] = character
+        recovered["recognition_correction"] = selection
+        recovered_segments.append(recovered)
+    result = dict(piece)
+    result.update(
+        {
+            "x": _number(geometry.get("x")),
+            "y": _number(geometry.get("y")),
+            "width": _number(geometry.get("width")),
+            "height": _number(geometry.get("height")),
+            "text": candidate,
+            "source": "component-isolated-stylized-sfx-recovery-v2",
+            "segments": recovered_segments,
+            "geometry_source": selection,
+            "recognition_selection": selection,
+            "recognizer_retry": recognizer_retry,
+            "component_sfx_retry_texts": retry_texts,
+            "component_sfx_vote_count": vote_count,
+            "component_sfx_component_count": len(physical_segments),
+        }
+    )
+    if glyph_vote_counts:
+        result["component_sfx_glyph_vote_counts"] = glyph_vote_counts
+        result["component_sfx_glyph_retry_texts"] = glyph_retry_texts
+    result["hypotheses"] = _selected_hypotheses_with_candidate(
+        piece,
+        hypothesis_id=hypothesis_id,
+        text=candidate,
+        source=hypothesis_source,
+    )
+    result["selected_hypothesis_id"] = hypothesis_id
+    return result
+
 def _observed_segment_surface(item: dict[str, object]) -> str:
     """Return the non-empty observed segment stream regardless of Vision source.
 
@@ -4063,6 +7330,171 @@ def _observed_segment_surface(item: dict[str, object]) -> str:
         if value:
             parts.append(value)
     return _normalize_line_surface("".join(parts))
+
+
+def _detector_duplicate_overclaim_conflicts_with_observed_geometry(
+    item: dict[str, object], manga_text: str
+) -> bool:
+    """Reject a low-confidence detector reading that exactly doubles consensus text.
+
+    This is intentionally narrow: MangaOCR and the observed Vision segment labels
+    must agree on the shorter Japanese surface, those segments must span nearly the
+    whole detector region, and the detector raw text must be exactly two copies of
+    that shorter surface.  High-confidence detector readings are left untouched.
+    """
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.65:
+        return False
+
+    normalized_raw = _normalize_line_surface(item.get("raw_text"))
+    normalized_manga = _normalize_line_surface(manga_text)
+    if (
+        len(_study_surface_characters(normalized_manga)) < 2
+        or _japanese_character_count(normalized_manga) < 2
+        or normalized_raw != normalized_manga + normalized_manga
+    ):
+        return False
+    if _observed_segment_surface(item) != normalized_manga:
+        return False
+
+    segments = [
+        segment
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict) and _normalize_line_surface(segment.get("text"))
+    ]
+    if not segments or any(
+        not str(segment.get("source") or "").startswith("vision-accurate-range-v2")
+        for segment in segments
+    ):
+        return False
+
+    region_x = _number(item.get("x"))
+    region_width = _number(item.get("width"))
+    if region_width <= 0:
+        return False
+    left = min(_number(segment.get("x")) for segment in segments)
+    right = max(
+        _number(segment.get("x")) + _number(segment.get("width"))
+        for segment in segments
+    )
+    coverage = max(0.0, right - left) / region_width
+    edge_slack = region_width * 0.08
+    return (
+        coverage >= 0.88
+        and left <= region_x + edge_slack
+        and right >= region_x + region_width - edge_slack
+    )
+
+
+def _repair_detector_duplicate_overclaim_after_geometry(
+    piece: dict[str, object],
+) -> dict[str, object]:
+    """Re-evaluate detector duplicate overclaim after final glyph geometry exists.
+
+    The early detector-vs-MangaOCR decision runs before several horizontal
+    geometry repairs. Keep that decision cheap, then revisit only detector
+    selections once final observed segment boxes can prove that the shorter
+    MangaOCR surface occupies the whole region.
+    """
+    if str(piece.get("selected_hypothesis_id") or "") != "detector-recognition":
+        return piece
+
+    hypotheses = [
+        dict(item)
+        for item in piece.get("hypotheses") or []
+        if isinstance(item, dict)
+    ]
+    manga_text = ""
+    for hypothesis in hypotheses:
+        if str(hypothesis.get("id") or "") == "manga-ocr":
+            manga_text = str(hypothesis.get("text") or "").strip()
+            break
+    if not manga_text:
+        return piece
+    if not _detector_duplicate_overclaim_conflicts_with_observed_geometry(
+        piece, manga_text
+    ):
+        return piece
+
+    result = dict(piece)
+    result["text"] = manga_text
+    result["selected_hypothesis_id"] = "manga-ocr"
+    result["recognition_selection"] = "detector-duplicate-consensus-v2"
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = str(hypothesis.get("id") or "") == "manga-ocr"
+    result["hypotheses"] = hypotheses
+    return result
+
+
+_DOT_PREFIX_CHARS = frozenset({".", "．", "・", "…", "⋯", "‥"})
+
+
+def _repair_horizontal_punctuation_crop_leak(
+    piece: dict[str, object],
+) -> dict[str, object]:
+    """Trim Japanese text stolen from a neighbour into a tiny punctuation crop."""
+    if str(piece.get("orientation") or "") != "horizontal":
+        return piece
+    if str(piece.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return piece
+    if _number(piece.get("confidence")) < 0.85:
+        return piece
+    if _number(piece.get("width")) > 0.08 or _number(piece.get("height")) > 0.07:
+        return piece
+
+    raw = _normalize_line_surface(piece.get("raw_text"))
+    observed = _observed_segment_surface(piece)
+    if _japanese_character_count(raw) or _japanese_character_count(observed):
+        return piece
+    segments = [
+        item for item in piece.get("segments") or [] if isinstance(item, dict)
+    ]
+    if not 1 <= len(segments) <= 3:
+        return piece
+
+    target = str(piece.get("text") or "").strip()
+    prefix_chars: list[str] = []
+    for character in target:
+        if character in _DOT_PREFIX_CHARS:
+            prefix_chars.append(character)
+            continue
+        break
+    if len(prefix_chars) < 2:
+        return piece
+    prefix = "".join(prefix_chars)
+    suffix = target[len(prefix):]
+    if _japanese_character_count(suffix) < 2:
+        return piece
+    if len(_study_surface_characters(suffix)) <= len(segments):
+        return piece
+
+    hypotheses = [
+        dict(item)
+        for item in piece.get("hypotheses") or []
+        if isinstance(item, dict)
+    ]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-punctuation-prefix",
+            "text": prefix,
+            "source": "manga-ocr",
+            "selected": True,
+        }
+    )
+
+    result = dict(piece)
+    result["text"] = prefix
+    result["selected_hypothesis_id"] = "manga-ocr-punctuation-prefix"
+    result["recognition_selection"] = "horizontal-punctuation-crop-leak-trim-v1"
+    result["hypotheses"] = hypotheses
+    result["punctuation_crop_leak_trim"] = {
+        "source": "geometry-bounded-mangaocr-prefix-v1",
+        "removed_suffix": suffix,
+    }
+    return result
 
 
 def _prefer_detector_recognition(item: dict[str, object], manga_text: str) -> bool:
@@ -4087,6 +7519,9 @@ def _prefer_detector_recognition(item: dict[str, object], manga_text: str) -> bo
     observed_surface = _observed_segment_surface(item)
     normalized_raw = _normalize_line_surface(raw)
     normalized_manga = _normalize_line_surface(manga_text)
+
+    if _detector_duplicate_overclaim_conflicts_with_observed_geometry(item, manga_text):
+        return False
 
     if orientation == "vertical" and observed_surface:
         raw_segment_similarity = difflib.SequenceMatcher(
@@ -4988,7 +8423,7 @@ def _recognize_dark_column_surfaces(
         try:
             gray = crop.convert("L").resize((12, 24), Image.Resampling.BOX)
             try:
-                mean = sum(int(value) for value in gray.getdata()) / (12 * 24)
+                mean = sum(int(value) for value in gray.tobytes()) / (12 * 24)
             finally:
                 gray.close()
             square_crop = _square_pad_dark_column_crop(crop)
@@ -5631,6 +9066,7 @@ def _infer_vertical_character_segments(
         return distance, -ink_total
 
     selected = min(clusters, key=cluster_score)
+    selected_cluster_index = clusters.index(selected)
     band_scores = [
         float(sum(row_counts[start : end + 1]))
         for start, end in selected
@@ -5642,6 +9078,36 @@ def _infer_vertical_character_segments(
     ]
     if not selected:
         return []
+
+    # A thin Vision rectangle is meant to seed one vertical lane.  Small kana
+    # or punctuation can sit just beyond the detector-anchored row cluster,
+    # leaving the old grid allocator with too few rows and forcing it to invent
+    # a second text column.  Join exactly one immediately-adjacent cluster only
+    # when doing so explains the requested character count as a single lane.
+    # This is deliberately limited to expanded rectangles and an exact band
+    # count; ambiguous/multi-column geometry keeps the old behavior.
+    if (
+        str(region.get("source") or "") == "expanded-vision-rectangle"
+        and len(selected) < len(compact)
+    ):
+        continuation_gap = max(gap_limit + 2, min(12, int(round(median_height * 0.60))))
+        continuations: list[list[tuple[int, int]]] = []
+        for neighbor_index in (selected_cluster_index - 1, selected_cluster_index + 1):
+            if not (0 <= neighbor_index < len(clusters)):
+                continue
+            neighbor = clusters[neighbor_index]
+            if len(selected) + len(neighbor) != len(compact):
+                continue
+            if neighbor_index < selected_cluster_index:
+                gap = selected[0][0] - neighbor[-1][1] - 1
+                combined = [*neighbor, *selected]
+            else:
+                gap = neighbor[0][0] - selected[-1][1] - 1
+                combined = [*selected, *neighbor]
+            if 0 <= gap <= continuation_gap:
+                continuations.append(combined)
+        if len(continuations) == 1:
+            selected = continuations[0]
 
     rows_per_column = max(1, min(len(compact), len(selected)))
     y0, y1 = selected[0][0], selected[-1][1]
@@ -5714,6 +9180,163 @@ def _infer_vertical_character_segments(
         )
     return segments if len(segments) >= max(2, len(compact) // 2) else []
 
+
+
+def _segments_span_multiple_vertical_columns(segments: list[dict[str, object]]) -> bool:
+    if len(segments) < 2:
+        return False
+    centers = [
+        _number(segment.get("x")) + _number(segment.get("width")) / 2.0
+        for segment in segments
+    ]
+    widths = sorted(
+        _number(segment.get("width"))
+        for segment in segments
+        if _number(segment.get("width")) > 0.0
+    )
+    if not widths:
+        return False
+    median_width = widths[len(widths) // 2]
+    return max(centers) - min(centers) >= max(0.004, median_width * 0.72)
+
+
+def _single_deletion_surface(shorter: str, longer: str) -> bool:
+    if len(longer) != len(shorter) + 1:
+        return False
+    return any(longer[:index] + longer[index + 1 :] == shorter for index in range(len(longer)))
+
+
+def _retry_expanded_rectangle_single_deletion_overclaim(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+    manga_text: str,
+) -> tuple[str, list[dict[str, object]]] | None:
+    """Retry a p32-like expanded rectangle on its observed one-lane ink.
+
+    Expanded rectangles can include nearby panel art.  When the full crop OCR
+    has exactly one extra character, the synthetic allocator may expose the
+    problem by needing two columns even though deleting one character lets the
+    detector-anchored ink plus one nearby continuation form a single lane.
+    Re-OCR only that tight observed lane and accept only an exact one-character
+    deletion of the original surface.
+    """
+    if str(item.get("source") or "") != "expanded-vision-rectangle":
+        return None
+    if str(item.get("orientation") or "") != "vertical":
+        return None
+    if _number(item.get("confidence"), 1.0) > 0.35:
+        return None
+    if _compact_surface(item.get("raw_text")):
+        return None
+
+    original_surface = _compact_surface(manga_text)
+    original = unicodedata.normalize("NFKC", original_surface)
+    if not (4 <= len(original) <= 10):
+        return None
+    if _japanese_character_count(original) < 2:
+        return None
+
+    original_segments = _infer_vertical_character_segments(image, item, original_surface)
+    if len(original_segments) != len(original):
+        return None
+    if not original_segments or not all(
+        str(segment.get("source") or "").startswith("ink-grid-v1")
+        for segment in original_segments
+    ):
+        return None
+    if not _segments_span_multiple_vertical_columns(original_segments):
+        return None
+
+    # Character labels do not affect ink discovery.  Probe one character fewer
+    # to ask whether the same page pixels admit an exact single-lane geometry.
+    probe_text = original_surface[:-1]
+    probe_segments = _infer_vertical_character_segments(image, item, probe_text)
+    if len(probe_segments) != len(probe_text):
+        return None
+    if not probe_segments or not all(
+        str(segment.get("source") or "").startswith("ink-grid-v1")
+        for segment in probe_segments
+    ):
+        return None
+    if _segments_span_multiple_vertical_columns(probe_segments):
+        return None
+
+    geometry = _geometry_union(probe_segments)
+    if geometry is None:
+        return None
+    tight_region = dict(item)
+    tight_region.update(geometry)
+    try:
+        crop = _crop_region(image, tight_region)
+        try:
+            retry_surface = _compact_surface(model(crop))  # type: ignore[operator]
+            retry = unicodedata.normalize("NFKC", retry_surface)
+        finally:
+            crop.close()
+    except Exception:
+        return None
+
+    if not _single_deletion_surface(retry, original):
+        return None
+    retry_segments = _infer_vertical_character_segments(image, item, retry_surface)
+    if len(retry_segments) != len(retry_surface) or _segments_span_multiple_vertical_columns(retry_segments):
+        return None
+    return retry_surface, retry_segments
+
+
+def _repair_expanded_rectangle_single_deletion_overclaims_late(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Repair surviving expanded rectangles only after merge/recall is complete.
+
+    The v69 retry proved the p32 geometry, but mutating the recognition surface
+    before downstream merge/dedupe could make the only useful expanded candidate
+    disappear.  Keep the original candidate through those stages, then apply the
+    same one-character-deletion retry to the final survivor and attach the tight
+    observed one-lane geometry returned by the retry.
+    """
+    output: list[dict[str, object]] = []
+    for region in regions:
+        item = dict(region)
+        retry = _retry_expanded_rectangle_single_deletion_overclaim(
+            model, image, item, str(item.get("text") or "")
+        )
+        if retry is None:
+            output.append(item)
+            continue
+
+        retry_text, retry_segments = retry
+        retry_segments = _tighten_vertical_slot_ink_segments(image, retry_segments)
+        item["text"] = retry_text
+        item["segments"] = retry_segments
+        geometry = _geometry_union(retry_segments)
+        if geometry is not None:
+            item.update(geometry)
+        item["geometry_source"] = str(
+            retry_segments[0].get("source") if retry_segments else "ink-grid-v1"
+        )
+        item["recognizer_retry"] = "expanded-rectangle-tight-lane-v2-late"
+        item["recognition_selection"] = "expanded-rectangle-single-deletion-v2-late"
+
+        hypotheses = item.get("hypotheses")
+        if isinstance(hypotheses, list):
+            for hypothesis in hypotheses:
+                if isinstance(hypothesis, dict):
+                    hypothesis["selected"] = False
+            hypotheses.append(
+                {
+                    "id": "manga-ocr-expanded-tight-lane-v2-late",
+                    "text": retry_text,
+                    "source": "manga-ocr",
+                    "selected": True,
+                }
+            )
+        item["selected_hypothesis_id"] = "manga-ocr-expanded-tight-lane-v2-late"
+        output.append(item)
+    return output
 
 
 def _ocr_crop_padding(
@@ -5855,7 +9478,7 @@ def _tall_dense_merged_layout_candidate(item: dict[str, object]) -> bool:
         and coverage >= 0.85
         and 0.20 <= black_ratio <= 0.50
         and white_ratio >= 0.40
-        and midtone_ratio <= 0.15
+        and midtone_ratio <= 0.156
     )
 
 
@@ -5867,24 +9490,36 @@ def _record_tall_merged_ocr_consensus(
     """Authorize merged-lane geometry only after two local OCR views agree.
 
     The structural heuristic alone is deliberately insufficient: dense artwork
-    can also be one tall blob. The tight crop and square-padded crop must return
-    exactly the same usable Japanese surface before component-count geometry is
-    relaxed for this one proposal.
+    can also be one tall blob. The tight crop and square-padded crop must agree
+    on the complete Japanese core; only a trailing punctuation run may differ
+    before component-count geometry is relaxed for this one proposal.
     """
     if not _tall_dense_merged_layout_candidate(item):
         return False
     direct = _compact_surface(direct_text)
     square = _compact_surface(square_text)
-    if not direct or direct != square:
+    if not direct or not square:
         return False
-    if not _layout_text_usable(direct):
+    punctuation = "!！?？。…‥〜～・、,．."
+    direct_core = direct.rstrip(punctuation)
+    square_core = square.rstrip(punctuation)
+    if not direct_core or direct_core != square_core:
         return False
-    if not _layout_context_candidate_plausible(item, direct):
+    # Only a trailing punctuation run may differ.  Internal punctuation or any
+    # semantic-core mismatch still rejects the merged-lane recovery.
+    if not (direct == direct_core or direct.startswith(direct_core)):
+        return False
+    if not (square == square_core or square.startswith(square_core)):
+        return False
+    consensus_text = direct if len(direct) <= len(square) else square
+    if not _layout_text_usable(consensus_text):
+        return False
+    if not _layout_context_candidate_plausible(item, consensus_text):
         return False
     provenance = dict(item.get("provenance") or {})
     provenance["tall_merged_ocr_consensus"] = True
-    provenance["tall_merged_ocr_consensus_kind"] = "direct+square-v1"
-    provenance["tall_merged_ocr_consensus_text"] = direct
+    provenance["tall_merged_ocr_consensus_kind"] = "direct+square-trailing-punctuation-v2"
+    provenance["tall_merged_ocr_consensus_text"] = consensus_text
     item["provenance"] = provenance
     return True
 
@@ -6149,6 +9784,256 @@ def _vertical_dense_span_is_crossing_rule(
     return span_width >= max(lane_width * 1.22, (scan_right - scan_left) * 1.04)
 
 
+def _nearby_horizontal_panel_rule(
+    image: Image.Image,
+    *,
+    scan_left: int,
+    scan_right: int,
+    current_bottom: int,
+    lane_width: int,
+    threshold: int = 165,
+) -> bool:
+    """Return true when a long panel/frame rule sits just above the lane end.
+
+    Expanded Vision rectangles can already overlap a panel separator by a few
+    pixels.  In that case the ordinary trailing-gap scan starts below the rule
+    and can attach text/art from the next panel.  Look for a long horizontal
+    dark run intersecting the lane immediately before ``current_bottom``.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0 or lane_width <= 0:
+        return False
+    lookback = max(12, min(32, int(round(lane_width * 0.8))))
+    top = max(0, current_bottom - lookback)
+    bottom = min(page_height, current_bottom + 2)
+    if bottom <= top:
+        return False
+    crop = image.crop((0, top, page_width, bottom)).convert("L")
+    try:
+        pixels = list(crop.getdata())
+        width, height = crop.size
+    finally:
+        crop.close()
+    minimum_span = max(
+        int(round(page_width * 0.20)),
+        int(round(lane_width * 4.0)),
+    )
+    for row in range(height):
+        row_pixels = pixels[row * width : (row + 1) * width]
+        active = [int(value) <= threshold for value in row_pixels]
+        for start, end in _contiguous_spans(active):
+            if end < scan_left or start >= scan_right:
+                continue
+            if end - start + 1 >= minimum_span:
+                return True
+    return False
+
+
+def _vertical_single_leading_glyph_geometry(
+    image: Image.Image,
+    region: dict[str, object],
+) -> dict[str, object] | None:
+    """Recover exactly one glyph-sized ink span immediately above a vertical lane.
+
+    The ordinary leading-ink recovery intentionally walks an entire contiguous
+    same-column run.  That is correct when the detector dropped a real prefix,
+    but it is too broad when a detector begins at the second glyph of a longer
+    column: the walk can absorb several already-separate words.  This helper is
+    the bounded counterpart: it inspects only the nearest physical span above
+    the detector top and extends by that one span when it is glyph-sized,
+    centered on the same lane and separated by only a small inter-glyph gap.
+    """
+    if str(region.get("orientation") or "") != "vertical":
+        return None
+    if str(region.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return None
+    if str(region.get("detector") or "") != _LAYOUT_DETECTOR:
+        return None
+
+    provenance = region.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    if not bool(provenance.get("single_merged_component")):
+        return None
+    component_count = int(_number(provenance.get("component_count"), 0.0))
+    component_coverage = _number(provenance.get("component_coverage"), 0.0)
+    if not (1 <= component_count <= 2) or component_coverage < 0.90:
+        return None
+
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return None
+    x = max(0.0, min(1.0, _number(region.get("x"))))
+    y = max(0.0, min(1.0, _number(region.get("y"))))
+    width = max(0.0, min(1.0 - x, _number(region.get("width"))))
+    height = max(0.0, min(1.0 - y, _number(region.get("height"))))
+    left = max(0, min(page_width - 1, round(x * page_width)))
+    right = max(left + 1, min(page_width, round((x + width) * page_width)))
+    current_top = max(0, min(page_height - 1, round((1.0 - y - height) * page_height)))
+    lane_width = right - left
+    lane_height = max(1, round(height * page_height))
+    if lane_width < 8 or lane_height < 16:
+        return None
+
+    side_pad = max(2, min(5, int(round(lane_width * 0.12))))
+    scan_left = max(0, left - side_pad)
+    scan_right = min(page_width, right + side_pad)
+    max_extension = min(52, max(24, int(round(lane_width * 1.30))))
+    search_top = max(0, current_top - max_extension)
+    if current_top - search_top < 8:
+        return None
+
+    crop = image.crop((scan_left, search_top, scan_right, current_top)).convert("L")
+    try:
+        pixels = list(crop.getdata())
+        crop_width, crop_height = crop.size
+    finally:
+        crop.close()
+    if not pixels or crop_width < 4 or crop_height < 4:
+        return None
+
+    threshold = 165
+    row_counts = [
+        sum(1 for value in pixels[row * crop_width : (row + 1) * crop_width] if int(value) <= threshold)
+        for row in range(crop_height)
+    ]
+    minimum_row_ink = max(2, int(round(crop_width * 0.055)))
+    spans = _contiguous_spans([count >= minimum_row_ink for count in row_counts])
+    spans = [span for span in spans if span[1] - span[0] + 1 >= 2]
+    if not spans:
+        return None
+
+    start, end = spans[-1]
+    gap = crop_height - end - 1
+    span_height = end - start + 1
+    min_height = max(6, int(round(lane_width * 0.35)))
+    max_height = max(min_height + 1, int(round(lane_width * 1.05)))
+    max_gap = max(4, min(10, int(round(lane_width * 0.24))))
+    if gap > max_gap or not (min_height <= span_height <= max_height):
+        return None
+
+    peak_ratio = max(row_counts[start : end + 1] or [0]) / max(1.0, float(crop_width))
+    global_top = search_top + start
+    global_bottom = search_top + end + 1
+    if peak_ratio >= 0.88 and _vertical_dense_span_is_crossing_rule(
+        image,
+        scan_left=scan_left,
+        scan_right=scan_right,
+        row_top=global_top,
+        row_bottom=global_bottom,
+        lane_width=lane_width,
+    ):
+        return None
+
+    extension = current_top - global_top
+    if extension <= 0 or extension > max_extension:
+        return None
+
+    result = dict(region)
+    result["height"] = round(min(1.0 - y, height + extension / page_height), 6)
+    result_provenance = dict(provenance)
+    result_provenance["single_leading_glyph_geometry"] = {
+        "old_top_px": int(current_top),
+        "new_top_px": int(global_top),
+        "extension_px": int(extension),
+        "glyph_height_px": int(span_height),
+        "gap_px": int(gap),
+        "scan_x_px": [int(scan_left), int(scan_right)],
+    }
+    result["provenance"] = result_provenance
+    result["single_leading_glyph_geometry"] = True
+    return result
+
+
+def _accept_vertical_single_leading_glyph_text(old_text: object, candidate_text: object) -> bool:
+    old = _vertical_recovery_surface(old_text)
+    candidate = _vertical_recovery_surface(candidate_text)
+    if not old or not candidate or candidate == old:
+        return False
+
+    # A clipped first glyph can be hallucinated as an opening quote while the
+    # remainder of the line is read perfectly.  Permit only a one-position
+    # replacement where the old first codepoint is non-study punctuation, the
+    # new one is exactly one Japanese study character, and every later
+    # codepoint is identical.
+    if len(candidate) == len(old) and len(old) >= 3 and candidate[1:] == old[1:]:
+        old_head = old[0]
+        candidate_head = candidate[0]
+        if old_head in "「『【〔［〈《（(" and len(_study_surface_characters(candidate_head)) == 1:
+            return _japanese_character_count(candidate_head) == 1
+    return False
+
+
+def _recover_vertical_single_leading_glyph_context(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    extended = _vertical_single_leading_glyph_geometry(image, item)
+    if extended is None:
+        return item
+
+    old_text = str(item.get("text") or "").strip()
+    old_surface = _vertical_recovery_surface(old_text)
+    if not old_surface or old_surface[0] not in "「『【〔［〈《（(":
+        return item
+    try:
+        y_crop = _crop_region_with_extra_y(image, item, extra_y_ratio=0.020)
+        try:
+            y_text = str(model(y_crop) or "").strip()  # type: ignore[operator]
+        finally:
+            y_crop.close()
+        xy_crop = _crop_region_with_extra_context(
+            image,
+            item,
+            extra_x_ratio=min(0.012, max(0.005, _number(item.get("width")) * 0.35)),
+            extra_y_ratio=0.030,
+        )
+        try:
+            xy_text = str(model(xy_crop) or "").strip()  # type: ignore[operator]
+        finally:
+            xy_crop.close()
+    except Exception:
+        return item
+
+    if _vertical_recovery_surface(y_text) != _vertical_recovery_surface(xy_text):
+        return item
+    if not _accept_vertical_single_leading_glyph_text(old_text, y_text):
+        return item
+    if not _leading_extension_has_centered_ink(image, {
+        **extended,
+        "provenance": {
+            **dict(extended.get("provenance") or {}),
+            "leading_ink_geometry": dict((extended.get("provenance") or {}).get("single_leading_glyph_geometry") or {}),
+        },
+    }):
+        return item
+
+    result = dict(extended)
+    result["text"] = y_text
+    result["raw_text"] = y_text
+    result["recognizer_retry"] = "vertical-single-leading-glyph-v1"
+    result_provenance = dict(result.get("provenance") or {})
+    info = dict(result_provenance.get("single_leading_glyph_geometry") or {})
+    info.update({"y_context_text": y_text, "xy_context_text": xy_text})
+    result_provenance["single_leading_glyph_recovery"] = info
+    result["provenance"] = result_provenance
+    hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-single-leading-glyph",
+            "text": y_text,
+            "source": "manga-ocr-y+xy-context",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
+    result["selected_hypothesis_id"] = "manga-ocr-single-leading-glyph"
+    return result
+
+
 def _vertical_leading_ink_geometry(
     image: Image.Image,
     region: dict[str, object],
@@ -6324,6 +10209,17 @@ def _vertical_trailing_ink_geometry(
     side_pad = max(2, min(5, int(round(lane_width * 0.12))))
     scan_left = max(0, left - side_pad)
     scan_right = min(page_width, right + side_pad)
+    if (
+        str(region.get("source") or "") == "expanded-vision-rectangle"
+        and _nearby_horizontal_panel_rule(
+            image,
+            scan_left=scan_left,
+            scan_right=scan_right,
+            current_bottom=current_bottom,
+            lane_width=lane_width,
+        )
+    ):
+        return None
     max_extension = min(
         int(round(page_height * 0.12)),
         max(48, int(round(lane_height * 0.72))),
@@ -6653,6 +10549,540 @@ def _accept_vertical_trailing_context_text(old_text: object, candidate_text: obj
     return False
 
 
+def _vertical_trailing_retry_japanese_core(value: object) -> str:
+    surface = _vertical_recovery_surface(value)
+    return "".join(
+        character
+        for character in surface
+        if "\u3040" <= character <= "\u30ff"
+        or "\u3400" <= character <= "\u9fff"
+        or character in "々〆ヶー"
+    )
+
+
+def _vertical_trailing_retry_probe_geometry(
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object] | None:
+    """Probe at most three glyph pitches below the original detector tail."""
+    if not bool(item.get("trailing_ink_geometry")):
+        return None
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return None
+    if str(item.get("orientation") or "") != "vertical":
+        return None
+
+    page_width, page_height = image.size
+    provenance = item.get("provenance") or {}
+    detector_bbox = provenance.get("detector_bbox_px") if isinstance(provenance, dict) else None
+    left: int
+    top: int
+    right: int
+    detector_bottom: int
+    try:
+        raw_left, raw_top, raw_right, raw_bottom = detector_bbox  # type: ignore[misc]
+        left = max(0, min(page_width - 1, round(float(raw_left))))
+        top = max(0, min(page_height - 1, round(float(raw_top))))
+        right = max(left + 1, min(page_width, round(float(raw_right))))
+        detector_bottom = max(top + 1, min(page_height, round(float(raw_bottom))))
+    except (TypeError, ValueError):
+        x = max(0.0, min(1.0, _number(item.get("x"))))
+        y = max(0.0, min(1.0, _number(item.get("y"))))
+        width = max(0.0, min(1.0 - x, _number(item.get("width"))))
+        height = max(0.0, min(1.0 - y, _number(item.get("height"))))
+        left = max(0, min(page_width - 1, round(x * page_width)))
+        right = max(left + 1, min(page_width, round((x + width) * page_width)))
+        top = max(0, min(page_height - 1, round((1.0 - y - height) * page_height)))
+        detector_bottom = max(top + 1, min(page_height, round((1.0 - y) * page_height)))
+
+    lane_width = right - left
+    if lane_width < 8:
+        return None
+
+    max_extra = min(
+        180,
+        max(1, int(round(page_height * 0.20))),
+        max(48, int(round(lane_width * 3.25))),
+    )
+    probe_bottom = min(page_height, detector_bottom + max_extra)
+    current_y = max(0.0, min(1.0, _number(item.get("y"))))
+    current_bottom = max(top + 1, min(page_height, round((1.0 - current_y) * page_height)))
+    if probe_bottom <= current_bottom:
+        return None
+
+    result = dict(item)
+    result["x"] = round(left / page_width, 6)
+    result["width"] = round((right - left) / page_width, 6)
+    result["y"] = round(max(0.0, 1.0 - probe_bottom / page_height), 6)
+    result["height"] = round((probe_bottom - top) / page_height, 6)
+    return result
+
+
+def _vertical_segment_ink_stats(
+    image: Image.Image,
+    segment: dict[str, object],
+) -> tuple[int, int, int, int, int, float]:
+    page_width, page_height = image.size
+    x = max(0.0, min(1.0, _number(segment.get("x"))))
+    y = max(0.0, min(1.0, _number(segment.get("y"))))
+    width = max(0.0, min(1.0 - x, _number(segment.get("width"))))
+    height = max(0.0, min(1.0 - y, _number(segment.get("height"))))
+    left = max(0, min(page_width - 1, round(x * page_width)))
+    right = max(left + 1, min(page_width, round((x + width) * page_width)))
+    top = max(0, min(page_height - 1, round((1.0 - y - height) * page_height)))
+    bottom = max(top + 1, min(page_height, round((1.0 - y) * page_height)))
+    crop = image.crop((left, top, right, bottom)).convert("L")
+    try:
+        pixels = list(crop.getdata())
+    finally:
+        crop.close()
+    dark = sum(1 for value in pixels if int(value) <= 165)
+    return left, top, right, bottom, dark, dark / max(1, len(pixels))
+
+
+def _vertical_trailing_retry_suffix_segments(
+    image: Image.Image,
+    item: dict[str, object],
+    probe: dict[str, object],
+    candidate: str,
+    added_count: int,
+) -> list[dict[str, object]]:
+    if added_count <= 0:
+        return []
+    segments = _layout_line_ink_character_segments(image, probe, candidate)
+    if len(segments) != len(_compact_surface(candidate)) or len(segments) < added_count:
+        return []
+    segments = _tighten_vertical_slot_ink_segments(image, segments)
+    suffix = [dict(segment) for segment in segments[-added_count:]]
+
+    page_width, page_height = image.size
+    y = max(0.0, min(1.0, _number(item.get("y"))))
+    width = max(0.0, min(1.0, _number(item.get("width"))))
+    old_bottom = max(1, min(page_height, round((1.0 - y) * page_height)))
+    lane_width = max(1, round(width * page_width))
+
+    bounds: list[tuple[int, int]] = []
+    for segment in suffix:
+        _left, top, _right, bottom, dark, ratio = _vertical_segment_ink_stats(image, segment)
+        slot_height = bottom - top
+        if dark < 8 or ratio < 0.055:
+            return []
+        if slot_height < max(3, int(round(lane_width * 0.28))):
+            return []
+        if slot_height > max(12, int(round(lane_width * 1.85))):
+            return []
+        bounds.append((top, bottom))
+
+    # A hallucinated longer OCR string can repartition the already-observed ink
+    # into extra slots. Require the alleged suffix to begin at the physical tail
+    # of the old box and to extend meaningfully beyond it.
+    if bounds[0][0] < old_bottom - int(round(lane_width * 0.65)):
+        return []
+    if bounds[0][0] > old_bottom + int(round(lane_width * 0.65)):
+        return []
+    if bounds[-1][1] < old_bottom + int(round(lane_width * 0.45)):
+        return []
+    for (_left_top, left_bottom), (right_top, _right_bottom) in zip(bounds, bounds[1:]):
+        if right_top - left_bottom > max(6, int(round(lane_width * 0.70))):
+            return []
+    return suffix
+
+
+def _recover_vertical_trailing_ocr_retry(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Recover at most three same-lane trailing glyphs after ink geometry fired.
+
+    This is intentionally narrower than the normal layout retry path: the
+    existing text must be reproduced by both the direct and square-padded views,
+    the wider trailing-only view may only append a short Japanese suffix, and
+    every appended slot must contain real same-lane ink.
+    """
+    probe = _vertical_trailing_retry_probe_geometry(image, item)
+    if probe is None:
+        return item
+    old = _vertical_recovery_surface(item.get("text"))
+    if not old or len(old) < 2:
+        return item
+
+    direct_crop: Image.Image | None = None
+    square_crop: Image.Image | None = None
+    wider_crop: Image.Image | None = None
+    wider_square_crop: Image.Image | None = None
+    try:
+        direct_crop = _crop_region(image, item)
+        direct_text = str(model(direct_crop) or "").strip()  # type: ignore[operator]
+        square_crop = _square_pad_dark_column_crop(direct_crop)
+        square_text = str(model(square_crop) or "").strip()  # type: ignore[operator]
+        wider_crop = _crop_region(image, probe)
+        wider_text = str(model(wider_crop) or "").strip()  # type: ignore[operator]
+        wider_square_crop = _square_pad_dark_column_crop(wider_crop)
+        wider_square_text = str(model(wider_square_crop) or "").strip()  # type: ignore[operator]
+    except Exception:
+        return item
+    finally:
+        if wider_square_crop is not None:
+            wider_square_crop.close()
+        if wider_crop is not None:
+            wider_crop.close()
+        if square_crop is not None:
+            square_crop.close()
+        if direct_crop is not None:
+            direct_crop.close()
+
+    old_core = _vertical_trailing_retry_japanese_core(old)
+    direct_core = _vertical_trailing_retry_japanese_core(direct_text)
+    square_core = _vertical_trailing_retry_japanese_core(square_text)
+    if not old_core or direct_core != old_core or square_core != old_core:
+        return item
+
+    wider_core = _vertical_trailing_retry_japanese_core(wider_text)
+    wider_square_core = _vertical_trailing_retry_japanese_core(wider_square_text)
+    if not wider_core or wider_core != wider_square_core:
+        return item
+
+    candidate = _vertical_recovery_surface(wider_text)
+    if not candidate.startswith(old) or candidate == old:
+        return item
+    added = candidate[len(old) :]
+    added_chars = _study_surface_characters(added)
+    if not 1 <= len(added_chars) <= 3:
+        return item
+    if len(added_chars) != len(added):
+        return item
+    if any(
+        not (
+            "\u3040" <= character <= "\u30ff"
+            or "\u3400" <= character <= "\u9fff"
+            or character in "々〆ヶー"
+        )
+        for character in added_chars
+    ):
+        return item
+
+    suffix_segments = _vertical_trailing_retry_suffix_segments(
+        image,
+        item,
+        probe,
+        candidate,
+        len(added_chars),
+    )
+    if len(suffix_segments) != len(added_chars):
+        return item
+
+    _, page_height = image.size
+    y = max(0.0, min(1.0, _number(item.get("y"))))
+    height = max(0.0, min(1.0 - y, _number(item.get("height"))))
+    old_top = max(0, min(page_height - 1, round((1.0 - y - height) * page_height)))
+    old_bottom = max(old_top + 1, min(page_height, round((1.0 - y) * page_height)))
+    suffix_bounds = [_vertical_segment_ink_stats(image, segment) for segment in suffix_segments]
+    new_bottom = min(page_height, max(value[3] for value in suffix_bounds) + 2)
+    if new_bottom <= old_bottom:
+        return item
+
+    result = dict(item)
+    result["y"] = round(max(0.0, 1.0 - new_bottom / page_height), 6)
+    result["height"] = round((new_bottom - old_top) / page_height, 6)
+    result["text"] = candidate
+    result["raw_text"] = candidate
+    result["recognizer_retry"] = "vertical-trailing-ink-ocr-v2"
+    result["trailing_ink_ocr_retry"] = True
+    provenance = dict(result.get("provenance") or {})
+    provenance["trailing_ink_ocr_retry"] = {
+        "old_bottom_px": int(old_bottom),
+        "new_bottom_px": int(new_bottom),
+        "added_text": added,
+        "added_japanese_glyphs": len(added_chars),
+        "direct_core": direct_core,
+        "square_core": square_core,
+        "wider_text": candidate,
+        "wider_direct_core": wider_core,
+        "wider_square_core": wider_square_core,
+        "intermediate_core": old_core,
+        "suffix_slots_px": [
+            [int(value[1]), int(value[3]), int(value[4])]
+            for value in suffix_bounds
+        ],
+    }
+    result["provenance"] = provenance
+    hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-trailing-ink-ocr-v2",
+            "text": candidate,
+            "source": "manga-ocr-direct+square+trailing-context",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
+    result["selected_hypothesis_id"] = "manga-ocr-trailing-ink-ocr-v2"
+    return result
+
+
+def _recover_vertical_trailing_intermediate_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+    extended: dict[str, object],
+) -> dict[str, object]:
+    """Rebuild the first trailing stage only when direct and square agree."""
+    old = _vertical_recovery_surface(item.get("text"))
+    if not old or len(old) < 2:
+        return item
+
+    direct_crop: Image.Image | None = None
+    square_crop: Image.Image | None = None
+    try:
+        direct_crop = _crop_region(image, extended)
+        direct_text = str(model(direct_crop) or "").strip()  # type: ignore[operator]
+        square_crop = _square_pad_dark_column_crop(direct_crop)
+        square_text = str(model(square_crop) or "").strip()  # type: ignore[operator]
+    except Exception:
+        return item
+    finally:
+        if square_crop is not None:
+            square_crop.close()
+        if direct_crop is not None:
+            direct_crop.close()
+
+    direct_surface = _vertical_recovery_surface(direct_text)
+    direct_core = _vertical_trailing_retry_japanese_core(direct_text)
+    square_core = _vertical_trailing_retry_japanese_core(square_text)
+    old_core = _vertical_trailing_retry_japanese_core(old)
+    if not old_core or direct_core != square_core:
+        return item
+    if not direct_surface.startswith(old) or not _accept_vertical_trailing_context_text(old, direct_surface):
+        return item
+
+    added = direct_surface[len(old) :]
+    added_chars = _study_surface_characters(added)
+    if not 1 <= len(added_chars) <= 3 or len(added_chars) != len(added):
+        return item
+    suffix_segments = _vertical_trailing_retry_suffix_segments(
+        image, item, extended, direct_surface, len(added_chars)
+    )
+    if len(suffix_segments) != len(added_chars):
+        return item
+
+    result = dict(extended)
+    result["text"] = direct_surface
+    result["raw_text"] = direct_surface
+    result["recognizer_retry"] = "vertical-trailing-ink-consensus-v1"
+    provenance = dict(result.get("provenance") or {})
+    provenance["trailing_ink_intermediate_consensus"] = {
+        "old_core": old_core,
+        "direct_core": direct_core,
+        "square_core": square_core,
+        "added_text": added,
+        "added_japanese_glyphs": len(added_chars),
+    }
+    result["provenance"] = provenance
+    hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-trailing-ink-consensus",
+            "text": direct_surface,
+            "source": "manga-ocr-direct+square",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
+    result["selected_hypothesis_id"] = "manga-ocr-trailing-ink-consensus"
+    return result
+
+
+
+def _recover_vertical_trailing_detector_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+    extended: dict[str, object],
+) -> dict[str, object]:
+    """Bridge two ink-backed trailing stages when the first OCR stage misses.
+
+    The full detector-anchored crop must agree in direct and square-padded OCR.
+    A longer candidate is accepted only when it can be split uniquely into two
+    consecutive 1-3 glyph suffixes: the first is physically supported by the
+    normal trailing-ink extension, the second by the wider detector probe.
+    """
+    old = _vertical_recovery_surface(item.get("text"))
+    if not old or len(old) < 2:
+        return item
+    probe = _vertical_trailing_retry_probe_geometry(image, extended)
+    if probe is None:
+        return item
+
+    direct_crop: Image.Image | None = None
+    square_crop: Image.Image | None = None
+    try:
+        direct_crop = _crop_region(image, probe)
+        direct_text = str(model(direct_crop) or "").strip()  # type: ignore[operator]
+        square_crop = _square_pad_dark_column_crop(direct_crop)
+        square_text = str(model(square_crop) or "").strip()  # type: ignore[operator]
+    except Exception:
+        return item
+    finally:
+        if square_crop is not None:
+            square_crop.close()
+        if direct_crop is not None:
+            direct_crop.close()
+
+    direct_core = _vertical_trailing_retry_japanese_core(direct_text)
+    square_core = _vertical_trailing_retry_japanese_core(square_text)
+    if not direct_core or direct_core != square_core:
+        return item
+
+    candidate = _vertical_recovery_surface(direct_text)
+    if not candidate.startswith(old) or candidate == old:
+        return item
+    added = candidate[len(old) :]
+    added_chars = _study_surface_characters(added)
+    if not 2 <= len(added_chars) <= 6 or len(added_chars) != len(added):
+        return item
+    if any(
+        not (
+            "\u3040" <= character <= "\u30ff"
+            or "\u3400" <= character <= "\u9fff"
+            or character in "々〆ヶー"
+        )
+        for character in added_chars
+    ):
+        return item
+
+    page_width, page_height = image.size
+    lane_width = max(1, round(_number(item.get("width")) * page_width))
+    old_bottom = max(
+        1,
+        min(page_height, round((1.0 - _number(item.get("y"))) * page_height)),
+    )
+
+    valid_splits: list[
+        tuple[
+            int,
+            str,
+            list[dict[str, object]],
+            list[dict[str, object]],
+        ]
+    ] = []
+    for stage1_count in range(1, min(3, len(added_chars) - 1) + 1):
+        stage2_count = len(added_chars) - stage1_count
+        if not 1 <= stage2_count <= 3:
+            continue
+        stage1_added = added[:stage1_count]
+        stage1_candidate = old + stage1_added
+        stage1_segments = _vertical_trailing_retry_suffix_segments(
+            image,
+            item,
+            extended,
+            stage1_candidate,
+            stage1_count,
+        )
+        if len(stage1_segments) != stage1_count:
+            continue
+
+        stage1_bounds = [
+            _vertical_segment_ink_stats(image, segment) for segment in stage1_segments
+        ]
+        # This stricter check is only for split inference. It rejects a single
+        # stretched slot spanning two glyphs and a three-slot repartition that
+        # reaches materially back into the already recognized old surface.
+        if stage1_bounds[0][1] < old_bottom - int(round(lane_width * 0.30)):
+            continue
+        if any(
+            (value[3] - value[1]) > max(12, int(round(lane_width * 1.15)))
+            for value in stage1_bounds
+        ):
+            continue
+
+        staged = dict(extended)
+        staged["text"] = stage1_candidate
+        staged["raw_text"] = stage1_candidate
+        stage2_segments = _vertical_trailing_retry_suffix_segments(
+            image,
+            staged,
+            probe,
+            candidate,
+            stage2_count,
+        )
+        if len(stage2_segments) != stage2_count:
+            continue
+        valid_splits.append(
+            (stage1_count, stage1_candidate, stage1_segments, stage2_segments)
+        )
+
+    if len(valid_splits) != 1:
+        return item
+
+    stage1_count, stage1_candidate, stage1_segments, stage2_segments = valid_splits[0]
+    stage2_count = len(added_chars) - stage1_count
+    stage1_added = added[:stage1_count]
+    stage2_added = added[stage1_count:]
+    all_suffix_segments = [*stage1_segments, *stage2_segments]
+    suffix_bounds = [
+        _vertical_segment_ink_stats(image, segment) for segment in all_suffix_segments
+    ]
+
+    y = max(0.0, min(1.0, _number(item.get("y"))))
+    height = max(0.0, min(1.0 - y, _number(item.get("height"))))
+    old_top = max(
+        0,
+        min(page_height - 1, round((1.0 - y - height) * page_height)),
+    )
+    new_bottom = min(page_height, max(value[3] for value in suffix_bounds) + 2)
+    if new_bottom <= old_bottom:
+        return item
+
+    result = dict(extended)
+    result["y"] = round(max(0.0, 1.0 - new_bottom / page_height), 6)
+    result["height"] = round((new_bottom - old_top) / page_height, 6)
+    result["text"] = candidate
+    result["raw_text"] = candidate
+    result["recognizer_retry"] = "vertical-trailing-detector-consensus-v1"
+    result["trailing_ink_detector_consensus"] = True
+    provenance = dict(result.get("provenance") or {})
+    provenance["trailing_detector_consensus"] = {
+        "old_bottom_px": int(old_bottom),
+        "new_bottom_px": int(new_bottom),
+        "direct_core": direct_core,
+        "square_core": square_core,
+        "stage1_text": stage1_candidate,
+        "stage1_added_text": stage1_added,
+        "stage2_added_text": stage2_added,
+        "stage1_added_japanese_glyphs": int(stage1_count),
+        "stage2_added_japanese_glyphs": int(stage2_count),
+        "stage1_slots_px": [
+            [int(value[1]), int(value[3]), int(value[4])]
+            for value in suffix_bounds[:stage1_count]
+        ],
+        "stage2_slots_px": [
+            [int(value[1]), int(value[3]), int(value[4])]
+            for value in suffix_bounds[stage1_count:]
+        ],
+    }
+    result["provenance"] = provenance
+    hypotheses = [
+        dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)
+    ]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-trailing-detector-consensus",
+            "text": candidate,
+            "source": "manga-ocr-detector-direct+square+two-stage-ink",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
+    result["selected_hypothesis_id"] = "manga-ocr-trailing-detector-consensus"
+    return result
+
 def _recover_vertical_trailing_context(
     model: object,
     image: Image.Image,
@@ -6670,25 +11100,424 @@ def _recover_vertical_trailing_context(
             crop.close()
     except Exception:
         return item
-    if not _accept_vertical_trailing_context_text(old_text, candidate):
+    if _accept_vertical_trailing_context_text(old_text, candidate) and _vertical_recovery_surface(candidate) != _vertical_recovery_surface(old_text):
+        result = dict(extended)
+        result["text"] = candidate or old_text
+        result["raw_text"] = candidate or old_text
+        result["recognizer_retry"] = "vertical-trailing-ink-v1"
+        hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
+        for hypothesis in hypotheses:
+            hypothesis["selected"] = False
+        hypotheses.append(
+            {
+                "id": "manga-ocr-trailing-ink",
+                "text": candidate or old_text,
+                "source": "manga-ocr",
+                "selected": True,
+            }
+        )
+        result["hypotheses"] = hypotheses
+        result["selected_hypothesis_id"] = "manga-ocr-trailing-ink"
+    else:
+        result = _recover_vertical_trailing_intermediate_consensus(model, image, item, extended)
+        if result is item:
+            return _recover_vertical_trailing_detector_consensus(
+                model, image, item, extended
+            )
+    return _recover_vertical_trailing_ocr_retry(model, image, result)
+
+
+def _recover_vertical_trailing_detector_anchor_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Retry a short merged lane from its observed detector bbox.
+
+    Later recognition-only geometry may drift away from the original detector
+    lane while the detector bbox in provenance remains authoritative.  Keep
+    this fallback deliberately narrow: only short, merged layout lines are
+    eligible, and the existing two-stage detector consensus still has to prove
+    every appended glyph with same-lane ink.
+    """
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
         return item
-    result = dict(extended)
-    result["text"] = candidate or old_text
-    result["raw_text"] = candidate or old_text
-    result["recognizer_retry"] = "vertical-trailing-ink-v1"
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    old = _vertical_recovery_surface(item.get("text"))
+    old_core = _vertical_trailing_retry_japanese_core(old)
+    if not (2 <= len(old_core) <= 3):
+        return item
+
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return item
+    if int(provenance.get("component_count") or 0) > 2:
+        return item
+    if not bool(provenance.get("single_merged_component")):
+        return item
+    detector_bbox = provenance.get("detector_bbox_px")
+
+    page_width, page_height = image.size
+    try:
+        raw_left, raw_top, raw_right, raw_bottom = detector_bbox  # type: ignore[misc]
+        left = max(0, min(page_width - 1, round(float(raw_left))))
+        top = max(0, min(page_height - 1, round(float(raw_top))))
+        right = max(left + 1, min(page_width, round(float(raw_right))))
+        bottom = max(top + 1, min(page_height, round(float(raw_bottom))))
+    except (TypeError, ValueError):
+        return item
+    if right - left < 8 or bottom - top < 16:
+        return item
+
+    anchor = dict(item)
+    anchor["x"] = round(left / page_width, 6)
+    anchor["width"] = round((right - left) / page_width, 6)
+    anchor["y"] = round(max(0.0, 1.0 - bottom / page_height), 6)
+    anchor["height"] = round((bottom - top) / page_height, 6)
+    anchor.pop("trailing_ink_geometry", None)
+    anchor_provenance = dict(provenance)
+    anchor_provenance.pop("trailing_ink_geometry", None)
+    anchor["provenance"] = anchor_provenance
+
+    extended = _vertical_trailing_ink_geometry(image, anchor)
+    if extended is None:
+        return item
+    repaired = _recover_vertical_trailing_detector_consensus(
+        model, image, anchor, extended
+    )
+    if _vertical_recovery_surface(repaired.get("text")) == old:
+        return item
+
+    result = dict(item)
+    repaired_y = max(0.0, min(1.0, _number(repaired.get("y"))))
+    repaired_height = max(0.0, min(1.0 - repaired_y, _number(repaired.get("height"))))
+    repaired_top = max(0, min(page_height - 1, round((1.0 - repaired_y - repaired_height) * page_height)))
+    repaired_bottom = max(repaired_top + 1, min(page_height, round((1.0 - repaired_y) * page_height)))
+    current_y = max(0.0, min(1.0, _number(item.get("y"))))
+    current_height = max(0.0, min(1.0 - current_y, _number(item.get("height"))))
+    current_top = max(0, min(page_height - 1, round((1.0 - current_y - current_height) * page_height)))
+    final_top = min(current_top, repaired_top)
+
+    result["x"] = repaired.get("x")
+    result["width"] = repaired.get("width")
+    result["y"] = round(max(0.0, 1.0 - repaired_bottom / page_height), 6)
+    result["height"] = round((repaired_bottom - final_top) / page_height, 6)
+    result["text"] = repaired.get("text")
+    result["raw_text"] = repaired.get("raw_text")
+    result["recognizer_retry"] = "vertical-trailing-detector-anchor-consensus-v1"
+    result["trailing_ink_detector_consensus"] = True
+    result["hypotheses"] = repaired.get("hypotheses", item.get("hypotheses", []))
+    result["selected_hypothesis_id"] = repaired.get("selected_hypothesis_id")
+
+    result_provenance = dict(provenance)
+    repaired_provenance = repaired.get("provenance")
+    if isinstance(repaired_provenance, dict):
+        result_provenance.update(repaired_provenance)
+    detector_info = result_provenance.get("trailing_detector_consensus")
+    if isinstance(detector_info, dict):
+        result_provenance["trailing_detector_anchor_consensus"] = dict(detector_info)
+    result_provenance["trailing_detector_anchor_bbox_px"] = [left, top, right, bottom]
+    result["provenance"] = result_provenance
+    return result
+
+
+def _recover_vertical_exact_detector_first_glyph_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Resolve a first-glyph OCR conflict using the physical detector bbox.
+
+    Generic OCR padding is useful for recall, but on a tight ink-component lane
+    it can add enough neighbouring texture to flip only the first glyph while
+    leaving the rest of a multi-glyph word unchanged.  Accept an exact-detector
+    reread only when two near-identical physical views agree, all later glyphs
+    match the current read, and the detector evidence is strong.
+    """
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return item
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    if str(item.get("detector") or "") != _LAYOUT_DETECTOR:
+        return item
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return item
+
+    current = _vertical_recovery_surface(item.get("text"))
+    if not (4 <= len(current) <= 10):
+        return item
+    if _japanese_character_count(current) < 4:
+        return item
+
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return item
+    component_count = int(_number(provenance.get("component_count"), 0.0))
+    coverage = _number(provenance.get("component_coverage"), 0.0)
+    confidence = _number(item.get("confidence"), 0.0)
+    if component_count < 4 or coverage < 0.78 or confidence < 0.72:
+        return item
+
+    detector_bbox = provenance.get("detector_bbox_px")
+    page_width, page_height = image.size
+    try:
+        raw_left, raw_top, raw_right, raw_bottom = detector_bbox  # type: ignore[misc]
+        left = max(0, min(page_width - 1, round(float(raw_left))))
+        top = max(0, min(page_height - 1, round(float(raw_top))))
+        right = max(left + 1, min(page_width, round(float(raw_right))))
+        bottom = max(top + 1, min(page_height, round(float(raw_bottom))))
+    except (TypeError, ValueError):
+        return item
+    if right - left < 8 or bottom - top < 24:
+        return item
+
+    outputs: list[str] = []
+    for pad in (0, 2):
+        crop = image.crop(
+            (
+                max(0, left - pad),
+                max(0, top - pad),
+                min(page_width, right + pad),
+                min(page_height, bottom + pad),
+            )
+        ).convert("RGB")
+        try:
+            outputs.append(_vertical_recovery_surface(str(model(crop) or "")))  # type: ignore[operator]
+        except Exception:
+            return item
+        finally:
+            crop.close()
+
+    if not outputs[0] or outputs[0] != outputs[1]:
+        return item
+    candidate = outputs[0]
+    if len(candidate) != len(current) or candidate == current:
+        return item
+    if candidate[1:] != current[1:] or candidate[0] == current[0]:
+        return item
+    if _japanese_character_count(candidate) != _japanese_character_count(current):
+        return item
+    if component_count < len(candidate):
+        return item
+
+    result = dict(item)
+    result["text"] = candidate
+    result["raw_text"] = candidate
+    result["recognizer_retry"] = "vertical-exact-detector-first-glyph-v1"
+    result["selected_hypothesis_id"] = "manga-ocr-exact-detector-first-glyph-v1"
+    result_provenance = dict(provenance)
+    result_provenance["exact_detector_first_glyph_consensus"] = {
+        "current": current,
+        "candidate": candidate,
+        "views": list(outputs),
+        "bbox_px": [left, top, right, bottom],
+    }
+    result["provenance"] = result_provenance
     hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
     for hypothesis in hypotheses:
         hypothesis["selected"] = False
     hypotheses.append(
         {
-            "id": "manga-ocr-trailing-ink",
-            "text": candidate or old_text,
-            "source": "manga-ocr",
+            "id": "manga-ocr-exact-detector-first-glyph-v1",
+            "text": candidate,
+            "source": "manga-ocr-exact-detector-consensus",
             "selected": True,
         }
     )
     result["hypotheses"] = hypotheses
-    result["selected_hypothesis_id"] = "manga-ocr-trailing-ink"
+    return result
+
+
+def _recover_vertical_punctuated_bracket_overread_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Recheck a punctuated ink lane when padded OCR hallucinates an opener.
+
+    This never expands text or changes its remaining characters. A bracket-like
+    first character may be replaced with observed kana only when three tight
+    detector views independently agree, with strong physical lane coverage.
+    """
+    if (
+        str(item.get("source") or "") != _LAYOUT_LINE_SOURCE
+        or str(item.get("orientation") or "") != "vertical"
+        or str(item.get("detector") or "") != _LAYOUT_DETECTOR
+        or str(item.get("selected_hypothesis_id") or "") != "manga-ocr"
+    ):
+        return item
+    current = _compact_surface(item.get("text"))
+    if not (6 <= len(current) <= 10):
+        return item
+    if not current or unicodedata.category(current[0]) != "Ps":
+        return item
+    if not re.fullmatch(r"[ぁ-ゟァ-ヿー]{2,5}[！!]{2,4}", current[1:]):
+        return item
+    prov = item.get("provenance")
+    if not isinstance(prov, dict):
+        return item
+    components = int(_number(prov.get("component_count"), 0.0))
+    coverage = _number(prov.get("component_coverage"), 0.0)
+    confidence = _number(item.get("confidence"), 0.0)
+    if components < 3 or coverage < 0.90 or confidence < 0.78:
+        return item
+    bbox = prov.get("detector_bbox_px")
+    try:
+        x1, y1, x2, y2 = (round(float(x)) for x in bbox)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return item
+    width, height = image.size
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(x1 + 1, min(width, x2))
+    y2 = max(y1 + 1, min(height, y2))
+    if x2 - x1 < 10 or y2 - y1 < 40:
+        return item
+    views: list[str] = []
+    for pad in (0, 2, 4):
+        crop = image.crop((max(0, x1 - pad), max(0, y1 - pad),
+                           min(width, x2 + pad), min(height, y2 + pad))).convert("RGB")
+        try:
+            views.append(_compact_surface(str(model(crop) or "")))  # type: ignore[operator]
+        except Exception:
+            return item
+        finally:
+            crop.close()
+    if not views[0] or len(set(views)) != 1:
+        return item
+    candidate = views[0]
+    if (
+        len(candidate) != len(current)
+        or candidate[1:] != current[1:]
+        or not re.fullmatch(r"[ぁ-ゟァ-ヿ]", candidate[0])
+    ):
+        return item
+    result = dict(item)
+    result["text"] = candidate
+    result["raw_text"] = candidate
+    result["recognizer_retry"] = "vertical-punctuated-bracket-overread-v1"
+    result["selected_hypothesis_id"] = "manga-ocr-punctuated-bracket-overread-v1"
+    repaired = dict(prov)
+    repaired["punctuated_bracket_overread_consensus"] = {
+        "old": current, "candidate": candidate, "views": views,
+        "bbox_px": [x1, y1, x2, y2],
+    }
+    result["provenance"] = repaired
+    hypotheses = [dict(h) for h in item.get("hypotheses", []) if isinstance(h, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append({"id": "manga-ocr-punctuated-bracket-overread-v1+isolated-short-bubble-consensus-v1+short-raw-trailing-misread-v1+vertical-punctuation-ink-proof-v1",
+                       "text": candidate, "source": "manga-ocr-exact-detector-consensus",
+                       "selected": True})
+    result["hypotheses"] = hypotheses
+    return result
+
+
+def _recover_vertical_exact_detector_leading_pair_consensus(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Repair exactly two leading glyphs from a tight detector-bbox consensus.
+
+    This is the bounded companion to the v96p18 first-glyph repair.  It only
+    runs on strong ink-component vertical lanes whose two exact physical views
+    agree, whose length is unchanged, and whose complete suffix from glyph 3
+    onward is identical to the current read.  The detector may be short by at
+    most one connected component because adjacent kana strokes can merge.
+    """
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return item
+    if str(item.get("orientation") or "") != "vertical":
+        return item
+    if str(item.get("detector") or "") != _LAYOUT_DETECTOR:
+        return item
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return item
+
+    current = _vertical_recovery_surface(item.get("text"))
+    if not (6 <= len(current) <= 10):
+        return item
+    if _japanese_character_count(current) < 6:
+        return item
+
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return item
+    component_count = int(_number(provenance.get("component_count"), 0.0))
+    coverage = _number(provenance.get("component_coverage"), 0.0)
+    confidence = _number(item.get("confidence"), 0.0)
+    if component_count < len(current) - 1 or coverage < 0.85 or confidence < 0.80:
+        return item
+
+    detector_bbox = provenance.get("detector_bbox_px")
+    page_width, page_height = image.size
+    try:
+        raw_left, raw_top, raw_right, raw_bottom = detector_bbox  # type: ignore[misc]
+        left = max(0, min(page_width - 1, round(float(raw_left))))
+        top = max(0, min(page_height - 1, round(float(raw_top))))
+        right = max(left + 1, min(page_width, round(float(raw_right))))
+        bottom = max(top + 1, min(page_height, round(float(raw_bottom))))
+    except (TypeError, ValueError):
+        return item
+    if right - left < 8 or bottom - top < 24:
+        return item
+
+    outputs: list[str] = []
+    for pad in (0, 2):
+        crop = image.crop(
+            (
+                max(0, left - pad),
+                max(0, top - pad),
+                min(page_width, right + pad),
+                min(page_height, bottom + pad),
+            )
+        ).convert("RGB")
+        try:
+            outputs.append(_vertical_recovery_surface(str(model(crop) or "")))  # type: ignore[operator]
+        except Exception:
+            return item
+        finally:
+            crop.close()
+
+    if not outputs[0] or outputs[0] != outputs[1]:
+        return item
+    candidate = outputs[0]
+    if len(candidate) != len(current) or candidate == current:
+        return item
+    if candidate[2:] != current[2:]:
+        return item
+    if candidate[0] == current[0] or candidate[1] == current[1]:
+        return item
+    if _japanese_character_count(candidate) != _japanese_character_count(current):
+        return item
+
+    result = dict(item)
+    result["text"] = candidate
+    result["raw_text"] = candidate
+    result["recognizer_retry"] = "vertical-exact-detector-leading-pair-v1"
+    result["selected_hypothesis_id"] = "manga-ocr-exact-detector-leading-pair-v1"
+    result_provenance = dict(provenance)
+    result_provenance["exact_detector_leading_pair_consensus"] = {
+        "current": current,
+        "candidate": candidate,
+        "views": list(outputs),
+        "bbox_px": [left, top, right, bottom],
+    }
+    result["provenance"] = result_provenance
+    hypotheses = [dict(value) for value in item.get("hypotheses", []) if isinstance(value, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append(
+        {
+            "id": "manga-ocr-exact-detector-leading-pair-v1",
+            "text": candidate,
+            "source": "manga-ocr-exact-detector-consensus",
+            "selected": True,
+        }
+    )
+    result["hypotheses"] = hypotheses
     return result
 
 
@@ -6696,7 +11525,17 @@ def _recover_vertical_edge_context(
     model: object, image: Image.Image, item: dict[str, object]
 ) -> dict[str, object]:
     result = _recover_vertical_leading_context(model, image, item)
-    return _recover_vertical_trailing_context(model, image, result)
+    if _vertical_recovery_surface(result.get("text")) == _vertical_recovery_surface(item.get("text")):
+        result = _recover_vertical_single_leading_glyph_context(model, image, result)
+    result = _recover_vertical_trailing_context(model, image, result)
+    if _vertical_recovery_surface(result.get("text")) != _vertical_recovery_surface(item.get("text")):
+        return result
+    anchored = _recover_vertical_trailing_detector_anchor_consensus(
+        model, image, item
+    )
+    if _vertical_recovery_surface(anchored.get("text")) != _vertical_recovery_surface(item.get("text")):
+        return anchored
+    return result
 
 
 def _crop_region(image: Image.Image, region: dict[str, object]) -> Image.Image:
@@ -7304,18 +12143,107 @@ def _weak_synthetic_vertical_region(item: dict[str, object]) -> bool:
 
 
 
-def _synthetic_vertical_texture_noise(image: Image.Image, item: dict[str, object]) -> bool:
-    """Reject expanded synthetic lanes that sit on artwork/panel borders.
 
-    MangaOCR can produce perfectly plausible Japanese from character art. Real
-    speech balloons in this recovery path have a very white background with
-    sparse black glyph ink; screentone/line-art hallucinations have much more
-    midtone texture. A second edge rule removes long punctuation-heavy strips
-    accidentally built from the page/panel border.
+def _dark_block_ink_grid_edge_art_noise(image: Image.Image, item: dict[str, object]) -> bool:
+    """Reject dark-block fallback text whose synthetic glyphs sit on an art edge.
+
+    A genuine black narration box surrounds its white glyphs with dark pixels.
+    Hair, clothing, and thick panel artwork can also form a coarse dense dark
+    component, but MangaOCR then tends to borrow nearby text and the inferred
+    ink-grid lands at the boundary of that dark shape.  Validate only the
+    ink-grid fallback path; measured dark-column narration remains untouched.
+    """
+    if str(item.get("source") or "") != "dark-block-proposal":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+
+    segments = [
+        segment
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict)
+        and _compact_surface(segment.get("text"))
+        and _number(segment.get("width")) > 0.0
+        and _number(segment.get("height")) > 0.0
+    ]
+    if len(segments) < 2:
+        return False
+    if any("ink-grid-v1" not in str(segment.get("source") or "") for segment in segments):
+        return False
+
+    union = _geometry_union(segments)
+    if union is None:
+        return False
+
+    page_width, page_height = image.size
+    x = max(0.0, min(1.0, _number(union.get("x"))))
+    y = max(0.0, min(1.0, _number(union.get("y"))))
+    width = max(0.0, min(1.0 - x, _number(union.get("width"))))
+    height = max(0.0, min(1.0 - y, _number(union.get("height"))))
+    if width <= 0.001 or height <= 0.001:
+        return False
+
+    left = max(0, min(page_width - 1, int(round(x * page_width))))
+    right = max(left + 1, min(page_width, int(round((x + width) * page_width))))
+    top = max(0, min(page_height - 1, int(round((1.0 - y - height) * page_height))))
+    bottom = max(top + 1, min(page_height, int(round((1.0 - y) * page_height))))
+
+    pad = max(3, int(round(min(page_width, page_height) * 0.0065)))
+    outer_left = max(0, left - pad)
+    outer_right = min(page_width, right + pad)
+    outer_top = max(0, top - pad)
+    outer_bottom = min(page_height, bottom + pad)
+    if outer_left == left and outer_right == right and outer_top == top and outer_bottom == bottom:
+        return False
+
+    crop = image.crop((outer_left, outer_top, outer_right, outer_bottom)).convert("L")
+    try:
+        pixels = list(crop.getdata())
+        crop_width, crop_height = crop.size
+    finally:
+        crop.close()
+    if not pixels or crop_width <= 0 or crop_height <= 0:
+        return False
+
+    inner_left = left - outer_left
+    inner_right = right - outer_left
+    inner_top = top - outer_top
+    inner_bottom = bottom - outer_top
+    ring: list[int] = []
+    for row in range(crop_height):
+        base = row * crop_width
+        for column in range(crop_width):
+            if inner_left <= column < inner_right and inner_top <= row < inner_bottom:
+                continue
+            ring.append(int(pixels[base + column]))
+    if len(ring) < 24:
+        return False
+
+    dark_ratio = sum(value <= 100 for value in ring) / len(ring)
+    if dark_ratio >= 0.78:
+        return False
+
+    light_ratio = sum(value >= 220 for value in ring) / len(ring)
+    item["synthetic_rejection"] = {
+        "reason": "dark-block-edge-art-v1",
+        "ring_dark_ratio": round(dark_ratio, 4),
+        "ring_light_ratio": round(light_ratio, 4),
+        "ring_pad_px": pad,
+    }
+    return True
+
+def _synthetic_vertical_texture_noise(image: Image.Image, item: dict[str, object]) -> bool:
+    """Reject synthetic recovery lanes that sit on artwork/panel borders.
+
+    Expanded rectangle/seed recovery uses page texture, while dark-block
+    ink-grid fallback uses the local background ring around inferred glyphs.
     """
     if str(item.get("orientation") or "") != "vertical":
         return False
-    if str(item.get("source") or "") not in {"expanded-vision-rectangle", "expanded-vertical-seed"}:
+    source = str(item.get("source") or "")
+    if source == "dark-block-proposal":
+        return _dark_block_ink_grid_edge_art_noise(image, item)
+    if source not in {"expanded-vision-rectangle", "expanded-vertical-seed"}:
         return False
     page_width, page_height = image.size
     x = max(0.0, min(1.0, _number(item.get("x"))))
@@ -7466,7 +12394,7 @@ def _recognize_wide_horizontal_segment(
         square = _square_pad_dark_column_crop(crop)
         gray = square.convert("L").resize((12, 12), Image.Resampling.BOX)
         try:
-            mean = sum(int(value) for value in gray.getdata()) / 144.0
+            mean = sum(int(value) for value in gray.tobytes()) / 144.0
         finally:
             gray.close()
         ocr_crop = ImageOps.invert(square) if mean < 128 else square
@@ -8077,7 +13005,7 @@ def _recognize_ruby_above_segment(
     try:
         gray = crop.convert("L")
         try:
-            values = list(gray.getdata())
+            values = list(gray.tobytes())
             if not values:
                 return ""
             ordered = sorted(int(value) for value in values)
@@ -9869,6 +14797,193 @@ def _repair_horizontal_trailing_punctuation_from_page_ink(
     return result
 
 
+_TRAILING_DOT_CHARS = frozenset({".", "．", "・"})
+
+
+def _repair_horizontal_trailing_dot_run_from_page_ink(
+    image: Image.Image,
+    piece: dict[str, object],
+) -> dict[str, object]:
+    """Replace one coarse trailing-dot Vision box with observed dot components.
+
+    MangaOCR sometimes sees a three-dot SFX tail while Accurate Vision groups
+    two dots into one box and clips the last dot at the detector edge.  Accept
+    the longer punctuation run only when the already-trusted Japanese prefix is
+    identical and the page contains exactly the requested number of compact,
+    baseline-aligned ink components after that prefix.
+    """
+    if str(piece.get("orientation") or "") != "horizontal":
+        return piece
+    if str(piece.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return piece
+
+    target = str(piece.get("text") or "").strip()
+    if not target:
+        return piece
+    split_at = len(target)
+    while split_at > 0 and target[split_at - 1] in _TRAILING_DOT_CHARS:
+        split_at -= 1
+    prefix = target[:split_at]
+    dot_run = target[split_at:]
+    if not prefix or not 2 <= len(dot_run) <= 4:
+        return piece
+    if any(character not in _TRAILING_DOT_CHARS for character in dot_run):
+        return piece
+
+    segments = [
+        dict(item)
+        for item in piece.get("segments") or []
+        if isinstance(item, dict)
+    ]
+    if len(segments) < 2:
+        return piece
+    surfaces = [str(item.get("text") or "").strip() for item in segments]
+    if any(len(surface) != 1 for surface in surfaces):
+        return piece
+    if len(prefix) >= len(segments):
+        return piece
+    prefix_segments = segments[: len(prefix)]
+    suffix_segments = segments[len(prefix):]
+    if "".join(surfaces[: len(prefix)]) != prefix:
+        return piece
+    if not suffix_segments or any(
+        str(item.get("text") or "").strip() not in _TRAILING_DOT_CHARS
+        for item in suffix_segments
+    ):
+        return piece
+    raw = str(piece.get("raw_text") or "").strip()
+    if not raw.startswith(prefix):
+        return piece
+    raw_suffix = raw[len(prefix):]
+    if not raw_suffix or any(character not in _TRAILING_DOT_CHARS for character in raw_suffix):
+        return piece
+    if any(
+        not str(item.get("source") or "").startswith("vision-accurate-range-v2")
+        for item in segments
+    ):
+        return piece
+
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return piece
+    prefix_widths = [
+        max(1.0, _number(item.get("width")) * page_width)
+        for item in prefix_segments
+    ]
+    heights = [
+        max(1.0, _number(item.get("height")) * page_height)
+        for item in segments
+    ]
+    median_width = statistics.median(prefix_widths)
+    median_height = statistics.median(heights)
+    if median_width < 4.0 or median_height < 6.0:
+        return piece
+
+    prefix_right = max(
+        (_number(item.get("x")) + _number(item.get("width"))) * page_width
+        for item in prefix_segments
+    )
+    region_right = (
+        _number(piece.get("x")) + _number(piece.get("width"))
+    ) * page_width
+    segment_right = max(
+        (_number(item.get("x")) + _number(item.get("width"))) * page_width
+        for item in segments
+    )
+    line_top = min(
+        (1.0 - _number(item.get("y")) - _number(item.get("height"))) * page_height
+        for item in segments
+    )
+    line_bottom = max(
+        (1.0 - _number(item.get("y"))) * page_height
+        for item in segments
+    )
+    left = max(0, int(math.floor(prefix_right - 1.0)))
+    right = min(
+        page_width,
+        int(
+            math.ceil(
+                max(region_right, segment_right)
+                + max(4.0, median_width * 0.20)
+            )
+        ),
+    )
+    top = max(0, int(math.floor(line_top)))
+    bottom = min(page_height, int(math.ceil(line_bottom)))
+    if right - left < 8 or bottom - top < 8:
+        return piece
+
+    crop = image.crop((left, top, right, bottom)).convert("L")
+    try:
+        binary = crop.point(lambda value: 255 if value < 160 else 0)
+        try:
+            components = _binary_components(binary)
+        finally:
+            binary.close()
+    finally:
+        crop.close()
+
+    crop_height = bottom - top
+    dot_components: list[tuple[int, int, int, int, int]] = []
+    for x, y, width, height, area in components:
+        if area < 6 or width < 2 or height < 2:
+            continue
+        center_y = y + height / 2.0
+        if center_y < crop_height * 0.45 or center_y > crop_height * 0.93:
+            continue
+        if width > max(12.0, median_width * 0.36):
+            continue
+        if height > max(14.0, median_height * 0.30):
+            continue
+        if area > max(90.0, median_width * median_height * 0.12):
+            continue
+        dot_components.append((x, y, width, height, area))
+
+    dot_components.sort(key=lambda item: item[0])
+    if len(dot_components) != len(dot_run):
+        return piece
+    centers_y = [item[1] + item[3] / 2.0 for item in dot_components]
+    if max(centers_y) - min(centers_y) > max(6.0, median_height * 0.18):
+        return piece
+    centers_x = [item[0] + item[2] / 2.0 for item in dot_components]
+    if any(b <= a for a, b in zip(centers_x, centers_x[1:])):
+        return piece
+
+    dot_segments: list[dict[str, object]] = []
+    for character, (x, y, width, height, _area) in zip(dot_run, dot_components):
+        global_left = left + x
+        global_top = top + y
+        global_bottom = global_top + height
+        dot_segments.append(
+            {
+                "text": character,
+                "orientation": "horizontal",
+                "x": global_left / page_width,
+                "y": 1.0 - (global_bottom / page_height),
+                "width": width / page_width,
+                "height": height / page_height,
+                "source": "horizontal-trailing-dot-ink-v1",
+                "recognition_correction": "horizontal-trailing-dot-ink-v1",
+            }
+        )
+
+    result = dict(piece)
+    result["segments"] = prefix_segments + dot_segments
+    geometry = _geometry_union(result["segments"])
+    if geometry is not None:
+        result.update(geometry)
+    result["geometry_source"] = (
+        str(piece.get("geometry_source") or "vision-accurate-range-v2")
+        + "+horizontal-trailing-dot-ink-v1"
+    )
+    result["trailing_dot_ink_consensus"] = {
+        "source": "observed-page-ink-v1",
+        "component_count": len(dot_components),
+        "text": dot_run,
+    }
+    return result
+
+
 def _relabel_nfkc_equivalent_segment_surfaces(
     piece: dict[str, object],
 ) -> dict[str, object]:
@@ -10159,7 +15274,7 @@ def _short_raw_empty_rectangle_art_noise(item: dict[str, object]) -> bool:
     # These candidates are only ~one small text row tall.  A genuine vertical
     # two/three-glyph lane should either be taller or have detector-backed glyph
     # geometry; without either signal we prefer to reject the art hallucination.
-    if _number(item.get("height"), 1.0) > 0.025:
+    if _number(item.get("height"), 1.0) > 0.030:
         return False
     return True
 
@@ -10168,6 +15283,1276 @@ def _suppress_short_raw_empty_rectangle_art_noise(
     regions: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     return [region for region in regions if not _short_raw_empty_rectangle_art_noise(region)]
+
+
+def _tiny_empty_horizontal_oneglyph_art_noise(item: dict[str, object]) -> bool:
+    """Reject a tiny rectangle-only one-kana hallucination with no observed glyph."""
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    detector = str(item.get("detector") or "")
+    if "vision-rectangles" not in detector:
+        return False
+    if _compact_surface(item.get("raw_text")) or _segment_surface(item):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if len(text) != 1 or not ("\u3040" <= text <= "\u30ff"):
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    return 0.0 < width <= 0.040 and 0.0 < height <= 0.030
+
+
+def _suppress_tiny_empty_horizontal_oneglyph_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _tiny_empty_horizontal_oneglyph_art_noise(region)]
+
+
+def _segment_surface(item: dict[str, object]) -> str:
+    return _compact_surface(
+        "".join(
+            str(segment.get("text") or "")
+            for segment in item.get("segments") or []
+            if isinstance(segment, dict)
+        )
+    )
+
+
+def _horizontal_ruby_echo_candidate(
+    candidate: dict[str, object],
+    regions: list[dict[str, object]],
+) -> bool:
+    """Return true for a tiny horizontal furigana echo beside vertical base kanji.
+
+    Vision sometimes exposes one kana from furigana as a standalone horizontal
+    region and MangaOCR expands that tiny crop into a plausible word.  Reject it
+    only when the observed kana box is materially smaller than nearby *kanji*
+    geometry from an accepted vertical layout lane and the boxes align on the
+    same page-ink band.  This avoids deleting real small base text such as に…
+    beside a katakana column.
+    """
+    if str(candidate.get("orientation") or "") != "horizontal":
+        return False
+    if str(candidate.get("source") or "").strip():
+        return False
+    if str(candidate.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    width = _number(candidate.get("width"))
+    height = _number(candidate.get("height"))
+    if not (0.0 < width <= 0.040 and 0.0 < height <= 0.030):
+        return False
+
+    if "repeated-kana-ink-split-v1" in str(candidate.get("geometry_source") or ""):
+        return False
+
+    raw = unicodedata.normalize("NFKC", _compact_surface(candidate.get("raw_text")))
+    text = unicodedata.normalize("NFKC", _compact_surface(candidate.get("text")))
+    segments = [
+        segment
+        for segment in candidate.get("segments") or []
+        if isinstance(segment, dict) and _compact_surface(segment.get("text"))
+    ]
+    if not segments or len(segments) > 3:
+        return False
+
+    strict_single = False
+    if len(segments) == 1 and len(raw) == 1 and "\u3040" <= raw <= "\u30ff":
+        observed = unicodedata.normalize("NFKC", _compact_surface(segments[0].get("text")))
+        strict_single = observed == raw
+
+    expanded_kana = (
+        2 <= len(text) <= 6
+        and len(text) > len(segments)
+        and all("\u3040" <= character <= "\u30ff" for character in text)
+    )
+    if not strict_single and not expanded_kana:
+        return False
+
+    for peer in regions:
+        if peer is candidate:
+            continue
+        if str(peer.get("orientation") or "") != "vertical":
+            continue
+        if str(peer.get("source") or "") != _LAYOUT_LINE_SOURCE:
+            continue
+
+        all_segments_supported = True
+        for segment in segments:
+            sx1 = _number(segment.get("x"))
+            sy1 = _number(segment.get("y"))
+            sw = _number(segment.get("width"))
+            sh = _number(segment.get("height"))
+            sx2, sy2 = sx1 + sw, sy1 + sh
+            if sw <= 0.0 or sh <= 0.0:
+                all_segments_supported = False
+                break
+
+            covered = 0.0
+            for peer_segment in peer.get("segments") or []:
+                if not isinstance(peer_segment, dict):
+                    continue
+                peer_text = _compact_surface(peer_segment.get("text"))
+                if not _is_kanji_character(peer_text):
+                    continue
+                px1 = _number(peer_segment.get("x"))
+                py1 = _number(peer_segment.get("y"))
+                pw = _number(peer_segment.get("width"))
+                ph = _number(peer_segment.get("height"))
+                if pw <= 0.0 or ph <= 0.0:
+                    continue
+                px2, py2 = px1 + pw, py1 + ph
+                horizontal_gap = max(px1 - sx2, sx1 - px2, 0.0)
+                vertical_overlap = max(0.0, min(sy2, py2) - max(sy1, py1))
+                if horizontal_gap > 0.005 or vertical_overlap <= 0.0:
+                    continue
+                if sw > pw * 0.72 or sh > ph * 1.35:
+                    continue
+                covered += vertical_overlap / sh
+            if min(1.0, covered) < 0.78:
+                all_segments_supported = False
+                break
+        if all_segments_supported:
+            return True
+    return False
+
+
+def _suppress_tiny_horizontal_ruby_echo_regions(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        region
+        for region in regions
+        if not _horizontal_ruby_echo_candidate(region, regions)
+    ]
+
+
+def _horizontal_prefix_duplicate_candidate(
+    candidate: dict[str, object],
+    regions: list[dict[str, object]],
+) -> bool:
+    """Reject a short horizontal detector echo already covered by a vertical lane."""
+    if str(candidate.get("orientation") or "") != "horizontal":
+        return False
+    if str(candidate.get("source") or "").strip():
+        return False
+    if str(candidate.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if _number(candidate.get("confidence"), 1.0) > 0.50:
+        return False
+
+    text = unicodedata.normalize("NFKC", _compact_surface(candidate.get("text")))
+    if not (2 <= len(text) <= 4):
+        return False
+
+    x1 = _number(candidate.get("x"))
+    y1 = _number(candidate.get("y"))
+    width = _number(candidate.get("width"))
+    height = _number(candidate.get("height"))
+    if width <= 0.0 or height <= 0.0 or width > 0.060 or height > 0.045:
+        return False
+    x2, y2 = x1 + width, y1 + height
+    candidate_area = width * height
+
+    for peer in regions:
+        if peer is candidate:
+            continue
+        if str(peer.get("orientation") or "") != "vertical":
+            continue
+        if str(peer.get("source") or "") != _LAYOUT_LINE_SOURCE:
+            continue
+        peer_text = unicodedata.normalize("NFKC", _compact_surface(peer.get("text")))
+        if len(peer_text) <= len(text) or not peer_text.startswith(text):
+            continue
+
+        px1 = _number(peer.get("x"))
+        py1 = _number(peer.get("y"))
+        pw = _number(peer.get("width"))
+        ph = _number(peer.get("height"))
+        px2, py2 = px1 + pw, py1 + ph
+        overlap_width = max(0.0, min(x2, px2) - max(x1, px1))
+        overlap_height = max(0.0, min(y2, py2) - max(y1, py1))
+        overlap_fraction = (overlap_width * overlap_height) / candidate_area
+        if overlap_fraction >= 0.70:
+            return True
+    return False
+
+
+def _suppress_horizontal_prefix_duplicates(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        region
+        for region in regions
+        if not _horizontal_prefix_duplicate_candidate(region, regions)
+    ]
+
+
+def _short_symbol_only_art_noise(item: dict[str, object]) -> bool:
+    """Reject a tiny symbol crop that MangaOCR turns into Japanese text."""
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.60:
+        return False
+    if _number(item.get("width")) > 0.040 or _number(item.get("height")) > 0.030:
+        return False
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    observed = unicodedata.normalize("NFKC", _segment_surface(item))
+    if not raw or raw != observed:
+        return False
+    if any(character.isalnum() or _japanese_character_count(character) for character in raw):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    return 1 <= _japanese_character_count(text) <= 4 and _japanese_character_count(text) == len(text)
+
+
+def _suppress_short_symbol_only_art_noise(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _short_symbol_only_art_noise(region)]
+
+
+def _detector_disagreement_art_noise(item: dict[str, object]) -> bool:
+    """Reject narrow horizontal art crops where two OCR surfaces disagree sharply.
+
+    These are detector-backed boxes, but the detector glyph surface and MangaOCR
+    disagree in a pattern observed on panel/roof/hair strokes rather than text.
+    Keep the rule deliberately narrow: either a low-confidence one-glyph MangaOCR
+    surface conflicts with a two-glyph detector surface, or a repeated-kana detector
+    surface is extended by one unsupported leading kana.
+    """
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    observed = unicodedata.normalize("NFKC", _segment_surface(item))
+    if not text or not raw or not observed:
+        return False
+
+    confidence = _number(item.get("confidence"), 1.0)
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+
+    raw_symbol_only = bool(raw) and not any(
+        character.isalnum() or _japanese_character_count(character)
+        for character in raw
+    )
+    observed_symbol_only = bool(observed) and not any(
+        character.isalnum() or _japanese_character_count(character)
+        for character in observed
+    )
+    symbol_surface_agreement = (
+        raw_symbol_only
+        and observed_symbol_only
+        and difflib.SequenceMatcher(a=raw, b=observed, autojunk=False).ratio() >= 0.50
+    )
+    one_glyph_conflict = (
+        confidence <= 0.30
+        and len(text) == 1
+        and _japanese_character_count(text) == 1
+        and raw != text
+        and width <= 0.090
+        and height <= 0.045
+        and (
+            (len(raw) == 2 and raw == observed)
+            or symbol_surface_agreement
+        )
+    )
+    if one_glyph_conflict:
+        return True
+
+    repeated_suffix_conflict = (
+        confidence <= 0.50
+        and len(text) == len(observed) == 4
+        and len(raw) == 3
+        and text[1:] == raw
+        and observed[1:] == raw
+        and text[0] != observed[0]
+        and len(set(raw)) == 1
+        and all("\u3040" <= character <= "\u30ff" for character in text + observed)
+        and width <= 0.120
+        and height <= 0.035
+    )
+    return repeated_suffix_conflict
+
+
+def _suppress_detector_disagreement_art_noise(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _detector_disagreement_art_noise(region)]
+
+
+def _margin_page_number_noise(item: dict[str, object]) -> bool:
+    """Reject tiny top-margin page numbers; they are navigation ink, not study text."""
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if not (1 <= len(text) <= 3) or not text.isdigit():
+        return False
+    x = _number(item.get("x"))
+    y = _number(item.get("y"))
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if width <= 0.0 or height <= 0.0:
+        return False
+    if y > 0.085 or height > 0.035 or width > 0.070:
+        return False
+    # Printed page counters live near the outer top corners, not in-panel.
+    if not (x <= 0.14 or x + width >= 0.86):
+        return False
+    detector = str(item.get("detector") or "")
+    if "vision" not in detector:
+        return False
+    observed = unicodedata.normalize("NFKC", _segment_surface(item))
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    if observed and not observed.isdigit():
+        return False
+    if raw and not raw.isdigit():
+        return False
+    return True
+
+
+def _suppress_margin_page_number_regions(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _margin_page_number_noise(region)]
+
+
+def _detector_giant_oneglyph_art_noise(item: dict[str, object]) -> bool:
+    """Reject giant detector art that collapsed to one ASCII/digit glyph.
+
+    Real vertical SFX here should not surface as a single ASCII/digit symbol with
+    a giant rectangle and no corroborating geometry.  p33's stray ``1`` is the
+    motivating case.
+    """
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "detector-recognition":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.55:
+        return False
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if not raw or raw != text or len(text) != 1 or not text.isdigit():
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if width < 0.15 or height < 0.12:
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    nonempty = [segment for segment in segments if _compact_surface(segment.get("text"))]
+    if len(nonempty) != 1:
+        return False
+    return _compact_surface(nonempty[0].get("text")) == text
+
+
+def _suppress_detector_giant_oneglyph_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _detector_giant_oneglyph_art_noise(region)]
+
+
+def _empty_vertical_rectangle_mangaocr_art_noise(item: dict[str, object]) -> bool:
+    """Reject low-confidence vertical overclaims on empty wide rectangles.
+
+    These are detector rectangles with no observed glyph geometry at all.  The
+    crop is wider than it is tall despite being labelled vertical, and MangaOCR
+    invents a short phrase from nearby art strokes (real p30/p36/p39 cases).
+    """
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    if raw:
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    if any(_compact_surface(segment.get("text")) for segment in segments):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if not (2 <= len(text) <= 4) or _japanese_character_count(text) != len(text):
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if width <= 0.0 or height <= 0.0 or height > 0.100:
+        return False
+    # The real p36 crop shifts slightly between fresh Vision runs.  Width is
+    # the stable signal for this class; do not require a brittle aspect ratio.
+    # Keeping the >=7.5% page-width floor preserves real short bubbles such as
+    # p22 はい！ and the small p27/p39 fragments.
+    if width < 0.075:
+        return False
+    detector = str(item.get("detector") or "")
+    return "vision-rectangles" in detector
+
+
+def _suppress_empty_vertical_rectangle_mangaocr_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _empty_vertical_rectangle_mangaocr_art_noise(region)]
+
+
+def _empty_horizontal_rectangle_mangaocr_art_noise(item: dict[str, object]) -> bool:
+    """Reject large empty horizontal rectangles that MangaOCR expands from art."""
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if str(item.get("orientation") or "") != "horizontal":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    if raw:
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    if any(_compact_surface(segment.get("text")) for segment in segments):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if _japanese_character_count(text) < 2:
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if width < 0.16 or height < 0.09:
+        return False
+    if width / max(height, 1e-9) < 1.4:
+        return False
+    detector = str(item.get("detector") or "")
+    return detector == "vision-rectangles-original"
+
+
+def _suppress_empty_horizontal_rectangle_mangaocr_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _empty_horizontal_rectangle_mangaocr_art_noise(region)]
+
+
+def _page_edge_synthetic_ink_grid_art_noise(item: dict[str, object]) -> bool:
+    """Reject large page-edge expanded art composed only of synthetic ink-grid cells."""
+    if str(item.get("source") or "") != "expanded-vision-rectangle":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    if _compact_surface(item.get("raw_text")):
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    y = _number(item.get("y"))
+    if width < 0.070 or height < 0.150:
+        return False
+    if not (y <= 0.002 or y + height >= 0.998):
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    nonempty = [segment for segment in segments if _compact_surface(segment.get("text"))]
+    if len(nonempty) < 2:
+        return False
+    if any("ink-grid-v1" not in str(segment.get("source") or "") for segment in nonempty):
+        return False
+    return "ink-grid-v1" in str(item.get("geometry_source") or "")
+
+
+def _suppress_page_edge_synthetic_ink_grid_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _page_edge_synthetic_ink_grid_art_noise(region)]
+
+
+def _page_edge_narrow_vertical_overread(item: dict[str, object]) -> bool:
+    """Reject OCR text invented from a physically clipped right-edge lane."""
+    if str(item.get("source") or "") != _LAYOUT_LINE_SOURCE:
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+
+    detector = str(item.get("detector") or "")
+    selected = str(item.get("selected_hypothesis_id") or "")
+    x = _number(item.get("x"))
+    width = _number(item.get("width"))
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+
+    component_count = 0
+    if detector == _LAYOUT_DETECTOR:
+        if selected != "manga-ocr-square-retry":
+            return False
+        if _compact_surface(item.get("raw_text")):
+            return False
+        if width <= 0.0 or width > 0.021 or x + width < 0.999:
+            return False
+        component_count = int(_number(provenance.get("component_count")))
+    elif detector == "manga-layout-cluster-v1":
+        if selected != "manga-ocr-layout-cluster-member-v3":
+            return False
+        if str(provenance.get("proposal_kind") or "") != "layout_context_cluster_v2":
+            return False
+        if not provenance.get("cluster_context_donor") or not provenance.get(
+            "cluster_member_consensus"
+        ):
+            return False
+        if width <= 0.0 or width > 0.035 or x + width < 0.999:
+            return False
+        if _number(item.get("height")) < 0.120:
+            return False
+
+        members = [
+            value
+            for value in provenance.get("member_boxes") or []
+            if isinstance(value, dict)
+        ]
+        if not (3 <= len(members) <= 4):
+            return False
+        edge_member = min(
+            members,
+            key=lambda value: abs(_number(value.get("x")) - x)
+            + abs(_number(value.get("width")) - width),
+        )
+        if abs(_number(edge_member.get("x")) - x) > 0.004:
+            return False
+        if abs(_number(edge_member.get("width")) - width) > 0.004:
+            return False
+        if _number(edge_member.get("component_coverage")) < 0.90:
+            return False
+        component_count = int(_number(edge_member.get("component_count")))
+    else:
+        return False
+
+    if component_count <= 0 or component_count > 2:
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    return _japanese_character_count(text) > component_count
+
+
+def _suppress_page_edge_narrow_vertical_overreads(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _page_edge_narrow_vertical_overread(region)]
+
+
+def _empty_multicolumn_sentence_art_noise(item: dict[str, object]) -> bool:
+    """Reject long invented multicolumn vertical sentences with zero geometry evidence."""
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+    if str(item.get("orientation_reason") or "") != "japanese-multicolumn-geometry":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    if _compact_surface(item.get("raw_text")):
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    if any(_compact_surface(segment.get("text")) for segment in segments):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    japanese = _japanese_character_count(text)
+    if japanese < 6 or japanese != len(text):
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if width < 0.095 or height > 0.090:
+        return False
+    detector = str(item.get("detector") or "")
+    return "vision-rectangles" in detector
+
+
+def _suppress_empty_multicolumn_sentence_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _empty_multicolumn_sentence_art_noise(region)]
+
+
+def _clipped_bottom_vertical_fragment_art_noise(item: dict[str, object]) -> bool:
+    """Reject clipped bottom-edge vertical fragments hallucinated from empty multicolumn rectangles."""
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+    if str(item.get("orientation_reason") or "") != "japanese-multicolumn-geometry":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.25:
+        return False
+    if _compact_surface(item.get("raw_text")):
+        return False
+    segments = [segment for segment in item.get("segments") or [] if isinstance(segment, dict)]
+    if any(_compact_surface(segment.get("text")) for segment in segments):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if not (2 <= len(text) <= 3):
+        return False
+    if any(character in text for character in "！!？?・．。、，…"):
+        return False
+    if not all('HIRAGANA' in unicodedata.name(ch, '') or 'KATAKANA' in unicodedata.name(ch, '') for ch in text):
+        return False
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    y = _number(item.get("y"))
+    if not (0.040 <= width <= 0.060 and 0.0 < height <= 0.040):
+        return False
+    if y + height < 0.90:
+        return False
+    detector = str(item.get("detector") or "")
+    return "vision-rectangles" in detector
+
+
+def _suppress_clipped_bottom_vertical_fragment_art(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _clipped_bottom_vertical_fragment_art_noise(region)]
+
+
+def _small_geometry_mangaocr_overclaim(item: dict[str, object]) -> bool:
+    """Reject a long MangaOCR surface that cannot fit its observed glyph geometry.
+
+    Some tiny detector crops land on one or two furigana/base glyphs while
+    MangaOCR reads neighboring main text and returns a much longer plausible
+    phrase.  Suppress only when detector/raw and observed segment surfaces agree
+    on that short physical surface, the final MangaOCR text exceeds it by at
+    least three Japanese characters, and the crop is both small and low
+    confidence.  This deliberately leaves short SFX expansions such as ビクッ
+    alone.
+    """
+    if str(item.get("source") or "").strip():
+        return False
+    if str(item.get("selected_hypothesis_id") or "") != "manga-ocr":
+        return False
+    if _number(item.get("confidence"), 1.0) > 0.50:
+        return False
+
+    width = _number(item.get("width"))
+    height = _number(item.get("height"))
+    if not (0.0 < width <= 0.130 and 0.0 < height <= 0.060):
+        return False
+
+    segments = [
+        segment
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict)
+        and _compact_surface(segment.get("text"))
+        and _number(segment.get("width")) > 0.0
+        and _number(segment.get("height")) > 0.0
+    ]
+    if not (1 <= len(segments) <= 2):
+        return False
+
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+    observed = unicodedata.normalize(
+        "NFKC",
+        _compact_surface("".join(str(segment.get("text") or "") for segment in segments)),
+    )
+    if not raw or not observed:
+        return False
+    if not (raw == observed or raw in observed or observed in raw):
+        return False
+
+    text_japanese = _japanese_character_count(text)
+    observed_japanese = max(
+        _japanese_character_count(raw),
+        _japanese_character_count(observed),
+    )
+    return text_japanese >= 4 and text_japanese >= observed_japanese + 3
+
+
+def _suppress_small_geometry_mangaocr_overclaims(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [
+        region
+        for region in regions
+        if not _small_geometry_mangaocr_overclaim(region)
+    ]
+
+
+
+def _expanded_vertical_seed_evidence_overclaim(item: dict[str, object]) -> bool:
+    """Reject expanded vertical seeds only when final geometry/evidence says art.
+
+    Geometryless expanded seeds are intentionally allowed by the full-volume
+    recovery path.  A detector box being wide is not enough to reject one: the
+    failed v81/v82 p69 smoke demonstrated that real speech can originate from a
+    non-tall Vision seed.  For geometryless candidates we therefore require a
+    broad crop *and* strong disagreement between detector OCR and MangaOCR.
+
+    The independent segment-grid branch rejects the p24 failure mode where a
+    horizontal/art crop was forced through a vertical ink-grid layout.
+    """
+    if str(item.get("source") or "") != "expanded-vertical-seed":
+        return False
+    if str(item.get("orientation") or "") != "vertical":
+        return False
+
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if not text:
+        return False
+
+    width = max(0.0, _number(item.get("width")))
+    height = max(0.0, _number(item.get("height")))
+    if width <= 0.0 or height <= 0.0:
+        return False
+
+    segments = [
+        segment
+        for segment in item.get("segments") or []
+        if isinstance(segment, dict)
+        and _compact_surface(segment.get("text"))
+        and _number(segment.get("width")) > 0.0
+        and _number(segment.get("height")) > 0.0
+    ]
+    if not segments:
+        raw = unicodedata.normalize("NFKC", _compact_surface(item.get("raw_text")))
+        detector_geometry = item.get("detector_geometry")
+        detector_width = 0.0
+        detector_height = 0.0
+        if isinstance(detector_geometry, dict):
+            detector_width = max(0.0, _number(detector_geometry.get("width")))
+            detector_height = max(0.0, _number(detector_geometry.get("height")))
+
+        expanded_crop_is_broad = width >= 0.20 and width >= height * 0.85
+        detector_seed_is_nonvertical = (
+            detector_width > 0.0
+            and detector_height > 0.0
+            and detector_width >= detector_height
+        )
+        similarity = (
+            difflib.SequenceMatcher(a=raw, b=text, autojunk=False).ratio()
+            if raw
+            else 1.0
+        )
+        detector_mangaocr_disagree = (
+            bool(raw)
+            and similarity <= 0.45
+            and len(text) >= len(raw) + 3
+        )
+        broad_disagreement = (
+            expanded_crop_is_broad
+            and detector_seed_is_nonvertical
+            and detector_mangaocr_disagree
+        )
+        if broad_disagreement:
+            item["synthetic_rejection"] = {
+                "reason": "expanded-seed-detector-mangaocr-disagreement-v1",
+                "width": round(width, 4),
+                "height": round(height, 4),
+                "detector_width": round(detector_width, 4),
+                "detector_height": round(detector_height, 4),
+                "surface_similarity": round(similarity, 4),
+                "raw_length": len(raw),
+                "text_length": len(text),
+            }
+        return broad_disagreement
+
+    if len(segments) < 3:
+        return False
+    if any("ink-grid-v1" not in str(segment.get("source") or "") for segment in segments):
+        return False
+
+    centers_x = [
+        _number(segment.get("x")) + _number(segment.get("width")) / 2.0
+        for segment in segments
+    ]
+    centers_y = [
+        _number(segment.get("y")) + _number(segment.get("height")) / 2.0
+        for segment in segments
+    ]
+    x_span_ratio = (max(centers_x) - min(centers_x)) / max(width, 1e-9)
+    y_span_ratio = (max(centers_y) - min(centers_y)) / max(height, 1e-9)
+    tall_segments = sum(
+        1
+        for segment in segments
+        if _number(segment.get("height")) >= height * 0.45
+    )
+    horizontal_full_height_grid = (
+        x_span_ratio >= 0.45
+        and y_span_ratio <= 0.25
+        and tall_segments >= max(3, int(len(segments) * 0.75))
+    )
+    if horizontal_full_height_grid:
+        item["synthetic_rejection"] = {
+            "reason": "expanded-seed-horizontal-full-height-grid-v1",
+            "x_center_span_ratio": round(x_span_ratio, 4),
+            "y_center_span_ratio": round(y_span_ratio, 4),
+            "tall_segment_count": tall_segments,
+            "segment_count": len(segments),
+        }
+    return horizontal_full_height_grid
+
+
+_RECOVERY_SOURCES_REQUIRING_FINAL_GEOMETRY = {
+    "dark-block-proposal",
+    "expanded-vision-rectangle",
+}
+
+
+def _usable_labeled_segment_geometry(item: dict[str, object]) -> bool:
+    for segment in item.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        if not _compact_surface(segment.get("text")):
+            continue
+        if _number(segment.get("width")) <= 0.0 or _number(segment.get("height")) <= 0.0:
+            continue
+        return True
+    return False
+
+
+def _unverified_recovery_region(item: dict[str, object]) -> bool:
+    """Reject recovery proposals that exhausted geometry recovery without evidence.
+
+    Expanded rectangles/seeds and dark-block proposals are deliberately allowed
+    to enter recognition without initial character boxes.  By the end of the
+    pipeline, however, all of their normal recovery/retry paths have already run.
+    If none produced even one labeled positive-area segment, serializing the
+    MangaOCR surface would create a clickable hallucinated region with no page
+    evidence.  Ordinary detector regions are intentionally outside this guard.
+    """
+    if _expanded_vertical_seed_evidence_overclaim(item):
+        return True
+    if str(item.get("source") or "") not in _RECOVERY_SOURCES_REQUIRING_FINAL_GEOMETRY:
+        return False
+    if not _compact_surface(item.get("text")):
+        return False
+    return not _usable_labeled_segment_geometry(item)
+
+
+def _suppress_unverified_recovery_regions(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions if not _unverified_recovery_region(region)]
+
+
+def _region_iou(left: dict[str, object], right: dict[str, object]) -> float:
+    lx1 = _number(left.get("x"))
+    ly1 = _number(left.get("y"))
+    lx2 = lx1 + max(0.0, _number(left.get("width")))
+    ly2 = ly1 + max(0.0, _number(left.get("height")))
+    rx1 = _number(right.get("x"))
+    ry1 = _number(right.get("y"))
+    rx2 = rx1 + max(0.0, _number(right.get("width")))
+    ry2 = ry1 + max(0.0, _number(right.get("height")))
+    intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(
+        0.0, min(ly2, ry2) - max(ly1, ry1)
+    )
+    left_area = max(0.0, lx2 - lx1) * max(0.0, ly2 - ly1)
+    right_area = max(0.0, rx2 - rx1) * max(0.0, ry2 - ry1)
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _exact_overlap_evidence_score(item: dict[str, object]) -> tuple[float, float, float, float]:
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    observed = unicodedata.normalize("NFKC", _segment_surface(item))
+    similarity = (
+        difflib.SequenceMatcher(a=text, b=observed, autojunk=False).ratio()
+        if text and observed
+        else 0.0
+    )
+    exact_geometry_text = 1.0 if text and observed == text else 0.0
+    layout_lane = 1.0 if str(item.get("source") or "") == _LAYOUT_LINE_SOURCE else 0.0
+    confidence = _number(item.get("confidence"))
+    return exact_geometry_text, similarity, layout_lane, confidence
+
+
+def _weak_shifted_vertical_duplicate(
+    first: dict[str, object], second: dict[str, object]
+) -> int | None:
+    """Return the stronger member's position (0/1), or None.
+
+    The ordinary IoU threshold misses the same narrow text lane when one
+    ink-component detector proposal is shifted sideways by a few pixels.
+    Only identical vertical text, strongly overlapping geometry and a large
+    *physical* coverage gap allow suppression. Adjacent genuine lines are
+    retained even if they happen to say the same thing.
+    """
+    if not all(
+        str(row.get("source") or "") == _LAYOUT_LINE_SOURCE
+        and str(row.get("orientation") or "") == "vertical"
+        and str(row.get("detector") or "") == "manga-ink-components-v1"
+        for row in (first, second)
+    ):
+        return None
+    text = unicodedata.normalize("NFKC", _compact_surface(first.get("text")))
+    if len(text) < 3 or text != unicodedata.normalize("NFKC", _compact_surface(second.get("text"))):
+        return None
+    if (
+        _region_iou(first, second) < 0.12
+        or _vertical_overlap_fraction(first, second) < 0.90
+        or _horizontal_overlap_fraction(first, second) < 0.32
+    ):
+        return None
+    first_prov = first.get("provenance") or {}
+    second_prov = second.get("provenance") or {}
+    if not isinstance(first_prov, dict) or not isinstance(second_prov, dict):
+        return None
+    if min(
+        _number(first_prov.get("component_count")),
+        _number(second_prov.get("component_count")),
+    ) < 3:
+        return None
+    first_cov = _number(first_prov.get("component_coverage"))
+    second_cov = _number(second_prov.get("component_coverage"))
+    winner = 0 if first_cov >= second_cov else 1
+    high, low = (first, second) if winner == 0 else (second, first)
+    high_cov, low_cov = sorted((first_cov, second_cov), reverse=True)
+    if (
+        high_cov < 0.80
+        or low_cov > 0.55
+        or high_cov - low_cov < 0.25
+        or _number(high.get("confidence")) < _number(low.get("confidence")) + 0.02
+    ):
+        return None
+    return winner
+
+
+def _suppress_exact_text_overlap_duplicates(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Keep the best-evidenced member of exact-text overlapping duplicate pairs."""
+    normalized = [
+        unicodedata.normalize("NFKC", _compact_surface(region.get("text")))
+        for region in regions
+    ]
+    scores = [_exact_overlap_evidence_score(region) for region in regions]
+    removed: set[int] = set()
+    for left_index, left in enumerate(regions):
+        if left_index in removed or not normalized[left_index]:
+            continue
+        for right_index in range(left_index + 1, len(regions)):
+            if right_index in removed:
+                continue
+            if normalized[left_index] != normalized[right_index]:
+                continue
+            right = regions[right_index]
+            if _region_iou(left, right) < 0.30:
+                winner = _weak_shifted_vertical_duplicate(left, right)
+                if winner is None:
+                    continue
+                if winner == 1:
+                    removed.add(left_index)
+                    break
+                removed.add(right_index)
+                continue
+            left_score = scores[left_index]
+            right_score = scores[right_index]
+            if right_score > left_score:
+                removed.add(left_index)
+                break
+            removed.add(right_index)
+    return [region for index, region in enumerate(regions) if index not in removed]
+
+
+
+def _contained_overlap_evidence_score(
+    item: dict[str, object],
+) -> tuple[float, float, float, int, float]:
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    observed = unicodedata.normalize("NFKC", _segment_surface(item))
+    similarity = (
+        difflib.SequenceMatcher(a=text, b=observed, autojunk=False).ratio()
+        if text and observed
+        else 0.0
+    )
+    exact_geometry_text = 1.0 if text and observed == text else 0.0
+    layout_lane = 1.0 if str(item.get("source") or "") == _LAYOUT_LINE_SOURCE else 0.0
+    confidence = _number(item.get("confidence"))
+    return exact_geometry_text, similarity, layout_lane, len(text), confidence
+
+
+def _vertical_overlap_fraction(left: dict[str, object], right: dict[str, object]) -> float:
+    left_top = _number(left.get("y"))
+    left_bottom = left_top + max(0.0, _number(left.get("height")))
+    right_top = _number(right.get("y"))
+    right_bottom = right_top + max(0.0, _number(right.get("height")))
+    overlap = max(0.0, min(left_bottom, right_bottom) - max(left_top, right_top))
+    shortest = min(
+        max(0.0, left_bottom - left_top),
+        max(0.0, right_bottom - right_top),
+    )
+    return overlap / shortest if shortest > 0.0 else 0.0
+
+
+def _horizontal_overlap_fraction(left: dict[str, object], right: dict[str, object]) -> float:
+    left_start = _number(left.get("x"))
+    left_end = left_start + max(0.0, _number(left.get("width")))
+    right_start = _number(right.get("x"))
+    right_end = right_start + max(0.0, _number(right.get("width")))
+    overlap = max(0.0, min(left_end, right_end) - max(left_start, right_start))
+    narrowest = min(
+        max(0.0, left_end - left_start),
+        max(0.0, right_end - right_start),
+    )
+    return overlap / narrowest if narrowest > 0.0 else 0.0
+
+
+def _terminal_conflict_strength(item: dict[str, object]) -> tuple[int, float, float]:
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return 0, 0.0, _number(item.get("confidence"))
+    return (
+        int(_number(provenance.get("component_count"))),
+        _number(provenance.get("component_coverage")),
+        _number(item.get("confidence")),
+    )
+
+
+def _suppress_terminal_glyph_conflict_duplicates(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Drop a weak same-lane candidate that disagrees only on its last glyph.
+
+    The guard is deliberately narrow.  It targets the p32 pattern where an
+    ink-components context retry and a raw-components lane cover the same
+    vertical bubble text, share every preceding glyph, and only disagree on
+    the terminal character.  The raw lane must have materially stronger
+    component support before the weaker retry can be removed.
+    """
+    normalized = [
+        unicodedata.normalize("NFKC", _compact_surface(region.get("text")))
+        for region in regions
+    ]
+    removed: set[int] = set()
+    for left_index, left in enumerate(regions):
+        if left_index in removed:
+            continue
+        left_text = normalized[left_index]
+        if (
+            len(left_text) < 4
+            or str(left.get("orientation") or "") != "vertical"
+            or str(left.get("source") or "") != _LAYOUT_LINE_SOURCE
+        ):
+            continue
+        for right_index in range(left_index + 1, len(regions)):
+            if right_index in removed:
+                continue
+            right = regions[right_index]
+            right_text = normalized[right_index]
+            if (
+                len(right_text) != len(left_text)
+                or left_text[:-1] != right_text[:-1]
+                or left_text[-1:] == right_text[-1:]
+                or str(right.get("orientation") or "") != "vertical"
+                or str(right.get("source") or "") != _LAYOUT_LINE_SOURCE
+                or _vertical_overlap_fraction(left, right) < 0.90
+                or _horizontal_overlap_fraction(left, right) < 0.35
+            ):
+                continue
+
+            left_detector = str(left.get("detector") or "")
+            right_detector = str(right.get("detector") or "")
+            if {left_detector, right_detector} != {
+                "manga-ink-components-v1",
+                "manga-raw-components-v1",
+            }:
+                continue
+
+            if left_detector == "manga-raw-components-v1":
+                strong_index, weak_index = left_index, right_index
+            else:
+                strong_index, weak_index = right_index, left_index
+            strong = regions[strong_index]
+            weak = regions[weak_index]
+            strong_count, strong_coverage, strong_confidence = _terminal_conflict_strength(strong)
+            weak_count, weak_coverage, weak_confidence = _terminal_conflict_strength(weak)
+            if (
+                strong_count < weak_count + 2
+                or strong_coverage < 0.90
+                or weak_coverage > 0.65
+                or strong_confidence < weak_confidence + 0.08
+            ):
+                continue
+            removed.add(weak_index)
+            if weak_index == left_index:
+                break
+    return [region for index, region in enumerate(regions) if index not in removed]
+
+
+def _suppress_contained_text_overlap_duplicates(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Suppress overlapping substring duplicates using geometry-backed evidence.
+
+    Layout recovery can emit both a complete lane and a shorter line-split or
+    rectangle candidate covering the same ink.  Exact-text dedup handles the
+    identical case; this guard extends it only when one normalized surface is a
+    literal substring of the other and the boxes materially overlap.  Evidence
+    agreement wins before completeness, so a longer hallucinated MangaOCR
+    surface cannot displace a shorter region whose character boxes agree.
+    """
+    normalized = [
+        unicodedata.normalize("NFKC", _compact_surface(region.get("text")))
+        for region in regions
+    ]
+    scores = [_contained_overlap_evidence_score(region) for region in regions]
+    removed: set[int] = set()
+    for left_index, left in enumerate(regions):
+        if left_index in removed or not normalized[left_index]:
+            continue
+        for right_index in range(left_index + 1, len(regions)):
+            if right_index in removed or not normalized[right_index]:
+                continue
+            left_text = normalized[left_index]
+            right_text = normalized[right_index]
+            if left_text == right_text:
+                continue
+            if left_text not in right_text and right_text not in left_text:
+                continue
+            if _region_iou(left, regions[right_index]) < 0.30:
+                continue
+            left_score = scores[left_index]
+            right_score = scores[right_index]
+            if right_score > left_score:
+                removed.add(left_index)
+                break
+            removed.add(right_index)
+    return [region for index, region in enumerate(regions) if index not in removed]
+
+def _weak_raw_square_pad_component_overread(item: dict[str, object]) -> bool:
+    """Reject a long square-retry reading from a physically two-component art crop.
+
+    This requires unusually weak component evidence *and* an implausibly long
+    Japanese surface in a short raw-detector rectangle.  It does not reject a
+    normal two-glyph reply or a longer text lane with actual detector support.
+    """
+    if (
+        str(item.get("source") or "") != _LAYOUT_LINE_SOURCE
+        or str(item.get("orientation") or "") != "vertical"
+        or str(item.get("detector") or "") != "manga-raw-components-v1"
+        or str(item.get("recognizer_retry") or "") != "vertical-square-pad-v1"
+        or _number(item.get("confidence"), 1.0) > 0.60
+        or not (0.0 < _number(item.get("height")) <= 0.05)
+        or not (0.0 < _number(item.get("width")) <= 0.035)
+    ):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    if len(text) < 6 or _japanese_character_count(text) < 3:
+        return False
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    return (
+        1 <= int(_number(provenance.get("component_count"))) <= 2
+        and 0.0 < _number(provenance.get("component_coverage")) <= 0.65
+    )
+
+
+def _suppress_weak_raw_square_pad_component_overreads(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [item for item in regions if not _weak_raw_square_pad_component_overread(item)]
+
+
+def _nonlexical_first_mangaocr_hypothesis(item: dict[str, object]) -> str:
+    hypotheses = item.get("hypotheses")
+    if not isinstance(hypotheses, list):
+        return ""
+    for hypothesis in hypotheses:
+        if not isinstance(hypothesis, dict) or hypothesis.get("id") != "manga-ocr":
+            continue
+        return unicodedata.normalize("NFKC", _compact_surface(hypothesis.get("text")))
+    return ""
+
+
+def _v96p24_unsupported_art_retry(item: dict[str, object]) -> bool:
+    """Suppress three physically disjoint kinds of short artifact overread.
+
+    The first two require a square retry that contradicts the first reading;
+    the edge case requires a clipped, two-component ink lane and an XY retry.
+    The semantic surface alone is never sufficient to suppress a candidate.
+    """
+    if (
+        str(item.get("source") or "") != _LAYOUT_LINE_SOURCE
+        or str(item.get("orientation") or "") != "vertical"
+    ):
+        return False
+    text = unicodedata.normalize("NFKC", _compact_surface(item.get("text")))
+    first = _nonlexical_first_mangaocr_hypothesis(item)
+    if not text or not first:
+        return False
+    provenance = item.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    count = int(_number(provenance.get("component_count")))
+    coverage = _number(provenance.get("component_coverage"))
+    confidence = _number(item.get("confidence"), 1.0)
+    width = _number(item.get("width"), 1.0)
+    height = _number(item.get("height"), 1.0)
+    detector = str(item.get("detector") or "")
+    selected = str(item.get("selected_hypothesis_id") or "")
+    black_ratio = _number(provenance.get("black_ratio"), 1.0)
+    hiragana = lambda surface: bool(surface) and all("\u3040" <= char <= "\u309f" for char in surface)
+    katakana = lambda surface: bool(surface) and all("\u30a0" <= char <= "\u30ff" for char in surface)
+    nonlexical = lambda surface: bool(surface) and not any(char.isalnum() for char in surface)
+    # Two katakana invented by a square retry on an observed-gap, two-component
+    # short raw crop. A genuine short raw lane with independent weak-region
+    # support does not satisfy this branch.
+    if (
+        detector == "manga-raw-components-v1"
+        and selected == "manga-ocr-square-retry"
+        and len(text) == 2 and katakana(text)
+        and len(first) == 1 and hiragana(first)
+        and provenance.get("support_kind") == "observed-gap"
+        and count == 2 and 1.0 <= coverage <= 1.35
+        and confidence <= 0.60 and 0 < height <= 0.035
+        and 0 < width <= 0.035 and black_ratio <= 0.11
+    ):
+        return True
+    # A repeated two-kana square reading derived from three thin art strokes,
+    # while the initial crop contains only punctuation rather than lettering.
+    if (
+        detector == "manga-ink-components-v1"
+        and selected == "manga-ocr-square-retry"
+        and len(text) == 2 and hiragana(text) and text[0] == text[1]
+        and nonlexical(first) and count == 3 and 0.9 <= coverage <= 1.3
+        and confidence <= 0.68 and 0.025 <= height <= 0.050
+        and 0 < width <= 0.035 and black_ratio <= 0.11
+    ):
+        return True
+    # Context read at the clipped bottom edge expands two weak ink strokes
+    # into a lexical two-kana lane, although the direct crop was nonlexical.
+    return (
+        detector == "manga-ink-components-v1"
+        and selected == "manga-ocr-xy-context-retry"
+        and len(text) == 2 and hiragana(text) and nonlexical(first)
+        and count == 2 and 0 < coverage <= 0.65
+        and confidence <= 0.65 and _number(item.get("y"), 1.0) <= 0.001
+        and 0 < height <= 0.055 and 0 < width <= 0.035
+    )
+
+
+def _suppress_v96p24_unsupported_art_retries(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [item for item in regions if not _v96p24_unsupported_art_retry(item)]
 
 
 def _finalize_worker_output_regions(
@@ -10181,7 +16566,27 @@ def _finalize_worker_output_regions(
     cannot accidentally serialize a candidate that already satisfies a final
     rejection predicate.
     """
-    return _suppress_short_raw_empty_rectangle_art_noise(regions)
+    cleaned = _suppress_short_raw_empty_rectangle_art_noise(regions)
+    cleaned = _suppress_tiny_empty_horizontal_oneglyph_art(cleaned)
+    cleaned = _suppress_tiny_horizontal_ruby_echo_regions(cleaned)
+    cleaned = _suppress_horizontal_prefix_duplicates(cleaned)
+    cleaned = _suppress_short_symbol_only_art_noise(cleaned)
+    cleaned = _suppress_detector_disagreement_art_noise(cleaned)
+    cleaned = _suppress_margin_page_number_regions(cleaned)
+    cleaned = _suppress_detector_giant_oneglyph_art(cleaned)
+    cleaned = _suppress_empty_vertical_rectangle_mangaocr_art(cleaned)
+    cleaned = _suppress_empty_horizontal_rectangle_mangaocr_art(cleaned)
+    cleaned = _suppress_page_edge_synthetic_ink_grid_art(cleaned)
+    cleaned = _suppress_page_edge_narrow_vertical_overreads(cleaned)
+    cleaned = _suppress_empty_multicolumn_sentence_art(cleaned)
+    cleaned = _suppress_clipped_bottom_vertical_fragment_art(cleaned)
+    cleaned = _suppress_small_geometry_mangaocr_overclaims(cleaned)
+    cleaned = _suppress_weak_raw_square_pad_component_overreads(cleaned)
+    cleaned = _suppress_v96p24_unsupported_art_retries(cleaned)
+    cleaned = _suppress_unverified_recovery_regions(cleaned)
+    cleaned = _suppress_terminal_glyph_conflict_duplicates(cleaned)
+    cleaned = _suppress_exact_text_overlap_duplicates(cleaned)
+    return _suppress_contained_text_overlap_duplicates(cleaned)
 
 
 def _recover_short_fullwidth_digit_geometry_from_page_ink(
@@ -10209,25 +16614,33 @@ def _recover_short_fullwidth_digit_geometry_from_page_ink(
         for char in target
     ):
         return piece
-    if _compact_surface(piece.get("raw_text")):
-        return piece
+    raw_surface = unicodedata.normalize("NFKC", _compact_surface(piece.get("raw_text")))
     if str(piece.get("selected_hypothesis_id") or "") != "manga-ocr":
         return piece
     if "vision-rectangles" not in str(piece.get("detector") or ""):
         return piece
     confidence = float(piece.get("confidence") or 0.0)
-    if confidence > 0.40:
-        return piece
 
     segments = [
         dict(item)
         for item in piece.get("segments") or []
         if isinstance(item, dict)
     ]
-    segment_surface = _compact_surface(
-        "".join(str(item.get("text") or "") for item in segments)
+    segment_surface = unicodedata.normalize(
+        "NFKC",
+        _compact_surface("".join(str(item.get("text") or "") for item in segments)),
     )
-    if segment_surface:
+    target_ascii = unicodedata.normalize("NFKC", target)
+    empty_geometry_path = not raw_surface and not segment_surface and confidence <= 0.40
+    partial_geometry_path = (
+        bool(raw_surface)
+        and raw_surface == segment_surface
+        and raw_surface != target_ascii
+        and (target_ascii.startswith(raw_surface) or target_ascii.endswith(raw_surface))
+        and all(character.isascii() and character.isdigit() for character in raw_surface)
+        and any(not _compact_surface(item.get("text")) for item in segments)
+    )
+    if not (empty_geometry_path or partial_geometry_path):
         return piece
 
     page_width, page_height = image.size
@@ -10311,6 +16724,8 @@ def _recover_short_fullwidth_digit_geometry_from_page_ink(
         "component_count": len(candidates),
         "threshold": threshold,
     }
+    if partial_geometry_path:
+        result["short_fullwidth_digit_ink_geometry"]["partial_observed_surface"] = raw_surface
     result["geometry_source"] = (
         str(piece.get("geometry_source") or "")
         + ("+" if piece.get("geometry_source") else "")
@@ -11650,12 +18065,1938 @@ def _suppress_nested_caption_vertical_fragments(
     return output
 
 
+def _short_bubble_has_upstream_same_lane_ink(
+    gray: Image.Image,
+    box: tuple[float, float, float, float],
+    scale: float,
+) -> bool:
+    """Reject a short fragment cut from the tail of a longer vertical lane.
+
+    Side whitespace alone is insufficient: the terminal two glyphs of a
+    multi-glyph column can have perfectly white left/right margins. Require
+    a blank band immediately *above* the proposed standalone bubble as well.
+    Inspect only the middle of its own physical column to avoid bubble edges.
+    """
+    left, top, right, _ = (int(round(v)) for v in box)
+    inset = max(2, round(2 * scale), (right - left) // 6)
+    x1, x2 = left + inset, right - inset
+    y1, y2 = max(0, top - round(12 * scale)), max(0, top - round(2 * scale))
+    if x2 <= x1 or y2 <= y1:
+        return False
+    band = gray.crop((x1, y1, x2, y2))
+    try:
+        pixels = band.tobytes()
+        dark = sum(value < 145 for value in pixels)
+        return dark >= max(12, round(0.22 * len(pixels)))
+    finally:
+        band.close()
+
+
+def _short_bubble_isolated_candidates(
+    image: Image.Image,
+    output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Unclaimed compact ink lanes with independent white-space support.
+
+    The regular layout detector deliberately rejects unsupported two-component
+    columns.  A *small* subset inside white speech bubbles can be recovered
+    safely from two agreeing narrow OCR views.  Recheck final output before
+    accepting one: the original detection passes may already have recovered it.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+    scale = page_width / 760.0
+    existing_boxes = [_pixel_bbox(row, page_width, page_height) for row in output]
+    gray = image.convert("L")
+    proposals: list[dict[str, object]] = []
+    try:
+        candidates = [*_layout_vertical_lines(image), *_raw_vertical_lines(image)]
+        for candidate in candidates:
+            if str(candidate.get("source") or "") != _LAYOUT_LINE_SOURCE:
+                continue
+            prov = candidate.get("provenance")
+            if not isinstance(prov, dict):
+                continue
+            count = int(_number(prov.get("component_count")))
+            coverage = _number(prov.get("component_coverage"))
+            box = _pixel_bbox(candidate, page_width, page_height)
+            left, top, right, bottom = box
+            width, height = right - left, bottom - top
+            if not (15 * scale <= width <= 38 * scale and 39 * scale <= height <= 65 * scale):
+                continue
+            if not (0.78 <= coverage <= 1.10):
+                continue
+            # Do not turn short ruby, artwork fragments or cropped neighbouring
+            # text into independent speech. The two-component route requires
+            # whiter surroundings than the four-component physical lane route.
+            short_raw = str(candidate.get("detector") or "") == _RAW_LAYOUT_DETECTOR
+            if short_raw:
+                if count != 2:
+                    continue
+            elif count < 4:
+                continue
+            if any(_pixel_cover(box, other) >= 0.22 for other in existing_boxes):
+                continue
+            # A two-glyph suffix from an existing *long* vertical column can
+            # have white sides and unanimous small-crop OCR. It is not an
+            # independent short speech bubble when same-lane ink sits above.
+            if _short_bubble_has_upstream_same_lane_ink(gray, box, scale):
+                continue
+            if any(
+                _pixel_cover(box, _pixel_bbox(old, page_width, page_height)) >= 0.50
+                for old in proposals
+            ):
+                continue
+            x1, y1, x2, y2 = (int(round(value)) for value in box)
+            side_width = max(4, round(8 * scale))
+            offset = max(2, round(4 * scale))
+
+            def white_fraction(a: int, b: int) -> float:
+                a = max(0, a)
+                b = min(page_width, b)
+                if a >= b:
+                    return 0.0
+                patch = gray.crop((a, max(0, y1 - offset), b, min(page_height, y2 + offset)))
+                try:
+                    pixels = patch.tobytes()
+                    return sum(pixel >= 220 for pixel in pixels) / max(1, len(pixels))
+                finally:
+                    patch.close()
+
+            left_white = white_fraction(x1 - offset - side_width, x1 - offset)
+            right_white = white_fraction(x2 + offset, x2 + offset + side_width)
+            threshold = 0.96 if short_raw else 0.80
+            if min(left_white, right_white) < threshold:
+                continue
+            if not short_raw and max(left_white, right_white) < 0.96:
+                continue
+            item = dict(candidate)
+            evidence = dict(prov)
+            evidence.update(
+                {
+                    "short_bubble_left_white": round(left_white, 4),
+                    "short_bubble_right_white": round(right_white, 4),
+                    "short_bubble_isolated": True,
+                }
+            )
+            item["provenance"] = evidence
+            proposals.append(item)
+    finally:
+        gray.close()
+    return proposals[:16]
+
+
+def _recover_isolated_short_bubble_lanes(
+    model: object,
+    image: Image.Image,
+    output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Late, consensus-only recovery of physical 1–2 glyph speech bubbles."""
+    recovered = [dict(row) for row in output]
+    page_width, page_height = image.size
+    for proposal in _short_bubble_isolated_candidates(image, recovered):
+        l, t, r, b = _pixel_bbox(proposal, page_width, page_height)
+        views: list[str] = []
+        for pad in (4, 6, 8):
+            inset = max(1, round(pad * page_width / 760.0))
+            bounds = (
+                max(0, round(l) - inset),
+                max(0, round(t) - inset),
+                min(page_width, round(r) + inset),
+                min(page_height, round(b) + inset),
+            )
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                text = _compact_surface(model(crop))  # type: ignore[operator]
+            except Exception:
+                text = ""
+            finally:
+                crop.close()
+            views.append(text)
+        valid = [text for text in views if text and len(text) <= 5]
+        winner = max(set(valid), key=lambda text: (valid.count(text), text), default="")
+        if not winner or valid.count(winner) < 2:
+            continue
+        count = _japanese_character_count(winner)
+        if count < 2 and not (
+            count == 1
+            and len(winner) >= 3
+            and all(character in "．.・…" for character in winner[1:])
+        ):
+            continue
+        if count > 3:
+            continue
+        if any(
+            _pixel_cover(_pixel_bbox(proposal, page_width, page_height),
+                         _pixel_bbox(old, page_width, page_height)) >= 0.22
+            for old in recovered
+        ):
+            continue
+        item = dict(proposal)
+        item.update(
+            {
+                "text": winner,
+                "raw_text": winner,
+                "recognizer": "manga-ocr",
+                "recognition_selection": "isolated-short-bubble-consensus-v1",
+                "selected_hypothesis_id": "isolated-short-bubble-consensus-v1",
+                "recognizer_retry": "isolated-short-bubble-consensus-v1",
+                "hypotheses": [
+                    {"id": f"isolated-short-bubble-crop-{idx}", "text": view,
+                     "source": "manga-ocr", "selected": view == winner}
+                    for idx, view in enumerate(views)
+                ],
+            }
+        )
+        item["segments"] = _layout_line_character_segments(item, winner, image=image)
+        if not item["segments"]:
+            continue
+        item["word_geometry"] = "observed-short-bubble-ink-v1"
+        item["geometry_status"] = "observed"
+        recovered.append(item)
+    return recovered
+
+
+
+def _bold_vertical_bubble_candidates(
+    image: Image.Image,
+    output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Find intact, large, high-contrast speech lanes missed by glyph-size filters.
+
+    Very heavy vertical type can fuse two characters into an ink component taller
+    than the regular raw/layout detector permits. Require three adjacent, broad,
+    similarly aligned physical components inside a mostly white column; do not
+    infer missing ink from an OCR string or split a tail off an existing lane.
+    """
+    width, height = image.size
+    if width < 200 or height < 200:
+        return []
+    scan_scale = min(1.0, 760.0 / width)
+    gray = image.convert("L")
+    scan = gray.resize(
+        (max(1, round(width * scan_scale)), max(1, round(height * scan_scale))),
+        Image.Resampling.BOX,
+    ) if scan_scale < 0.999 else gray.copy()
+    try:
+        binary = scan.point(lambda value: 255 if value < 125 else 0)
+        try:
+            raw = _binary_components(binary)
+        finally:
+            binary.close()
+    finally:
+        scan.close()
+    factor = 1.0 / scan_scale
+    components: list[tuple[float, float, float, float, float]] = []
+    for raw_x, raw_y, raw_w, raw_h, area in raw:
+        density = area / max(1, raw_w * raw_h)
+        if not (
+            28 <= raw_w <= 55
+            and 30 <= raw_h <= 90
+            and area >= 450
+            and 0.24 <= density <= 0.85
+            and raw_h <= raw_w * 2.5
+        ):
+            continue
+        components.append((raw_x * factor, raw_y * factor,
+                           raw_w * factor, raw_h * factor, density))
+    components.sort(key=lambda item: (item[1], item[0]))
+    groups: list[list[tuple[float, float, float, float, float]]] = []
+    for component in components:
+        cx = component[0] + component[2] / 2.0
+        matched = None
+        best_distance = float("inf")
+        for group in groups:
+            previous = group[-1]
+            gap = component[1] - (previous[1] + previous[3])
+            distance = abs(cx - (previous[0] + previous[2] / 2.0))
+            if (
+                -2.0 * factor <= gap <= 12.0 * factor
+                and distance <= 7.0 * factor
+                and 0.65 <= component[2] / max(previous[2], 1.0) <= 1.5
+                and distance < best_distance
+            ):
+                matched = group
+                best_distance = distance
+        if matched is None:
+            groups.append([component])
+        else:
+            matched.append(component)
+
+    existing_boxes = [_pixel_bbox(row, width, height) for row in output]
+    results: list[dict[str, object]] = []
+    try:
+        for group in groups:
+            # Exactly three large connected blobs may contain four or five
+            # glyphs; extra blobs are handled by the normal detectors instead.
+            if len(group) != 3:
+                continue
+            left = min(c[0] for c in group)
+            top = min(c[1] for c in group)
+            right = max(c[0] + c[2] for c in group)
+            bottom = max(c[1] + c[3] for c in group)
+            bw, bh = right - left, bottom - top
+            if not (28 * factor <= bw <= 53 * factor
+                    and 105 * factor <= bh <= 190 * factor):
+                continue
+            box = (left, top, right, bottom)
+            if any(_pixel_cover(box, old) >= 0.20 for old in existing_boxes):
+                continue
+            # Refuse a three-component *suffix* of a longer column, including
+            # columns from which the ordinary detector recovered no text.
+            if _short_bubble_has_upstream_same_lane_ink(gray, box, factor):
+                continue
+            side_fractions = []
+            for a, b in ((left - 12 * factor, left - 4 * factor),
+                         (right + 4 * factor, right + 12 * factor)):
+                x1 = max(0, int(round(a)))
+                x2 = min(width, int(round(b)))
+                y1 = max(0, int(round(top + 5 * factor)))
+                y2 = min(height, int(round(bottom - 5 * factor)))
+                if x2 <= x1 or y2 <= y1:
+                    side_fractions.append(0.0)
+                    continue
+                band = gray.crop((x1, y1, x2, y2))
+                try:
+                    pixels = band.tobytes()
+                    side_fractions.append(sum(value >= 220 for value in pixels) / len(pixels))
+                finally:
+                    band.close()
+            if min(side_fractions) < 0.86 or max(side_fractions) < 0.93:
+                continue
+            pad = 2 * factor
+            left = max(0.0, left - pad)
+            top = max(0.0, top - pad)
+            right = min(float(width), right + pad)
+            bottom = min(float(height), bottom + pad)
+            results.append({
+                "text": "", "raw_text": "", "orientation": "vertical",
+                "orientation_reason": "observed-heavy-ink-components",
+                "x": round(left / width, 6),
+                "y": round(1.0 - bottom / height, 6),
+                "width": round((right - left) / width, 6),
+                "height": round((bottom - top) / height, 6),
+                "confidence": 0.5,
+                "detector": "manga-bold-bubble-components-v1",
+                "source": _LAYOUT_LINE_SOURCE,
+                "geometry_source": "observed-heavy-ink-components",
+                "geometry_status": "observed",
+                "provenance": {
+                    "proposal_kind": "bold_vertical_speech_lane",
+                    "component_count": len(group),
+                    "component_bboxes_px": [
+                        [round(c[0], 2), round(c[1], 2),
+                         round(c[0] + c[2], 2), round(c[1] + c[3], 2)]
+                        for c in group
+                    ],
+                    "side_white_fractions": [round(v, 4) for v in side_fractions],
+                    "detector_bbox_px": [round(v, 2) for v in (left, top, right, bottom)],
+                },
+            })
+    finally:
+        gray.close()
+    return results[:8]
+
+
+def _recover_bold_vertical_bubble_lanes(
+    model: object,
+    image: Image.Image,
+    output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Recognize only physically isolated large-type lanes with crop consensus."""
+    recovered = [dict(row) for row in output]
+    width, height = image.size
+    for proposal in _bold_vertical_bubble_candidates(image, recovered):
+        left, top, right, bottom = _pixel_bbox(proposal, width, height)
+        views: list[str] = []
+        for pad in (0, 3, 7):
+            inset = round(pad * width / 760.0)
+            bounds = (max(0, round(left) - inset),
+                      max(0, round(top) - inset),
+                      min(width, round(right) + inset),
+                      min(height, round(bottom) + inset))
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                view = _compact_surface(model(crop))  # type: ignore[operator]
+            except Exception:
+                view = ""
+            finally:
+                crop.close()
+            views.append(view)
+        valid = [view for view in views if 3 <= len(view) <= 7
+                 and _japanese_character_count(view) >= 3
+                 and _japanese_character_count(view) / len(view) >= 0.75]
+        winner = max(set(valid), key=lambda view: (valid.count(view), view), default="")
+        if not winner or valid.count(winner) < 2:
+            continue
+        if not (12 * width / 760.0 <= (bottom - top) / len(winner)
+                <= 75 * width / 760.0):
+            continue
+        if any(_pixel_cover((left, top, right, bottom),
+                            _pixel_bbox(old, width, height)) >= 0.20 for old in recovered):
+            continue
+        item = dict(proposal)
+        item.update({
+            "text": winner,
+            "raw_text": winner,
+            "recognizer": "manga-ocr",
+            "recognition_selection": "bold-bubble-crop-consensus-v1",
+            "selected_hypothesis_id": "bold-bubble-crop-consensus-v1",
+            "recognizer_retry": "bold-bubble-crop-consensus-v1",
+            "hypotheses": [
+                {"id": f"bold-bubble-crop-{idx}", "text": view,
+                 "source": "manga-ocr", "selected": view == winner}
+                for idx, view in enumerate(views)
+            ],
+        })
+        item["segments"] = _layout_line_character_segments(item, winner, image=image)
+        if not item["segments"]:
+            continue
+        item["word_geometry"] = "observed-bold-bubble-ink-v1"
+        # Ink-valley geometry is still approximate when adjacent bold glyphs
+        # touch; do not mislabel it as exact per-character detection.
+        item["geometry_status"] = "approximate"
+        recovered.append(item)
+    return recovered
+
+
+def _orphan_bold_leading_lanes(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Find a short *physical* leading lane before an already-read bold tail.
+
+    Scan only the tail's own main-print x band (excluding side ruby). Three
+    separate substantial components, clear upper ink boundary and the absence
+    of existing coverage are required; recognition decides the surface later.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    s = width / 760.0
+    proposals: list[dict[str, object]] = []
+    gray = image.convert("L")
+    try:
+        for row in output:
+            if (str(row.get("source") or "") != _LAYOUT_LINE_SOURCE
+                    or str(row.get("detector") or "") != _LAYOUT_DETECTOR):
+                continue
+            left, top, right, bottom = _pixel_bbox(row, width, height)
+            bw, bh = right - left, bottom - top
+            if not (30*s <= bw <= 53*s and 105*s <= bh <= 205*s
+                    and top >= 195*s):
+                continue
+            x1 = max(0, round(left - 2*s))
+            x2 = min(width, round(left + min(32*s, bw - 8*s)))
+            y1 = max(0, round(top - 190*s))
+            y2 = max(0, round(top - 50*s))
+            if x2 - x1 < 20*s or y2 - y1 < 95*s:
+                continue
+            patch = gray.crop((x1, y1, x2, y2))
+            binary = patch.point(lambda pixel: 255 if pixel < 125 else 0)
+            try:
+                components = [
+                    (x1+x, y1+y, cw, ch, area)
+                    for x, y, cw, ch, area in _binary_components(binary)
+                    if cw >= 13*s and ch >= 9*s and area >= 75*s*s
+                ]
+            finally:
+                binary.close()
+                patch.close()
+            components.sort(key=lambda c: c[1])
+            if len(components) != 3:
+                continue
+            first, middle, last = components
+            if not (first[1] >= y1 + 12*s
+                    and first[1]+first[3] < middle[1]
+                    and middle[1]+middle[3] < last[1]
+                    and last[1]+last[3] <= y2 - 2*s):
+                continue
+            centers = [x + cw/2 for x, _, cw, _, _ in components]
+            if max(centers) - min(centers) > 8*s:
+                continue
+            left_ink = min(c[0] for c in components)
+            right_ink = max(c[0]+c[2] for c in components)
+            top_ink = first[1]
+            bottom_ink = last[1]+last[3]
+            box = (max(0.0, left_ink-3*s), max(0.0, top_ink-3*s),
+                   min(float(width), right_ink+3*s),
+                   min(float(height), bottom_ink+3*s))
+            if not (65*s <= box[3]-box[1] <= 125*s
+                    and box[3] < top - 20*s):
+                continue
+            if any(_pixel_cover(box, _pixel_bbox(peer, width, height)) >= .16
+                   for peer in output):
+                continue
+            proposals.append({
+                "text": "", "raw_text": "", "orientation": "vertical",
+                "source": _LAYOUT_LINE_SOURCE,
+                "detector": "manga-orphan-leading-components-v1",
+                "x": round(box[0]/width, 6),
+                "y": round(1-box[3]/height, 6),
+                "width": round((box[2]-box[0])/width, 6),
+                "height": round((box[3]-box[1])/height, 6),
+                "provenance": {"component_bboxes_px": [
+                    [round(x, 2), round(y, 2), round(x+cw, 2), round(y+ch, 2)]
+                    for x, y, cw, ch, _ in components
+                ], "anchored_to_existing_bold_tail": True},
+            })
+    finally:
+        gray.close()
+    return proposals[:6]
+
+
+def _orphan_merged_vertical_lanes(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """One very tall dense ink component can be a complete missed print lane.
+
+    Unlike the generic short-bubble recovery, a narrow ruby column may touch
+    one side, but an existing region must never cover its own main-print core.
+    """
+    width, height = image.size
+    scale = width / 760.0
+    if width < 500 or height < 500:
+        return []
+    gray = image.convert("L")
+    results: list[dict[str, object]] = []
+    try:
+        for row in _layout_vertical_lines(image):
+            provenance = row.get("provenance")
+            if not isinstance(provenance, dict) or provenance.get("component_count") != 1:
+                continue
+            left, top, right, bottom = _pixel_bbox(row, width, height)
+            bw, bh = right-left, bottom-top
+            if not (28*scale <= bw <= 41*scale
+                    and 140*scale <= bh <= 255*scale
+                    and .30 <= _number(provenance.get("black_ratio"))
+                    and _number(provenance.get("white_ratio")) <= .60):
+                continue
+            box = (left, top, right, bottom)
+            if _short_bubble_has_upstream_same_lane_ink(gray, box, scale):
+                continue
+            if any(_pixel_cover(box, _pixel_bbox(peer, width, height)) >= .18
+                   for peer in output):
+                continue
+            # A single narrow ruby neighbour is permissible, but the outer
+            # margin on the opposite side must be clear of page art/other text.
+            side_white = []
+            for a, b in ((left-12*scale, left-4*scale),
+                         (right+4*scale, right+12*scale)):
+                x1 = max(0, round(a)); x2 = min(width, round(b))
+                y1 = max(0, round(top+10*scale)); y2 = min(height, round(bottom-10*scale))
+                if x2 <= x1 or y2 <= y1:
+                    side_white.append(0.0)
+                    continue
+                strip = gray.crop((x1, y1, x2, y2))
+                try:
+                    pixels = strip.tobytes()
+                    side_white.append(sum(p >= 220 for p in pixels)/max(1,len(pixels)))
+                finally:
+                    strip.close()
+            if max(side_white) < .96 or min(side_white) < .80:
+                continue
+            item = dict(row)
+            item["detector"] = "manga-merged-vertical-components-v1"
+            item["provenance"] = {**provenance,
+                "orphan_merged_component": True,
+                "side_white_fractions": [round(v,4) for v in side_white]}
+            results.append(item)
+    finally:
+        gray.close()
+    return results[:6]
+
+
+def _recover_orphan_vertical_lanes(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Late conservative recovery; never rewrite existing independently read text."""
+    recovered = [dict(row) for row in output]
+    width, height = image.size
+    for proposal in (*_orphan_bold_leading_lanes(image, recovered),
+                     *_orphan_merged_vertical_lanes(image, recovered)):
+        l, t, r, b = _pixel_bbox(proposal, width, height)
+        if any(_pixel_cover((l,t,r,b),_pixel_bbox(peer,width,height)) >= .18
+               for peer in recovered):
+            continue
+        views: list[str] = []
+        for pad in (0, 3, 7):
+            inset = round(pad * width / 760.0)
+            bounds = (max(0, round(l)-inset), max(0, round(t)-inset),
+                      min(width, round(r)+inset), min(height, round(b)+inset))
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                text = _vertical_recovery_surface(model(crop))  # type: ignore[operator]
+            except Exception:
+                text = ""
+            finally:
+                crop.close()
+            views.append(text)
+        valid = [view for view in views if 3 <= len(view) <= 10
+                 and _japanese_character_count(view) >= 3
+                 and _japanese_character_count(view)/len(view) >= .75]
+        winner = max(set(valid), key=lambda text: (valid.count(text), text), default="")
+        if not winner or valid.count(winner) < 2:
+            # A fused multi-glyph component can have a detector rectangle which
+            # clips one edge: symmetric 0/3/7 px crops need not agree even
+            # though the entire print lane is present. Retry only the physical
+            # *merged* orphan with independent, asymmetrically padded views.
+            # In particular, never relax the three-component bold-lane guard.
+            if proposal.get("detector") != "manga-merged-vertical-components-v1":
+                continue
+            scale = width / 760.0
+            contextual = (
+                (-1, -4, 2, 6),    # complete glyph edges
+                (1, -1, 0, 1),     # tight main-print lane, exclude side ruby
+                (-2, -6, 4, 8),    # independent outer context
+            )
+            for x_before, y_before, x_after, y_after in contextual:
+                bounds = (max(0, round(l + x_before*scale)),
+                          max(0, round(t + y_before*scale)),
+                          min(width, round(r + x_after*scale)),
+                          min(height, round(b + y_after*scale)))
+                crop = image.crop(bounds).convert("RGB")
+                try:
+                    text = _vertical_recovery_surface(model(crop))  # type: ignore[operator]
+                except Exception:
+                    text = ""
+                finally:
+                    crop.close()
+                views.append(text)
+            contextual_valid = [view for view in views[3:] if 3 <= len(view) <= 10
+                                and _japanese_character_count(view) >= 3
+                                and _japanese_character_count(view)/len(view) >= .75]
+            winner = max(set(contextual_valid),
+                         key=lambda text: (contextual_valid.count(text), text), default="")
+            if not winner or contextual_valid.count(winner) < 2:
+                continue
+        if any(_vertical_recovery_surface(peer.get("text")) == winner
+               for peer in recovered):
+            continue
+        item = dict(proposal)
+        item.update({"text": winner, "raw_text": winner, "recognizer": "manga-ocr",
+                     "recognition_selection": "orphan-vertical-consensus-v1",
+                     "selected_hypothesis_id": "orphan-vertical-consensus-v1",
+                     "recognizer_retry": "orphan-vertical-consensus-v1",
+                     "hypotheses": [{"id":f"orphan-crop-{i}","text":view,
+                         "source":"manga-ocr","selected":view==winner}
+                         for i,view in enumerate(views)]})
+        item["segments"] = _layout_line_character_segments(item, winner, image=image)
+        if not item["segments"]:
+            continue
+        item["word_geometry"] = "observed-orphan-vertical-ink-v1"
+        item["geometry_status"] = "approximate"
+        recovered.append(item)
+    return recovered
+
+
+def _recover_orphan_after_worker_cleanup(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Retry physically observed merged lanes after worker-only noise cleanup.
+
+    The initial late recovery operates on raw recognition output. A temporary
+    false-positive rectangle can overlap a complete but missed print column,
+    blocking the candidate. Some such rectangles are removed only by the
+    durable worker-output cleanup. Re-check those *merged* candidates against
+    that exact post-cleanup population, without altering or dropping any rows
+    from the original output. A recovered row still must pass the unmodified
+    multi-crop consensus and glyph-ink geometry guards, and must survive the
+    normal worker and service output filters downstream.
+    """
+    cleaned = _finalize_worker_output_regions(output)
+    # Service-side cleanup removes a small additional set of temporary
+    # post-cluster amalgams. The real p39 orphan becomes visible only after
+    # the same two output filters that will be applied to the worker payload.
+    # Import at call time: the worker is also a standalone subprocess module.
+    from . import manga as manga_service
+    persisted = manga_service._finalize_recognized_regions(cleaned)
+    if len(persisted) == len(output):
+        return output
+    merged = _orphan_merged_vertical_lanes(image, persisted)
+    if not merged:
+        return output
+    existing = {
+        (_vertical_recovery_surface(row.get("text")),
+         tuple(round(n, 3) for n in _pixel_bbox(row, *image.size)))
+        for row in output
+    }
+    reread = _recover_orphan_vertical_lanes(model, image, persisted)
+    additions = [
+        row for row in reread[len(persisted):]
+        if row.get("detector") == "manga-merged-vertical-components-v1"
+        and (_vertical_recovery_surface(row.get("text")),
+             tuple(round(n, 3) for n in _pixel_bbox(row, *image.size))) not in existing
+    ]
+    return output + additions if additions else output
+
+
+def _ruby_anchored_full_main_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[dict[str, object], dict[str, object]]]:
+    """Recover a missing large print lane only beside a surviving small ruby lane.
+
+    A ruby-only OCR box is not itself evidence that its whole dialogue was
+    recognized. The proposed larger lane must contain independently observed
+    main-print ink *both above and below* the ruby, without another read main
+    text region covering that ink. No language/phrase/page lookup is used.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    scale = width / 760.0
+    gray = image.convert("L")
+    candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+    try:
+        for anchor in output:
+            text = _vertical_recovery_surface(anchor.get("text"))
+            if (anchor.get("source") != _LAYOUT_LINE_SOURCE
+                    or anchor.get("orientation") != "vertical"
+                    or not re.fullmatch(r"[ぁ-ゖァ-ヿ]{4,7}", text)):
+                continue
+            ax, ay, ar, ab = _pixel_bbox(anchor, width, height)
+            ruby_width, ruby_height = ar-ax, ab-ay
+            if not (11*scale <= ruby_width <= 17*scale
+                    and 65*scale <= ruby_height <= 85*scale):
+                continue
+            box = (round(ax-2.32*ruby_width), round(ay-2.23*ruby_height),
+                   round(ar+1.05*ruby_width), round(ab+.99*ruby_height))
+            l, t, r, b = box
+            if not (0 <= l < ax < r <= width and 0 <= t < ay < ab < b <= height
+                    and 40*scale <= r-l <= 74*scale
+                    and 250*scale <= b-t <= 375*scale):
+                continue
+            # A distinct neighbouring main-print band must have substantial
+            # physical ink in four vertically separated areas, including top
+            # and bottom outside the small ruby annotation.
+            main_right = round(ax-.8*ruby_width)
+            spans = ((t, t+round(.8*ruby_height)),
+                     (t+round(.8*ruby_height), round(ay)-5),
+                     (round(ay+.25*ruby_height), round(ay+.8*ruby_height)),
+                     (round(ab)+4, b-3))
+            if main_right-l < 15*scale or any(end <= start for start,end in spans):
+                continue
+            ratios: list[float] = []
+            for top, bottom in spans:
+                crop = gray.crop((l, top, main_right, bottom))
+                try:
+                    pixels = crop.tobytes()
+                    ratios.append(sum(pixel < 150 for pixel in pixels) /
+                                  max(1,len(pixels)))
+                finally:
+                    crop.close()
+            if min(ratios) < .28:
+                continue
+            if any(peer is not anchor
+                   and _pixel_cover(box, _pixel_bbox(peer, width, height)) >= .16
+                   for peer in output):
+                continue
+            proposal = {
+                "text": "", "raw_text": "", "orientation": "vertical",
+                "source": _LAYOUT_LINE_SOURCE,
+                "detector": "manga-ruby-anchored-main-components-v1",
+                "x": round(l/width, 6), "y": round(1-b/height, 6),
+                "width": round((r-l)/width, 6),
+                "height": round((b-t)/height, 6),
+                "provenance": {
+                    "ruby_anchor_bbox_px": [round(v, 2) for v in (ax,ay,ar,ab)],
+                    "physical_main_ink_ratios": [round(v,4) for v in ratios],
+                    "main_print_band_px": [l,main_right],
+                },
+            }
+            candidates.append((proposal, anchor))
+    finally:
+        gray.close()
+    return candidates[:3]
+
+
+def _recover_ruby_anchored_full_main_lanes(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Use two full reads plus independently agreeing upper/lower main text."""
+    width, height = image.size
+    scale = width / 760.0
+    recovered = list(output)
+    for proposal, anchor in _ruby_anchored_full_main_candidates(image, recovered):
+        l,t,r,b = (round(v) for v in _pixel_bbox(proposal,width,height))
+        ax,ay,ar,ab = _pixel_bbox(anchor,width,height)
+        rh = ab-ay
+        boxes = (
+            (l,t,r,b),
+            (max(0,l-round(2*scale)), max(0,t-round(6*scale)),
+             min(width,r+round(2*scale)), min(height,b+round(20*scale))),
+            (l,min(height,t+round(10*scale)), max(l+1,r-round(scale)),round(ay)),
+            (l,round(ay-.2*rh),max(l+1,r-round(scale)),round(ab+.925*rh)),
+        )
+        views: list[str] = []
+        for bounds in boxes:
+            if bounds[0]>=bounds[2] or bounds[1]>=bounds[3]:
+                views.append("")
+                continue
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                views.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                views.append("")
+            finally:
+                crop.close()
+        whole, contextual, upper, lower = views
+        if not (whole == contextual == upper+lower
+                and 6 <= len(whole) <= 12 and 2 <= len(upper) <= 6
+                and 2 <= len(lower) <= 7
+                and _japanese_character_count(whole) >= len(whole)*.85
+                and whole != _vertical_recovery_surface(anchor.get("text"))
+                and not any(_vertical_recovery_surface(row.get("text")) == whole
+                            for row in recovered)):
+            continue
+        item = dict(proposal)
+        item.update({
+            "text":whole,"raw_text":whole,"recognizer":"manga-ocr",
+            "recognition_selection":"ruby-main-full-and-split-consensus-v1",
+            "selected_hypothesis_id":"ruby-main-full-and-split-consensus-v1",
+            "recognizer_retry":"ruby-main-full-and-split-consensus-v1",
+            "hypotheses":[{"id":f"ruby-main-{idx}","text":view,
+                           "source":"manga-ocr","selected":view==whole}
+                          for idx,view in enumerate(views)],
+        })
+        item["segments"] = _layout_line_character_segments(item, whole, image=image)
+        if len(item["segments"]) < len(whole):
+            continue
+        item["word_geometry"] = "observed-ruby-main-ink-v1"
+        item["geometry_status"] = "approximate"
+        recovered.append(item)
+    return recovered
+
+
+
+def _recover_ruby_main_after_output_cleanup(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Retry only newly unblocked ruby-anchored main lanes after durable cleanup.
+
+    Initial late recovery observes temporary post-cluster regions; one of those
+    can overlap missing main print although it will never survive serialization.
+    Compare candidates before and after the exact worker/service cleanup rather
+    than relaxing the physical-ink, overlap, or four-OCR-view consensus checks.
+    Never replace an existing region or persist a temporary blocker here.
+    """
+    cleaned = _finalize_worker_output_regions(output)
+    from . import manga as manga_service
+    persisted = manga_service._finalize_recognized_regions(cleaned)
+    if len(persisted) >= len(output):
+        return output
+
+    def key(row: dict[str, object]) -> tuple[float, ...]:
+        return tuple(round(v, 2) for v in _pixel_bbox(row, *image.size))
+
+    blocked_before = {key(proposal) for proposal, _anchor in
+                      _ruby_anchored_full_main_candidates(image, output)}
+    available_after = {
+        key(proposal) for proposal, _anchor in
+        _ruby_anchored_full_main_candidates(image, persisted)
+    } - blocked_before
+    if not available_after:
+        return output
+
+    reread = _recover_ruby_anchored_full_main_lanes(model, image, persisted)
+    existing = {
+        (_vertical_recovery_surface(row.get("text")), key(row)) for row in output
+    }
+    additions = [
+        row for row in reread[len(persisted):]
+        if key(row) in available_after
+        and (_vertical_recovery_surface(row.get("text")), key(row)) not in existing
+    ]
+    return output + additions if additions else output
+
+
+def _recover_shifted_contextual_leading_lanes(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Recover a clipped prefix only after the final lane/segment geometry exists.
+
+    A context-gap line can be detected a few pixels left of its actual glyphs.
+    The ordinary leading-ink pass then rejects genuine leading ink as
+    edge-dominated. Re-anchor the narrow lane *only* when every retained glyph
+    segment independently supports the same rightward offset. Accept an OCR
+    prefix only with a measured extension and two agreeing crop views. No
+    page-specific text or page number is part of the production decision.
+    """
+    page_width, page_height = image.size
+    result = list(output)
+    for index, row in enumerate(output):
+        provenance = row.get("provenance")
+        if (
+            row.get("source") != _LAYOUT_LINE_SOURCE
+            or row.get("detector") != "manga-context-gap-components-v1"
+            or not isinstance(provenance, dict)
+            or provenance.get("proposal_kind") != "contextual_missing_vertical_text_line"
+            or row.get("orientation") != "vertical"
+            or row.get("recognizer_retry")
+        ):
+            continue
+        old = _vertical_recovery_surface(row.get("text"))
+        segments = row.get("segments")
+        if not (3 <= len(old) <= 9 and isinstance(segments, list)
+                and len(segments) == len(old)
+                and all(isinstance(part, dict) and part.get("orientation") == "vertical"
+                        for part in segments)):
+            continue
+        left, top, right, bottom = _pixel_bbox(row, page_width, page_height)
+        lane_width = right - left
+        if not (15 <= lane_width <= max(35, round(page_width * .055))
+                and 38 <= bottom - top <= round(page_height * .15)):
+            continue
+        segment_left = min(_number(part.get("x")) * page_width for part in segments)
+        segment_right = max((_number(part.get("x")) + _number(part.get("width")))
+                            * page_width for part in segments)
+        shift = segment_left - left
+        if not (lane_width * .27 <= shift <= lane_width * .55
+                and segment_right > right + lane_width * .16
+                and segment_right - segment_left <= lane_width * 1.55):
+            continue
+        # Re-anchor to actual printed glyph ink, retaining a 1px safety margin.
+        corrected_left = max(0, round(segment_left) - 1)
+        corrected_right = min(page_width, max(right + round(shift),
+                                                round(segment_right) + 1))
+        anchored = dict(row)
+        anchored["x"] = round(corrected_left / page_width, 6)
+        anchored["width"] = round((corrected_right - corrected_left) / page_width, 6)
+        extended = _vertical_leading_ink_geometry(image, anchored)
+        if extended is None or not _leading_extension_has_centered_ink(image, extended):
+            continue
+        ink_info = (extended.get("provenance") or {}).get("leading_ink_geometry") or {}
+        extra = _number(ink_info.get("extension_px"))
+        if not (lane_width * 1.20 <= extra <= lane_width * 2.50):
+            continue
+        full_top = max(0, round(_number(ink_info.get("new_top_px")) - 2))
+        full_bottom = min(page_height, bottom + 3)
+        # Two nearby crops must give identical full text. The third crop
+        # tolerates minor layout differences but cannot vote by itself.
+        observations: list[str] = []
+        for padding in (0, 3, 6):
+            x1 = max(0, corrected_left - padding - 2)
+            x2 = min(page_width, corrected_right + padding + 2)
+            y1 = max(0, full_top - padding)
+            y2 = min(page_height, full_bottom + padding)
+            crop = image.crop((x1, y1, x2, y2)).convert("RGB")
+            try:
+                observations.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                observations.append("")
+            finally:
+                crop.close()
+        votes = {text: observations.count(text) for text in observations if text}
+        winner = max(votes, key=lambda text: (votes[text], text), default="")
+        if (not winner or votes[winner] < 2 or not winner.endswith(old)
+                or not _accept_vertical_leading_context_text(old, winner)
+                or not _leading_prefix_width_supported(image, extended, old, winner)):
+            continue
+        prefix = winner[:-len(old)]
+        prefix_len = len(_study_surface_characters(prefix))
+        if not (1 <= prefix_len <= 3 and lane_width * .52 * prefix_len <= extra
+                <= lane_width * 1.45 * prefix_len):
+            continue
+        corrected = dict(extended)
+        corrected["text"] = winner
+        corrected["raw_text"] = winner
+        corrected["recognizer_retry"] = "shifted-context-gap-leading-consensus-v1"
+        corrected["recognition_selection"] = "shifted-context-gap-leading-consensus-v1"
+        corrected["selected_hypothesis_id"] = "shifted-context-gap-leading-consensus-v1"
+        corrected["provenance"] = {
+            **dict(extended.get("provenance") or {}),
+            "shifted_context_gap_leading": {
+                "old_text": old, "old_bbox_px": [left, top, right, bottom],
+                "new_bbox_px": list(_pixel_bbox(corrected, page_width, page_height)),
+                "segment_left_px": round(segment_left, 2),
+                "segment_right_px": round(segment_right, 2),
+                "readings": observations,
+            },
+        }
+        corrected["hypotheses"] = [
+            {"id": f"shifted-leading-{offset}", "text": reading,
+             "source": "manga-ocr", "selected": reading == winner}
+            for offset, reading in zip((0, 3, 6), observations)
+        ]
+        corrected["segments"] = _layout_line_character_segments(corrected, winner, image=image)
+        if len(corrected["segments"]) != len(_study_surface_characters(winner)):
+            continue
+        corrected["word_geometry"] = "observed-shifted-contextual-leading-v1"
+        corrected["geometry_status"] = "approximate"
+        result[index] = corrected
+    return result
+
+
+def _recover_low_confidence_clipped_vertical_donors(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Reread a short uncertain donor only when a real top glyph was clipped.
+
+    A low-confidence layout donor can start below the first small character;
+    a two-view disagreement is never enough to replace its current text.
+    """
+    width, height = image.size
+    s = width / 760.0
+    recovered = [dict(row) for row in output]
+    gray = image.convert("L")
+    try:
+        for index, row in enumerate(recovered):
+            if (row.get("source") != _LAYOUT_LINE_SOURCE
+                    or row.get("detector") != "wide-vertical-text-donor-v1"
+                    or str(row.get("orientation") or "") != "vertical"
+                    or _number(row.get("confidence"), 1) > .30):
+                continue
+            provenance = row.get("provenance")
+            if not isinstance(provenance, dict) or (
+                    provenance.get("proposal_kind") != "vertical_text_line_raw"
+                    or provenance.get("component_count") != 4
+                    or not .80 <= _number(provenance.get("component_coverage")) <= 1.10
+                    or provenance.get("bidirectional_peer_bleed_trim")):
+                continue
+            old = _vertical_recovery_surface(row.get("text"))
+            left, top, right, bottom = _pixel_bbox(row, width, height)
+            if not (3 <= len(old) <= 6 and 15*s <= right-left <= 24*s
+                    and 55*s <= bottom-top <= 86*s and top >= 25*s):
+                continue
+            x1 = max(0, round(left-2*s)); x2 = min(width, round(right+3*s))
+            y1 = max(0, round(top-17*s)); y2 = min(height, round(bottom+20*s))
+            band = gray.crop((round(left), y1, round(right), round(top)))
+            try:
+                dark = sum(px < 135 for px in band.tobytes())
+            finally:
+                band.close()
+            if dark < 20*s*s:
+                continue
+            views: list[str] = []
+            for pad in (0, 3, 7):
+                inset = round(pad*s)
+                crop = image.crop((max(0,x1-inset), max(0,y1-inset),
+                                   min(width,x2+inset), min(height,y2+inset))).convert("RGB")
+                try:
+                    views.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+                except Exception:
+                    views.append("")
+                finally:
+                    crop.close()
+            valid = [v for v in views if len(v) == len(old)+1
+                     and _japanese_character_count(v) >= len(old)]
+            winner = max(set(valid), key=lambda v: (valid.count(v),v), default="")
+            if not winner or valid.count(winner) < 2 or winner == old:
+                continue
+            # One new top character must be supported by actual ink; the extra
+            # bottom crop is OCR context, not newly claimed clickable geometry.
+            item = dict(row)
+            item["y"] = round(1 - bottom/height, 6)
+            item["height"] = round((bottom-y1)/height, 6)
+            item["text"] = winner
+            item["raw_text"] = winner
+            item["recognizer_retry"] = "clipped-low-confidence-donor-consensus-v1"
+            item["recognition_selection"] = "clipped-low-confidence-donor-consensus-v1"
+            item["selected_hypothesis_id"] = "clipped-low-confidence-donor-consensus-v1"
+            item["provenance"] = {**dict(row.get("provenance") or {}),
+                "clipped_low_confidence_donor": True, "observed_leading_dark_pixels": dark,
+                "original_text": old}
+            item["hypotheses"] = [{"id":f"leading-donor-crop-{i}",
+                "text":view,"source":"manga-ocr", "selected":view==winner}
+                for i,view in enumerate(views)]
+            item["segments"] = _layout_line_character_segments(item, winner, image=image)
+            if not item["segments"]:
+                continue
+            item["word_geometry"] = "observed-clipped-leading-ink-v1"
+            item["geometry_status"] = "approximate"
+            recovered[index] = item
+    finally:
+        gray.close()
+    return recovered
+
+
+def _recover_short_raw_trailing_misread(
+    model: object,
+    image: Image.Image,
+    item: dict[str, object],
+) -> dict[str, object]:
+    """Reread a small-kana line when the raw box clipped its physical last glyph.
+
+    Unlike generic X/Y context, this extends only to observed same-lane trailing
+    ink and requires two near-exact views to agree on the unchanged prefix.
+    """
+    old = _compact_surface(item.get("text"))
+    prov = item.get("provenance")
+    if not (
+        str(item.get("source") or "") == _LAYOUT_LINE_SOURCE
+        and str(item.get("detector") or "") == _RAW_LAYOUT_DETECTOR
+        and isinstance(prov, dict)
+        and int(_number(prov.get("component_count"))) == 2
+        and _number(item.get("confidence"), 1.0) < 0.65
+        and len(old) == 3
+        and old[1] in "っッゃゅょャュョ"
+    ):
+        return item
+    extended = _vertical_trailing_ink_geometry(image, item)
+    if extended is None:
+        return item
+    page_width, page_height = image.size
+    left, top, right, bottom = _pixel_bbox(item, page_width, page_height)
+    _, ext_top, _, ext_bottom = _pixel_bbox(extended, page_width, page_height)
+    extension = ext_bottom - bottom
+    if not (12 <= extension <= 42) or ext_top < top - 4:
+        return item
+    width = right - left
+    if not (11 <= width <= 27):
+        return item
+    views: list[str] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    for left_pad, top_pad, bottom_pad in ((0.65, 6, 4), (0.58, 5, 3)):
+        box = (
+            max(0, round(left - width * left_pad)),
+            max(0, round(top - top_pad)),
+            min(page_width, round(right + 2)),
+            min(page_height, round(ext_bottom + bottom_pad)),
+        )
+        boxes.append(box)
+        crop = image.crop(box).convert("RGB")
+        try:
+            value = _compact_surface(model(crop))  # type: ignore[operator]
+        except Exception:
+            value = ""
+        finally:
+            crop.close()
+        views.append(value)
+    if not (
+        views[0] == views[1]
+        and views[0] != old
+        and len(views[0]) == len(old)
+        and views[0][:2] == old[:2]
+        and _japanese_character_count(views[0]) >= 3
+    ):
+        return item
+    result = dict(item)
+    result.update(
+        {
+            "text": views[0],
+            "y": extended["y"],
+            "height": extended["height"],
+            "recognizer_retry": "short-raw-trailing-misread-v1",
+            "selected_hypothesis_id": "short-raw-trailing-misread-v1",
+            "recognition_selection": "short-raw-trailing-misread-consensus-v1",
+        }
+    )
+    provenance = dict(prov)
+    provenance["short_raw_trailing_misread"] = {
+        "original_text": old,
+        "candidate": views[0],
+        "views": views,
+        "crop_boxes_px": boxes,
+        "extension_px": round(extension, 1),
+    }
+    result["provenance"] = provenance
+    result["hypotheses"] = [
+        {"id": "short-raw-trailing-misread-v1", "text": views[0],
+         "source": "manga-ocr-dual-bounded-crop", "selected": True}
+    ]
+    result.pop("segments", None)
+    result["segments"] = _layout_line_character_segments(result, views[0], image=image)
+    if not result["segments"]:
+        return item
+    return result
+
+
+def _art_connected_short_vertical_noise(
+    image: Image.Image,
+    region: dict[str, object],
+    peers: list[dict[str, object]],
+) -> bool:
+    """Reject an *unsupported* short vertical OCR string physically carried by art.
+
+    A weak, raw-text-free detector guess is not an observed printed word when
+    its apparent glyph ink is connected to a much larger drawing outside the
+    candidate box. Test bounded 8-connected components of page ink, not OCR
+    vocabulary, page number, or the recognized text. Existing raw observations,
+    strong hypotheses, and recovered text never enter this path.
+
+    A separate narrow case rejects a weak vertical *wide-region donor* that
+    borrows glyphs from a verified horizontal Latin title. This is a script /
+    orientation conflict, not a generic ban on horizontal/vertical overlap.
+    """
+    if (region.get("source") != _LAYOUT_LINE_SOURCE
+            or region.get("orientation") != "vertical"):
+        return False
+    surface = _compact_surface(region.get("text"))
+    if not (2 <= len(surface) <= 5):
+        return False
+    detector = str(region.get("detector") or "")
+    confidence = _number(region.get("confidence"), 1.0)
+    x, y = _number(region.get("x")), _number(region.get("y"))
+    w, h = _number(region.get("width")), _number(region.get("height"))
+    if not (0.0 <= x < 1.0 and 0.0 <= y < 1.0
+            and 0.0 < w <= 0.07 and 0.0 < h <= 0.105
+            and x+w <= 1.0 and y+h <= 1.0):
+        return False
+
+    if detector == "wide-vertical-text-donor-v1" and confidence <= 0.55:
+        for peer in peers:
+            if (peer is region or peer.get("orientation") != "horizontal"
+                    or _number(peer.get("confidence"), 0.0) < 0.95):
+                continue
+            ptext = _compact_surface(peer.get("text"))
+            if len(re.findall(r"[A-Za-z]", ptext)) < 5:
+                continue
+            px, py = _number(peer.get("x")), _number(peer.get("y"))
+            pw, ph = _number(peer.get("width")), _number(peer.get("height"))
+            if pw < 0.14 or ph > 0.055:
+                continue
+            overlap_x = max(0.0, min(x+w, px+pw) - max(x, px))
+            overlap_y = max(0.0, min(y+h, py+ph) - max(y, py))
+            if overlap_x >= 0.75*w and overlap_y >= 0.25*h:
+                return True
+        return False
+
+    if not (detector == "manga-ink-components-v1" and confidence <= 0.70
+            and not _compact_surface(region.get("raw_text"))):
+        return False
+    width, height = image.size
+    left = round(x*width)
+    right = round((x+w)*width)
+    top = round((1-y-h)*height)
+    bottom = round((1-y)*height)
+    if right-left < 8 or bottom-top < 14:
+        return False
+    pad = max(10, round(36 * width / 760.0))
+    outer_left, outer_top = max(0, left-pad), max(0, top-pad)
+    outer_right = min(width, right+pad)
+    outer_bottom = min(height, bottom+pad)
+    with image.crop((outer_left, outer_top, outer_right, outer_bottom)).convert("L") as gray:
+        tw, th = gray.size
+        black = bytearray(1 if value < 105 else 0 for value in gray.tobytes())
+    from collections import deque
+    seen = bytearray(tw*th)
+    inner_left, inner_right = left-outer_left, right-outer_left
+    inner_top, inner_bottom = top-outer_top, bottom-outer_top
+    # Every candidate component must touch the claimed glyph box. Bound each
+    # flood fill by the local 36px frame: unrelated remote artwork cannot count.
+    for yy in range(inner_top, inner_bottom):
+        for xx in range(inner_left, inner_right):
+            start = yy*tw+xx
+            if not black[start] or seen[start]:
+                continue
+            seen[start] = 1
+            queue = deque([(xx, yy)])
+            inside = total = 0
+            min_x = max_x = xx
+            min_y = max_y = yy
+            while queue:
+                cx, cy = queue.popleft()
+                total += 1
+                inside += inner_left <= cx < inner_right and inner_top <= cy < inner_bottom
+                min_x, max_x = min(min_x, cx), max(max_x, cx)
+                min_y, max_y = min(min_y, cy), max(max_y, cy)
+                for ny in range(max(0,cy-1), min(th,cy+2)):
+                    for nx in range(max(0,cx-1), min(tw,cx+2)):
+                        index = ny*tw+nx
+                        if black[index] and not seen[index]:
+                            seen[index] = 1
+                            queue.append((nx,ny))
+            span = max((max_x-min_x+1)/max(1,right-left),
+                       (max_y-min_y+1)/max(1,bottom-top))
+            if inside >= 3 and (total-inside) >= 75*inside and span >= 4.0:
+                return True
+    return False
+
+
+def _suppress_art_connected_short_vertical_noise(
+    image: Image.Image, regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [region for region in regions
+            if not _art_connected_short_vertical_noise(image, region, regions)]
+
+
+def _full_lane_above_clipped_vision_tail_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[int, dict[str, object]]]:
+    """Independent component detector can see full ink of a clipped Vision tail.
+
+    The recovered line must occupy the *same* x band, begin two or more glyphs
+    above the retained rectangle and end before its exaggerated lower boundary.
+    Never infer a word from the image or replace an already independently read
+    layout line; the OCR model must read the complete candidate consistently.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    detected = _layout_vertical_lines(image)
+    found: list[tuple[int, dict[str, object]]] = []
+    scale = width / 760.0
+    for index, row in enumerate(output):
+        if not (row.get("source") == "expanded-vision-rectangle"
+                and row.get("orientation") == "vertical"
+                and row.get("recognizer_retry") == "vertical-leading-ink-v1"):
+            continue
+        old = _vertical_recovery_surface(row.get("text"))
+        if not (5 <= len(old) <= 10 and _japanese_character_count(old) >= 3):
+            continue
+        l,t,r,b = _pixel_bbox(row,width,height)
+        for candidate in detected:
+            cl,ct,cr,cb = _pixel_bbox(candidate,width,height)
+            band_overlap = max(0.0,min(r,cr)-max(l,cl))/max(1.0,min(r-l,cr-cl))
+            if not (band_overlap >= .80 and 35*scale <= t-ct <= 105*scale
+                    and 8*scale <= b-cb <= 110*scale
+                    and 150*scale <= cb-ct <= 270*scale
+                    and 27*scale <= cr-cl <= 45*scale):
+                continue
+            if any(peer is not row and
+                   _pixel_cover((cl,ct,cr,cb),_pixel_bbox(peer,width,height)) >= .22
+                   for peer in output):
+                continue
+            found.append((index, candidate))
+    return found[:3]
+
+
+def _recover_full_lane_above_clipped_vision_tail(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    recovered = list(output)
+    width,height = image.size
+    scale = width/760.0
+    for index, candidate in _full_lane_above_clipped_vision_tail_candidates(image,output):
+        old = _compact_surface(output[index].get("text"))
+        l,t,r,b = _pixel_bbox(candidate,width,height)
+        views: list[str] = []
+        for pad in (1,3,5):
+            margin = round(pad*scale)
+            crop = image.crop((max(0,round(l)-margin),max(0,round(t)-margin),
+                               min(width,round(r)+margin),min(height,round(b)+margin))).convert("RGB")
+            try:
+                views.append(_compact_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                views.append("")
+            finally:
+                crop.close()
+        winner = max(set(views),key=lambda val:(views.count(val),val),default="")
+        if not (winner and views.count(winner)>=2 and winner.endswith(old)
+                and len(_study_surface_characters(winner))-len(_study_surface_characters(old)) in (1,2,3)
+                and _accept_vertical_leading_context_text(old,winner)
+                and not any(_vertical_recovery_surface(peer.get("text"))==winner
+                            for i,peer in enumerate(output) if i!=index)):
+            continue
+        row = dict(output[index]); row.update({
+            "source": _LAYOUT_LINE_SOURCE,
+            "detector": "manga-full-layout-tail-components-v1",
+            "text":winner, "raw_text":winner,
+            "x":candidate["x"],"y":candidate["y"],
+            "width":candidate["width"],"height":candidate["height"],
+            "recognizer_retry":"full-layout-component-vision-tail-consensus-v1",
+            "recognition_selection":"full-layout-component-vision-tail-consensus-v1",
+            "selected_hypothesis_id":"full-layout-component-vision-tail-consensus-v1",
+            "geometry_status":"approximate",
+            "word_geometry":"observed-full-layout-component-v1",
+            "provenance":{**dict(output[index].get("provenance") or {}),
+                          "full_component_bbox_px":[round(v,2) for v in (l,t,r,b)],
+                          "previous_text":old},
+            "hypotheses":[{"id":f"full-layout-{i}","text":text,
+                           "source":"manga-ocr","selected":text==winner}
+                          for i,text in enumerate(views)],
+        })
+        row["segments"]=_layout_line_character_segments(row,winner,image=image)
+        if len(row["segments"]) != len(_compact_surface(winner)):
+            continue
+        recovered[index]=row
+    return recovered
+
+
+def _short_ruby_adjacent_lower_main_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[dict[str,object], dict[str,object]]]:
+    """A short ruby label near the foot of a balloon may mask its main print.
+
+    Require substantial independently visible dark ink in the adjacent large
+    print band, a narrower ruby band, and no already recovered main region.
+    This does not infer main characters from the ruby reading.
+    """
+    width,height=image.size
+    if width<500 or height<500:return []
+    scale=width/760.0
+    gray=image.convert("L")
+    proposals=[]
+    try:
+        for anchor in output:
+            surface=_vertical_recovery_surface(anchor.get("text"))
+            if not (anchor.get("source")==_LAYOUT_LINE_SOURCE
+                    and anchor.get("orientation")=="vertical"
+                    and re.fullmatch(r"[ぁ-ゖァ-ヿ]{4,7}",surface)):
+                continue
+            ax,ay,ar,ab=_pixel_bbox(anchor,width,height)
+            rw,rh=ar-ax,ab-ay
+            if not (11*scale<=rw<=18*scale and 40*scale<=rh<=62*scale
+                    and ay>=height*.72):
+                continue
+            l,t,r,b=[round(v) for v in
+                (ax-1.98*rw,ay-5*scale,ax-.12*rw,ab+.8*rh)]
+            if not (0<=l<r<=width and 0<=t<b<=height
+                    and 20*scale<=r-l<=35*scale and 75*scale<=b-t<=112*scale):
+                continue
+            box=(l,t,r,b)
+            if any(peer is not anchor and
+                   _pixel_cover(box,_pixel_bbox(peer,width,height))>=.19
+                   for peer in output):continue
+            crop=gray.crop(box)
+            try:
+                pixels=crop.tobytes()
+                ink=sum(v<155 for v in pixels)/max(1,len(pixels))
+                w,h=crop.size
+                top=sum(v<155 for v in pixels[:w*(h//3)])/max(1,w*(h//3))
+                bottom=sum(v<155 for v in pixels[w*(2*h//3):])/max(1,w*(h-2*h//3))
+            finally: crop.close()
+            if not (.22<=ink<=.53 and top>=.18 and bottom>=.10):continue
+            proposal={"text":"","raw_text":"","orientation":"vertical",
+                      "source":_LAYOUT_LINE_SOURCE,
+                      "detector":"manga-short-ruby-adjacent-main-ink-v1",
+                      "x":round(l/width,6),"y":round(1-b/height,6),
+                      "width":round((r-l)/width,6),"height":round((b-t)/height,6),
+                      "provenance":{"ruby_anchor_bbox_px":[ax,ay,ar,ab],
+                                    "main_ink_fraction":round(ink,4),
+                                    "main_upper_lower_fraction":[round(top,4),round(bottom,4)]}}
+            proposals.append((proposal,anchor))
+    finally:gray.close()
+    return proposals[:3]
+
+
+def _recover_short_ruby_adjacent_lower_main(
+    model:object,image:Image.Image,output:list[dict[str,object]],
+)->list[dict[str,object]]:
+    recovered=list(output)
+    width,height=image.size
+    scale=width/760.0
+    for proposal,anchor in _short_ruby_adjacent_lower_main_candidates(image,recovered):
+        l,t,r,b=_pixel_bbox(proposal,width,height)
+        observations=[]
+        for pad in (0,2,4):
+            margin=round(pad*scale)
+            crop=image.crop((max(0,round(l)-margin),max(0,round(t)-margin),
+                             min(width,round(r)+margin),min(height,round(b)+margin))).convert("RGB")
+            try:observations.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:observations.append("")
+            finally:crop.close()
+        winner=max(set(observations),key=lambda txt:(observations.count(txt),txt),default="")
+        if not (winner and observations.count(winner)>=2
+                and 2<=len(_study_surface_characters(winner))<=5
+                and _japanese_character_count(winner)>=2
+                and winner!=_vertical_recovery_surface(anchor.get("text"))
+                and not any(_vertical_recovery_surface(peer.get("text"))==winner
+                            for peer in recovered)):
+            continue
+        item=dict(proposal); item.update({
+            "text":winner,"raw_text":winner,"recognizer":"manga-ocr",
+            "recognizer_retry":"short-ruby-main-ink-consensus-v1",
+            "recognition_selection":"short-ruby-main-ink-consensus-v1",
+            "selected_hypothesis_id":"short-ruby-main-ink-consensus-v1",
+            "hypotheses":[{"id":f"short-ruby-main-{i}","text":text,
+                           "source":"manga-ocr","selected":text==winner}
+                          for i,text in enumerate(observations)],
+            "word_geometry":"observed-short-ruby-main-ink-v1",
+            "geometry_status":"approximate"})
+        item["segments"]=_layout_line_character_segments(item,winner,image=image)
+        if len(item["segments"])!=len(_study_surface_characters(winner)):
+            continue
+        recovered.append(item)
+    return recovered
+
+
+
+
+def _short_ruby_adjacent_upper_main_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[dict[str, object], list[tuple[int, int]]]]:
+    """Two large, *separately printed* glyphs directly left of short ruby.
+
+    The existing lower-balloon retry is not suitable for a top-of-page ruby
+    whose adjacent main column is followed by a run of punctuation: it includes
+    the dots in the crop. Require exactly two independent full-size glyph
+    components, no third following full-size glyph, and no previously
+    represented main region. The ruby reading is never used as OCR text.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    scale = width / 760.0
+    components = _raw_layout_component_candidates(image)
+    result: list[tuple[dict[str, object], list[tuple[int, int]]]] = []
+    for anchor in output:
+        reading = _vertical_recovery_surface(anchor.get("text"))
+        if not (anchor.get("source") == _LAYOUT_LINE_SOURCE
+                and anchor.get("orientation") == "vertical"
+                and re.fullmatch(r"[ぁ-ゖァ-ヿ]{4,7}", reading)):
+            continue
+        ax, ay, ar, ab = _pixel_bbox(anchor, width, height)
+        rw, rh = ar - ax, ab - ay
+        if not (11*scale <= rw <= 18*scale
+                and 40*scale <= rh <= 62*scale and ay < height*.33):
+            continue
+        large = [part for part in components
+                 if ax-2.25*rw <= part["x"] <= ax-rw
+                 and 18*scale <= part["width"] <= 35*scale
+                 and 17*scale <= part["height"] <= 36*scale
+                 and abs(part["x"]+part["width"]/2-(ax-1.05*rw)) <= 14*scale
+                 and ay-12*scale <= part["y"] <= ab+40*scale]
+        for first in large:
+            for second in large:
+                if second["y"] <= first["y"]:
+                    continue
+                if (abs(first["x"]-second["x"]) > 5*scale
+                        or not 0 <= second["y"]-(first["y"]+first["height"]) <= 10*scale
+                        or abs(first["width"]-second["width"]) > 8*scale):
+                    continue
+                left = min(first["x"], second["x"]) - scale
+                top = first["y"] - 2*scale
+                right = max(first["x"]+first["width"], second["x"]+second["width"]) + scale
+                bottom = second["y"] + second["height"] + 2*scale
+                box = (left, top, right, bottom)
+                if not (0 <= left < right < width and 0 <= top < bottom < height
+                        and abs(top-ay) <= 14*scale and abs(bottom-ab) <= 18*scale
+                        and 52*scale <= bottom-top <= 80*scale):
+                    continue
+                # A third large glyph immediately below means this is a longer
+                # column, not an isolated two-character word. Do not truncate it.
+                if any(part is not first and part is not second
+                       and abs(part["x"]-second["x"]) <= 5*scale
+                       and 17*scale <= part["width"] <= 35*scale
+                       and 17*scale <= part["height"] <= 36*scale
+                       and 0 <= part["y"]-(second["y"]+second["height"]) <= 10*scale
+                       for part in large):
+                    continue
+                if any(peer is not anchor and _pixel_cover(
+                        box, _pixel_bbox(peer, width, height)) >= .16
+                       for peer in output):
+                    continue
+                candidate = {
+                    "text": "", "raw_text": "", "orientation": "vertical",
+                    "source": _LAYOUT_LINE_SOURCE,
+                    "detector": "manga-short-ruby-upper-two-glyph-ink-v1",
+                    "x": round(left/width, 6), "y": round(1-bottom/height, 6),
+                    "width": round((right-left)/width, 6),
+                    "height": round((bottom-top)/height, 6),
+                    "provenance": {
+                        "ruby_anchor_bbox_px": [ax, ay, ar, ab],
+                        "main_ink_glyph_bands_px": [
+                            [first["y"], first["y"]+first["height"]],
+                            [second["y"], second["y"]+second["height"]],
+                        ],
+                    },
+                }
+                result.append((candidate, [(round(first["y"]), round(first["y"]+first["height"])),
+                                           (round(second["y"]), round(second["y"]+second["height"]))]))
+                break
+            if result and result[-1][0]["provenance"]["ruby_anchor_bbox_px"] == [ax, ay, ar, ab]:
+                break
+    return result[:3]
+
+
+def _recover_short_ruby_adjacent_upper_main(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Append a missing two-glyph main lane only after independent OCR votes."""
+    recovered = list(output)
+    width, height = image.size
+    scale = width / 760.0
+    for proposal, bands in _short_ruby_adjacent_upper_main_candidates(image, recovered):
+        left, top, right, bottom = _pixel_bbox(proposal, width, height)
+        observations = []
+        for pad in (0, 2, 4):
+            margin = round(pad*scale)
+            crop = image.crop((max(0, round(left)-margin), max(0, round(top)-margin),
+                               min(width, round(right)+margin), min(height, round(bottom)+margin))).convert("RGB")
+            try:
+                observations.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                observations.append("")
+            finally:
+                crop.close()
+        valid = [text for text in observations if re.fullmatch(r"[\u3400-\u9fff]{2}", text)]
+        winner = max(set(valid), key=lambda text: (valid.count(text), text), default="")
+        if not winner or valid.count(winner) < 2:
+            continue
+        if any(_vertical_recovery_surface(peer.get("text")) == winner for peer in recovered):
+            continue
+        item = dict(proposal)
+        item.update({
+            "text": winner, "raw_text": winner, "recognizer": "manga-ocr",
+            "recognizer_retry": "short-ruby-upper-main-ink-consensus-v1",
+            "recognition_selection": "short-ruby-upper-main-ink-consensus-v1",
+            "selected_hypothesis_id": "short-ruby-upper-main-ink-consensus-v1",
+            "hypotheses": [{"id": f"short-ruby-upper-{i}", "text": text,
+                            "source": "manga-ocr", "selected": text == winner}
+                           for i, text in enumerate(observations)],
+            "word_geometry": "observed-short-ruby-upper-main-ink-v1",
+            "geometry_status": "approximate",
+        })
+        item["segments"] = _layout_line_character_segments(item, winner, image=image)
+        if (len(item["segments"]) != 2
+                or any(_number(seg.get("height")) <= .005 for seg in item["segments"])):
+            continue
+        # Each clickable glyph must reach the physical ink band of that glyph.
+        segments = item["segments"]
+        if any(not (abs(_pixel_bbox(seg, width, height)[1]-band[0]) <= 7*scale
+                        and abs(_pixel_bbox(seg, width, height)[3]-band[1]) <= 7*scale)
+               for seg, band in zip(segments, bands)):
+            continue
+        recovered.append(item)
+    return recovered
+
+
+def _suppress_unverified_left_edge_art_ocr(
+    image:Image.Image,output:list[dict[str,object]],
+)->list[dict[str,object]]:
+    """Drop a tall synthetic vertical lane drawn from a cut-off panel border.
+
+    This is restricted to edge-touching context-retry regions whose ink has a
+    long edge-connected component, not ordinary short speech touching the edge.
+    """
+    width,height=image.size
+    scale=width/760.0
+    gray=image.convert("L")
+    try:
+        filtered=[]
+        for region in output:
+            if not (region.get("source")==_LAYOUT_LINE_SOURCE
+                    and region.get("orientation")=="vertical"
+                    and region.get("recognizer_retry")=="vertical-y-context-v1"
+                    and _number(region.get("x"))<.002
+                    and 20*scale<=_number(region.get("width"))*width<=28*scale
+                    and _number(region.get("height"))*height>=260*scale
+                    and not _compact_surface(region.get("raw_text"))):
+                filtered.append(region);continue
+            l,t,r,b=_pixel_bbox(region,width,height)
+            crop=gray.crop((0,max(0,round(t)),min(width,round(r)),min(height,round(b))))
+            try:
+                binary=crop.point(lambda pixel:255 if pixel<155 else 0)
+                components=_binary_components(binary)
+            finally:
+                binary.close();crop.close()
+            large=[(x,y,cw,ch,area)for x,y,cw,ch,area in components
+                   if x<=1 and ch>=.22*(b-t) and area>=300*scale*scale]
+            if len(large)>=2 and sum(c[4] for c in large)>=1100*scale*scale:
+                continue
+            filtered.append(region)
+        return filtered
+    finally:gray.close()
+
+
+
+
+def _retry_spurious_punctuation_before_vertical_number(
+    model: object,
+    image: Image.Image,
+    row: dict[str, object],
+) -> dict[str, object]:
+    """Reread a bounded line when OCR invents a punctuation prefix before print.
+
+    A tall narrow Japanese column may contain a real leading word followed by
+    digits. The first reading can mislabel the word as repeated punctuation.
+    Never infer the word from neighbouring dialogue or replace a correctly
+    recognised suffix: accept only two matching fresh readings, identical
+    numeric suffix, and geometry-compatible Japanese leading characters.
+    """
+    if (row.get("orientation") != "vertical"
+            or row.get("source") != _LAYOUT_LINE_SOURCE
+            or row.get("detector") not in {_RAW_LAYOUT_DETECTOR, "manga-ink-components-v1"}
+            or row.get("recognizer_retry")
+            or _compact_surface(row.get("raw_text"))):
+        return row
+    original = _vertical_recovery_surface(row.get("text"))
+    match = re.fullmatch(r"([!?]{3,})([0-9][0-9\u3040-\u30ff\u3400-\u9fff]{2,9})", original)
+    if not match or len(match.group(1)) > 5:
+        return row
+    suffix = match.group(2)
+    pw, ph = image.size
+    left, top, right, bottom = _pixel_bbox(row, pw, ph)
+    lane_width, lane_height = right-left, bottom-top
+    if not (16 <= lane_width <= 39 and 68 <= lane_height <= 180
+            and _number(row.get("confidence"), 1.0) < .9):
+        return row
+    readings: list[str] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    for side, vertical in ((1, 1), (2, 2), (3, 3)):
+        box = (max(0, int(left)-side), max(0, int(top)-vertical),
+               min(pw, int(math.ceil(right))+side),
+               min(ph, int(math.ceil(bottom))+vertical))
+        boxes.append(box)
+        crop = image.crop(box).convert("RGB")
+        try:
+            readings.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+        except Exception:
+            readings.append("")
+        finally:
+            crop.close()
+    votes = {text: readings.count(text) for text in readings if text}
+    winner = max(votes, key=lambda text: (votes[text], text), default="")
+    if not winner or votes[winner] < 2 or not winner.endswith(suffix):
+        return row
+    prefix = winner[:-len(suffix)]
+    if not (1 <= len(prefix) <= 3 and _japanese_character_count(prefix) == len(prefix)
+            and "!" not in winner and "?" not in winner
+            and len(winner) <= max(9, round(lane_height / (lane_width * .53)))):
+        return row
+    corrected = dict(row)
+    corrected["text"] = winner
+    corrected["recognizer_retry"] = "vertical-punctuation-prefix-reread-v1"
+    corrected["recognition_selection"] = "vertical-punctuation-prefix-consensus-v1"
+    corrected["selected_hypothesis_id"] = "vertical-punctuation-prefix-consensus-v1"
+    corrected["hypotheses"] = [
+        {"id": f"vertical-prefix-{index}", "text": value,
+         "source": "manga-ocr-bounded-crop", "selected": value == winner}
+        for index, value in enumerate(readings)
+    ]
+    corrected["provenance"] = {
+        **dict(row.get("provenance") or {}),
+        "vertical_punctuation_prefix": {
+            "previous": original, "crop_boxes_px": [list(box) for box in boxes],
+            "readings": readings, "accepted": winner,
+        },
+    }
+    corrected["segments"] = _layout_line_character_segments(corrected, winner, image=image)
+    if len(corrected["segments"]) != len(_study_surface_characters(winner)):
+        return row
+    corrected["word_geometry"] = "observed-vertical-punctuation-prefix-v1"
+    corrected["geometry_status"] = "approximate"
+    return corrected
+
+
+
+def _suppress_detector_only_microtext_below_numeric_caption(
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Reject tiny detector-only pseudo-text below a large, verified amount.
+
+    This is deliberately a three-piece *shared-parent* guard, not a generic
+    Japanese-text or poster filter. A recognized main numeric line is retained;
+    two small fragment rows are removed only if both were split from the same
+    horizontal Vision observation whose independent full-crop OCR contains no
+    Japanese text. Other genuine captions/amounts remain unchanged.
+    """
+    suppress: set[int] = set()
+    for main in rows:
+        main_text = unicodedata.normalize("NFKC", _compact_surface(main.get("text")))
+        if (not re.fullmatch(r"[\$¥€£]?[0-9,]{7,14}", main_text)
+                or str(main.get("orientation") or "") != "horizontal"
+                or not str(main.get("source") or "").endswith("/line-split-v2")
+                or main.get("selected_hypothesis_id") != "detector-recognition"
+                or _number(main.get("height")) < .016):
+            continue
+        hyp = main.get("hypotheses")
+        if not isinstance(hyp, list):
+            continue
+        independent = [str(h.get("text") or "") for h in hyp
+                       if isinstance(h, dict) and h.get("id") == "manga-ocr"]
+        if len(independent) != 1 or _japanese_character_count(independent[0]):
+            continue
+        main_x = _number(main.get("x"))
+        main_end = main_x + _number(main.get("width"))
+        main_y = _number(main.get("y"))
+        pieces: list[tuple[int, dict[str, object]]] = []
+        for idx, candidate in enumerate(rows):
+            if candidate is main or candidate.get("hypotheses") != hyp:
+                continue
+            text = _compact_surface(candidate.get("text"))
+            if (candidate.get("selected_hypothesis_id") != "detector-recognition"
+                    or candidate.get("orientation") != "horizontal"
+                    or not str(candidate.get("source") or "").endswith("/line-split-v2")
+                    or not 1 <= len(text) <= 10
+                    or _japanese_character_count(text) < 1
+                    or not main_x - .01 <= _number(candidate.get("x")) <= main_end + .02
+                    or not 0.005 <= main_y - _number(candidate.get("y")) <= .045
+                    or _number(candidate.get("height")) >= _number(main.get("height")) * .81):
+                continue
+            pieces.append((idx, candidate))
+        if (len(pieces) == 2
+                and min(len(_compact_surface(item.get("text"))) for _, item in pieces) <= 2
+                and sum(len(_compact_surface(item.get("text"))) for _, item in pieces) >= 6
+                and abs(_number(pieces[0][1].get("y")) - _number(pieces[1][1].get("y"))) <= .012):
+            suppress.update(index for index, _ in pieces)
+    return [row for index, row in enumerate(rows) if index not in suppress]
+
+
+def _isolated_glyph_below_short_number(
+    image: Image.Image,
+    number: dict[str, object],
+) -> tuple[int, int, int, int] | None:
+    """Find a separately printed, large glyph below short horizontal digits.
+
+    Checks two binary thresholds against the *actual ink*. Ruby-sized components
+    and parts of surrounding print cannot themselves satisfy the area, glyph
+    pitch and centered-under-the-digits criteria.
+    """
+    if (number.get("orientation") != "horizontal"
+            or "short-fullwidth-digit-ink-v1" not in str(number.get("geometry_source") or "")
+            or not re.fullmatch(r"[０-９]{2}", _compact_surface(number.get("text")))):
+        return None
+    segments = [item for item in number.get("segments") or [] if isinstance(item, dict)]
+    if len(segments) != 2 or not all(
+        item.get("source") == "short-fullwidth-digit-ink-v1" for item in segments
+    ):
+        return None
+    pw, ph = image.size
+    glyphs = [_pixel_bbox(item, pw, ph) for item in segments]
+    left = min(b[0] for b in glyphs)
+    right = max(b[2] for b in glyphs)
+    bottom = max(b[3] for b in glyphs)
+    glyph_height = statistics.median(b[3] - b[1] for b in glyphs)
+    digit_width = right - left
+    if not (15 <= glyph_height <= 42 and 15 <= digit_width <= 55):
+        return None
+    roi = (max(0, math.floor(left) - 2), max(0, math.floor(bottom) + 1),
+           min(pw, math.ceil(right) + 2), min(ph, math.ceil(bottom + glyph_height * 1.75)))
+    if roi[2] - roi[0] < 16 or roi[3] - roi[1] < 16:
+        return None
+    gray = image.convert("L").crop(roi)
+    try:
+        candidates = []
+        for threshold in (135, 175):
+            binary = gray.point(lambda color, t=threshold: 255 if color <= t else 0)
+            try:
+                components = _binary_components(binary)
+            finally:
+                binary.close()
+            filtered = [
+                (roi[0] + x, roi[1] + y, roi[0] + x + w, roi[1] + y + h)
+                for x, y, w, h, area in components
+                if (.65 * glyph_height <= h <= glyph_height * 1.55
+                    and .55 * glyph_height <= w <= glyph_height * 1.65
+                    and area >= glyph_height * glyph_height * .23
+                    and abs((roi[0] + x + w / 2) - ((left + right) / 2)) <= glyph_height * .40
+                    and y <= glyph_height * .55)
+            ]
+            if len(filtered) != 1:
+                return None
+            candidates.append(filtered[0])
+        box1, box2 = candidates
+        overlap = max(0, min(box1[2], box2[2]) - max(box1[0], box2[0])) * max(
+            0, min(box1[3], box2[3]) - max(box1[1], box2[1]))
+        area1, area2 = ((b[2]-b[0]) * (b[3]-b[1]) for b in (box1, box2))
+        if overlap / max(1, area1 + area2 - overlap) < .73:
+            return None
+        return tuple(int(v) for v in box1)
+    finally:
+        gray.close()
+
+
+def _recover_isolated_glyph_after_short_number(
+    model: object,
+    image: Image.Image,
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Add a glyph only after independent OCR and geometry evidence agree.
+
+    The number, adjacent already-readable vertical line, and isolated ink are
+    three independent constraints. Never infer a missing character from sentence
+    context; the exact single-kanji label must win at least two fresh readings.
+    """
+    pw, ph = image.size
+    additions: list[dict[str, object]] = []
+    for number in rows:
+        box = _isolated_glyph_below_short_number(image, number)
+        if box is None:
+            continue
+        left, top, right, bottom = box
+        nearby = [row for row in rows
+                  if row.get("orientation") == "vertical"
+                  and len(_compact_surface(row.get("text"))) >= 4
+                  and 10 <= left - _pixel_bbox(row, pw, ph)[0] <= 50
+                  and abs(_pixel_bbox(row, pw, ph)[1] - top) <= 40
+                  and _pixel_bbox(row, pw, ph)[3] >= bottom + 25]
+        if len(nearby) != 1:
+            continue
+        if any(_region_coverage(row, {"x": left/pw, "y": 1-bottom/ph,
+                                      "width": (right-left)/pw, "height": (bottom-top)/ph}) >= .35
+               for row in rows if row is not number and row is not nearby[0]):
+            continue
+        readings = []
+        for pad in (2, 4, 6):
+            crop = image.crop((max(0, left-pad), max(0, top-pad),
+                               min(pw, right+pad), min(ph, bottom+pad))).convert("RGB")
+            try:
+                readings.append(_compact_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                readings.append("")
+            finally:
+                crop.close()
+        votes = {s: readings.count(s) for s in readings if s}
+        winner = max(votes, key=lambda s: (votes[s], s), default="")
+        if (votes.get(winner, 0) < 2 or len(winner) != 1
+                or not ("\u3400" <= winner <= "\u9fff")):
+            continue
+        segment = {
+            "text": winner, "orientation": "vertical",
+            "x": left/pw, "y": 1-bottom/ph,
+            "width": (right-left)/pw, "height": (bottom-top)/ph,
+            "source": "verified-isolated-ink-glyph-v1",
+        }
+        additions.append({
+            **segment,
+            "confidence": .80,
+            "pipeline_fingerprint": dict(number.get("pipeline_fingerprint") or {}),
+            "detector": "manga-ink-isolated-glyph-v1",
+            "recognizer": "manga-ocr",
+            "source": "verified-isolated-ink-glyph-v1",
+            "raw_text": "",
+            "segments": [segment],
+            "recognizer_retry": "isolated-glyph-after-number-consensus-v1",
+            "recognition_selection": "isolated-ink-and-ocr-consensus-v1",
+            "selected_hypothesis_id": "isolated-ink-and-ocr-consensus-v1",
+            "hypotheses": [{"id": f"isolated-crop-{i}", "text": value,
+                             "source": "manga-ocr", "selected": value == winner}
+                            for i, value in enumerate(readings)],
+            "geometry_status": "observed",
+            "geometry_source": "verified-isolated-ink-glyph-v1",
+            "word_geometry": "observed-single-glyph-v1",
+            "provenance": {"crop_box_px": list(box), "readings": readings,
+                           "neighboring_number": str(number.get("text") or "")},
+        })
+    return rows + additions
+
+def _suppress_unverified_large_sfx_tail(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Reject an oversized SFX reading when its final kana has no glyph evidence.
+
+    For a rare large horizontal Vision region the detector's last "glyph" can
+    be an ASCII stroke marker, while MangaOCR hallucinates an extra kana at
+    that position. The detector's two supported kana are not independently
+    sufficient to label the whole stylized sound effect. Do not expose this
+    uncertain fragment as clickable Japanese; leave all other regions intact.
+    """
+    kept: list[dict[str, object]] = []
+    for region in regions:
+        segments = region.get("segments")
+        text = str(region.get("text") or "")
+        raw = str(region.get("raw_text") or "")
+        large = (
+            region.get("orientation") == "horizontal"
+            and .075 <= _number(region.get("height")) <= .15
+            and .22 <= _number(region.get("width")) <= .40
+            and _number(region.get("confidence"), 1.0) <= .60
+        )
+        unsupported_tail = (
+            isinstance(segments, list) and len(segments) == 3
+            and isinstance(segments[-1], dict)
+            and str(segments[-1].get("text") or "") in {"^", "/", "\\"}
+            and len(raw) == 2 and len(text) == 3 and text.startswith(raw)
+            and all("\u30a0" <= char <= "\u30ff" for char in text)
+            and [str(part.get("text") or "") for part in segments[:2]
+                 if isinstance(part, dict)] == list(raw)
+        )
+        if large and unsupported_tail:
+            continue
+        kept.append(region)
+    return kept
+
+
 def _recognize_regions(
     model: object,
     image: Image.Image,
     regions: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     prepared = _prepare_regions_for_ocr(regions, image)
+    large_sfx_proposals = _large_stylized_sfx_component_proposals(image, prepared)
+    thin_large_sfx_proposals = _thin_large_sfx_core_proposals(image, prepared)
     layout_proposals = _manga_layout_line_proposals(image, prepared)
     # `_prepare_regions_for_ocr` may replace a tiny source-less Vision seed with
     # an expanded crop. Re-attach weak-lane corroboration from the original
@@ -11812,6 +20153,9 @@ def _recognize_regions(
                 if cluster_square_crop is not None:
                     cluster_square_crop.close()
                 crop.close()
+            item = _recover_vertical_exact_detector_first_glyph_consensus(model, image, item)
+            item = _recover_vertical_exact_detector_leading_pair_consensus(model, image, item)
+            item = _recover_vertical_punctuated_bracket_overread_consensus(model, image, item)
             item = _recover_vertical_edge_context(model, image, item)
             item["recognizer"] = "manga-ocr"
             if is_layout:
@@ -11981,16 +20325,51 @@ def _recognize_regions(
     refreshed = _promote_wide_vertical_text_to_layout_lanes(
         image, refreshed, _wide_vertical_geometry_candidates(image)
     )
+    refreshed = _recover_short_wide_vertical_donor_trailing_context(
+        model, image, refreshed
+    )
+    refreshed = _reread_wide_vertical_layout_donors_exact_crop(
+        model, image, refreshed
+    )
     refreshed = _suppress_redundant_implausible_wide_vertical_donors(refreshed)
     recalled = _post_recognition_cluster_recall(model, image, refreshed)
+    recalled = _recover_gapped_vertical_sfx_fragments(model, image, recalled)
     repaired = _repair_post_cluster_truncated_members(image, recalled)
     repaired = _suppress_complete_post_cluster_amalgams(repaired)
     repaired = _trim_wide_donor_adjacent_tall_prefix(repaired)
+    repaired = _trim_wide_donor_bidirectional_peer_bleed(repaired)
+    repaired = _trim_wide_donor_punctuated_right_peer_prefix_bleed(repaired)
+    repaired = _suppress_wide_vertical_promoted_chunks_borrowing_peer_prefix(repaired)
     repaired = _suppress_supported_raw_same_lane_fragments(repaired)
     repaired = _repair_multiline_caption_from_full_region_suffix(repaired)
     repaired = _suppress_nested_caption_vertical_fragments(repaired)
+    repaired = _recover_missing_speech_bubble_columns(model, image, repaired)
+    repaired = [
+        _trim_vertical_prefix_above_panel_rule(image, piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _trim_vertical_ghost_prefix_from_main_ink(image, piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_short_punctuated_square_retry_prefix_overread(piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_horizontal_punctuation_crop_leak(piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_detector_duplicate_overclaim_after_geometry(piece)
+        for piece in repaired
+    ]
     repaired = [
         _repair_horizontal_trailing_punctuation_from_page_ink(image, piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_horizontal_trailing_dot_run_from_page_ink(image, piece)
         for piece in repaired
     ]
     repaired = [
@@ -12009,8 +20388,816 @@ def _recognize_regions(
         _recover_short_fullwidth_digit_geometry_from_page_ink(image, piece)
         for piece in repaired
     ]
+    repaired = [
+        _repair_wide_stylized_horizontal_sfx_consensus(model, image, piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_component_isolated_stylized_sfx(model, image, piece)
+        for piece in repaired
+    ]
+    repaired = [
+        _repair_large_empty_rectangle_sfx_consensus(model, image, piece)
+        for piece in repaired
+    ]
+    for proposal in large_sfx_proposals:
+        if any(
+            _region_coverage(proposal, existing) >= 0.42
+            or _region_coverage(existing, proposal) >= 0.42
+            for existing in repaired
+        ):
+            continue
+        recovered = _recognize_large_stylized_sfx_proposal(model, image, proposal)
+        if recovered is None:
+            continue
+        recovered["pipeline_fingerprint"] = dict(pipeline_fingerprint)
+        repaired.append(recovered)
+    for proposal in thin_large_sfx_proposals:
+        if any(
+            _region_coverage(proposal, existing) >= 0.42
+            or _region_coverage(existing, proposal) >= 0.42
+            for existing in repaired
+        ):
+            continue
+        recovered = _recognize_thin_large_sfx_core_proposal(model, image, proposal)
+        if recovered is None:
+            continue
+        recovered["pipeline_fingerprint"] = dict(pipeline_fingerprint)
+        repaired.append(recovered)
+    repaired = _repair_expanded_rectangle_single_deletion_overclaims_late(
+        model, image, repaired
+    )
     repaired = _suppress_short_raw_empty_rectangle_art_noise(repaired)
-    return _suppress_nested_expanded_vertical_duplicates(repaired)
+    repaired = _suppress_tiny_horizontal_ruby_echo_regions(repaired)
+    repaired = _suppress_horizontal_prefix_duplicates(repaired)
+    repaired = _suppress_short_symbol_only_art_noise(repaired)
+    repaired = _suppress_page_edge_narrow_vertical_overreads(repaired)
+    repaired = _suppress_nested_expanded_vertical_duplicates(repaired)
+    repaired = _suppress_small_geometry_mangaocr_overclaims(repaired)
+    repaired = _suppress_weak_raw_square_pad_component_overreads(repaired)
+    repaired = _suppress_v96p24_unsupported_art_retries(repaired)
+    repaired = _suppress_unverified_recovery_regions(repaired)
+    repaired = _suppress_terminal_glyph_conflict_duplicates(repaired)
+    repaired = _suppress_exact_text_overlap_duplicates(repaired)
+    final = _suppress_contained_text_overlap_duplicates(repaired)
+    final = [_recover_short_raw_trailing_misread(model, image, row) for row in final]
+    final = _recover_bold_vertical_bubble_lanes(model, image, final)
+    for row in final:
+        if row.get("recognizer_retry") == "bold-bubble-crop-consensus-v1":
+            row["pipeline_fingerprint"] = dict(pipeline_fingerprint)
+    final = _recover_low_confidence_clipped_vertical_donors(model, image, final)
+    final = _recover_orphan_vertical_lanes(model, image, final)
+    for row in final:
+        if row.get("recognizer_retry") == "clipped-low-confidence-donor-consensus-v1":
+            row["pipeline_fingerprint"] = dict(pipeline_fingerprint)
+        if row.get("recognizer_retry") == "orphan-vertical-consensus-v1":
+            row["pipeline_fingerprint"] = dict(pipeline_fingerprint)
+    final = _recover_isolated_short_bubble_lanes(model, image, final)
+    final = _recover_orphan_after_worker_cleanup(model, image, final)
+    final = _recover_ruby_anchored_full_main_lanes(model, image, final)
+    after_ruby = _recover_ruby_main_after_output_cleanup(model, image, final)
+    after_punctuation = _repair_ink_verified_punctuation_columns(
+        image, _recover_shifted_contextual_leading_lanes(model, image, after_ruby)
+    )
+    after_pair = _recover_missing_two_glyph_prefix(model, image, after_punctuation)
+    fused = _recover_fused_neighbor_column(model, image, after_pair)
+    full_tail = _recover_full_lane_above_clipped_vision_tail(model,image,fused)
+    short_main = _recover_short_ruby_adjacent_lower_main(model,image,full_tail)
+    upper_main = _recover_short_ruby_adjacent_upper_main(model, image, short_main)
+    without_edge = _suppress_unverified_left_edge_art_ocr(image,upper_main)
+    without_art = _suppress_art_connected_short_vertical_noise(image, without_edge)
+    without_ruby = _suppress_mixed_ruby_spill_vertical_regions(without_art)
+    after_prefix = [
+        _retry_spurious_punctuation_before_vertical_number(model, image, row)
+        for row in without_ruby
+    ]
+    without_poster_noise = _suppress_detector_only_microtext_below_numeric_caption(after_prefix)
+    without_sfx_noise = _suppress_unverified_large_sfx_tail(without_poster_noise)
+    isolated = _recover_isolated_glyph_after_short_number(model, image, without_sfx_noise)
+    return _recover_three_track_raw_gaps_v96p41(model, image, isolated)
+
+
+
+
+def _extend_three_track_trailing_ink_v96p41(
+    image: Image.Image,
+    box: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Include a physically observed, detached final kana in a short gap lane.
+
+    Thin strokes may fail the generic component area cutoff and an OCR crop can
+    truncate the last character even when its horizontal neighbours are correct.
+    Only extend a pre-qualified three-track candidate if the *original pixels*
+    show a vertical stroke and two separately connected horizontal strokes in
+    the same narrow lane immediately below its current bbox. This is a geometry
+    retry, not an OCR-word completion or an unconditional crop enlargement.
+    """
+    left, top, right, bottom = box
+    x0 = max(0, int(math.floor(left)))
+    x1 = min(image.width, int(math.ceil(right)))
+    y0 = max(0, int(math.ceil(bottom)))
+    y1 = min(image.height, y0 + 20)
+    if x1 - x0 < 13 or y1 - y0 < 17:
+        return box
+    gray = image.crop((x0, y0, x1, y1)).convert("L")
+    try:
+        binary = gray.point(lambda value: 255 if value < 125 else 0)
+        try:
+            components = _binary_components(binary)
+        finally:
+            binary.close()
+    finally:
+        gray.close()
+    vertical = [
+        (x, y, width, height, area)
+        for x, y, width, height, area in components
+        if 2 <= width <= 6 and 7 <= height <= 15
+        and area >= 14 and 0 <= y <= 5
+    ]
+    for x, y, width, height, area in vertical:
+        strokes = sorted(
+            ((sx, sy, sw, sh, sa)
+            for sx, sy, sw, sh, sa in components
+            if 4 <= sw <= 12 and 1 <= sh <= 4 and sa >= 6
+            and abs((sx + sw / 2) - (x + width / 2)) <= 12
+            and y <= sy <= y + 13),
+            key=lambda item: item[1],
+        )
+        for i, first in enumerate(strokes):
+            for second in strokes[i + 1:]:
+                if 3 <= second[1] - first[1] <= 11:
+                    low = max(y + height, first[1] + first[3], second[1] + second[3])
+                    if 9 <= low <= 19:
+                        return left, top, right, float(y0 + low + 1)
+    return box
+
+
+def _multi_column_gap_proposals_v96p41(
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Identify omitted glyph columns using ink and neighbouring column pitch.
+
+    This deliberately does not consume Mokuro text, page numbers or a
+    dictionary. A proposal is only a rectangle; recognition remains independent.
+    Currently bounded to short/tall vertical dialogue in the upper 62% of a
+    page, where separated glyph components are reliable enough for a retry.
+    """
+    page_width, page_height = image.size
+    if page_width <= 0 or page_height <= 0:
+        return []
+    known = [
+        _pixel_bbox(row, page_width, page_height)
+        for row in regions
+        if row.get("orientation") == "vertical"
+    ]
+    if len(known) < 3:
+        return []
+    components = _raw_layout_component_candidates(image)
+    grouped: list[dict[str, object]] = []
+    for component in sorted(components, key=lambda row: float(row["cx"])):
+        cx = float(component["cx"])
+        group = min(
+            (item for item in grouped if abs(float(item["mean_x"]) - cx) <= 6.0),
+            key=lambda item: abs(float(item["mean_x"]) - cx),
+            default=None,
+        )
+        if group is None:
+            group = {"mean_x": cx, "items": []}
+            grouped.append(group)
+        items = group["items"]
+        assert isinstance(items, list)
+        items.append(component)
+        group["mean_x"] = sum(float(item["cx"]) for item in items) / len(items)
+
+    raw: list[tuple[float, float, float, float, int]] = []
+    for group in grouped:
+        items = group["items"]
+        assert isinstance(items, list)
+        run: list[dict[str, float]] = []
+        runs: list[list[dict[str, float]]] = []
+        for component in sorted(items, key=lambda value: float(value["y"])):
+            if run and float(component["y"]) - (
+                float(run[-1]["y"]) + float(run[-1]["height"])
+            ) > 32.0:
+                runs.append(run)
+                run = []
+            run.append(component)
+        if run:
+            runs.append(run)
+        for stack in runs:
+            if len(stack) < 4:
+                continue
+            left = min(float(c["x"]) for c in stack)
+            top = min(float(c["y"]) for c in stack)
+            right = max(float(c["x"]) + float(c["width"]) for c in stack)
+            bottom = max(float(c["y"]) + float(c["height"]) for c in stack)
+            width = right - left
+            height = bottom - top
+            if not (
+                10.0 <= width <= 32.0
+                and 58.0 <= height <= 225.0
+                and height / width >= 3.3
+                and top >= 12.0
+                and bottom <= page_height * 0.62
+            ):
+                continue
+            box = (left, top, right, bottom)
+            center = (left + right) / 2.0
+            if any(
+                abs(center - (other[0] + other[2]) / 2.0) < 11.0
+                and _pixel_vertical_overlap(box, other) > 0.5
+                for other in known
+            ):
+                continue
+            crop = image.crop((
+                max(0, int(left) - 1), max(0, int(top) - 1),
+                min(page_width, int(right) + 2),
+                min(page_height, int(bottom) + 2),
+            )).convert("L")
+            try:
+                histogram = crop.histogram()
+            finally:
+                crop.close()
+            pixel_count = max(1, sum(histogram))
+            black = sum(histogram[:100]) / pixel_count
+            white = sum(histogram[220:]) / pixel_count
+            if not (0.065 < black < 0.50 and white > 0.37):
+                continue
+            raw.append((left, top, right, bottom, len(stack)))
+
+    # Both already accepted and missing tracks can corroborate a short gap;
+    # require three distinct, nearly equidistant physical columns in one y band.
+    peers = [(*box, "known") for box in known] + [(*row[:4], "raw") for row in raw]
+
+    def center(box: tuple[object, ...]) -> float:
+        return (float(box[0]) + float(box[2])) / 2.0
+
+    def adjacent(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+        return (
+            17.0 <= abs(center(left) - center(right)) <= 45.0
+            and _pixel_vertical_overlap(left, right) >= 0.58
+        )
+
+    proposals: list[dict[str, object]] = []
+    for row in raw:
+        candidate = row[:4]
+        center_x = center(candidate)
+        near = [
+            peer for peer in peers
+            if peer[:4] != candidate
+            and abs(center(peer) - center_x) <= 90.0
+            and _pixel_vertical_overlap(candidate, peer) >= 0.55
+        ]
+        first = sorted(
+            (peer for peer in near if adjacent(candidate, peer)),
+            key=lambda peer: abs(center(peer) - center_x),
+        )[:8]
+        chain = False
+        for left in first:
+            for right in near:
+                if left == right:
+                    continue
+                ordered_centers = sorted((center(candidate), center(left), center(right)))
+                step_a = ordered_centers[1] - ordered_centers[0]
+                step_b = ordered_centers[2] - ordered_centers[1]
+                if (17.0 <= step_a <= 45.0 and 17.0 <= step_b <= 45.0
+                        and abs(step_a - step_b) <= 16.0):
+                    chain = True
+                    break
+            if chain:
+                break
+        if not chain:
+            continue
+        raw_box = _extend_three_track_trailing_ink_v96p41(image, candidate)
+        left, top, right, bottom = raw_box
+        # Keep the original raw-box extension and its 1 px OCR crop margin.
+        # A 12 px raw gap may be too narrow for the stroke detector, whereas
+        # its actual 14 px OCR crop includes the complete detached suffix.
+        left = max(0.0, left - 1.0)
+        top = max(0.0, top - 1.0)
+        right = min(float(page_width), right + 1.0)
+        bottom = min(float(page_height), bottom + 1.0)
+        if raw_box == candidate and 13 <= right - left < 16:
+            left, top, right, bottom = _extend_three_track_trailing_ink_v96p41(
+                image, (left, top, right, bottom),
+            )
+        proposals.append({
+            "text": "", "raw_text": "", "orientation": "vertical",
+            "x": round(left / page_width, 6),
+            "y": round(1.0 - bottom / page_height, 6),
+            "width": round((right - left) / page_width, 6),
+            "height": round((bottom - top) / page_height, 6),
+            "source": _LAYOUT_LINE_SOURCE,
+            "detector": _RAW_LAYOUT_DETECTOR,
+            "confidence": 0.6,
+            "geometry_status": "observed",
+            "provenance": {
+                "proposal_kind": "three_track_raw_gap_v96p41",
+                "component_count": row[4],
+                "detector_bbox_px": [left, top, right, bottom],
+            },
+        })
+    return proposals[:12]
+
+
+def _recover_three_track_raw_gaps_v96p41(
+    model: object,
+    image: Image.Image,
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    recovered = [dict(item) for item in regions]
+    for proposal in _multi_column_gap_proposals_v96p41(image, recovered):
+        text = _recognize_vertical_companion_consensus(model, image, proposal)
+        if not text or not (4 <= _japanese_character_count(text) <= 16):
+            continue
+        if any(
+            _normalize_line_surface(old.get("text")) == _normalize_line_surface(text)
+            and _region_coverage(old, proposal) >= 0.20
+            for old in recovered
+        ):
+            continue
+        if any(
+            _region_coverage(proposal, old) >= 0.50
+            and (
+                old.get("orientation") == proposal.get("orientation")
+                or _region_coverage(old, proposal) >= 0.50
+            )
+            for old in recovered
+        ):
+            # A short transverse detector fragment can sit across the top
+            # of a much taller verified vertical column. It is not evidence
+            # that the whole physical column was already recognized. Keep
+            # the original overlap guard for same-direction or broad peers.
+            continue
+        item = dict(proposal)
+        item.update({
+            "text": text, "raw_text": text,
+            "recognizer": "manga-ocr",
+            "recognizer_retry": "three-track-raw-gap-consensus-v96p41",
+            "recognition_selection": "three-track-raw-gap-consensus-v96p41",
+            "selected_hypothesis_id": "three-track-raw-gap-consensus-v96p41",
+            "hypotheses": [{"id": "three-track-raw-gap-consensus-v96p41", "text": text,
+                            "source": "manga-ocr-3crop-majority", "selected": True}],
+        })
+        segments = _layout_line_character_segments(item, text, image=image)
+        if not segments:
+            continue
+        item["segments"] = segments
+        item["word_geometry"] = "pixel-bounded-three-track-v96p41"
+        recovered.append(item)
+    return recovered
+
+
+def _suppress_mixed_ruby_spill_vertical_regions(
+    regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Discard a narrow ruby lane contaminated by a nearby main-print column.
+
+    A narrow phonetic reading should not become a separate clickable dialogue
+    sentence when OCR has fused its kana with punctuation from an adjacent,
+    already recognized main column. Ordinary furigana without this evidence
+    remains untouched (including readings beside otherwise recovered main text).
+    """
+    removed: set[int] = set()
+    for index, candidate in enumerate(regions):
+        if (candidate.get("source") != _LAYOUT_LINE_SOURCE
+                or candidate.get("orientation") != "vertical"):
+            continue
+        text = _compact_surface(candidate.get("text"))
+        width = _number(candidate.get("width"))
+        height = _number(candidate.get("height"))
+        provenance = candidate.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        kana = sum("\u3040" <= ch <= "\u30ff" for ch in text)
+        kanji = sum("\u3400" <= ch <= "\u9fff" for ch in text)
+        punctuation = sum(ch in "．．．！!。・、！？…" for ch in text)
+        if not (.012 <= width <= .0245 and .11 <= height <= .235
+                and len(text) >= 9 and kana >= 6 and kanji <= 1
+                and punctuation >= 2
+                and _number(provenance.get("black_ratio"), 1.0) < .13):
+            continue
+        x = _number(candidate.get("x"))
+        for peer_index, peer in enumerate(regions):
+            if (peer_index == index
+                    or peer.get("source") != _LAYOUT_LINE_SOURCE
+                    or peer.get("orientation") != "vertical"):
+                continue
+            peer_text = _compact_surface(peer.get("text"))
+            if sum("\u3400" <= ch <= "\u9fff" for ch in peer_text) < 2:
+                continue
+            peer_width = _number(peer.get("width"))
+            peer_height = _number(peer.get("height"))
+            peer_x = _number(peer.get("x"))
+            if (peer_width < width * 1.5 or peer_height < height * 1.25
+                    or _layout_vertical_overlap(candidate, peer) < .83):
+                continue
+            if peer_x + .7 * peer_width <= x <= peer_x + peer_width + .4 * width:
+                removed.add(index)
+                break
+    return [row for i, row in enumerate(regions) if i not in removed]
+
+
+def _fused_neighbor_column_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[tuple[float, float, float, float], list[tuple[int, int]],
+                tuple[float, float, float, float]]]:
+    """Unsplit printed lane between two retained peers inside a fused detector box.
+
+    The primary dilated component detector can fuse *two* printed columns into
+    one very wide region.  The right column survives OCR, but the adjacent
+    unrepresented column is then lost. Only a seven-ish-band raw-ink column
+    inside an otherwise unexplained gap between two independently recognized
+    neighbouring lanes can be proposed. No OCR text or page number is used.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    scale = width / 760.0
+    peers: list[tuple[tuple[float, float, float, float], dict[str, object]]] = []
+    for row in output:
+        if (row.get("source") != _LAYOUT_LINE_SOURCE
+                or row.get("orientation") != "vertical"
+                or len(_compact_surface(row.get("text"))) < 4):
+            continue
+        box = _pixel_bbox(row, width, height)
+        if 14*scale <= box[2]-box[0] <= 34*scale and 65*scale <= box[3]-box[1] <= 170*scale:
+            peers.append((box, row))
+    peers.sort(key=lambda part: part[0][0])
+    gaps = []
+    for index, (left, left_row) in enumerate(peers):
+        for right, right_row in peers[index + 1:]:
+            if right[0] - left[0] > 70*scale:
+                break
+            if abs(left[1] - right[1]) > 14*scale:
+                continue
+            start, stop = left[2] + 2*scale, right[0] - 3*scale
+            if not (16*scale <= stop-start <= 32*scale
+                    and min(left[3], right[3]) - max(left[1], right[1]) >= 60*scale):
+                continue
+            gaps.append((start, stop, left, right))
+    if not gaps:
+        return []
+    # Fused detector evidence is required: raw glyphs in a random art gap do
+    # not make a text line. Compute components only when qualifying peers exist.
+    detected = [_pixel_bbox(row, width, height)
+                for row in _layout_vertical_lines(image)
+                if (row.get("provenance") or {}).get("component_count", 0) >= 3]
+    raw = _raw_layout_component_candidates(image)
+    candidates = []
+    for start, stop, left, right in gaps:
+        y0 = min(left[1], right[1]) - 8*scale
+        y1 = max(left[3], right[3]) + 35*scale
+        components = sorted((component for component in raw
+                             if start <= component["x"]
+                             and component["x"]+component["width"] <= stop
+                             and y0 <= component["y"]
+                             and component["y"]+component["height"] <= y1
+                             and 3*scale <= component["width"] <= 19*scale
+                             and 5*scale <= component["height"] <= 23*scale),
+                            key=lambda component: component["y"])
+        bands: list[list[float]] = []
+        for component in components:
+            top, bottom = component["y"], component["y"]+component["height"]
+            if bands and top <= bands[-1][1] + scale:
+                bands[-1][1] = max(bands[-1][1], bottom)
+            else:
+                bands.append([top, bottom])
+        if (not 6 <= len(bands) <= 10
+                or bands[-1][1] - bands[0][0] < 85*scale
+                or max(component["cx"] for component in components)
+                   - min(component["cx"] for component in components) > 10*scale):
+            continue
+        box = (start, bands[0][0] - 2*scale, stop + scale, bands[-1][1] + 2*scale)
+        if any(_pixel_cover(box, _pixel_bbox(row, width, height)) >= .14
+               for row in output):
+            continue
+        fused = [region for region in detected
+                 if (region[0] <= start + 2*scale
+                     and region[2] >= right[2] - scale
+                     and region[1] <= bands[0][0] + 4*scale
+                     and region[3] >= bands[-1][1] - 15*scale
+                     and region[2]-region[0] >= 37*scale)]
+        if len(fused) != 1:
+            continue
+        candidates.append((box, [(round(top), round(bottom)) for top, bottom in bands], fused[0]))
+    return candidates[:3]
+
+
+def _recover_fused_neighbor_column(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Recover only OCR-consensus text with physical, nonoverlapping glyph boxes."""
+    from . import manga as manga_service
+    persisted = manga_service._finalize_recognized_regions(
+        _finalize_worker_output_regions(output))
+    recovered = list(output)
+    width, height = image.size
+    for box, bands, fused in _fused_neighbor_column_candidates(image, persisted):
+        left, top, right, bottom = box
+        if any(_pixel_cover(box, _pixel_bbox(peer, width, height)) >= .14
+               for peer in recovered):
+            continue
+        views = []
+        for pad in (0, 1, 3):
+            delta = round(pad * width / 760.0)
+            bounds = (max(0, round(left)-delta), max(0, round(top)-delta),
+                      min(width, round(right)+delta), min(height, round(bottom)+delta))
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                views.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                views.append("")
+            finally:
+                crop.close()
+        band_heights = [bottom - top for top, bottom in bands]
+        typical_glyph_height = statistics.median(band_heights)
+        # A vertically fused double-height ink band still contains two printed
+        # glyphs. Never accept a two-vote OCR truncation that drops one of them.
+        expected_glyphs = len(bands) + sum(
+            1 for height_px in band_heights
+            if height_px >= 1.75 * typical_glyph_height
+        )
+        valid = [text for text in views
+                 if 6 <= len(text) <= 10 and len(text) == expected_glyphs
+                 and _japanese_character_count(text) >= len(text)*.85]
+        winner = max(set(valid), key=lambda text: (valid.count(text), text), default="")
+        if not winner or valid.count(winner) < 2:
+            continue
+        if any(_vertical_recovery_surface(row.get("text")) == winner for row in recovered):
+            continue
+        item = {
+            "text": winner, "raw_text": winner, "orientation": "vertical",
+            "source": _LAYOUT_LINE_SOURCE,
+            "detector": "manga-fused-neighboring-column-v1",
+            "recognizer": "manga-ocr", "confidence": .62,
+            "x": round(left/width, 6), "y": round(1-bottom/height, 6),
+            "width": round((right-left)/width, 6),
+            "height": round((bottom-top)/height, 6),
+            "recognizer_retry": "fused-neighbor-column-crop-consensus-v1",
+            "recognition_selection": "fused-neighbor-column-crop-consensus-v1",
+            "selected_hypothesis_id": "fused-neighbor-column-crop-consensus-v1",
+            "hypotheses": [{"id": f"fused-gap-crop-{index}", "text": text,
+                            "source": "manga-ocr", "selected": text == winner}
+                           for index, text in enumerate(views)],
+            "provenance": {"raw_ink_glyph_bands_px": [list(band) for band in bands],
+                           "fused_detector_bbox_px": list(fused),
+                           "split_fused_neighboring_columns": True},
+            "geometry_status": "approximate",
+            "word_geometry": "observed-fused-neighboring-ink-v1",
+        }
+        item["segments"] = _layout_line_character_segments(item, winner, image=image)
+        if len(item["segments"]) != len(winner) or any(
+                _number(segment.get("height")) <= .005 for segment in item["segments"]):
+            continue
+        recovered.append(item)
+    return recovered
+
+def _missing_two_glyph_prefix_candidates(
+    image: Image.Image, output: list[dict[str, object]],
+) -> list[tuple[dict[str, object], tuple[float, float, float, float],
+                list[tuple[int, int]]]]:
+    """Two visibly printed, separately banded glyphs above a recovered tail.
+
+    The earlier leading-ink retry can recover the lower characters from a
+    clipped detector box yet stop below two larger preceding characters. Only
+    previously ink-verified vertical lines can anchor this second recovery.
+    We do not infer characters from the existing text or a page-specific rule.
+    """
+    width, height = image.size
+    if width < 500 or height < 500:
+        return []
+    scale = width / 760.0
+    result: list[tuple[dict[str, object], tuple[float, float, float, float],
+                       list[tuple[int, int]]]] = []
+    gray = image.convert("L")
+    try:
+        for row in output:
+            info = (row.get("provenance") or {}).get("leading_ink_geometry") or {}
+            if (row.get("source") != _LAYOUT_LINE_SOURCE
+                    or row.get("detector") != _LAYOUT_DETECTOR
+                    or row.get("orientation") != "vertical"
+                    or row.get("recognizer_retry") != "vertical-leading-ink-v1"
+                    or not 35*scale <= _number(info.get("extension_px")) <= 90*scale):
+                continue
+            old = _vertical_recovery_surface(row.get("text"))
+            left, top, right, bottom = _pixel_bbox(row, width, height)
+            if not (4 <= len(old) <= 10 and 25*scale <= right-left <= 48*scale
+                    and 90*scale <= top <= height-90*scale):
+                continue
+            x1, x2 = round(left+4*scale), round(right-3*scale)
+            y1, y2 = round(top-96*scale), round(top+5*scale)
+            if x1 < 0 or x2 > width or y1 < 0 or y2 > height or x2-x1 < 16:
+                continue
+            scan = gray.crop((x1, y1, x2, y2))
+            try:
+                raw = scan.tobytes()
+            finally:
+                scan.close()
+            scan_width = x2-x1
+            min_dark = max(round(7*scale), round(scan_width*.27))
+            runs: list[tuple[int, int]] = []
+            begin: int | None = None
+            for offset in range(y2-y1):
+                line = raw[offset*scan_width:(offset+1)*scan_width]
+                ink = sum(value < 120 for value in line) >= min_dark
+                if ink and begin is None:
+                    begin = y1+offset
+                elif not ink and begin is not None:
+                    runs.append((begin, y1+offset-1))
+                    begin = None
+            if begin is not None:
+                runs.append((begin, y2-1))
+            strong = [(a, b) for a, b in runs
+                      if 16*scale <= b-a+1 <= 39*scale]
+            if not (len(strong) == 2
+                    and scale <= strong[1][0]-strong[0][1]-1 <= 18*scale
+                    and abs(strong[-1][1]-top) <= 5*scale
+                    and strong[0][0] >= top-85*scale):
+                continue
+            box = (max(0.0, left-1*scale), max(0.0, strong[0][0]-3*scale),
+                   min(float(width), right+1*scale),
+                   min(float(height), strong[-1][1]+3*scale))
+            if any(_pixel_cover(box, _pixel_bbox(peer, width, height)) >= .16
+                   for peer in output):
+                continue
+            result.append((row, box, strong))
+    finally:
+        gray.close()
+    return result[:5]
+
+
+def _recover_missing_two_glyph_prefix(
+    model: object, image: Image.Image, output: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Append only two independently printed glyphs; never rewrite the tail.
+
+    Three OCR crops must agree at least twice, and two distinct full-height ink
+    bands must support the new region. Existing golden text and its hitboxes are
+    retained unchanged; the missing leading pair has its own two glyph hitboxes.
+    """
+    width, height = image.size
+    recovered = list(output)
+    for tail, box, bands in _missing_two_glyph_prefix_candidates(image, recovered):
+        left, top, right, bottom = box
+        views: list[str] = []
+        for pad in (0, 3, 6):
+            amount = round(pad * width / 760.0)
+            bounds = (max(0, round(left)-amount), max(0, round(top)-amount),
+                      min(width, round(right)+amount), min(height, round(bottom)+amount))
+            crop = image.crop(bounds).convert("RGB")
+            try:
+                views.append(_vertical_recovery_surface(model(crop)))  # type: ignore[operator]
+            except Exception:
+                views.append("")
+            finally:
+                crop.close()
+        valid = [text for text in views if len(_study_surface_characters(text)) == 2
+                 and _japanese_character_count(text) == 2 and len(text) == 2]
+        if len(valid) < 2:
+            continue
+        winner = max(set(valid), key=lambda text: (valid.count(text), text))
+        if valid.count(winner) < 2 or winner in _vertical_recovery_surface(tail.get("text")) or any(
+                _vertical_recovery_surface(row.get("text")) == winner
+                and _pixel_cover(box, _pixel_bbox(row, width, height)) >= .05
+                for row in recovered):
+            continue
+        item = {
+            "text": winner, "raw_text": winner,
+            "orientation": "vertical", "source": _LAYOUT_LINE_SOURCE,
+            "detector": "manga-leading-two-glyph-bands-v1",
+            "recognizer": "manga-ocr", "confidence": .62,
+            "x": round(left/width, 6), "y": round(1-bottom/height, 6),
+            "width": round((right-left)/width, 6),
+            "height": round((bottom-top)/height, 6),
+            "recognizer_retry": "leading-two-glyph-ink-consensus-v1",
+            "recognition_selection": "leading-two-glyph-ink-consensus-v1",
+            "selected_hypothesis_id": "leading-two-glyph-ink-consensus-v1",
+            "hypotheses": [{"id": f"leading-pair-{i}", "text": text,
+                            "source": "manga-ocr", "selected": text == winner}
+                           for i, text in enumerate(views)],
+            "provenance": {
+                "observed_upper_glyph_bands_px": [list(band) for band in bands],
+                "anchor_lower_line_bbox_px": list(_pixel_bbox(tail, width, height)),
+                "two_glyph_ink_consensus": True,
+            },
+            "geometry_status": "approximate",
+            "word_geometry": "observed-leading-two-glyph-bands-v1",
+        }
+        segments = []
+        for char, (band_top, band_bottom) in zip(winner, bands):
+            seg_top = max(0., band_top - 1*width/760)
+            seg_bottom = min(float(height), band_bottom + 1*width/760)
+            segments.append({
+                "text": char, "orientation": "vertical",
+                "x": item["x"], "width": item["width"],
+                "y": round(1-seg_bottom/height, 6),
+                "height": round((seg_bottom-seg_top)/height, 6),
+                "source": "observed-leading-two-glyph-bands-v1",
+                "geometry_status": "approximate",
+            })
+        item["segments"] = segments
+        recovered.append(item)
+    return recovered
+
+
+def _repair_ink_verified_punctuation_column(
+    image: Image.Image, region: dict[str, object],
+) -> dict[str, object]:
+    """Remove OCR-invented kana only when the column is *physically* all dots + !!.
+
+    No language-model vote can prove punctuation-only content. Require a stack
+    of six or more uniform round, aligned ink components, immediately followed
+    by two exclamation strokes in the actual image crop. Leave every uncertain
+    page/region unchanged; this never manufactures a lexical word.
+    """
+    text = _compact_surface(region.get("text"))
+    surface = unicodedata.normalize("NFKC", text)
+    match = re.fullmatch(r"[.・…]{2,}(.+?)(!{2})", surface)
+    if not match or _japanese_character_count(match.group(1)) < 2:
+        return region
+    if (
+        region.get("orientation") != "vertical"
+        or region.get("source") != _LAYOUT_LINE_SOURCE
+        or region.get("detector") != "manga-ink-components-v1"
+    ):
+        return region
+    page_width, page_height = image.size
+    scale = page_width / 760.0
+    left, top, right, bottom = _pixel_bbox(region, page_width, page_height)
+    x1, y1 = max(0, int(math.floor(left))), max(0, int(math.floor(top)))
+    x2 = min(page_width, int(math.ceil(right)))
+    y2 = min(page_height, int(math.ceil(bottom)))
+    if not (12 * scale <= x2 - x1 <= 28 * scale and
+            85 * scale <= y2 - y1 <= 170 * scale):
+        return region
+    crop = image.crop((x1, y1, x2, y2)).convert("L")
+    binary = crop.point(lambda value: 255 if value < 140 else 0)
+    try:
+        components = sorted(
+            (x, y, w, h, area) for x, y, w, h, area in _binary_components(binary)
+            if area >= 3 * scale * scale
+        )
+    finally:
+        binary.close()
+        crop.close()
+    components.sort(key=lambda box: box[1])
+    dots = []
+    for component in components:
+        x, y, w, h, area = component
+        if not (4 * scale <= w <= 11 * scale and
+                4 * scale <= h <= 11 * scale and
+                abs(w - h) <= 2.5 * scale and
+                .52 <= area / (w * h) <= .88):
+            break
+        if dots:
+            prev = dots[-1]
+            gap = y - prev[1]
+            if not (8 * scale <= gap <= 14 * scale and
+                    abs(x + w / 2 - (prev[0] + prev[2] / 2)) <= 2.5 * scale):
+                break
+        dots.append(component)
+    if not (6 <= len(dots) <= 12 and len(dots) % 3 == 0):
+        return region
+    trailing = components[len(dots):]
+    # Two observed exclamation strokes, not a guessed Japanese character.
+    strokes = [box for box in trailing if box[3] >= 12 * scale and
+               box[1] > dots[-1][1] + dots[-1][3]]
+    if len(strokes) != 2 or len(trailing) > 5:
+        return region
+    if abs(strokes[0][1] - strokes[1][1]) > 3 * scale:
+        return region
+    if any(box[1] < strokes[0][1] for box in trailing):
+        return region
+    physical = "…" * (len(dots) // 3) + "！！"
+    if physical == text:
+        return region
+    fixed = dict(region)
+    fixed["text"] = physical
+    fixed["recognition_correction"] = "vertical-punctuation-ink-proof-v1"
+    fixed["selected_hypothesis_id"] = "vertical-punctuation-ink-proof-v1"
+    fixed["word_geometry"] = "observed-punctuation-ink-v1"
+    fixed["segments"] = _layout_line_character_segments(fixed, physical, image=image)
+    provenance = dict(region.get("provenance") or {})
+    provenance["punctuation_ink_proof"] = {
+        "dot_components": len(dots), "terminal_strokes": len(strokes),
+        "bbox_px": [x1, y1, x2, y2],
+    }
+    fixed["provenance"] = provenance
+    hypotheses = [dict(h) for h in region.get("hypotheses") or [] if isinstance(h, dict)]
+    for hypothesis in hypotheses:
+        hypothesis["selected"] = False
+    hypotheses.append({"id": "vertical-punctuation-ink-proof-v1", "text": physical,
+                       "source": "observed-page-ink", "selected": True})
+    fixed["hypotheses"] = hypotheses
+    return fixed
+
+
+def _repair_ink_verified_punctuation_columns(
+    image: Image.Image, regions: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [_repair_ink_verified_punctuation_column(image, row) for row in regions]
 
 
 def _single(source: Path, output: Path) -> int:

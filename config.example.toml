@@ -94,6 +94,10 @@ mpv_mark_watched = "Ctrl+a"
 energy_monitoring_enabled = true
 energy_sample_seconds = 30.0
 
+[power]
+manual_energy_saving = false
+auto_battery_energy_saving = true
+
 [companion]
 # Disabled until a companion client is paired. Keep 127.0.0.1 for local-only
 # development; use 0.0.0.0 only on a trusted LAN.

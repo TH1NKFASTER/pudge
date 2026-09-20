@@ -26,10 +26,22 @@ import httpx
 from rapidfuzz import fuzz
 
 from .branding import APP_SLUG
+from .cover_assets import CoverRef
 from .llm import OllamaClient, build_chat_payload
+from .library_groups import literature_franchise_metadata
 from .metadata_cache import MetadataCache
 from .providers.nyaa import NyaaClient, NyaaRelease
 from .providers.qbittorrent import QBittorrentClient
+from .review_providers import (
+    JITEN_API_BASE,
+    JPDB_API_BASE,
+    JitenReviewProvider,
+    JpdbReviewProvider,
+    ReviewOutcomeUnknown,
+    ReviewProviderError,
+    credential_account_key,
+    provider_capabilities,
+)
 
 
 class LightNovelError(RuntimeError):
@@ -447,6 +459,71 @@ def _html_chapter_title(raw: bytes) -> str:
             continue
         return title[:160]
     return ""
+
+
+def _epub_cover_blob(path: Path) -> tuple[bytes, str] | None:
+    """Read only an EPUB cover without parsing chapter bodies."""
+    with zipfile.ZipFile(path) as zf:
+        try:
+            container = ET.fromstring(zf.read("META-INF/container.xml"))
+        except (KeyError, ET.ParseError) as exc:
+            raise LightNovelError(f"Invalid EPUB container: {exc}") from exc
+        rootfile = next((node for node in container.iter() if node.tag.endswith("rootfile")), None)
+        if rootfile is None:
+            raise LightNovelError("EPUB has no rootfile")
+        opf_path = str(rootfile.attrib.get("full-path") or "")
+        if not opf_path:
+            raise LightNovelError("EPUB rootfile path is empty")
+        try:
+            opf = ET.fromstring(zf.read(opf_path))
+        except (KeyError, ET.ParseError) as exc:
+            raise LightNovelError(f"Invalid EPUB package: {exc}") from exc
+
+        cover_id = ""
+        manifest: dict[str, tuple[str, str, str]] = {}
+        for node in opf.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag == "meta" and str(node.attrib.get("name") or "").casefold() == "cover":
+                cover_id = str(node.attrib.get("content") or "")
+            elif tag == "item":
+                item_id = str(node.attrib.get("id") or "")
+                href = str(node.attrib.get("href") or "")
+                if item_id and href:
+                    manifest[item_id] = (
+                        href,
+                        str(node.attrib.get("media-type") or ""),
+                        str(node.attrib.get("properties") or ""),
+                    )
+
+        cover_entry = manifest.get(cover_id) if cover_id else None
+        if cover_entry is None:
+            cover_entry = next((entry for entry in manifest.values() if "cover-image" in entry[2].split()), None)
+        if cover_entry is None:
+            cover_entry = next(
+                (entry for entry in manifest.values() if entry[1].startswith("image/") and "cover" in entry[0].casefold()),
+                None,
+            )
+        if cover_entry is None:
+            return None
+        href, media_type, _props = cover_entry
+        href_path = PurePosixPath(unquote(str(href).split("#", 1)[0]))
+        archive_path = str((PurePosixPath(opf_path).parent / href_path).as_posix())
+        try:
+            raw = zf.read(archive_path)
+        except KeyError:
+            return None
+        if not raw:
+            return None
+        suffix = PurePosixPath(href).suffix.casefold()
+        if not suffix:
+            suffix = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/webp": ".webp",
+                "image/gif": ".gif",
+            }.get(media_type.casefold(), ".jpg")
+        return raw, suffix
+
 
 def _epub_metadata(path: Path) -> tuple[str, list[tuple[str, str]], tuple[bytes, str] | None]:
     with zipfile.ZipFile(path) as zf:
@@ -909,6 +986,7 @@ class LightNovelSettings:
     reader_mode: str = "scroll"
     blur_images: bool = False
     auto_bookmarks: bool = True
+    highlight_optimal_words: bool = True
     word_color_theme: str = "balanced"
     word_color_new: str = "#f3f6fb"
     word_color_learning: str = "#f4bd63"
@@ -931,8 +1009,8 @@ class LightNovelSettings:
 
 class LightNovelService:
     CONTENT_SCHEMA = 10
-    JITEN_BASE = "https://api.jiten.moe/api"
-    JPDB_BASE = "https://jpdb.io"
+    JITEN_BASE = JITEN_API_BASE
+    JPDB_BASE = JPDB_API_BASE
     WORD_COLOR_THEMES = {
         "balanced", "jiten", "jpdb", "focus", "underline", "none", "custom"
     }
@@ -943,6 +1021,20 @@ class LightNovelService:
     )
     DEFAULT_FURIGANA_STATES = "new,learning,young,mature,due,failed"
     DEFAULT_UNDERLINE_STATES = "new,learning,young,mature,due,failed,known,mastered,never-forget,blacklisted"
+    JITEN_LIVE_STATE_TTL_SECONDS = 45.0
+    JITEN_STATE_PREFETCH_BATCH_SIZE = 200
+    JITEN_STATE_PREFETCH_PAUSE_SECONDS = 0.20
+    JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS = 60.0
+    JITEN_KNOWN_STATE_BY_VALUE = {
+        0: "new",
+        1: "young",
+        2: "mature",
+        3: "blacklisted",
+        4: "due",
+        5: "mastered",
+        6: "redundant",
+        7: "suspended",
+    }
 
     @classmethod
     def _jiten_state_csv(cls, value: Any, default: str) -> str:
@@ -1027,6 +1119,15 @@ class LightNovelService:
         self._jiten_media_cache = MetadataCache(
             Path(config.paths.cache_dir), "jiten-media-stats", schema="v2"
         )
+        # Jiten lexical/token parsing is stable enough for the chapter cache, but
+        # the user's SRS state is mutable. Keep it separately and briefly in
+        # memory so a cached chapter can never pin New/Young/Mature forever.
+        self._jiten_live_state_lock = threading.RLock()
+        self._jiten_live_state_cache: dict[
+            tuple[str, int, int], tuple[float, dict[str, Any]]
+        ] = {}
+        self._jiten_optimal_stats_lock = threading.Lock()
+        self._jiten_optimal_stats_cache: dict[str, tuple[float, dict[str, int]]] = {}
         self._ensure_schema()
 
     def _log(self, message: str, *args: Any) -> None:
@@ -1204,6 +1305,7 @@ class LightNovelService:
             reader_mode=values.get("reader_mode", "scroll") if values.get("reader_mode", "scroll") in {"scroll", "pages"} else "scroll",
             blur_images=values.get("blur_images", "0") == "1",
             auto_bookmarks=values.get("auto_bookmarks", "1") != "0",
+            highlight_optimal_words=values.get("highlight_optimal_words", "1") != "0",
             word_color_theme=(
                 values.get("word_color_theme", "balanced")
                 if values.get("word_color_theme", "balanced") in self.WORD_COLOR_THEMES
@@ -1254,7 +1356,7 @@ class LightNovelService:
             "reader_font", "reader_theme", "reader_font_size", "reader_text_color", "reader_background_color",
             "reader_width", "reader_line_height", "reader_indent", "reader_vertical", "reader_mode",
             "blur_images",
-            "auto_bookmarks",
+            "auto_bookmarks", "highlight_optimal_words",
             "word_color_theme", "word_color_new", "word_color_learning", "word_color_due",
             "word_color_known", "word_color_blacklisted",
             "pitch_accent_color",
@@ -1315,6 +1417,9 @@ class LightNovelService:
             "reader_mode": str(values.get("reader_mode", current.reader_mode)).strip().lower(),
             "blur_images": "1" if bool(values.get("blur_images", current.blur_images)) else "0",
             "auto_bookmarks": "1" if bool(values.get("auto_bookmarks", current.auto_bookmarks)) else "0",
+            "highlight_optimal_words": (
+                "1" if bool(values.get("highlight_optimal_words", current.highlight_optimal_words)) else "0"
+            ),
             "word_color_theme": str(
                 values.get("word_color_theme", current.word_color_theme)
             ).strip().lower(),
@@ -1406,6 +1511,7 @@ class LightNovelService:
             "reader_mode": s.reader_mode,
             "blur_images": s.blur_images,
             "auto_bookmarks": s.auto_bookmarks,
+            "highlight_optimal_words": s.highlight_optimal_words,
             "word_color_theme": s.word_color_theme,
             "word_color_new": s.word_color_new,
             "word_color_learning": s.word_color_learning,
@@ -1529,6 +1635,40 @@ class LightNovelService:
             temp.write_bytes(raw)
             temp.replace(target)
         return f"covers/{target.name}"
+
+    def cover_ref(self, book_id: int, *, asset_base: str) -> CoverRef:
+        book = self.book(int(book_id))
+        cover_url = str(book.get("cover_url") or "").strip()
+        if not cover_url and book.get("anilist_id") is not None and self._anilist_cache is not None:
+            media_id = int(book["anilist_id"])
+            remote = next(
+                (item for item in self._anilist_cache[1] if int(item.get("media_id") or 0) == media_id),
+                None,
+            )
+            cover_url = str((remote or {}).get("cover") or "").strip()
+        if not cover_url:
+            raise LightNovelError("Light novel has no cover")
+        if cover_url.startswith("covers/"):
+            filename = Path(cover_url).name
+            target = self.cover_cache_dir / filename
+            if not target.is_file() or target.stat().st_size <= 0:
+                raise LightNovelError("Stored light novel cover is missing")
+            revision = hashlib.sha256(
+                f"{filename}:{target.stat().st_size}:{target.stat().st_mtime_ns}".encode("utf-8")
+            ).hexdigest()[:20]
+            preview_url = f"{asset_base}/covers/{filename}"
+            source_kind = "embedded"
+        else:
+            revision = hashlib.sha256(cover_url.encode("utf-8")).hexdigest()[:20]
+            preview_url = cover_url if cover_url.startswith(("http://", "https://", "data:")) else f"{asset_base}/{cover_url.lstrip('/')}"
+            source_kind = "remote" if cover_url.startswith(("http://", "https://")) else "embedded"
+        return CoverRef(
+            asset_id=f"light_novel:{int(book_id)}",
+            source_revision=revision,
+            thumbnail_url=preview_url,
+            preview_url=preview_url,
+            source_kind=source_kind,
+        )
 
     def _migrate_inline_covers(self) -> int:
         """Move legacy EPUB data URLs out of SQLite/WebKit into the cover cache."""
@@ -1798,6 +1938,38 @@ class LightNovelService:
             self._log("LN repaired local metadata rows=%s", repaired)
         return repaired
 
+    def _repair_missing_local_cover(self, item: dict[str, Any]) -> dict[str, Any]:
+        cover_url = str(item.get("cover_url") or "").strip()
+        if not cover_url.startswith("covers/"):
+            return item
+        target = self.cover_cache_dir / Path(cover_url).name
+        try:
+            if target.is_file() and target.stat().st_size > 0:
+                return item
+        except OSError:
+            pass
+        source = Path(str(item.get("file_path") or ""))
+        if source.suffix.casefold() != ".epub" or not source.is_file():
+            return item
+        try:
+            cover = _epub_cover_blob(source)
+            if cover is None:
+                return item
+            raw, suffix = cover
+            restored_url = self._store_cover_bytes(raw, suffix)
+        except (OSError, LightNovelError, zipfile.BadZipFile, UnicodeError, ET.ParseError) as exc:
+            self._log("LN cover repair skipped book=%s error=%s", item.get("id"), exc)
+            return item
+        if restored_url != cover_url:
+            with self._connection() as conn:
+                conn.execute(
+                    "UPDATE ln_books SET cover_url=?,updated_at=? WHERE id=?",
+                    (restored_url, time.time(), int(item["id"])),
+                )
+            item["cover_url"] = restored_url
+        self._log("LN restored missing EPUB cover book=%s cover=%s", item.get("id"), item.get("cover_url"))
+        return item
+
     def books(self) -> list[dict[str, Any]]:
         self._repair_missing_volumes()
         with self._connection() as conn:
@@ -1821,7 +1993,7 @@ class LightNovelService:
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
-            item = dict(row)
+            item = self._repair_missing_local_cover(dict(row))
             title = str(item.get("title") or "")
             media_id = item.get("anilist_id")
             item["series_key"] = (
@@ -2027,6 +2199,41 @@ class LightNovelService:
                 break
         raise LightNovelError(f"Jiten request failed: {last}")
 
+    def _jiten_mutation(self, action: str, payload: dict[str, Any] | None = None) -> Any:
+        """Single-send Jiten mutation. Ambiguous failures are never retried here."""
+        token = self.settings().jiten_api_key
+        if not token:
+            raise LightNovelError("Jiten API token is not configured")
+        url = f"{self.JITEN_BASE}/{action.lstrip('/')}"
+        try:
+            response = httpx.post(
+                url, headers=self._jiten_headers(token), json=payload, timeout=30
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise LightNovelError(f"Jiten mutation outcome is unknown: {exc}") from exc
+        if response.status_code == 408 or response.status_code >= 500:
+            raise LightNovelError(
+                f"Jiten mutation outcome is unknown after HTTP {response.status_code}"
+            )
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = str(body.get("error_message") or body.get("detail") or "")
+            except Exception:
+                pass
+            raise LightNovelError(
+                f"Jiten HTTP {response.status_code}{': ' + detail if detail else ''}"
+            )
+        try:
+            data = response.json() if response.content else {}
+        except ValueError as exc:
+            raise LightNovelError("Jiten mutation outcome is unknown: invalid JSON") from exc
+        if isinstance(data, dict) and data.get("error_message"):
+            raise LightNovelError(str(data["error_message"]))
+        return data
+
     def _jiten_get(self, action: str, params: dict[str, Any] | None = None) -> Any:
         token = self.settings().jiten_api_key
         headers = {
@@ -2059,6 +2266,389 @@ class LightNovelService:
                     continue
                 break
         raise LightNovelError(f"Jiten request failed: {last}")
+
+    @classmethod
+    def _jiten_known_state_names(cls, payload: Any) -> list[str]:
+        """Normalize Jiten KnownState enum values/names into stable lowercase names."""
+        rows = payload if isinstance(payload, list) else []
+        result: list[str] = []
+        aliases = {
+            "neverforget": "never-forget",
+            "never_forget": "never-forget",
+        }
+        for value in rows:
+            state = ""
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                state = cls.JITEN_KNOWN_STATE_BY_VALUE.get(int(value), "")
+            else:
+                raw = str(value or "").strip()
+                if raw.isdigit():
+                    state = cls.JITEN_KNOWN_STATE_BY_VALUE.get(int(raw), "")
+                else:
+                    state = aliases.get(raw.casefold(), raw.casefold().replace("_", "-"))
+            if state and state not in result:
+                result.append(state)
+        return result
+
+    @staticmethod
+    def _jiten_state_label(states: list[str]) -> str:
+        lowered = {str(value or "").casefold() for value in states}
+        # Jiten's word page presents the durable tier as the primary label even
+        # when Due is also present. Keep that behavior in the Pudge popup.
+        for state, label in (
+            ("blacklisted", "Blacklisted"),
+            ("mastered", "Mastered"),
+            ("mature", "Mature"),
+            ("young", "Young"),
+            ("due", "Due"),
+            ("suspended", "Suspended"),
+            ("redundant", "Redundant"),
+            ("new", "New"),
+        ):
+            if state in lowered:
+                return label
+        return "New"
+
+    def _jiten_live_state_key(self, word_id: int, reading_index: int) -> tuple[str, int, int]:
+        account_key = credential_account_key("jiten", self.settings().jiten_api_key)
+        return (account_key, int(word_id), int(reading_index))
+
+    def _cached_jiten_live_state(
+        self,
+        word_id: int,
+        reading_index: int,
+        *,
+        allow_stale: bool = False,
+    ) -> dict[str, Any] | None:
+        key = self._jiten_live_state_key(word_id, reading_index)
+        if not key[0]:
+            return None
+        with self._jiten_live_state_lock:
+            cached = self._jiten_live_state_cache.get(key)
+        if cached is None:
+            return None
+        fetched_at, payload = cached
+        if not allow_stale and time.monotonic() - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS:
+            return None
+        result = dict(payload)
+        result["stale"] = bool(time.monotonic() - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS)
+        return result
+
+    def invalidate_jiten_live_state(self, word_id: int, reading_index: int) -> None:
+        key = self._jiten_live_state_key(word_id, reading_index)
+        with self._jiten_live_state_lock:
+            self._jiten_live_state_cache.pop(key, None)
+
+    def _jiten_live_state_payload(
+        self,
+        word_id: int,
+        reading_index: int,
+        raw_states: Any,
+        *,
+        knowledge_status: str,
+        study_deck_ids: Any = None,
+    ) -> dict[str, Any]:
+        states = self._jiten_known_state_names(raw_states)
+        payload = {
+            "ok": True,
+            "provider": "jiten",
+            "wordId": int(word_id),
+            "readingIndex": int(reading_index),
+            "states": states,
+            "knownState": states,
+            "normalizedState": self._normalized_state(states),
+            "rawStateLabel": self._jiten_state_label(states),
+            "knowledgeStatus": str(knowledge_status),
+            "stale": False,
+        }
+        if isinstance(study_deck_ids, list):
+            payload["studyDeckIds"] = [
+                int(value) for value in study_deck_ids
+                if isinstance(value, int) or str(value).isdigit()
+            ]
+        return payload
+
+    def jiten_live_states(
+        self,
+        pairs: list[tuple[int, int]],
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Batch-refresh Jiten state for word identities while preserving R15 fallback semantics."""
+        settings = self.settings()
+        token = str(settings.jiten_api_key or "").strip()
+        if not token:
+            raise LightNovelError("Jiten API token is not configured")
+        account_key = credential_account_key("jiten", token)
+        if not account_key:
+            raise LightNovelError("Jiten account identity is unavailable")
+
+        ordered: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for raw_word_id, raw_reading_index in pairs:
+            try:
+                pair = (int(raw_word_id), int(raw_reading_index))
+            except (TypeError, ValueError):
+                continue
+            if pair[0] <= 0 or pair[1] < 0 or pair in seen:
+                continue
+            seen.add(pair)
+            ordered.append(pair)
+        if not ordered:
+            return []
+
+        now = time.monotonic()
+        ready: dict[tuple[int, int], dict[str, Any]] = {}
+        pending: list[tuple[int, int]] = []
+        stale: dict[tuple[int, int], dict[str, Any]] = {}
+        with self._jiten_live_state_lock:
+            for pair in ordered:
+                cached = self._jiten_live_state_cache.get((account_key, pair[0], pair[1]))
+                if cached is None:
+                    pending.append(pair)
+                    continue
+                fetched_at, payload = cached
+                snapshot = dict(payload)
+                expired = now - fetched_at > self.JITEN_LIVE_STATE_TTL_SECONDS
+                snapshot["stale"] = bool(expired)
+                stale[pair] = snapshot
+                if not force and not expired:
+                    snapshot["knowledgeStatus"] = "live_state_cache"
+                    ready[pair] = snapshot
+                else:
+                    pending.append(pair)
+
+        if pending:
+            try:
+                response = self._jiten_request(
+                    "reader/lookup-vocabulary",
+                    {"words": [[word_id, reading_index] for word_id, reading_index in pending]},
+                )
+                rows = response.get("result") if isinstance(response, dict) else None
+                deck_rows = response.get("decks") if isinstance(response, dict) else None
+                if not isinstance(rows, list) or len(rows) != len(pending):
+                    raise LightNovelError(
+                        "Jiten vocabulary-state lookup returned a row count that does not match the request"
+                    )
+                if not isinstance(deck_rows, list) or len(deck_rows) != len(pending):
+                    deck_rows = [[] for _ in pending]
+                fetched_at = time.monotonic()
+                with self._jiten_live_state_lock:
+                    for pair, raw_states, deck_ids in zip(pending, rows, deck_rows):
+                        payload = self._jiten_live_state_payload(
+                            pair[0],
+                            pair[1],
+                            raw_states,
+                            knowledge_status="live_provider_batch",
+                            study_deck_ids=deck_ids,
+                        )
+                        self._jiten_live_state_cache[(account_key, pair[0], pair[1])] = (
+                            fetched_at,
+                            dict(payload),
+                        )
+                        ready[pair] = payload
+            except Exception:
+                missing = []
+                for pair in pending:
+                    snapshot = stale.get(pair)
+                    if snapshot is None:
+                        missing.append(pair)
+                        continue
+                    snapshot = dict(snapshot)
+                    snapshot["knowledgeStatus"] = "stale_live_state_cache"
+                    snapshot["stale"] = True
+                    ready[pair] = snapshot
+                if missing:
+                    raise
+
+        return [ready[pair] for pair in ordered if pair in ready]
+
+    def jiten_optimal_word_stats(self, *, force: bool = False) -> dict[str, int]:
+        """Return the account Mature count and N+1 frequency ceiling.
+
+        Jiten exposes the authoritative Mature count separately from the local
+        parsed corpus. Keep it briefly cached per account: the threshold only
+        changes after reviews and does not need to accompany every reader batch.
+        """
+        token = str(self.settings().jiten_api_key or "").strip()
+        if not token:
+            return {"matureWords": 0, "optimalWordLimit": 1000}
+        account_key = credential_account_key("jiten", token)
+        now = time.monotonic()
+        if account_key and not force:
+            with self._jiten_optimal_stats_lock:
+                cached = self._jiten_optimal_stats_cache.get(account_key)
+            if cached is not None and now - cached[0] <= self.JITEN_OPTIMAL_WORD_STATS_TTL_SECONDS:
+                return dict(cached[1])
+        data = self._jiten_get("user/vocabulary/known-ids/amount")
+        mature = 0
+        if isinstance(data, dict):
+            try:
+                mature = max(0, int(data.get("mature") if data.get("mature") is not None else data.get("Mature") or 0))
+            except (TypeError, ValueError):
+                mature = 0
+        payload = {"matureWords": mature, "optimalWordLimit": max(1000, mature * 2)}
+        if account_key:
+            with self._jiten_optimal_stats_lock:
+                self._jiten_optimal_stats_cache[account_key] = (now, dict(payload))
+        return payload
+
+    def jiten_corpus_pairs(self) -> list[tuple[int, int]]:
+        """Return parsed local vocabulary ordered by Jiten frequency, then local occurrence count."""
+        stats: dict[tuple[int, int], list[int | None]] = {}
+        with self._connection() as conn:
+            cursor = conn.execute(
+                "SELECT parsed_json FROM ln_parse_cache "
+                "WHERE parser_schema LIKE 'jiten%' ORDER BY created_at"
+            )
+            for row in cursor:
+                try:
+                    parsed = json.loads(str(row["parsed_json"] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                for item in parsed.get("vocabulary") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        pair = (int(item.get("wordId")), int(item.get("readingIndex")))
+                    except (TypeError, ValueError):
+                        continue
+                    if pair[0] <= 0 or pair[1] < 0:
+                        continue
+                    entry = stats.setdefault(pair, [None, 0])
+                    try:
+                        rank = int(item.get("frequencyRank"))
+                    except (TypeError, ValueError):
+                        rank = 0
+                    if rank > 0 and (entry[0] is None or rank < int(entry[0])):
+                        entry[0] = rank
+                for group in parsed.get("tokens") or []:
+                    if not isinstance(group, list):
+                        continue
+                    for token_row in group:
+                        if not isinstance(token_row, dict):
+                            continue
+                        try:
+                            pair = (
+                                int(token_row.get("wordId")),
+                                int(token_row.get("readingIndex")),
+                            )
+                        except (TypeError, ValueError):
+                            continue
+                        if pair[0] <= 0 or pair[1] < 0:
+                            continue
+                        entry = stats.setdefault(pair, [None, 0])
+                        entry[1] = int(entry[1] or 0) + 1
+
+        unknown_rank = 1 << 60
+        return sorted(
+            stats,
+            key=lambda pair: (
+                int(stats[pair][0]) if stats[pair][0] is not None else unknown_rank,
+                -int(stats[pair][1] or 0),
+                pair[0],
+                pair[1],
+            ),
+        )
+
+    def jiten_prefetch_corpus_states(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        """Warm the R15 live-state cache from the already parsed local LN/manga corpus."""
+        if not str(self.settings().jiten_api_key or "").strip():
+            return {"ok": False, "reason": "no_api_key", "total": 0, "warmed": 0}
+        pairs = self.jiten_corpus_pairs()
+        size = max(1, min(500, int(batch_size or self.JITEN_STATE_PREFETCH_BATCH_SIZE)))
+        warmed = 0
+        batches = 0
+        for offset in range(0, len(pairs), size):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            batch = pairs[offset : offset + size]
+            try:
+                warmed += len(self.jiten_live_states(batch))
+                batches += 1
+            except Exception as exc:
+                self._log(
+                    "Jiten state corpus prefetch stopped offset=%s total=%s error=%s",
+                    offset,
+                    len(pairs),
+                    exc,
+                )
+                return {
+                    "ok": False,
+                    "reason": "provider_error",
+                    "total": len(pairs),
+                    "warmed": warmed,
+                    "batches": batches,
+                    "error": str(exc),
+                }
+            if offset + size < len(pairs) and self.JITEN_STATE_PREFETCH_PAUSE_SECONDS > 0:
+                if cancel_event is not None:
+                    if cancel_event.wait(self.JITEN_STATE_PREFETCH_PAUSE_SECONDS):
+                        break
+                else:
+                    time.sleep(self.JITEN_STATE_PREFETCH_PAUSE_SECONDS)
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        return {
+            "ok": not cancelled,
+            "reason": "cancelled" if cancelled else "complete",
+            "total": len(pairs),
+            "warmed": warmed,
+            "batches": batches,
+        }
+
+    def jiten_live_state(
+        self,
+        word_id: int,
+        reading_index: int,
+        *,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Return current Jiten SRS state without reparsing the chapter text."""
+        word_id = int(word_id)
+        reading_index = int(reading_index)
+        if word_id <= 0 or reading_index < 0:
+            raise LightNovelError("Invalid Jiten card identity")
+        token = str(self.settings().jiten_api_key or "").strip()
+        if not token:
+            raise LightNovelError("Jiten API token is not configured")
+
+        if not force:
+            cached = self._cached_jiten_live_state(word_id, reading_index)
+            if cached is not None:
+                cached["knowledgeStatus"] = "live_state_cache"
+                return cached
+
+        stale = self._cached_jiten_live_state(word_id, reading_index, allow_stale=True)
+        try:
+            raw = self._jiten_get(
+                f"vocabulary/{word_id}/{reading_index}/known-state"
+            )
+            payload = self._jiten_live_state_payload(
+                word_id,
+                reading_index,
+                raw,
+                knowledge_status="live_provider_state",
+                study_deck_ids=(stale or {}).get("studyDeckIds"),
+            )
+            key = self._jiten_live_state_key(word_id, reading_index)
+            with self._jiten_live_state_lock:
+                self._jiten_live_state_cache[key] = (time.monotonic(), dict(payload))
+            return payload
+        except Exception:
+            if stale is not None:
+                stale["knowledgeStatus"] = "stale_live_state_cache"
+                stale["stale"] = True
+                return stale
+            raise
 
     @staticmethod
     def _jiten_title_key(value: str) -> str:
@@ -2383,7 +2973,7 @@ class LightNovelService:
     def test_study(self, backend: str) -> dict[str, Any]:
         backend = backend.casefold()
         if backend == "jpdb":
-            self._jpdb_request("ping", {})
+            self._jpdb_request("list-user-decks", {"fields": ["id"]})
         else:
             self._jiten_request("reader/ping", {})
         return {"ok": True, "backend": backend}
@@ -2524,10 +3114,14 @@ class LightNovelService:
                 conn.execute("UPDATE ln_books SET current_chapter=?,updated_at=? WHERE id=?", (int(chapter_index), time.time(), int(book_id)))
         return row
 
-    def _chapter_payload(self, row: sqlite3.Row, parsed: dict[str, Any]) -> dict[str, Any]:
+    def _provider_scoped_study_payload(
+        self, parsed: dict[str, Any], backend: str
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        """Keep provider knowledge/IDs isolated instead of guessing cross-provider mappings."""
+        backend = str(backend or "jiten").casefold()
         vocabulary = parsed.get("vocabulary") or []
         vocab_map: dict[tuple[int, int], dict[str, Any]] = {}
-        pairs: list[tuple[int, int]] = []
+        result_vocab: list[dict[str, Any]] = []
         for item in vocabulary:
             if not isinstance(item, dict):
                 continue
@@ -2535,31 +3129,132 @@ class LightNovelService:
                 pair = (int(item.get("wordId")), int(item.get("readingIndex")))
             except (TypeError, ValueError):
                 continue
-            vocab_map[pair] = item
-            pairs.append(pair)
-        settings = self.settings()
-        if settings.study_backend == "jpdb":
-            try:
-                state_map = self._jpdb_states(list(dict.fromkeys(pairs)))
-            except LightNovelError:
-                state_map = {}
-        else:
-            state_map = {}
-        result_vocab: list[dict[str, Any]] = []
-        for pair, item in vocab_map.items():
-            states = state_map.get(pair) or [str(x) for x in (item.get("knownState") or item.get("cardState") or [])]
             clone = dict(item)
-            clone["states"] = states
-            clone["normalizedState"] = self._normalized_state(states)
+            clone["sourceProvider"] = "jiten"
+            clone["idNamespace"] = "jiten"
+            clone["reviewProvider"] = backend
+            if backend == "jpdb":
+                # Jiten wordId/readingIndex are not JPDB vid/sid. Until a real
+                # mapping exists, JPDB knowledge must stay unknown and review
+                # mutations must remain disabled for these tokens.
+                clone.pop("knownState", None)
+                clone.pop("cardState", None)
+                clone["states"] = []
+                clone["normalizedState"] = "unknown"
+                clone["knowledgeStatus"] = "unavailable_mapping"
+                clone["reviewable"] = False
+            else:
+                live = self._cached_jiten_live_state(pair[0], pair[1], allow_stale=True)
+                states = (
+                    list(live.get("states") or [])
+                    if live is not None
+                    else [
+                        str(value).casefold()
+                        for value in (item.get("knownState") or item.get("cardState") or [])
+                    ]
+                )
+                clone["states"] = states
+                clone["knownState"] = states
+                clone["normalizedState"] = self._normalized_state(states)
+                clone["rawStateLabel"] = (
+                    str(live.get("rawStateLabel") or self._jiten_state_label(states))
+                    if live is not None
+                    else self._jiten_state_label(states)
+                )
+                clone["knowledgeStatus"] = (
+                    str(live.get("knowledgeStatus") or "live_state_cache")
+                    if live is not None
+                    else "cached_parse_state"
+                )
+                clone["reviewable"] = True
+            vocab_map[pair] = clone
             result_vocab.append(clone)
+
+        result_tokens: list[Any] = []
+        for group in parsed.get("tokens") or []:
+            if not isinstance(group, list):
+                result_tokens.append(group)
+                continue
+            token_group: list[Any] = []
+            for raw in group:
+                if not isinstance(raw, dict):
+                    token_group.append(raw)
+                    continue
+                token = dict(raw)
+                try:
+                    pair = (int(token.get("wordId")), int(token.get("readingIndex")))
+                except (TypeError, ValueError):
+                    pair = None
+                scoped_card = vocab_map.get(pair) if pair is not None else None
+                if scoped_card is None and isinstance(token.get("card"), dict):
+                    scoped_card = dict(token["card"])
+                    scoped_card["sourceProvider"] = "jiten"
+                    scoped_card["idNamespace"] = "jiten"
+                    scoped_card["reviewProvider"] = backend
+                    if backend == "jpdb":
+                        scoped_card.pop("knownState", None)
+                        scoped_card.pop("cardState", None)
+                        scoped_card["states"] = []
+                        scoped_card["normalizedState"] = "unknown"
+                        scoped_card["knowledgeStatus"] = "unavailable_mapping"
+                        scoped_card["reviewable"] = False
+                    else:
+                        live = (
+                            self._cached_jiten_live_state(pair[0], pair[1], allow_stale=True)
+                            if pair is not None
+                            else None
+                        )
+                        states = (
+                            list(live.get("states") or [])
+                            if live is not None
+                            else [
+                                str(value).casefold()
+                                for value in (
+                                    scoped_card.get("knownState")
+                                    or scoped_card.get("cardState")
+                                    or []
+                                )
+                            ]
+                        )
+                        scoped_card["states"] = states
+                        scoped_card["knownState"] = states
+                        scoped_card["normalizedState"] = self._normalized_state(states)
+                        scoped_card["rawStateLabel"] = (
+                            str(live.get("rawStateLabel") or self._jiten_state_label(states))
+                            if live is not None
+                            else self._jiten_state_label(states)
+                        )
+                        scoped_card["knowledgeStatus"] = (
+                            str(live.get("knowledgeStatus") or "live_state_cache")
+                            if live is not None
+                            else "cached_parse_state"
+                        )
+                        scoped_card["reviewable"] = True
+                if scoped_card is not None:
+                    token["card"] = dict(scoped_card)
+                token["sourceProvider"] = "jiten"
+                token["idNamespace"] = "jiten"
+                token["reviewProvider"] = backend
+                token["reviewable"] = backend != "jpdb"
+                token_group.append(token)
+            result_tokens.append(token_group)
+        return result_tokens, result_vocab
+
+    def _chapter_payload(self, row: sqlite3.Row, parsed: dict[str, Any]) -> dict[str, Any]:
+        settings = self.settings()
+        tokens, vocabulary = self._provider_scoped_study_payload(
+            parsed, settings.study_backend
+        )
         return {
             "book_id": int(row["book_id"]),
             "chapter_index": int(row["chapter_index"]),
+            "chapter_key": str(row["text_hash"] or f"chapter:{int(row['chapter_index'])}"),
+            "character_count": len(str(row["text"] or "")),
             "title": str(row["title"]),
             "text": str(row["text"]),
             "paragraphs": parsed.get("paragraphs") or [],
-            "tokens": parsed.get("tokens") or [],
-            "vocabulary": result_vocab,
+            "tokens": tokens,
+            "vocabulary": vocabulary,
             "settings": self.settings_payload(),
             "parsing": False,
         }
@@ -2570,40 +3265,15 @@ class LightNovelService:
             raise LightNovelError("No Japanese text to parse")
         digest = hashlib.sha256(("study-v1\0" + selected).encode("utf-8")).hexdigest()
         parsed = self._parse_text(selected, digest)
-        vocabulary = parsed.get("vocabulary") or []
-        vocab_map: dict[tuple[int, int], dict[str, Any]] = {}
-        pairs: list[tuple[int, int]] = []
-        for item in vocabulary:
-            if not isinstance(item, dict):
-                continue
-            try:
-                pair = (int(item.get("wordId")), int(item.get("readingIndex")))
-            except (TypeError, ValueError):
-                continue
-            vocab_map[pair] = item
-            pairs.append(pair)
         settings = self.settings()
-        if settings.study_backend == "jpdb":
-            try:
-                state_map = self._jpdb_states(list(dict.fromkeys(pairs)))
-            except LightNovelError:
-                state_map = {}
-        else:
-            state_map = {}
-        result_vocab: list[dict[str, Any]] = []
-        for pair, item in vocab_map.items():
-            states = state_map.get(pair) or [
-                str(value) for value in (item.get("knownState") or item.get("cardState") or [])
-            ]
-            clone = dict(item)
-            clone["states"] = states
-            clone["normalizedState"] = self._normalized_state(states)
-            result_vocab.append(clone)
+        tokens, vocabulary = self._provider_scoped_study_payload(
+            parsed, settings.study_backend
+        )
         return {
             "text": selected,
             "paragraphs": parsed.get("paragraphs") or [],
-            "tokens": parsed.get("tokens") or [],
-            "vocabulary": result_vocab,
+            "tokens": tokens,
+            "vocabulary": vocabulary,
             "settings": self.settings_payload(),
         }
 
@@ -3196,29 +3866,288 @@ class LightNovelService:
             int(book_id), int(chapter_index), float(offset), source="auto"
         )
 
-    def study_action(self, backend: str, action: str, word_id: int, reading_index: int, *, grade: str = "good", sentence: str = "", deck_id: str | int | None = None) -> dict[str, Any]:
+    def study_provider_capabilities(self, backend: str) -> dict[str, Any]:
+        selected = str(backend or self.settings().study_backend or "jiten").casefold()
+        settings = self.settings()
+        token = settings.jpdb_api_token if selected == "jpdb" else settings.jiten_api_key
+        return provider_capabilities(selected, token)
+
+    def strict_review_candidates(
+        self,
+        *,
+        required: int,
+        exclude_keys: set[str] | None = None,
+        trusted_previous_keys: set[str] | None = None,
+    ) -> dict[str, Any]:
+        settings = self.settings()
+        backend = str(settings.study_backend or "jiten").casefold()
+        if backend != "jiten":
+            raise LightNovelError("Strict pre-episode review gate currently supports Jiten only")
+        try:
+            provider = JitenReviewProvider(settings.jiten_api_key)
+            return provider.list_strict_review_candidates(
+                required=max(1, int(required)),
+                exclude_keys=set(exclude_keys or set()),
+                trusted_previous_keys=set(trusted_previous_keys or set()),
+            )
+        except ReviewProviderError as exc:
+            raise LightNovelError(str(exc)) from exc
+
+    def strict_review_submit(
+        self,
+        word_id: int,
+        reading_index: int,
+        grade: str,
+        *,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        settings = self.settings()
+        backend = str(settings.study_backend or "jiten").casefold()
+        if backend != "jiten":
+            raise LightNovelError("Strict pre-episode review gate currently supports Jiten only")
+        try:
+            provider = JitenReviewProvider(settings.jiten_api_key)
+            # Revalidate immediately before the mutation. This prevents a stale
+            # gate card from creating a brand-new Jiten card if account state
+            # changed after the study-batch was fetched. Keep the two network
+            # timings separate so runtime diagnostics can distinguish slow
+            # review-history from a slow POST /review.
+            started = time.perf_counter()
+            provider.validate_strict_review_candidate(int(word_id), int(reading_index))
+            revalidate_ms = round((time.perf_counter() - started) * 1000.0, 1)
+            mutation_started = time.perf_counter()
+            result = provider.submit_review(
+                int(word_id),
+                int(reading_index),
+                str(grade),
+                attempt_id=str(attempt_id),
+            )
+            self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+            result["revalidate_ms"] = revalidate_ms
+            result["mutation_ms"] = round((time.perf_counter() - mutation_started) * 1000.0, 1)
+            result["provider_total_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+            return result
+        except ReviewOutcomeUnknown:
+            raise
+        except ReviewProviderError as exc:
+            raise LightNovelError(str(exc)) from exc
+
+    def _jiten_add_custom_sentence(
+        self, word_id: int, reading_index: int, sentence: str
+    ) -> None:
+        text = str(sentence or "").strip()
+        if not text:
+            return
+        self._jiten_mutation(
+            f"user/example-sentences/{int(word_id)}/{int(reading_index)}",
+            {"text": text[:2000], "source": "Pudge"},
+        )
+
+    def _jiten_upload_card_image(
+        self,
+        word_id: int,
+        reading_index: int,
+        image_bytes: bytes,
+        *,
+        filename: str = "pudge-manga-page.jpg",
+    ) -> None:
+        if not image_bytes:
+            return
+        token = str(self.settings().jiten_api_key or "").strip()
+        if not token:
+            raise LightNovelError("Jiten API token is not configured")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"ApiKey {token}",
+            "User-Agent": APP_SLUG,
+        }
+        url = f"{self.JITEN_BASE}/srs/card-media/{int(word_id)}/{int(reading_index)}"
+        try:
+            response = httpx.post(
+                url,
+                headers=headers,
+                files={"file": (str(filename or "pudge-manga-page.jpg"), image_bytes, "image/jpeg")},
+                timeout=30,
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise LightNovelError(f"Jiten card-media upload failed: {exc}") from exc
+        if response.status_code >= 400:
+            detail = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    detail = str(body.get("error") or body.get("error_message") or body.get("detail") or "")
+            except Exception:
+                pass
+            raise LightNovelError(
+                f"Jiten card-media HTTP {response.status_code}{': ' + detail if detail else ''}"
+            )
+
+    def study_action(
+        self,
+        backend: str,
+        action: str,
+        word_id: int,
+        reading_index: int,
+        *,
+        grade: str = "good",
+        sentence: str = "",
+        deck_id: str | int | None = None,
+        attempt_id: str = "",
+        id_namespace: str = "",
+        media_image: bytes | None = None,
+        media_filename: str = "",
+    ) -> dict[str, Any]:
         backend = backend.casefold()
+        namespace = str(id_namespace or ("jiten" if backend == "jiten" else "")).casefold()
         if backend == "jpdb":
             if action == "review":
-                self._jpdb_request("review", {"vid": int(word_id), "sid": int(reading_index), "grade": {"again":"fail","hard":"hard","good":"okay","easy":"easy"}.get(grade, "okay")})
-            elif action == "add":
-                target: str | int = int(deck_id) if str(deck_id or "").isdigit() else (str(deck_id or "forq") or "forq")
-                self._jpdb_request("deck/add-vocabulary", {"id": target, "vocabulary": [[int(word_id), int(reading_index)]], "ignore_unknown": True})
+                if namespace != "jpdb":
+                    raise LightNovelError(
+                        "JPDB review is disabled for Jiten IDs: native vid/sid mapping is unavailable"
+                    )
+                try:
+                    return JpdbReviewProvider(self.settings().jpdb_api_token).submit_review(
+                        int(word_id),
+                        int(reading_index),
+                        grade,
+                        attempt_id=str(attempt_id or f"pudge-{time.time_ns()}"),
+                    )
+                except ReviewOutcomeUnknown as exc:
+                    return {
+                        "ok": False,
+                        "outcome": "unknown",
+                        "provider": "jpdb",
+                        "attempt_id": exc.attempt_id,
+                        "message": str(exc),
+                    }
+                except ReviewProviderError as exc:
+                    raise LightNovelError(str(exc)) from exc
+            if action == "add":
+                if namespace != "jpdb":
+                    raise LightNovelError(
+                        "JPDB add is disabled for Jiten IDs: native vid/sid mapping is unavailable"
+                    )
+                target: str | int = (
+                    int(deck_id)
+                    if str(deck_id or "").isdigit()
+                    else (str(deck_id or "forq") or "forq")
+                )
+                self._jpdb_request(
+                    "deck/add-vocabulary",
+                    {
+                        "id": target,
+                        "vocabulary": [[int(word_id), int(reading_index)]],
+                        "ignore_unknown": True,
+                    },
+                )
                 if sentence:
-                    self._jpdb_request("set-card-sentence", {"vid": int(word_id), "sid": int(reading_index), "sentence": sentence})
-            else:
-                raise LightNovelError("Unsupported JPDB action")
-        else:
-            if action == "review":
-                rating = {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(grade, 3)
-                self._jiten_request("srs/review", {"wordId": int(word_id), "readingIndex": int(reading_index), "rating": rating})
-            elif action == "add":
-                if deck_id is None or not str(deck_id).isdigit():
-                    raise LightNovelError("Choose a Jiten study deck")
-                self._jiten_request(f"srs/study-decks/{int(deck_id)}/words", {"wordId": int(word_id), "readingIndex": int(reading_index), "occurrences": 1, "sentence": sentence or None, "source": "pudge"})
-            else:
-                raise LightNovelError("Unsupported Jiten action")
-        return {"ok": True}
+                    self._jpdb_request(
+                        "set-card-sentence",
+                        {
+                            "vid": int(word_id),
+                            "sid": int(reading_index),
+                            "sentence": sentence,
+                        },
+                    )
+                return {"ok": True, "outcome": "confirmed", "provider": "jpdb"}
+            raise LightNovelError("Unsupported JPDB action")
+
+        if action == "review":
+            if namespace and namespace != "jiten":
+                raise LightNovelError("Jiten review requires Jiten-native wordId/readingIndex")
+            enrichment_warnings: list[str] = []
+            auto_added = False
+            # Review buttons also act as sentence-mining buttons: when the form is
+            # not present in any Jiten study deck, add it to the selected deck
+            # first. Membership is revalidated immediately before mutation so a
+            # stale parse/cache cannot create an accidental duplicate.
+            selected_deck = int(deck_id) if str(deck_id or "").isdigit() else None
+            # A selected destination turns review into sentence mining. Revalidate
+            # membership before mutating so a stale reader cache never duplicates
+            # a word that already belongs to any Jiten study deck. Legacy review
+            # callers without a selected deck keep the original single-send path.
+            if selected_deck is not None:
+                current_rows = self.jiten_live_states(
+                    [(int(word_id), int(reading_index))], force=True
+                )
+                current = current_rows[0] if current_rows else {}
+                deck_ids = current.get("studyDeckIds") if isinstance(current, dict) else []
+                if not isinstance(deck_ids, list):
+                    deck_ids = []
+                if not deck_ids:
+                    self._jiten_mutation(
+                        f"srs/study-decks/{selected_deck}/words",
+                        {
+                            "wordId": int(word_id),
+                            "readingIndex": int(reading_index),
+                            "occurrences": 1,
+                            "sentence": (sentence[:150] if sentence else None),
+                            "source": "pudge",
+                        },
+                    )
+                    auto_added = True
+                    try:
+                        self._jiten_add_custom_sentence(int(word_id), int(reading_index), sentence)
+                    except Exception as exc:
+                        enrichment_warnings.append(f"custom sentence: {exc}")
+                    if media_image:
+                        try:
+                            self._jiten_upload_card_image(
+                                int(word_id),
+                                int(reading_index),
+                                media_image,
+                                filename=media_filename or "pudge-manga-page.jpg",
+                            )
+                        except Exception as exc:
+                            # Card media is a Jiten+ feature. Never lose a confirmed
+                            # add/review merely because that optional enrichment is unavailable.
+                            enrichment_warnings.append(f"manga page: {exc}")
+                    self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+            try:
+                result = JitenReviewProvider(self.settings().jiten_api_key).submit_review(
+                    int(word_id),
+                    int(reading_index),
+                    grade,
+                    attempt_id=str(attempt_id or f"pudge-{time.time_ns()}"),
+                )
+                self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+                if isinstance(result, dict):
+                    result["auto_added"] = auto_added
+                    if enrichment_warnings:
+                        result["enrichment_warnings"] = enrichment_warnings
+                return result
+            except ReviewOutcomeUnknown as exc:
+                self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+                payload = {
+                    "ok": False,
+                    "outcome": "unknown",
+                    "provider": "jiten",
+                    "attempt_id": exc.attempt_id,
+                    "message": str(exc),
+                    "auto_added": auto_added,
+                }
+                if enrichment_warnings:
+                    payload["enrichment_warnings"] = enrichment_warnings
+                return payload
+            except ReviewProviderError as exc:
+                raise LightNovelError(str(exc)) from exc
+        if action == "add":
+            if deck_id is None or not str(deck_id).isdigit():
+                raise LightNovelError("Choose a Jiten study deck")
+            self._jiten_mutation(
+                f"srs/study-decks/{int(deck_id)}/words",
+                {
+                    "wordId": int(word_id),
+                    "readingIndex": int(reading_index),
+                    "occurrences": 1,
+                    "sentence": sentence or None,
+                    "source": "pudge",
+                },
+            )
+            self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+            return {"ok": True, "outcome": "confirmed", "provider": "jiten"}
+        raise LightNovelError("Unsupported Jiten action")
 
     def decks(self, backend: str) -> list[dict[str, Any]]:
         if backend.casefold() == "jpdb":
@@ -3248,7 +4177,7 @@ class LightNovelService:
         if not uid:
             return []
         collection_query = """
-        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl relations{edges{relationType node{id format}}}}}}}}
+        query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{extraLarge large}siteUrl relations{edges{relationType node{id format}}}}}}}}
         """
         collection = self._anilist_post(collection_query, {"userId": int(uid)}).get("MediaListCollection") or {}
         items: list[dict[str, Any]] = []
@@ -3265,7 +4194,7 @@ class LightNovelService:
                     "synonyms": media.get("synonyms") or [], "format": media_format, "status": entry.get("status"),
                     "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0,
                     "chapters": media.get("chapters"), "volumes": media.get("volumes"), "media_status": media.get("status"),
-                    "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                    "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
                     "mean_score": media.get("meanScore"), "genres": media.get("genres") or [],
                     "year": (media.get("startDate") or {}).get("year"),
                     "relations": [
@@ -3310,7 +4239,7 @@ class LightNovelService:
         if not cleaned:
             return []
         gql = """
-        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl relations{edges{relationType node{id format}}} mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
+        query($search:String!,$perPage:Int!){Page(page:1,perPage:$perPage){media(search:$search,type:MANGA,format:NOVEL,sort:SEARCH_MATCH){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{extraLarge large}siteUrl relations{edges{relationType node{id format}}} mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}}
         """
         data = self._anilist_post(gql, {"search": cleaned, "perPage": max(1, min(25, int(limit)))})
         out: list[dict[str, Any]] = []
@@ -3322,7 +4251,7 @@ class LightNovelService:
                 "titles": [x for x in [titles.get("romaji"), titles.get("english"), titles.get("native")] if x], "synonyms": media.get("synonyms") or [],
                 "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0,
                 "progress_volumes": entry.get("progressVolumes") or 0, "chapters": media.get("chapters"), "volumes": media.get("volumes"),
-                "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
+                "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "",
                 "mean_score": media.get("meanScore"), "genres": media.get("genres") or [],
                 "year": (media.get("startDate") or {}).get("year"),
                 "relations": [
@@ -3340,13 +4269,13 @@ class LightNovelService:
 
     def _anilist_novel_by_id(self, media_id: int) -> dict[str, Any]:
         gql = """
-        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{large}siteUrl relations{edges{relationType node{id format}}} mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}
+        query($id:Int!){Media(id:$id,type:MANGA){id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{extraLarge large}siteUrl relations{edges{relationType node{id format}}} mediaListEntry{status progress progressVolumes score(format:POINT_10)}}}
         """
         media = self._anilist_post(gql, {"id": int(media_id)}).get("Media") or {}
         if str(media.get("format") or "").upper() != "NOVEL":
             raise LightNovelError("Selected AniList entry is not a light novel")
         titles = media.get("title") or {}; entry = media.get("mediaListEntry") or {}
-        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "", "mean_score": media.get("meanScore"), "genres": media.get("genres") or [], "year": (media.get("startDate") or {}).get("year"), "relations": [{"relation_type": str((edge or {}).get("relationType") or ""), "media_id": ((edge or {}).get("node") or {}).get("id"), "format": str(((edge or {}).get("node") or {}).get("format") or "")} for edge in ((media.get("relations") or {}).get("edges") or []) if str((edge or {}).get("relationType") or "").upper() in {"PREQUEL", "SEQUEL"}], "user_score": float(entry.get("score")) if entry.get("score") is not None else None}
+        return {"media_id": media.get("id"), "title": titles.get("userPreferred") or titles.get("romaji") or "", "format": "NOVEL", "status": entry.get("status") or "", "progress": entry.get("progress") or 0, "progress_volumes": entry.get("progressVolumes") or 0, "volumes": media.get("volumes"), "chapters": media.get("chapters"), "media_status": media.get("status"), "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "", "site_url": media.get("siteUrl") or "", "mean_score": media.get("meanScore"), "genres": media.get("genres") or [], "year": (media.get("startDate") or {}).get("year"), "relations": [{"relation_type": str((edge or {}).get("relationType") or ""), "media_id": ((edge or {}).get("node") or {}).get("id"), "format": str(((edge or {}).get("node") or {}).get("format") or "")} for edge in ((media.get("relations") or {}).get("edges") or []) if str((edge or {}).get("relationType") or "").upper() in {"PREQUEL", "SEQUEL"}], "user_score": float(entry.get("score")) if entry.get("score") is not None else None}
 
     @staticmethod
     def _match_title(value: str) -> str:
@@ -3901,40 +4830,7 @@ class LightNovelService:
             for item in novels
             if item.get("media_id") is not None
         }
-        franchise_by_media: dict[int, str] = {}
-        adjacency: dict[int, set[int]] = {media_id: set() for media_id in by_media}
-        for media_id, item in by_media.items():
-            for relation in item.get("relations") or []:
-                if not isinstance(relation, dict):
-                    continue
-                try:
-                    other = int(relation.get("media_id"))
-                except (TypeError, ValueError):
-                    continue
-                if (
-                    other in adjacency
-                    and str(relation.get("relation_type") or "").upper() in {"PREQUEL", "SEQUEL"}
-                    and str(relation.get("format") or "NOVEL").upper() == "NOVEL"
-                ):
-                    adjacency[media_id].add(other)
-                    adjacency[other].add(media_id)
-        seen: set[int] = set()
-        for root in sorted(adjacency):
-            if root in seen:
-                continue
-            component: set[int] = set()
-            stack = [root]
-            while stack:
-                current = stack.pop()
-                if current in component:
-                    continue
-                component.add(current)
-                stack.extend(adjacency.get(current, ()))
-            seen.update(component)
-            if len(component) > 1:
-                key = f"anilist-franchise:{min(component)}"
-                for related_media_id in component:
-                    franchise_by_media[related_media_id] = key
+        franchise_metadata = literature_franchise_metadata(novels)
 
         books = self.books()
         for book in books:
@@ -3946,7 +4842,13 @@ class LightNovelService:
             book["anilist_genres"] = list(item.get("genres") or [])
             book["anilist_year"] = item.get("year")
             book["anilist_media_status"] = item.get("media_status")
-            book["franchise_key"] = franchise_by_media.get(int(media_id), "")
+            group = franchise_metadata.get(int(media_id), {})
+            book["franchise_key"] = str(group.get("franchise_key") or "")
+            book["franchise_title"] = str(group.get("franchise_title") or "")
+            book["franchise_order"] = int(group.get("franchise_order") or 0)
+            book["franchise_series_count"] = int(group.get("franchise_series_count") or 1)
+            book["franchise_ambiguous"] = bool(group.get("franchise_ambiguous"))
+            book["relation_kind"] = str(group.get("relation_kind") or "")
             if not book.get("cover_url") and item.get("cover"):
                 book["cover_url"] = item["cover"]
         return {

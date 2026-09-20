@@ -150,6 +150,8 @@
       const waitReason=String(transcription.wait_reason||'');
       let queue='';
       if(waitReason==='foreground') queue=ru()?'ждёт окончания воспроизведения':'waiting for playback to finish';
+      else if(waitReason==='energy_saving') queue=ru()?'приостановлено: энергосбережение':'paused: energy saving';
+      else if(waitReason==='thermal') queue=ru()?'приостановлено: температурное ограничение':'paused: thermal limit';
       else if(waitReason==='heavy_work') queue=ru()?'ждёт освобождения аудио-обработки':'waiting for audio worker';
       else {
         const pos=Math.max(0,Number(transcription.queue_position||0)),size=Math.max(pos,Number(transcription.queue_size||0));

@@ -57,7 +57,7 @@ def test_jimaku_dns_failure_retries_then_uses_stale_positive_cache(monkeypatch, 
     monkeypatch.setattr("pudge.providers.jimaku.time.sleep", lambda _seconds: None)
     try:
         assert client._get_json(path, params) == payload
-        assert attempts == 3
+        assert attempts == 1
     finally:
         client.close()
 

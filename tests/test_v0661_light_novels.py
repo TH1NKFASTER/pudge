@@ -74,13 +74,24 @@ def test_jiten_parse_is_persistently_cached(tmp_path: Path, monkeypatch: pytest.
     assert service2.chapter(book["id"], 0)["tokens"]
 
 
-def test_jpdb_uses_jiten_ids_without_reparsing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_jpdb_does_not_cast_jiten_ids_to_native_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = LightNovelService(cfg(tmp_path))
     service.save_settings({"jpdb_api_token": "jpdb", "study_backend": "jpdb"})
-    seen = []
-    monkeypatch.setattr(service, "_jpdb_request", lambda action, payload=None: seen.append((action, payload)) or {})
-    service.study_action("jpdb", "review", 123, 4, grade="good")
-    assert seen == [("review", {"vid": 123, "sid": 4, "grade": "okay"})]
+    monkeypatch.setattr(
+        service,
+        "_jpdb_request",
+        lambda *_args, **_kwargs: pytest.fail("Jiten IDs must not be sent to JPDB"),
+    )
+    with pytest.raises(Exception, match="native vid/sid mapping is unavailable"):
+        service.study_action(
+            "jpdb",
+            "review",
+            123,
+            4,
+            grade="good",
+            attempt_id="legacy-regression",
+            id_namespace="jiten",
+        )
 
 
 def test_anilist_open_and_finish_volume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

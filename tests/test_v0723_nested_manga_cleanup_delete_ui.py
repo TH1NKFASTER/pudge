@@ -305,7 +305,6 @@ def test_ln_and_manga_series_cards_share_selection_hover_context_and_score_model
     manga = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
 
     assert "pudge-v0.7.23-ln-manga-series-parity-score-v1" in html
-    assert "pudge-v0.7.23-manga-series-score-parity-v1" in manga
     assert 'data-ln-series-ids="${seriesIds}"' in html
     assert 'data-ln-series-select="${escapeHtml(key)}"' in html
     assert "toggleLnSeriesSelection(group)" in html
@@ -523,6 +522,7 @@ def test_manga_library_avoids_redundant_rebuilds_and_jiten_refocus_jank() -> Non
     assert "pudge-v0.7.23-manga-library-stability-v1" in manga
     assert "function mangaLibraryRenderSignature(books)" in manga
     assert "renderSignature === libraryRenderSignature" in manga
-    assert "previousScrollTop" in manga
+    assert "PudgeLibraryShelves?.captureScrollAnchor" in manga
+    assert "PudgeLibraryShelves?.restoreScrollAnchor" in manga
     assert "region.closest?.('[data-series-scroll]')" not in html
     assert "Async Jiten hydration must not repeatedly resize/refocus" in html

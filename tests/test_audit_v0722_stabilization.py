@@ -67,7 +67,7 @@ def test_failed_migration_rolls_back_all_schema_changes(tmp_path: Path, monkeypa
         connection.execute("CREATE TABLE should_rollback(value INTEGER)")
         raise sqlite3.OperationalError("simulated migration failure")
 
-    monkeypatch.setattr(Database, "_migrate_v7", fail_migration)
+    monkeypatch.setattr(Database, f"_migrate_v{LATEST_SCHEMA_VERSION}", fail_migration)
     with pytest.raises(sqlite3.OperationalError, match="simulated"):
         Database(path)
 

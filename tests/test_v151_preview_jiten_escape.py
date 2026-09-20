@@ -24,7 +24,7 @@ def test_jiten_study_term_puts_ruby_only_on_kanji_segments() -> None:
 
 def test_escape_prioritizes_library_multiselect_over_native_text_selection() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    block = html[html.index("function clearSelectionOnEscape(){"):html.index("async function handleEscape(event)")]
+    block = html[html.index("function clearSelectionOnEscape(source='keydown'){"):html.index("async function handleEscape(event)")]
     assert block.index("ui.page==='lightnovels'") < block.index("const nativeSelection=window.getSelection?.();")
     assert block.index("ui.page==='manga'") < block.index("const nativeSelection=window.getSelection?.();")
     assert block.index("ui.page==='audiobooks'") < block.index("const nativeSelection=window.getSelection?.();")

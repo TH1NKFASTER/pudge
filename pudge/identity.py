@@ -96,12 +96,30 @@ class IdentityResolver:
         return changed == 1
 
     def lookup(self, *, video_path: Path | None = None, torrent_hash: str = "") -> dict[str, Any] | None:
-        if video_path is None and not torrent_hash:
+        path_value = str(video_path) if video_path is not None else ""
+        hash_value = str(torrent_hash or "").strip().casefold()
+        if not path_value and not hash_value:
             return None
         with self.database.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM media_identity_ledger WHERE video_path=? OR torrent_hash=? "
-                "ORDER BY locked DESC,updated_at DESC LIMIT 1",
-                (str(video_path or ""), str(torrent_hash or "").casefold()),
-            ).fetchone()
-        return dict(row) if row is not None else None
+            # Exact path is the strongest local identity and must never be
+            # diluted by an empty torrent hash matching unrelated rows.
+            if path_value:
+                row = conn.execute(
+                    "SELECT * FROM media_identity_ledger WHERE video_path=? "
+                    "ORDER BY locked DESC,updated_at DESC LIMIT 1",
+                    (path_value,),
+                ).fetchone()
+                if row is not None:
+                    return dict(row)
+            if not hash_value:
+                return None
+            rows = conn.execute(
+                "SELECT * FROM media_identity_ledger WHERE torrent_hash=? "
+                "ORDER BY locked DESC,updated_at DESC LIMIT 2",
+                (hash_value,),
+            ).fetchall()
+        if len(rows) != 1:
+            # A hash collision/duplicate ledger entry is ambiguous. Do not pick
+            # whichever happened to be updated last.
+            return None
+        return dict(rows[0])

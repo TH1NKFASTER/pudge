@@ -30,6 +30,8 @@ class UIConfig:
     notifications_enabled: bool = True
     permissions_requested: bool = False
     jiten_developer_tools_confirmed: bool = False
+    review_gate_enabled: bool = False
+    review_gate_count: int = 5
 
 
 @dataclass(slots=True)
@@ -164,6 +166,12 @@ class ShortcutsConfig:
 class DiagnosticsConfig:
     energy_monitoring_enabled: bool = True
     energy_sample_seconds: float = 30.0
+
+
+@dataclass(slots=True)
+class PowerConfig:
+    manual_energy_saving: bool = False
+    auto_battery_energy_saving: bool = True
 
 
 @dataclass(slots=True)
@@ -307,6 +315,7 @@ class AppConfig:
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     shortcuts: ShortcutsConfig = field(default_factory=ShortcutsConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
+    power: PowerConfig = field(default_factory=PowerConfig)
     companion: CompanionConfig = field(default_factory=CompanionConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     jimaku: JimakuConfig = field(default_factory=JimakuConfig)
@@ -381,6 +390,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     qbittorrent = _section(raw, "qbittorrent")
     aria2 = _section(raw, "aria2")
     agent = _section(raw, "agent")
+    power = _section(raw, "power")
     playback = _section(raw, "playback")
     shortcuts = _section(raw, "shortcuts")
     companion = _section(raw, "companion")
@@ -399,6 +409,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             notifications_enabled=bool(ui.get("notifications_enabled", True)),
             permissions_requested=bool(ui.get("permissions_requested", False)),
             jiten_developer_tools_confirmed=bool(ui.get("jiten_developer_tools_confirmed", False)),
+            review_gate_enabled=bool(ui.get("review_gate_enabled", False)),
+            review_gate_count=max(1, min(50, int(ui.get("review_gate_count", 5)))),
         ),
         paths=PathsConfig(
             download_dirs=_load_watched_media_dirs(paths),
@@ -517,6 +529,10 @@ def load_config(path: Path | None = None) -> AppConfig:
             # Always-on, low-overhead diagnostics. Kept out of Settings UI.
             energy_monitoring_enabled=True,
             energy_sample_seconds=30.0,
+        ),
+        power=PowerConfig(
+            manual_energy_saving=bool(power.get("manual_energy_saving", False)),
+            auto_battery_energy_saving=bool(power.get("auto_battery_energy_saving", True)),
         ),
         companion=CompanionConfig(
             enabled=bool(companion.get("enabled", False)),
@@ -791,6 +807,8 @@ escape_exits_fullscreen = {_toml_bool(config.ui.escape_exits_fullscreen)}
 notifications_enabled = {_toml_bool(config.ui.notifications_enabled)}
 permissions_requested = {_toml_bool(config.ui.permissions_requested)}
 jiten_developer_tools_confirmed = {_toml_bool(config.ui.jiten_developer_tools_confirmed)}
+review_gate_enabled = {_toml_bool(config.ui.review_gate_enabled)}
+review_gate_count = {max(1, min(50, int(config.ui.review_gate_count)))}
 
 [paths]
 watched_media_dirs = {_toml_string_list(config.paths.download_dirs)}
@@ -883,6 +901,10 @@ mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 [diagnostics]
 energy_monitoring_enabled = {_toml_bool(config.diagnostics.energy_monitoring_enabled)}
 energy_sample_seconds = {config.diagnostics.energy_sample_seconds}
+
+[power]
+manual_energy_saving = {_toml_bool(config.power.manual_energy_saving)}
+auto_battery_energy_saving = {_toml_bool(config.power.auto_battery_energy_saving)}
 
 [companion]
 enabled = {_toml_bool(config.companion.enabled)}

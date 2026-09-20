@@ -86,8 +86,8 @@ def test_pipeline_fingerprint_binds_v18_detector_and_image() -> None:
 
     image = Image.new("RGB", (17, 23), "white")
     first = _pipeline_fingerprint(image, FakeModel())
-    assert first["generation"] == _PIPELINE_GENERATION == "pudge-manga-regions-v59-layout-token-geometry"
-    assert first["worker"] == _PIPELINE_WORKER == "pudge-manga-recovery-phase3.4-first20-recall-v59"
+    assert first["generation"] == _PIPELINE_GENERATION == "pudge-manga-regions-v96p27-orphan-vertical-ink"
+    assert first["worker"] == _PIPELINE_WORKER == "pudge-manga-recovery-phase3.4-full-volume-v96p27"
     assert first["ocr_crop_policy"] == _OCR_CROP_POLICY == "vertical-failure-retry-pad-v2"
     assert first["detector"] == _LAYOUT_PIPELINE == "manga-layout-dual-pass-v1"
     assert first["image_size"] == [17, 23]

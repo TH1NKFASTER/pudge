@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## v0.7.28 — Statistics, study workflow, library scheduling, and Manga OCR
+
+Range: [v0.7.27 → v0.7.28](https://github.com/TH1NKFASTER/pudge/compare/v0.7.27...v0.7.28).
+
+These notes describe the source changes relative to v0.7.27. They do not imply that every feature has been validated on a release build.
+
+### Statistics and cross-device history
+- Added a Statistics page with overview, per-work summaries, an activity calendar, and a journal. Filter by period, content type, or work; edit recorded activity, add manual entries, export CSV, and reset statistics history.
+- Introduced an append-only consumption ledger with stable media identities, sessions, activity events, correction records, and device-scoped event sequencing. Anime, manga, light novels, audiobooks, and visual novels contribute supported activity observations.
+- Report elapsed active time with overlap-aware aggregation; distinguish first-time and repeat consumption where native volume data is available. Manga page counts and light-novel text ranges are recorded separately from time. Native volume coverage begins when tracking is enabled; historical progress is not represented as measured consumption.
+- Extended mobile synchronization to replay consumption records alongside the existing progress protocol, including conflict detection and history-reset epochs.
+
+### Reading and review
+- Added an optional per-episode review gate for playback, with configurable review count, a dedicated review-card overlay, progress persisted per account and episode, and prefetching of existing Jiten review cards. It is disabled by default.
+- Require evidence of an existing reviewable card before strict-gate submission; never silently count or retry a review whose remote outcome is unknown. JPDB capability discovery is present, but strict playback gating is not enabled for JPDB because the required review-enumeration and reconciliation guarantees are unproven.
+- Refresh Jiten card/deck state independently of cached text parsing, prefetch state for the parsed local corpus, and offer optional highlighting of eligible N+1 words in the readers.
+- When reviewing a word absent from the selected Jiten study decks, support adding it to the selected deck with a contextual sentence; manga study can also attach the source page. Revalidate membership before mutation to avoid duplicate additions.
+- Improved reader text and ruby interactions, study-card context selection, and recovery of chapter images/covers.
+
+### Library, playback, and personal scheduling
+- Group related manga and light-novel series into franchise shelves with expand/collapse and preserved scroll position. Improve local cover previews, including source resolution and retry behavior.
+- Added personal weekly episode-release schedules with explicit time zones and rewatch support. Future episodes stay locked until their scheduled release; notifications and retention respect the personal schedule.
+- Adjusted playback admission, session tracking, and UI presentation for the review gate and personal schedule.
+
+### Power and background performance
+- Added manual energy-saving mode and automatic low-battery policy with hysteresis. Background work reports its reason for waiting and cooperates with the policy.
+- Reduced redundant refresh/poll activity, refined task admission/retirement, and improved runtime diagnostics around application sessions and background work.
+
+### Manga OCR and quality tools
+- Extended layout-aware OCR recovery for short/partial columns, missed main text alongside ruby, trailing glyphs, punctuation, bold or stylized text, and large sound effects. Added bounded cross-candidate consensus and geometry/artwork guards to limit invented text, duplicate regions, and unintended merges.
+- Improved word/ruby hitboxes and reader integration. The page-31 trailing-kana recovery and page-39 short ruby/main-text recovery are covered by dedicated regression tests.
+- Added benchmarking tools and documentation for JMangaBench and Manga109, a review-diff utility, and a 40-page One Piece golden-text test corpus with comparison tooling. Review the golden-data licensing and redistribution scope before publishing it in a public repository.
+
+### Tests and release preparation
+- Expanded unit, integration, and regression coverage across OCR, the study workflow, scheduling, statistics, synchronization, energy policy, and reader UI. Added benchmark Makefile targets and improved test-batch handling.
+- This is a source-diff summary, not a test-pass report; complete local and macOS release validation must be run separately.
+
 ## v0.7.27 — Manga OCR, runtime hardening, and more accurate synchronization
 
 Range: [v0.7.26 → v0.7.27](https://github.com/TH1NKFASTER/pudge/compare/v0.7.26...v0.7.27).

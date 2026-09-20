@@ -12,7 +12,7 @@
   function shell() {
     const root = $('visualNovelsContent');
     if (!root) return null;
-    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${ru()?'Окно игры':'Game window'}<select id="vnWindow"></select></label><label>${ru()?'Область диалога':'Dialogue area'}<select id="vnRegion"><option value="lower62">${ru()?'Нижние 62%':'Lower 62%'}</option><option value="lower50">${ru()?'Нижние 50%':'Lower 50%'}</option><option value="lower40">${ru()?'Нижние 40%':'Lower 40%'}</option><option value="full">${ru()?'Всё окно':'Full window'}</option></select></label><button id="vnRefresh">${ru()?'Обновить окна':'Refresh windows'}</button><button id="vnStart" class="primary">${ru()?'Начать чтение':'Start reader'}</button><button id="vnStop" hidden>${ru()?'Остановить':'Stop'}</button></div><div id="vnStatus" class="vn-status"></div><div class="vn-actions"><button id="vnIdentity">AniList</button></div><div class="vn-grid"><section class="vn-live"><h3>${ru()?'Текущая реплика':'Current line'}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3>${ru()?'История':'Transcript'}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
+    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${ru()?'Окно игры':'Game window'}<select id="vnWindow"></select></label><label>${ru()?'Название игры':'Game title'}<input id="vnGameTitle" type="text" placeholder="Visual Novel"></label><label>${ru()?'Область диалога':'Dialogue area'}<select id="vnRegion"><option value="lower62">${ru()?'Нижние 62%':'Lower 62%'}</option><option value="lower50">${ru()?'Нижние 50%':'Lower 50%'}</option><option value="lower40">${ru()?'Нижние 40%':'Lower 40%'}</option><option value="full">${ru()?'Всё окно':'Full window'}</option></select></label><button id="vnRefresh">${ru()?'Обновить окна':'Refresh windows'}</button><button id="vnStart" class="primary">${ru()?'Начать чтение':'Start reader'}</button><button id="vnStop" hidden>${ru()?'Остановить':'Stop'}</button></div><div id="vnStatus" class="vn-status"></div><div class="vn-grid"><section class="vn-live"><h3>${ru()?'Текущая реплика':'Current line'}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3>${ru()?'История':'Transcript'}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
     return root;
   }
 
@@ -22,6 +22,8 @@
     try {
       windows = await pywebview.api.visual_novel_windows();
       select.innerHTML=windows.length?windows.map(row=>`<option value="${Number(row.id)}">${esc(row.label)}</option>`).join(''):`<option>${ru()?'Подходящих окон нет':'No suitable windows'}</option>`;
+      const first=windows[0]||null;
+      if(first&&$('vnGameTitle')&&!String($('vnGameTitle').value||'').trim())$('vnGameTitle').value=String(first.title||first.owner||'Visual Novel');
     } catch (error) {
       $('vnStatus').textContent=error.message||error;
       $('vnStatus').classList.add('error');
@@ -140,9 +142,10 @@
     pollGeneration+=1;renderRequestId+=1;
     if(pollTimer)clearTimeout(pollTimer);pollTimer=null;
     await applyRegionPreset($('vnRegion')?.value||'lower62');
-    activeWindow={id,title:row.title||row.label||'Visual Novel'};
+    const gameTitle=String($('vnGameTitle')?.value||row.title||row.label||'Visual Novel').trim()||'Visual Novel';
+    activeWindow={id,title:gameTitle,owner:String(row.owner||'')};
     lastLineId=0;lastCurrentKey='';parsed.clear();
-    await pywebview.api.visual_novel_start(id,activeWindow.title);
+    await pywebview.api.visual_novel_start(id,activeWindow.title,activeWindow.owner);
     await update(pollGeneration);
   }
 
@@ -153,11 +156,7 @@
     await update(pollGeneration);
   }
 
-  async function refreshIdentity(){if(!activeWindow)return;const identity=await pywebview.api.media_identity_current('visual_novel',activeWindow.id);if($('vnCurrent'))$('vnCurrent').dataset.pudgeMediaId=String(identity?.anilist_id||'');}
-
-
-  document.addEventListener('change',event=>{if(event.target.id==='vnRegion')void applyRegionPreset(event.target.value).catch(error=>window.toast?.(String(error?.message||error)));});
-  document.addEventListener('click',event=>{void (async()=>{if(event.target.id==='vnRefresh'||event.target.id==='vnRefreshError')await loadWindows();else if(event.target.id==='vnStart')await start();else if(event.target.id==='vnStop')await stop();else if(event.target.id==='vnPermission')await pywebview.api.open_screen_recording_settings();else if(event.target.id==='vnIdentity'&&activeWindow)await window.showMediaIdentity?.('visual_novel',activeWindow.id,activeWindow.title);else{const line=event.target.closest?.('[data-vn-line]');if(line){const state=await pywebview.api.visual_novel_state();transcriptRows=state.transcript||[];const row=transcriptRows.find(item=>Number(item.id)===Number(line.dataset.vnLine));if(row){lastLineId=Number(row.id);lastCurrentKey='';void renderCurrent(row.text,lastLineId,pollGeneration);}}}})().catch(error=>window.toast?.(String(error?.message||error)));});
-  window.addEventListener('pudge-media-identity-changed',event=>{if(event.detail?.kind==='visual_novel')void refreshIdentity();});
-  window.PudgeVisualNovels={load:async()=>{shell();pollGeneration+=1;renderRequestId+=1;await loadWindows();await update(pollGeneration);await refreshIdentity();},stop};
+  document.addEventListener('change',event=>{if(event.target.id==='vnRegion')void applyRegionPreset(event.target.value).catch(error=>window.toast?.(String(error?.message||error)));else if(event.target.id==='vnWindow'){const row=windows.find(item=>Number(item.id)===Number(event.target.value||0));if(row&&$('vnGameTitle'))$('vnGameTitle').value=String(row.title||row.owner||'Visual Novel');}});
+  document.addEventListener('click',event=>{void (async()=>{if(event.target.id==='vnRefresh'||event.target.id==='vnRefreshError')await loadWindows();else if(event.target.id==='vnStart')await start();else if(event.target.id==='vnStop')await stop();else if(event.target.id==='vnPermission')await pywebview.api.open_screen_recording_settings();else{const line=event.target.closest?.('[data-vn-line]');if(line){const state=await pywebview.api.visual_novel_state();transcriptRows=state.transcript||[];const row=transcriptRows.find(item=>Number(item.id)===Number(line.dataset.vnLine));if(row){lastLineId=Number(row.id);lastCurrentKey='';void renderCurrent(row.text,lastLineId,pollGeneration);}}}})().catch(error=>window.toast?.(String(error?.message||error)));});
+  window.PudgeVisualNovels={load:async()=>{shell();pollGeneration+=1;renderRequestId+=1;await loadWindows();await update(pollGeneration);},stop};
 })();

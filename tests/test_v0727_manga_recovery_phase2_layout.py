@@ -131,6 +131,6 @@ def test_phase2_cache_namespace_is_intentionally_new() -> None:
 
     root = Path(__file__).resolve().parents[1]
     source = (root / "pudge/manga.py").read_text(encoding="utf-8")
-    assert 'pudge-manga-regions-v59-layout-token-geometry' in source
+    assert 'pudge-manga-regions-v96p27-orphan-vertical-ink' in source
     assert 'manga_ocr_page_status:v18:' in source
-    assert '-regions-v59.json' in source
+    assert '-regions-v96p27.json' in source

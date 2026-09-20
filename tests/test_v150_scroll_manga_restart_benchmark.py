@@ -8,13 +8,13 @@ MANGA_JS = ROOT / "pudge" / "web" / "manga_reader_v2.js"
 POLICY = ROOT / "scripts" / "compare_subtitle_alignment_stt_policies.py"
 
 
-def test_manga_ln_grid_is_not_given_light_novel_masonry_rows() -> None:
+def test_ln_and_manga_no_longer_depend_on_dense_masonry_layout() -> None:
     html = HTML.read_text(encoding="utf-8")
     manga = MANGA_JS.read_text(encoding="utf-8")
-    assert ".ln-grid.ln-masonry{grid-auto-flow:dense;grid-auto-rows:8px}" in html
-    assert ".ln-grid{grid-template-columns:repeat(auto-fill,minmax(min(300px,100%),1fr));grid-auto-flow:dense;grid-auto-rows:8px" not in html
-    assert '<div class="ln-grid ln-masonry">${lnSeriesGroups(books)}</div>' in html
-    assert '<div class="ln-grid">${mangaLibraryGroups(books)}</div>' in manga
+    assert "grid-auto-flow:dense" not in html
+    assert "layoutLnMasonry" not in html
+    assert "PudgeLibraryShelves?.build" in html
+    assert "PudgeLibraryShelves?.build" in manga
 
 
 def test_polychrome_effect_is_not_disabled_during_anime_scroll() -> None:

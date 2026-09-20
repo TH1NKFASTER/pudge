@@ -20,6 +20,7 @@ from typing import Any, Callable
 import httpx
 from PIL import Image, ImageEnhance, ImageOps
 
+from .cover_assets import CoverRef
 from .database import Database
 from .manga_ocr_artifact import (
     artifact_page,
@@ -33,7 +34,7 @@ from .work_scheduler import WorkPriority
 
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-_REGION_CACHE_KEY = "pudge-manga-regions-v59-layout-token-geometry"
+_REGION_CACHE_KEY = "pudge-manga-regions-v96p27-orphan-vertical-ink"
 
 
 def _natural_key(value: str) -> list[object]:
@@ -244,11 +245,27 @@ def _finalize_recognized_regions(regions: list[dict[str, Any]]) -> list[dict[str
     # entry points, so this keeps the GUI process free of model initialization.
     from .manga_ocr_worker import (
         _suppress_complete_post_cluster_amalgams,
+        _suppress_clipped_bottom_vertical_fragment_art,
+        _suppress_detector_giant_oneglyph_art,
+        _suppress_empty_horizontal_rectangle_mangaocr_art,
+        _suppress_empty_multicolumn_sentence_art,
+        _suppress_empty_vertical_rectangle_mangaocr_art,
+        _suppress_margin_page_number_regions,
+        _suppress_page_edge_synthetic_ink_grid_art,
         _suppress_short_raw_empty_rectangle_art_noise,
+        _suppress_tiny_empty_horizontal_oneglyph_art,
     )
 
     normalized = _suppress_complete_post_cluster_amalgams(normalized)
-    return _suppress_short_raw_empty_rectangle_art_noise(normalized)
+    normalized = _suppress_short_raw_empty_rectangle_art_noise(normalized)
+    normalized = _suppress_tiny_empty_horizontal_oneglyph_art(normalized)
+    normalized = _suppress_margin_page_number_regions(normalized)
+    normalized = _suppress_detector_giant_oneglyph_art(normalized)
+    normalized = _suppress_empty_vertical_rectangle_mangaocr_art(normalized)
+    normalized = _suppress_page_edge_synthetic_ink_grid_art(normalized)
+    normalized = _suppress_empty_multicolumn_sentence_art(normalized)
+    normalized = _suppress_clipped_bottom_vertical_fragment_art(normalized)
+    return _suppress_empty_horizontal_rectangle_mangaocr_art(normalized)
 
 
 
@@ -857,7 +874,7 @@ class MangaService:
                         self.cache_dir
                         / "manga-ocr"
                         / "artifacts"
-                        / f"{previous_fingerprint}-regions-v59.json"
+                        / f"{previous_fingerprint}-regions-v96p25.json"
                     )
         if stale_artifact_path is not None:
             stale_artifact_path.unlink(missing_ok=True)
@@ -1073,28 +1090,78 @@ class MangaService:
             ]
         return self.remove_books(ids or [int(book_id)])
 
-    def _local_cover_data_uri(self, row: Any) -> str:
+    def _cover_source(self, row: Any) -> tuple[Path, str, str]:
         path = Path(str(row["path"]))
+        stat = path.stat()
+        pages = self._pages(path)
+        if not pages:
+            raise ValueError("Manga has no pages")
+        page_name = str(pages[0])
+        revision = hashlib.sha1(
+            f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{page_name}".encode("utf-8")
+        ).hexdigest()[:20]
+        return path, page_name, revision
+
+    def _local_cover_data_uri(self, row: Any) -> str:
         try:
-            stat = path.stat()
-            pages = self._pages(path)
-            if not pages:
-                return ""
-            digest = hashlib.sha1(
-                f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{pages[0]}".encode("utf-8")
-            ).hexdigest()[:20]
+            path, page_name, revision = self._cover_source(row)
             cover_dir = self.cache_dir / "manga-covers"
             cover_dir.mkdir(parents=True, exist_ok=True)
-            target = cover_dir / f"{digest}.jpg"
+            target = cover_dir / f"{revision}.jpg"
             if not target.is_file() or target.stat().st_size <= 0:
                 with zipfile.ZipFile(path) as archive:
-                    image = Image.open(io.BytesIO(archive.read(pages[0]))).convert("RGB")
+                    image = Image.open(io.BytesIO(archive.read(page_name))).convert("RGB")
                 image.thumbnail((320, 480))
                 image.save(target, format="JPEG", quality=82, optimize=True)
             data = target.read_bytes()
             return f"data:image/jpeg;base64,{base64.b64encode(data).decode('ascii')}"
         except (OSError, ValueError, zipfile.BadZipFile):
             return ""
+
+    def cover_ref(self, book_id: int, *, asset_base: str) -> CoverRef:
+        row = self._book(int(book_id))
+        path, page_name, revision = self._cover_source(row)
+        del path, page_name
+        return CoverRef(
+            asset_id=f"manga:{int(book_id)}",
+            source_revision=revision,
+            thumbnail_url="",
+            preview_url=f"{asset_base}/api/covers/manga/{int(book_id)}/{revision}",
+            source_kind="local_page",
+        )
+
+    def cover_preview_asset(
+        self, book_id: int, *, expected_revision: str = ""
+    ) -> tuple[Path, str, str]:
+        row = self._book(int(book_id))
+        path, page_name, revision = self._cover_source(row)
+        if expected_revision and str(expected_revision) != revision:
+            raise KeyError("stale manga cover revision")
+        media_type = mimetypes.guess_type(page_name)[0] or "image/jpeg"
+        suffix = Path(page_name).suffix.casefold()
+        if suffix not in _IMAGE_EXTENSIONS:
+            suffix = mimetypes.guess_extension(media_type) or ".img"
+        preview_dir = self.cache_dir / "manga-cover-previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        target = preview_dir / f"v1-{revision}-original{suffix}"
+        if not target.is_file() or target.stat().st_size <= 0:
+            with zipfile.ZipFile(path) as archive:
+                raw = archive.read(page_name)
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=preview_dir,
+                    prefix=f".{target.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    handle.write(raw)
+                    temporary = Path(handle.name)
+                temporary.replace(target)
+            finally:
+                if temporary is not None and temporary.exists():
+                    temporary.unlink(missing_ok=True)
+        return target, media_type, revision
 
     def _remote_cover_target(self, url: str) -> Path:
         digest = hashlib.sha256(str(url).encode("utf-8")).hexdigest()[:24]
@@ -1890,7 +1957,7 @@ class MangaService:
     def _ocr_artifact_path(self, book_id: int) -> Path:
         row = self._book(int(book_id))
         fingerprint = str(row["source_fingerprint"] or f"book-{int(book_id)}")
-        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}-regions-v59.json"
+        return self.cache_dir / "manga-ocr" / "artifacts" / f"{fingerprint}-regions-v96p27.json"
 
     def _load_ocr_artifact(self, book_id: int) -> dict[str, Any] | None:
         book_id = int(book_id)

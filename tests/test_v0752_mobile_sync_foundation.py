@@ -168,6 +168,7 @@ def test_library_snapshot_uses_opaque_entities_and_canonical_positions(
     assert by_kind["light_novel"]["position"]["chapter_hash"] == "chapter-hash"
     assert by_kind["audiobook"]["position"]["position_ms"] == 123_500
     assert all("/tmp/" not in item["entity_id"] for item in snapshot["entities"])
+    assert all(item.get("consumption_media_uuid") for item in snapshot["entities"])
     assert snapshot["relations"][0]["type"] == "read_with_audio"
 
 
@@ -428,6 +429,25 @@ def test_http_api_health_pairing_library_and_events(tmp_path: Path) -> None:
         )
         assert status == 200
         assert pushed["results"][0]["status"] == "applied"
+
+        media = service.consumption.ensure_media(kind="manga", title="HTTP Manga", aliases=[("stable", "http-volume")])
+        session = service.consumption.start_session(kind="manga", media_uuid=media.media_uuid, started_at_utc=time.time())
+        now = time.time()
+        service.consumption.append_interval(
+            session_id=session, kind="manga", interval_start_utc=now - 4, interval_end_utc=now,
+            elapsed_monotonic_ms=4000,
+            media=[{"media_uuid": media.media_uuid, "role": "primary", "locator_start": {"page_id": "p1"}, "locator_end": {"page_id": "p1"}}],
+            payload={"page_count": 10},
+        )
+        status, consumption = _json_request(f"{base}/api/v1/consumption/changes?cursor=0&limit=100", token=token)
+        assert status == 200
+        event_record = next(row for row in consumption["records"] if row["type"] == "event")
+        status, replayed = _json_request(
+            f"{base}/api/v1/consumption/events", method="POST", token=token,
+            payload={"reset_epoch": consumption["reset_epoch"], "records": [event_record]},
+        )
+        assert status == 200
+        assert replayed["results"][0]["status"] == "duplicate"
     finally:
         server.shutdown()
         server.server_close()

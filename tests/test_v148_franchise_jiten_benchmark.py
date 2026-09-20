@@ -16,15 +16,15 @@ def _load_policy_module():
     return module
 
 
-def test_franchise_hover_masonry_and_three_series_layout():
+def test_franchise_shelf_wraps_without_dense_masonry_or_resize_loop():
     assert '.ln-franchise-group:hover{' in HTML
-    assert 'grid-auto-rows:8px' in HTML
-    assert 'function layoutLnMasonry(' in HTML
-    assert 'new ResizeObserver(schedule)' in HTML
-    assert 'data-ln-franchise-count="${groups.length}"' in HTML
-    assert '[data-ln-franchise-count="3"]{grid-column:span 3}' in HTML
-    assert '[data-ln-franchise-count="3"] .ln-franchise-series{grid-template-columns:repeat(3,minmax(0,1fr))}' in HTML
-    assert '[data-ln-franchise-count="4"] .ln-franchise-series{grid-template-columns:repeat(2,minmax(0,1fr))}' in HTML
+    assert 'grid-auto-flow:dense' not in HTML
+    assert 'function layoutLnMasonry(' not in HTML
+    assert 'new ResizeObserver(schedule)' not in HTML
+    assert '.ln-franchise-group{grid-column:1/-1' in HTML
+    assert '.ln-franchise-series{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr))' in HTML
+    assert 'data-library-shelf-key=' in HTML
+    assert 'data-library-shelf-toggle=' in HTML
 
 
 def test_ordinary_audiobook_context_menu_unpairs_and_hides_markup():

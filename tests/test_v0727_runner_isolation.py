@@ -77,3 +77,34 @@ def test_isolated_runner_recurses_continues_and_times_out(tmp_path: Path) -> Non
     assert summary["totals"]["timeouts"] == 1
     assert summary["totals"]["failed_files"] == 2
     assert not shared_log.exists()
+
+
+def test_isolated_runner_neuters_macos_open_command(tmp_path: Path) -> None:
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_open_probe.py").write_text(
+        """import os\nimport shutil\nfrom pathlib import Path\n\ndef test_open_is_isolated():\n    resolved = Path(shutil.which('open') or '')\n    isolated_root = Path(os.environ['PUDGE_HOME']).parent\n    assert resolved.is_file()\n    assert str(resolved).startswith(str(isolated_root))\n""",
+        encoding="utf-8",
+    )
+
+    results = tmp_path / "results"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--batch",
+            "0",
+            "--batches",
+            "1",
+            "--results-dir",
+            str(results),
+            "--timeout",
+            "10",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

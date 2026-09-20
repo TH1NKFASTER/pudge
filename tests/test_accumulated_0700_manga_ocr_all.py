@@ -35,7 +35,7 @@ def test_manga_ocr_cache_status_uses_only_region_artifacts(tmp_path: Path) -> No
         ).fetchone()[0] == 0
         conn.execute(
             "INSERT INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-            "VALUES(?,1,'pudge-manga-regions-v59-layout-token-geometry','[]',?)",
+            "VALUES(?,1,'pudge-manga-regions-v96p27-orphan-vertical-ink','[]',?)",
             (book_id, now),
         )
     status = service.ocr_cache_status(book_id)

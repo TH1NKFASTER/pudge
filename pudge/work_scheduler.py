@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -16,6 +15,7 @@ except ImportError:  # pragma: no cover - Pudge ships on macOS.
     fcntl = None  # type: ignore[assignment]
 
 from .foreground import foreground_active
+from .power_policy import PowerPolicy
 
 
 class WorkPriority(IntEnum):
@@ -63,7 +63,15 @@ class WorkScheduler:
     tasks never start while mpv/user preparation owns the foreground marker.
     """
 
-    def __init__(self, cache_dir: Path, *, logger: Any = None) -> None:
+    def __init__(
+        self,
+        cache_dir: Path,
+        *,
+        logger: Any = None,
+        power_manual_enabled: bool = False,
+        power_auto_enabled: bool = True,
+        power_policy: PowerPolicy | None = None,
+    ) -> None:
         self.cache_dir = Path(cache_dir).expanduser()
         self.logger = logger
         self._local_lock = threading.Lock()
@@ -75,7 +83,16 @@ class WorkScheduler:
         # cooperative background workers then yield at a safe boundary.
         self._active_priority: WorkPriority | None = None
         self._priority_requests: list[tuple[int, int, object, str]] = []
-        self._resource_cache: tuple[float, dict[str, Any]] = (0.0, {})
+        self.power_policy = power_policy or PowerPolicy(
+            manual_enabled=power_manual_enabled,
+            auto_enabled=power_auto_enabled,
+            run_command=lambda *args, **kwargs: subprocess.run(*args, **kwargs),
+            platform=sys.platform,
+        )
+        # Keep the public background_allowed() method as the admission seam.
+        # A number of callers/tests override it to suppress resource probes; the
+        # detailed reason is recorded per-thread by the normal implementation.
+        self._background_decision_local = threading.local()
 
     def _log(self, message: str, *args: Any) -> None:
         if self.logger is not None:
@@ -146,44 +163,34 @@ class WorkScheduler:
                 return True
             return any(row[0] < requested for row in self._waiters)
 
+    def power_snapshot(self, *, refresh: bool = False) -> dict[str, Any]:
+        return self.power_policy.snapshot(refresh=refresh).as_dict()
+
     def resource_status(self, *, refresh: bool = False) -> dict[str, Any]:
-        now = time.monotonic()
-        cached_at, cached = self._resource_cache
-        if not refresh and cached and now - cached_at < 30.0:
-            return dict(cached)
-        status: dict[str, Any] = {
-            "thermal_limited": False,
-            "on_battery": False,
-            "battery_percent": None,
-        }
-        if sys.platform == "darwin":
-            try:
-                battery = subprocess.run(
-                    ["pmset", "-g", "batt"],
-                    text=True,
-                    capture_output=True,
-                    timeout=2,
-                    check=False,
-                ).stdout
-                match = re.search(r"(\d+)%", battery)
-                status["battery_percent"] = int(match.group(1)) if match else None
-                status["on_battery"] = "Battery Power" in battery
-            except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-                pass
-            try:
-                thermal = subprocess.run(
-                    ["pmset", "-g", "therm"],
-                    text=True,
-                    capture_output=True,
-                    timeout=2,
-                    check=False,
-                ).stdout
-                limits = [int(value) for value in re.findall(r"(?:CPU|GPU)_Speed_Limit\s*=\s*(\d+)", thermal)]
-                status["thermal_limited"] = bool(limits and min(limits) < 100)
-            except (OSError, subprocess.SubprocessError, TypeError, ValueError):
-                pass
-        self._resource_cache = (now, dict(status))
-        return status
+        """Compatibility view plus the richer PowerPolicy fields."""
+        snapshot = self.power_policy.snapshot(refresh=refresh)
+        payload = snapshot.as_dict()
+        # Historical callers treated an unknown power source as False. Keep that
+        # narrow compatibility while power_snapshot() preserves None/unknown.
+        payload["on_battery"] = bool(snapshot.on_battery)
+        return payload
+
+    def background_block_reason(
+        self,
+        *,
+        priority: WorkPriority | int = WorkPriority.BACKGROUND,
+        resource: str = "cpu",
+    ) -> str | None:
+        if foreground_active(self.cache_dir):
+            reason: str | None = "foreground"
+        else:
+            requested = WorkPriority(int(priority))
+            if requested != WorkPriority.BACKGROUND:
+                reason = None
+            else:
+                reason = self.power_policy.background_block_reason(resource=resource)
+        self._background_decision_local.reason = reason
+        return reason
 
     def background_allowed(
         self,
@@ -191,18 +198,32 @@ class WorkScheduler:
         priority: WorkPriority | int = WorkPriority.BACKGROUND,
         resource: str = "cpu",
     ) -> bool:
-        if foreground_active(self.cache_dir):
-            return False
+        return self.background_block_reason(priority=priority, resource=resource) is None
+
+    def background_wait_reason(
+        self,
+        *,
+        priority: WorkPriority | int = WorkPriority.BACKGROUND,
+        resource: str = "cpu",
+        fallback: str = "foreground",
+    ) -> str | None:
+        """Return the admission reason without bypassing background_allowed().
+
+        background_allowed() is the compatibility/override seam used by tests and
+        by callers that intentionally suppress resource probes.  The normal
+        implementation records the precise reason in thread-local state, so this
+        helper can preserve energy_saving/thermal/foreground diagnostics without
+        probing battery state a second time.
+        """
         requested = WorkPriority(int(priority))
-        if requested != WorkPriority.BACKGROUND:
-            return True
-        status = self.resource_status()
-        if resource in {"cpu", "gpu"} and bool(status.get("thermal_limited")):
-            return False
-        battery = status.get("battery_percent")
-        if bool(status.get("on_battery")) and battery is not None and int(battery) <= 20:
-            return False
-        return True
+        if requested == WorkPriority.BACKGROUND and resource == "cpu":
+            allowed = self.background_allowed()
+        else:
+            allowed = self.background_allowed(priority=requested, resource=resource)
+        if allowed:
+            return None
+        reason = getattr(self._background_decision_local, "reason", None)
+        return str(reason or fallback)
 
     def wait_until_background(
         self,
@@ -250,12 +271,17 @@ class WorkScheduler:
                     resource=resource,
                 ):
                     return None
-            elif not self.background_allowed(priority=requested_priority, resource=resource):
-                self._log(
-                    "SKIP step=work_scheduler.heavy name=%s reason=foreground_active",
-                    name,
+            else:
+                block_reason = self.background_wait_reason(
+                    priority=requested_priority, resource=resource
                 )
-                return None
+                if block_reason is not None:
+                    self._log(
+                        "SKIP step=work_scheduler.heavy name=%s reason=%s",
+                        name,
+                        block_reason,
+                    )
+                    return None
 
         waiter: object | None = None
         if blocking:
@@ -332,16 +358,25 @@ class WorkScheduler:
                 raise
 
             if locked:
-                if foreground_sensitive and not self.background_allowed(
-                    priority=requested_priority,
-                    resource=resource,
-                ):
+                block_reason = (
+                    self.background_wait_reason(
+                        priority=requested_priority, resource=resource
+                    )
+                    if foreground_sensitive
+                    else None
+                )
+                if block_reason is not None:
                     try:
                         if fcntl is not None:
                             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                     finally:
                         handle.close()
                         self._local_lock.release()
+                    self._log(
+                        "SKIP step=work_scheduler.heavy name=%s reason=%s",
+                        name,
+                        block_reason,
+                    )
                     if not blocking:
                         return None
                     if cancel_event is not None:

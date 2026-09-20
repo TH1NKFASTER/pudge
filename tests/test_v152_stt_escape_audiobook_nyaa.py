@@ -97,12 +97,14 @@ def test_audiobook_nyaa_volume_selection_chooses_only_requested_files() -> None:
     assert [row["file_id"] for row in selected] == [1]
 
 
-def test_escape_card_selection_has_window_capture_fallback() -> None:
+def test_escape_uses_one_window_capture_dispatcher() -> None:
     html = INDEX.read_text(encoding="utf-8")
     assert "function isEscapeKey(event)" in html
     assert "event?.key==='Esc'" in html
-    assert "window.addEventListener('keydown',captureEscapeCardSelection,true)" in html
+    assert "window.addEventListener('keydown',dispatchEscapeEvent,true)" in html
+    assert "function captureEscapeCardSelection(event)" in html
     assert "window.addEventListener('keyup',captureEscapeCardSelection,true)" in html
+    assert "if(!clearSelectionOnEscape('keyup'))return;" in html
 
 
 def test_light_novel_context_menu_has_selective_nyaa_audiobook_search() -> None:

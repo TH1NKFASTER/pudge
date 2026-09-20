@@ -4,6 +4,7 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +13,11 @@ from typing import Iterable, Iterator
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode
 from .episode_state import transition_episode_state, stronger_episode_state
+from .personal_schedule import (
+    PersonalReleaseItem,
+    PersonalReleaseSchedule,
+    materialize_weekly_items,
+)
 
 
 SCHEMA = """
@@ -219,6 +225,40 @@ CREATE TABLE IF NOT EXISTS playlist_items (
 
 CREATE INDEX IF NOT EXISTS idx_playlist_items_queue
 ON playlist_items(playlist_id, state, position);
+
+CREATE TABLE IF NOT EXISTS personal_release_schedules (
+    schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id TEXT NOT NULL DEFAULT 'default',
+    anime_id INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    start_local_datetime TEXT NOT NULL,
+    timezone_iana TEXT NOT NULL,
+    cadence TEXT NOT NULL DEFAULT 'weekly',
+    first_episode_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    rewatch INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY(anime_id) REFERENCES anime(media_id) ON DELETE CASCADE,
+    UNIQUE(profile_id, anime_id)
+);
+
+CREATE TABLE IF NOT EXISTS personal_release_items (
+    schedule_id INTEGER NOT NULL,
+    logical_episode_id INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    unlock_at_utc REAL NOT NULL,
+    nominal_local_datetime TEXT NOT NULL,
+    schedule_revision INTEGER NOT NULL,
+    unlocked_once INTEGER NOT NULL DEFAULT 0,
+    watched_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(schedule_id, logical_episode_id),
+    FOREIGN KEY(schedule_id) REFERENCES personal_release_schedules(schedule_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_personal_release_items_unlock
+ON personal_release_items(schedule_id, unlocked_once, unlock_at_utc, ordinal);
 
 CREATE TABLE IF NOT EXISTS state (
     key TEXT PRIMARY KEY,
@@ -432,9 +472,197 @@ CREATE TABLE IF NOT EXISTS media_identities (
     updated_at REAL NOT NULL,
     PRIMARY KEY(kind,local_id)
 );
+
+
+CREATE TABLE IF NOT EXISTS consumption_media (
+    media_uuid TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title_snapshot TEXT NOT NULL DEFAULT '',
+    current_library_kind TEXT NOT NULL DEFAULT '',
+    current_library_id TEXT NOT NULL DEFAULT '',
+    source_revision TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    deleted_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_media_library
+ON consumption_media(current_library_kind,current_library_id);
+
+CREATE TABLE IF NOT EXISTS consumption_media_aliases (
+    kind TEXT NOT NULL,
+    alias_type TEXT NOT NULL,
+    alias_value TEXT NOT NULL,
+    media_uuid TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(kind,alias_type,alias_value),
+    FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_alias_media
+ON consumption_media_aliases(media_uuid);
+
+CREATE TABLE IF NOT EXISTS vn_titles (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    normalized_title TEXT NOT NULL,
+    executable_hint TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(normalized_title,executable_hint)
+);
+
+CREATE TABLE IF NOT EXISTS consumption_devices (
+    device_id TEXT PRIMARY KEY,
+    device_name TEXT NOT NULL DEFAULT '',
+    next_seq INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS consumption_sessions (
+    session_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'default',
+    device_id TEXT NOT NULL,
+    activity_group_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    primary_media_uuid TEXT,
+    started_at_utc REAL NOT NULL,
+    ended_at_utc REAL,
+    origin TEXT NOT NULL DEFAULT 'automatic',
+    status TEXT NOT NULL DEFAULT 'active',
+    measurement_method TEXT NOT NULL DEFAULT 'observation',
+    policy_version TEXT NOT NULL DEFAULT 'r7-v1',
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    FOREIGN KEY(primary_media_uuid) REFERENCES consumption_media(media_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_sessions_time
+ON consumption_sessions(started_at_utc,ended_at_utc);
+CREATE INDEX IF NOT EXISTS idx_consumption_sessions_media
+ON consumption_sessions(primary_media_uuid,status,started_at_utc);
+CREATE INDEX IF NOT EXISTS idx_consumption_sessions_group
+ON consumption_sessions(activity_group_id,kind,started_at_utc);
+
+CREATE TABLE IF NOT EXISTS consumption_events (
+    event_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    device_seq INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    interval_start_utc REAL NOT NULL,
+    interval_end_utc REAL NOT NULL,
+    elapsed_monotonic_ms REAL NOT NULL,
+    received_at_utc REAL NOT NULL,
+    timezone_iana TEXT NOT NULL DEFAULT '',
+    utc_offset INTEGER NOT NULL DEFAULT 0,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    content_hash TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    UNIQUE(device_id,device_seq),
+    FOREIGN KEY(session_id) REFERENCES consumption_sessions(session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_events_session
+ON consumption_events(session_id,interval_start_utc);
+CREATE INDEX IF NOT EXISTS idx_consumption_events_time
+ON consumption_events(interval_start_utc,interval_end_utc);
+
+CREATE TABLE IF NOT EXISTS consumption_event_media (
+    event_id TEXT NOT NULL,
+    media_uuid TEXT NOT NULL,
+    source_revision TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'primary',
+    locator_start_json TEXT NOT NULL DEFAULT '{}',
+    locator_end_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(event_id,media_uuid,role),
+    FOREIGN KEY(event_id) REFERENCES consumption_events(event_id) ON DELETE CASCADE,
+    FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_event_media_media
+ON consumption_event_media(media_uuid,event_id);
+
+CREATE TABLE IF NOT EXISTS vn_capture_sessions (
+    session_id TEXT PRIMARY KEY,
+    vn_title_id TEXT NOT NULL,
+    window_id INTEGER NOT NULL,
+    generation INTEGER NOT NULL,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    FOREIGN KEY(session_id) REFERENCES consumption_sessions(session_id),
+    FOREIGN KEY(vn_title_id) REFERENCES vn_titles(id)
+);
+CREATE INDEX IF NOT EXISTS idx_vn_capture_title
+ON vn_capture_sessions(vn_title_id,started_at);
+
+CREATE TABLE IF NOT EXISTS consumption_corrections (
+    correction_id TEXT PRIMARY KEY,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    parent_revision INTEGER NOT NULL DEFAULT 0,
+    excluded INTEGER NOT NULL DEFAULT 0,
+    replacement_start_utc REAL,
+    replacement_end_utc REAL,
+    replacement_duration_seconds REAL,
+    reason TEXT NOT NULL DEFAULT '',
+    device_id TEXT NOT NULL DEFAULT '',
+    created_at_utc REAL NOT NULL,
+    UNIQUE(target_type,target_id,revision)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_corrections_target
+ON consumption_corrections(target_type,target_id,revision DESC);
+
+CREATE TABLE IF NOT EXISTS consumption_manual_entries (
+    manual_id TEXT PRIMARY KEY,
+    media_uuid TEXT,
+    kind TEXT NOT NULL,
+    title_snapshot TEXT NOT NULL DEFAULT '',
+    started_at_utc REAL,
+    duration_seconds REAL NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    origin TEXT NOT NULL DEFAULT 'manual',
+    created_at_utc REAL NOT NULL,
+    updated_at_utc REAL NOT NULL,
+    FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_manual_time
+ON consumption_manual_entries(started_at_utc,kind);
+
+CREATE TABLE IF NOT EXISTS consumption_daily_rollups (
+    local_day TEXT PRIMARY KEY,
+    total_seconds REAL NOT NULL DEFAULT 0,
+    breakdown_json TEXT NOT NULL DEFAULT '{}',
+    event_count INTEGER NOT NULL DEFAULT 0,
+    policy_version TEXT NOT NULL DEFAULT 'r8-v1',
+    generated_at_utc REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS consumption_history_state (
+    profile_id TEXT PRIMARY KEY,
+    reset_epoch INTEGER NOT NULL DEFAULT 0,
+    reset_at_utc REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS consumption_sync_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_type TEXT NOT NULL,
+    record_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at_utc REAL NOT NULL,
+    UNIQUE(record_type,record_key)
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_sync_outbox_created
+ON consumption_sync_outbox(created_at_utc,id);
+
+CREATE TABLE IF NOT EXISTS consumption_sync_receipts (
+    device_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    record_hash TEXT NOT NULL,
+    received_at_utc REAL NOT NULL,
+    PRIMARY KEY(device_id,record_id)
+);
 """
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 11
 
 
 def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
@@ -464,8 +692,13 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._connection_scope_local = threading.local()
         existing_database = self.path.is_file() and self.path.stat().st_size > 0
         with self.connect() as conn:
+            # WAL mode is persistent for the database file. Reissuing this PRAGMA
+            # on every short-lived connection forces SQLite to touch/parse schema
+            # state repeatedly and showed up directly in the R10 energy profile.
+            conn.execute("PRAGMA journal_mode=WAL")
             version_row = conn.execute("PRAGMA user_version").fetchone()
             previous_version = int(version_row[0] if version_row else 0)
             if existing_database and previous_version < LATEST_SCHEMA_VERSION:
@@ -518,6 +751,18 @@ class Database:
             conn.execute("PRAGMA user_version=6")
         if version < 7:
             self._migrate_v7(conn)
+            conn.execute("PRAGMA user_version=7")
+        if version < 8:
+            self._migrate_v8(conn)
+            conn.execute("PRAGMA user_version=8")
+        if version < 9:
+            self._migrate_v9(conn)
+            conn.execute("PRAGMA user_version=9")
+        if version < 10:
+            self._migrate_v10(conn)
+            conn.execute("PRAGMA user_version=10")
+        if version < 11:
+            self._migrate_v11(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -750,13 +995,186 @@ class Database:
             """
         )
 
-    @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def _migrate_v8(self, conn: sqlite3.Connection) -> None:
+        _execute_sql_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS personal_release_schedules (
+                schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL DEFAULT 'default',
+                anime_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                start_local_datetime TEXT NOT NULL,
+                timezone_iana TEXT NOT NULL,
+                cadence TEXT NOT NULL DEFAULT 'weekly',
+                first_episode_id INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                rewatch INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(anime_id) REFERENCES anime(media_id) ON DELETE CASCADE,
+                UNIQUE(profile_id, anime_id)
+            );
+            CREATE TABLE IF NOT EXISTS personal_release_items (
+                schedule_id INTEGER NOT NULL,
+                logical_episode_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                unlock_at_utc REAL NOT NULL,
+                nominal_local_datetime TEXT NOT NULL,
+                schedule_revision INTEGER NOT NULL,
+                unlocked_once INTEGER NOT NULL DEFAULT 0,
+                watched_at REAL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(schedule_id, logical_episode_id),
+                FOREIGN KEY(schedule_id) REFERENCES personal_release_schedules(schedule_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_personal_release_items_unlock
+            ON personal_release_items(schedule_id, unlocked_once, unlock_at_utc, ordinal);
+            """,
+        )
+
+    def _migrate_v9(self, conn: sqlite3.Connection) -> None:
+        """Add stable consumption identities and the append-only R7 ledger."""
+        _execute_sql_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS consumption_media (
+                media_uuid TEXT PRIMARY KEY,kind TEXT NOT NULL,title_snapshot TEXT NOT NULL DEFAULT '',
+                current_library_kind TEXT NOT NULL DEFAULT '',current_library_id TEXT NOT NULL DEFAULT '',
+                source_revision TEXT NOT NULL DEFAULT '',metadata_json TEXT NOT NULL DEFAULT '{}',
+                deleted_at REAL,created_at REAL NOT NULL,updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_media_library ON consumption_media(current_library_kind,current_library_id);
+            CREATE TABLE IF NOT EXISTS consumption_media_aliases (
+                kind TEXT NOT NULL,alias_type TEXT NOT NULL,alias_value TEXT NOT NULL,media_uuid TEXT NOT NULL,created_at REAL NOT NULL,
+                PRIMARY KEY(kind,alias_type,alias_value),
+                FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_alias_media ON consumption_media_aliases(media_uuid);
+            CREATE TABLE IF NOT EXISTS vn_titles (
+                id TEXT PRIMARY KEY,title TEXT NOT NULL,normalized_title TEXT NOT NULL,executable_hint TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,updated_at REAL NOT NULL,UNIQUE(normalized_title,executable_hint)
+            );
+            CREATE TABLE IF NOT EXISTS consumption_devices (
+                device_id TEXT PRIMARY KEY,next_seq INTEGER NOT NULL DEFAULT 1,created_at REAL NOT NULL,updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS consumption_sessions (
+                session_id TEXT PRIMARY KEY,profile_id TEXT NOT NULL DEFAULT 'default',device_id TEXT NOT NULL,
+                activity_group_id TEXT NOT NULL,kind TEXT NOT NULL,primary_media_uuid TEXT,
+                started_at_utc REAL NOT NULL,ended_at_utc REAL,origin TEXT NOT NULL DEFAULT 'automatic',
+                status TEXT NOT NULL DEFAULT 'active',measurement_method TEXT NOT NULL DEFAULT 'observation',
+                policy_version TEXT NOT NULL DEFAULT 'r7-v1',schema_version INTEGER NOT NULL DEFAULT 1,metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(primary_media_uuid) REFERENCES consumption_media(media_uuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_sessions_time ON consumption_sessions(started_at_utc,ended_at_utc);
+            CREATE INDEX IF NOT EXISTS idx_consumption_sessions_media ON consumption_sessions(primary_media_uuid,status,started_at_utc);
+            CREATE TABLE IF NOT EXISTS consumption_events (
+                event_id TEXT PRIMARY KEY,device_id TEXT NOT NULL,device_seq INTEGER NOT NULL,session_id TEXT NOT NULL,kind TEXT NOT NULL,
+                interval_start_utc REAL NOT NULL,interval_end_utc REAL NOT NULL,elapsed_monotonic_ms REAL NOT NULL,received_at_utc REAL NOT NULL,
+                timezone_iana TEXT NOT NULL DEFAULT '',utc_offset INTEGER NOT NULL DEFAULT 0,payload_json TEXT NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL,schema_version INTEGER NOT NULL DEFAULT 1,UNIQUE(device_id,device_seq),
+                FOREIGN KEY(session_id) REFERENCES consumption_sessions(session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_events_session ON consumption_events(session_id,interval_start_utc);
+            CREATE INDEX IF NOT EXISTS idx_consumption_events_time ON consumption_events(interval_start_utc,interval_end_utc);
+            CREATE TABLE IF NOT EXISTS consumption_event_media (
+                event_id TEXT NOT NULL,media_uuid TEXT NOT NULL,source_revision TEXT NOT NULL DEFAULT '',role TEXT NOT NULL DEFAULT 'primary',
+                locator_start_json TEXT NOT NULL DEFAULT '{}',locator_end_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY(event_id,media_uuid,role),
+                FOREIGN KEY(event_id) REFERENCES consumption_events(event_id) ON DELETE CASCADE,
+                FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_event_media_media ON consumption_event_media(media_uuid,event_id);
+            CREATE TABLE IF NOT EXISTS vn_capture_sessions (
+                session_id TEXT PRIMARY KEY,vn_title_id TEXT NOT NULL,window_id INTEGER NOT NULL,generation INTEGER NOT NULL,started_at REAL NOT NULL,ended_at REAL,
+                FOREIGN KEY(session_id) REFERENCES consumption_sessions(session_id),FOREIGN KEY(vn_title_id) REFERENCES vn_titles(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vn_capture_title ON vn_capture_sessions(vn_title_id,started_at);
+            """,
+        )
+
+    def _migrate_v10(self, conn: sqlite3.Connection) -> None:
+        """Add R8 statistics corrections, manual entries and rebuildable rollups."""
+        _execute_sql_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS consumption_corrections (
+                correction_id TEXT PRIMARY KEY,target_type TEXT NOT NULL,target_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,parent_revision INTEGER NOT NULL DEFAULT 0,excluded INTEGER NOT NULL DEFAULT 0,
+                replacement_start_utc REAL,replacement_end_utc REAL,replacement_duration_seconds REAL,
+                reason TEXT NOT NULL DEFAULT '',device_id TEXT NOT NULL DEFAULT '',created_at_utc REAL NOT NULL,
+                UNIQUE(target_type,target_id,revision)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_sessions_group
+            ON consumption_sessions(activity_group_id,kind,started_at_utc);
+            CREATE INDEX IF NOT EXISTS idx_consumption_corrections_target
+            ON consumption_corrections(target_type,target_id,revision DESC);
+            CREATE TABLE IF NOT EXISTS consumption_manual_entries (
+                manual_id TEXT PRIMARY KEY,media_uuid TEXT,kind TEXT NOT NULL,title_snapshot TEXT NOT NULL DEFAULT '',
+                started_at_utc REAL,duration_seconds REAL NOT NULL,note TEXT NOT NULL DEFAULT '',origin TEXT NOT NULL DEFAULT 'manual',
+                created_at_utc REAL NOT NULL,updated_at_utc REAL NOT NULL,
+                FOREIGN KEY(media_uuid) REFERENCES consumption_media(media_uuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_manual_time
+            ON consumption_manual_entries(started_at_utc,kind);
+            CREATE TABLE IF NOT EXISTS consumption_daily_rollups (
+                local_day TEXT PRIMARY KEY,total_seconds REAL NOT NULL DEFAULT 0,breakdown_json TEXT NOT NULL DEFAULT '{}',
+                event_count INTEGER NOT NULL DEFAULT 0,policy_version TEXT NOT NULL DEFAULT 'r8-v1',generated_at_utc REAL NOT NULL
+            );
+            """,
+        )
+        self._ensure_column(conn, "consumption_devices", "device_name", "TEXT NOT NULL DEFAULT ''")
+
+
+    def _migrate_v11(self, conn: sqlite3.Connection) -> None:
+        """Add R9 native-volume/offline consumption transport state."""
+        _execute_sql_script(
+            conn,
+            """
+            CREATE TABLE IF NOT EXISTS consumption_history_state (
+                profile_id TEXT PRIMARY KEY,reset_epoch INTEGER NOT NULL DEFAULT 0,
+                reset_at_utc REAL NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS consumption_sync_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,record_type TEXT NOT NULL,
+                record_key TEXT NOT NULL,payload_json TEXT NOT NULL,created_at_utc REAL NOT NULL,
+                UNIQUE(record_type,record_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_consumption_sync_outbox_created
+            ON consumption_sync_outbox(created_at_utc,id);
+            CREATE TABLE IF NOT EXISTS consumption_sync_receipts (
+                device_id TEXT NOT NULL,record_id TEXT NOT NULL,record_hash TEXT NOT NULL,
+                received_at_utc REAL NOT NULL,PRIMARY KEY(device_id,record_id)
+            );
+            INSERT OR IGNORE INTO consumption_history_state(profile_id,reset_epoch,reset_at_utc)
+            VALUES('default',0,0);
+            """,
+        )
+
+    def _scope_local(self) -> threading.local:
+        local = getattr(self, "_connection_scope_local", None)
+        if local is None:
+            local = threading.local()
+            self._connection_scope_local = local
+        return local
+
+    def _open_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        # API payload assembly calls many small repository methods. When the
+        # caller established connection_scope(), reuse one thread-local SQLite
+        # connection instead of reparsing the large schema dozens of times.
+        shared = getattr(self._scope_local(), "connection", None)
+        if shared is not None:
+            yield shared
+            return
+        conn = self._open_connection()
         try:
             yield conn
             conn.commit()
@@ -764,6 +1182,25 @@ class Database:
             conn.rollback()
             raise
         finally:
+            conn.close()
+
+    @contextmanager
+    def connection_scope(self) -> Iterator[sqlite3.Connection]:
+        local = self._scope_local()
+        shared = getattr(local, "connection", None)
+        if shared is not None:
+            yield shared
+            return
+        conn = self._open_connection()
+        local.connection = conn
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            local.connection = None
             conn.close()
 
     def set_state(self, key: str, value: str) -> None:
@@ -2606,6 +3043,35 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM subtitle_jobs ORDER BY next_check").fetchall()
 
+    def subtitle_job_poll_hint(self, *, min_priority: int = 200) -> dict[str, float | int]:
+        """Return the tiny scheduling state needed by foreground polling.
+
+        The web UI must not keep a stale due subtitle row hot-looping after a
+        worker has moved its next_check into the future.  Fetch only aggregate
+        scheduling metadata instead of serializing every subtitle job.
+        """
+        now = time.time()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN state IN ('pending','processing') THEN 1 ELSE 0 END) AS active_count,
+                  SUM(CASE WHEN state IN ('pending','processing') AND next_check<=? THEN 1 ELSE 0 END) AS due_count,
+                  SUM(CASE WHEN state IN ('pending','processing') AND priority>=? THEN 1 ELSE 0 END) AS priority_count,
+                  SUM(CASE WHEN state IN ('pending','processing') AND priority>=? AND next_check<=? THEN 1 ELSE 0 END) AS priority_due_count,
+                  MIN(CASE WHEN state IN ('pending','processing') THEN next_check ELSE NULL END) AS next_check
+                FROM subtitle_jobs
+                """,
+                (now, max(0, int(min_priority)), max(0, int(min_priority)), now),
+            ).fetchone()
+        return {
+            "active_count": int((row["active_count"] if row is not None else 0) or 0),
+            "due_count": int((row["due_count"] if row is not None else 0) or 0),
+            "priority_count": int((row["priority_count"] if row is not None else 0) or 0),
+            "priority_due_count": int((row["priority_due_count"] if row is not None else 0) or 0),
+            "next_check": float((row["next_check"] if row is not None else 0.0) or 0.0),
+        }
+
     def reset_pending_subtitle_jobs(self) -> int:
         """Make pending jobs immediately due after a resolver/validation upgrade."""
         now = time.time()
@@ -3382,6 +3848,221 @@ class Database:
     def mark_rating_prompted(self, media_id: int, episode: int) -> None:
         self.set_state(f"rating_prompted:{int(media_id)}:{int(episode)}", "1")
 
+    def personal_release_schedule(
+        self,
+        anime_id: int,
+        *,
+        profile_id: str = "default",
+        now: float | None = None,
+    ) -> PersonalReleaseSchedule | None:
+        current = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM personal_release_schedules WHERE profile_id=? AND anime_id=?",
+                (str(profile_id), int(anime_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            if bool(row["enabled"]):
+                conn.execute(
+                    """
+                    UPDATE personal_release_items
+                    SET unlocked_once=1,updated_at=?
+                    WHERE schedule_id=? AND unlocked_once=0 AND unlock_at_utc<=?
+                    """,
+                    (current, int(row["schedule_id"]), current),
+                )
+            items = conn.execute(
+                """
+                SELECT * FROM personal_release_items
+                WHERE schedule_id=? ORDER BY ordinal,logical_episode_id
+                """,
+                (int(row["schedule_id"]),),
+            ).fetchall()
+            return PersonalReleaseSchedule(
+                schedule_id=int(row["schedule_id"]),
+                anime_id=int(row["anime_id"]),
+                enabled=bool(row["enabled"]),
+                start_local_datetime=str(row["start_local_datetime"]),
+                timezone_iana=str(row["timezone_iana"]),
+                first_episode=int(row["first_episode_id"]),
+                revision=int(row["revision"]),
+                rewatch=bool(row["rewatch"]),
+                items=tuple(
+                    PersonalReleaseItem(
+                        episode=int(item["logical_episode_id"]),
+                        ordinal=int(item["ordinal"]),
+                        unlock_at_utc=float(item["unlock_at_utc"]),
+                        nominal_local_datetime=str(item["nominal_local_datetime"]),
+                        unlocked=bool(item["unlocked_once"]),
+                        watched_at=float(item["watched_at"]) if item["watched_at"] is not None else None,
+                    )
+                    for item in items
+                ),
+            )
+
+    def active_personal_release_schedules(self, *, now: float | None = None) -> list[PersonalReleaseSchedule]:
+        current = time.time() if now is None else float(now)
+        with self.connect() as conn:
+            ids = [
+                int(row["anime_id"])
+                for row in conn.execute(
+                    "SELECT anime_id FROM personal_release_schedules WHERE enabled=1 ORDER BY anime_id"
+                ).fetchall()
+            ]
+        return [
+            schedule
+            for anime_id in ids
+            if (schedule := self.personal_release_schedule(anime_id, now=current)) is not None
+        ]
+
+    def save_personal_release_schedule(
+        self,
+        anime_id: int,
+        *,
+        episodes: list[int],
+        start_local_datetime: str,
+        timezone_iana: str,
+        rewatch: bool,
+        profile_id: str = "default",
+        now: float | None = None,
+    ) -> PersonalReleaseSchedule:
+        ordered = [int(value) for value in episodes]
+        if not ordered or any(value < 1 for value in ordered) or len(set(ordered)) != len(ordered):
+            raise ValueError("Personal schedule requires a unique ordered episode list")
+        current = time.time() if now is None else float(now)
+        materialized = materialize_weekly_items(
+            ordered,
+            start_local_datetime=start_local_datetime,
+            timezone_iana=timezone_iana,
+        )
+        with self.connect() as conn:
+            previous = conn.execute(
+                "SELECT * FROM personal_release_schedules WHERE profile_id=? AND anime_id=?",
+                (str(profile_id), int(anime_id)),
+            ).fetchone()
+            revision = int(previous["revision"]) + 1 if previous is not None else 1
+            if previous is None:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO personal_release_schedules(
+                        profile_id,anime_id,enabled,start_local_datetime,timezone_iana,cadence,
+                        first_episode_id,revision,rewatch,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'weekly',?,?,?,?,?)
+                    """,
+                    (
+                        str(profile_id), int(anime_id), 1, str(start_local_datetime),
+                        str(timezone_iana), ordered[0], revision, int(bool(rewatch)), current, current,
+                    ),
+                )
+                schedule_id = int(cursor.lastrowid)
+                preserved: dict[int, sqlite3.Row] = {}
+            else:
+                schedule_id = int(previous["schedule_id"])
+                preserved = {
+                    int(row["logical_episode_id"]): row
+                    for row in conn.execute(
+                        "SELECT * FROM personal_release_items WHERE schedule_id=?",
+                        (schedule_id,),
+                    ).fetchall()
+                    if bool(row["unlocked_once"]) or row["watched_at"] is not None
+                }
+                conn.execute(
+                    """
+                    UPDATE personal_release_schedules
+                    SET enabled=1,start_local_datetime=?,timezone_iana=?,cadence='weekly',
+                        first_episode_id=?,revision=?,rewatch=?,updated_at=?
+                    WHERE schedule_id=?
+                    """,
+                    (str(start_local_datetime), str(timezone_iana), ordered[0], revision, int(bool(rewatch)), current, schedule_id),
+                )
+                conn.execute("DELETE FROM personal_release_items WHERE schedule_id=?", (schedule_id,))
+            for item in materialized:
+                old = preserved.get(item.episode)
+                unlock_at = float(old["unlock_at_utc"]) if old is not None else item.unlock_at_utc
+                nominal = str(old["nominal_local_datetime"]) if old is not None else item.nominal_local_datetime
+                unlocked = int(bool(old["unlocked_once"])) if old is not None else int(item.unlock_at_utc <= current)
+                watched_at = old["watched_at"] if old is not None else None
+                item_revision = int(old["schedule_revision"]) if old is not None else revision
+                conn.execute(
+                    """
+                    INSERT INTO personal_release_items(
+                        schedule_id,logical_episode_id,ordinal,unlock_at_utc,nominal_local_datetime,
+                        schedule_revision,unlocked_once,watched_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (schedule_id,item.episode,item.ordinal,unlock_at,nominal,item_revision,unlocked,watched_at,current),
+                )
+            conn.execute(
+                "UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=? WHERE key='ui_state_version'",
+                (current,),
+            )
+        result = self.personal_release_schedule(anime_id, profile_id=profile_id, now=current)
+        if result is None:
+            raise RuntimeError("Failed to persist personal release schedule")
+        return result
+
+    def disable_personal_release_schedule(self, anime_id: int, *, profile_id: str = "default") -> bool:
+        now = time.time()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE personal_release_schedules SET enabled=0,revision=revision+1,updated_at=?
+                WHERE profile_id=? AND anime_id=? AND enabled!=0
+                """,
+                (now, str(profile_id), int(anime_id)),
+            )
+            if int(cursor.rowcount or 0):
+                conn.execute(
+                    "UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=? WHERE key='ui_state_version'",
+                    (now,),
+                )
+                return True
+            return False
+
+    def mark_personal_release_watched(
+        self, anime_id: int, episode: int, *, watched_at: float | None = None, profile_id: str = "default"
+    ) -> bool:
+        now = time.time() if watched_at is None else float(watched_at)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT schedule_id FROM personal_release_schedules WHERE profile_id=? AND anime_id=? AND enabled=1",
+                (str(profile_id), int(anime_id)),
+            ).fetchone()
+            if row is None:
+                return False
+            cursor = conn.execute(
+                """
+                UPDATE personal_release_items
+                SET watched_at=COALESCE(watched_at,?),unlocked_once=1,updated_at=?
+                WHERE schedule_id=? AND logical_episode_id=?
+                """,
+                (now, now, int(row["schedule_id"]), int(episode)),
+            )
+            if int(cursor.rowcount or 0):
+                conn.execute(
+                    "UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=? WHERE key='ui_state_version'",
+                    (now,),
+                )
+                return True
+            return False
+
+    def personal_release_item_retained(self, media_id: int | None, episode: int | None) -> bool:
+        if media_id is None or episode is None:
+            return False
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM personal_release_schedules s
+                JOIN personal_release_items i ON i.schedule_id=s.schedule_id
+                WHERE s.enabled=1 AND s.anime_id=? AND i.logical_episode_id=? AND i.watched_at IS NULL
+                LIMIT 1
+                """,
+                (int(media_id), int(episode)),
+            ).fetchone()
+            return row is not None
+
     def reconcile_anilist_progress(self, media_id: int, progress: int) -> int:
         """Undo local watched markers for episodes no longer watched on AniList.
 
@@ -3495,7 +4176,17 @@ class Database:
     def due_cleanup(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM episodes WHERE delete_after IS NOT NULL AND delete_after<=?",
+                """
+                SELECT e.* FROM episodes e
+                WHERE e.delete_after IS NOT NULL AND e.delete_after<=?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM personal_release_schedules s
+                    JOIN personal_release_items i ON i.schedule_id=s.schedule_id
+                    WHERE s.enabled=1 AND s.anime_id=e.media_id
+                      AND i.logical_episode_id=e.episode AND i.watched_at IS NULL
+                  )
+                """,
                 (time.time(),),
             ).fetchall()
 

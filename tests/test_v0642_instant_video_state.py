@@ -138,8 +138,11 @@ def test_legacy_cleaned_ocr_cache_is_recognized_without_db_origin(tmp_path: Path
 def test_web_ui_applies_settings_state_and_polls_priority_jobs_immediately() -> None:
     html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "duePrioritySubtitleJobs" in html
-    assert "document.hidden||!ui.windowActive?5000:1000" in html
-    assert "if(r.state)ui.state=r.state" in html
+    assert "if(hidden)return 60000" in html
+    assert "return 1000" in html
+    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in html
+    assert "if(r?.state){acceptUiState(r.state)" in html
+    assert "else if(r?.ui_state_version)" in html
     assert "if(r.recheck_subtitles)" in html
     assert "setTimeout(pollForegroundWork,0)" in html
     assert "if(progress>=.95)return 2000" in html

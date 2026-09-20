@@ -67,7 +67,7 @@ def test_dark_narration_box_is_proposed_and_replaces_tiny_seed() -> None:
 def test_foreground_page_forces_mangaocr_and_debug_overlay_exposes_provenance() -> None:
     manga = (ROOT / "pudge/manga.py").read_text(encoding="utf-8")
     reader = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    assert '_REGION_CACHE_KEY = "pudge-manga-regions-v59-layout-token-geometry"' in manga
+    assert '_REGION_CACHE_KEY = "pudge-manga-regions-v96p27-orphan-vertical-ink"' in manga
     assert '"manga-ocr-region", blocking=True, foreground_sensitive=False' in manga
     assert 'data-region-source="${esc(region.source || \'\')}"' in reader
     assert 'data-region-ocr-backend="${esc(region.recognizer || \'\')}"' in reader

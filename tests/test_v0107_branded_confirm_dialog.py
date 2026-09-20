@@ -7,9 +7,17 @@ WEB = ROOT / "pudge" / "web"
 
 def test_branded_confirm_dialog_uses_pudge_logo() -> None:
     source = (WEB / "pudge_confirm.js").read_text(encoding="utf-8")
+    html = (WEB / "index.html").read_text(encoding="utf-8")
     assert 'src="app-logo.png"' in source
     assert "window.pudgeConfirm = (message, options = {}) => new Promise" in source
-    assert "event.key === 'Escape'" in source
+    # Escape ownership moved to the single window-capture dispatcher in R1.
+    # The confirm module exposes a close API instead of competing for Escape.
+    assert "window.PudgeConfirm =" in source
+    assert "closeIfOpen:" in source
+    assert "event.key === 'Escape'" not in source
+    assert "window.addEventListener('keydown',dispatchEscapeEvent,true)" in html
+    assert "window.PudgeConfirm?.closeIfOpen?.()" in html
+    # Enter-to-confirm remains local because it is not part of Escape dispatch.
     assert "event.key === 'Enter'" in source
 
 

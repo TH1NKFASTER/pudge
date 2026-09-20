@@ -286,7 +286,7 @@ def test_refresh_button_is_reset_after_each_local_refresh() -> None:
     html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
     assert "localRefreshing:false" in html
     assert "ui.localRefreshing=false" in html
-    assert "duePrioritySubtitleJobs().length>0" in html
+    assert "effectivePrioritySubtitleDueCount()>0" in html
     assert "status.subtitleCheckingBackground" in html
 
 

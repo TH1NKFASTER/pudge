@@ -64,14 +64,20 @@
   document.addEventListener('keydown', event => {
     const backdrop = document.getElementById('pudgeConfirmBackdrop');
     if (!backdrop?.classList.contains('open')) return;
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      finish(false);
-    } else if (event.key === 'Enter' && !pendingDanger) {
+    if (event.key === 'Enter' && !pendingDanger) {
       event.preventDefault();
       finish(true);
     }
   }, true);
+
+  window.PudgeConfirm = {
+    isOpen: () => Boolean(document.getElementById('pudgeConfirmBackdrop')?.classList.contains('open')),
+    closeIfOpen: () => {
+      if (!document.getElementById('pudgeConfirmBackdrop')?.classList.contains('open')) return false;
+      finish(false);
+      return true;
+    },
+  };
 
   window.pudgeConfirm = (message, options = {}) => new Promise(resolve => {
     if (pendingResolve) {

@@ -83,7 +83,7 @@ def test_manga_service_reader_prefers_artifact_over_database_cache(tmp_path: Pat
     with db.connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO manga_ocr_cache(book_id,page_index,region_key,text,updated_at) "
-            "VALUES(?,0,'pudge-manga-regions-v59-layout-token-geometry',?,1)",
+            "VALUES(?,0,'pudge-manga-regions-v96p27-orphan-vertical-ink',?,1)",
             (
                 book_id,
                 json.dumps(

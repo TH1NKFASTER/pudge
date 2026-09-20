@@ -241,6 +241,14 @@ import sysconfig
 print(sysconfig.get_paths()["purelib"])
 PYSITEINSTALL
 )"
+# launchd may start the scheduled agent at any moment. During an in-place
+# update there is a short interval where the old package directory is removed;
+# unload the agent before that destructive step so it can never observe a
+# half-installed runtime. The GUI bootstraps the freshly written plist again
+# after it reopens.
+if (( FAST_UPDATE )) && [[ -f "$AGENT_PLIST" ]]; then
+  launchctl bootout "gui/$(id -u)" "$AGENT_PLIST" >/dev/null 2>&1 || true
+fi
 rm -rf "$INSTALL_SITE_PACKAGES/pudge" "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N)
 "$VENV_DIR/bin/python" -m pip install --no-cache-dir --no-deps "$WHEEL_PATH"
 

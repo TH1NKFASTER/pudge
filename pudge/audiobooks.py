@@ -1554,6 +1554,27 @@ class AudiobookService:
             process = self._players.get(int(book_id))
             return bool(process is not None and process.poll() is None)
 
+    def consumption_playback_observations(self) -> list[dict[str, Any]]:
+        """Return a small, non-library snapshot for the R8 runtime recorder."""
+        with self._lock:
+            candidates = [
+                (int(book_id), process, self._last_positions.get(int(book_id)), self._speeds.get(int(book_id), 1.0))
+                for book_id, process in self._players.items()
+                if process is not None and process.poll() is None
+            ]
+        observations: list[dict[str, Any]] = []
+        for book_id, process, position, speed in candidates:
+            if process.poll() is not None:
+                continue
+            active = self.is_playback_active(book_id)
+            observations.append({
+                "book_id": book_id,
+                "position": max(0.0, float(position or 0.0)),
+                "speed": max(0.1, float(speed or 1.0)),
+                "active": bool(active),
+            })
+        return observations
+
     def is_paused(self, book_id: int) -> bool:
         """Return mpv's explicit pause state.
 
@@ -3133,10 +3154,13 @@ class AudiobookService:
             job = dict(self._transcription_jobs.get(audiobook_id) or {})
         requested_priority = WorkPriority(int(job.get("priority") or int(WorkPriority.BACKGROUND)))
         if self.work_scheduler is not None and heavy_lease is None:
-            if not self.work_scheduler.background_allowed(priority=requested_priority, resource="cpu"):
+            block_reason = self.work_scheduler.background_wait_reason(
+                priority=requested_priority, resource="cpu"
+            )
+            if block_reason is not None:
                 self._set_transcription_job(audiobook_id, {
                     "status": "queued", "ready": False,
-                    "phase": "waiting_for_foreground", "wait_reason": "foreground",
+                    "phase": "waiting_for_policy", "wait_reason": block_reason,
                 })
             heavy_lease = self.work_scheduler.acquire_heavy(
                 "audiobook-stt", blocking=True, foreground_sensitive=True,
@@ -3475,17 +3499,20 @@ class AudiobookService:
             priority = WorkPriority(int(job.get("priority") or int(WorkPriority.BACKGROUND)))
             heavy_lease = None
             if self.work_scheduler is not None:
-                if not self.work_scheduler.background_allowed(priority=priority, resource="cpu"):
+                block_reason = self.work_scheduler.background_wait_reason(
+                    priority=priority, resource="cpu"
+                )
+                if block_reason is not None:
                     self._set_transcription_job(audiobook_id, {
                         "status": "queued", "ready": False,
-                        "phase": "waiting_for_foreground", "wait_reason": "foreground",
+                        "phase": "waiting_for_policy", "wait_reason": block_reason,
                     })
-                    if last_wait != (audiobook_id, "foreground"):
+                    if last_wait != (audiobook_id, block_reason):
                         LOGGER.info(
-                            "Audiobook STT waiting audio=%s reason=foreground priority=%s",
-                            audiobook_id, priority.name.casefold(),
+                            "Audiobook STT waiting audio=%s reason=%s priority=%s",
+                            audiobook_id, block_reason, priority.name.casefold(),
                         )
-                        last_wait = (audiobook_id, "foreground")
+                        last_wait = (audiobook_id, block_reason)
                     if cancel_event is not None:
                         cancel_event.wait(0.5)
                     else:

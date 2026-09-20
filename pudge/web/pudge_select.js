@@ -159,14 +159,6 @@
   document.addEventListener('input', event => {
     if (event.target instanceof HTMLSelectElement) sync(event.target);
   }, true);
-  document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && openSelect) {
-      event.preventDefault();
-      const select = openSelect;
-      close(select);
-      enhanced.get(select)?.button?.blur();
-    }
-  }, true);
   window.addEventListener('resize', () => openSelect && position(openSelect));
   window.addEventListener('scroll', () => openSelect && position(openSelect), true);
 
@@ -197,7 +189,7 @@
 
   installValueHook('value');
   installValueHook('selectedIndex');
-  window.PudgeSelect = {enhance, sync, scan, close};
+  window.PudgeSelect = {enhance, sync, scan, close, isOpen:()=>Boolean(openSelect), closeIfOpen:()=>{if(!openSelect)return false;const select=openSelect;close(select);enhanced.get(select)?.button?.blur();return true;}};
 
   const start = () => {
     scan(document);

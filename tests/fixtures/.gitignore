@@ -1,0 +1,7 @@
+# Private or copyrighted manga corpus is never a test fixture.
+/v96p*/pages/
+/v96p*/fresh/
+/v96p37_ruby_regions.json
+/private_ocr/
+/v96p*/
+/*_ruby_*audit*.cjs

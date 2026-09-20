@@ -24,8 +24,19 @@
   let previewPanX = 0;
   let previewPanY = 0;
   let suppressClickUntil = 0;
+  let previewRestoreFocus = null;
+  let previewOpenFrame = 0;
+  let previewRequestGeneration = 0;
+  let previewRetry = null;
+  const previewDecodeInflight = new Map();
+  const previewResolveInflight = new Map();
+  const PREVIEW_DECODE_TIMEOUT_MS = 8000;
 
   const coverImage = target => target?.closest?.(COVER_SELECTOR) || null;
+  // Anime cards already use primary click to play/open the episode. Physical
+  // mouse movement during a click must never turn that gesture into a cover
+  // preview. Trackpad pinch remains available because it uses gesture events.
+  const allowMouseDragPreview = image => !image?.closest?.('[data-continue-card="1"],.airing-card[data-action="play"]');
   const rectFor = image => {
     const rect=image.getBoundingClientRect();
     return {left:rect.left,top:rect.top,width:rect.width,height:rect.height};
@@ -93,23 +104,135 @@
   function resetPreview({animate=true}={}){
     previewZoom=1;previewPanX=0;previewPanY=0;previewPinch=null;previewPan=null;applyPreviewTransform({animate});
   }
-  function closePreview(){
-    const overlay=previewOverlay();if(!overlay)return;
-    previewPinch=null;previewPan=null;previewZoom=1;previewPanX=0;previewPanY=0;
-    // Closing is deliberately synchronous.  A pending transform/fade used to
-    // keep an invisible preview over the UI for ~180 ms and made repeated
-    // open/close gestures feel stuck.
-    overlay.querySelector('img')?.style.setProperty('transition','none');
-    overlay.remove();
+  function fitPreviewImage(image,width=null,height=null){
+    if(!image)return;
+    const naturalWidth=Number(width||image.naturalWidth||0);
+    const naturalHeight=Number(height||image.naturalHeight||0);
+    if(!Number.isFinite(naturalWidth)||!Number.isFinite(naturalHeight)||naturalWidth<=0||naturalHeight<=0)return;
+    const availableWidth=Math.max(120,window.innerWidth-72);
+    const availableHeight=Math.max(120,window.innerHeight-72);
+    const fitScale=Math.min(availableWidth/naturalWidth,availableHeight/naturalHeight);
+    image.style.width=`${Math.max(1,Math.round(naturalWidth*fitScale))}px`;
+    image.style.height=`${Math.max(1,Math.round(naturalHeight*fitScale))}px`;
+    image.dataset.pudgeFitScale=String(fitScale);
+    clampPreviewPan();
   }
-  function openPreviewSource(source){
-    const src=String(source||'').trim();if(!src)return;
+  function coverRefFor(image){
+    const kind=String(image?.dataset?.pudgeCoverKind||'').trim();
+    const id=Number(image?.dataset?.pudgeCoverId||0);
+    return kind&&Number.isFinite(id)&&id>0?{kind,id}:null;
+  }
+  function setRetryVisible(visible){
+    const button=previewOverlay()?.querySelector?.('.pudge-cover-preview-retry');
+    if(button)button.hidden=!visible;
+  }
+  async function preloadPreviewSource(source){
+    const src=String(source||'').trim();if(!src)return null;
+    if(previewDecodeInflight.has(src))return previewDecodeInflight.get(src);
+    const task=(async()=>{
+      const candidate=new Image();candidate.decoding='async';candidate.src=src;
+      let timer=0;
+      const timeout=new Promise(resolve=>{timer=setTimeout(()=>resolve(false),PREVIEW_DECODE_TIMEOUT_MS);});
+      const load=(async()=>{
+        if(typeof candidate.decode==='function'){
+          try{await candidate.decode();}catch(_error){return false;}
+        }else if(!candidate.complete){
+          await new Promise(resolve=>{candidate.onload=()=>resolve();candidate.onerror=()=>resolve();});
+        }
+        return Boolean(candidate.naturalWidth&&candidate.naturalHeight);
+      })();
+      const ok=await Promise.race([load,timeout]);
+      if(timer)clearTimeout(timer);
+      return ok?candidate:null;
+    })().finally(()=>previewDecodeInflight.delete(src));
+    previewDecodeInflight.set(src,task);
+    return task;
+  }
+  async function applyResolvedCoverRef(ref,generation){
+    if(!ref||generation!==previewRequestGeneration||!previewOverlay())return false;
+    const source=String(ref.preview_url||'').trim();
+    if(!source)return false;
+    const candidate=await preloadPreviewSource(source);
+    if(!candidate||generation!==previewRequestGeneration||!previewOverlay())return false;
+    const image=previewImage();if(!image)return false;
+    image.src=source;
+    image.dataset.pudgePreviewSourceKind=String(ref.source_kind||'');
+    image.dataset.pudgePreviewRevision=String(ref.source_revision||'');
+    fitPreviewImage(image,candidate.naturalWidth,candidate.naturalHeight);
+    applyPreviewTransform();
+    setRetryVisible(false);
+    previewRetry=null;
+    return true;
+  }
+  async function resolveCoverRef(stableRef,generation){
+    if(!stableRef||!window.pywebview?.api?.cover_preview_resolve)return false;
+    try{
+      const key=`${stableRef.kind}:${stableRef.id}:${Math.max(1,Number(window.devicePixelRatio||1)).toFixed(2)}:${Number(window.innerWidth||0)}x${Number(window.innerHeight||0)}`;
+      let request=previewResolveInflight.get(key);
+      if(!request){
+        request=Promise.resolve(window.pywebview.api.cover_preview_resolve(
+          stableRef.kind,stableRef.id,Number(window.devicePixelRatio||1),
+          Number(window.innerWidth||0),Number(window.innerHeight||0)
+        )).finally(()=>previewResolveInflight.delete(key));
+        previewResolveInflight.set(key,request);
+      }
+      const resolved=await request;
+      const applied=await applyResolvedCoverRef(resolved,generation);
+      if(!applied&&generation===previewRequestGeneration&&previewOverlay()){
+        previewRetry=()=>resolveCoverRef(stableRef,generation);setRetryVisible(true);
+      }
+      return applied;
+    }catch(_error){
+      if(generation===previewRequestGeneration&&previewOverlay()){
+        previewRetry=()=>resolveCoverRef(stableRef,generation);setRetryVisible(true);
+      }
+      return false;
+    }
+  }
+  function closePreview(options={}){
+    const invalidate=options.invalidate!==false;
+    const restoreFocus=options.restoreFocus!==false;
+    if(invalidate)previewRequestGeneration+=1;
+    const overlay=previewOverlay();
+    const restore=previewRestoreFocus;
+    previewRestoreFocus=null;previewRetry=null;
+    if(previewOpenFrame){cancelAnimationFrame(previewOpenFrame);previewOpenFrame=0;}
+    const image=previewImage();
+    if(previewPan?.pointerId!=null)image?.releasePointerCapture?.(previewPan.pointerId);
+    if(drag?.peek)discardPeek(drag.peek,{snap:false});
+    if(pinch?.peek&&pinch.peek!==drag?.peek)discardPeek(pinch.peek,{snap:false});
+    drag=null;pinch=null;previewPinch=null;previewPan=null;previewZoom=1;previewPanX=0;previewPanY=0;
+    // Closing is synchronous/idempotent: pending resolver/decode work is
+    // invalidated before the overlay disappears and cannot resurrect it.
+    overlay?.querySelector('img')?.style.setProperty('transition','none');
+    overlay?.remove();
+    if(restoreFocus&&restore?.isConnected&&typeof restore.focus==='function')queueMicrotask(()=>restore.focus({preventScroll:true}));
+  }
+  function previewFocusable(overlay){
+    return [...(overlay?.querySelectorAll?.('button')||[])].filter(button=>!button.hidden);
+  }
+  function openPreviewSource(source,restoreFocusTo=null){
+    const src=String(source||'').trim();if(!src)return 0;
     suppressClickUntil=performance.now()+500;
-    closePreview();
-    const overlay=document.createElement('div');overlay.className='pudge-cover-preview';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.innerHTML=`<div class="pudge-cover-preview-card"><button class="pudge-cover-preview-close" type="button" aria-label="Close">×</button><img alt="" draggable="false" src="${src.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}"></div>`;
-    document.body.appendChild(overlay);previewZoom=1;previewPanX=0;previewPanY=0;requestAnimationFrame(()=>{overlay.classList.add('open');applyPreviewTransform({animate:true});});
+    closePreview({invalidate:false,restoreFocus:false});
+    const generation=++previewRequestGeneration;
+    previewRestoreFocus=restoreFocusTo?.isConnected?restoreFocusTo:(document.activeElement&&document.activeElement!==document.body?document.activeElement:null);
+    const overlay=document.createElement('div');overlay.className='pudge-cover-preview';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Cover preview');overlay.innerHTML=`<div class="pudge-cover-preview-card"><button class="pudge-cover-preview-close" type="button" aria-label="Close">×</button><button class="pudge-cover-preview-retry" type="button" aria-label="Retry high-resolution cover" title="Retry high-resolution cover" hidden>↻</button><img alt="" draggable="false" src="${src.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}"></div>`;
+    document.body.appendChild(overlay);previewZoom=1;previewPanX=0;previewPanY=0;
+    const openedImage=overlay.querySelector('img');
+    openedImage?.addEventListener('load',()=>{if(generation===previewRequestGeneration&&overlay.isConnected){fitPreviewImage(openedImage);applyPreviewTransform();}});
+    if(openedImage?.complete)fitPreviewImage(openedImage);
+    previewOpenFrame=requestAnimationFrame(()=>{previewOpenFrame=0;if(!overlay.isConnected||generation!==previewRequestGeneration)return;overlay.classList.add('open');applyPreviewTransform({animate:true});overlay.querySelector('.pudge-cover-preview-close')?.focus({preventScroll:true});});
+    overlay.addEventListener('keydown',event=>{
+      if(event.key!=='Tab')return;
+      const buttons=previewFocusable(overlay);if(!buttons.length)return;
+      event.preventDefault();const current=Math.max(0,buttons.indexOf(document.activeElement));
+      const next=event.shiftKey?(current-1+buttons.length)%buttons.length:(current+1)%buttons.length;
+      buttons[next].focus({preventScroll:true});
+    });
     overlay.addEventListener('click',event=>{
       if(event.target.closest?.('.pudge-cover-preview-close')){closePreview();return;}
+      if(event.target.closest?.('.pudge-cover-preview-retry')){event.preventDefault();void previewRetry?.();return;}
       const current=previewImage();
       if(!current){closePreview();return;}
       const rect=current.getBoundingClientRect();
@@ -120,8 +243,18 @@
       if(!inside)closePreview();
     });
     overlay.addEventListener('dblclick',event=>{if(event.target.closest?.('img')){event.preventDefault();setPreviewZoom(1);}});
+    return generation;
   }
-  function openPreview(image){const src=imageSource(image);if(!src)return;openPreviewSource(src);}
+  function openPreview(image){
+    const src=imageSource(image);if(!src)return;
+    const generation=openPreviewSource(src,image);
+    const stableRef=coverRefFor(image);
+    if(stableRef&&generation)void resolveCoverRef(stableRef,generation);
+  }
+  function openResolvedRef(ref,thumbnail=''){
+    const fallback=String(thumbnail||ref?.thumbnail_url||ref?.preview_url||'').trim();if(!fallback)return;
+    const generation=openPreviewSource(fallback);if(generation)void applyResolvedCoverRef(ref,generation);
+  }
 
   // Native image dragging would steal the pointer stream before the preview
   // threshold is reached, so cover drags belong exclusively to this gesture.
@@ -130,7 +263,8 @@
   },true);
 
   document.addEventListener('pointerdown',event=>{
-    if(coverImage(event.target))event.preventDefault();
+    const pressedCover=coverImage(event.target);
+    if(pressedCover&&allowMouseDragPreview(pressedCover))event.preventDefault();
     const openImage=event.target.closest?.('.pudge-cover-preview img');
     if(openImage&&event.button===0&&previewZoom>1.001){
       event.preventDefault();
@@ -138,7 +272,7 @@
       openImage.setPointerCapture?.(event.pointerId);applyPreviewTransform();return;
     }
     if(event.button!==0||event.pointerType!=='mouse'||previewOverlay())return;
-    const image=coverImage(event.target);if(!image||!imageSource(image))return;
+    const image=pressedCover;if(!image||!allowMouseDragPreview(image)||!imageSource(image))return;
     drag={pointerId:event.pointerId,image,startX:event.clientX,startY:event.clientY,peek:null,moved:false,opened:false};
     image.setPointerCapture?.(event.pointerId);
   },true);
@@ -217,11 +351,9 @@
     if(previewZoom>1.001){event.preventDefault();panPreview(-Number(event.deltaX||0),-Number(event.deltaY||0));}
   },{capture:true,passive:false});
 
-  window.addEventListener('resize',()=>{if(previewOverlay())applyPreviewTransform();});
+  window.addEventListener('resize',()=>{const image=previewImage();if(image){fitPreviewImage(image);applyPreviewTransform();}});
   document.addEventListener('click',event=>{
     if(performance.now()<suppressClickUntil&&coverImage(event.target)){event.preventDefault();event.stopImmediatePropagation();}
   },true);
-  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&previewOverlay()){event.preventDefault();closePreview();}},true);
-
-  window.PudgeCoverPreview={open:image=>openPreview(image),openSource:source=>openPreviewSource(source),close:closePreview,zoom:setPreviewZoom,pan:panPreview};
+  window.PudgeCoverPreview={open:image=>openPreview(image),openSource:source=>openPreviewSource(source),openRef:(ref,thumbnail)=>openResolvedRef(ref,thumbnail),close:closePreview,isOpen:()=>Boolean(previewOverlay()),closeIfOpen:()=>{if(!previewOverlay())return false;closePreview();return true;},zoom:setPreviewZoom,pan:panPreview};
 })();

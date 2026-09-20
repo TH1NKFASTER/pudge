@@ -5,7 +5,7 @@ import sys
 import time
 
 from .config import DEFAULT_CONFIG_PATH, load_config
-from .app_session import app_session_active
+from .app_session import app_session_active, app_session_window_active
 from .branding import APP_AGENT_CLI, APP_NAME
 from .manager import AnimeManager
 from .logging_utils import configure_logging, timed_step
@@ -22,6 +22,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.scheduled and not app_session_active():
         print(f"{APP_NAME} Agent: приложение закрыто, фоновая работа пропущена")
+        return 0
+    if args.scheduled and app_session_window_active():
+        print(f"{APP_NAME} Agent: окно активно, тяжёлая фоновая работа отложена")
         return 0
     logger = configure_logging()
     manager = AnimeManager(config)
@@ -47,6 +50,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         if not search_due and not anilist_due and not subtitle_due:
             print(f"{APP_NAME} Agent: ещё не наступило время следующей проверки")
+            return 0
+        # The user can bring Pudge to the foreground after this scheduled
+        # process passed the cheap pre-manager check. Recheck immediately before
+        # heavy maintenance to close that race without changing normal cadence.
+        if app_session_window_active():
+            print(f"{APP_NAME} Agent: окно стало активным, тяжёлая фоновая работа отложена")
             return 0
     try:
         with timed_step(logger, "agent.run", scheduled=args.scheduled):

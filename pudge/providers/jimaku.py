@@ -141,7 +141,7 @@ class JimakuClient:
         self._api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
         self.logger = configure_logging()
         self.client = httpx.Client(
-            timeout=45,
+            timeout=httpx.Timeout(15.0, connect=6.0),
             follow_redirects=True,
             headers={
                 "Authorization": api_key,
@@ -343,7 +343,8 @@ class JimakuClient:
             raise JimakuError(self._rate_limit_message(rate_limit_remaining))
 
         last_network_error: httpx.HTTPError | None = None
-        for attempt in range(3):
+        max_attempts = 2
+        for attempt in range(max_attempts):
             try:
                 self._acquire_request_slot(path)
                 with timed_step(
@@ -386,9 +387,18 @@ class JimakuClient:
                     except OSError:
                         pass
                 return payload
-            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            except httpx.TransportError as exc:
                 last_network_error = exc
-                if attempt < 2:
+                if stale_payload is not None:
+                    count = len(stale_payload) if isinstance(stale_payload, list) else 1
+                    self.logger.warning(
+                        "FALLBACK step=jimaku.http path=%s cache=stale count=%s error=%s",
+                        path,
+                        count,
+                        exc,
+                    )
+                    return stale_payload
+                if attempt < max_attempts - 1:
                     self.logger.warning(
                         "RETRY step=jimaku.http path=%s attempt=%s error=%s",
                         path,

@@ -54,6 +54,6 @@ def test_v15_does_not_reintroduce_fast_vision_detector_pass() -> None:
 
 def test_v15_cache_generation_isolated() -> None:
     manga = (ROOT / "pudge/manga.py").read_text(encoding="utf-8")
-    assert 'pudge-manga-regions-v59-layout-token-geometry' in manga
+    assert 'pudge-manga-regions-v96p27-orphan-vertical-ink' in manga
     assert 'manga_ocr_page_status:v18:' in manga
-    assert '-regions-v59.json' in manga
+    assert '-regions-v96p27.json' in manga

@@ -66,7 +66,7 @@ def test_blurred_reader_uses_same_inline_img_and_reveal_only_removes_blur() -> N
     assert "lnBuildInlineRasterPreview" not in click
     assert "window.PudgeCoverPreview?.open?.(image)" in click
 
-    assert "function openPreviewSource(source)" in preview
+    assert "function openPreviewSource(source,restoreFocusTo=null)" in preview
     assert "openSource:source=>openPreviewSource(source)" in preview
 
 

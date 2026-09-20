@@ -260,6 +260,12 @@ class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
                 limit = int((query.get("limit") or ["200"])[0])
                 self._send_json(200, {"ok": True, **self.server.service.changes(cursor=cursor, limit=limit)})
                 return
+            if request.path == "/api/v1/consumption/changes":
+                query = parse_qs(request.query)
+                cursor = int((query.get("cursor") or ["0"])[0])
+                limit = int((query.get("limit") or ["200"])[0])
+                self._send_json(200, {"ok": True, **self.server.service.consumption_changes(cursor=cursor, limit=limit)})
+                return
             self._send_json(404, {"ok": False, "error": "Not found"})
         except Exception as exc:
             self._handle_error(exc)
@@ -294,6 +300,16 @@ class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(events, list):
                     raise MobileSyncValidationError("events must be an array")
                 self._send_json(200, {"ok": True, **self.server.service.push_events(device_id, events)})
+                return
+            if request.path == "/api/v1/consumption/events":
+                records = payload.get("records")
+                if not isinstance(records, list):
+                    raise MobileSyncValidationError("records must be an array")
+                try:
+                    reset_epoch = int(payload.get("reset_epoch", 0))
+                except (TypeError, ValueError) as exc:
+                    raise MobileSyncValidationError("reset_epoch must be an integer") from exc
+                self._send_json(200, {"ok": True, **self.server.service.push_consumption_records(device_id, records, reset_epoch=reset_epoch)})
                 return
             self._send_json(404, {"ok": False, "error": "Not found"})
         except Exception as exc:

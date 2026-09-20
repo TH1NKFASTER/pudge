@@ -48,3 +48,47 @@ build-release:
 clean:
 	rm -rf build dist *.egg-info .pytest_cache .ruff_cache
 	find pudge tests scripts -type d -name __pycache__ -prune -exec rm -rf {} +
+
+PUDGE_BENCH_DATA ?= $(HOME)/Downloads/pudge-bench-data
+PUDGE_RUNTIME_PYTHON ?= $(HOME)/.local/share/pudge/venv/bin/python
+JMANGA_REPO ?= $(PUDGE_BENCH_DATA)/JMangaBench_Mixed-repo
+JMANGA_BENCHMARK ?= $(PUDGE_BENCH_DATA)/JMangaBench_Mixed
+MANGA109_ROOT ?= $(PUDGE_BENCH_DATA)/Manga109-v2026
+BENCH_TAG ?= $(shell date +%Y%m%d-%H%M%S)
+BENCH_OUT ?= $(PUDGE_BENCH_DATA)/results/$(BENCH_TAG)
+
+.PHONY: benchmark-setup benchmark-jmanga benchmark-manga109 benchmark-compare
+
+benchmark-setup:
+	bash scripts/setup_manga_ocr_benchmark.command
+
+benchmark-jmanga:
+	@mkdir -p "$(BENCH_OUT)"
+	PYTHONPATH="$(CURDIR)" "$(PUDGE_RUNTIME_PYTHON)" -m pudge.manga_benchmark_cli jmanga-predict \
+		--benchmark "$(JMANGA_BENCHMARK)" \
+		--output "$(BENCH_OUT)/jmanga-predictions.jsonl"
+	cd "$(JMANGA_REPO)" && uv run python -m jmangabench validate-predictions \
+		--benchmark "$(JMANGA_BENCHMARK)" \
+		--predictions "$(BENCH_OUT)/jmanga-predictions.jsonl"
+	cd "$(JMANGA_REPO)" && uv run python -m jmangabench evaluate \
+		--benchmark "$(JMANGA_BENCHMARK)" \
+		--predictions "$(BENCH_OUT)/jmanga-predictions.jsonl" \
+		--output "$(BENCH_OUT)/jmanga-evaluation"
+	PYTHONPATH="$(CURDIR)" "$(PUDGE_RUNTIME_PYTHON)" -m pudge.manga_benchmark_cli jmanga-wrap-report \
+		--report "$(BENCH_OUT)/jmanga-evaluation/report.json" \
+		--predictions "$(BENCH_OUT)/jmanga-predictions.jsonl" \
+		--benchmark-root "$(JMANGA_BENCHMARK)" \
+		--output "$(BENCH_OUT)/jmanga-report.json"
+	@echo "JMangaBench result: $(BENCH_OUT)/jmanga-report.json"
+
+benchmark-manga109:
+	@mkdir -p "$(BENCH_OUT)"
+	PYTHONPATH="$(CURDIR)" "$(PUDGE_RUNTIME_PYTHON)" -m pudge.manga_benchmark_cli manga109 \
+		--images-root "$(MANGA109_ROOT)/images" \
+		--annotations-root "$(MANGA109_ROOT)/annotations" \
+		--output-dir "$(BENCH_OUT)/manga109"
+	@echo "Manga109 result: $(BENCH_OUT)/manga109/report.json"
+
+benchmark-compare:
+	@test -n "$(OLD)" -a -n "$(NEW)" || (echo "Usage: make benchmark-compare OLD=/path/old.json NEW=/path/new.json [OUT=/path/compare.json]" && exit 2)
+	PYTHONPATH="$(CURDIR)" $(PYTHON) -m pudge.manga_benchmark_cli compare "$(OLD)" "$(NEW)" $(if $(OUT),--output "$(OUT)",)

@@ -21,7 +21,8 @@ def test_inactive_window_defers_render_and_slows_polling() -> None:
     assert "pendingDataRender:false" in html
     assert "if(!force&&!ui.windowActive){ui.pendingDataRender=true;return;}" in html
     assert "if(next&&ui.pendingDataRender)renderDataPages(true)" in html
-    assert "if(!downloads.length)return document.hidden||!ui.windowActive?120000:15000" in html
+    assert "if(!downloads.length)return hidden?120000:15000" in html
+    assert "if(!downloads.length&&subtitlePollHintFresh()&&effectiveSubtitleActiveCount()>0)" in html
     assert "Math.min(60000,delay)" in html
     assert "window.addEventListener('blur'" in html
     assert "setWindowActivity(false)" in html

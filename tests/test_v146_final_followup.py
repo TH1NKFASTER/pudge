@@ -276,12 +276,14 @@ def test_ln_store_title_keeps_local_volume_but_matches_base_anilist_work() -> No
     assert _series_key(title) == _series_key("ようこそ実力至上主義の教室へ 第1巻")
 
 
-def test_ln_franchise_layout_is_dense_label_free_and_selectable() -> None:
+def test_ln_franchise_layout_uses_stable_full_width_shelves_and_selection() -> None:
     html = HTML.read_text(encoding="utf-8")
-    assert "grid-auto-flow:dense" in html
+    assert "grid-auto-flow:dense" not in html
+    assert ".ln-franchise-group{grid-column:1/-1" in html
     assert 'data-ln-franchise-ids=' in html
+    assert 'data-library-shelf-key=' in html
     assert "toggleLnFranchiseSelection" in html
-    assert '<div class="ln-franchise-head">' not in html
+    assert "data-library-shelf-toggle" in html
 
 
 def test_anime_cards_avoid_webkit_paint_containment_and_subtitle_toggle_is_optimistic() -> None:

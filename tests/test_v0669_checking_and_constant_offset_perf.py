@@ -23,11 +23,13 @@ def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active():
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     assert "function nextPrioritySubtitleDelay()" in html
     assert "function nextForegroundSubtitleDelay()" in html
-    assert "activeDownloads().length>0||dueForegroundSubtitleJobs().length>0" in html
+    assert "activeDownloads().length>0||effectiveSubtitleDueCount()>0" in html
     assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
-    assert "hasActiveForegroundWork()||foregroundSubtitleJobs().length||ui.emptyPolls<2" in html
-    assert "if(ui.subtitleForegroundBlocked)return document.hidden||!ui.windowActive?15000:5000" in html
-    assert "return document.hidden||!ui.windowActive?5000:1000" in html
+    assert "hasActiveForegroundWork()||effectiveSubtitleActiveCount()>0||ui.emptyPolls<2" in html
+    assert "if(hidden)return 60000" in html
+    assert "if(ui.subtitleForegroundBlocked)return 5000" in html
+    assert "return 1000" in html
+    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in html
     assert "function ensureForegroundPollScheduled()" in html
 
 
