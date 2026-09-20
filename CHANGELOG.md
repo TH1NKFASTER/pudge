@@ -32,7 +32,7 @@ These notes describe the source changes relative to v0.7.27. They do not imply t
 
 ### Manga OCR and quality tools
 - Extended layout-aware OCR recovery for short/partial columns, missed main text alongside ruby, trailing glyphs, punctuation, bold or stylized text, and large sound effects. Added bounded cross-candidate consensus and geometry/artwork guards to limit invented text, duplicate regions, and unintended merges.
-- Improved word/ruby hitboxes and reader integration. The page-31 trailing-kana recovery and page-39 short ruby/main-text recovery are covered by dedicated regression tests.
+- Improved word/ruby hitboxes and reader integration. Added regression tests for missing characters, short text near furigana, and text-region boundary recovery.
 - Added benchmarking tools and documentation for JMangaBench and Manga109, a review-diff utility, and a 40-page One Piece golden-text test corpus with comparison tooling. Review the golden-data licensing and redistribution scope before publishing it in a public repository.
 
 ### Tests and release preparation
