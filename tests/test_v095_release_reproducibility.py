@@ -14,7 +14,11 @@ def test_home_download_status_is_external_module() -> None:
     assert "function libraryCard(a){" in Path("pudge/web/library.js").read_text(encoding="utf-8")
     assert "function compactDownloadStatus(download){" in module
     assert "function episodePresentationStatus(a,episode){" in module
-    assert "episodePresentationStatus(a,episode)+finalSuffix" in index
+    start = index.index("function waitingHomeCard(a){")
+    end = index.index("function downloadAvailableHomeCard(a){", start)
+    block = index[start:end]
+    assert "const state=episodePresentationStatus(a,episode);" in block
+    assert "finalSuffix" not in block
 
 
 def test_ci_checks_all_python_and_javascript() -> None:

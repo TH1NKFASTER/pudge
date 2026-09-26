@@ -56,6 +56,7 @@
   function sync(select) {
     const state = enhanced.get(select);
     if (!state) return;
+    hideNativeSelect(select);
     state.label.textContent = selectedLabel(select);
     state.button.disabled = Boolean(select.disabled);
     state.button.setAttribute('aria-disabled', String(Boolean(select.disabled)));
@@ -78,8 +79,26 @@
     state.menu.querySelector('.selected')?.scrollIntoView({block: 'nearest'});
   }
 
+  function hideNativeSelect(select) {
+    if (!select?.style) return;
+    // WKWebView can briefly keep a native select painted while the settings DOM
+    // is being rebuilt. Do not rely only on the stylesheet for hiding the native
+    // control: the inline !important contract makes enhancement atomic.
+    for (const [name, value] of [
+      ['position','absolute'], ['width','1px'], ['height','1px'], ['opacity','0'],
+      ['pointer-events','none'], ['margin','0'], ['padding','0'],
+    ]) select.style.setProperty(name, value, 'important');
+    select.setAttribute('aria-hidden', 'true');
+    select.tabIndex = -1;
+  }
+
   function enhance(select) {
     if (!(select instanceof HTMLSelectElement) || enhanced.has(select) || shouldSkip(select)) return;
+    // A script reload must not wrap an already-enhanced select a second time.
+    if (select.dataset.pudgeSelectEnhanced === '1' || select.closest?.('.pudge-select')) {
+      hideNativeSelect(select);
+      return;
+    }
     const shell = document.createElement('span');
     shell.className = 'pudge-select';
     const button = document.createElement('button');
@@ -101,6 +120,8 @@
     shell.append(select, button);
     document.body.appendChild(menu);
     select.classList.add('pudge-select-native');
+    select.dataset.pudgeSelectEnhanced = '1';
+    hideNativeSelect(select);
     enhanced.set(select, {shell, button, label, menu});
     sync(select);
 

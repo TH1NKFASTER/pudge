@@ -6,10 +6,11 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import tomllib
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .branding import APP_NAME, BACKUP_APP_ID, APP_SLUG
 
@@ -227,7 +228,144 @@ def _atomic_copy(source: Path, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path, cache_dir: Path) -> dict[str, Any]:
+
+# These locations belong to the receiving machine, not to the backup producer.
+# Preserve the existing effective paths and never copy absolute paths from an
+# unrelated home directory into a restored runtime configuration.
+_LOCAL_PATH_FIELDS = {
+    "library": {"database_path", "root_dir", "cover_cache_dir"},
+    "paths": {"cache_dir", "subtitle_dirs", "watched_media_dirs", "download_dirs"},
+}
+
+
+def _restore_config_for_destination(
+    restored_text: str, current_text: str, *, database_path: Path, cache_dir: Path
+) -> str:
+    from .branding import DEFAULT_LIBRARY_DIR
+    from .config import DEFAULT_CACHE_DIR
+
+    restored = tomllib.loads(restored_text)
+    try:
+        current = tomllib.loads(current_text) if current_text.strip() else {}
+    except tomllib.TOMLDecodeError:
+        # A damaged current config must not prevent recovery from a valid backup.
+        # In that case retain only the explicitly supplied destination DB/cache.
+        current = {}
+    if not isinstance(restored, dict) or not isinstance(current, dict):
+        raise ValueError("Invalid backup configuration")
+    for section_name, keys in _LOCAL_PATH_FIELDS.items():
+        section_values = restored.get(section_name, {})
+        if not isinstance(section_values, dict):
+            raise ValueError(f"Invalid backup [{section_name}] section")
+        for key, value in section_values.items():
+            if key in keys:
+                valid = (
+                    isinstance(value, list) and all(isinstance(item, str) for item in value)
+                    if key in {"subtitle_dirs", "watched_media_dirs", "download_dirs"}
+                    else isinstance(value, str)
+                )
+                if not valid:
+                    raise ValueError(f"Invalid backup path {section_name}.{key}")
+
+    if not isinstance(current.get("paths", {}), dict) or not isinstance(current.get("library", {}), dict):
+        raise ValueError("Invalid existing configuration paths")
+
+    local: dict[tuple[str, str], Any] = {
+        ("library", "database_path"): str(database_path),
+        ("library", "root_dir"): str(current.get("library", {}).get("root_dir", DEFAULT_LIBRARY_DIR)),
+        ("library", "cover_cache_dir"): str(
+            current.get("library", {}).get("cover_cache_dir", DEFAULT_CACHE_DIR / "covers")
+        ),
+        ("paths", "cache_dir"): str(cache_dir),
+    }
+    current_paths = current.get("paths", {})
+    for key in ("subtitle_dirs", "watched_media_dirs"):
+        if key in current_paths:
+            value = current_paths[key]
+            if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                raise ValueError(f"Invalid existing paths.{key}")
+            local[("paths", key)] = value
+    # Old installations may still use download_dirs rather than watched_media_dirs.
+    if "watched_media_dirs" not in current_paths and "download_dirs" in current_paths:
+        value = current_paths["download_dirs"]
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ValueError("Invalid existing paths.download_dirs")
+        local[("paths", "download_dirs")] = value
+
+    def literal(value: Any) -> str:
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, list) and all(isinstance(x, str) for x in value):
+            return "[" + ", ".join(json.dumps(x, ensure_ascii=False) for x in value) + "]"
+        raise ValueError("Invalid destination path setting")
+
+    # Preserve comments, unknown settings and non-path settings. TOML arrays for
+    # the operational paths are expected to use Pudge's one-line writer format.
+    # Reject nonstandard multiline assignments instead of risking silent data loss.
+    lines = restored_text.splitlines(keepends=True)
+    result: list[str] = []
+    section = ""
+    seen: set[tuple[str, str]] = set()
+    for line in lines:
+        section_match = re.match(r"^\s*\[([^]\n]+)]\s*(?:#.*)?$", line.rstrip("\r\n"))
+        if section_match:
+            section = section_match.group(1).strip()
+        assignment = re.match(r"^\s*([A-Za-z0-9_-]+)\s*=", line)
+        key = assignment.group(1) if assignment else ""
+        identity = (section, key)
+        if section in _LOCAL_PATH_FIELDS and key in _LOCAL_PATH_FIELDS[section]:
+            if identity in seen:
+                raise ValueError("Duplicate location setting in backup")
+            seen.add(identity)
+            # After removing this one line, the document must still be complete.
+            # A multiline value would fail the final tomllib validation.
+            if identity in local:
+                result.append(f"{key} = {literal(local[identity])}\n")
+            continue
+        result.append(line)
+
+    text = "".join(result)
+    for sec in ("library", "paths"):
+        missing = [(key, value) for (name, key), value in local.items() if name == sec and (name, key) not in seen]
+        if not missing:
+            continue
+        lines = text.splitlines(keepends=True)
+        start = next((i for i, line in enumerate(lines)
+                      if line.strip() == f"[{sec}]"), None)
+        additions = [f"{key} = {literal(value)}\n" for key, value in missing]
+        if start is None:
+            text = text.rstrip("\n") + f"\n\n[{sec}]\n" + "".join(additions)
+        else:
+            lines[start + 1:start + 1] = additions
+            text = "".join(lines)
+
+    checked = tomllib.loads(text)
+    for sec, key in (("library", "database_path"), ("library", "root_dir"),
+                     ("library", "cover_cache_dir"), ("paths", "cache_dir")):
+        value = checked[sec][key]
+        if not isinstance(value, str):
+            raise ValueError(f"Invalid path type: {sec}.{key}")
+    for key in ("subtitle_dirs", "watched_media_dirs", "download_dirs"):
+        value = checked.get("paths", {}).get(key, [])
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ValueError(f"Invalid paths.{key}")
+    return text
+
+
+def _validate_staged_config(staged_config: Path, *, database_path: Path, cache_dir: Path) -> None:
+    # Full application parser, not merely syntactic TOML validation. This runs
+    # before live database/config replacement, so malformed settings cannot
+    # strand the application in an unbootable state.
+    from .config import load_config
+
+    parsed = load_config(staged_config)
+    if parsed.library.database_path.expanduser().resolve() != database_path.expanduser().resolve():
+        raise ValueError("Restored configuration points to a different database")
+    if parsed.paths.cache_dir.expanduser().resolve() != cache_dir.expanduser().resolve():
+        raise ValueError("Restored configuration points to a different cache directory")
+
+
+def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path, cache_dir: Path, post_commit: Callable[[], None] | None = None) -> dict[str, Any]:
     """Validate completely in staging, then replace live files with rollback.
 
     Callers that own long-lived services should quiesce their writers before this
@@ -317,14 +455,20 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
         staged_config: Path | None = None
         if restored_config.exists():
             staged_config = tmp / "config.final.toml"
-            if backup_format >= 2 and config_path.is_file():
-                merged = _merge_config_secrets(
-                    restored_config.read_text(encoding="utf-8"),
-                    config_path.read_text(encoding="utf-8"),
-                )
-                staged_config.write_text(merged, encoding="utf-8")
-            else:
-                shutil.copy2(restored_config, staged_config)
+            current_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+            incoming_text = restored_config.read_text(encoding="utf-8")
+            merged = (
+                _merge_config_secrets(incoming_text, current_text)
+                if backup_format >= 2 and current_text
+                else incoming_text
+            )
+            staged_config.write_text(
+                _restore_config_for_destination(
+                    merged, current_text, database_path=database_path, cache_dir=cache_dir
+                ),
+                encoding="utf-8",
+            )
+            _validate_staged_config(staged_config, database_path=database_path, cache_dir=cache_dir)
 
         rollback_dir = tmp / "rollback"
         rollback_dir.mkdir(parents=True, exist_ok=True)
@@ -358,6 +502,10 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                 config_path.chmod(0o600)
             for _original, staged, target in staged_cached:
                 _atomic_copy(staged, target)
+            # Keep rollback snapshots alive through service rebind. The caller
+            # must not declare success until the new runtime is operational.
+            if post_commit is not None:
+                post_commit()
         except Exception:
             for target, backup_target in reversed(cache_rollbacks):
                 if backup_target is None:

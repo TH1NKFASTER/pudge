@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from ..filename import parse_anime_filename, release_tokens, title_similarity
+from ..filename import normalize_title, parse_anime_filename, release_tokens, title_similarity
 from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_japanese_subtitle
 from ..logging_utils import configure_logging, timed_step
 from ..branding import APP_SLUG
@@ -65,6 +65,40 @@ def find_7zip() -> str | None:
             return str(path)
     return None
 
+
+
+_SEASON_TOKEN_RE = re.compile(r"(?i)(?:^|[\s._-])s(?:eason\s*)?0*(?P<season>\d{1,2})(?=$|[\s._-])")
+_ORDINAL_SEASON_RE = re.compile(r"(?i)\b(?P<season>\d{1,2})(?:st|nd|rd|th)\s+season\b")
+_ROMAN_SEASONS = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9}
+
+
+def explicit_season_hint(name: str, identity_title: str = "") -> int | None:
+    """Return a season explicitly encoded by a subtitle release name.
+
+    This is deliberately conservative: unknown/untagged files stay eligible.
+    Besides S02/Season 2/2nd Season, recognize sequel suffixes such as
+    ``Ansatsu Kyoushitsu II`` only when the base title exactly matches the
+    requested identity.
+    """
+    parsed = parse_anime_filename(name)
+    if parsed.season is not None:
+        return int(parsed.season)
+    for pattern in (_SEASON_TOKEN_RE, _ORDINAL_SEASON_RE):
+        match = pattern.search(name)
+        if match:
+            return int(match.group("season"))
+    base = normalize_title(identity_title)
+    parsed_title = normalize_title(parsed.title)
+    if not base or not parsed_title.startswith(base + " "):
+        return None
+    suffix = parsed_title[len(base):].strip()
+    if suffix in _ROMAN_SEASONS:
+        return _ROMAN_SEASONS[suffix]
+    if suffix.isdigit():
+        value = int(suffix)
+        if 2 <= value <= 9:
+            return value
+    return None
 
 
 _EPISODE_RANGE_PATTERNS = (
@@ -557,12 +591,28 @@ class JimakuClient:
             similarity = title_similarity(identity.title, parsed.title)
             score = similarity * 0.32
             episode_range = explicit_episode_range(item.name)
+            season_hint = explicit_season_hint(item.name, identity.title)
             item.details = {
                 "parsed_title": parsed.title,
                 "parsed_episode": parsed.episode,
+                "parsed_season": parsed.season,
+                "explicit_season_hint": season_hint,
                 "explicit_episode_range": list(episode_range) if episode_range else None,
                 "title_similarity": round(similarity, 2),
             }
+            if (
+                identity.season is not None
+                and season_hint is not None
+                and int(season_hint) != int(identity.season)
+            ):
+                score -= 1000
+                item.details["season_match"] = "mismatch"
+                item.details["hard_reject_reason"] = "season_mismatch"
+            elif identity.season is not None and season_hint is not None:
+                score += 12
+                item.details["season_match"] = "exact"
+            else:
+                item.details["season_match"] = "unknown"
             if identity.episode is not None:
                 if parsed.episode == identity.episode:
                     score += 55

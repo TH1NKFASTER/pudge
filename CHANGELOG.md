@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## v0.7.29 — Manga editing, review workflow, release discovery, and timing reliability
+
+Range: [v0.7.28 → v0.7.29](https://github.com/TH1NKFASTER/pudge/compare/v0.7.28...v0.7.29).
+
+These notes are derived from the complete source diff against v0.7.28, including new files that were still untracked in the development checkout before release preparation.
+
+### Manga OCR, Mokuro, and manual correction tools
+- Added adaptive multi-process Manga OCR. Worker count is bounded by observed free memory, falls back to one worker when memory information is unavailable, preserves completed pages when memory pressure interrupts a run, and shuts down coordinator/child process groups without leaving OCR workers behind.
+- Added OCR benchmarking utilities for measuring real worker RSS and deciding when additional parallel workers are safe; benchmark runs are bounded by system-memory reserve checks and do not publish private OCR text.
+- Added Mokuro import and an optional managed Mokuro OCR backend. Imports validate image identity and geometry in private staging before publication, preserve line-level coordinates, can discover an unambiguous nearby sidecar/archive, and do not overwrite a valid native Pudge OCR result.
+- Added persistent manual Manga OCR editing: correct text, change reading order, edit region geometry/hitboxes, hide/restore regions, add regions, merge/unmerge regions, and split/unsplit regions. Manual layers survive restart and same-source OCR rebuilds, support undo/history, participate in study order, and fail closed when the source scan or region identity no longer matches.
+- Added a corrections modal and direct reader controls for those edits, plus durable reader/status preferences and more detailed diagnostics for missing or unpainted study/status regions.
+- Refined Manga/Jiten N+1 behavior: already-young Jiten words may provide context without becoming N+1 targets, large chapters use bounded sentence fallback, status/card-star eligibility is independent from the visual-highlight toggle, and imported Mokuro geometry is used without fabricating per-character boxes.
+
+### Reviews and Jiten
+- Added an optional “all due words from this episode” review-gate mode. Pudge resolves the episode’s prepared or embedded Japanese subtitles, intersects that vocabulary with the live Jiten due queue, requires every matching due card, introduces no new words, and permanently grants the episode after completion. An episode with no matching due words is granted immediately.
+- Added native previous-review undo through Jiten, including an optimistic UI rollback, a previous-review strip, and Command-Z. Local gate progress is reversed only after the provider mutation is reconciled.
+- Stabilized the review-card UI: the word stays in one slot when the answer is revealed, ruby/pitch information groups with the revealed word, closed and revealed cards reserve the same height, and `Show answer` occupies the same control row as `Again / Hard / Good / Easy`.
+- Removed duplicate reading presentation for kana-only/single-ruby cards and tightened focus/hover transitions so the review overlay does not flicker or retain stale controls.
+- Added explicit JitenMPV update controls: checking for an update is read-only, “up to date” and network failure are distinct states, and the official installer runs only after an explicit Update action.
+
+### Anime releases, AniList, and personal schedules
+- Added persistent discovery for anime that are still in AniList `PLANNING` when their first episode airs. Discovery waits for release metadata, retries with backoff, avoids retroactive old-release offers, survives restarts, and never treats a failed search as a successful transition.
+- Added finished-anime sequel actions. Pudge can identify the earliest direct sequel, offer Planning/Watching depending on release state, and start a download for a released sequel without silently changing unrelated list status.
+- Added AniList related-media notifications for newly added anime relations, with filtering/persistence so already-seen relations are not repeatedly surfaced.
+- Improved absolute/release episode numbering across split cours and short stage entries, including safe local aliases for releases whose scene numbering continues across AniList entries. Nyaa matching now uses those aliases without letting them override unrelated season/title identity.
+- Extended personal release schedules from weekly-only to validated hour/day/week intervals. Hour schedules use elapsed time, day/week schedules preserve wall-clock time across DST, edits carry a revision guard, and already-unlocked episode boundaries remain stable when a schedule is edited.
+- Reduced anime-page/state startup work by avoiding repeated full-library reads while building ready-queue badges; state-build duration is now logged for regression diagnosis.
+
+### Torrent state and download control
+- Reworked the global torrent Off state around observed backend truth rather than requested intent. Unknown/read-failed backends are no longer displayed as confirmed zero traffic, stale polls cannot overwrite a newer toggle generation, and UI status is shared consistently across download surfaces.
+- Added a cross-process admission gate so GUI, agent, audiobook, resume, reconnect, and delayed-start paths recheck the current torrent policy before starting network work. Switching Off waits for in-flight admission and blocks late starts from an older generation.
+- qBittorrent Off handling now pauses both persisted and live Pudge-owned hashes (including audiobook jobs) while leaving foreign torrents alone, and continues attempting other hashes after an individual pause failure.
+- aria2 read-only probes no longer auto-start the sidecar. Ownership detection and unreachable-sidecar recovery were tightened, while write paths explicitly ensure the backend is ready before duplicate probing/resume/search.
+- Refined compact/download status copy and torrent-toggle geometry, including truthful confirmed-Off presentation without redundant secondary text.
+
+### Subtitle selection and timeline alignment
+- Advanced embedded-reference timeline alignment to `timeline-v6.19-edge-zones-audio-verify`. Start/end clock hints are now global only when they agree, remain valid as distinct master clocks for very large proven edits, and otherwise influence only their local edge zones instead of biasing the middle of an episode.
+- Added guards for false late/tail clock jumps, transient non-monotonic excursions, and decreasing-clock transitions. Real large edits remain supported, while ambiguous short tails and unsupported jumps are rejected rather than guessed.
+- Large opening edge disagreement can now require Japanese-audio verification even when subtitle cues fill the opening and there is no obvious long subtitle gap; older affected timeline-cache generations are selectively requeued.
+- Improved Jimaku season parsing/ranking so explicit wrong-season files are rejected more strongly while valid roman/bare sequel naming remains usable.
+- Playback subtitle cleanup preserves legitimate Japanese Han-only lines while still removing clear inline Chinese contamination.
+- Replaced deprecated Pillow `Image.getdata()` usage in Manga OCR with a compatibility helper using `get_flattened_data()` on newer Pillow versions, removing the large warning flood from the test suite.
+
+### Light novels, statistics, backup, and runtime recovery
+- Added account-scoped Light Novel library snapshots for cold/offline startup. A failed AniList refresh no longer erases the last successful grouping, and local/manual AniList links are reconciled without overwriting conflicting explicit links.
+- Made Statistics requests/mutations generation-aware and asynchronous so stale responses do not repaint over newer filters or corrections; exhausted journal pagination no longer keeps issuing requests.
+- Backup restore now preserves destination-machine database/cache/library/media paths instead of importing absolute paths from the backup producer. The staged config is parsed by the real application loader before commit, and runtime rebind failure can roll back files/cache rather than leaving a half-restored installation.
+- Hardened companion streaming/OCR lifecycle: active tickets and protected HLS files are retained correctly, invalid requests do not renew tickets, partial/truncated OCR batches remain retryable, and transcoders/jobs are cleaned up without publishing false success.
+- Diagnostic log export now sanitizes sensitive text before packaging.
+
+### UI, installation, and release engineering
+- Flattened advanced settings so power-saving and review-gate controls are first-class sections instead of being hidden behind an “Additional settings” wrapper; select enhancement and click-away/Escape ownership were tightened.
+- Updated the macOS application icon/padding and made installation use the same canonical icon asset.
+- Replaced the old root-level generic brand migration scripts with the scoped `scripts/migrations/legacy_anime_mpv.py` migration used by installation.
+- Expanded the release source bundle to include documented developer paths (`tests`, `docs`, `scripts`, `Makefile`, protocol docs, and workflow fixtures) and added a bundle validator for required files and local Markdown links.
+- Added the same quality gate to GitHub release CI that runs locally before the four test batches, and hardened release staging so unrelated dirty files are not accidentally included in a normal release metadata commit.
+- GitHub Release bodies are now sourced from the matching `CHANGELOG.md` version section. Re-running a release workflow also refreshes the existing Release body, fixing the behavior that left v0.7.28 with only GitHub’s generated “Full Changelog” link.
+
+
 ## v0.7.28 — Statistics, study workflow, library scheduling, and Manga OCR
 
 Range: [v0.7.27 → v0.7.28](https://github.com/TH1NKFASTER/pudge/compare/v0.7.27...v0.7.28).

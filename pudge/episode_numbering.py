@@ -68,6 +68,46 @@ def _format(anime: Any) -> str:
     return str(_value(anime, "format", "") or "").upper()
 
 
+def _airing_year(node: dict[str, Any]) -> int | None:
+    try:
+        season_year = int(node.get("season_year") or 0)
+    except (TypeError, ValueError):
+        season_year = 0
+    if season_year > 0:
+        return season_year
+    start = str(node.get("start_date") or "")
+    try:
+        return int(start[:4]) if len(start) >= 4 else None
+    except ValueError:
+        return None
+
+
+def _short_stage_alias(
+    current: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    media_episode: int,
+    counted: int,
+) -> int | None:
+    """Return a near release alias for an adjacent short split-stage entry."""
+    if counted < 1 or counted > 3:
+        return None
+    if title_similarity(
+        str(current.get("title") or ""),
+        str(candidate.get("title") or ""),
+    ) < 80.0:
+        return None
+    current_year = _airing_year(current)
+    candidate_year = _airing_year(candidate)
+    if (
+        current_year is None
+        or candidate_year is None
+        or abs(current_year - candidate_year) > 1
+    ):
+        return None
+    return int(media_episode) + int(counted)
+
+
 def _as_anilist(anime: Any) -> AniListAnime:
     return AniListAnime(
         id=_media_id(anime),
@@ -140,6 +180,7 @@ def episode_numbering_from_graph(
     offset = 0
     predecessors: list[dict[str, Any]] = []
     chain: list[int] = [media_id]
+    local_stage_aliases: list[int] = []
 
     for _ in range(20):
         current = nodes[current_id]
@@ -181,6 +222,22 @@ def episode_numbering_from_graph(
                 int(item[3].get("media_id") or 0),
             ),
         )
+        # Some streaming releases split one release-season into separate AniList
+        # entries.  A very short, adjacent direct prequel is then numbered as the
+        # first episode(s) of the same scene season even though the wider franchise
+        # graph may continue for hundreds of episodes.  Preserve that near alias in
+        # addition to the full absolute number.  This is intentionally narrow so a
+        # normal 12/24-episode previous season cannot become an accepted alias.
+        if not predecessors:
+            short_stage_alias = _short_stage_alias(
+                current,
+                candidate,
+                media_episode=media_episode,
+                counted=counted,
+            )
+            if short_stage_alias is not None:
+                local_stage_aliases.append(short_stage_alias)
+
         offset += counted
         current_id = int(candidate["media_id"])
         visited.add(current_id)
@@ -196,11 +253,19 @@ def episode_numbering_from_graph(
             and str(item.get("title") or "").strip()
         )
     )
+    aliases = tuple(
+        dict.fromkeys(
+            [
+                *local_stage_aliases,
+                *([release_episode] if offset else []),
+            ]
+        )
+    )
     return EpisodeNumbering(
         media_episode=media_episode,
         release_episode=release_episode,
         offset=offset,
-        aliases=(release_episode,) if offset else (),
+        aliases=aliases,
         prequel_titles=titles,
         chain=tuple(chain),
         source="relation_graph",

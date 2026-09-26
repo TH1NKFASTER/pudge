@@ -1302,3 +1302,23 @@ def test_continue_watching_renders_before_ready_sections() -> None:
     render_current = html[render_start:render_end]
 
     assert render_current.index("section.continueWatching") < render_current.index("readySections?")
+
+
+def test_poll_planned_release_discovery_exposes_backend_offers(tmp_path: Path) -> None:
+    api = make_api(tmp_path)
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=321,
+            title="Upcoming",
+            status="PLANNING",
+            next_airing_episode=1,
+            next_airing_at=2_100_000_000,
+        )
+    )
+    discovery = api.manager.planned_release_discovery()
+    discovery._save(321, {"phase": "found", "found_at": 2_100_000_001})
+
+    result = api.poll_planned_release_discovery()
+
+    assert [row["media_id"] for row in result["offers"]] == [321]
+    assert result["offers"][0]["title"] == "Upcoming"

@@ -26,6 +26,7 @@ from .base import CircuitBreaker
 
 
 NYAA_NS = "https://nyaa.si/xmlns/nyaa"
+NYAA_RSS_MIRROR_BASES = ("https://nyaa.net", "https://cn.nyaa.net")
 GROUP_RE = re.compile(r"^\s*\[([^\]]+)\]")
 SUFFIX_GROUP_RE = re.compile(
     r"-(?P<group>[A-Za-z][A-Za-z0-9._-]{1,31})(?:\s+\([^)]*\))?\s*$"
@@ -106,6 +107,12 @@ SEASON_WORDS = {
     "ninth": 9,
     "tenth": 10,
 }
+STAGE_SPLIT_SUFFIX_RE = re.compile(
+    r"(?i)\s*[-:]\s*"
+    r"\d{1,2}(?:st|nd|rd|th)"
+    r"(?:\s*(?:&|＆|and|[-–—])\s*\d{1,2}(?:st|nd|rd|th))?"
+    r"\s+STAGE\s*$"
+)
 
 
 class NyaaError(RuntimeError):
@@ -531,7 +538,16 @@ def _text(item: ET.Element, name: str, default: str = "") -> str:
 
 
 def _nyaa_text(item: ET.Element, name: str, default: str = "") -> str:
-    return _text(item, f"{{{NYAA_NS}}}{name}", default)
+    # Read nyaa.si's namespace first, then accept compatible read-only mirrors
+    # whose RSS extension namespace uses their own host (for example nyaa.net).
+    direct = item.find(f"{{{NYAA_NS}}}{name}")
+    if direct is not None and direct.text is not None:
+        return direct.text.strip()
+    for child in item:
+        local_name = str(child.tag).rsplit("}", 1)[-1]
+        if local_name == name and child.text is not None:
+            return child.text.strip()
+    return default
 
 
 def parse_rss(xml_text: str) -> list[NyaaRelease]:
@@ -588,6 +604,12 @@ class NyaaClient:
         timeout: float = 20.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.search_base_urls = [self.base_url]
+        host = (urlparse(self.base_url).hostname or "").casefold()
+        if host in {"nyaa.si", "www.nyaa.si"}:
+            for mirror in NYAA_RSS_MIRROR_BASES:
+                if mirror not in self.search_base_urls:
+                    self.search_base_urls.append(mirror)
         self.proxy_mode = proxy_mode
         self.proxy_url = self._normalize_proxy_url(proxy_url)
         self.pre_search_command = pre_search_command.strip()
@@ -721,14 +743,6 @@ class NyaaClient:
     ) -> list[NyaaRelease]:
         self._run_hook()
         selected_category = category or self.category
-        url = (
-            f"{self.base_url}/?page=rss&q={quote_plus(query)}"
-            f"&c={quote_plus(selected_category)}&f={int(filter_id)}"
-        )
-        if sort_by:
-            url += f"&s={quote_plus(str(sort_by))}"
-        if order:
-            url += f"&o={quote_plus(str(order))}"
         mode = self.proxy_mode.casefold()
         attempts: list[str | None]
         if mode == "proxy_only":
@@ -745,13 +759,41 @@ class NyaaClient:
         attempts = list(dict.fromkeys(attempts))
 
         errors: list[str] = []
-        for proxy in attempts:
-            if proxy is None and mode == "proxy_only":
-                continue
-            try:
-                return parse_rss(self._get(url, proxy))
-            except NyaaError as exc:
-                errors.append(str(exc))
+        had_successful_response = False
+        for base_url in list(self.search_base_urls):
+            url = (
+                f"{base_url}/?page=rss&q={quote_plus(query)}"
+                f"&c={quote_plus(selected_category)}&f={int(filter_id)}"
+            )
+            if sort_by:
+                url += f"&s={quote_plus(str(sort_by))}"
+            if order:
+                url += f"&o={quote_plus(str(order))}"
+            for proxy in attempts:
+                if proxy is None and mode == "proxy_only":
+                    continue
+                try:
+                    releases = parse_rss(self._get(url, proxy))
+                    had_successful_response = True
+                    if not releases:
+                        # Read-only mirrors can lag the primary (or each other).
+                        # An empty but valid RSS response therefore cannot prove
+                        # that a release is absent. Do not waste time retrying the
+                        # same mirror through another proxy route; probe the next
+                        # distinct mirror instead.
+                        break
+                    # A mirror that actually returned data should stay first for
+                    # later alias queries in this search. This avoids repeatedly
+                    # paying a dead-primary timeout while still letting an empty
+                    # stale mirror fall through to a fresher one.
+                    if self.search_base_urls[0] != base_url:
+                        self.search_base_urls.remove(base_url)
+                        self.search_base_urls.insert(0, base_url)
+                    return releases
+                except NyaaError as exc:
+                    errors.append(f"{base_url}: {exc}")
+        if had_successful_response:
+            return []
         raise NyaaError("; ".join(dict.fromkeys(errors)) or "Nyaa недоступен")
 
 
@@ -924,6 +966,28 @@ def release_identity_mismatch_reason(anime: LibraryAnime, title: str) -> str | N
     if release_season == 0:
         return "special-season-zero"
     return None
+
+
+
+def _absolute_episode_alias_overrides_season_identity(
+    reason: str | None,
+    title: str,
+    alternative_episodes: tuple[int, ...],
+) -> bool:
+    """Allow scene-season tags only when an absolute episode alias proves identity.
+
+    Release groups sometimes number a continuous franchise as S06E02 while
+    AniList represents that episode as #1 of a separate entry. Only explicit
+    cross-season contradictions are overridable; S00, multi-season packs and
+    Final Season conflicts remain hard failures.
+    """
+    if reason not in {"cross-season-explicit", "cross-season-release"}:
+        return False
+    if _season_number(title) == 0 or 0 in _explicit_season_numbers(title):
+        return False
+    found_episode, explicit = _release_episode_match(title)
+    allowed = {int(value) for value in alternative_episodes if int(value) > 0}
+    return bool(explicit and found_episode in allowed)
 
 
 def release_is_safe_batch_candidate(
@@ -1129,10 +1193,13 @@ def release_related_title_conflict_reason(
     token phrase and that title is either more specific than a positive alias or
     is the only exact franchise-title match.
     """
+    positive_values: list[str] = []
+    for value in [anime.title, *anime.titles, *anime.synonyms]:
+        positive_values.extend(_release_search_title_variants(str(value or "")))
     positives = list(dict.fromkeys(
-        str(value).strip()
-        for value in [anime.title, *anime.titles, *anime.synonyms]
-        if str(value).strip()
+        value.strip()
+        for value in positive_values
+        if value.strip()
     ))
     release = str(release_title or "")
     positive_exact = [value for value in positives if _token_phrase_present(value, release)]
@@ -1157,9 +1224,12 @@ def _title_match_score(
     release_title: str,
     alternative_titles: tuple[str, ...] = (),
 ) -> tuple[float, list[str]]:
+    raw_aliases: list[str] = []
+    for value in [anime.title, *alternative_titles, *anime.titles, *anime.synonyms]:
+        raw_aliases.extend(_release_search_title_variants(value))
     aliases = list(dict.fromkeys(
         value.strip()
-        for value in [anime.title, *alternative_titles, *anime.titles, *anime.synonyms]
+        for value in raw_aliases
         if value.strip()
     ))
     if not aliases:
@@ -1197,6 +1267,7 @@ def release_title_is_plausible(
     release_title: str,
     alternative_titles: tuple[str, ...] = (),
     negative_titles: tuple[str, ...] = (),
+    alternative_episodes: tuple[int, ...] = (),
 ) -> bool:
     """Shared fail-closed title identity check for provider results/resume.
 
@@ -1205,7 +1276,10 @@ def release_title_is_plausible(
     token overlap (for example Kimetsu returned for Shingeki) is rejected,
     while exact aliases and strong fuzzy aliases remain eligible.
     """
-    if release_identity_mismatch_reason(anime, release_title) is not None:
+    identity_mismatch = release_identity_mismatch_reason(anime, release_title)
+    if identity_mismatch is not None and not _absolute_episode_alias_overrides_season_identity(
+        identity_mismatch, release_title, alternative_episodes
+    ):
         return False
     if release_related_title_conflict_reason(anime, release_title, negative_titles) is not None:
         return False
@@ -1526,6 +1600,23 @@ def score_release(
     return replace(release, score=round(score, 3), reasons=reasons)
 
 
+def _release_search_title_variants(value: str) -> tuple[str, ...]:
+    """Return narrow search/identity aliases for split-stage AniList titles.
+
+    Release groups commonly omit AniList's split-stage suffix entirely.  Put
+    the bare series title first so a bounded automatic search does not spend
+    its whole wall-clock budget probing a verbose title that no release uses.
+    The original title remains as a fallback and identity alias.
+    """
+    original = str(value or "").strip()
+    if not original:
+        return ()
+    stripped = STAGE_SPLIT_SUFFIX_RE.sub("", original).strip(" -:–—")
+    if stripped and stripped != original:
+        return (stripped, original)
+    return (original,)
+
+
 def search_ranked(
     client: NyaaClient,
     anime: LibraryAnime,
@@ -1549,7 +1640,9 @@ def search_ranked(
     max_queries: int = 5,
     query_budget_seconds: float | None = None,
 ) -> list[NyaaRelease]:
-    raw_aliases = [anime.title, *alternative_titles, *anime.titles, *anime.synonyms]
+    raw_aliases: list[str] = []
+    for source_title in [anime.title, *alternative_titles, *anime.titles, *anime.synonyms]:
+        raw_aliases.extend(_release_search_title_variants(source_title))
     aliases: list[str] = []
     for value in raw_aliases:
         value = value.strip()
@@ -1567,10 +1660,11 @@ def search_ranked(
     # necessarily the title used by release groups (for example Youjo Senki II
     # releases are not usually named Saga of Tanya the Evil Season 2).
     canonical_variants: list[str] = []
-    canonical_folded = fold_search_title(anime.title).strip()
-    for value in (canonical_folded, anime.title.strip()):
-        if value and value in aliases and value not in canonical_variants:
-            canonical_variants.append(value)
+    for canonical_title in _release_search_title_variants(anime.title):
+        canonical_folded = fold_search_title(canonical_title).strip()
+        for value in (canonical_folded, canonical_title.strip()):
+            if value and value in aliases and value not in canonical_variants:
+                canonical_variants.append(value)
     remaining_aliases = [value for value in aliases if value not in canonical_variants]
     remaining_aliases.sort(
         key=lambda value: (_season_number(value) == expected_season, len(value)),
@@ -1592,7 +1686,14 @@ def search_ranked(
             )
 
     queries: list[str] = []
-    for base in dict.fromkeys(value.strip() for value in bases if value.strip()):
+    unique_bases = list(dict.fromkeys(value.strip() for value in bases if value.strip()))
+    # When AniList splits a franchise/cour differently from release groups, the
+    # exact scene marker can be impossible to infer (for example local ep1 ->
+    # S06E02). Probe all title aliases first, before one verbose alias consumes
+    # the automatic query budget with several numeric spellings.
+    if not batch and episode is not None and alternative_episodes:
+        queries.extend(unique_bases)
+    for base in unique_bases:
         if batch:
             queries.extend([base, f"{base} batch", f"{base} complete"])
             if anime.episodes and anime.episodes > 1:
@@ -1603,7 +1704,10 @@ def search_ranked(
                     ]
                 )
         elif episode is not None:
-            episode_numbers = [episode, *(value for value in alternative_episodes if value > 0)]
+            episode_numbers = [
+                *(value for value in alternative_episodes if value > 0),
+                episode,
+            ]
             for episode_number in dict.fromkeys(episode_numbers):
                 number = int(episode_number)
                 # Nyaa tokenizes S01E43/E43 differently from a standalone 43.
@@ -1657,9 +1761,8 @@ def search_ranked(
     eligible_releases = [
         release
         for release in by_hash.values()
-        if release_identity_mismatch_reason(anime, release.title) is None
-        and release_title_is_plausible(
-            anime, release.title, alternative_titles, negative_titles
+        if release_title_is_plausible(
+            anime, release.title, alternative_titles, negative_titles, alternative_episodes
         )
         and not (
             episode is not None
@@ -1746,7 +1849,7 @@ def search_shana_ranked(
         for item in ranked
         if any(reason.startswith("exact-title") or reason.startswith("alias-title") or reason.startswith("fuzzy-title") for reason in item.reasons)
         and release_title_is_plausible(
-            anime, item.title, alternative_titles, negative_titles
+            anime, item.title, alternative_titles, negative_titles, alternative_episodes
         )
     ]
     ranked.sort(key=lambda item: (item.score, item.published), reverse=True)
@@ -1787,7 +1890,7 @@ def search_subsplease_ranked(
             anime, release.title, alternative_titles
         )
         if title_score < 25.0 or not release_title_is_plausible(
-            anime, release.title, alternative_titles, negative_titles
+            anime, release.title, alternative_titles, negative_titles, alternative_episodes
         ):
             continue
         eligible.append(release)

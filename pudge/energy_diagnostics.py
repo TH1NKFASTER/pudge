@@ -276,6 +276,11 @@ class EnergyDiagnosticsMonitor:
         for total in role_totals.values():
             total["cpu_percent"] = round(float(total["cpu_percent"]), 2)
             total["rss_mb"] = round(float(total["rss_mb"]), 2)
+        # Full argv may contain aria2 --rpc-secret, URLs with credentials and
+        # provider tokens. Keep it transient for process classification only.
+        # Neither future energy JSONL nor exported diagnostics may contain it.
+        for row in rows:
+            row.pop("command", None)
         return {
             "timestamp": time.time(),
             "platform": sys.platform,

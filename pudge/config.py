@@ -32,6 +32,7 @@ class UIConfig:
     jiten_developer_tools_confirmed: bool = False
     review_gate_enabled: bool = False
     review_gate_count: int = 5
+    review_gate_all_due_episode_words: bool = False
 
 
 @dataclass(slots=True)
@@ -186,6 +187,7 @@ class CompanionConfig:
 @dataclass(slots=True)
 class ToolsConfig:
     mpv: str = "mpv"
+    manga_ocr_backend: str = "pudge"
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     alass: str = "alass"
@@ -411,6 +413,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             jiten_developer_tools_confirmed=bool(ui.get("jiten_developer_tools_confirmed", False)),
             review_gate_enabled=bool(ui.get("review_gate_enabled", False)),
             review_gate_count=max(1, min(50, int(ui.get("review_gate_count", 5)))),
+            review_gate_all_due_episode_words=bool(ui.get("review_gate_all_due_episode_words", False)),
         ),
         paths=PathsConfig(
             download_dirs=_load_watched_media_dirs(paths),
@@ -543,6 +546,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         tools=ToolsConfig(
             mpv=str(tools.get("mpv", "mpv")),
+            manga_ocr_backend=(lambda v: v if v in {"pudge", "mokuro"} else "pudge")(str(tools.get("manga_ocr_backend", "pudge")).strip().casefold()),
             ffmpeg=str(tools.get("ffmpeg", "ffmpeg")),
             ffprobe=str(tools.get("ffprobe", "ffprobe")),
             alass=str(tools.get("alass", "alass")),
@@ -809,6 +813,7 @@ permissions_requested = {_toml_bool(config.ui.permissions_requested)}
 jiten_developer_tools_confirmed = {_toml_bool(config.ui.jiten_developer_tools_confirmed)}
 review_gate_enabled = {_toml_bool(config.ui.review_gate_enabled)}
 review_gate_count = {max(1, min(50, int(config.ui.review_gate_count)))}
+review_gate_all_due_episode_words = {_toml_bool(config.ui.review_gate_all_due_episode_words)}
 
 [paths]
 watched_media_dirs = {_toml_string_list(config.paths.download_dirs)}
@@ -915,6 +920,7 @@ max_events_per_request = {config.companion.max_events_per_request}
 
 [tools]
 mpv = {_toml_string(config.tools.mpv)}
+manga_ocr_backend = {_toml_string(config.tools.manga_ocr_backend)}
 ffmpeg = {_toml_string(config.tools.ffmpeg)}
 ffprobe = {_toml_string(config.tools.ffprobe)}
 alass = {_toml_string(config.tools.alass)}

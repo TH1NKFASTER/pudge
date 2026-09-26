@@ -70,3 +70,13 @@ The resulting archive is written to `dist/pudge-macos-vX.Y.Z.zip`.
 
 Generated wheels, ZIPs, virtual environments, caches, logs and local config are
 ignored by git.
+
+## Release bundle contract
+
+The published source release ZIP includes the documented developer tooling needed by the commands above, including `Makefile`, `scripts/`, `MOBILE_SYNC_PROTOCOL.md`, and the static workflow files used by source-level release checks. `scripts/check_release_bundle.py` validates the staged archive so internal documentation links and documented commands do not silently disappear from a release.
+
+Release automation requires a clean working tree before the version bump and stages only the files it intentionally updates. It must not use `git add -A` to absorb unrelated local work.
+
+## Legacy Anime MPV migration
+
+The one-time Anime MPV → Pudge compatibility migration lives at `scripts/migrations/legacy_anime_mpv.py`. It is deliberately narrow: it migrates known legacy defaults only, never performs arbitrary product renames, does not follow unexpected symlinks, and leaves conflicting source files untouched. Configuration changes are written atomically with a backup, and similar-looking custom paths are not rewritten merely because they contain the legacy product name.

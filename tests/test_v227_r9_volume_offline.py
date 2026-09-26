@@ -61,10 +61,10 @@ def test_r9_schema_adds_offline_transport_with_pre_v11_backup(tmp_path: Path) ->
 
     migrated = Database(path)
     backup = path.with_name(f"{path.name}.pre-v{LATEST_SCHEMA_VERSION}.backup")
-    assert LATEST_SCHEMA_VERSION == 11
+    assert LATEST_SCHEMA_VERSION >= 11
     assert backup.is_file()
     with migrated.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 11
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         assert conn.execute("SELECT value FROM state WHERE key='r9-probe'").fetchone()[0] == "kept"
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"consumption_sync_receipts", "consumption_sync_outbox", "consumption_history_state"} <= tables

@@ -18,6 +18,69 @@
   let studyCardGeneration = 0;
   let translationRequest = 0;
   const optimisticStudyPairs = new Set();
+  // Native Jiten states are mutable and account-scoped. Parsed vocabulary is not.
+  let studyStateEpoch = 0;
+  let studyStateScope = '';
+  const pendingJitenMutations = new Set();
+
+  function notifyStudyStatesChanged() {
+    if (typeof window.dispatchEvent === 'function' && typeof CustomEvent === 'function') {
+      window.dispatchEvent(new CustomEvent('pudge-study-states-changed'));
+    }
+  }
+
+  function jitenTokenPair(token = {}) {
+    const id = Number(token.wordId ?? token.word_id ?? token.card?.wordId ?? token.card?.word_id ?? 0);
+    const reading = Number(token.readingIndex ?? token.reading_index ?? token.card?.readingIndex ?? token.card?.reading_index ?? -1);
+    return Number.isInteger(id) && id > 0 && Number.isInteger(reading) && reading >= 0
+      ? `${id}:${reading}` : '';
+  }
+
+  function invalidateJitenStatePair(token) {
+    const pair = jitenTokenPair(token);
+    if (!pair) return;
+    pendingJitenMutations.add(pair);
+    studyStateEpoch += 1;
+    for (const node of document.querySelectorAll('[data-pudge-study-token]')) {
+      const item = registry.get(String(node.dataset.pudgeStudyToken || ''));
+      if (jitenTokenPair(item) !== pair) continue;
+      delete node.dataset.pudgeStudyVerified;
+      delete node.dataset.pudgeStudyScope;
+    }
+    notifyStudyStatesChanged();
+  }
+
+  function applyJitenStatesToVisible(rows) {
+    const byPair = new Map((rows || []).filter(row => row?.ok).map(row => [
+      `${Number(row.wordId)}:${Number(row.readingIndex)}`, row,
+    ]));
+    for (const node of document.querySelectorAll('[data-pudge-study-token]')) {
+      const token = registry.get(String(node.dataset.pudgeStudyToken || ''));
+      if (!token || String(token.backend || 'jiten').toLowerCase() !== 'jiten') continue;
+      const pair = jitenTokenPair(token);
+      if (pendingJitenMutations.has(pair)) continue;
+      const row = byPair.get(pair);
+      if (row) applyStudyStateToCard(token.card || (token.card = {}), node, row);
+    }
+    notifyStudyStatesChanged();
+  }
+
+  async function refreshJitenPairAfterMutation(token) {
+    const pair = jitenTokenPair(token);
+    if (!pair) return;
+    const [id, reading] = pair.split(':').map(Number);
+    try {
+      const rows = await lookupLiveStates([[id, reading]], {force:true});
+      if (!rows.length || !pendingJitenMutations.has(pair)) return;
+      // Any previously started hydration must not overwrite this confirmed POST.
+      studyStateEpoch += 1;
+      pendingJitenMutations.delete(pair);
+      applyJitenStatesToVisible(rows);
+    } catch (_) {
+      // Keep unresolved operations uncolored until an authoritative refresh.
+    }
+  }
+
 
   const selectedDeckByBackend = new Map();
   const studyDeckCache = new Map();
@@ -415,15 +478,18 @@
   }
 
   function position(el, rect) {
-    requestAnimationFrame(() => {
-      const r = el.getBoundingClientRect();
-      let left = rect.left + rect.width / 2 - r.width / 2;
-      left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
-      let top = rect.bottom + 10;
-      if (top + r.height > window.innerHeight - 8) top = Math.max(8, rect.top - r.height - 10);
-      el.style.left = `${left}px`;
-      el.style.top = `${top}px`;
-    });
+    if (!el || !rect) return;
+    // Force layout and place the card in the same JS task that makes it visible.
+    // The old requestAnimationFrame path allowed one painted frame at the
+    // element's static position near the top-left, which looked like a giant
+    // empty outlined card before the real Jiten popup jumped into place.
+    const r = el.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - r.width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - r.width - 8));
+    let top = rect.bottom + 10;
+    if (top + r.height > window.innerHeight - 8) top = Math.max(8, rect.top - r.height - 10);
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
   }
 
   async function apiDecks(backend) {
@@ -480,6 +546,19 @@
     card.normalizedState = String(payload.normalizedState || normalizeState({...card, normalizedState:''}));
     card.rawStateLabel = String(payload.rawStateLabel || '');
     card.knowledgeStatus = String(payload.knowledgeStatus || 'live_provider_batch');
+    if (target?.dataset) {
+      // A parse snapshot or a stale/error result can never assert "New".
+      const scoped = String(payload.account_scope || '');
+      const confirmed = scoped && scoped === studyStateScope && !payload.stale &&
+        ['new','learning','known','due','blacklisted'].includes(String(card.normalizedState || '').toLowerCase());
+      if (confirmed) {
+        target.dataset.pudgeStudyVerified = '1';
+        target.dataset.pudgeStudyScope = scoped;
+      } else {
+        delete target.dataset.pudgeStudyVerified;
+        delete target.dataset.pudgeStudyScope;
+      }
+    }
     if (Array.isArray(payload.studyDeckIds)) {
       card.studyDeckIds = payload.studyDeckIds.map(value => Number(value)).filter(Number.isInteger);
     }
@@ -503,6 +582,7 @@
       badge.classList.add(`state-${state}`);
       badge.textContent = stateLabel(card);
       badge.title = payload.stale ? (ru() ? 'Последнее известное состояние Jiten' : 'Last known Jiten state') : '';
+      refreshActiveOptimalBadge();
     }
     return true;
   }
@@ -517,7 +597,11 @@
       const payload = await apiStudyState({
         backend:'jiten', word_id:wordId, reading_index:readingIndex, force:Boolean(force),
       });
-      applyLiveStudyState(current, target, payload);
+      if (payload?.ok && payload?.account_scope && payload.account_scope === studyStateScope) {
+        applyJitenStatesToVisible([payload]);
+      } else {
+        applyLiveStudyState(current, target, payload);
+      }
       return payload;
     } catch (_) {
       // Keep the last provider/parse state. Network failure must not demote a
@@ -559,10 +643,32 @@
       if (words.length >= 500) break;
     }
     if (!words.length) return [];
+    const epoch = studyStateEpoch;
     const result = await apiStudyStates({backend:'jiten', words, force:Boolean(force)});
+    // The server snapshots the account identity before its network call. Compare
+    // against the current account after the call, so slow old-account responses
+    // cannot color the new account's book.
+    let accountScope = String(result?.account_scope || '');
+    const caps = API()?.study_provider_capabilities
+      ? await API().study_provider_capabilities('jiten') : null;
+    // Compatibility with older WebAppApi builds: the capability endpoint is
+    // authoritative for account identity, so a missing top-level scope must not
+    // discard an otherwise valid state batch. G16 also adds account_scope to the
+    // backend response so mixed-version windows converge after restart.
+    if (!accountScope) accountScope = String(caps?.account_key || '');
+    if (epoch !== studyStateEpoch || !result?.ok || !accountScope ||
+        !caps || accountScope !== String(caps.account_key || '')) return [];
+    if (studyStateScope && studyStateScope !== accountScope) {
+      for (const node of document.querySelectorAll('[data-pudge-study-verified="1"]')) {
+        delete node.dataset.pudgeStudyVerified;
+        delete node.dataset.pudgeStudyScope;
+      }
+      notifyStudyStatesChanged();
+    }
+    studyStateScope = accountScope;
     const limit = Number(result?.optimalWordLimit ?? result?.optimal_word_limit);
     if (Number.isFinite(limit) && limit > 0) latestOptimalWordLimit = Math.max(1000, Math.floor(limit));
-    return Array.isArray(result?.states) ? result.states : [];
+    return Array.isArray(result?.states) ? result.states.map(row => ({...row, account_scope:accountScope})) : [];
   }
 
   function studyCardStateSet(card = {}) {
@@ -576,7 +682,12 @@
 
   function nPlusOneCompanionKnown(card = {}) {
     const states = studyCardStateSet(card);
-    return ['mature','known','mastered','never-forget','blacklisted','redundant'].some(state => states.has(state));
+    // Jiten's Young tier is already a learned/reviewing word, not a fresh +1.
+    // Treat it as usable context just like Mature.  The previous Mature-only
+    // rule made otherwise-valid N+1 sentences disappear for users with a large
+    // Young queue.
+    return ['young','mature','learning','known','mastered','never-forget','blacklisted','redundant']
+      .some(state => states.has(state));
   }
 
   function nPlusOneTargetEligible(card = {}) {
@@ -620,10 +731,14 @@
     refreshOptimalHighlights();
   }
 
-  function applyOptimalHighlights(entries, {enabled = true, frequencyLimit = latestOptimalWordLimit} = {}) {
-    const rows = (Array.isArray(entries) ? entries : []).filter(row => row?.token && row?.node);
-    for (const row of rows) row.node.classList?.remove('pudge-optimal-word');
-    if (!enabled || !rows.length) return 0;
+  // One read-only N+1 decision for both the text highlight and the study-card star.
+  // The caller supplies token occurrences, not word IDs: eligibility is contextual.
+  function evaluateOptimalTargets(entries, {
+    frequencyLimit = latestOptimalWordLimit,
+    minSentenceTokens = 10,
+    fallbackMinSentenceTokens = 5,
+  } = {}) {
+    const rows = (Array.isArray(entries) ? entries : []).filter(row => row?.token);
     const limit = Math.max(1000, Number(frequencyLimit || latestOptimalWordLimit || 1000));
     const byContext = new Map();
     for (const row of rows) {
@@ -633,36 +748,81 @@
       if (!byContext.has(context)) byContext.set(context, []);
       byContext.get(context).push(row);
     }
-    let highlighted = 0;
-    for (const [context, contextRows] of byContext) {
-      const spans = sentenceSpans(context);
-      for (const span of spans) {
-        const sentenceRows = contextRows.filter(row => {
-          const {start, end} = tokenContextBounds(row.token);
-          const point = Number.isFinite(start) ? start : end;
-          return Number.isFinite(point) && point >= span.start && point < span.end;
-        }).sort((a, b) => tokenContextBounds(a.token).start - tokenContextBounds(b.token).start);
-        if (sentenceRows.length < 10) continue;
-        for (let index = 0; index < sentenceRows.length; index += 1) {
-          const row = sentenceRows[index];
-          const card = row.token.card || {};
-          const rank = Number(card.frequencyRank ?? card.frequency_rank ?? 0);
-          if (!Number.isFinite(rank) || rank <= 0 || rank > limit || !nPlusOneTargetEligible(card)) continue;
-          let allOtherKnown = true;
-          for (let other = 0; other < sentenceRows.length; other += 1) {
-            if (other === index) continue;
-            if (!nPlusOneCompanionKnown(sentenceRows[other].token.card || {})) {
-              allOtherKnown = false;
-              break;
-            }
+
+    const evaluateWithMinimum = minimum => {
+      const eligible = new Set();
+      const minTokens = Math.max(2, Number(minimum || 0));
+      for (const [context, contextRows] of byContext) {
+        for (const span of sentenceSpans(context)) {
+          const seen = new Set();
+          const sentenceRows = contextRows.filter(row => {
+            const {start, end} = tokenContextBounds(row.token);
+            const point = Number.isFinite(start) ? start : end;
+            if (!Number.isFinite(point) || point < span.start || point >= span.end) return false;
+            const occurrence = `${start}:${end}:${studyPairKey(row.token)}:${row.token.surface || ''}`;
+            if (seen.has(occurrence)) return false;
+            seen.add(occurrence);
+            return true;
+          }).sort((a, b) => tokenContextBounds(a.token).start - tokenContextBounds(b.token).start);
+          if (sentenceRows.length < minTokens) continue;
+          for (let index = 0; index < sentenceRows.length; index += 1) {
+            const row = sentenceRows[index];
+            const card = row.token.card || {};
+            const rank = Number(card.frequencyRank ?? card.frequency_rank ?? 0);
+            if (!Number.isFinite(rank) || rank <= 0 || rank > limit || !nPlusOneTargetEligible(card)) continue;
+            if (sentenceRows.some((other, otherIndex) =>
+              otherIndex !== index && !nPlusOneCompanionKnown(other.token.card || {}))) continue;
+            eligible.add(row.token);
           }
-          if (!allOtherKnown) continue;
-          row.node.classList?.add('pudge-optimal-word');
-          highlighted += 1;
         }
       }
+      return eligible;
+    };
+
+    // Preserve the old >=10-token preference when it finds useful material.
+    // A whole chapter with zero results gets one bounded relaxation to >=5
+    // tokens; N+1 strictness (one target, known companions, frequency gate)
+    // is unchanged.
+    let eligible = evaluateWithMinimum(minSentenceTokens);
+    const fallback = Math.max(2, Number(fallbackMinSentenceTokens || 0));
+    if (!eligible.size && rows.length >= 40 && fallback < Number(minSentenceTokens || 10)) {
+      eligible = evaluateWithMinimum(fallback);
     }
-    return highlighted;
+    return eligible;
+  }
+
+  function refreshActiveOptimalBadge() {
+    const current = activeToken;
+    if (!current) return;
+    const badge = document.querySelector?.('#pudgeStudyCard .pudge-study-optimal');
+    if (!badge) return;
+    // LN tokens live in the native LN registry rather than this module's DOM
+    // registry. applyOptimalHighlights records eligibility on the actual target
+    // element so the shared card can still show the same decision. Manga keeps
+    // highlightOptimalWords=false and therefore cannot acquire this marker.
+    const allowed = current.backend.toLowerCase() === 'jiten' &&
+      current.token.highlightOptimalWords !== false && !current.token.fallback &&
+      !current.pendingReview && !current.reviewOutcomeUnknown;
+    const targetEligible = current.target?.dataset?.pudgeOptimalEligible === '1';
+    const registryEligible = evaluateOptimalTargets(registeredStudyEntries()).has(current.token);
+    badge.hidden = !allowed || !(targetEligible || registryEligible);
+  }
+
+  function applyOptimalHighlights(entries, {enabled = true, frequencyLimit = latestOptimalWordLimit} = {}) {
+    const rows = (Array.isArray(entries) ? entries : []).filter(row => row?.token && row?.node);
+    for (const row of rows) {
+      row.node.classList?.remove('pudge-optimal-word');
+      if (row.node.dataset) delete row.node.dataset.pudgeOptimalEligible;
+    }
+    const eligible = evaluateOptimalTargets(rows, {frequencyLimit});
+    for (const row of rows) {
+      if (!eligible.has(row.token)) continue;
+      if (row.node.dataset) row.node.dataset.pudgeOptimalEligible = '1';
+      if (enabled) row.node.classList?.add('pudge-optimal-word');
+    }
+    // Disabling the background never disables the independently computed star.
+    refreshActiveOptimalBadge();
+    return enabled ? eligible.size : 0;
   }
 
   function registeredStudyEntries() {
@@ -684,7 +844,9 @@
     const rows = [...liveStateHydrationPairs.entries()].slice(0, 500);
     for (const [key] of rows) liveStateHydrationPairs.delete(key);
     try {
+      const epoch = studyStateEpoch;
       const states = await lookupLiveStates(rows.map(([, pair]) => pair));
+      if (epoch !== studyStateEpoch) return;
       const byPair = new Map(states.map(row => [`${Number(row?.wordId || 0)}:${Number(row?.readingIndex ?? -1)}`, row]));
       for (const node of document.querySelectorAll('[data-pudge-study-token]')) {
         const token = registry.get(String(node.dataset.pudgeStudyToken || ''));
@@ -692,7 +854,7 @@
         const wordId = Number(token.wordId ?? token.word_id ?? token.card?.wordId ?? token.card?.word_id ?? 0);
         const readingIndex = Number(token.readingIndex ?? token.reading_index ?? token.card?.readingIndex ?? token.card?.reading_index ?? -1);
         const row = byPair.get(`${wordId}:${readingIndex}`);
-        if (!row) continue;
+        if (!row || pendingJitenMutations.has(`${wordId}:${readingIndex}`)) continue;
         const card = token.card || (token.card = {});
         applyStudyStateToCard(card, node, row);
       }
@@ -704,6 +866,7 @@
         if (row) applyLiveStudyState(activeToken, activeToken.target, row);
       }
       refreshOptimalHighlights();
+      notifyStudyStatesChanged();
     } catch (_) {
       // Initial coloring is opportunistic. Per-card R15 refresh remains authoritative.
     } finally {
@@ -774,7 +937,7 @@
       : '';
     pop.innerHTML = `
       <div class="pudge-study-head">
-        <div class="pudge-study-term-wrap"><div class="pudge-study-term">${studyTerm(card, token)}</div>${jitenLink}</div>
+        <div class="pudge-study-term-wrap"><div class="pudge-study-term">${studyTerm(card, token)}</div>${jitenLink}<span class="pudge-study-optimal" hidden tabindex="0" role="img" aria-label="${ru() ? 'Подходит для изучения' : 'A good new word to learn in this context'}" title="${ru() ? 'Хорошее новое слово для изучения в этом контексте' : 'A good new word to learn in this context'}" data-tooltip="${ru() ? 'Хорошее новое слово для изучения в этом контексте' : 'A good new word to learn in this context'}">★</span></div>
         <div class="pudge-study-head-actions">
           ${headerActions.map(action =>
             `<button class="pudge-study-header-action" data-pudge-study-action-tone="${String(action.tone || '') === 'listen' || String(action.id) === 'paired-audio-here' ? 'listen' : ''}" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
@@ -806,7 +969,12 @@
           `<button class="pudge-study-extra-action" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
         ).join('')}</div>` : ''}
       </div>`}`;
+    // Keep the first visible layout off-screen until size + position are known.
+    // This prevents the fixed card from flashing at its static top-left position.
+    pop.style.left = '-10000px';
+    pop.style.top = '-10000px';
     pop.classList.add('open');
+    refreshActiveOptimalBadge();
     sizeStudyCard(pop);
     position(pop, anchorRect);
     if (fallbackOnly) return;
@@ -840,7 +1008,51 @@
   function closeStudyCard() {
     studyCardGeneration += 1;
     activeToken = null;
-    document.getElementById('pudgeStudyCard')?.classList.remove('open');
+    const card = document.getElementById('pudgeStudyCard');
+    const focusedInside = document.activeElement;
+    if (card && focusedInside && card.contains(focusedInside)) focusedInside.blur?.();
+    card?.classList.remove('open');
+    if (card) {
+      card.style.left = '-10000px';
+      card.style.top = '-10000px';
+    }
+  }
+
+  function handleReviewKeydown(event) {
+    const card = document.getElementById('pudgeStudyCard');
+    if (!card?.classList.contains('open')) return false;
+    if (event?.isComposing || event?.repeat || event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
+    if (event?.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return false;
+
+    const key = String(event?.key || '');
+    const code = String(event?.code || '');
+    const gradeByKey = {
+      '1':'again', Digit1:'again', Numpad1:'again',
+      '2':'hard', Digit2:'hard', Numpad2:'hard',
+      '3':'good', Digit3:'good', Numpad3:'good',
+      '4':'easy', Digit4:'easy', Numpad4:'easy',
+    };
+    const grade = gradeByKey[key] || gradeByKey[code] || '';
+    if (grade) {
+      const button = card.querySelector(`[data-pudge-study-review="${grade}"]`);
+      if (!button || button.disabled) return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      button.focus?.({preventScroll:true});
+      return true;
+    }
+
+    if (code === 'Space' || key === ' ') {
+      const focused = document.activeElement?.closest?.('[data-pudge-study-review]');
+      if (!focused || !card.contains(focused) || focused.disabled) return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      focused.click();
+      return true;
+    }
+    return false;
   }
 
   function textWithoutRuby(fragment) {
@@ -1110,6 +1322,7 @@
         return;
       }
       current.pendingReview = true;
+      if (String(current.backend || '').toLowerCase() === 'jiten') invalidateJitenStatePair(token);
       suppressOptimalForPair(token, current.target);
       closeStudyCard();
       try {
@@ -1131,8 +1344,12 @@
         }
         if (result?.ok === false) {
           rollbackOptimisticStudyPair(token);
+          if (String(current.backend || '').toLowerCase() === 'jiten') void refreshJitenPairAfterMutation(token);
           window.toast?.(result?.message || (ru() ? 'Не удалось сохранить review' : 'Could not save review'));
           return;
+        }
+        if (String(current.backend || '').toLowerCase() === 'jiten') {
+          void refreshJitenPairAfterMutation(token);
         }
         if (Array.isArray(result?.enrichment_warnings) && result.enrichment_warnings.length) {
           window.toast?.(`${ru() ? 'Review сохранён; дополнение не удалось' : 'Review saved; enrichment failed'}: ${result.enrichment_warnings.join('; ')}`);
@@ -1157,13 +1374,17 @@
         sentence: current.sentence,
         id_namespace: current.idNamespace,
       };
+      if (String(current.backend || '').toLowerCase() === 'jiten') invalidateJitenStatePair(token);
       suppressOptimalForPair(token, current.target);
       closeStudyCard();
       try {
         const result = await apiAction(request);
         if (result?.ok === false) {
           rollbackOptimisticStudyPair(token);
+          if (String(current.backend || '').toLowerCase() === 'jiten') void refreshJitenPairAfterMutation(token);
           window.toast?.(result?.message || (ru() ? 'Не удалось добавить слово' : 'Could not add word'));
+        } else if (result?.outcome !== 'unknown' && String(current.backend || '').toLowerCase() === 'jiten') {
+          void refreshJitenPairAfterMutation(token);
         }
       } catch (error) {
         rollbackOptimisticStudyPair(token);
@@ -1235,12 +1456,39 @@
         closeStudyCard();
         return true;
       },
+      handleReviewKeydown,
       renderParsedText,
       renderParsedParagraph,
       contextForToken: studyContextFromEntries,
       lookupLiveStates,
       queueLiveStateHydration,
+      currentAccountScope() { return studyStateScope; },
+      verifiedJitenStateForElement(node) {
+        if (!studyStateScope || node?.dataset?.pudgeStudyVerified !== '1' ||
+            node.dataset.pudgeStudyScope !== studyStateScope) return null;
+        const token = registry.get(String(node.dataset.pudgeStudyToken || ''));
+        if (!token || String(token.backend || 'jiten').toLowerCase() !== 'jiten' ||
+            !jitenTokenPair(token)) return null;
+        const states = (token.card?.states || token.card?.knownState || [])
+          .map(value => String(value || '').toLowerCase().replace(/_/g, '-'));
+        const due = states.some(value => ['due','failed'].includes(value));
+        const ignored = states.some(value => ['blacklisted','redundant','ignored'].includes(value));
+        if (ignored) return {level:'unknown', due, ignored:true, states, pair:jitenTokenPair(token)};
+        // Due is an orthogonal review flag. Preserve the durable knowledge tier
+        // instead of painting every due Mature/Known word as Learning.
+        let level = 'unknown';
+        if (states.some(value => ['known','mastered','never-forget'].includes(value))) level = 'known';
+        else if (states.some(value => ['learning','young','mature'].includes(value))) level = 'learning';
+        else if (states.includes('new')) level = 'new';
+        else {
+          const normalized = normalizeState(token.card || {});
+          if (['new','learning','known'].includes(normalized)) level = normalized;
+        }
+        if (!['new','learning','known'].includes(level)) return null;
+        return {level, due, ignored:false, states, pair:jitenTokenPair(token)};
+      },
       applyOptimalHighlights,
+      evaluateOptimalTargets,
       refreshOptimalHighlights,
       optimalWordLimit() { return latestOptimalWordLimit; },
       inlinePitch: renderInlinePitch,

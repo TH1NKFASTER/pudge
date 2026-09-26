@@ -1,52 +1,34 @@
 # Releasing Pudge
 
-Pudge releases are built from an exact version tag. The release command checks
-the checkout, updates version metadata when needed, runs the required checks,
-and publishes only after they pass.
+Release from a reviewed `main` checkout. The release helper refuses unrelated local changes; after it performs the version bump it stages only the explicit release metadata files rather than `git add -A`.
 
-## Standard release
-
-From a clean `main` checkout with the release changes already reviewed:
+## Normal release
 
 ```bash
-make release VERSION=0.7.26 PYTHON=.venv-test/bin/python
+make release VERSION=<next-version>
 ```
 
-The command verifies that the checkout is current, updates version metadata,
-runs lint and the full test batches, creates the release commit, pushes `main`,
-and creates the matching version tag.
+The helper fetches `origin/main` and tags, checks that the checkout is not stale/diverged, bumps version metadata, refreshes `uv.lock`, runs `make quality` and all four test batches, commits only the release metadata files, pushes `main`, creates the tag, and pushes it.
 
-Public tags are never moved. If a step fails, fix the cause and start again
-instead of forcing the tag or publishing an unchecked archive.
+If the generated changelog entry still contains `TODO: release notes`, validation stops. Edit only the generated release metadata and rerun the same command; unrelated working-tree changes remain a hard error.
 
-## Build without publishing
+Use `--no-push` through `scripts/release.py` when validating the release commit without publishing it.
 
-Use this when you want to inspect the archive without creating a commit or tag:
+## CI gates
 
-```bash
-make build-release
-```
+Tag releases require both:
 
-The archive is written to `dist/pudge-macos-vX.Y.Z.zip`.
+- the same `make quality` gate used locally;
+- all four test batches and release metadata validation.
 
-## Run the checks yourself
+The release archive is built only after both jobs succeed.
 
-```bash
-make test-batches
-make lint
-python -m compileall -q pudge scripts
-```
+## Release archive contract
 
-Before a public release, also read the user-facing README, user guide, changelog,
-and algorithms overview once as product documentation rather than as code
-comments. Remove stale implementation detail instead of documenting obsolete
-internals.
+The macOS source archive includes runtime sources plus the developer paths referenced by its documentation: `tests/`, `docs/`, `scripts/`, `Makefile`, `MOBILE_SYNC_PROTOCOL.md`, and release workflow fixtures. `scripts/check_release_bundle.py` validates required paths and local Markdown links before the ZIP is created.
 
-## What GitHub Actions publishes
+The archive intentionally excludes user databases, caches, OCR corpora/fixtures that are not licensed for redistribution, logs, secrets and model caches.
 
-After a valid version tag is pushed, GitHub Actions verifies the tag/version,
-runs the macOS test batches, builds `pudge-macos-vX.Y.Z.zip`, and creates the
-GitHub Release with its checksum.
+## GitHub Release notes
 
-No archive is published when validation fails. The tag must always point to the
-reviewed release commit.
+The release workflow extracts the matching `## vX.Y.Z` section from `CHANGELOG.md` and publishes that text as the GitHub Release body. It does not rely on GitHub-generated notes. Re-running the workflow for an existing tag refreshes both the assets and the Release body, so old releases can be backfilled after release-note workflow fixes.

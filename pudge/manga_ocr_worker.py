@@ -17,6 +17,14 @@ from pathlib import Path
 from PIL import Image, ImageFilter, ImageOps
 
 
+def _pillow_flattened_data(image):
+    """Return flattened pixels without Pillow 12.1+ getdata() warnings."""
+    getter = getattr(image, "get_flattened_data", None)
+    if getter is not None:
+        return getter()
+    return image.getdata()
+
+
 def _number(value: object, default: float = 0.0) -> float:
     try:
         number = float(value)
@@ -275,7 +283,7 @@ def _dark_text_block_regions(image: Image.Image) -> list[dict[str, object]]:
     small = gray.resize((target_width, target_height), Image.Resampling.BOX)
     gray.close()
     try:
-        pixels = list(small.getdata())
+        pixels = list(_pillow_flattened_data(small))
     finally:
         small.close()
     w, h = target_width, target_height
@@ -4292,7 +4300,7 @@ def _trim_vertical_prefix_above_panel_rule(
 
     crop = image.crop((0, search_top, page_width, search_bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -7047,7 +7055,7 @@ def _component_isolated_stylized_sfx_crop(
                 continue
             patch = image.crop((sx1, sy1, sx2, sy2)).convert("L")
             try:
-                pixels = [int(value) for value in patch.getdata()]
+                pixels = [int(value) for value in _pillow_flattened_data(patch)]
                 if not pixels:
                     continue
                 dark = sum(value <= 210 for value in pixels)
@@ -8910,7 +8918,7 @@ def _infer_vertical_character_segments(
 
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
     finally:
         crop.close()
     if not pixels:
@@ -9750,7 +9758,7 @@ def _vertical_dense_span_is_crossing_rule(
     bottom = max(top + 1, min(page_height, row_bottom))
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         width, height = crop.size
     finally:
         crop.close()
@@ -9810,7 +9818,7 @@ def _nearby_horizontal_panel_rule(
         return False
     crop = image.crop((0, top, page_width, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         width, height = crop.size
     finally:
         crop.close()
@@ -9885,7 +9893,7 @@ def _vertical_single_leading_glyph_geometry(
 
     crop = image.crop((scan_left, search_top, scan_right, current_top)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -10086,7 +10094,7 @@ def _vertical_leading_ink_geometry(
 
     crop = image.crop((scan_left, search_top, scan_right, search_bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -10231,7 +10239,7 @@ def _vertical_trailing_ink_geometry(
 
     crop = image.crop((scan_left, search_top, scan_right, search_bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -10362,7 +10370,7 @@ def _leading_extension_has_centered_ink(
 
     crop = image.crop((scan_left, new_top, scan_right + 1, old_top)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -10633,7 +10641,7 @@ def _vertical_segment_ink_stats(
     bottom = max(top + 1, min(page_height, round((1.0 - y) * page_height)))
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
     finally:
         crop.close()
     dark = sum(1 for value in pixels if int(value) <= 165)
@@ -11740,7 +11748,7 @@ def _refine_horizontal_segment_ink(image: Image.Image, segment: dict[str, object
     bottom = max(top + 1, min(page_height, int(round((1.0 - y) * page_height))))
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -11865,7 +11873,7 @@ def _recover_vertical_slot_x_ink(image: Image.Image, segment: dict[str, object])
     scan_right = min(page_width, right + pad_x)
     crop = image.crop((scan_left, top, scan_right, bottom)).convert("L")
     try:
-        pixels = [int(value) for value in crop.getdata()]
+        pixels = [int(value) for value in _pillow_flattened_data(crop)]
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -11946,7 +11954,7 @@ def _tighten_vertical_slot_ink(image: Image.Image, segment: dict[str, object]) -
     bottom = max(top + 1, min(page_height, int(round((1.0 - y) * page_height))))
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -12198,7 +12206,7 @@ def _dark_block_ink_grid_edge_art_noise(image: Image.Image, item: dict[str, obje
 
     crop = image.crop((outer_left, outer_top, outer_right, outer_bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
         crop_width, crop_height = crop.size
     finally:
         crop.close()
@@ -13348,7 +13356,7 @@ def _chapter_main_ink_prefix_runs(
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
         crop_width, crop_height = crop.size
-        pixels = [int(value) for value in crop.getdata()]
+        pixels = [int(value) for value in _pillow_flattened_data(crop)]
         if crop_width < 12 or crop_height < 12 or not pixels:
             return []
         ordered = sorted(pixels)
@@ -14170,7 +14178,7 @@ def _chapter_main_ink_groups(
         crop_width, crop_height = crop.size
         if crop_width < 20 or crop_height < 16:
             return None
-        pixels = [int(value) for value in crop.getdata()]
+        pixels = [int(value) for value in _pillow_flattened_data(crop)]
         if not pixels:
             return None
         ordered = sorted(pixels)
@@ -15158,7 +15166,7 @@ def _split_repeated_kana_union_segment_from_page_ink(
         crop_width, crop_height = crop.size
         if crop_width < 8 or crop_height < 8:
             return piece
-        pixels = [int(value) for value in crop.getdata()]
+        pixels = [int(value) for value in _pillow_flattened_data(crop)]
         if not pixels:
             return piece
         ordered = sorted(pixels)
@@ -16665,7 +16673,7 @@ def _recover_short_fullwidth_digit_geometry_from_page_ink(
         crop_width, crop_height = crop.size
         if crop_width < 10 or crop_height < 12:
             return piece
-        pixels = [int(value) for value in crop.getdata()]
+        pixels = [int(value) for value in _pillow_flattened_data(crop)]
         if not pixels:
             return piece
         ordered = sorted(pixels)
@@ -17579,7 +17587,7 @@ def _vertical_leading_ink_character_segments(
 
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
     finally:
         crop.close()
     if not pixels:
@@ -17669,7 +17677,7 @@ def _layout_line_ink_character_segments(
 
     crop = image.crop((left, top, right, bottom)).convert("L")
     try:
-        pixels = list(crop.getdata())
+        pixels = list(_pillow_flattened_data(crop))
     finally:
         crop.close()
     if not pixels:
@@ -20031,7 +20039,7 @@ def _recognize_regions(
                 if str(item.get("source") or "") == "dark-block-proposal":
                     sample = crop.convert("L").resize((24, 24), Image.Resampling.BOX)
                     try:
-                        mean = sum(int(value) for value in sample.getdata()) / (24 * 24)
+                        mean = sum(int(value) for value in _pillow_flattened_data(sample)) / (24 * 24)
                     finally:
                         sample.close()
                     if mean < 118:

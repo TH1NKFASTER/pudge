@@ -5463,6 +5463,8 @@ def _validate_embedded_reference_output(
         "source_end_seconds": round(source_end, 3),
         "aligned_end_seconds": round(aligned_end, 3),
         "reference_end_seconds": round(reference_end, 3),
+        "alignment_extension_seconds": round(aligned_end - source_end, 3),
+        "reference_overshoot_seconds": round(aligned_end - reference_end, 3),
     }
 
     # ALASS should preserve almost every source cue. A few malformed cues may be
@@ -5479,7 +5481,7 @@ def _validate_embedded_reference_output(
     # only when alignment materially *extends* the source as well as overshooting
     # the reference. Otherwise a valid movie ASS with ending/sign cues can be
     # falsely rejected even when ALASS applies an essentially zero shift.
-    if aligned_end > reference_end + 180.0 and aligned_end > source_end + 30.0:
+    if aligned_end > reference_end + 30.0 and aligned_end > source_end + 30.0:
         return False, "aligned_too_long", details
     return True, "ok", details
 

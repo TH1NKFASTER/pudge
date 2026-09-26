@@ -9,7 +9,7 @@ from pudge.database import Database
 from pudge.library import scan_library
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from brand_migration import migrate_paths, rewrite_config
+from scripts.migrations.legacy_anime_mpv import migrate_paths, rewrite_config
 
 ROOT = Path(__file__).parents[1]
 
@@ -22,8 +22,8 @@ def test_product_is_now_pudge_with_legacy_migration_metadata() -> None:
     assert "anime-mpv" in LEGACY_APP_SLUGS
 
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'brand_migration.py" paths' in installer
-    assert 'brand_migration.py" config' in installer
+    assert 'scripts/migrations/legacy_anime_mpv.py" paths' in installer
+    assert 'scripts/migrations/legacy_anime_mpv.py" config' in installer
     assert 'killall Dock' in installer
     assert 'ln -s "$APP_PATH" "$legacy_app"' in installer
     assert 'APP_PATH="$APP_DIR/$APP_NAME.app"' in installer
@@ -181,3 +181,87 @@ def test_empty_nested_library_directories_are_pruned_but_root_is_kept(tmp_path: 
     assert cfg.library.root_dir.is_dir()
     assert not (cfg.library.root_dir / "Anime A").exists()
     assert nonempty.is_dir()
+
+
+def test_brand_config_does_not_rewrite_similar_custom_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    current = home / "Movies" / "pudge"
+    current.mkdir(parents=True)
+    config = tmp_path / "config.toml"
+    custom = home / "Movies" / "Anime MPV custom"
+    config.write_text(
+        f'[library]\nroot_dir = "{custom}"\n'
+        '[qbittorrent]\ncategory = "anime-mpv-custom"\n',
+        encoding="utf-8",
+    )
+    report = rewrite_config(
+        config,
+        home,
+        app_name="pudge",
+        app_slug="pudge",
+        legacy_names=["Anime MPV"],
+        legacy_slugs=["anime-mpv"],
+    )
+    text = config.read_text(encoding="utf-8")
+    assert str(custom) in text
+    assert 'category = "anime-mpv-custom"' in text
+    assert report.rewritten == []
+
+
+def test_brand_directory_merge_preserves_conflict_and_moves_unique_files(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    old = home / "Movies" / "Anime MPV" / "Series"
+    new = home / "Movies" / "pudge" / "Series"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    (old / "old-only.mkv").write_bytes(b"old-only")
+    (old / "same.mkv").write_bytes(b"same")
+    (new / "same.mkv").write_bytes(b"same")
+    (old / "conflict.mkv").write_bytes(b"legacy")
+    (new / "conflict.mkv").write_bytes(b"current")
+
+    report = migrate_paths(
+        home,
+        app_name="pudge",
+        app_slug="pudge",
+        legacy_names=["Anime MPV"],
+        legacy_slugs=["anime-mpv"],
+    )
+    assert (new / "old-only.mkv").read_bytes() == b"old-only"
+    assert not (old / "old-only.mkv").exists()
+    assert (new / "same.mkv").read_bytes() == b"same"
+    assert not (old / "same.mkv").exists()
+    assert (old / "conflict.mkv").read_bytes() == b"legacy"
+    assert (new / "conflict.mkv").read_bytes() == b"current"
+    assert str(old / "conflict.mkv") in report.conflicts
+
+
+def test_brand_config_rewrite_is_exact_atomic_and_keeps_backup(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    old_root = home / "Movies" / "Anime MPV"
+    new_root = home / "Movies" / "pudge"
+    old_root.mkdir(parents=True)
+    (old_root / "episode.mkv").write_bytes(b"video")
+    migrate_paths(
+        home,
+        app_name="pudge",
+        app_slug="pudge",
+        legacy_names=["Anime MPV"],
+        legacy_slugs=["anime-mpv"],
+    )
+    config = tmp_path / "config.toml"
+    original = f'[library]\nroot_dir = "{old_root}" # keep me\n[custom]\nvalue = "Anime MPV"\n'
+    config.write_text(original, encoding="utf-8")
+    report = rewrite_config(
+        config,
+        home,
+        app_name="pudge",
+        app_slug="pudge",
+        legacy_names=["Anime MPV"],
+        legacy_slugs=["anime-mpv"],
+    )
+    text = config.read_text(encoding="utf-8")
+    assert f'root_dir = "{new_root}" # keep me' in text
+    assert '[custom]\nvalue = "Anime MPV"' in text
+    assert (tmp_path / "config.toml.pre-pudge-brand-migration.bak").read_text(encoding="utf-8") == original
+    assert report.rewritten == ["library.root_dir"]

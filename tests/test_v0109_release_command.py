@@ -15,6 +15,8 @@ def test_make_release_requires_version_and_uses_release_helper() -> None:
 
 def test_release_helper_has_full_safe_release_pipeline() -> None:
     source = RELEASE.read_text(encoding="utf-8")
+    assert "git add -A" not in source
+    assert "ensure_safe_release_start(version)" in source
     for contract in (
         '"fetch", "origin", "main", "--tags"',
         '"merge-base", "--is-ancestor", "origin/main", "HEAD"',
@@ -22,7 +24,7 @@ def test_release_helper_has_full_safe_release_pipeline() -> None:
         'run("make", "quality", f"PYTHON={python}")',
         'run("make", "test-batches", f"PYTHON={python}")',
         'git("diff", "--check")',
-        'git("add", "-A")',
+        'git("add", "--", *RELEASE_FILES)',
         'git("diff", "--cached", "--check")',
         'run("git", "--no-pager", "diff", "--cached", "--stat")',
         'git("commit", "-m", f"Pudge v{version}")',

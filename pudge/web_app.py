@@ -20,6 +20,7 @@ import zipfile
 import httpx
 from rapidfuzz import fuzz
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import date
 from pathlib import Path
@@ -49,13 +50,20 @@ from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
 from .episode_state import watched_by_anilist_progress
 from .episode_numbering import resolve_episode_numbering
 from .presentation_state import derive_episode_presentation, download_complete
-from .personal_schedule import local_iso_from_epoch, preview_weekly_dates
+from .personal_schedule import (
+    PersonalScheduleRevisionConflict,
+    local_iso_from_epoch,
+    normalize_schedule_rule,
+    preview_schedule_dates,
+)
 from .first_experience import (
+    check_jiten_mpv_update,
     configure_mpv_study_keys,
     dependency_status,
     install_jiten_mpv,
     install_media_tools,
     mpv_study_status,
+    update_jiten_mpv as update_jiten_mpv_release,
 )
 from .jimaku_trial import apply_jimaku_trial
 from .job_center import JobCenter
@@ -79,10 +87,13 @@ from .providers.nyaa import NyaaClient
 from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
 from .review_gate import EpisodeReviewIdentity, ReviewGateStore, review_card_key
+from .review_episode_due import build_episode_due_review_cards, resolve_episode_review_subtitle
 from .review_providers import ReviewOutcomeUnknown
 from .safe_mode import SafeModeController
 from .secrets_store import keep_masked_secret, masked_secret
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
+from .torrent_observation import normalize_torrent_state
+from .torrent_admission import TorrentAdmission
 from .task_supervisor import TaskSupervisor
 from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
@@ -248,8 +259,12 @@ class WebAppApi:
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
         startup_was_enabled = _disable_torrents_for_startup(self.config)
-        write_torrents_enabled(self.config, self.config.config_path)
-        startup_aria2_stopped = self._shutdown_aria2_from_config(reason="startup")
+        # Publish Off before backend shutdown so an agent with a stale config
+        # cannot issue a new start while this GUI session is coming up.
+        with TorrentAdmission(self.config.config_path).locked() as admission:
+            admission.publish(False)
+            write_torrents_enabled(self.config, self.config.config_path)
+            startup_aria2_stopped = self._shutdown_aria2_from_config(reason="startup")
         self.logger.info(
             "EVENT torrent.startup_off previous_enabled=%s aria2_stopped=%s",
             startup_was_enabled,
@@ -314,6 +329,14 @@ class WebAppApi:
         # mutation semantics while still preventing stale snapshots from
         # overriding an explicit click later in the session.
         self._torrent_session_authoritative = False
+        # A requested Off is not proof of an observed stop.  Only this session's
+        # positively verified backend observations may establish that fact.
+        self._torrent_off_evidence: dict[str, Any] = {
+            "generation": 0,
+            "aria2_shutdown_confirmed": bool(startup_aria2_stopped),
+            "checked_at": 0.0,
+        }
+        self._torrent_off_probe_lock = threading.RLock()
         self.visual_novels = VisualNovelService(logger=self.logger)
         self._vn_consumption_session_id = ""
         self._vn_title_id = ""
@@ -600,7 +623,9 @@ class WebAppApi:
         state_dir = DATA_DIR / "aria2"
         if not aria.enabled and not state_dir.exists():
             return False
-        client = Aria2Client(
+        client = None
+        try:
+            client = Aria2Client(
             enabled=True,
             binary=aria.binary,
             rpc_port=aria.rpc_port,
@@ -616,8 +641,7 @@ class WebAppApi:
             upload_limit_kib=aria.upload_limit_kib,
             vpn_interface=aria.vpn_interface,
             vpn_kill_switch=aria.vpn_kill_switch,
-        )
-        try:
+            )
             stopped = bool(client.shutdown(save_session=True))
             self.logger.info(
                 "EVENT torrent.aria2_quiet reason=%s stopped=%s", reason, stopped
@@ -631,36 +655,84 @@ class WebAppApi:
             )
             return False
         finally:
-            client.close()
+            if client is not None:
+                client.close()
+
+    @staticmethod
+    def _pudge_owned_qbittorrent_row(
+        row: Any, *, owned_hashes: set[str], category: str,
+    ) -> bool:
+        raw = dict(getattr(row, "raw", {}) or {})
+        tags = {tag.strip().casefold() for tag in str(raw.get("tags") or "").split(",")}
+        return bool(
+            str(getattr(row, "torrent_hash", "") or "").strip().casefold() in owned_hashes
+            or (category and str(raw.get("category") or "").strip().casefold() == category)
+            or APP_SLUG.casefold() in tags
+        )
 
     def _quiesce_qbittorrent(self, *, reason: str) -> int:
-        """Pause only Pudge-owned qBittorrent hashes, without launching qBittorrent."""
+        """Pause persisted and live Pudge-owned hashes, including audiobooks.
+
+        A just-added audiobook may not yet be in the anime downloads table.
+        Query the existing qBittorrent process with auto-start disabled, and
+        keep pausing other hashes even if one read or stop RPC fails.
+        """
         qbt = self.config.qbittorrent
         if not qbt.enabled or not hasattr(self, "manager"):
             return 0
-        client = QBittorrentClient(
-            qbt.base_url,
-            qbt.username,
-            qbt.password,
-            qbt.api_key,
-            verify_tls=qbt.verify_tls,
-            pre_download_command=qbt.pre_download_command,
-            auto_start_app=False,
-        )
+        client = None
         paused = 0
         try:
-            for row in self.manager.db.downloads():
-                torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().lower()
-                if not torrent_hash:
-                    continue
-                client.pause(torrent_hash)
-                paused += 1
+            client = QBittorrentClient(
+                qbt.base_url, qbt.username, qbt.password, qbt.api_key,
+                verify_tls=qbt.verify_tls,
+                pre_download_command=qbt.pre_download_command,
+                auto_start_app=False,
+            )
+            hashes: set[str] = set()
+            try:
+                hashes = {
+                    str(getattr(row, "torrent_hash", "") or "").strip().casefold()
+                    for row in self.manager.db.downloads()
+                }
+                hashes.discard("")
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=torrent.qbittorrent_local_hashes reason=%s error_type=%s",
+                    reason, type(exc).__name__,
+                )
+            try:
+                live = client.torrents(category="")
+                category = str(qbt.category or "").strip().casefold()
+                for row in live:
+                    if self._pudge_owned_qbittorrent_row(
+                        row, owned_hashes=hashes, category=category,
+                    ):
+                        torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().casefold()
+                        if torrent_hash:
+                            hashes.add(torrent_hash)
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=torrent.qbittorrent_live_hashes reason=%s error_type=%s",
+                    reason, type(exc).__name__,
+                )
+            for torrent_hash in sorted(hashes):
+                try:
+                    client.pause(torrent_hash)
+                    paused += 1
+                except Exception as exc:
+                    self.logger.warning(
+                        "FALLBACK step=torrent.qbittorrent_pause reason=%s hash=%s error_type=%s",
+                        reason, torrent_hash, type(exc).__name__,
+                    )
         except Exception as exc:
-            self.logger.debug(
-                "Torrent qBittorrent quiet skipped reason=%s error=%s", reason, exc
+            self.logger.warning(
+                "FALLBACK step=torrent.qbittorrent_quiet reason=%s error_type=%s",
+                reason, type(exc).__name__,
             )
         finally:
-            client.close()
+            if client is not None:
+                client.close()
         if paused:
             self.logger.info(
                 "EVENT torrent.qbittorrent_quiet reason=%s paused=%s", reason, paused
@@ -672,6 +744,163 @@ class WebAppApi:
             "aria2_stopped": self._shutdown_aria2_from_config(reason=reason),
             "qbittorrent_paused": self._quiesce_qbittorrent(reason=reason),
         }
+
+    def _observe_qbittorrent_quiet(self) -> tuple[bool, int | None]:
+        """Verify Pudge-owned qBittorrent downloads using a no-start client.
+
+        A successful pause RPC is not enough: the next read may still report
+        an active hash or nonzero traffic. Unknown backend states are not proof.
+        """
+        qbt = getattr(self.config, "qbittorrent", None)
+        if not getattr(qbt, "enabled", False):
+            return True, 0
+        client = None
+        try:
+            client = QBittorrentClient(
+                qbt.base_url, qbt.username, qbt.password, qbt.api_key,
+                verify_tls=qbt.verify_tls, auto_start_app=False, timeout=2.0,
+            )
+            owned = {
+                str(getattr(item, "torrent_hash", "") or "").strip().casefold()
+                for item in self.manager.db.downloads()
+            }
+            category = str(qbt.category or "").strip().casefold()
+            paused = 0
+            for row in client.torrents(category=""):
+                raw = dict(getattr(row, "raw", {}) or {})
+                if not self._pudge_owned_qbittorrent_row(
+                    row, owned_hashes=owned, category=category,
+                ):
+                    continue
+                if (normalize_torrent_state(getattr(row, "state", "")) != "paused"
+                        or self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed") > 0
+                        or self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed") > 0):
+                    return False, None
+                paused += 1
+            return True, paused
+        except Exception as exc:
+            self.logger.debug("Torrent Off qBittorrent observation unavailable: %s", type(exc).__name__)
+            return False, None
+        finally:
+            if client is not None:
+                client.close()
+
+    def _observe_aria2_stopped(self, *, shutdown_confirmed: bool) -> bool:
+        """Observe that no Pudge aria2 sidecar can currently transfer data.
+
+        ``shutdown_confirmed`` is retained for API compatibility with the Off
+        evidence record, but absence is itself observable proof: requiring a
+        previous successful shutdown made an already-stopped aria2 report
+        "Shutdown not confirmed" forever.  An authenticated RPC, a known
+        Pudge-managed stale process, or any listener on the configured port
+        remains conservative evidence that Off is not confirmed.
+        """
+        del shutdown_confirmed
+        state_dir = DATA_DIR / "aria2"
+        if not state_dir.exists():
+            return True  # No Pudge-managed sidecar state exists on this machine.
+        aria = self.config.aria2
+        client = None
+        try:
+            client = Aria2Client(
+                enabled=True, binary=aria.binary, rpc_port=aria.rpc_port,
+                state_dir=state_dir, auto_start=False, timeout=1.5,
+            )
+            if client._probe():
+                return False
+            managed_state = getattr(client, "managed_sidecar_running", lambda: None)()
+            if managed_state is True:
+                return False
+            # A failed authenticated RPC could be an unrelated service or a
+            # sidecar that cannot be identified on this platform.  Never call
+            # an occupied port stopped.
+            try:
+                with socket.create_connection(("127.0.0.1", aria.rpc_port), timeout=0.25):
+                    return False
+            except OSError:
+                return managed_state is not None
+        except Exception as exc:
+            self.logger.debug("Torrent Off aria2 observation unavailable: %s", type(exc).__name__)
+            return False
+        finally:
+            if client is not None:
+                client.close()
+
+    def _torrent_off_probe_guard(self) -> threading.RLock:
+        with self._torrent_state_guard():
+            lock = getattr(self, "_torrent_off_probe_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._torrent_off_probe_lock = lock
+            return lock
+
+    def _torrent_off_status(self, generation: int) -> dict[str, Any]:
+        # Serialize read-only probes. An older concurrent result must not
+        # overwrite a newer same-generation observation.
+        with self._torrent_off_probe_guard():
+            return self._torrent_off_status_serialized(generation)
+
+    def _torrent_off_status_serialized(self, generation: int) -> dict[str, Any]:
+        """Observe a stopped backend only after this generation requested Off.
+
+        A failed poll never becomes fresh zero. Polls are throttled to avoid
+        repeatedly authenticating against an offline qBittorrent installation.
+        """
+        now = time.time()
+        evidence = dict(getattr(self, "_torrent_off_evidence", {}) or {})
+        backend_errors: list[str] = []
+        verified = False
+        paused: int | None = None
+        observed_at: float | None = None
+        if evidence.get("generation") == generation:
+            last = float(evidence.get("checked_at") or 0)
+            if last > 0 and 0 <= now - last < 10:
+                verified = bool(evidence.get("verified"))
+                paused = evidence.get("paused") if verified else None
+                observed_at = last if verified else None
+                backend_errors = list(evidence.get("backend_errors") or [])
+            else:
+                aria_ok = self._observe_aria2_stopped(
+                    shutdown_confirmed=bool(evidence.get("aria2_shutdown_confirmed"))
+                )
+                qbt_ok, qbt_paused = self._observe_qbittorrent_quiet()
+                verified = bool(aria_ok and qbt_ok)
+                if not aria_ok:
+                    backend_errors.append("aria2_unconfirmed")
+                if not qbt_ok:
+                    backend_errors.append("qbittorrent_unconfirmed")
+                observed_at = now if verified else None
+                paused = qbt_paused if verified else None
+                with self._torrent_state_guard():
+                    if (int(getattr(self, "_torrent_toggle_generation", 0)) == generation
+                            and not (self._torrent_enabled_state() and self._downloads_configured())):
+                        self._torrent_off_evidence = {
+                            **evidence, "checked_at": now, "verified": verified,
+                            "paused": paused, "backend_errors": backend_errors,
+                        }
+                    else:
+                        # Never publish a past Off poll after a newer On/Off.
+                        return self.torrent_traffic_status()
+        result = {
+            "enabled": False, "desired_enabled": False, "generation": generation,
+            "transition": "off_confirmed" if verified else "unconfirmed",
+            "download_speed": 0 if verified else None,
+            "upload_speed": 0 if verified else None,
+            "active": 0 if verified else None,
+            "waiting": 0 if verified else None,
+            "paused": paused,
+            "updated_at": observed_at,
+            "observed_at": observed_at,
+            "stale": not verified,
+            "observed_state": "stopped" if verified else "unknown",
+            "backend_errors": backend_errors,
+        }
+        with self._torrent_state_guard():
+            if (int(getattr(self, "_torrent_toggle_generation", 0)) == generation
+                    and not (self._torrent_enabled_state() and self._downloads_configured())):
+                self._last_torrent_traffic = result
+                return dict(result)
+        return self.torrent_traffic_status()
 
     def _enter_background_quiet(self, *, reason: str) -> dict[str, Any]:
         lock = getattr(self, "_background_quiet_lock", None)
@@ -1696,6 +1925,8 @@ class WebAppApi:
             "first_episode": schedule.first_episode if schedule else (order[0] if order else None),
             "revision": schedule.revision if schedule else 0,
             "rewatch": bool(schedule and schedule.rewatch),
+            "cycle_id": schedule.cycle_id if schedule else 0,
+            "rule": schedule.rule.as_dict() if schedule else normalize_schedule_rule().as_dict(),
             "status": "disabled",
             "next_episode": None,
             "next_unlock_at": None,
@@ -1785,10 +2016,21 @@ class WebAppApi:
         next_queue_count = 0
         franchise_queue_available = False
         if anime.media_status != "NOT_YET_RELEASED":
-            next_queue_count = len(self._ready_queue_items([anime.media_id], limit=5))
+            known_anime = {int(anime.media_id): anime}
+            next_queue_count = len(
+                self._ready_queue_items(
+                    [anime.media_id],
+                    limit=5,
+                    anime_by_id=known_anime,
+                )
+            )
             relation_ids = sorted(self._relation_ids(anime))
             franchise_queue_available = bool(
-                self._ready_queue_items([anime.media_id, *relation_ids], limit=1)
+                self._ready_queue_items(
+                    [anime.media_id, *relation_ids],
+                    limit=1,
+                    anime_by_id=known_anime,
+                )
             )
         local_state = str(local.state or "") if local is not None else ""
         if local is not None and not japanese_subtitles_required and local_state != "watched":
@@ -2998,6 +3240,34 @@ class WebAppApi:
                     self._torrent_session_enabled = bool(nyaa.torrents_enabled)
             return bool(self._torrent_session_enabled)
 
+    def _torrent_shared_admission(self) -> TorrentAdmission | None:
+        config_path = getattr(getattr(self, "config", None), "config_path", None)
+        return TorrentAdmission(Path(config_path)) if config_path is not None else None
+
+    @staticmethod
+    def _torrent_off_action_response() -> dict[str, Any]:
+        return {
+            "ok": False,
+            "enabled": False,
+            "blocked_by_global_off": True,
+            "error": "Enable torrents before resuming a download",
+        }
+
+    def _torrent_start_guard(self) -> threading.RLock:
+        """Serialize GUI-originated starts with global Off's backend shutdown.
+
+        Always acquire this lock *before* the state lock if both are needed.
+        Off publishes its desired state under the state lock first, then waits
+        for an in-flight start to finish before shutting down the backends.
+        """
+        state_lock = self._torrent_state_guard()
+        with state_lock:
+            guard = getattr(self, "_torrent_start_lock", None)
+            if guard is None:
+                guard = threading.RLock()
+                self._torrent_start_lock = guard
+            return guard
+
     def _bump_ui_state_version(self) -> str:
         manager = getattr(self, "manager", None)
         db = getattr(manager, "db", None)
@@ -3075,6 +3345,7 @@ class WebAppApi:
             "jiten_developer_tools_confirmed": cfg.ui.jiten_developer_tools_confirmed,
             "review_gate_enabled": cfg.ui.review_gate_enabled,
             "review_gate_count": max(1, min(50, int(cfg.ui.review_gate_count))),
+            "review_gate_all_due_episode_words": bool(getattr(cfg.ui, "review_gate_all_due_episode_words", False)),
             "library_root": str(cfg.library.root_dir),
             "watched_folders": "\n".join(str(path) for path in cfg.paths.download_dirs),
             "subtitle_folders": "\n".join(str(path) for path in cfg.paths.subtitle_dirs),
@@ -3162,6 +3433,7 @@ class WebAppApi:
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
             "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
             "mpv_study_plugin": cfg.tools.mpv_study_plugin,
+            "manga_ocr_backend": cfg.tools.manga_ocr_backend,
             "mpv_study_plugins": study_plugins,
             "energy_monitoring_enabled": cfg.diagnostics.energy_monitoring_enabled,
             "energy_sample_seconds": cfg.diagnostics.energy_sample_seconds,
@@ -3497,11 +3769,12 @@ class WebAppApi:
         # transaction boundaries. The expensive read-heavy Home snapshot that
         # follows reuses one SQLite connection instead of reopening/reparsing the
         # schema for every repository helper.
-        self.manager.reconcile_completed_download_rows()
-        self.manager.reconcile_prepared_subtitle_rows()
-        with self.manager.db.connection_scope():
-            payload = self._get_state(refresh_storage=True)
-            return self._store_ui_state_snapshot(payload)
+        with timed_step(self.logger, "web.get_state"):
+            self.manager.reconcile_completed_download_rows()
+            self.manager.reconcile_prepared_subtitle_rows()
+            with self.manager.db.connection_scope():
+                payload = self._get_state(refresh_storage=True)
+                return self._store_ui_state_snapshot(payload)
 
     def get_state_fast(self) -> dict[str, Any]:
         """Return UI state without recursively scanning the video library.
@@ -3539,9 +3812,11 @@ class WebAppApi:
         refresh: bool = True,
     ) -> dict[str, Any]:
         warning = ""
+        observed_at: float | None = None
         if refresh and self._downloads_configured():
             try:
                 self.manager.sync_downloads()
+                observed_at = time.time()
             except Exception as exc:
                 warning = str(exc)
         anime_by_id = {
@@ -3574,83 +3849,116 @@ class WebAppApi:
             "storage": self._storage_payload(refresh=False),
             "network_guard": network_guard,
             "warning": warning,
+            "observed_at": observed_at,
         }
 
     def torrent_traffic_status(self) -> dict[str, Any]:
-        """Return authoritative torrent state/rates without rebuilding full UI state."""
+        """Report *observed* rates; never turn a failed poll into fresh zero traffic."""
         enabled = bool(self._torrent_enabled_state() and self._downloads_configured())
+        started_generation = int(getattr(self, "_torrent_toggle_generation", 0))
         manager_config = getattr(getattr(self, "manager", None), "config", None)
         if manager_config is not None and getattr(manager_config, "nyaa", None) is not None:
             manager_config.nyaa.torrents_enabled = bool(enabled)
         if not enabled:
-            paused = self._paused_torrent_count()
-            # Torrent traffic status is about backend jobs, not logical
-            # download intents. A stale intent can legitimately survive after
-            # discovery concludes that there is nothing to start; surfacing it
-            # here as `waiting` makes Torrent Off claim traffic is pending when
-            # no backend job exists.
-            result = {
-                "enabled": False,
-                "download_speed": 0,
-                "upload_speed": 0,
-                "active": 0,
-                "waiting": 0,
-                "paused": paused,
-                "updated_at": time.time(),
-            }
-            self._last_torrent_traffic = result
-            return dict(result)
+            return self._torrent_off_status(started_generation)
 
         if not self._torrent_traffic_lock.acquire(blocking=False):
-            return dict(self._last_torrent_traffic)
+            previous = dict(getattr(self, "_last_torrent_traffic", {}) or {})
+            if previous.get("enabled") is True:
+                return previous
+            return {
+                "enabled": True, "download_speed": None, "upload_speed": None,
+                "active": None, "waiting": None, "paused": None,
+                "updated_at": None, "observed_at": None, "stale": True,
+                "observed_state": "unknown", "backend_errors": [],
+            }
         try:
-            down = 0
-            up = 0
-            active = 0
-            waiting = 0
-            for backend, client in self.manager.torrent_clients():
+            down = up = active = waiting = paused = 0
+            counts = {name: 0 for name in (
+                "downloading", "queued", "stalled", "paused", "checking",
+                "seeding", "complete", "error", "unknown"
+            )}
+            backend_errors: list[str] = []
+            observed = 0
+            try:
+                clients = self.manager.torrent_clients()
+            except Exception as exc:
+                self.logger.debug("Torrent traffic clients unavailable: %s", exc)
+                clients = []
+                backend_errors.append("backend_discovery")
+            for backend, client in clients:
                 try:
                     if backend == "aria2" and isinstance(client, Aria2Client):
                         stats = client.traffic_stats()
                         down += max(0, int(stats.get("download_speed") or 0))
                         up += max(0, int(stats.get("upload_speed") or 0))
                         active += max(0, int(stats.get("active") or 0))
-                        waiting = max(waiting, max(0, int(stats.get("waiting") or 0)))
-                        continue
-
-                    rows = client.torrents(category=self.config.qbittorrent.category)
-                    for row in rows:
-                        raw = dict(getattr(row, "raw", {}) or {})
-                        row_down = self._download_number(
-                            raw, "dlspeed", "download_speed", "downloadSpeed"
-                        )
-                        row_up = self._download_number(
-                            raw, "upspeed", "upload_speed", "uploadSpeed"
-                        )
-                        down += row_down
-                        up += row_up
-                        state = str(getattr(row, "state", "") or "").casefold()
-                        if state not in {"paused", "stopped", "complete", "completed"}:
-                            active += 1
-                        if state in {"waiting", "queued", "stalled"}:
-                            waiting += 1
+                        waiting += max(0, int(stats.get("waiting") or 0))
+                        paused += max(0, int(stats.get("paused") or 0))
+                    else:
+                        rows = client.torrents(category=self.config.qbittorrent.category)
+                        for row in rows:
+                            raw = dict(getattr(row, "raw", {}) or {})
+                            down += self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed")
+                            up += self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed")
+                            state = normalize_torrent_state(getattr(row, "state", ""))
+                            counts[state] += 1
+                            if state in {"downloading", "seeding"}:
+                                active += 1
+                            elif state in {"queued", "stalled"}:
+                                waiting += 1
+                            elif state == "paused":
+                                paused += 1
+                    observed += 1
                 except Exception as exc:
-                    self.logger.debug(
-                        "Torrent traffic snapshot skipped backend=%s error=%s",
-                        backend,
-                        exc,
+                    # An enabled aria2 backend is intentionally lazy: with no
+                    # work it may have no process at all. A closed port and no
+                    # Pudge-managed sidecar are a fresh observed zero, not
+                    # "Download status unavailable".  Do not start aria2 from
+                    # this read-only status path.
+                    aria_absent = bool(
+                        backend == "aria2"
+                        and self._observe_aria2_stopped(shutdown_confirmed=False)
                     )
+                    if aria_absent:
+                        observed += 1
+                    else:
+                        backend_errors.append(str(backend))
+                        self.logger.debug(
+                            "Torrent traffic snapshot skipped backend=%s error=%s", backend, exc
+                        )
                 finally:
                     client.close()
+            stale = bool(backend_errors or not observed)
+            now = time.time() if not stale else None
             result = {
                 "enabled": True,
-                "download_speed": down,
-                "upload_speed": up,
-                "active": active,
-                "waiting": waiting,
-                "paused": 0,
-                "updated_at": time.time(),
+                "download_speed": None if backend_errors else down,
+                "upload_speed": None if backend_errors else up,
+                "active": None if backend_errors else active,
+                "waiting": None if backend_errors else waiting,
+                "paused": None if backend_errors else paused,
+                "updated_at": now,
+                "observed_at": now,
+                "stale": stale,
+                "observed_state": "unknown" if stale else "observed",
+                "backend_errors": backend_errors,
+                "counts": counts,
             }
+            # An On poll started before a newer Off must not publish observed
+            # rates or re-enable the toggle after the Off transition.
+            if not self._torrent_enabled_state():
+                return self.torrent_traffic_status()
+            if started_generation != int(getattr(self, "_torrent_toggle_generation", 0)):
+                # On -> Off -> On can happen while one old poll is in flight.
+                # Its rates belong to a superseded session, even if On again.
+                result.update(
+                    download_speed=None, upload_speed=None,
+                    active=None, waiting=None, paused=None, counts=None,
+                    updated_at=None, observed_at=None,
+                    stale=True, observed_state="unknown",
+                )
+                return result
             self._last_torrent_traffic = result
             return dict(result)
         finally:
@@ -3667,6 +3975,12 @@ class WebAppApi:
             return 0
 
     def _resume_incomplete_torrent_jobs(self) -> int:
+        with self._torrent_start_guard():
+            if not self._torrent_enabled_state():
+                return 0
+            return self._resume_incomplete_torrent_jobs_impl()
+
+    def _resume_incomplete_torrent_jobs_impl(self) -> int:
         db = getattr(getattr(self, "manager", None), "db", None)
         loader = getattr(db, "downloads", None)
         clients = getattr(getattr(self, "manager", None), "torrent_clients", None)
@@ -3711,7 +4025,7 @@ class WebAppApi:
                 client.close()
         return resumed
 
-    def _torrent_toggle_auto_search(self) -> None:
+    def _torrent_toggle_auto_search(self, *, generation: int | None = None) -> None:
         started = 0
         resumed = 0
         try:
@@ -3724,11 +4038,24 @@ class WebAppApi:
                 self.logger.warning(
                     "RETRY step=torrent.toggle_ui_version error=%r", str(exc)
                 )
-            # Resume retained jobs first. This never submits a new torrent and
-            # keeps an off -> on transition from duplicating unfinished work.
-            resumed = int(self._resume_incomplete_torrent_jobs() or 0)
-            # Discovery is follow-up work as well.
-            started = int(self.manager.auto_search_current() or 0)
+            # The Off toggle publishes its intent before waiting for this lock;
+            # once Off completes, no old On task may resume or discover jobs.
+            with self._torrent_start_guard():
+                current_generation = int(getattr(self, "_torrent_toggle_generation", 0))
+                current = generation is None or generation == current_generation
+                if current and self._torrent_enabled_state():
+                    # Bring the managed write backend up before resume/search.
+                    # The toggle acknowledgement remains fast because this runs
+                    # in the already-supervised follow-up worker. Older test and
+                    # integration doubles may not expose the readiness hook.
+                    ensure_ready = getattr(self.manager, "ensure_torrent_backend_ready", None)
+                    if callable(ensure_ready):
+                        ensure_ready()
+                if current and self._torrent_enabled_state():
+                    # Resume retained jobs before discovering new downloads.
+                    resumed = int(self._resume_incomplete_torrent_jobs() or 0)
+                if current and self._torrent_enabled_state():
+                    started = int(self.manager.auto_search_current() or 0)
         except Exception as exc:
             self.logger.warning("RETRY step=torrent.toggle_start error=%r", str(exc))
         finally:
@@ -3747,6 +4074,9 @@ class WebAppApi:
         with lock:
             previous = bool(self._torrent_session_enabled)
             previous_authoritative = bool(getattr(self, "_torrent_session_authoritative", False))
+            generation = int(getattr(self, "_torrent_toggle_generation", 0)) + 1
+            self._torrent_toggle_generation = generation
+            self._torrent_off_evidence = {}
             self._torrent_session_enabled = requested
             self._torrent_session_authoritative = True
             self.config.nyaa.torrents_enabled = requested
@@ -3772,7 +4102,17 @@ class WebAppApi:
 
         quiet_result: dict[str, Any] = {}
         if not requested:
-            quiet_result = self._quiesce_torrent_backends(reason="toggle_off")
+            # A resume that began before Off finishes first; then quiesce it.
+            # A delayed On worker rechecks desired state after this guard.
+            with self._torrent_start_guard():
+                shared = self._torrent_shared_admission()
+                if shared is not None:
+                    with shared.locked():
+                        shared.publish(False)
+                        if not self._torrent_enabled_state():
+                            quiet_result = self._quiesce_torrent_backends(reason="toggle_off")
+                elif not self._torrent_enabled_state():
+                    quiet_result = self._quiesce_torrent_backends(reason="toggle_off")
 
         try:
             with lock:
@@ -3810,11 +4150,31 @@ class WebAppApi:
                 )
             raise
 
+        if not requested and not persisted:
+            with lock:
+                if (self._torrent_toggle_generation == generation
+                        and not self._torrent_session_enabled):
+                    self._torrent_off_evidence = {
+                        "generation": generation,
+                        "aria2_shutdown_confirmed": bool(quiet_result.get("aria2_stopped", False)),
+                        "checked_at": 0.0,
+                    }
         if logger is not None:
             logger.info(
                 "EVENT torrent.toggle_transition source=persist desired=%s effective=%s",
                 requested, persisted,
             )
+        # On becomes visible to the background agent only after its config
+        # was persisted, and only if a newer Off did not supersede this click.
+        if requested and persisted:
+            with self._torrent_start_guard():
+                shared = self._torrent_shared_admission()
+                if shared is not None:
+                    with shared.locked():
+                        with lock:
+                            if (self._torrent_toggle_generation == generation
+                                    and self._torrent_session_enabled):
+                                shared.publish(True)
         scheduled = False
         if requested and persisted and self._downloads_configured():
             supervisor = getattr(self, "task_supervisor", None)
@@ -3822,7 +4182,7 @@ class WebAppApi:
                 try:
                     supervisor.start(
                         name="torrent-toggle-auto-search",
-                        target=self._torrent_toggle_auto_search,
+                        target=lambda: self._torrent_toggle_auto_search(generation=generation),
                         replace=True,
                     )
                     scheduled = True
@@ -3845,12 +4205,47 @@ class WebAppApi:
             "backend": self.manager.torrent_backend_name() if self._downloads_configured() else "disabled",
             "started": 0,
             "search_scheduled": scheduled,
-            "waiting": self.manager.download_intents.waiting_count(),
+            # A search intent is not a backend torrent job. This quick ACK
+            # carries no observed backend waiting count.
+            "waiting": None,
+            "pending_intents": self.manager.download_intents.waiting_count(),
+            # Off acknowledgement carries intent; read-only status polling
+            # subsequently confirms whether backend traffic really stopped.
+            "transition": "unconfirmed" if not persisted else "enabled",
             "aria2_stopped": bool(quiet_result.get("aria2_stopped", False)),
             "qbittorrent_paused": int(quiet_result.get("qbittorrent_paused", 0) or 0),
         }
 
     def torrent_download_action(
+        self,
+        torrent_hash: str,
+        action: str,
+        delete_files: bool = False,
+        backend: str = "",
+    ) -> dict[str, Any]:
+        # Acquiring clients can launch aria2/qBittorrent. Keep the admission
+        # guard until the side effect is complete, not just until a boolean
+        # was checked, so Off cannot race with a delayed resume/reconnect.
+        if str(action or "").strip().casefold() in {"resume", "reconnect"}:
+            with self._torrent_start_guard():
+                shared = self._torrent_shared_admission()
+                if shared is not None:
+                    with shared.locked():
+                        if not self._torrent_enabled_state() or not shared.enabled(fallback=self._torrent_enabled_state()):
+                            return self._torrent_off_action_response()
+                        return self._torrent_download_action_impl(
+                            torrent_hash, action, delete_files=delete_files, backend=backend
+                        )
+                if not self._torrent_enabled_state():
+                    return self._torrent_off_action_response()
+                return self._torrent_download_action_impl(
+                    torrent_hash, action, delete_files=delete_files, backend=backend
+                )
+        return self._torrent_download_action_impl(
+            torrent_hash, action, delete_files=delete_files, backend=backend
+        )
+
+    def _torrent_download_action_impl(
         self,
         torrent_hash: str,
         action: str,
@@ -4920,7 +5315,10 @@ class WebAppApi:
         return state
 
     def manga_state(self) -> dict[str, Any]:
-        return self._backfill_manga_mean_scores(self.manga.state())
+        return self._manga_state_payload(self._backfill_manga_mean_scores(self.manga.state()))
+
+    def manga_save_reader_preferences(self, values: dict[str, Any]) -> dict[str, Any]:
+        return self.manga.save_reader_preferences(dict(values or {}))
 
     def manga_remove_series(self, book_id: int) -> dict[str, Any]:
         target_id = int(book_id)
@@ -5010,37 +5408,83 @@ class WebAppApi:
             user_score=item.get("user_score"),
             mean_score=item.get("mean_score"),
         )
-        return {"book": book, "state": self.manga.state()}
+        return {"book": book, "state": self._manga_state_payload()}
 
     def manga_unbind_anilist(self, book_id: int) -> dict[str, Any]:
         book = self.manga.unbind_anilist(int(book_id))
-        return {"book": book, "state": self.manga.state()}
+        return {"book": book, "state": self._manga_state_payload()}
 
-    def _manga_ocr_log_path(self) -> Path:
-        return DEFAULT_LOG_PATH.with_name(f"{APP_SLUG}-manga-ocr-install.log")
+    def _manga_ocr_backend(self) -> str:
+        config = getattr(self, "config", None)
+        tools = getattr(config, "tools", None)
+        backend = str(getattr(tools, "manga_ocr_backend", "pudge") or "pudge").strip().casefold()
+        return backend if backend in {"pudge", "mokuro"} else "pudge"
+
+    def _mokuro_ocr_root(self) -> Path:
+        return self.config.paths.cache_dir / "mokuro-ocr"
+
+    def _mokuro_ocr_python_path(self) -> Path:
+        root = self._mokuro_ocr_root() / "venv"
+        return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    def _mokuro_ocr_package_marker_path(self) -> Path:
+        return self._mokuro_ocr_root() / "package-ready.json"
+
+    def _mokuro_ocr_marker_path(self) -> Path:
+        return self._mokuro_ocr_root() / "model-ready.json"
+
+    def _manga_ocr_backend_available(self, *, refresh: bool = False) -> bool:
+        if self._manga_ocr_backend() == "mokuro":
+            return self._mokuro_ocr_python_path().is_file() and self._mokuro_ocr_marker_path().is_file()
+        return self.manga.ocr_available(refresh=refresh)
+
+    def _manga_state_payload(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(state if state is not None else self.manga.state())
+        payload["ocr_backend"] = self._manga_ocr_backend()
+        payload["ocr_available"] = self._manga_ocr_backend_available()
+        return payload
+
+    def _manga_ocr_log_path(self, backend: str | None = None) -> Path:
+        selected = str(backend or self._manga_ocr_backend()).strip().casefold()
+        suffix = "mokuro-ocr-install" if selected == "mokuro" else "manga-ocr-install"
+        return DEFAULT_LOG_PATH.with_name(f"{APP_SLUG}-{suffix}.log")
 
     def _manga_ocr_marker_path(self) -> Path:
         return self.config.paths.cache_dir / "manga-ocr" / "model-ready.json"
 
     def manga_ocr_status(self) -> dict[str, Any]:
+        backend = self._manga_ocr_backend()
         with self._manga_ocr_install_lock:
             state = dict(self._manga_ocr_install_state)
             thread = self._manga_ocr_install_thread
-            running = bool(thread is not None and thread.is_alive())
-        installed = self.manga.ocr_available(refresh=not running)
-        marker = self._manga_ocr_marker_path()
-        model_ready = marker.is_file()
+            state_backend = str(state.get("backend") or "pudge").strip().casefold()
+            thread_backend = str(state.get("backend") or backend).strip().casefold()
+            running = bool(thread is not None and thread.is_alive() and thread_backend == backend)
+        if backend == "mokuro":
+            python = self._mokuro_ocr_python_path()
+            package_marker = self._mokuro_ocr_package_marker_path()
+            marker = self._mokuro_ocr_marker_path()
+            installed = python.is_file() and package_marker.is_file()
+            model_ready = marker.is_file() and installed
+        else:
+            installed = self.manga.ocr_available(refresh=not running)
+            marker = self._manga_ocr_marker_path()
+            model_ready = marker.is_file()
         if running:
             state["running"] = True
+        elif state_backend == backend and state.get("state") == "failed":
+            state["running"] = False
         elif installed and model_ready:
             state.update({"state": "ready", "running": False})
         elif installed:
             state.update({"state": "package_installed", "running": False})
         else:
-            state.update({"state": "not_installed", "running": False})
+            state.update({"state": "not_installed", "running": False, "detail": ""})
+        state["backend"] = backend
         state["installed"] = installed
         state["model_ready"] = model_ready
-        state["log_path"] = str(self._manga_ocr_log_path())
+        log_path = self._manga_ocr_log_path("mokuro") if backend == "mokuro" else self._manga_ocr_log_path()
+        state["log_path"] = str(log_path)
         return state
 
     def _set_manga_ocr_install_state(self, state: str, detail: str = "") -> None:
@@ -5100,20 +5544,89 @@ class WebAppApi:
             self.logger.exception("FAIL step=manga_ocr.install error=%r", str(exc))
             self._set_manga_ocr_install_state("failed", str(exc))
 
+    def _run_mokuro_ocr_install(self) -> None:
+        backend = "mokuro"
+        log_path = self._manga_ocr_log_path(backend)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        root = self._mokuro_ocr_root()
+        venv_dir = root / "venv"
+        python = self._mokuro_ocr_python_path()
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            with log_path.open("w", encoding="utf-8") as log:
+                self._set_manga_ocr_install_state("installing_package", "Creating isolated Mokuro environment")
+                base_python = python_executable()
+                completed = subprocess.run(
+                    [base_python, "-m", "venv", str(venv_dir)],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=10 * 60,
+                )
+                if completed.returncode != 0 or not python.is_file():
+                    raise RuntimeError(f"Mokuro venv creation failed with code {completed.returncode}")
+                completed = subprocess.run(
+                    [str(python), "-m", "pip", "install", "--upgrade", "pip", "mokuro==0.2.5"],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=45 * 60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(f"Mokuro install exited with code {completed.returncode}")
+                package_marker = self._mokuro_ocr_package_marker_path()
+                package_marker.write_text(
+                    json.dumps({"ready_at": time.time(), "python": str(python), "version": "0.2.5"}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                self._set_manga_ocr_install_state("downloading_model", "Downloading and warming Mokuro models")
+                log.write("\nPackage installed. Loading Mokuro detector and MangaOCR model...\n")
+                log.flush()
+                completed = subprocess.run(
+                    [
+                        str(python),
+                        "-c",
+                        "from mokuro import __version__; from mokuro.manga_page_ocr import MangaPageOcr; "
+                        "MangaPageOcr(); print('Mokuro '+__version__+' models ready')",
+                    ],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=60 * 60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(f"Mokuro model preload exited with code {completed.returncode}")
+                marker = self._mokuro_ocr_marker_path()
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    json.dumps({"ready_at": time.time(), "python": str(python), "version": "0.2.5"}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                self._set_manga_ocr_install_state("ready", "Mokuro and models are ready")
+        except Exception as exc:
+            self.logger.exception("FAIL step=mokuro_ocr.install error=%r", str(exc))
+            self._set_manga_ocr_install_state("failed", str(exc))
+
     def install_manga_ocr(self) -> dict[str, Any]:
+        backend = self._manga_ocr_backend()
         with self._manga_ocr_install_lock:
             thread = self._manga_ocr_install_thread
             already_running = bool(thread is not None and thread.is_alive())
             if not already_running:
+                label = "Mokuro" if backend == "mokuro" else "MangaOCR"
                 self._manga_ocr_install_state = {
-                "state": "starting",
-                "detail": "Starting MangaOCR installation",
-                "started_at": time.time(),
+                    "state": "starting",
+                    "backend": backend,
+                    "detail": f"Starting {label} installation",
+                    "started_at": time.time(),
                     "finished_at": 0.0,
                 }
                 thread = threading.Thread(
-                    target=self._run_manga_ocr_install,
-                    name=f"{APP_SLUG}-manga-ocr-install",
+                    target=self._run_mokuro_ocr_install if backend == "mokuro" else self._run_manga_ocr_install,
+                    name=f"{APP_SLUG}-{backend}-ocr-install",
                     daemon=True,
                 )
                 self._manga_ocr_install_thread = thread
@@ -5139,7 +5652,12 @@ class WebAppApi:
         live_processed_raw = state.get("processed_pages", state.get("cached_pages"))
         state.update(cache)
         state["running"] = running
-        if cache["complete"] and not running:
+        if (
+            cache["complete"]
+            and not running
+            and state.get("state") not in {"failed", "cancelled", "partial"}
+            and not state.get("errors")
+        ):
             state["state"] = "ready"
 
         total = max(0, int(cache.get("total_pages") or 0))
@@ -5262,11 +5780,19 @@ class WebAppApi:
         try:
             cancel_event = self._manga_ocr_cancel_events.get(book_id)
             while True:
-                result = self.manga.ocr_book(
-                    book_id,
-                    progress=on_progress,
-                    cancelled=cancel_event.is_set if cancel_event is not None else None,
-                )
+                if self._manga_ocr_backend() == "mokuro":
+                    result = self.manga.ocr_book_mokuro(
+                        book_id,
+                        mokuro_python=self._mokuro_ocr_python_path(),
+                        progress=on_progress,
+                        cancelled=cancel_event.is_set if cancel_event is not None else None,
+                    )
+                else:
+                    result = self.manga.ocr_book(
+                        book_id,
+                        progress=on_progress,
+                        cancelled=cancel_event.is_set if cancel_event is not None else None,
+                    )
                 if not result.get("preempted"):
                     break
                 self.logger.info(
@@ -5337,7 +5863,7 @@ class WebAppApi:
             with self._manga_book_ocr_lock:
                 self._manga_book_ocr_state[book_id] = {
                     **result,
-                    "state": "ready" if result.get("complete") else "partial",
+                    "state": "ready" if result.get("complete") and not result.get("errors") and not parse_errors else "partial",
                     "running": False,
                     "parsed_regions": parsed_count,
                     "total_regions": len(region_texts),
@@ -5345,14 +5871,23 @@ class WebAppApi:
                 }
             job_id = self._manga_ocr_job_ids.get(book_id, "")
             if job_id:
-                self.job_center.finish(
-                    job_id,
-                    message="Manga OCR ready",
-                    result={"book_id": book_id, "cached_pages": result.get("cached_pages", 0)},
-                )
+                all_errors = [*result.get("errors", []), *parse_errors]
+                if all_errors or not result.get("complete"):
+                    self.job_center.fail(
+                        job_id,
+                        RuntimeError(str(all_errors[0]) if all_errors else "Manga OCR incomplete"),
+                        message="Manga OCR incomplete",
+                    )
+                else:
+                    self.job_center.finish(
+                        job_id,
+                        message="Manga OCR ready",
+                        result={"book_id": book_id, "cached_pages": result.get("cached_pages", 0)},
+                    )
         except Exception as exc:
             self.logger.exception("FAIL step=manga_ocr.book book_id=%s error=%r", book_id, str(exc))
-            cache = self.manga.ocr_cache_status(book_id)
+            cache_status = getattr(self.manga, "ocr_cache_status", None)
+            cache = cache_status(book_id) if callable(cache_status) else {}
             with self._manga_book_ocr_lock:
                 self._manga_book_ocr_state[book_id] = {
                     **cache,
@@ -5379,8 +5914,9 @@ class WebAppApi:
         attempt_of: str = "",
     ) -> dict[str, Any]:
         book_id = int(book_id)
-        if not self.manga.ocr_available():
-            raise RuntimeError("MangaOCR is not installed. Install it from Settings → Essential.")
+        if not self._manga_ocr_backend_available():
+            label = "Mokuro" if self._manga_ocr_backend() == "mokuro" else "MangaOCR"
+            raise RuntimeError(f"{label} OCR backend is not installed. Install it from Settings → Essential.")
         with self._manga_book_ocr_lock:
             thread = self._manga_book_ocr_threads.get(book_id)
             if thread is None or not thread.is_alive():
@@ -5417,6 +5953,40 @@ class WebAppApi:
                 thread.start()
         return self.manga_ocr_book_status(book_id)
 
+    def manga_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
+        return self.manga.nearby_mokuro(int(book_id))
+
+    def import_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
+        book_id = int(book_id)
+        if self.manga_ocr_book_status(book_id).get("running"):
+            raise RuntimeError("Stop the running volume OCR before importing Mokuro")
+        return self.manga.import_nearby_mokuro(book_id)
+
+    def choose_manga_mokuro(self, book_id: int) -> dict[str, Any]:
+        """Use a native file picker; never accept untrusted browser-supplied paths."""
+        book_id = int(book_id)
+        if self.manga_ocr_book_status(book_id).get("running"):
+            raise RuntimeError("Stop the running volume OCR before importing Mokuro")
+        if self.window is None:
+            return {"cancelled": True}
+        try:
+            import webview
+
+            result = self.window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                directory=str(Path.home() / "Downloads"),
+                allow_multiple=False,
+                file_types=("Mokuro OCR (*.mokuro)",),
+            )
+        except Exception as exc:
+            return {"cancelled": True, "error": str(exc)}
+        if not result:
+            return {"cancelled": True}
+        chosen = result[0] if isinstance(result, (list, tuple)) else result
+        if self.manga_ocr_book_status(book_id).get("running"):
+            raise RuntimeError("Volume OCR started during Mokuro selection; import was not performed")
+        return {"cancelled": False, **self.manga.import_mokuro(book_id, Path(str(chosen)))}
+
     def choose_manga_file(self) -> dict[str, Any]:
         if self.window is None:
             return {"cancelled": True}
@@ -5427,7 +5997,7 @@ class WebAppApi:
                 webview.OPEN_DIALOG,
                 directory=str(Path.home()),
                 allow_multiple=True,
-                file_types=("Manga archives (*.cbz;*.zip)",),
+                file_types=("Manga / Mokuro (*.cbz;*.zip;*.mokuro)",),
             )
         except Exception as exc:
             return {"cancelled": True, "error": str(exc)}
@@ -5435,32 +6005,61 @@ class WebAppApi:
             return {"cancelled": True}
         selected = list(result) if isinstance(result, (list, tuple)) else [result]
         paths = [str(value) for value in selected]
+        planned: dict[Path, Path | None] = {}
+        errors: list[str] = []
+        for raw in selected:
+            path = Path(str(raw)).expanduser().resolve()
+            if path.suffix.casefold() == ".mokuro":
+                try:
+                    archive = self.manga.archive_for_mokuro(path)
+                except Exception as exc:
+                    errors.append(f"{path.name}: {exc}")
+                    continue
+                previous = planned.get(archive)
+                if previous is not None and previous != path:
+                    errors.append(f"{path.name}: more than one Mokuro sidecar was selected for {archive.name}")
+                    continue
+                planned[archive] = path
+            elif path.suffix.casefold() in {".cbz", ".zip"}:
+                planned.setdefault(path, None)
+            else:
+                errors.append(f"{path.name}: unsupported manga file")
         job_id = self.job_center.start(
             "import",
             "Import manga",
             payload={"media_kind": "manga", "paths": paths},
-            total=len(paths),
+            total=max(1, len(planned)),
         )
         cancel_event = threading.Event()
         self._import_cancel_events[job_id] = cancel_event
         books: list[dict[str, Any]] = []
-        errors: list[str] = []
-        for index, value in enumerate(selected, 1):
+        for index, (archive_path, explicit_mokuro) in enumerate(planned.items(), 1):
             if cancel_event.is_set():
                 break
             try:
-                book = self.manga.import_file(Path(str(value)))
+                book = self.manga.import_file(archive_path)
                 books.append(book)
-                if self.manga.ocr_available():
+                mokuro_attempted = False
+                if explicit_mokuro is not None:
+                    mokuro_attempted = True
+                    self.manga.import_mokuro(
+                        int(book["id"]), explicit_mokuro, require_full_coverage=True,
+                    )
+                else:
+                    nearby = self.manga.nearby_mokuro(int(book["id"]))
+                    if nearby.get("available"):
+                        mokuro_attempted = True
+                        self.manga.import_nearby_mokuro(int(book["id"]))
+                if not mokuro_attempted and self._manga_ocr_backend_available():
                     self.start_manga_ocr_book(int(book["id"]))
             except Exception as exc:
-                errors.append(f"{Path(str(value)).name}: {exc}")
+                errors.append(f"{archive_path.name}: {exc}")
             self.job_center.update(
                 job_id,
                 state="running",
                 current=index,
-                total=len(selected),
-                message=f"Imported {len(books)}/{len(selected)}",
+                total=max(1, len(planned)),
+                message=f"Imported {len(books)}/{max(1, len(planned))}",
             )
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
@@ -5473,7 +6072,7 @@ class WebAppApi:
             )
         else:
             self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
-        return {"cancelled": False, "books": books, "errors": errors, "state": self.manga.state()}
+        return {"cancelled": False, "books": books, "errors": errors, "state": self._manga_state_payload()}
 
     def choose_manga_folder(self) -> dict[str, Any]:
         # Import all manga content recursively under one selected folder.
@@ -5565,7 +6164,7 @@ class WebAppApi:
 
         if cancel_event.is_set():
             self.job_center.cancelled(job_id)
-            return {"cancelled": True, "books": books, "errors": errors, "state": self.manga.state()}
+            return {"cancelled": True, "books": books, "errors": errors, "state": self._manga_state_payload()}
 
         if books:
             self.job_center.finish(
@@ -5590,7 +6189,7 @@ class WebAppApi:
             "books": books,
             "errors": errors,
             "folder": str(source_root),
-            "state": self.manga.state(),
+            "state": self._manga_state_payload(),
         }
 
     def cover_preview_resolve(
@@ -5686,6 +6285,119 @@ class WebAppApi:
     def manga_ocr_artifact(self, book_id: int) -> dict[str, Any]:
         return self.manga.ocr_artifact(int(book_id))
 
+    def manga_ocr_corrections(self, book_id: int) -> dict[str, Any]:
+        return self.manga.manual_ocr_corrections(int(book_id))
+
+    def manga_split_ocr_region(
+        self, book_id: int, page_index: int, source_ref: dict[str, Any],
+        parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self.manga.split_manual_ocr_region(
+            int(book_id), int(page_index), dict(source_ref or {}),
+            [dict(item) for item in (parts or []) if isinstance(item, dict)],
+        )
+
+    def manga_unsplit_ocr_region(
+        self, book_id: int, addition_id: str,
+    ) -> dict[str, Any]:
+        return self.manga.unsplit_manual_ocr_region(int(book_id), str(addition_id))
+
+    def manga_merge_ocr_regions(
+        self, book_id: int, page_index: int, first_ref: dict[str, Any],
+        second_ref: dict[str, Any], text: str, orientation: str = "vertical",
+    ) -> dict[str, Any]:
+        return self.manga.merge_manual_ocr_regions(
+            int(book_id), int(page_index), dict(first_ref or {}), dict(second_ref or {}),
+            str(text), str(orientation),
+        )
+
+    def manga_unmerge_ocr_region(
+        self, book_id: int, addition_id: str,
+    ) -> dict[str, Any]:
+        return self.manga.unmerge_manual_ocr_region(int(book_id), str(addition_id))
+
+    def manga_add_ocr_region(
+        self, book_id: int, page_index: int, geometry: dict[str, Any],
+        text: str, orientation: str = "vertical",
+    ) -> dict[str, Any]:
+        return self.manga.add_manual_ocr_region(
+            int(book_id), int(page_index), dict(geometry or {}), str(text), str(orientation)
+        )
+
+    def manga_update_added_ocr_region(
+        self, book_id: int, addition_id: str, text: str | None = None,
+        geometry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.manga.update_manual_ocr_region(
+            int(book_id), str(addition_id), text=text,
+            geometry=dict(geometry) if geometry is not None else None,
+        )
+
+    def manga_undo_added_ocr_region(
+        self, book_id: int, addition_id: str,
+    ) -> dict[str, Any]:
+        return self.manga.undo_manual_ocr_region(int(book_id), str(addition_id))
+
+    def manga_set_ocr_correction(
+        self, book_id: int, page_index: int, region_index: int, text: str
+    ) -> dict[str, Any]:
+        return self.manga.set_manual_ocr_correction(
+            int(book_id), int(page_index), int(region_index), str(text)
+        )
+
+    def manga_undo_ocr_correction(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        return self.manga.undo_manual_ocr_correction(
+            int(book_id), int(page_index), int(region_index)
+        )
+
+    def manga_suppress_ocr_region(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        return self.manga.suppress_manual_ocr_region(
+            int(book_id), int(page_index), int(region_index)
+        )
+
+    def manga_restore_ocr_region(
+        self, book_id: int, suppression_id: str
+    ) -> dict[str, Any]:
+        return self.manga.restore_manual_ocr_region(
+            int(book_id), str(suppression_id)
+        )
+
+    def manga_set_ocr_geometry(
+        self,
+        book_id: int,
+        page_index: int,
+        region_index: int,
+        geometry: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.manga.set_manual_ocr_geometry(
+            int(book_id), int(page_index), int(region_index), dict(geometry or {})
+        )
+
+    def manga_undo_ocr_geometry(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        return self.manga.undo_manual_ocr_geometry(
+            int(book_id), int(page_index), int(region_index)
+        )
+
+    def manga_set_ocr_reading_order(
+        self, book_id: int, page_index: int, order: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        return self.manga.set_manual_ocr_reading_order(
+            int(book_id), int(page_index), list(order or [])
+        )
+
+    def manga_undo_ocr_reading_order(
+        self, book_id: int, page_index: int
+    ) -> dict[str, Any]:
+        return self.manga.undo_manual_ocr_reading_order(
+            int(book_id), int(page_index)
+        )
+
     def manga_export_ocr_debug(
         self, payload: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -5771,6 +6483,124 @@ class WebAppApi:
             else []
         )
 
+        def quality_report(regions: list[dict[str, Any]]) -> dict[str, Any]:
+            by_geometry: dict[str, int] = {}
+            by_detector: dict[str, int] = {}
+            by_source: dict[str, int] = {}
+            rows: list[dict[str, Any]] = []
+            counters = {
+                "fallback": 0,
+                "error": 0,
+                "retry": 0,
+                "correction": 0,
+                "multiple_hypotheses": 0,
+                "hypothesis_disagreement": 0,
+                "word_geometry_unmapped": 0,
+                "suspect": 0,
+            }
+
+            def bump(bucket: dict[str, int], key: Any) -> None:
+                label = str(key or "unknown").strip() or "unknown"
+                bucket[label] = bucket.get(label, 0) + 1
+
+            for index, region in enumerate(regions):
+                geometry = str(region.get("geometry_status") or "unknown")
+                detector = str(region.get("detector") or "unknown")
+                region_source = str(region.get("source") or "unknown")
+                bump(by_geometry, geometry)
+                bump(by_detector, detector)
+                bump(by_source, region_source)
+
+                hypotheses = [
+                    dict(item)
+                    for item in region.get("hypotheses") or []
+                    if isinstance(item, dict)
+                ]
+                hypothesis_texts = {
+                    str(item.get("text") or "").strip()
+                    for item in hypotheses
+                    if str(item.get("text") or "").strip()
+                }
+                if len(hypotheses) > 1:
+                    counters["multiple_hypotheses"] += 1
+                if len(hypothesis_texts) > 1:
+                    counters["hypothesis_disagreement"] += 1
+
+                reasons: list[str] = []
+                if bool(region.get("fallback")):
+                    counters["fallback"] += 1
+                    reasons.append("fallback")
+                if str(region.get("error") or "").strip():
+                    counters["error"] += 1
+                    reasons.append("region_error")
+                if str(region.get("recognizer_retry") or "").strip():
+                    counters["retry"] += 1
+                    reasons.append("recognizer_retry")
+                if str(region.get("recognition_correction") or "").strip():
+                    counters["correction"] += 1
+                    reasons.append("recognition_correction")
+                if str(region.get("word_geometry") or "") != "mapped_segments":
+                    counters["word_geometry_unmapped"] += 1
+                    reasons.append("word_geometry_unmapped")
+                if geometry in {"synthetic", "unknown", "unavailable"}:
+                    reasons.append(f"geometry_{geometry}")
+                try:
+                    confidence = float(region.get("confidence") or 0.0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                if confidence > 0.0 and confidence < 0.5:
+                    reasons.append("low_detector_confidence")
+                if len(hypothesis_texts) > 1:
+                    reasons.append("hypothesis_disagreement")
+                if not str(region.get("text") or "").strip():
+                    reasons.append("empty_selected_text")
+                if reasons:
+                    counters["suspect"] += 1
+
+                rows.append(
+                    {
+                        "index": index,
+                        "id": str(region.get("id") or ""),
+                        "text": str(region.get("text") or ""),
+                        "raw_text": str(region.get("raw_text") or ""),
+                        "detector": detector,
+                        "source": region_source,
+                        "geometry_status": geometry,
+                        "word_geometry": str(region.get("word_geometry") or ""),
+                        "confidence": confidence,
+                        "selected_hypothesis_id": str(region.get("selected_hypothesis_id") or ""),
+                        "recognition_selection": str(region.get("recognition_selection") or ""),
+                        "recognizer_retry": str(region.get("recognizer_retry") or ""),
+                        "recognition_correction": str(region.get("recognition_correction") or ""),
+                        "hypothesis_count": len(hypotheses),
+                        "hypothesis_text_count": len(hypothesis_texts),
+                        "suspect_reasons": reasons,
+                    }
+                )
+
+            return {
+                "schema": "pudge-manga-ocr-quality-report-v1",
+                "note": (
+                    "Diagnostic evidence only. Suspect flags and OCR confidences are not "
+                    "calibrated probabilities of text correctness."
+                ),
+                "page_status": str(backend.get("status") or ""),
+                "page_reason": str(backend.get("reason") or ""),
+                "retryable": bool(backend.get("retryable")),
+                "region_count": len(regions),
+                "counts": counters,
+                "by_geometry_status": dict(sorted(by_geometry.items())),
+                "by_detector": dict(sorted(by_detector.items())),
+                "by_source": dict(sorted(by_source.items())),
+                "regions": rows,
+            }
+
+        quality = quality_report(backend_regions)
+        (output_root / "quality-report.json").write_text(
+            json.dumps(quality, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
         def backend_boxes() -> str:
             rows: list[str] = []
             for index, region in enumerate(backend_regions):
@@ -5835,7 +6665,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 <section class="panel"><h2>Backend regions</h2><div class="canvas"><img src="{image_ref}">{backend_boxes()}</div></section>
 <section class="panel"><h2>Rendered overlay</h2><div class="canvas"><img src="{image_ref}">{frontend_boxes()}</div></section>
 </div>
-<p>See <code>snapshot.json</code> for reading order, confidence, DOM sizes, selections and click hit-testing.</p>
+<p>See <code>snapshot.json</code> for raw state and <code>quality-report.json</code> for per-region diagnostic evidence, retries, hypothesis disagreement and geometry coverage.</p>
 </body></html>"""
         (output_root / "overlay.html").write_text(overlay_html, encoding="utf-8")
 
@@ -5857,6 +6687,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "event_count": len(source["events"]),
             "backend_region_count": len(backend_regions),
             "frontend_region_count": len(frontend_regions),
+            "quality_suspect_count": int(quality["counts"]["suspect"]),
         }
 
 
@@ -6237,11 +7068,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         backend = str(data.get("backend") or self.light_novels.settings().study_backend or "jiten").casefold()
         if backend != "jiten":
             return {"ok": False, "provider": backend, "unsupported": True}
-        return self.light_novels.jiten_live_state(
+        result = self.light_novels.jiten_live_state(
             int(data.get("word_id") or data.get("wordId") or 0),
             int(data.get("reading_index") or data.get("readingIndex") or 0),
             force=bool(data.get("force")),
         )
+        try:
+            scope = str(self.light_novels.study_provider_capabilities("jiten").get("account_key") or "")
+        except Exception:
+            scope = ""
+        if scope:
+            result["account_scope"] = scope
+        return result
 
     def study_states(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = payload or {}
@@ -6275,6 +7113,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "provider": "jiten",
             "states": states,
         }
+        try:
+            scope = str(self.light_novels.study_provider_capabilities("jiten").get("account_key") or "")
+        except Exception:
+            scope = ""
+        if scope:
+            result["account_scope"] = scope
         if hasattr(self.light_novels, "jiten_optimal_word_stats"):
             try:
                 result.update(self.light_novels.jiten_optimal_word_stats())
@@ -6296,6 +7140,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._review_gate_lock = threading.RLock()
         if not hasattr(self, "_review_gate_store"):
             self._review_gate_store = ReviewGateStore(self.manager.db)
+        if not hasattr(self, "_review_gate_due_store"):
+            self._review_gate_due_store = ReviewGateStore(
+                self.manager.db, prefix="review_gate_episode_due:v1"
+            )
+        if not hasattr(self, "_review_gate_due_targets"):
+            self._review_gate_due_targets = {}
         if not hasattr(self, "_review_gate_candidates"):
             self._review_gate_candidates = {}
         if not hasattr(self, "_review_gate_pending"):
@@ -6628,6 +7478,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self._ensure_review_gate_runtime()
         if not bool(self.config.ui.review_gate_enabled) or not hasattr(self, "light_novels"):
             return {"started": False, "reason": "disabled", "available": 0}
+        if bool(getattr(self.config.ui, "review_gate_all_due_episode_words", False)):
+            return {"started": False, "reason": "episode_due_mode", "available": 0}
         backend = str(self.light_novels.settings().study_backend or "jiten").casefold()
         caps = self.light_novels.study_provider_capabilities(backend)
         account_key = str(caps.get("account_key") or "")
@@ -6741,6 +7593,122 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def _review_gate_scope(account_key: str, identity: EpisodeReviewIdentity) -> str:
         return f"{account_key}:{identity.logical_id}"
 
+    def _review_gate_begin_episode_due(
+        self,
+        video_path: str,
+        status: dict[str, Any],
+        *,
+        begin_started: float,
+    ) -> dict[str, Any]:
+        identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
+        account_key = str(status["account_key"])
+        scope = self._review_gate_scope(account_key, identity)
+        try:
+            path = Path(self._play_key(video_path))
+            episode = self.manager.db.episode_by_path(path)
+            if episode is None:
+                raise LightNovelError("Episode metadata is unavailable for review scanning.")
+            subtitle_path, subtitle_meta = resolve_episode_review_subtitle(
+                video_path=Path(episode.video_path),
+                subtitle_path=getattr(episode, "subtitle_path", None),
+                embedded_subtitle_id=getattr(episode, "embedded_subtitle_id", None),
+                cache_dir=self.config.paths.cache_dir,
+                ffmpeg_path=self.config.tools.ffmpeg,
+                ffprobe_path=self.config.tools.ffprobe,
+            )
+            scan_started = time.perf_counter()
+            scanned = build_episode_due_review_cards(
+                self.light_novels,
+                subtitle_path,
+                self.config.paths.cache_dir,
+            )
+            scanned["subtitle_source"] = str(subtitle_meta.get("source") or "")
+            scanned["subtitle_path"] = str(subtitle_path)
+            cards = [
+                dict(card)
+                for card in (scanned.get("cards") or [])
+                if isinstance(card, dict)
+            ]
+            scan_ms = round((time.perf_counter() - scan_started) * 1000.0, 1)
+        except Exception as exc:
+            failed = dict(status)
+            failed.update(
+                {
+                    "cards": [],
+                    "available": 0,
+                    "issued": 0,
+                    "reason": "episode_due_scan_failed",
+                    "message": str(exc),
+                    "candidate_fetch_ms": round((time.perf_counter() - begin_started) * 1000.0, 1),
+                }
+            )
+            return failed
+
+        snapshot = self._review_gate_due_store.snapshot(account_key, identity)
+        confirmed = list(snapshot.get("confirmed_card_keys") or [])
+        unknown = list(snapshot.get("unknown_card_keys") or [])
+        current_keys = [
+            str(card.get("pudgeCardKey") or "")
+            for card in cards
+            if str(card.get("pudgeCardKey") or "")
+        ]
+        target_keys = list(dict.fromkeys([*current_keys, *confirmed, *unknown]))
+        required = len(target_keys)
+        with self._review_gate_lock:
+            self._review_gate_due_targets[scope] = {
+                "required": required,
+                "keys": tuple(target_keys),
+            }
+            progress = self._review_gate_due_store.status(
+                account_key, identity, required=required
+            )
+            if progress.granted:
+                progress = self._review_gate_due_store.grant(
+                    account_key, identity, required=required
+                )
+            exclude = set(progress.confirmed_card_keys) | set(progress.unknown_card_keys)
+            visible = [
+                card for card in cards
+                if str(card.get("pudgeCardKey") or "") not in exclude
+            ]
+            issued_keys = {
+                str(card.get("pudgeCardKey") or "")
+                for card in visible
+                if str(card.get("pudgeCardKey") or "")
+            }
+            self._review_gate_candidates[scope] = issued_keys
+
+        payload = {
+            **status,
+            **progress.payload(),
+            "all_due_episode_words": True,
+            "blocking": not progress.granted,
+            "granted": progress.granted,
+            "cards": [] if progress.granted else visible,
+            "available": len(visible),
+            "issued": 0 if progress.granted else len(visible),
+            "session_id": "",
+            "prefetched": False,
+            "episode_vocabulary_count": int(scanned.get("episode_pairs") or 0),
+            "episode_due_count": int(scanned.get("due_pairs") or 0),
+            "candidate_fetch_ms": scan_ms,
+            "begin_ms": round((time.perf_counter() - begin_started) * 1000.0, 1),
+            "reason": "granted" if progress.granted else "episode_due_reviews_required",
+        }
+        if not progress.granted and not visible:
+            payload["message"] = (
+                "No reviewable due words remain for this episode."
+                if not progress.unknown_card_keys
+                else "A previous review outcome is unknown; this episode cannot be granted automatically."
+            )
+        self.logger.info(
+            "EVENT review_gate.episode_due media_id=%s episode=%s source=%s vocabulary=%s due=%s required=%s completed=%s issued=%s granted=%s duration_ms=%.1f",
+            identity.media_id, identity.episode, str(scanned.get("subtitle_source") or ""),
+            payload["episode_vocabulary_count"], payload["episode_due_count"],
+            progress.required, progress.completed, payload["issued"], progress.granted, payload["begin_ms"],
+        )
+        return payload
+
     def _review_gate_local_status(self, video_path: str) -> dict[str, Any]:
         self._ensure_review_gate_runtime()
         required = max(1, min(50, int(self.config.ui.review_gate_count)))
@@ -6781,12 +7749,51 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if not account_key:
             payload["reason"] = "review provider account identity is unavailable"
             return payload
-        progress = self._review_gate_store.status(account_key, identity, required=required)
+        all_due_episode_words = bool(getattr(self.config.ui, "review_gate_all_due_episode_words", False))
+        payload["all_due_episode_words"] = all_due_episode_words
+        if all_due_episode_words:
+            scope = self._review_gate_scope(account_key, identity)
+            target = self._review_gate_due_targets.get(scope)
+            snapshot = self._review_gate_due_store.snapshot(account_key, identity)
+            if target is not None:
+                progress = self._review_gate_due_store.status(
+                    account_key, identity, required=max(0, int(target.get("required") or 0))
+                )
+            elif bool(snapshot.get("granted")):
+                progress = self._review_gate_due_store.status(account_key, identity, required=0)
+            else:
+                confirmed = tuple(snapshot.get("confirmed_card_keys") or ())
+                unknown = tuple(snapshot.get("unknown_card_keys") or ())
+                # Exact required count is intentionally discovered only on Begin,
+                # because obtaining it means parsing this episode and refreshing
+                # Jiten live state. Until then, keep the gate closed without doing
+                # network work from a lightweight status poll.
+                placeholder_required = max(1, len(confirmed) + 1)
+                payload.update(
+                    {
+                        "supported": True,
+                        "blocking": True,
+                        "granted": False,
+                        "required": placeholder_required,
+                        "completed": len(confirmed),
+                        "remaining": max(1, placeholder_required - len(confirmed)),
+                        "confirmed_card_keys": list(confirmed),
+                        "unknown_card_keys": list(unknown),
+                        "account_key": account_key,
+                        "media_id": identity.media_id,
+                        "episode": identity.episode,
+                        "reason": "episode_due_scan_required",
+                    }
+                )
+                return payload
+        else:
+            progress = self._review_gate_store.status(account_key, identity, required=required)
         payload.update(
             {
                 "supported": True,
                 "blocking": not progress.granted,
                 "granted": progress.granted,
+                "required": progress.required,
                 "completed": progress.completed,
                 "remaining": progress.remaining,
                 "confirmed_card_keys": list(progress.confirmed_card_keys),
@@ -6794,7 +7801,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "account_key": account_key,
                 "media_id": identity.media_id,
                 "episode": identity.episode,
-                "reason": "granted" if progress.granted else "reviews_required",
+                "reason": "granted" if progress.granted else (
+                    "episode_due_reviews_required" if all_due_episode_words else "reviews_required"
+                ),
             }
         )
         return payload
@@ -6843,6 +7852,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def review_gate_begin(self, video_path: str) -> dict[str, Any]:
         begin_started = time.perf_counter()
+        self._ensure_review_gate_runtime()
+        if bool(getattr(self.config.ui, "review_gate_all_due_episode_words", False)):
+            with self._review_gate_lock:
+                status = self._review_gate_local_status(video_path)
+                if not status.get("blocking"):
+                    return status
+            return self._review_gate_begin_episode_due(
+                video_path, status, begin_started=begin_started
+            )
         with self._review_gate_lock:
             status = self._review_gate_local_status(video_path)
             if not status.get("blocking"):
@@ -6980,6 +7998,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
             account_key = str(status["account_key"])
             scope = self._review_gate_scope(account_key, identity)
+            due_mode = bool(status.get("all_due_episode_words"))
+            progress_store = self._review_gate_due_store if due_mode else self._review_gate_store
             if card_key in set(status.get("confirmed_card_keys") or []):
                 return {**status, "ok": True, "outcome": "already_counted"}
             if card_key in set(status.get("unknown_card_keys") or []):
@@ -7023,21 +8043,25 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             # replacement card on the next begin.
             with self._review_gate_lock:
                 self._review_gate_candidates.get(scope, set()).discard(card_key)
-                self._review_gate_evict_prefetched(account_key, card_key)
-            self._review_gate_refill_if_needed(account_key)
+                if not due_mode:
+                    self._review_gate_evict_prefetched(account_key, card_key)
+            if not due_mode:
+                self._review_gate_refill_if_needed(account_key)
             raise
         except ReviewOutcomeUnknown as exc:
             with self._review_gate_lock:
-                progress = self._review_gate_store.mark_unknown(
+                progress = progress_store.mark_unknown(
                     account_key,
                     identity,
-                    required=max(1, int(status["required"])),
+                    required=max(0 if due_mode else 1, int(status["required"])),
                     card_key=card_key,
                 )
                 self._review_gate_candidates.get(scope, set()).discard(card_key)
-                self._review_gate_evict_prefetched(account_key, card_key)
+                if not due_mode:
+                    self._review_gate_evict_prefetched(account_key, card_key)
                 updated = self._review_gate_local_status(video_path)
-            self._review_gate_refill_if_needed(account_key)
+            if not due_mode:
+                self._review_gate_refill_if_needed(account_key)
             self.logger.info(
                 "EVENT review_gate.submit_unknown media_id=%s episode=%s card=%s provider_ms=%.1f attempt=%s",
                 identity.media_id, identity.episode, card_key,
@@ -7056,19 +8080,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             with self._review_gate_lock:
                 self._review_gate_pending.discard(pending_key)
         with self._review_gate_lock:
-            progress = self._review_gate_store.mark_confirmed(
+            progress = progress_store.mark_confirmed(
                 account_key,
                 identity,
-                required=max(1, int(status["required"])),
+                required=max(0 if due_mode else 1, int(status["required"])),
                 card_key=card_key,
             )
             self._review_gate_candidates.get(scope, set()).discard(card_key)
-            self._review_gate_evict_prefetched(account_key, card_key)
+            if not due_mode:
+                self._review_gate_evict_prefetched(account_key, card_key)
             updated = self._review_gate_local_status(video_path)
-        self._review_gate_refill_if_needed(
-            account_key,
-            episode_completed=bool(updated.get("granted")),
-        )
+        if not due_mode:
+            self._review_gate_refill_if_needed(
+                account_key,
+                episode_completed=bool(updated.get("granted")),
+            )
         self.logger.info(
             "EVENT review_gate.review media_id=%s episode=%s card=%s completed=%s required=%s granted=%s provider_ms=%.1f revalidate_ms=%s mutation_ms=%s",
             identity.media_id,
@@ -7082,6 +8108,59 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             result.get("mutation_ms") if isinstance(result, dict) else None,
         )
         return {**updated, "ok": True, "outcome": "confirmed", "review": result}
+
+    def review_gate_undo(
+        self,
+        video_path: str,
+        word_id: int,
+        reading_index: int,
+    ) -> dict[str, Any]:
+        card_key = review_card_key(int(word_id), int(reading_index))
+        with self._review_gate_lock:
+            status = self._review_gate_local_status(video_path)
+            if not status.get("supported"):
+                return {**status, "ok": False, "outcome": "unsupported"}
+            identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
+            account_key = str(status["account_key"])
+            scope = self._review_gate_scope(account_key, identity)
+            due_mode = bool(status.get("all_due_episode_words"))
+            progress_store = self._review_gate_due_store if due_mode else self._review_gate_store
+            required = max(0 if due_mode else 1, int(status.get("required") or 0))
+            if card_key not in set(status.get("confirmed_card_keys") or []):
+                return {**status, "ok": True, "outcome": "not_counted"}
+            pending_key = f"{scope}:{card_key}"
+            if pending_key in self._review_gate_pending:
+                return {**status, "ok": False, "outcome": "pending"}
+
+        undo_started = time.perf_counter()
+        result = self.light_novels.strict_review_undo(int(word_id), int(reading_index))
+
+        with self._review_gate_lock:
+            progress = progress_store.unmark_confirmed(
+                account_key,
+                identity,
+                required=required,
+                card_key=card_key,
+            )
+            self._review_gate_candidates.setdefault(scope, set()).add(card_key)
+            updated = self._review_gate_local_status(video_path)
+
+        self.logger.info(
+            "EVENT review_gate.undo media_id=%s episode=%s card=%s completed=%s required=%s provider_ms=%.1f",
+            identity.media_id,
+            identity.episode,
+            card_key,
+            progress.completed,
+            progress.required,
+            (time.perf_counter() - undo_started) * 1000.0,
+        )
+        return {
+            **updated,
+            "ok": True,
+            "outcome": "undone",
+            "undone_card_key": card_key,
+            "undo": result,
+        }
 
     def _study_manga_card_image(
         self, media_context: dict[str, Any] | None
@@ -7900,7 +8979,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             client.close()
         if normalized == "manga":
             book = self.manga.set_score(int(book_id), value)
-            return {"ok": True, "book": book, "state": self.manga.state()}
+            return {"ok": True, "book": book, "state": self._manga_state_payload()}
         if normalized in {"novel", "light_novel"}:
             book = self.light_novels.set_score(int(book_id), value)
             return {"ok": True, "book": book, "state": self.light_novel_state()}
@@ -7969,6 +9048,26 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def _audiobook_nyaa_title_looks_like_audiobook(value: str) -> bool:
         text = unicodedata.normalize("NFKC", str(value or "")).casefold()
         return bool(re.search(r"(?:オーディオブック|audiobook|unabridged)", text, re.I))
+
+    @contextmanager
+    def _audiobook_torrent_start_admission(self):
+        """Fence audiobook add/unpause with GUI Off and the scheduled agent.
+
+        Metadata inspection runs outside the guard; we acquire it again before
+        unpausing, so Off during file selection cannot restart the download.
+        """
+        with self._torrent_start_guard():
+            shared = self._torrent_shared_admission()
+            if shared is not None:
+                with shared.locked():
+                    if (not self._torrent_enabled_state()
+                            or not shared.enabled(fallback=self._torrent_enabled_state())):
+                        raise LightNovelError("Enable torrents before downloading an audiobook")
+                    yield
+            else:
+                if not self._torrent_enabled_state():
+                    raise LightNovelError("Enable torrents before downloading an audiobook")
+                yield
 
     def _audiobook_torrent_client(self) -> tuple[str, Any]:
         qbt_cfg = getattr(self.config, "qbittorrent", None)
@@ -8761,14 +9860,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         backend_name, torrent = self._audiobook_torrent_client()
         torrent_hash = ""
         try:
-            torrent_hash = torrent.add_release(
-                item,
-                save_path=destination,
-                category=f"{APP_SLUG}-audiobooks",
-                tags=[APP_SLUG, "audiobook", f"ln-book:{int(book_id)}", f"volume:{target_volume}"],
-                paused=True,
-                stop_at_metadata=True,
-            )
+            with self._audiobook_torrent_start_admission():
+                torrent_hash = torrent.add_release(
+                    item,
+                    save_path=destination,
+                    category=f"{APP_SLUG}-audiobooks",
+                    tags=[APP_SLUG, "audiobook", f"ln-book:{int(book_id)}", f"volume:{target_volume}"],
+                    paused=True,
+                    stop_at_metadata=True,
+                )
             deadline = time.monotonic() + 35.0
             files: list[dict[str, Any]] = []
             while time.monotonic() < deadline:
@@ -8849,7 +9949,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             else:
                 torrent.set_file_priority(torrent_hash, all_ids, 0)
                 torrent.set_file_priority(torrent_hash, sorted(selected_ids), 6)
-            torrent.start(torrent_hash)
+            with self._audiobook_torrent_start_admission():
+                torrent.start(torrent_hash)
         except Exception:
             if torrent_hash:
                 try:
@@ -9053,6 +10154,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.ui.review_gate_count = max(
             1, min(50, int(values.get("review_gate_count", cfg.ui.review_gate_count)))
         )
+        cfg.ui.review_gate_all_due_episode_words = bool(
+            values.get("review_gate_all_due_episode_words", getattr(cfg.ui, "review_gate_all_due_episode_words", False))
+        )
         cfg.library.root_dir = Path(str(values.get("library_root", cfg.library.root_dir))).expanduser()
         def _folder_list(value: object) -> list[Path]:
             raw = str(value or "").replace(";", "\n")
@@ -9209,6 +10313,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             requested_study_plugin
             if requested_study_plugin in {"auto", "jiten", "jpdb"}
             else "auto"
+        )
+        requested_manga_ocr_backend = str(
+            values.get("manga_ocr_backend", cfg.tools.manga_ocr_backend)
+        ).strip().casefold()
+        cfg.tools.manga_ocr_backend = (
+            requested_manga_ocr_backend
+            if requested_manga_ocr_backend in {"pudge", "mokuro"}
+            else "pudge"
         )
         cfg.diagnostics.energy_monitoring_enabled = True
         cfg.diagnostics.energy_sample_seconds = 30.0
@@ -9402,6 +10514,39 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         status["manga_ocr"] = manga_ocr
         return status
+
+    def jiten_mpv_check_update(self) -> dict[str, Any]:
+        return check_jiten_mpv_update(
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+        )
+
+    def _jiten_mpv_action_payload(self, status: dict[str, Any]) -> dict[str, Any]:
+        ln = self.light_novels.settings()
+        plugins = mpv_study_status(
+            jiten_api_key=ln.jiten_api_key,
+            jpdb_api_token=ln.jpdb_api_token,
+            selected_plugin=self.config.tools.mpv_study_plugin,
+        )
+        return {"ok": True, "status": status.get("jiten_mpv", {}), "plugins": plugins}
+
+    def jiten_mpv_install(self) -> dict[str, Any]:
+        ln = self.light_novels.settings()
+        status = install_jiten_mpv(
+            ln.jiten_api_key,
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+        )
+        return self._jiten_mpv_action_payload(status)
+
+    def jiten_mpv_update(self) -> dict[str, Any]:
+        ln = self.light_novels.settings()
+        status = update_jiten_mpv_release(
+            ln.jiten_api_key,
+            mpv=self.config.tools.mpv,
+            ffmpeg=self.config.tools.ffmpeg,
+        )
+        return self._jiten_mpv_action_payload(status)
 
     def install_first_experience_dependencies(
         self, values: dict[str, Any] | None = None
@@ -9675,6 +10820,289 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         return {"ok": True, "queued": queued, "state": self.get_state()}
 
+    def poll_planned_release_discovery(self) -> dict[str, Any]:
+        """Return already-discovered Planning releases without mutating discovery state."""
+        return {"offers": self.manager.planned_release_discovery().offers()}
+
+    @staticmethod
+    def _final_sequel_sort_key(node: dict[str, Any]) -> tuple[str, int]:
+        start = str(node.get("start_date") or "").strip()
+        if not start:
+            try:
+                year = int(node.get("season_year") or 0)
+            except (TypeError, ValueError):
+                year = 0
+            start = f"{year:04d}" if year > 0 else "9999"
+        try:
+            media_id = int(node.get("media_id") or 0)
+        except (TypeError, ValueError):
+            media_id = 0
+        return start, media_id
+
+    def final_sequel_option(self, media_id: int) -> dict[str, Any]:
+        """Return the earliest direct SEQUEL for the score/final-episode surface."""
+        media_id = int(media_id)
+        def direct_sequels(graph: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], list[int]]:
+            nodes = {
+                int(node["media_id"]): dict(node)
+                for node in graph.get("nodes", [])
+                if isinstance(node, dict) and node.get("media_id") is not None
+            }
+            sequel_ids: list[int] = []
+            for edge in graph.get("edges", []):
+                if not isinstance(edge, dict):
+                    continue
+                try:
+                    source = int(edge.get("source"))
+                    target = int(edge.get("target"))
+                except (TypeError, ValueError):
+                    continue
+                if source != media_id or str(edge.get("relation_type") or "").upper() != "SEQUEL":
+                    continue
+                if target in nodes and target not in sequel_ids:
+                    sequel_ids.append(target)
+            return nodes, sequel_ids
+
+        graph = self.manager.relation_graph(media_id, force_refresh=False)
+        nodes, sequel_ids = direct_sequels(graph)
+        if not sequel_ids:
+            # A newly announced sequel can be newer than the normal 3-5 day graph
+            # cache. The score surface is user-driven, so one focused refresh is
+            # preferable to silently saying that no sequel exists.
+            try:
+                refreshed = self.manager.relation_graph(media_id, force_refresh=True)
+                nodes, sequel_ids = direct_sequels(refreshed)
+            except Exception as exc:
+                self.logger.warning(
+                    "FALLBACK step=final_sequel.relation_refresh media_id=%s error=%r",
+                    media_id,
+                    exc,
+                )
+        if not sequel_ids:
+            return {"ok": True, "sequel": None}
+
+        sequel = min((nodes[value] for value in sequel_ids), key=self._final_sequel_sort_key)
+        sequel_id = int(sequel["media_id"])
+        list_status = str(sequel.get("list_status") or "").upper()
+        media_status = str(sequel.get("media_status") or "").upper()
+        start_date = str(sequel.get("start_date") or "")
+        today = date.today().isoformat()
+        released = media_status in {"RELEASING", "FINISHED"}
+        if not released and media_status not in {"NOT_YET_RELEASED", "CANCELLED"} and start_date:
+            released = start_date <= today
+
+        already_active = list_status in {"CURRENT", "REPEATING", "COMPLETED"}
+        payload = {
+            "media_id": sequel_id,
+            "title": str(sequel.get("title") or f"AniList #{sequel_id}"),
+            "cover": str(sequel.get("cover_url") or ""),
+            "site_url": str(sequel.get("site_url") or f"https://anilist.co/anime/{sequel_id}"),
+            "start_date": start_date,
+            "season_year": sequel.get("season_year"),
+            "media_status": media_status,
+            "list_status": list_status,
+            "format": str(sequel.get("format") or ""),
+            "episodes": sequel.get("episodes"),
+            "released": bool(released),
+            "can_planning": not already_active and list_status != "PLANNING",
+            "can_watching": bool(released and list_status == "PLANNING"),
+            "can_download": bool(released and not already_active),
+        }
+        return {"ok": True, "sequel": payload}
+
+    def _ensure_final_sequel_local(self, sequel: dict[str, Any]) -> LibraryAnime:
+        media_id = int(sequel["media_id"])
+        existing = self.manager.db.get_anime(media_id)
+        if existing is not None:
+            return existing
+        anime = LibraryAnime(
+            media_id=media_id,
+            title=str(sequel.get("title") or f"AniList #{media_id}"),
+            titles=[str(sequel.get("title") or f"AniList #{media_id}")],
+            cover_url=str(sequel.get("cover") or ""),
+            site_url=str(sequel.get("site_url") or f"https://anilist.co/anime/{media_id}"),
+            status=str(sequel.get("list_status") or ""),
+            episodes=(int(sequel["episodes"]) if sequel.get("episodes") else None),
+            format=str(sequel.get("format") or "") or None,
+            season_year=(int(sequel["season_year"]) if sequel.get("season_year") else None),
+            start_date=str(sequel.get("start_date") or "") or None,
+            media_status=str(sequel.get("media_status") or "") or None,
+        )
+        self.manager.db.upsert_anime(anime)
+        return anime
+
+    def download_final_sequel(self, media_id: int) -> dict[str, Any]:
+        option = self.final_sequel_option(int(media_id))
+        sequel = option.get("sequel")
+        if not isinstance(sequel, dict):
+            return {"ok": False, "reason": "no_sequel"}
+        if not sequel.get("released"):
+            return {"ok": False, "reason": "not_released", "sequel": sequel}
+        if not self.manager.downloads_enabled():
+            return {"ok": False, "reason": "downloads_disabled", "sequel": sequel}
+
+        # Refresh one media row at click time so an airing sequel has an accurate
+        # nextAiringEpisode. Relation-graph caches intentionally live for days and
+        # are sufficient for the score UI, but not for deciding how many episodes
+        # are currently downloadable.
+        anime = None
+        client = None
+        try:
+            client = self._anilist_client()
+            anime = client.library_anime(int(sequel["media_id"]))
+        except Exception as exc:
+            self.logger.warning(
+                "FALLBACK step=final_sequel.media_metadata media_id=%s error=%r",
+                sequel.get("media_id"),
+                exc,
+            )
+        finally:
+            if client is not None:
+                client.close()
+        if anime is None:
+            anime = self._ensure_final_sequel_local(sequel)
+        else:
+            previous = self.manager.db.get_anime(anime.media_id)
+            if previous is not None and previous.relations and not anime.relations:
+                anime.relations = previous.relations
+            self.manager.db.upsert_anime(anime)
+
+        single = str(anime.format or "").upper() == "MOVIE" or anime.episodes == 1
+        if single:
+            release = self.manager.search_and_add_best(
+                anime.media_id,
+                episode=None,
+                batch=False,
+                automatic=False,
+            )
+            if release is None:
+                return {
+                    "ok": False,
+                    "reason": "no_release",
+                    "sequel": sequel,
+                    "message": "No suitable torrent release found yet",
+                }
+            return {
+                "ok": True,
+                "release": release.title,
+                "sequel": sequel,
+                "state": self.get_state(),
+            }
+
+        # Reuse the existing Planning auto-download pipeline: prefer an explicit
+        # season pack, then fall back to each released episode. This does not
+        # change the AniList list status.
+        if str(anime.media_status or "").upper() == "RELEASING" and not anime.next_airing_episode:
+            # AniList occasionally omits nextAiringEpisode briefly. Avoid treating
+            # the full announced episode count as already released.
+            anime.next_airing_episode = 2
+            anime.next_airing_at = int(time.time()) + 86400
+            self.manager.db.upsert_anime(anime)
+        try:
+            job = self.start_planning_episode_download(anime.media_id)
+        except ValueError:
+            return {"ok": False, "reason": "no_release", "sequel": sequel}
+        try:
+            job_media_id = int(job.get("media_id") or 0)
+        except (TypeError, ValueError):
+            job_media_id = 0
+        if job_media_id and job_media_id != int(anime.media_id):
+            return {
+                "ok": False,
+                "reason": "download_busy",
+                "sequel": sequel,
+                "job": job,
+            }
+        return {
+            "ok": True,
+            "background": True,
+            "job": job,
+            "sequel": sequel,
+            "state": self.get_state(),
+        }
+
+    def poll_anilist_related_media_notifications(self) -> dict[str, Any]:
+        """Fetch recent AniList RELATED_MEDIA_ADDITION notifications for anime.
+
+        The AniList unread counter is intentionally untouched. Pudge keeps its own
+        small seen-id list so showing a notification here does not mark it read on
+        AniList itself.
+        """
+        if not self.config.anilist.enabled or not self.config.anilist.access_token.strip():
+            return {"notifications": []}
+
+        cache_key = "anilist.related_media_additions.cache:v1"
+        checked_key = "anilist.related_media_additions.checked_at:v1"
+        seen_key = "anilist.related_media_additions.seen:v1"
+        now = time.time()
+        try:
+            checked_at = float(self.manager.db.get_state(checked_key, "0") or 0)
+        except ValueError:
+            checked_at = 0.0
+        try:
+            cached = json.loads(self.manager.db.get_state(cache_key, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            cached = []
+        if now - checked_at < 300:
+            return {"notifications": cached if isinstance(cached, list) else []}
+
+        try:
+            seen_values = json.loads(self.manager.db.get_state(seen_key, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            seen_values = []
+        seen = {int(value) for value in seen_values if str(value).isdigit()}
+
+        client = self._anilist_client()
+        try:
+            rows = client.related_media_addition_notifications(per_page=30)
+        except Exception as exc:
+            self.logger.warning("RETRY step=anilist.related_media_notifications error=%r", exc)
+            self.manager.db.set_state(checked_key, str(now))
+            return {
+                "notifications": cached if isinstance(cached, list) else [],
+                "warning": str(exc),
+            }
+        finally:
+            client.close()
+
+        cutoff = int(now - 7 * 86400)
+        pending = [
+            row
+            for row in rows
+            if str(row.get("media_type") or "").upper() == "ANIME"
+            and int(row.get("id") or 0) not in seen
+            and int(row.get("created_at") or 0) >= cutoff
+        ][:12]
+        self.manager.db.set_state(cache_key, json.dumps(pending, ensure_ascii=False))
+        self.manager.db.set_state(checked_key, str(now))
+        return {"notifications": pending}
+
+    def mark_anilist_related_media_notifications_seen(self, ids: list[int]) -> dict[str, Any]:
+        seen_key = "anilist.related_media_additions.seen:v1"
+        cache_key = "anilist.related_media_additions.cache:v1"
+        try:
+            previous = json.loads(self.manager.db.get_state(seen_key, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            previous = []
+        seen = {int(value) for value in previous if str(value).isdigit()}
+        for value in ids:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                seen.add(parsed)
+        kept = sorted(seen, reverse=True)[:500]
+        self.manager.db.set_state(seen_key, json.dumps(kept))
+        try:
+            cached = json.loads(self.manager.db.get_state(cache_key, "[]") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            cached = []
+        if isinstance(cached, list):
+            cached = [row for row in cached if int(row.get("id") or 0) not in seen]
+            self.manager.db.set_state(cache_key, json.dumps(cached, ensure_ascii=False))
+        return {"ok": True}
+
     def move_planned_to_watching(self, media_id: int) -> dict[str, Any]:
         client = self._anilist_client()
         try:
@@ -9691,6 +11119,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "release": release.title if release is not None else "",
             "state": self.get_state(),
         }
+
+    def set_anime_watching(self, media_id: int) -> dict[str, Any]:
+        """Move an AniList entry to CURRENT without implicitly starting a download."""
+        client = self._anilist_client()
+        try:
+            client.set_list_status(int(media_id), "CURRENT")
+        finally:
+            client.close()
+        self._set_local_anilist_status(int(media_id), "CURRENT")
+        return {"ok": True, "state": self.get_state()}
 
     def add_to_planning(self, media_id: int) -> dict[str, Any]:
         client = self._anilist_client()
@@ -12421,7 +13859,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             binary=str(values.get("aria2_binary", cfg.binary)).strip() or "aria2c",
             rpc_port=max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.rpc_port)))),
             pre_download_command=str(values.get("download_hook", self.config.qbittorrent.pre_download_command)).strip(),
-            auto_start=True,
+            auto_start=False,
             seed_mode=str(values.get("aria2_seed_mode", cfg.seed_mode)),
             seed_ratio=float(values.get("aria2_seed_ratio", cfg.seed_ratio)),
             seed_time_minutes=float(values.get("aria2_seed_time_minutes", cfg.seed_time_minutes)),
@@ -12653,17 +14091,52 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._play_exit_codes.pop(key, None)
         return {"status": "idle"}
 
+    def _personal_schedule_draft(
+        self, anime: LibraryAnime
+    ) -> tuple[list[int], bool, Any | None, bool, str]:
+        order, reason = self._personal_schedule_episode_order(anime)
+        if not order:
+            return [], False, None, False, reason
+        existing = self.manager.db.personal_release_schedule(
+            anime.media_id, advance_unlocks=False
+        )
+        if existing is not None and existing.enabled and existing.items:
+            return (
+                [int(item.episode) for item in existing.items],
+                bool(existing.rewatch),
+                existing,
+                False,
+                "",
+            )
+        total = int(anime.episodes or 0)
+        rewatch = bool(total and anime.progress >= total)
+        first = 1 if rewatch else max(1, int(anime.next_episode))
+        episodes = [episode for episode in order if episode >= first]
+        return episodes, rewatch, existing, bool(existing is not None and not existing.enabled), ""
+
     def personal_schedule_get(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
             return {"ok": False, "error": "Anime not found"}
         snapshot = self._personal_schedule_snapshot(anime)
-        if snapshot.get("enabled") and snapshot.get("start_local_datetime") and snapshot.get("timezone_iana"):
-            snapshot["preview"] = preview_weekly_dates(
-                start_local_datetime=str(snapshot["start_local_datetime"]),
-                timezone_iana=str(snapshot["timezone_iana"]),
-                count=max(1, int(snapshot.get("total_count") or 1)),
-            )
+        schedule = self.manager.db.personal_release_schedule(
+            anime.media_id, advance_unlocks=False
+        )
+        if schedule is not None and schedule.enabled:
+            snapshot["preview"] = [
+                {
+                    "episode": int(item.episode),
+                    "ordinal": int(item.ordinal),
+                    "local": local_iso_from_epoch(item.unlock_at_utc, schedule.timezone_iana),
+                    "nominal_local": item.nominal_local_datetime,
+                    "unlock_at_utc": float(item.unlock_at_utc),
+                    "dst_adjusted": bool(item.dst_adjusted),
+                    "preserved": bool(item.unlocked or item.watched_at is not None),
+                    "unlocked": bool(item.unlocked),
+                    "watched": item.watched_at is not None,
+                }
+                for item in schedule.items
+            ]
         else:
             snapshot["preview"] = []
         return {"ok": True, "schedule": snapshot}
@@ -12673,31 +14146,44 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         media_id: int,
         start_local_datetime: str,
         timezone_iana: str,
+        rule_unit: str = "weeks",
+        rule_every: int = 1,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
             return {"ok": False, "error": "Anime not found"}
-        order, reason = self._personal_schedule_episode_order(anime)
-        if not order:
-            return {"ok": False, "error": reason}
+        episodes, rewatch, existing, new_cycle, reason = self._personal_schedule_draft(anime)
+        if not episodes:
+            return {"ok": False, "error": reason or "Schedule has no episodes"}
+        actual_revision = int(existing.revision) if existing is not None else 0
+        if expected_revision is not None and int(expected_revision) != actual_revision:
+            return {
+                "ok": False,
+                "conflict": True,
+                "error": "Schedule changed in another window. Reload it before saving.",
+                "revision": actual_revision,
+                "schedule": self._personal_schedule_snapshot(anime),
+            }
         try:
-            preview = preview_weekly_dates(
+            rule = normalize_schedule_rule(rule_unit, rule_every)
+            preview = preview_schedule_dates(
+                episodes,
                 start_local_datetime=str(start_local_datetime),
                 timezone_iana=str(timezone_iana),
-                count=max(1, len(order)),
+                rule=rule,
+                previous_items=(existing.items if existing is not None and existing.enabled else ()),
             )
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             return {"ok": False, "error": str(exc)}
-        first_episode = 1 if anime.progress >= int(anime.episodes or 0) else max(1, anime.next_episode)
         return {
             "ok": True,
-            "preview": [
-                {**row, "episode": first_episode + int(row["ordinal"])}
-                for row in preview
-                if first_episode + int(row["ordinal"]) <= int(anime.episodes or first_episode)
-            ],
-            "rewatch": bool(anime.progress >= int(anime.episodes or 0)),
-            "first_episode": first_episode,
+            "preview": preview,
+            "rewatch": rewatch,
+            "first_episode": episodes[0],
+            "revision": actual_revision,
+            "new_cycle": new_cycle,
+            "rule": rule.as_dict(),
         }
 
     def personal_schedule_save(
@@ -12705,42 +14191,58 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         media_id: int,
         start_local_datetime: str,
         timezone_iana: str,
+        rule_unit: str = "weeks",
+        rule_every: int = 1,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
             return {"ok": False, "error": "Anime not found"}
-        order, reason = self._personal_schedule_episode_order(anime)
-        if not order:
-            return {"ok": False, "error": reason}
-        existing = self.manager.db.personal_release_schedule(anime.media_id)
-        if existing and existing.enabled and existing.items:
-            episodes = [item.episode for item in existing.items]
-            rewatch = bool(existing.rewatch)
-        else:
-            total = int(anime.episodes or 0)
-            rewatch = bool(total and anime.progress >= total)
-            first = 1 if rewatch else max(1, int(anime.next_episode))
-            episodes = [episode for episode in order if episode >= first]
+        episodes, rewatch, existing, new_cycle, reason = self._personal_schedule_draft(anime)
+        if not episodes:
+            return {"ok": False, "error": reason or "Schedule has no episodes"}
         try:
+            rule = normalize_schedule_rule(rule_unit, rule_every)
             schedule = self.manager.db.save_personal_release_schedule(
                 anime.media_id,
                 episodes=episodes,
                 start_local_datetime=str(start_local_datetime),
                 timezone_iana=str(timezone_iana),
                 rewatch=rewatch,
+                rule_unit=rule.unit,
+                rule_every=rule.every,
+                expected_revision=expected_revision,
+                new_cycle=new_cycle,
             )
-        except ValueError as exc:
+        except PersonalScheduleRevisionConflict as exc:
+            return {
+                "ok": False,
+                "conflict": True,
+                "error": "Schedule changed in another window. Reload it before saving.",
+                "expected_revision": exc.expected_revision,
+                "revision": exc.actual_revision,
+                "schedule": self._personal_schedule_snapshot(anime),
+            }
+        except (ValueError, OverflowError) as exc:
             return {"ok": False, "error": str(exc)}
         self.logger.info(
-            "EVENT personal_schedule.saved media_id=%s revision=%s first_episode=%s items=%s timezone=%s rewatch=%s",
+            "EVENT personal_schedule.saved media_id=%s revision=%s cycle=%s first_episode=%s items=%s timezone=%s rule=%sx%s clock=%s rewatch=%s",
             anime.media_id,
             schedule.revision,
+            schedule.cycle_id,
             schedule.first_episode,
             len(schedule.items),
             schedule.timezone_iana,
+            schedule.rule.every,
+            schedule.rule.unit,
+            schedule.rule.clock,
             schedule.rewatch,
         )
-        return {"ok": True, "schedule": self._personal_schedule_snapshot(anime), "state": self._get_state(refresh_storage=False)}
+        return {
+            "ok": True,
+            "schedule": self._personal_schedule_snapshot(anime),
+            "state": self._get_state(refresh_storage=False),
+        }
 
     def personal_schedule_tick(self) -> dict[str, Any]:
         delivered: list[dict[str, Any]] = []
@@ -12752,7 +14254,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if snapshot.get("status") != "new_ready" or snapshot.get("next_episode") is None:
                 continue
             episode = int(snapshot["next_episode"])
-            key = f"personal_schedule_notification:{schedule.schedule_id}:{episode}:ready"
+            key = f"personal_schedule_notification:{schedule.schedule_id}:{schedule.cycle_id}:{episode}:ready"
             if self.manager.db.get_state(key, ""):
                 continue
             if not self.config.ui.notifications_enabled:
@@ -12774,6 +14276,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 )
             if ok:
                 self.manager.db.set_state(key, "delivered")
+                self.manager.db.set_state(
+                    f"personal_schedule_notification:{schedule.schedule_id}:{episode}:ready",
+                    "delivered",
+                )
                 delivered.append({"media_id": anime.media_id, "episode": episode})
             self.logger.info(
                 "EVENT personal_schedule.notification media_id=%s episode=%s delivered=%s",
@@ -13766,14 +15272,30 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             result.append(payload)
         return result
 
-    def _ready_queue_items(self, media_ids: list[int], *, limit: int | None = None) -> list[dict[str, object]]:
-        anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
+    def _ready_queue_items(
+        self,
+        media_ids: list[int],
+        *,
+        limit: int | None = None,
+        anime_by_id: dict[int, LibraryAnime] | None = None,
+    ) -> list[dict[str, object]]:
+        # This helper is called while building every anime card. Loading the
+        # complete AniList table here made get_state() O(cards * library size)
+        # and added several seconds to the first Anime render. Resolve only the
+        # requested media IDs, reusing already-loaded LibraryAnime rows when
+        # the caller has them.
+        known_anime = dict(anime_by_id or {})
         items: list[dict[str, object]] = []
         seen_paths: set[str] = set()
         for media_id in media_ids:
-            anime = anime_by_id.get(int(media_id))
+            media_id = int(media_id)
+            anime = known_anime.get(media_id)
+            if anime is None:
+                anime = self.manager.db.get_anime(media_id)
+                if anime is not None:
+                    known_anime[media_id] = anime
             episodes = sorted(
-                self.manager.db.episodes(int(media_id)),
+                self.manager.db.episodes(media_id),
                 key=lambda episode: (
                     episode.episode is None,
                     int(episode.episode or 0),
@@ -13974,11 +15496,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             config_path=self.config_path,
                             database_path=self.config.library.database_path,
                             cache_dir=self.config.paths.cache_dir,
+                            post_commit=self._reload_runtime_services_after_restore,
                         )
-                        self._reload_runtime_services_after_restore()
                     except Exception:
-                        # restore_backup rolls live files back atomically. Rebind
-                        # services to that rolled-back state before surfacing error.
+                        # restore_backup also rolls back failures during runtime
+                        # rebind; reopen the original services after rollback.
                         self._reload_runtime_services_after_restore()
                         raise
                     finally:

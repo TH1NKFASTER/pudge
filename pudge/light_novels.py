@@ -1108,6 +1108,10 @@ class LightNovelService:
         self._state_refresh_lock = threading.Lock()
         self._state_refreshing = False
         self._state_version = 0
+        self._state_last_success: float | None = None
+        self._state_retry_after = 0.0
+        self._state_retry_failures = 0
+        self._literature_active_account = self._literature_account()
         self._prefetch_lock = threading.Lock()
         self._prefetch_generation = 0
         self._reader_generation = 0
@@ -1129,6 +1133,8 @@ class LightNovelService:
         self._jiten_optimal_stats_lock = threading.Lock()
         self._jiten_optimal_stats_cache: dict[str, tuple[float, dict[str, int]]] = {}
         self._ensure_schema()
+        self._load_literature_snapshot()
+        self._reconcile_local_series_links()
 
     def _log(self, message: str, *args: Any) -> None:
         if self.logger:
@@ -1535,16 +1541,17 @@ class LightNovelService:
         """Reuse an AniList work already linked by another local volume."""
         book = self.book(int(book_id))
         key = _series_key(str(book.get("title") or Path(str(book.get("file_path") or "")).stem))
-        if not key:
+        if not key or book.get("anilist_id") is not None:
             return False
         with self._connection() as conn:
             rows = conn.execute(
                 "SELECT * FROM ln_books WHERE id<>? AND anilist_id IS NOT NULL ORDER BY updated_at DESC",
                 (int(book_id),),
             ).fetchall()
-            match = next((row for row in rows if _series_key(str(row["title"] or "")) == key), None)
-            if match is None:
+            candidates = [row for row in rows if _series_key(str(row["title"] or "")) == key]
+            if len({int(row["anilist_id"]) for row in candidates}) != 1:
                 return False
+            match = candidates[0]
             conn.execute(
                 """UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,
                    anilist_total_volumes=?,anilist_user_score=?,
@@ -1564,9 +1571,9 @@ class LightNovelService:
             return 0
         changed = 0
         with self._connection() as conn:
-            rows = conn.execute("SELECT id,title FROM ln_books WHERE id<>?", (int(book_id),)).fetchall()
+            rows = conn.execute("SELECT id,title,anilist_id FROM ln_books WHERE id<>?", (int(book_id),)).fetchall()
             for row in rows:
-                if _series_key(str(row["title"] or "")) != key:
+                if _series_key(str(row["title"] or "")) != key or row["anilist_id"] is not None:
                     continue
                 conn.execute(
                     """UPDATE ln_books SET anilist_id=?,anilist_status=?,anilist_progress_volumes=?,
@@ -2464,6 +2471,47 @@ class LightNovelService:
                     raise
 
         return [ready[pair] for pair in ordered if pair in ready]
+
+    def jiten_card_media(self, pairs: list[tuple[int, int]]) -> dict[tuple[int, int], dict[str, Any]]:
+        """Best-effort fetch of the user's Jiten per-card media for review UI."""
+        ordered: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
+        for raw_word_id, raw_reading_index in pairs:
+            try:
+                pair = (int(raw_word_id), int(raw_reading_index))
+            except (TypeError, ValueError):
+                continue
+            if pair[0] <= 0 or pair[1] < 0 or pair in seen:
+                continue
+            seen.add(pair)
+            ordered.append(pair)
+        if not ordered:
+            return {}
+
+        result: dict[tuple[int, int], dict[str, Any]] = {}
+        for offset in range(0, len(ordered), 500):
+            chunk = ordered[offset : offset + 500]
+            payload = self._jiten_request(
+                "srs/card-media/batch",
+                {
+                    "items": [
+                        {"wordId": word_id, "readingIndex": reading_index}
+                        for word_id, reading_index in chunk
+                    ]
+                },
+            )
+            rows = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    pair = (int(row.get("wordId")), int(row.get("readingIndex")))
+                except (TypeError, ValueError):
+                    continue
+                result[pair] = dict(row)
+        return result
 
     def jiten_optimal_word_stats(self, *, force: bool = False) -> dict[str, int]:
         """Return the account Mature count and N+1 frequency ceiling.
@@ -3885,11 +3933,30 @@ class LightNovelService:
             raise LightNovelError("Strict pre-episode review gate currently supports Jiten only")
         try:
             provider = JitenReviewProvider(settings.jiten_api_key)
-            return provider.list_strict_review_candidates(
+            result = provider.list_strict_review_candidates(
                 required=max(1, int(required)),
                 exclude_keys=set(exclude_keys or set()),
                 trusted_previous_keys=set(trusted_previous_keys or set()),
             )
+            cards = [card for card in (result.get("cards") or []) if isinstance(card, dict)]
+            if cards:
+                try:
+                    media = self.jiten_card_media([
+                        (int(card.get("wordId")), int(card.get("readingIndex")))
+                        for card in cards
+                    ])
+                    for card in cards:
+                        pair = (int(card.get("wordId")), int(card.get("readingIndex")))
+                        row = media.get(pair) if isinstance(media, dict) else None
+                        image = row.get("image") if isinstance(row, dict) else None
+                        url = str(image.get("url") or "").strip() if isinstance(image, dict) else ""
+                        if url:
+                            card["pudgeContextImage"] = url
+                except Exception:
+                    # User card media is optional and must never make the gate fail.
+                    pass
+                result["cards"] = cards
+            return result
         except ReviewProviderError as exc:
             raise LightNovelError(str(exc)) from exc
 
@@ -3929,6 +3996,21 @@ class LightNovelService:
             return result
         except ReviewOutcomeUnknown:
             raise
+        except ReviewProviderError as exc:
+            raise LightNovelError(str(exc)) from exc
+
+    def strict_review_undo(self, word_id: int, reading_index: int) -> dict[str, Any]:
+        settings = self.settings()
+        backend = str(settings.study_backend or "jiten").casefold()
+        if backend != "jiten":
+            raise LightNovelError("Strict pre-episode review gate currently supports Jiten only")
+        try:
+            provider = JitenReviewProvider(settings.jiten_api_key)
+            started = time.perf_counter()
+            result = provider.undo_review(int(word_id), int(reading_index))
+            self.invalidate_jiten_live_state(int(word_id), int(reading_index))
+            result["mutation_ms"] = round((time.perf_counter() - started) * 1000.0, 1)
+            return result
         except ReviewProviderError as exc:
             raise LightNovelError(str(exc)) from exc
 
@@ -4167,15 +4249,115 @@ class LightNovelService:
             raise LightNovelError(str(data["errors"][0].get("message") or "AniList error"))
         return data.get("data") or {}
 
+    def _literature_account(self) -> str:
+        """Partition cached personal AniList state without storing the access token."""
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return ""
+        return hashlib.sha256(str(self.config.anilist.access_token).encode("utf-8")).hexdigest()
+
+    def _ensure_literature_account(self) -> None:
+        # Some callers construct a lightweight, read-only service projection
+        # without running __init__. It cannot own a mutable account cache.
+        if not hasattr(self, "_literature_active_account"):
+            return
+        account = self._literature_account()
+        if account == self._literature_active_account:
+            return
+        with self._state_refresh_lock:
+            if account == self._literature_active_account:
+                return
+            # A service can outlive a Settings account switch. Do not display
+            # another account's personal reading status from its RAM cache.
+            self._literature_active_account = account
+            self._anilist_cache = None
+            self._state_last_success = None
+            self._state_retry_after = 0.0
+            self._state_version += 1
+        self._load_literature_snapshot()
+
+    def _load_literature_snapshot(self) -> None:
+        account = self._literature_account()
+        if not account:
+            return
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    "SELECT value FROM ln_settings WHERE key=?",
+                    ("anilist_literature_snapshot:v1",),
+                ).fetchone()
+            payload = json.loads(str(row[0])) if row else {}
+            rows = payload.get("items") if isinstance(payload, dict) else None
+            if payload.get("account") == account and isinstance(rows, list) and all(isinstance(item, dict) for item in rows):
+                # On restart show the last successful grouping immediately, but
+                # never treat this disk snapshot as a fresh network response.
+                self._anilist_cache = (time.monotonic() - 301.0, [dict(item) for item in rows])
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            self._log("LN literature snapshot unreadable; refreshing in background")
+
+    def _save_literature_snapshot(self, rows: list[dict[str, Any]], account: str) -> None:
+        if not account or account != self._literature_account():
+            return
+        data = json.dumps({"account": account, "items": rows}, ensure_ascii=False)
+        # A corrupt/oversized API response must not displace the last usable
+        # snapshot. Normal libraries are well below this limit.
+        if len(data.encode("utf-8")) > 8 * 1024 * 1024:
+            self._log("LN literature snapshot exceeds 8 MiB; retaining previous snapshot")
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "INSERT INTO ln_settings(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("anilist_literature_snapshot:v1", data),
+            )
+
+    def _reconcile_local_series_links(self) -> int:
+        """Before the first UI snapshot inherit only unambiguous local links.
+
+        This is a single small local transaction, never a per-poll network scan.
+        Conflicting explicit AniList identities remain separate.
+        """
+        changed = 0
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id,title,file_path,anilist_id,anilist_status,"
+                "anilist_progress_volumes,anilist_total_volumes,anilist_user_score,cover_url "
+                "FROM ln_books ORDER BY id"
+            ).fetchall()
+            groups: dict[str, list[Any]] = {}
+            for row in rows:
+                key = _series_key(str(row["title"] or Path(str(row["file_path"] or "")).stem))
+                if key:
+                    groups.setdefault(key, []).append(row)
+            for group in groups.values():
+                donors = [row for row in group if row["anilist_id"] is not None]
+                if len({int(row["anilist_id"]) for row in donors}) != 1:
+                    continue
+                donor = donors[0]
+                for row in group:
+                    if row["anilist_id"] is not None:
+                        continue
+                    conn.execute(
+                        "UPDATE ln_books SET anilist_id=?,anilist_status=?,"
+                        "anilist_progress_volumes=?,anilist_total_volumes=?,anilist_user_score=?,"
+                        "cover_url=CASE WHEN cover_url='' THEN ? ELSE cover_url END,updated_at=? WHERE id=?",
+                        (donor["anilist_id"], donor["anilist_status"], donor["anilist_progress_volumes"],
+                         donor["anilist_total_volumes"], donor["anilist_user_score"], donor["cover_url"],
+                         time.time(), int(row["id"])),
+                    )
+                    changed += 1
+        return changed
+
     def anilist_literature(self, *, force: bool = False) -> list[dict[str, Any]]:
+        self._ensure_literature_account()
         if not self.config.anilist.enabled or not self.config.anilist.access_token:
             return []
         if not force and self._anilist_cache is not None and time.monotonic() - self._anilist_cache[0] < 300:
             return [dict(item) for item in self._anilist_cache[1]]
+        account = self._literature_account()
         viewer = self._anilist_post("query { Viewer { id } }", {}).get("Viewer") or {}
         uid = viewer.get("id")
         if not uid:
-            return []
+            raise LightNovelError("AniList viewer unavailable; keeping cached library")
         collection_query = """
         query($userId:Int!){MediaListCollection(userId:$userId,type:MANGA){lists{entries{status progress progressVolumes score(format:POINT_10) media{id format chapters volumes status synonyms meanScore genres startDate{year} title{userPreferred romaji english native}coverImage{extraLarge large}siteUrl relations{edges{relationType node{id format}}}}}}}}
         """
@@ -4208,7 +4390,15 @@ class LightNovelService:
                     ],
                     "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
                 })
+        if account != self._literature_account():
+            # The credentials changed during the request; do not publish a
+            # previous account's personal list into this service.
+            return []
         self._anilist_cache = (time.monotonic(), [dict(item) for item in items])
+        try:
+            self._save_literature_snapshot(items, account)
+        except (OSError, sqlite3.Error) as exc:
+            self._log("LN literature snapshot save failed: %s", exc)
         return items
 
     def anilist_novels(self, *, force: bool = False) -> list[dict[str, Any]]:
@@ -4822,6 +5012,7 @@ class LightNovelService:
         return results
 
     def _state_payload_fast(self) -> dict[str, Any]:
+        self._ensure_literature_account()
         literature = [dict(item) for item in (self._anilist_cache[1] if self._anilist_cache is not None else [])]
         novels = [item for item in literature if str(item.get("format") or "").upper() == "NOVEL"]
         planning = [item for item in literature if str(item.get("status") or "").upper() == "PLANNING"]
@@ -4857,38 +5048,51 @@ class LightNovelService:
         }
 
     def request_state_refresh(self, *, force: bool = False) -> bool:
+        self._ensure_literature_account()
         with self._state_refresh_lock:
             if self._state_refreshing:
                 return False
+            if not force and time.monotonic() < self._state_retry_after:
+                return False
             self._state_refreshing = True
+        account = self._literature_account()
 
         def worker() -> None:
+            success = False
             try:
                 self._migrate_inline_covers()
                 self.scan_downloaded()
                 self.reindex_outdated_sources()
-                # Local series inheritance needs no network and should happen even
-                # while AniList is unavailable.
-                for book in self.books():
-                    if not book.get("anilist_id"):
-                        self._inherit_series_anilist(int(book["id"]))
-                novels = self.anilist_novels(force=force) if self.config.anilist.enabled and self.config.anilist.access_token else []
-                if novels:
-                    self.auto_bind_anilist()
+                self._reconcile_local_series_links()
+                if account and account == self._literature_account():
+                    self.anilist_novels(force=force)
+                    if account != self._literature_account():
+                        return
+                    if self._anilist_cache is not None and self._anilist_cache[1]:
+                        self.auto_bind_anilist()
+                success = account == self._literature_account()
             except Exception as exc:
                 self._log("LN background refresh failed: %s", exc)
             finally:
                 with self._state_refresh_lock:
                     self._state_refreshing = False
                     self._state_version += 1
+                    if success:
+                        self._state_last_success = time.monotonic()
+                        self._state_retry_failures = 0
+                        self._state_retry_after = self._state_last_success + 300.0
+                    else:
+                        self._state_retry_failures += 1
+                        delay = min(300.0, 10.0 * (3 ** (self._state_retry_failures - 1)))
+                        self._state_retry_after = time.monotonic() + delay
 
         threading.Thread(target=worker, name="ln-state-refresh", daemon=True).start()
         return True
 
     def state(self) -> dict[str, Any]:
-        # Never block the WebView bridge on AniList/EPUB scanning. Trigger one
-        # initial background fill; later refreshes are explicit and guarded.
-        if self._state_version == 0 and self._anilist_cache is None and not self._state_refreshing:
+        # The disk snapshot is displayable immediately, even if the network is
+        # offline. Retry a failed refresh on later entries with bounded backoff.
+        if not self._state_refreshing and time.monotonic() >= self._state_retry_after:
             self.request_state_refresh(force=False)
         return self._state_payload_fast()
 

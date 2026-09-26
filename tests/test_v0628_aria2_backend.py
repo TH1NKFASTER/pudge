@@ -62,6 +62,7 @@ def test_aria2_add_and_list_preserves_anime_metadata(tmp_path: Path, monkeypatch
     gid = "0123456789abcdef"
 
     monkeypatch.setattr(client, "ensure_running", lambda: None)
+    monkeypatch.setattr(client, "_probe", lambda: True)
     monkeypatch.setattr(client, "_torrent_payload", lambda _url: None)
 
     def rpc(method: str, params=None):
@@ -180,6 +181,7 @@ def test_aria2_start_and_pause_are_idempotent(tmp_path: Path, monkeypatch) -> No
     calls: list[str] = []
     states = iter(("active", "paused", "paused", "active"))
     monkeypatch.setattr(client, "ensure_running", lambda: None)
+    monkeypatch.setattr(client, "_probe", lambda: True)
     monkeypatch.setattr(client, "_resolve_gid", lambda _value: "0123456789abcdef")
 
     def rpc(method: str, params=None):
@@ -353,6 +355,7 @@ def test_aria2_exposes_verification_without_publishing_completion(
         }
     )
     monkeypatch.setattr(client, "ensure_running", lambda: None)
+    monkeypatch.setattr(client, "_probe", lambda: True)
 
     def rpc(method: str, params=None):
         if method == "aria2.tellActive":
@@ -445,6 +448,7 @@ def test_aria2_delete_removes_owned_metadata(tmp_path: Path, monkeypatch) -> Non
     }
     client._save_metadata(metadata)
     monkeypatch.setattr(client, "ensure_running", lambda: None)
+    monkeypatch.setattr(client, "_probe", lambda: True)
 
     def rpc(method: str, params=None):
         if method in {"aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"}:
@@ -490,6 +494,7 @@ def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, mo
         }
     )
     monkeypatch.setattr(client, "ensure_running", lambda: None)
+    monkeypatch.setattr(client, "_probe", lambda: True)
 
     def rpc(method: str, params=None):
         if method == "aria2.tellActive":

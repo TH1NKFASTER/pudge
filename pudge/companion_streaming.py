@@ -84,6 +84,7 @@ class CompanionStreamingService:
         self._subtitle_lock = threading.RLock()
         self._jobs: dict[str, _Job] = {}
         self._tickets: dict[str, _Ticket] = {}
+        self._preparing_cache_keys: set[str] = set()
         self._closed = False
 
     def _log(self, level: str, message: str, *args: object) -> None:
@@ -191,6 +192,8 @@ class CompanionStreamingService:
     ) -> _Ticket:
         now = time.time()
         with self._lock:
+            if self._closed:
+                raise ValueError("Companion streaming is shutting down")
             for ticket in self._tickets.values():
                 if (
                     ticket.cache_key == cache_key
@@ -231,33 +234,49 @@ class CompanionStreamingService:
         return total
 
     def cleanup_cache(self, *, keep: set[str] | None = None) -> dict[str, int]:
-        keep = set(keep or ())
         now = time.time()
-        entries: list[tuple[float, int, Path]] = []
         removed = 0
         removed_bytes = 0
-        for path in self.cache_root.iterdir() if self.cache_root.is_dir() else ():
-            if not path.is_dir() or path.name in keep:
-                continue
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            size = self._directory_size(path)
-            if now - mtime > _CACHE_MAX_AGE_SECONDS:
+        # Serialize cleanup with ticket creation, transcoder startup and prepare.
+        # A second device must not evict the files currently served to the first.
+        with self._lock:
+            protected = set(keep or ()) | self._preparing_cache_keys
+            protected.update(
+                ticket.cache_key for ticket in self._tickets.values()
+                if ticket.expires_at > now
+            )
+            protected.update(
+                key for key, job in self._jobs.items() if job.state == "preparing"
+            )
+            entries: list[tuple[float, int, Path]] = []
+            protected_bytes = 0
+            for path in self.cache_root.iterdir() if self.cache_root.is_dir() else ():
+                if not path.is_dir():
+                    continue
+                if path.name in protected:
+                    protected_bytes += self._directory_size(path)
+                    continue
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                size = self._directory_size(path)
+                if now - mtime > _CACHE_MAX_AGE_SECONDS:
+                    shutil.rmtree(path, ignore_errors=True)
+                    removed += 1
+                    removed_bytes += size
+                    continue
+                entries.append((mtime, size, path))
+            # Protected streams still consume disk space. Include them in the
+            # budget, but never evict their files to satisfy that budget.
+            total = protected_bytes + sum(size for _mtime, size, _path in entries)
+            for _mtime, size, path in sorted(entries):
+                if total <= _CACHE_MAX_BYTES:
+                    break
                 shutil.rmtree(path, ignore_errors=True)
+                total -= size
                 removed += 1
                 removed_bytes += size
-                continue
-            entries.append((mtime, size, path))
-        total = sum(size for _mtime, size, _path in entries)
-        for _mtime, size, path in sorted(entries):
-            if total <= _CACHE_MAX_BYTES:
-                break
-            shutil.rmtree(path, ignore_errors=True)
-            total -= size
-            removed += 1
-            removed_bytes += size
         return {"removed": removed, "removed_bytes": removed_bytes, "remaining_bytes": max(0, total)}
 
     def _ffmpeg_path(self) -> str:
@@ -582,6 +601,11 @@ class CompanionStreamingService:
                     resource="gpu",
                 )
                 if lease is None:
+                    with self._lock:
+                        if not self._closed:
+                            job.state = "failed"
+                            job.error = "Streaming work slot unavailable"
+                            job.finished_at = time.time()
                     return
             for encoder in encoders:
                 if self._closed:
@@ -589,22 +613,27 @@ class CompanionStreamingService:
                 self._clear_hls_files(output_dir)
                 command = self._command(job.video_path, output_dir, encoder)
                 self._log("info", "START step=companion.hls entity=%s encoder=%s", job.entity_id, encoder)
-                try:
-                    process = subprocess.Popen(
-                        command,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
-                except OSError as exc:
-                    error = str(exc)
-                    continue
+                # The spawn and registration must be atomic with close().
                 with self._lock:
+                    if self._closed:
+                        return
+                    try:
+                        process = subprocess.Popen(
+                            command,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                        )
+                    except OSError as exc:
+                        error = str(exc)
+                        continue
                     job.process = process
                     job.encoder = encoder
                     job.state = "preparing"
                 stderr = process.communicate()[1] or b""
                 if process.returncode == 0 and self._playlist_ready(output_dir):
                     with self._lock:
+                        if self._closed:
+                            return
                         job.state = "ready"
                         job.finished_at = time.time()
                         job.error = ""
@@ -615,23 +644,48 @@ class CompanionStreamingService:
                         pass
                     self._log("info", "RESULT step=companion.hls entity=%s encoder=%s", job.entity_id, encoder)
                     if self.cache_registry is not None:
-                        self.cache_registry.register(
-                            "hls",
-                            output_dir,
-                            expires_at=time.time() + _CACHE_MAX_AGE_SECONDS,
-                            metadata={"entity_id": job.entity_id, "encoder": encoder},
-                        )
-                        self.cache_registry.enforce(
-                            {"hls": CachePolicy(_CACHE_MAX_BYTES, _CACHE_MAX_AGE_SECONDS)}
-                        )
+                        try:
+                            with self._lock:
+                                protected = self._preparing_cache_keys.copy()
+                                protected.add(job.cache_key)
+                                protected.update(
+                                    ticket.cache_key for ticket in self._tickets.values()
+                                    if ticket.expires_at > time.time()
+                                )
+                                protected.update(
+                                    key for key, active in self._jobs.items()
+                                    if active.state == "preparing"
+                                )
+                                self.cache_registry.register(
+                                    "hls",
+                                    output_dir,
+                                    expires_at=time.time() + _CACHE_MAX_AGE_SECONDS,
+                                    metadata={"entity_id": job.entity_id, "encoder": encoder},
+                                )
+                                self.cache_registry.enforce(
+                                    {"hls": CachePolicy(_CACHE_MAX_BYTES, _CACHE_MAX_AGE_SECONDS)},
+                                    protected_paths={self.cache_root / key for key in protected},
+                                )
+                        except Exception as exc:
+                            # Cache bookkeeping must not invalidate a playable stream.
+                            self._log("warning", "SKIP step=companion.hls_cache error=%r", str(exc))
                     return
                 error = stderr.decode("utf-8", errors="replace")[-1800:].strip() or f"ffmpeg exited {process.returncode}"
                 self._log("warning", "FALLBACK step=companion.hls entity=%s encoder=%s error=%r", job.entity_id, encoder, error)
             with self._lock:
-                job.state = "failed"
-                job.finished_at = time.time()
-                job.error = error or "Unable to prepare HLS stream"
-                job.process = None
+                if not self._closed:
+                    job.state = "failed"
+                    job.finished_at = time.time()
+                    job.error = error or "Unable to prepare HLS stream"
+                    job.process = None
+        except Exception as exc:
+            self._log("warning", "FAIL step=companion.hls entity=%s error=%r", job.entity_id, str(exc))
+            with self._lock:
+                if not self._closed:
+                    job.state = "failed"
+                    job.finished_at = time.time()
+                    job.error = str(exc)
+                    job.process = None
         finally:
             if lease is not None:
                 lease.release()
@@ -646,6 +700,8 @@ class CompanionStreamingService:
         if self._playlist_complete(output_dir):
             return None
         with self._lock:
+            if self._closed:
+                raise ValueError("Companion streaming is shutting down")
             existing = self._jobs.get(cache_key)
             if existing is not None and existing.state in {"preparing", "ready"}:
                 return existing
@@ -680,16 +736,24 @@ class CompanionStreamingService:
             raise ValueError("Companion streaming is shutting down")
         episode = self._resolve_episode(entity_id)
         cache_key, output_dir = self._cache_dir(Path(episode["video_path"]))
-        self._cleanup_tickets()
-        self.cleanup_cache(keep={cache_key})
-        subtitle_result = self._prepare_subtitles(episode, output_dir)
-        job = self._ensure_job(episode, cache_key, output_dir)
-        ticket = self._issue_ticket(
-            cache_key=cache_key,
-            entity_id=str(entity_id),
-            output_dir=output_dir,
-            device_id=str(device_id),
-        )
+        with self._lock:
+            if self._closed:
+                raise ValueError("Companion streaming is shutting down")
+            self._preparing_cache_keys.add(cache_key)
+        try:
+            self._cleanup_tickets()
+            self.cleanup_cache(keep={cache_key})
+            subtitle_result = self._prepare_subtitles(episode, output_dir)
+            job = self._ensure_job(episode, cache_key, output_dir)
+            ticket = self._issue_ticket(
+                cache_key=cache_key,
+                entity_id=str(entity_id),
+                output_dir=output_dir,
+                device_id=str(device_id),
+            )
+        finally:
+            with self._lock:
+                self._preparing_cache_keys.discard(cache_key)
 
         playlist_ready = self._playlist_ready(output_dir)
         with self._lock:
@@ -727,20 +791,22 @@ class CompanionStreamingService:
     def media_path(self, ticket_value: str, filename: str) -> tuple[Path, str]:
         self._cleanup_tickets()
         token = str(ticket_value or "")
-        with self._lock:
-            ticket = self._tickets.get(token)
-        if ticket is None or ticket.expires_at <= time.time():
-            raise ValueError("Stream ticket expired")
-        ticket.expires_at = time.time() + _STREAM_TTL_SECONDS
         name = str(filename or "")
-        if name not in _ALLOWED_MEDIA_FILES and not (
-            name.startswith("segment-") and name.endswith(".ts") and name[8:-3].isdigit()
-        ):
-            raise ValueError("Invalid stream media path")
-        path = (ticket.output_dir / name).resolve()
-        root = ticket.output_dir.resolve()
-        if root not in path.parents or not path.is_file():
-            raise FileNotFoundError(name)
+        with self._lock:
+            ticket = None if self._closed else self._tickets.get(token)
+            if ticket is None or ticket.expires_at <= time.time():
+                raise ValueError("Stream ticket expired")
+            if name not in _ALLOWED_MEDIA_FILES and not (
+                name.startswith("segment-") and name.endswith(".ts") and name[8:-3].isdigit()
+            ):
+                raise ValueError("Invalid stream media path")
+            path = (ticket.output_dir / name).resolve()
+            root = ticket.output_dir.resolve()
+            if root not in path.parents or not path.is_file():
+                raise FileNotFoundError(name)
+            # Only successful, authorized media requests extend the lease.
+            # Validate under the same lock used by close()/cache cleanup.
+            ticket.expires_at = time.time() + _STREAM_TTL_SECONDS
         try:
             os.utime(ticket.output_dir, None)
         except OSError:
@@ -766,10 +832,15 @@ class CompanionStreamingService:
         return len(tokens)
 
     def close(self) -> None:
-        self._closed = True
         with self._lock:
+            self._closed = True
             jobs = list(self._jobs.values())
             self._tickets.clear()
+            self._preparing_cache_keys.clear()
+            for job in jobs:
+                if job.state == "preparing":
+                    job.state = "cancelled"
+                    job.finished_at = time.time()
         for job in jobs:
             process = job.process
             if process is None or process.poll() is not None:

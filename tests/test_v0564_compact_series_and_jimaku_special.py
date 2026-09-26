@@ -85,7 +85,11 @@ def test_waiting_card_never_prints_episode_null() -> None:
     assert "episode!==null?t('label.episodeNotReady'" in home
     assert "t('label.notReady')" in home
     assert "episode:a.next_episode" not in home
-    assert "episodePresentationStatus(a,episode)+finalSuffix" in html
+    start = html.index("function waitingHomeCard(a){")
+    end = html.index("function downloadAvailableHomeCard(a){", start)
+    block = html[start:end]
+    assert "const state=episodePresentationStatus(a,episode);" in block
+    assert "finalSuffix" not in block
 
 
 def test_exact_title_single_special_is_accepted_without_jimaku_anilist_id(

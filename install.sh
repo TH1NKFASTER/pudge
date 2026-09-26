@@ -66,7 +66,7 @@ done
 # Product renames are migrations, not fresh installs. Move the old default
 # config/data/cache/library locations before reading config so a branding
 # change never creates an empty second installation.
-python3.12 "$PROJECT_DIR/brand_migration.py" paths \
+python3.12 "$PROJECT_DIR/scripts/migrations/legacy_anime_mpv.py" paths \
   --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
   --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}"
 
@@ -323,7 +323,7 @@ fi
 
 # Rewrite only old *default* branded paths/category values. Custom user paths
 # are left intact. This runs after the physical folder migration above.
-python3.12 "$PROJECT_DIR/brand_migration.py" config \
+python3.12 "$PROJECT_DIR/scripts/migrations/legacy_anime_mpv.py" config \
   --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
   --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}" \
   --config "$CONFIG_PATH"
@@ -630,7 +630,7 @@ cat > "$PLIST" <<PLIST
 </plist>
 PLIST
 
-ICON_SOURCE="$PROJECT_DIR/pudge/web/app-logo.png"
+ICON_SOURCE="$PROJECT_DIR/pudge/assets/app-icon.png"
 ICONSET="$BUILD_DIR/AppIcon.iconset"
 ICNS_PATH="$NEW_RESOURCES/AppIcon.icns"
 if [[ -f "$ICON_SOURCE" ]]; then

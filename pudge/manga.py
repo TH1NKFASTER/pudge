@@ -5,8 +5,12 @@ import difflib
 import hashlib
 import io
 import json
+import math
+import os
+import signal
 import mimetypes
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +26,7 @@ from PIL import Image, ImageEnhance, ImageOps
 
 from .cover_assets import CoverRef
 from .database import Database
+from .manga_mokuro import MokuroImportError, convert_mokuro
 from .manga_ocr_artifact import (
     artifact_page,
     build_artifact,
@@ -35,6 +40,128 @@ from .work_scheduler import WorkPriority
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 _REGION_CACHE_KEY = "pudge-manga-regions-v96p27-orphan-vertical-ink"
+_READER_PREFS_KEY = "manga_reader_preferences:v1"
+_MANUAL_OCR_CORRECTIONS_PREFIX = "manga_ocr_manual_corrections:v1:"
+_MANUAL_OCR_ORDER_PREFIX = "manga_ocr_manual_order:v1:"
+_MANUAL_OCR_GEOMETRY_PREFIX = "manga_ocr_manual_geometry:v1:"
+_MANUAL_OCR_SUPPRESSIONS_PREFIX = "manga_ocr_manual_suppressions:v1:"
+_MANUAL_OCR_ADDITIONS_PREFIX = "manga_ocr_manual_additions:v1:"
+_READER_PREF_DEFAULTS: dict[str, Any] = {
+    "statusHighlight": False,
+    "statusOpacity": 35,
+    "statusNew": True,
+    "statusLearning": True,
+    "statusKnown": True,
+    "statusDue": True,
+    "statusNewColor": "#ffdc46",
+    "statusLearningColor": "#4aa9ff",
+    "statusKnownColor": "#45cf80",
+    "statusDueColor": "#ef8d3d",
+}
+
+
+
+def _stop_ocr_process_tree(
+    process: subprocess.Popen[str], stop_path: Path, *, grace_seconds: float = 5.0,
+) -> None:
+    """Stop a batch coordinator and every model it spawned before deleting its stop file.
+
+    OCR subprocesses are started in their own POSIX session, so their group
+    contains only this job. Killing the coordinator PID alone may orphan
+    model processes that are still processing a page.
+    """
+    if process.poll() is not None:
+        # The coordinator can exit before a child has reaped itself; the job
+        # still owns its dedicated POSIX process group at this point. Do not
+        # rely on coordinator returncode as proof that every model has stopped.
+        group_id = getattr(process, "pid", None) if os.name == "posix" else None
+        if group_id is not None:
+            try:
+                os.killpg(group_id, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        return
+    try:
+        stop_path.write_text("stop\n", encoding="utf-8")
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    pgid = getattr(process, "pid", None) if os.name == "posix" else None
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        if pgid is None:
+            process.kill()
+            process.wait(timeout=grace_seconds)
+            return
+        # The coordinator may still be handling SIGTERM. Kill the entire
+        # session, including workers currently stuck inside model inference.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=grace_seconds)
+        return
+    if pgid is not None:
+        # SIGTERM may have stopped the coordinator before its children exited.
+        # Only this OCR job belongs to its dedicated process group.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _validated_batch_ocr_rows(
+    lines: list[str], expected_pages: set[int],
+) -> tuple[dict[int, dict[str, Any]], set[int], list[str]]:
+    """Reject corrupt, duplicate or foreign worker rows before cache publication.
+
+    A malformed row must never turn an unprocessed page into a verified-empty
+    page; duplicate rows invalidate the affected page instead of letting the
+    last write win. Valid rows for other pages remain usable after a crash.
+    """
+    rows: dict[int, dict[str, Any]] = {}
+    invalid: set[int] = set()
+    errors: list[str] = []
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError("not an object")
+            page_index = item["page_index"]
+            if type(page_index) is not int:
+                raise ValueError("non-integer page index")
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            errors.append(f"invalid_ocr_worker_row:line_{line_number}")
+            continue
+        if page_index not in expected_pages:
+            errors.append(f"unexpected_ocr_worker_page:{page_index}")
+            continue
+        if page_index in rows or page_index in invalid:
+            rows.pop(page_index, None)
+            invalid.add(page_index)
+            errors.append(f"duplicate_ocr_worker_page:{page_index}")
+            continue
+        if not str(item.get("error") or "").strip() and (
+            not isinstance(item.get("regions"), list)
+            or any(not isinstance(region, dict) for region in item["regions"])
+        ):
+            invalid.add(page_index)
+            errors.append(f"invalid_ocr_worker_regions:{page_index}")
+            continue
+        rows[page_index] = item
+    return rows, invalid, errors
 
 
 def _natural_key(value: str) -> list[object]:
@@ -684,6 +811,1577 @@ class MangaService:
     def invalidate_ocr_availability(self) -> None:
         self._ocr_available_cache = None
 
+    @staticmethod
+    def _manual_corrections_state_key(book_id: int) -> str:
+        return f"{_MANUAL_OCR_CORRECTIONS_PREFIX}{int(book_id)}"
+
+    @staticmethod
+    def _manual_order_state_key(book_id: int) -> str:
+        return f"{_MANUAL_OCR_ORDER_PREFIX}{int(book_id)}"
+
+    @staticmethod
+    def _manual_geometry_state_key(book_id: int) -> str:
+        return f"{_MANUAL_OCR_GEOMETRY_PREFIX}{int(book_id)}"
+
+    @staticmethod
+    def _manual_suppressions_state_key(book_id: int) -> str:
+        return f"{_MANUAL_OCR_SUPPRESSIONS_PREFIX}{int(book_id)}"
+
+    @staticmethod
+    def _manual_additions_state_key(book_id: int) -> str:
+        return f"{_MANUAL_OCR_ADDITIONS_PREFIX}{int(book_id)}"
+
+    @staticmethod
+    def _manual_region_anchor(region: dict[str, Any]) -> dict[str, Any]:
+        def number(name: str) -> float:
+            try:
+                value = float(region.get(name) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            return round(max(0.0, min(1.0, value)), 6)
+
+        return {
+            "x": number("x"),
+            "y": number("y"),
+            "width": number("width"),
+            "height": number("height"),
+            "orientation": str(region.get("orientation") or ""),
+        }
+
+    @classmethod
+    def _manual_stable_region_anchor(cls, region: dict[str, Any]) -> dict[str, Any]:
+        manual_geometry = region.get("manual_geometry")
+        if isinstance(manual_geometry, dict):
+            original_anchor = manual_geometry.get("original_anchor")
+            if isinstance(original_anchor, dict):
+                anchored = dict(region)
+                anchored.update(original_anchor)
+                return cls._manual_region_anchor(anchored)
+        return cls._manual_region_anchor(region)
+
+    @staticmethod
+    def _manual_anchor_iou(left: dict[str, Any], right: dict[str, Any]) -> float:
+        try:
+            lx1, ly1 = float(left["x"]), float(left["y"])
+            lx2, ly2 = lx1 + float(left["width"]), ly1 + float(left["height"])
+            rx1, ry1 = float(right["x"]), float(right["y"])
+            rx2, ry2 = rx1 + float(right["width"]), ry1 + float(right["height"])
+        except (KeyError, TypeError, ValueError):
+            return 0.0
+        intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(
+            0.0, min(ly2, ry2) - max(ly1, ry1)
+        )
+        union = max(0.0, (lx2 - lx1) * (ly2 - ly1)) + max(
+            0.0, (rx2 - rx1) * (ry2 - ry1)
+        ) - intersection
+        return intersection / union if union > 0 else 0.0
+
+    def _load_manual_corrections(self, book_id: int) -> list[dict[str, Any]]:
+        raw = self.db.get_state(self._manual_corrections_state_key(book_id), "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
+    def _save_manual_corrections(self, book_id: int, rows: list[dict[str, Any]]) -> None:
+        key = self._manual_corrections_state_key(book_id)
+        if not rows:
+            self.db.delete_state(key)
+            return
+        self.db.set_state(
+            key,
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _load_manual_orders(self, book_id: int) -> list[dict[str, Any]]:
+        raw = self.db.get_state(self._manual_order_state_key(book_id), "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
+    def _save_manual_orders(self, book_id: int, rows: list[dict[str, Any]]) -> None:
+        key = self._manual_order_state_key(book_id)
+        if not rows:
+            self.db.delete_state(key)
+            return
+        self.db.set_state(
+            key,
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _load_manual_geometries(self, book_id: int) -> list[dict[str, Any]]:
+        raw = self.db.get_state(self._manual_geometry_state_key(book_id), "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
+    def _save_manual_geometries(self, book_id: int, rows: list[dict[str, Any]]) -> None:
+        key = self._manual_geometry_state_key(book_id)
+        if not rows:
+            self.db.delete_state(key)
+            return
+        self.db.set_state(
+            key,
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _load_manual_suppressions(self, book_id: int) -> list[dict[str, Any]]:
+        raw = self.db.get_state(self._manual_suppressions_state_key(book_id), "").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)]
+
+    def _save_manual_suppressions(self, book_id: int, rows: list[dict[str, Any]]) -> None:
+        key = self._manual_suppressions_state_key(book_id)
+        if not rows:
+            self.db.delete_state(key)
+            return
+        self.db.set_state(
+            key,
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _load_manual_additions(self, book_id: int) -> list[dict[str, Any]]:
+        raw = self.db.get_state(self._manual_additions_state_key(book_id), "").strip()
+        try:
+            payload = json.loads(raw) if raw else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        return [dict(item) for item in payload if isinstance(item, dict)] if isinstance(payload, list) else []
+
+    def _save_manual_additions(self, book_id: int, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            self.db.delete_state(self._manual_additions_state_key(book_id))
+        else:
+            self.db.set_state(
+                self._manual_additions_state_key(book_id),
+                json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+            )
+
+    @staticmethod
+    def _validated_manual_geometry(geometry: dict[str, Any]) -> dict[str, float]:
+        try:
+            x = float(geometry.get("x"))
+            y = float(geometry.get("y"))
+            width = float(geometry.get("width"))
+            height = float(geometry.get("height"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("Manual OCR geometry must contain x/y/width/height") from exc
+        values = (x, y, width, height)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Manual OCR geometry must be finite")
+        if x < 0 or y < 0 or width < 0.002 or height < 0.002:
+            raise ValueError("Manual OCR geometry is outside the page")
+        if x + width > 1.000001 or y + height > 1.000001:
+            raise ValueError("Manual OCR geometry is outside the page")
+        return {
+            "x": round(x, 6),
+            "y": round(y, 6),
+            "width": round(width, 6),
+            "height": round(height, 6),
+        }
+
+    @staticmethod
+    def _transform_manual_box(
+        box: dict[str, Any],
+        source: dict[str, Any],
+        target: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            sx, sy = float(source["x"]), float(source["y"])
+            sw, sh = float(source["width"]), float(source["height"])
+            bx, by = float(box.get("x")), float(box.get("y"))
+            bw, bh = float(box.get("width")), float(box.get("height"))
+        except (KeyError, TypeError, ValueError):
+            return dict(box)
+        if sw <= 0 or sh <= 0 or bw <= 0 or bh <= 0:
+            return dict(box)
+        tx, ty = float(target["x"]), float(target["y"])
+        tw, th = float(target["width"]), float(target["height"])
+        transformed = dict(box)
+        transformed["x"] = round(max(0.0, min(1.0, tx + ((bx - sx) / sw) * tw)), 6)
+        transformed["y"] = round(max(0.0, min(1.0, ty + ((by - sy) / sh) * th)), 6)
+        transformed["width"] = round(max(0.0, min(1.0 - transformed["x"], (bw / sw) * tw)), 6)
+        transformed["height"] = round(max(0.0, min(1.0 - transformed["y"], (bh / sh) * th)), 6)
+        return transformed
+
+    def _manual_order_ref(self, region: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "manual_region_id": str((region.get("manual_addition") or {}).get("id") or ""),
+            "anchor": self._manual_stable_region_anchor(region),
+            "original_text": str(
+                region.get("ocr_text") or region.get("raw_text") or region.get("text") or ""
+            ),
+        }
+
+    def _match_manual_correction(
+        self,
+        correction: dict[str, Any],
+        regions: list[dict[str, Any]],
+        used: set[int],
+    ) -> tuple[int | None, str]:
+        manual_id = str(correction.get("manual_region_id") or "")
+        if manual_id:
+            for index, region in enumerate(regions):
+                if index in used:
+                    continue
+                if str((region.get("manual_addition") or {}).get("id") or "") == manual_id:
+                    return index, ""
+            return None, "manual_region_not_found"
+        anchor = correction.get("anchor")
+        if not isinstance(anchor, dict):
+            return None, "missing_anchor"
+        original = str(correction.get("original_text") or "")
+        scored: list[tuple[float, int, float, float]] = []
+        for index, region in enumerate(regions):
+            if index in used or region.get("manual_addition"):
+                continue
+            candidate_anchor = self._manual_region_anchor(region)
+            iou = self._manual_anchor_iou(anchor, candidate_anchor)
+            ax = float(anchor.get("x") or 0.0) + float(anchor.get("width") or 0.0) / 2
+            ay = float(anchor.get("y") or 0.0) + float(anchor.get("height") or 0.0) / 2
+            bx = float(candidate_anchor.get("x") or 0.0) + float(candidate_anchor.get("width") or 0.0) / 2
+            by = float(candidate_anchor.get("y") or 0.0) + float(candidate_anchor.get("height") or 0.0) / 2
+            distance = ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+            text = str(region.get("ocr_text") or region.get("raw_text") or region.get("text") or "")
+            text_ratio = difflib.SequenceMatcher(None, original, text).ratio() if original or text else 1.0
+            # Same source scan + strong geometry is authoritative. Text is only
+            # a tie-breaker because the point of a rebuild is that OCR text may change.
+            if iou < 0.35 and distance > 0.035:
+                continue
+            score = iou * 0.82 + text_ratio * 0.16 + max(0.0, 0.02 - distance) * 1.5
+            scored.append((score, index, iou, distance))
+        if not scored:
+            return None, "region_not_found"
+        scored.sort(reverse=True)
+        best = scored[0]
+        if best[2] < 0.45 and best[3] > 0.022:
+            return None, "geometry_changed"
+        if len(scored) > 1 and best[0] - scored[1][0] < 0.035:
+            return None, "ambiguous_geometry"
+        return best[1], ""
+
+    def _apply_manual_corrections(
+        self,
+        book_id: int,
+        page_index: int,
+        regions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fingerprint, _generation, _revision = self._ocr_context(int(book_id))
+        rows = []
+        for item in self._load_manual_corrections(int(book_id)):
+            try:
+                correction_page = int(item.get("page_index"))
+            except (TypeError, ValueError):
+                continue
+            if correction_page == int(page_index):
+                rows.append(item)
+        result = [dict(region) for region in regions]
+        used: set[int] = set()
+        conflicts: list[dict[str, Any]] = []
+        for correction in rows:
+            if str(correction.get("source_fingerprint") or "") != fingerprint:
+                conflicts.append({"id": str(correction.get("id") or ""), "reason": "source_changed"})
+                continue
+            index, reason = self._match_manual_correction(correction, result, used)
+            if index is None:
+                conflicts.append({"id": str(correction.get("id") or ""), "reason": reason})
+                continue
+            used.add(index)
+            region = dict(result[index])
+            ocr_text = str(region.get("text") or "")
+            corrected = str(correction.get("corrected_text") or "")
+            region["ocr_text"] = ocr_text
+            region["text"] = corrected
+            region["manual_correction"] = {
+                "id": str(correction.get("id") or ""),
+                "revision": int(correction.get("revision") or 1),
+                "original_text": str(correction.get("original_text") or ""),
+                "updated_at": float(correction.get("updated_at") or 0.0),
+                "provenance": "manual",
+            }
+            result[index] = region
+        return result, conflicts
+
+    def _apply_manual_suppressions(
+        self,
+        book_id: int,
+        page_index: int,
+        regions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fingerprint, _generation, _revision = self._ocr_context(int(book_id))
+        rows: list[dict[str, Any]] = []
+        for item in self._load_manual_suppressions(int(book_id)):
+            try:
+                suppression_page = int(item.get("page_index"))
+            except (TypeError, ValueError):
+                continue
+            if suppression_page == int(page_index):
+                rows.append(item)
+        result = [dict(region) for region in regions]
+        used: set[int] = set()
+        suppressed: set[int] = set()
+        conflicts: list[dict[str, Any]] = []
+        for suppression in rows:
+            suppression_id = str(suppression.get("id") or "")
+            if str(suppression.get("source_fingerprint") or "") != fingerprint:
+                conflicts.append({"id": suppression_id, "reason": "source_changed"})
+                continue
+            index, reason = self._match_manual_correction(suppression, result, used)
+            if index is None:
+                conflicts.append({"id": suppression_id, "reason": reason})
+                continue
+            used.add(index)
+            suppressed.add(index)
+        return [region for index, region in enumerate(result) if index not in suppressed], conflicts
+
+    def _apply_manual_additions(
+        self, book_id: int, page_index: int, regions: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fingerprint, _generation, _revision = self._ocr_context(book_id)
+        result = [dict(region) for region in regions]
+        conflicts: list[dict[str, Any]] = []
+        for item in self._load_manual_additions(book_id):
+            try:
+                if int(item.get("page_index", -1)) != int(page_index):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            addition_id = str(item.get("id") or "")
+            if str(item.get("source_fingerprint") or "") != fingerprint:
+                conflicts.append({"id": addition_id, "reason": "source_changed"})
+                continue
+            try:
+                geometry = self._validated_manual_geometry(item.get("geometry") or {})
+            except ValueError:
+                conflicts.append({"id": addition_id, "reason": "invalid_geometry"})
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                conflicts.append({"id": addition_id, "reason": "empty_text"})
+                continue
+            result.append({
+                **geometry,
+                "text": text,
+                "raw_text": text,
+                "ocr_text": text,
+                "orientation": str(item.get("orientation") or "vertical"),
+                "source": "manual",
+                "detector": "manual",
+                "geometry_source": "manual",
+                "manual_addition": {
+                    "id": addition_id,
+                    "revision": int(item.get("revision") or 1),
+                    "kind": str(item.get("kind") or "addition"),
+                    "merge_source_count": len(item.get("merge_sources") or []),
+                    "split_group_id": str(item.get("split_group_id") or ""),
+                    "split_part_index": int(item.get("split_part_index") or 0),
+                    "provenance": "manual",
+                },
+            })
+        return result, conflicts
+
+    def _apply_manual_reading_order(
+        self,
+        book_id: int,
+        page_index: int,
+        regions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fingerprint, _generation, _revision = self._ocr_context(int(book_id))
+        record = None
+        for item in self._load_manual_orders(int(book_id)):
+            try:
+                order_page = int(item.get("page_index"))
+            except (TypeError, ValueError):
+                continue
+            if order_page == int(page_index):
+                record = item
+                break
+        result = [dict(region) for region in regions]
+        if record is None:
+            return result, []
+        record_id = str(record.get("id") or f"page-{int(page_index)}")
+        if str(record.get("source_fingerprint") or "") != fingerprint:
+            return result, [{"id": record_id, "reason": "source_changed"}]
+        order = [dict(item) for item in record.get("order") or [] if isinstance(item, dict)]
+        active_suppressions = [
+            item
+            for item in self._load_manual_suppressions(int(book_id))
+            if int(item.get("page_index", -1)) == int(page_index)
+            and str(item.get("source_fingerprint") or "") == fingerprint
+        ]
+        used: set[int] = set()
+        matched: list[int] = []
+        for reference in order:
+            index, reason = self._match_manual_correction(reference, result, used)
+            if index is None:
+                # Reading-order records created before a region was hidden still
+                # contain that region.  Skip only a reference that can be tied
+                # safely to an active suppression; any other mismatch remains a
+                # conflict instead of silently reordering the wrong bubble.
+                hidden = False
+                for suppression in active_suppressions:
+                    anchor = suppression.get("anchor")
+                    if not isinstance(anchor, dict):
+                        continue
+                    pseudo = dict(anchor)
+                    pseudo["text"] = str(suppression.get("original_text") or "")
+                    pseudo["raw_text"] = pseudo["text"]
+                    pseudo["ocr_text"] = pseudo["text"]
+                    hidden_index, _hidden_reason = self._match_manual_correction(
+                        reference, [pseudo], set()
+                    )
+                    if hidden_index == 0:
+                        hidden = True
+                        break
+                if hidden:
+                    continue
+                return result, [{"id": record_id, "reason": f"order_{reason}"}]
+            used.add(index)
+            matched.append(index)
+        remaining = [index for index in range(len(result)) if index not in used]
+        # New manual additions append to a pre-existing saved order without
+        # invalidating it; deleting/rebuilding a real OCR region remains a conflict.
+        if any(not isinstance(result[index].get("manual_addition"), dict) for index in remaining):
+            return result, [{"id": record_id, "reason": "region_count_changed"}]
+        matched.extend(remaining)
+        ordered: list[dict[str, Any]] = []
+        revision = int(record.get("revision") or 1)
+        updated_at = float(record.get("updated_at") or 0.0)
+        for order_index, index in enumerate(matched):
+            region = dict(result[index])
+            region["manual_reading_order"] = {
+                "id": record_id,
+                "revision": revision,
+                "index": order_index,
+                "updated_at": updated_at,
+                "provenance": "manual",
+            }
+            ordered.append(region)
+        return ordered, []
+
+    def _apply_manual_geometry(
+        self,
+        book_id: int,
+        page_index: int,
+        regions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        fingerprint, _generation, _revision = self._ocr_context(int(book_id))
+        rows: list[dict[str, Any]] = []
+        for item in self._load_manual_geometries(int(book_id)):
+            try:
+                geometry_page = int(item.get("page_index"))
+            except (TypeError, ValueError):
+                continue
+            if geometry_page == int(page_index):
+                rows.append(item)
+        result = [dict(region) for region in regions]
+        used: set[int] = set()
+        conflicts: list[dict[str, Any]] = []
+        for correction in rows:
+            correction_id = str(correction.get("id") or "")
+            if str(correction.get("source_fingerprint") or "") != fingerprint:
+                conflicts.append({"id": correction_id, "reason": "source_changed"})
+                continue
+            index, reason = self._match_manual_correction(correction, result, used)
+            if index is None:
+                conflicts.append({"id": correction_id, "reason": reason})
+                continue
+            try:
+                target = self._validated_manual_geometry(dict(correction.get("geometry") or {}))
+            except ValueError:
+                conflicts.append({"id": correction_id, "reason": "invalid_geometry"})
+                continue
+            used.add(index)
+            region = dict(result[index])
+            source = self._manual_region_anchor(region)
+            transformed = dict(region)
+            transformed.update(target)
+            segments = region.get("segments")
+            if isinstance(segments, list):
+                transformed["segments"] = [
+                    self._transform_manual_box(item, source, target)
+                    if isinstance(item, dict)
+                    else item
+                    for item in segments
+                ]
+            provenance = region.get("provenance")
+            if isinstance(provenance, dict):
+                updated_provenance = dict(provenance)
+                line_boxes = provenance.get("line_boxes")
+                if isinstance(line_boxes, list):
+                    updated_provenance["line_boxes"] = [
+                        self._transform_manual_box(item, source, target)
+                        if isinstance(item, dict)
+                        else item
+                        for item in line_boxes
+                    ]
+                transformed["provenance"] = updated_provenance
+            transformed["manual_geometry"] = {
+                "id": correction_id,
+                "revision": int(correction.get("revision") or 1),
+                "original_anchor": dict(correction.get("anchor") or {}),
+                "updated_at": float(correction.get("updated_at") or 0.0),
+                "provenance": "manual",
+            }
+            transformed["geometry_source"] = "manual"
+            result[index] = transformed
+        return result, conflicts
+
+    def manual_ocr_corrections(self, book_id: int) -> dict[str, Any]:
+        book_id = int(book_id)
+        fingerprint, _generation, _revision = self._ocr_context(book_id)
+        rows = self._load_manual_corrections(book_id)
+        reading_orders = self._load_manual_orders(book_id)
+        geometries = self._load_manual_geometries(book_id)
+        suppressions = self._load_manual_suppressions(book_id)
+        additions = self._load_manual_additions(book_id)
+        return {
+            "book_id": book_id,
+            "source_fingerprint": fingerprint,
+            "corrections": rows,
+            "reading_orders": reading_orders,
+            "geometries": geometries,
+            "suppressions": suppressions,
+            "additions": additions,
+        }
+
+    def _merge_manual_order_refs(
+        self,
+        refs: list[dict[str, Any]],
+        source_regions: list[dict[str, Any]],
+        merged_ref: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        insert_at: int | None = None
+        for raw_ref in refs:
+            ref = dict(raw_ref)
+            matched_source = False
+            for region in source_regions:
+                matched, _reason = self._match_manual_correction(ref, [region], set())
+                if matched == 0:
+                    matched_source = True
+                    break
+            if matched_source:
+                if insert_at is None:
+                    insert_at = len(result)
+                continue
+            result.append(ref)
+        if insert_at is not None:
+            result.insert(insert_at, dict(merged_ref))
+        return result
+
+    @staticmethod
+    def _unmerge_manual_order_refs(
+        refs: list[dict[str, Any]],
+        merged_region_id: str,
+        source_refs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        replaced = False
+        for raw_ref in refs:
+            ref = dict(raw_ref)
+            if str(ref.get("manual_region_id") or "") == merged_region_id:
+                result.extend(dict(item) for item in source_refs)
+                replaced = True
+            else:
+                result.append(ref)
+        return result if replaced else [dict(item) for item in refs]
+
+    def _split_manual_order_refs(
+        self,
+        refs: list[dict[str, Any]],
+        source_region: dict[str, Any],
+        split_refs: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        replaced = False
+        for raw_ref in refs:
+            ref = dict(raw_ref)
+            matched, _reason = self._match_manual_correction(ref, [source_region], set())
+            if not replaced and matched == 0:
+                result.extend(dict(item) for item in split_refs)
+                replaced = True
+            else:
+                result.append(ref)
+        return result if replaced else [dict(item) for item in refs]
+
+    @staticmethod
+    def _unsplit_manual_order_refs(
+        refs: list[dict[str, Any]],
+        split_region_ids: set[str],
+        source_ref: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        inserted = False
+        for raw_ref in refs:
+            ref = dict(raw_ref)
+            manual_id = str(ref.get("manual_region_id") or "")
+            if manual_id in split_region_ids:
+                if not inserted:
+                    result.append(dict(source_ref))
+                    inserted = True
+                continue
+            result.append(ref)
+        return result if inserted else [dict(item) for item in refs]
+
+    def split_manual_ocr_region(
+        self,
+        book_id: int,
+        page_index: int,
+        source_ref: dict[str, Any],
+        parts: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        book_id, page_index = int(book_id), int(page_index)
+        requested = [dict(item) for item in parts if isinstance(item, dict)]
+        if len(requested) != 2:
+            raise ValueError("Split must contain exactly two OCR regions")
+        normalized_parts: list[dict[str, Any]] = []
+        for item in requested:
+            text = str(item.get("text") or "").strip()
+            if not text or len(text) > 2000:
+                raise ValueError("Split OCR text must contain 1–2000 characters")
+            orientation = str(item.get("orientation") or "vertical")
+            if orientation not in {"vertical", "horizontal"}:
+                raise ValueError("Invalid split OCR orientation")
+            geometry = self._validated_manual_geometry(dict(item.get("geometry") or {}))
+            normalized_parts.append({"text": text, "orientation": orientation, "geometry": geometry})
+
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            source_index, reason = self._match_manual_correction(dict(source_ref or {}), regions, set())
+            if source_index is None:
+                raise ValueError(f"OCR region cannot be matched safely: {reason}")
+            source_region = regions[source_index]
+            if source_region.get("manual_addition"):
+                raise ValueError("Manually added OCR regions cannot be split yet")
+
+            source_box = self._manual_region_anchor(source_region)
+            sx1, sy1 = float(source_region.get("x") or 0), float(source_region.get("y") or 0)
+            sx2 = sx1 + float(source_region.get("width") or 0)
+            sy2 = sy1 + float(source_region.get("height") or 0)
+            for item in normalized_parts:
+                geometry = item["geometry"]
+                x1, y1 = geometry["x"], geometry["y"]
+                x2, y2 = x1 + geometry["width"], y1 + geometry["height"]
+                tolerance = 0.002
+                if x1 < sx1 - tolerance or y1 < sy1 - tolerance or x2 > sx2 + tolerance or y2 > sy2 + tolerance:
+                    raise ValueError("Split OCR regions must stay inside the source hitbox")
+
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            now = time.time()
+            group_id = hashlib.sha256(
+                f"{fingerprint}|{page_index}|split|{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:20]
+            original = str(source_region.get("ocr_text") or source_region.get("raw_text") or source_region.get("text") or "")
+            source_order_ref = self._manual_order_ref(source_region)
+            suppression_id = hashlib.sha256(
+                f"{fingerprint}|{page_index}|split-suppress|{time.time_ns()}|{json.dumps(source_box, sort_keys=True)}".encode("utf-8")
+            ).hexdigest()[:20]
+            suppression = {
+                "id": suppression_id,
+                "page_index": page_index,
+                "source_fingerprint": fingerprint,
+                "anchor": source_box,
+                "original_text": original,
+                "created_at": now,
+                "updated_at": now,
+                "reason": "split",
+                "split_group_id": group_id,
+            }
+            additions = self._load_manual_additions(book_id)
+            split_additions: list[dict[str, Any]] = []
+            split_refs: list[dict[str, Any]] = []
+            for index, item in enumerate(normalized_parts):
+                addition_id = hashlib.sha256(
+                    f"{fingerprint}|{page_index}|split-part|{group_id}|{index}".encode("utf-8")
+                ).hexdigest()[:20]
+                addition = {
+                    "id": addition_id,
+                    "kind": "split",
+                    "split_group_id": group_id,
+                    "split_part_index": index,
+                    "split_source": {"suppression_id": suppression_id, "ref": dict(source_order_ref)},
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "geometry": dict(item["geometry"]),
+                    "text": str(item["text"]),
+                    "orientation": str(item["orientation"]),
+                    "revision": 1,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                additions.append(addition)
+                split_additions.append(addition)
+                split_refs.append({
+                    "manual_region_id": addition_id,
+                    "anchor": {**dict(item["geometry"]), "orientation": str(item["orientation"])},
+                    "original_text": str(item["text"]),
+                })
+
+            suppressions = self._load_manual_suppressions(book_id)
+            existing_hidden = [dict(item) for item in suppressions]
+            suppressions.append(suppression)
+            orders = self._load_manual_orders(book_id)
+            order = next((item for item in orders if int(item.get("page_index", -1)) == page_index
+                          and str(item.get("source_fingerprint") or "") == fingerprint), None)
+            if order is None:
+                canonical: list[dict[str, Any]] = []
+                for index, region in enumerate(regions):
+                    if index == source_index:
+                        canonical.extend(dict(item) for item in split_refs)
+                    else:
+                        canonical.append(self._manual_order_ref(region))
+                for hidden in existing_hidden:
+                    if int(hidden.get("page_index", -1)) != page_index or str(hidden.get("source_fingerprint") or "") != fingerprint:
+                        continue
+                    anchor = hidden.get("anchor")
+                    if isinstance(anchor, dict):
+                        canonical.append({"anchor": dict(anchor), "original_text": str(hidden.get("original_text") or "")})
+                order = {
+                    "id": hashlib.sha256(f"{fingerprint}|{page_index}|order|{time.time_ns()}".encode("utf-8")).hexdigest()[:20],
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "order": canonical,
+                    "revision": 1,
+                    "history": [],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                orders.append(order)
+            else:
+                order["order"] = self._split_manual_order_refs(
+                    [dict(item) for item in order.get("order") or [] if isinstance(item, dict)],
+                    source_region, split_refs,
+                )
+                order["history"] = [
+                    self._split_manual_order_refs(
+                        [dict(item) for item in snapshot if isinstance(item, dict)], source_region, split_refs
+                    )
+                    for snapshot in order.get("history") or [] if isinstance(snapshot, list)
+                ]
+                order["revision"] = int(order.get("revision") or 1) + 1
+                order["updated_at"] = now
+
+            self._save_manual_suppressions(book_id, suppressions)
+            self._save_manual_additions(book_id, additions)
+            self._save_manual_orders(book_id, orders)
+
+        page = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "split_group_id": group_id, "additions": [dict(item) for item in split_additions], "page": page}
+
+    def unsplit_manual_ocr_region(self, book_id: int, addition_id: str) -> dict[str, Any]:
+        book_id = int(book_id)
+        wanted = str(addition_id or "").strip()
+        with self._ocr_publish_lock(book_id):
+            additions = self._load_manual_additions(book_id)
+            target = next((item for item in additions if str(item.get("id") or "") == wanted), None)
+            if target is None:
+                return {"ok": True, "changed": False}
+            if str(target.get("kind") or "") != "split":
+                raise ValueError("Manual OCR region is not a split")
+            group_id = str(target.get("split_group_id") or "")
+            group = [item for item in additions if str(item.get("kind") or "") == "split"
+                     and str(item.get("split_group_id") or "") == group_id]
+            split_ids = {str(item.get("id") or "") for item in group}
+            source = dict(target.get("split_source") or {})
+            suppression_id = str(source.get("suppression_id") or "")
+            source_ref = dict(source.get("ref") or {})
+            page_index = int(target.get("page_index") or 0)
+            additions = [item for item in additions if str(item.get("id") or "") not in split_ids]
+            suppressions = [item for item in self._load_manual_suppressions(book_id)
+                            if str(item.get("id") or "") != suppression_id]
+            orders = self._load_manual_orders(book_id)
+            for order in orders:
+                if int(order.get("page_index", -1)) != page_index:
+                    continue
+                order["order"] = self._unsplit_manual_order_refs(
+                    [dict(item) for item in order.get("order") or [] if isinstance(item, dict)],
+                    split_ids, source_ref,
+                )
+                order["history"] = [
+                    self._unsplit_manual_order_refs(
+                        [dict(item) for item in snapshot if isinstance(item, dict)], split_ids, source_ref
+                    )
+                    for snapshot in order.get("history") or [] if isinstance(snapshot, list)
+                ]
+            self._save_manual_additions(book_id, additions)
+            self._save_manual_suppressions(book_id, suppressions)
+            self._save_manual_orders(book_id, orders)
+        return {
+            "ok": True,
+            "changed": True,
+            "page": self.text_regions(book_id, page_index, refresh=False, cached_only=True),
+        }
+
+    def merge_manual_ocr_regions(
+        self,
+        book_id: int,
+        page_index: int,
+        first_ref: dict[str, Any],
+        second_ref: dict[str, Any],
+        text: str,
+        orientation: str = "vertical",
+    ) -> dict[str, Any]:
+        book_id, page_index = int(book_id), int(page_index)
+        corrected = str(text or "").strip()
+        if not corrected or len(corrected) > 2000:
+            raise ValueError("Merged OCR text must contain 1–2000 characters")
+        if orientation not in {"vertical", "horizontal"}:
+            raise ValueError("Invalid merged OCR orientation")
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            used: set[int] = set()
+            first_index, first_reason = self._match_manual_correction(dict(first_ref or {}), regions, used)
+            if first_index is None:
+                raise ValueError(f"First OCR region cannot be matched safely: {first_reason}")
+            used.add(first_index)
+            second_index, second_reason = self._match_manual_correction(dict(second_ref or {}), regions, used)
+            if second_index is None:
+                raise ValueError(f"Second OCR region cannot be matched safely: {second_reason}")
+            if first_index == second_index:
+                raise ValueError("Choose two different OCR regions")
+            source_regions = [regions[index] for index in sorted((first_index, second_index))]
+            if any(region.get("manual_addition") for region in source_regions):
+                raise ValueError("Manually added OCR regions cannot be merged yet")
+
+            left = min(float(region.get("x") or 0.0) for region in source_regions)
+            bottom = min(float(region.get("y") or 0.0) for region in source_regions)
+            right = max(float(region.get("x") or 0.0) + float(region.get("width") or 0.0) for region in source_regions)
+            top = max(float(region.get("y") or 0.0) + float(region.get("height") or 0.0) for region in source_regions)
+            geometry = self._validated_manual_geometry({
+                "x": left,
+                "y": bottom,
+                "width": right - left,
+                "height": top - bottom,
+            })
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            now = time.time()
+            suppression_rows = self._load_manual_suppressions(book_id)
+            suppression_ids: list[str] = []
+            source_refs: list[dict[str, Any]] = []
+            for source_region in source_regions:
+                anchor = self._manual_stable_region_anchor(source_region)
+                original = str(
+                    source_region.get("ocr_text")
+                    or source_region.get("raw_text")
+                    or source_region.get("text")
+                    or ""
+                )
+                suppression_id = hashlib.sha256(
+                    f"{fingerprint}|{page_index}|merge-suppress|{time.time_ns()}|{json.dumps(anchor, sort_keys=True)}".encode("utf-8")
+                ).hexdigest()[:20]
+                suppression_rows.append({
+                    "id": suppression_id,
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "anchor": anchor,
+                    "original_text": original,
+                    "created_at": now,
+                    "updated_at": now,
+                    "reason": "merge",
+                })
+                suppression_ids.append(suppression_id)
+                source_refs.append(self._manual_order_ref(source_region))
+
+            addition_id = hashlib.sha256(
+                f"{fingerprint}|{page_index}|merge|{time.time_ns()}".encode("utf-8")
+            ).hexdigest()[:20]
+            addition = {
+                "id": addition_id,
+                "kind": "merge",
+                "page_index": page_index,
+                "source_fingerprint": fingerprint,
+                "geometry": geometry,
+                "text": corrected,
+                "orientation": orientation,
+                "merge_sources": [
+                    {"suppression_id": suppression_id, "ref": dict(source_ref)}
+                    for suppression_id, source_ref in zip(suppression_ids, source_refs)
+                ],
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            additions = self._load_manual_additions(book_id)
+            additions.append(addition)
+
+            merged_ref = {
+                "manual_region_id": addition_id,
+                "anchor": {**geometry, "orientation": orientation},
+                "original_text": corrected,
+            }
+            orders = self._load_manual_orders(book_id)
+            for order in orders:
+                if int(order.get("page_index", -1)) != page_index:
+                    continue
+                if str(order.get("source_fingerprint") or "") != fingerprint:
+                    continue
+                order["order"] = self._merge_manual_order_refs(
+                    [dict(item) for item in order.get("order") or [] if isinstance(item, dict)],
+                    source_regions,
+                    merged_ref,
+                )
+                order["history"] = [
+                    self._merge_manual_order_refs(
+                        [dict(item) for item in snapshot if isinstance(item, dict)],
+                        source_regions,
+                        merged_ref,
+                    )
+                    for snapshot in order.get("history") or []
+                    if isinstance(snapshot, list)
+                ]
+
+            self._save_manual_suppressions(book_id, suppression_rows)
+            self._save_manual_additions(book_id, additions)
+            self._save_manual_orders(book_id, orders)
+        page = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "addition": dict(addition), "page": page}
+
+    def unmerge_manual_ocr_region(self, book_id: int, addition_id: str) -> dict[str, Any]:
+        book_id = int(book_id)
+        wanted = str(addition_id or "").strip()
+        with self._ocr_publish_lock(book_id):
+            additions = self._load_manual_additions(book_id)
+            target = next((item for item in additions if str(item.get("id") or "") == wanted), None)
+            if target is None:
+                return {"ok": True, "changed": False}
+            if str(target.get("kind") or "") != "merge":
+                raise ValueError("Manual OCR region is not a merge")
+            page_index = int(target.get("page_index") or 0)
+            merge_sources = [dict(item) for item in target.get("merge_sources") or [] if isinstance(item, dict)]
+            suppression_ids = {
+                str(item.get("suppression_id") or "") for item in merge_sources
+                if str(item.get("suppression_id") or "")
+            }
+            source_refs = [dict(item.get("ref") or {}) for item in merge_sources if isinstance(item.get("ref"), dict)]
+            additions = [item for item in additions if item is not target]
+            suppressions = [
+                item for item in self._load_manual_suppressions(book_id)
+                if str(item.get("id") or "") not in suppression_ids
+            ]
+            orders = self._load_manual_orders(book_id)
+            for order in orders:
+                if int(order.get("page_index", -1)) != page_index:
+                    continue
+                order["order"] = self._unmerge_manual_order_refs(
+                    [dict(item) for item in order.get("order") or [] if isinstance(item, dict)],
+                    wanted,
+                    source_refs,
+                )
+                order["history"] = [
+                    self._unmerge_manual_order_refs(
+                        [dict(item) for item in snapshot if isinstance(item, dict)],
+                        wanted,
+                        source_refs,
+                    )
+                    for snapshot in order.get("history") or []
+                    if isinstance(snapshot, list)
+                ]
+            self._save_manual_additions(book_id, additions)
+            self._save_manual_suppressions(book_id, suppressions)
+            self._save_manual_orders(book_id, orders)
+        return {
+            "ok": True,
+            "changed": True,
+            "page": self.text_regions(book_id, page_index, refresh=False, cached_only=True),
+        }
+
+    def add_manual_ocr_region(
+        self, book_id: int, page_index: int, geometry: dict[str, Any],
+        text: str, orientation: str = "vertical",
+    ) -> dict[str, Any]:
+        book_id, page_index = int(book_id), int(page_index)
+        if page_index < 0 or page_index >= int(self._book(book_id)["page_count"]):
+            raise IndexError("Invalid manga page index")
+        corrected = str(text or "").strip()
+        if not corrected or len(corrected) > 2000:
+            raise ValueError("Manual OCR text must contain 1–2000 characters")
+        if orientation not in {"vertical", "horizontal"}:
+            raise ValueError("Invalid manual OCR orientation")
+        target = self._validated_manual_geometry(dict(geometry or {}))
+        with self._ocr_publish_lock(book_id):
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            now = time.time()
+            addition = {
+                "id": hashlib.sha256(f"{fingerprint}|{page_index}|add|{time.time_ns()}".encode()).hexdigest()[:20],
+                "page_index": page_index,
+                "source_fingerprint": fingerprint,
+                "geometry": target,
+                "text": corrected,
+                "orientation": orientation,
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+            }
+            rows = self._load_manual_additions(book_id)
+            rows.append(addition)
+            self._save_manual_additions(book_id, rows)
+        page = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "addition": dict(addition), "page": page}
+
+    def update_manual_ocr_region(
+        self, book_id: int, addition_id: str, *, text: str | None = None,
+        geometry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        book_id = int(book_id)
+        wanted = str(addition_id or "").strip()
+        if text is None and geometry is None:
+            raise ValueError("No manual OCR changes")
+        corrected = None if text is None else str(text).strip()
+        if corrected is not None and (not corrected or len(corrected) > 2000):
+            raise ValueError("Manual OCR text must contain 1–2000 characters")
+        target_geometry = None if geometry is None else self._validated_manual_geometry(dict(geometry))
+        with self._ocr_publish_lock(book_id):
+            rows = self._load_manual_additions(book_id)
+            target = next((row for row in rows if str(row.get("id") or "") == wanted), None)
+            if target is None:
+                raise KeyError("Manual OCR region not found")
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            if str(target.get("source_fingerprint") or "") != fingerprint:
+                raise ValueError("Manual OCR region belongs to a different source scan")
+            previous = {"text": target["text"], "geometry": dict(target["geometry"])}
+            if corrected is not None:
+                target["text"] = corrected
+            if target_geometry is not None:
+                target["geometry"] = target_geometry
+            if previous != {"text": target["text"], "geometry": target["geometry"]}:
+                target["history"] = [*(target.get("history") or []), previous][-20:]
+                target["revision"] = int(target.get("revision") or 1) + 1
+                target["updated_at"] = time.time()
+                self._save_manual_additions(book_id, rows)
+            page_index = int(target["page_index"])
+        return {"ok": True, "addition": dict(target),
+                "page": self.text_regions(book_id, page_index, refresh=False, cached_only=True)}
+
+    def undo_manual_ocr_region(self, book_id: int, addition_id: str) -> dict[str, Any]:
+        book_id = int(book_id)
+        wanted = str(addition_id or "").strip()
+        with self._ocr_publish_lock(book_id):
+            rows = self._load_manual_additions(book_id)
+            target = next((row for row in rows if str(row.get("id") or "") == wanted), None)
+            if target is None:
+                return {"ok": True, "changed": False}
+            kind = str(target.get("kind") or "addition")
+            if kind == "merge":
+                raise ValueError("Undo the merged OCR region instead")
+            if kind == "split":
+                raise ValueError("Undo the split OCR region instead")
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            stale = str(target.get("source_fingerprint") or "") != fingerprint
+            page_index = int(target["page_index"])
+            history = [] if stale else list(target.get("history") or [])
+            if history:
+                previous = history.pop()
+                target["text"] = previous["text"]
+                target["geometry"] = previous["geometry"]
+                target["history"] = history
+                target["revision"] = int(target.get("revision") or 1) + 1
+                target["updated_at"] = time.time()
+            else:
+                rows = [row for row in rows if row is not target]
+                # Remove obsolete references from durable reading order and undo history.
+                orders = self._load_manual_orders(book_id)
+                for order in orders:
+                    if int(order.get("page_index", -1)) != page_index:
+                        continue
+                    order["order"] = [ref for ref in order.get("order") or []
+                                      if str(ref.get("manual_region_id") or "") != wanted]
+                    order["history"] = [[ref for ref in snapshot
+                                         if str(ref.get("manual_region_id") or "") != wanted]
+                                        for snapshot in order.get("history") or []]
+                self._save_manual_orders(book_id, orders)
+            self._save_manual_additions(book_id, rows)
+        return {"ok": True, "changed": True,
+                "page": self.text_regions(book_id, page_index, refresh=False, cached_only=True)}
+
+    def suppress_manual_ocr_region(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        book_id, page_index, region_index = int(book_id), int(page_index), int(region_index)
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if region_index < 0 or region_index >= len(regions):
+                raise IndexError(f"Unknown manga OCR region index={region_index}")
+            region = regions[region_index]
+            if region.get("manual_addition"):
+                raise ValueError("Use manual-region undo for a manually added OCR region")
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            anchor = self._manual_stable_region_anchor(region)
+            original = str(region.get("ocr_text") or region.get("raw_text") or region.get("text") or "")
+            rows = self._load_manual_suppressions(book_id)
+            # Do not stack duplicate suppressions for the same visible region.
+            for existing in rows:
+                if int(existing.get("page_index", -1)) != page_index:
+                    continue
+                if str(existing.get("source_fingerprint") or "") != fingerprint:
+                    continue
+                matched, _reason = self._match_manual_correction(existing, [region], set())
+                if matched == 0:
+                    refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+                    return {"ok": True, "changed": False, "suppression": dict(existing), "page": refreshed}
+            now = time.time()
+            suppression_id = hashlib.sha256(
+                f"{fingerprint}|{page_index}|suppress|{time.time_ns()}|{json.dumps(anchor, sort_keys=True)}".encode("utf-8")
+            ).hexdigest()[:20]
+            suppression = {
+                "id": suppression_id,
+                "page_index": page_index,
+                "source_fingerprint": fingerprint,
+                "anchor": anchor,
+                "original_text": original,
+                "created_at": now,
+                "updated_at": now,
+            }
+            rows.append(suppression)
+            self._save_manual_suppressions(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "changed": True, "suppression": dict(suppression), "page": refreshed}
+
+    def restore_manual_ocr_region(self, book_id: int, suppression_id: str) -> dict[str, Any]:
+        book_id = int(book_id)
+        wanted = str(suppression_id or "").strip()
+        if not wanted:
+            raise ValueError("Missing manual OCR suppression id")
+        with self._ocr_publish_lock(book_id):
+            rows = self._load_manual_suppressions(book_id)
+            target = next((item for item in rows if str(item.get("id") or "") == wanted), None)
+            if target is None:
+                return {"ok": True, "changed": False}
+            reason = str(target.get("reason") or "")
+            if reason == "merge":
+                raise ValueError("Undo the merged OCR region instead")
+            if reason == "split":
+                raise ValueError("Undo the split OCR region instead")
+            try:
+                page_index = int(target.get("page_index"))
+            except (TypeError, ValueError):
+                page_index = 0
+            rows = [item for item in rows if str(item.get("id") or "") != wanted]
+            self._save_manual_suppressions(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "changed": True, "page_index": page_index, "page": refreshed}
+
+    def set_manual_ocr_geometry(
+        self,
+        book_id: int,
+        page_index: int,
+        region_index: int,
+        geometry: dict[str, Any],
+    ) -> dict[str, Any]:
+        book_id, page_index, region_index = int(book_id), int(page_index), int(region_index)
+        target = self._validated_manual_geometry(dict(geometry or {}))
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if region_index < 0 or region_index >= len(regions):
+                raise IndexError(f"Unknown manga OCR region index={region_index}")
+            region = regions[region_index]
+            existing_meta = (
+                region.get("manual_geometry")
+                if isinstance(region.get("manual_geometry"), dict)
+                else {}
+            )
+            current_id = str(existing_meta.get("id") or "")
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            rows = self._load_manual_geometries(book_id)
+            existing = next((item for item in rows if str(item.get("id") or "") == current_id), None)
+            now = time.time()
+            if existing is None:
+                anchor = self._manual_region_anchor(region)
+                original = str(region.get("ocr_text") or region.get("raw_text") or region.get("text") or "")
+                correction_id = hashlib.sha256(
+                    f"{fingerprint}|{page_index}|geometry|{time.time_ns()}".encode("utf-8")
+                ).hexdigest()[:20]
+                existing = {
+                    "id": correction_id,
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "anchor": anchor,
+                    "original_text": original,
+                    "geometry": target,
+                    "revision": 1,
+                    "history": [],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                rows.append(existing)
+            else:
+                previous = dict(existing.get("geometry") or {})
+                history = [
+                    dict(snapshot)
+                    for snapshot in existing.get("history") or []
+                    if isinstance(snapshot, dict)
+                ]
+                if previous and previous != target:
+                    history.append(previous)
+                existing["source_fingerprint"] = fingerprint
+                existing["geometry"] = target
+                existing["history"] = history[-20:]
+                existing["revision"] = int(existing.get("revision") or 1) + 1
+                existing["updated_at"] = now
+            self._save_manual_geometries(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "geometry": dict(existing), "page": refreshed}
+
+    def undo_manual_ocr_geometry(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        book_id, page_index, region_index = int(book_id), int(page_index), int(region_index)
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if region_index < 0 or region_index >= len(regions):
+                raise IndexError(f"Unknown manga OCR region index={region_index}")
+            meta = regions[region_index].get("manual_geometry")
+            correction_id = str(meta.get("id") or "") if isinstance(meta, dict) else ""
+            if not correction_id:
+                return {"ok": True, "changed": False, "page": payload}
+            rows = self._load_manual_geometries(book_id)
+            target = next((item for item in rows if str(item.get("id") or "") == correction_id), None)
+            if target is None:
+                return {"ok": True, "changed": False, "page": payload}
+            history = [
+                dict(snapshot)
+                for snapshot in target.get("history") or []
+                if isinstance(snapshot, dict)
+            ]
+            if history:
+                target["geometry"] = history.pop()
+                target["history"] = history
+                target["revision"] = int(target.get("revision") or 1) + 1
+                target["updated_at"] = time.time()
+            else:
+                rows = [item for item in rows if item is not target]
+            self._save_manual_geometries(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "changed": True, "page": refreshed}
+
+    def set_manual_ocr_reading_order(
+        self,
+        book_id: int,
+        page_index: int,
+        order: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        book_id, page_index = int(book_id), int(page_index)
+        requested = [dict(item) for item in order if isinstance(item, dict)]
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if len(requested) != len(regions) or not regions:
+                raise ValueError("Reading order must contain every OCR region on the page")
+
+            normalized: list[dict[str, Any]] = []
+            for item in requested:
+                anchor = item.get("anchor")
+                if not isinstance(anchor, dict):
+                    anchor = {name: item.get(name) for name in ("x", "y", "width", "height", "orientation")}
+                normalized.append({
+                    "anchor": {
+                        "x": round(float(anchor.get("x") or 0.0), 6),
+                        "y": round(float(anchor.get("y") or 0.0), 6),
+                        "width": round(float(anchor.get("width") or 0.0), 6),
+                        "height": round(float(anchor.get("height") or 0.0), 6),
+                        "orientation": str(anchor.get("orientation") or item.get("orientation") or ""),
+                    },
+                    "original_text": str(item.get("original_text") or item.get("text") or ""),
+                    "manual_region_id": str(item.get("manual_region_id") or ""),
+                })
+
+            used: set[int] = set()
+            matched: list[int] = []
+            for reference in normalized:
+                index, reason = self._match_manual_correction(reference, regions, used)
+                if index is None:
+                    raise ValueError(f"Reading-order region cannot be matched safely: {reason}")
+                used.add(index)
+                matched.append(index)
+            if len(set(matched)) != len(regions):
+                raise ValueError("Reading order contains duplicate OCR regions")
+            canonical = [self._manual_order_ref(regions[index]) for index in matched]
+
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            # Keep currently hidden regions in the durable record.  They are
+            # appended after the visible order and ignored while suppressed,
+            # so restoring one later does not invalidate the user's ordering.
+            for suppression in self._load_manual_suppressions(book_id):
+                if int(suppression.get("page_index", -1)) != page_index:
+                    continue
+                if str(suppression.get("source_fingerprint") or "") != fingerprint:
+                    continue
+                anchor = suppression.get("anchor")
+                if not isinstance(anchor, dict):
+                    continue
+                canonical.append({
+                    "anchor": dict(anchor),
+                    "original_text": str(suppression.get("original_text") or ""),
+                })
+
+            rows = self._load_manual_orders(book_id)
+            existing = next(
+                (item for item in rows if int(item.get("page_index", -1)) == page_index),
+                None,
+            )
+            now = time.time()
+            if existing is None:
+                order_id = hashlib.sha256(
+                    f"{fingerprint}|{page_index}|order|{time.time_ns()}".encode("utf-8")
+                ).hexdigest()[:20]
+                existing = {
+                    "id": order_id,
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "order": canonical,
+                    "revision": 1,
+                    "history": [],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                rows.append(existing)
+            else:
+                previous = [dict(item) for item in existing.get("order") or [] if isinstance(item, dict)]
+                history = [
+                    [dict(ref) for ref in snapshot if isinstance(ref, dict)]
+                    for snapshot in existing.get("history") or []
+                    if isinstance(snapshot, list)
+                ]
+                if previous and previous != canonical:
+                    history.append(previous)
+                existing["source_fingerprint"] = fingerprint
+                existing["order"] = canonical
+                existing["history"] = history[-20:]
+                existing["revision"] = int(existing.get("revision") or 1) + 1
+                existing["updated_at"] = now
+            self._save_manual_orders(book_id, rows)
+
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "reading_order": dict(existing), "page": refreshed}
+
+    def undo_manual_ocr_reading_order(self, book_id: int, page_index: int) -> dict[str, Any]:
+        book_id, page_index = int(book_id), int(page_index)
+        with self._ocr_publish_lock(book_id):
+            rows = self._load_manual_orders(book_id)
+            target = next(
+                (item for item in rows if int(item.get("page_index", -1)) == page_index),
+                None,
+            )
+            if target is None:
+                page = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+                return {"ok": True, "changed": False, "page": page}
+            history = [
+                [dict(ref) for ref in snapshot if isinstance(ref, dict)]
+                for snapshot in target.get("history") or []
+                if isinstance(snapshot, list)
+            ]
+            if history:
+                target["order"] = history.pop()
+                target["history"] = history
+                target["revision"] = int(target.get("revision") or 1) + 1
+                target["updated_at"] = time.time()
+            else:
+                rows = [item for item in rows if item is not target]
+            self._save_manual_orders(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "changed": True, "page": refreshed}
+
+    def set_manual_ocr_correction(
+        self,
+        book_id: int,
+        page_index: int,
+        region_index: int,
+        text: str,
+    ) -> dict[str, Any]:
+        book_id, page_index, region_index = int(book_id), int(page_index), int(region_index)
+        corrected = str(text or "").strip()
+        if not corrected:
+            raise ValueError("Corrected OCR text cannot be empty")
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if region_index < 0 or region_index >= len(regions):
+                raise IndexError(f"Unknown manga OCR region index={region_index}")
+            region = regions[region_index]
+            existing_meta = (
+                region.get("manual_correction")
+                if isinstance(region.get("manual_correction"), dict)
+                else {}
+            )
+            current_id = str(existing_meta.get("id") or "")
+            fingerprint, _generation, _revision = self._ocr_context(book_id)
+            rows = self._load_manual_corrections(book_id)
+            existing = next((item for item in rows if str(item.get("id") or "") == current_id), None)
+            now = time.time()
+            if existing is None:
+                original = str(region.get("ocr_text") or region.get("raw_text") or region.get("text") or "")
+                anchor = self._manual_stable_region_anchor(region)
+                correction_id = hashlib.sha256(
+                    f"{fingerprint}|{page_index}|{time.time_ns()}|{json.dumps(anchor, sort_keys=True)}".encode("utf-8")
+                ).hexdigest()[:20]
+                existing = {
+                    "id": correction_id,
+                    "page_index": page_index,
+                    "source_fingerprint": fingerprint,
+                    "anchor": anchor,
+                    "original_text": original,
+                    "corrected_text": corrected,
+                    "revision": 1,
+                    "history": [str(region.get("text") or original)],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                rows.append(existing)
+            else:
+                previous = str(existing.get("corrected_text") or "")
+                history = [str(item) for item in existing.get("history") or []]
+                if previous and (not history or history[-1] != previous):
+                    history.append(previous)
+                existing["history"] = history[-20:]
+                existing["corrected_text"] = corrected
+                existing["revision"] = int(existing.get("revision") or 1) + 1
+                existing["updated_at"] = now
+            self._save_manual_corrections(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {
+            "ok": True,
+            "correction": dict(existing),
+            "page": refreshed,
+        }
+
+    def undo_manual_ocr_correction(
+        self, book_id: int, page_index: int, region_index: int
+    ) -> dict[str, Any]:
+        book_id, page_index, region_index = int(book_id), int(page_index), int(region_index)
+        with self._ocr_publish_lock(book_id):
+            payload = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+            regions = [dict(item) for item in payload.get("regions") or [] if isinstance(item, dict)]
+            if region_index < 0 or region_index >= len(regions):
+                raise IndexError(f"Unknown manga OCR region index={region_index}")
+            meta = regions[region_index].get("manual_correction")
+            correction_id = str(meta.get("id") or "") if isinstance(meta, dict) else ""
+            if not correction_id:
+                return {"ok": True, "changed": False, "page": payload}
+            rows = self._load_manual_corrections(book_id)
+            target = next((item for item in rows if str(item.get("id") or "") == correction_id), None)
+            if target is None:
+                return {"ok": True, "changed": False, "page": payload}
+            history = [str(item) for item in target.get("history") or []]
+            previous = history.pop() if history else str(target.get("original_text") or "")
+            original = str(target.get("original_text") or "")
+            if previous == original:
+                rows = [item for item in rows if str(item.get("id") or "") != correction_id]
+            else:
+                target["corrected_text"] = previous
+                target["history"] = history
+                target["revision"] = int(target.get("revision") or 1) + 1
+                target["updated_at"] = time.time()
+            self._save_manual_corrections(book_id, rows)
+        refreshed = self.text_regions(book_id, page_index, refresh=False, cached_only=True)
+        return {"ok": True, "changed": True, "page": refreshed}
+
+    @staticmethod
+    def _sanitize_reader_preferences(values: dict[str, Any]) -> dict[str, Any]:
+        result = dict(_READER_PREF_DEFAULTS)
+        for key in ("statusHighlight", "statusNew", "statusLearning", "statusKnown", "statusDue"):
+            if key in values:
+                result[key] = bool(values[key])
+        if "statusOpacity" in values:
+            try:
+                result["statusOpacity"] = max(10, min(65, int(values["statusOpacity"])))
+            except (TypeError, ValueError):
+                pass
+        for key in ("statusNewColor", "statusLearningColor", "statusKnownColor", "statusDueColor"):
+            value = str(values.get(key, "") or "")
+            if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                result[key] = value.lower()
+        return result
+
+    def reader_preferences(self) -> dict[str, Any]:
+        raw = self.db.get_state(_READER_PREFS_KEY, "")
+        if not raw:
+            return {"configured": False, **_READER_PREF_DEFAULTS}
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"configured": False, **_READER_PREF_DEFAULTS}
+        if not isinstance(parsed, dict):
+            return {"configured": False, **_READER_PREF_DEFAULTS}
+        return {"configured": True, **self._sanitize_reader_preferences(parsed)}
+
+    def save_reader_preferences(self, values: dict[str, Any]) -> dict[str, Any]:
+        current = self.reader_preferences()
+        merged = {
+            key: current.get(key, default)
+            for key, default in _READER_PREF_DEFAULTS.items()
+        }
+        if isinstance(values, dict):
+            for key in _READER_PREF_DEFAULTS:
+                if key in values:
+                    merged[key] = values[key]
+        sanitized = self._sanitize_reader_preferences(merged)
+        self.db.set_state(
+            _READER_PREFS_KEY,
+            json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")),
+        )
+        return {"configured": True, **sanitized}
+
+    @staticmethod
+    def archive_for_mokuro(sidecar: Path) -> Path:
+        """Resolve one adjacent archive for a user-selected .mokuro sidecar.
+
+        The mapping is deliberately narrow: exact sibling stem, explicit
+        ``archive.cbz.mokuro``/``archive.zip.mokuro`` packaging, or the known
+        sibling ``mokuro/`` directory. Never guess by title across a folder.
+        """
+        path = Path(sidecar).expanduser().resolve()
+        if path.suffix.casefold() != ".mokuro" or not path.is_file():
+            raise MokuroImportError("Select an existing .mokuro file")
+        candidates: list[Path] = []
+        without_mokuro = path.with_suffix("")
+        if without_mokuro.suffix.casefold() in {".cbz", ".zip"} and without_mokuro.is_file():
+            candidates.append(without_mokuro.resolve())
+        else:
+            for suffix in (".cbz", ".zip"):
+                candidate = path.with_suffix(suffix)
+                if candidate.is_file():
+                    candidates.append(candidate.resolve())
+            if path.parent.name.casefold() == "mokuro":
+                for suffix in (".cbz", ".zip"):
+                    candidate = path.parent.parent / f"{path.stem}{suffix}"
+                    if candidate.is_file():
+                        candidates.append(candidate.resolve())
+        unique = list(dict.fromkeys(candidates))
+        if not unique:
+            raise MokuroImportError("No matching CBZ/ZIP archive was found next to this Mokuro file")
+        if len(unique) != 1:
+            raise MokuroImportError("Mokuro matches more than one archive; select the archive explicitly")
+        return unique[0]
+
     def ocr_available(self, *, refresh: bool = False) -> bool:
         now = time.monotonic()
         if not refresh and self._ocr_available_cache is not None:
@@ -1062,6 +2760,26 @@ class MangaService:
             }
             placeholders = ",".join("?" for _ in existing_ids)
             conn.execute(f"DELETE FROM manga_ocr_cache WHERE book_id IN ({placeholders})", existing_ids)
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(self._manual_corrections_state_key(book_id),) for book_id in existing_ids],
+            )
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(self._manual_order_state_key(book_id),) for book_id in existing_ids],
+            )
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(self._manual_geometry_state_key(book_id),) for book_id in existing_ids],
+            )
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(self._manual_suppressions_state_key(book_id),) for book_id in existing_ids],
+            )
+            conn.executemany(
+                "DELETE FROM state WHERE key=?",
+                [(self._manual_additions_state_key(book_id),) for book_id in existing_ids],
+            )
             conn.execute(f"DELETE FROM manga_books WHERE id IN ({placeholders})", existing_ids)
         generated_root = (self.cache_dir / "manga-imports").resolve()
         for row in rows:
@@ -1459,6 +3177,7 @@ class MangaService:
         return {
             "books": books,
             "ocr_available": self.ocr_available(),
+            "reader_preferences": self.reader_preferences(),
         }
 
     def _book(self, book_id: int) -> Any:
@@ -2219,20 +3938,41 @@ class MangaService:
                 retryable = True
         if not regions and status not in {"empty_verified"} and not cached_only:
             return None
+        normalized_regions = [
+            _normalize_region_orientation(dict(item))
+            for item in regions
+            if isinstance(item, dict)
+        ]
+        corrected_regions, correction_conflicts = self._apply_manual_corrections(
+            int(book_id), int(page_index), normalized_regions
+        )
+        visible_regions, suppression_conflicts = self._apply_manual_suppressions(
+            int(book_id), int(page_index), corrected_regions
+        )
+        with_additions, addition_conflicts = self._apply_manual_additions(
+            int(book_id), int(page_index), visible_regions
+        )
+        ordered_regions, order_conflicts = self._apply_manual_reading_order(
+            int(book_id), int(page_index), with_additions
+        )
+        geometry_regions, geometry_conflicts = self._apply_manual_geometry(
+            int(book_id), int(page_index), ordered_regions
+        )
         return {
             "book_id": int(book_id),
             "page_index": int(page_index),
-            "regions": [
-                _normalize_region_orientation(dict(item))
-                for item in regions
-                if isinstance(item, dict)
-            ],
+            "regions": geometry_regions,
             "available": True,
             "cached": True,
             "artifact": bool(artifact),
             "status": status,
             "reason": reason,
             "retryable": retryable,
+            "manual_correction_conflicts": correction_conflicts,
+            "manual_reading_order_conflicts": order_conflicts,
+            "manual_suppression_conflicts": suppression_conflicts,
+            "manual_addition_conflicts": addition_conflicts,
+            "manual_geometry_conflicts": geometry_conflicts,
         }
 
     def text_regions(
@@ -2404,15 +4144,35 @@ class MangaService:
                 "reason": "source_changed_during_ocr",
                 "retryable": True,
             }
+        corrected_regions, correction_conflicts = self._apply_manual_corrections(
+            int(book_id), index, normalized
+        )
+        visible_regions, suppression_conflicts = self._apply_manual_suppressions(
+            int(book_id), index, corrected_regions
+        )
+        with_additions, addition_conflicts = self._apply_manual_additions(
+            int(book_id), index, visible_regions
+        )
+        ordered_regions, order_conflicts = self._apply_manual_reading_order(
+            int(book_id), index, with_additions
+        )
+        geometry_regions, geometry_conflicts = self._apply_manual_geometry(
+            int(book_id), index, ordered_regions
+        )
         return {
             "book_id": int(book_id),
             "page_index": index,
-            "regions": normalized,
+            "regions": geometry_regions,
             "available": True,
             "cached": False,
             "status": status,
             "reason": reason,
             "retryable": retryable,
+            "manual_correction_conflicts": correction_conflicts,
+            "manual_reading_order_conflicts": order_conflicts,
+            "manual_suppression_conflicts": suppression_conflicts,
+            "manual_addition_conflicts": addition_conflicts,
+            "manual_geometry_conflicts": geometry_conflicts,
         }
 
     def _ocr_regions(self, image: Image.Image, regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2475,6 +4235,111 @@ class MangaService:
                         path.unlink(missing_ok=True)
                 if heavy_lease is not None:
                     heavy_lease.release()
+    def _nearby_mokuro_path(self, book_id: int) -> Path | None:
+        """Discover only unambiguous, same-volume sidecars next to the source.
+
+        Never search a whole library, follow symlinks, or accept paths supplied
+        by the browser. Ambiguous names require the existing manual picker.
+        """
+        archive = Path(str(self._book(int(book_id))["path"]))
+        choices = (
+            archive.with_suffix(".mokuro"),
+            archive.with_name(archive.name + ".mokuro"),
+            archive.parent / "mokuro" / (archive.stem + ".mokuro"),
+        )
+        found: list[Path] = []
+        for candidate in dict.fromkeys(choices):
+            if candidate.is_symlink() or candidate.parent.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                if 0 < candidate.stat().st_size <= 100 * 1024 * 1024:
+                    found.append(candidate)
+            except OSError:
+                continue
+        return found[0] if len(found) == 1 else None
+
+    def nearby_mokuro(self, book_id: int) -> dict[str, Any]:
+        """A lightweight hint for the reader, without reading or importing OCR."""
+        path = self._nearby_mokuro_path(int(book_id))
+        return {"available": path is not None, "filename": path.name if path else ""}
+
+    def import_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
+        """Require a complete page match before importing an auto-found sidecar."""
+        book_id = int(book_id)
+        path = self._nearby_mokuro_path(book_id)
+        if path is None:
+            raise MokuroImportError("No unambiguous Mokuro sidecar next to this volume; select the file manually")
+        return self.import_mokuro(book_id, path, require_full_coverage=True)
+
+    def import_mokuro(
+        self, book_id: int, sidecar: Path, *, require_full_coverage: bool = False,
+    ) -> dict[str, Any]:
+        """Import an explicit Mokuro sidecar into the existing volume OCR cache.
+
+        Validate every page and coordinate before writing. Existing verified
+        OCR pages are left intact unless replacement was explicitly requested.
+        """
+        book_id = int(book_id)
+        path = Path(sidecar).expanduser().resolve()
+        if path.suffix.casefold() != ".mokuro" or not path.is_file():
+            raise MokuroImportError("Select an existing .mokuro file")
+        if path.stat().st_size > 100 * 1024 * 1024:
+            raise MokuroImportError("Mokuro file exceeds the 100 MiB limit")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise MokuroImportError("Cannot read Mokuro JSON") from exc
+        row = self._book(book_id)
+        archive_path = Path(str(row["path"]))
+        names = self._pages(archive_path)
+        # A mismatched sidecar is rejected before any cache or artifact writes.
+        sizes: dict[int, tuple[int, int]] = {}
+        with zipfile.ZipFile(archive_path) as archive:
+            for index, name in enumerate(names):
+                with Image.open(io.BytesIO(archive.read(name))) as image:
+                    sizes[index] = image.size
+        pages = convert_mokuro(payload, names, image_sizes=sizes)
+        if require_full_coverage and len(pages) != len(names):
+            raise MokuroImportError("Nearby Mokuro does not cover every image in this volume")
+        with self._ocr_publish_lock(book_id):
+            fingerprint, generation, _revision = self._ocr_context(book_id)
+            updates: list[tuple[int, list[dict[str, Any]] | None, str, str, bool]] = []
+            skipped = 0
+            for page_index, regions in sorted(pages.items()):
+                with self.db.connect() as conn:
+                    cached = conn.execute(
+                        "SELECT text FROM manga_ocr_cache WHERE book_id=? AND page_index=? AND region_key=?",
+                        (book_id, page_index, _REGION_CACHE_KEY),
+                    ).fetchone()
+                if cached is not None:
+                    status = str(self._ocr_page_status(book_id, page_index).get("status") or "")
+                    # Preserve authoritative native/Mokuro OCR and legacy nonempty
+                    # cache rows; retryable partial/failed/empty-unknown rows may
+                    # be repaired by an explicitly selected Mokuro sidecar.
+                    if status in {"ready", "empty_verified"}:
+                        skipped += 1
+                        continue
+                    if not status:
+                        try:
+                            legacy_regions = json.loads(str(cached["text"] or "[]"))
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            legacy_regions = []
+                        if isinstance(legacy_regions, list) and legacy_regions:
+                            skipped += 1
+                            continue
+                updates.append((page_index, regions, "ready" if regions else "empty_verified", "mokuro_import", False))
+            if updates and not self._commit_ocr_page_updates(
+                book_id, source_fingerprint=fingerprint, generation=generation, updates=updates,
+            ):
+                raise MokuroImportError("Volume changed during Mokuro import; no pages were published")
+        return {
+            "book_id": book_id,
+            "imported_pages": len(updates),
+            "skipped_pages": skipped,
+            "sidecar_pages": len(pages),
+            **self.ocr_cache_status(book_id),
+        }
+
     def _cached_peer_region_pages(
         self,
         book_id: int,
@@ -2514,13 +4379,149 @@ class MangaService:
                 regions = json.loads(str(row["text"] or "[]"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            for region in regions if isinstance(regions, list) else []:
-                if not isinstance(region, dict):
-                    continue
+            normalized = [dict(region) for region in regions if isinstance(region, dict)] if isinstance(regions, list) else []
+            corrected, _correction_conflicts = self._apply_manual_corrections(
+                int(book_id), int(row["page_index"]), normalized
+            )
+            visible, _suppression_conflicts = self._apply_manual_suppressions(
+                int(book_id), int(row["page_index"]), corrected
+            )
+            with_additions, _addition_conflicts = self._apply_manual_additions(
+                int(book_id), int(row["page_index"]), visible
+            )
+            ordered, _order_conflicts = self._apply_manual_reading_order(
+                int(book_id), int(row["page_index"]), with_additions
+            )
+            for region in ordered:
                 text = str(region.get("text") or "").strip()
                 if text:
                     result.append((int(row["page_index"]), text))
         return result
+
+    def ocr_book_mokuro(
+        self,
+        book_id: int,
+        *,
+        mokuro_python: Path,
+        progress: Callable[..., None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Recognize a volume with the optional isolated Mokuro backend.
+
+        The original archive is never handed to Mokuro. Pudge copies only the
+        image members into a private staging directory, runs Mokuro there, then
+        validates/publishes the generated .mokuro through the same importer used
+        for user-provided sidecars.
+        """
+
+        python = Path(mokuro_python).expanduser()
+        if not python.is_file():
+            raise RuntimeError("Mokuro OCR backend is not installed. Install it from Settings → Essential.")
+
+        row = self._book(int(book_id))
+        archive_path = Path(str(row["path"]))
+        pages = self._pages(archive_path)
+        total = len(pages)
+        if total <= 0:
+            raise RuntimeError("Manga volume has no image pages")
+
+        def emit(done: int, phase: str) -> None:
+            if progress is None:
+                return
+            try:
+                progress(max(0, min(total, int(done))), total, None, str(phase))
+            except TypeError:
+                progress(max(0, min(total, int(done))), total, None)
+
+        if cancelled is not None and cancelled():
+            return {**self.ocr_cache_status(int(book_id)), "ok": False, "cancelled": True, "errors": []}
+
+        run_root = self.cache_dir / "manga-ocr" / "mokuro-runs"
+        run_root.mkdir(parents=True, exist_ok=True)
+        token = f"{int(book_id)}-{int(time.time() * 1000)}"
+        run_dir = run_root / token
+        volume_dir = run_dir / "volume"
+        volume_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = run_dir / "stdout.log"
+        stderr_path = run_dir / "stderr.log"
+        output_sidecar = run_dir / "volume.mokuro"
+        emit(0, "preparing")
+
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                for index, name in enumerate(pages, start=1):
+                    if cancelled is not None and cancelled():
+                        return {**self.ocr_cache_status(int(book_id)), "ok": False, "cancelled": True, "errors": []}
+                    normalized = str(name).replace("\\", "/")
+                    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+                    if not parts or any(part == ".." for part in parts) or normalized.startswith("/"):
+                        raise RuntimeError(f"Unsafe manga archive path: {name}")
+                    target = volume_dir.joinpath(*parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    data = archive.read(name)
+                    if len(data) > 128 * 1024 * 1024:
+                        raise RuntimeError(f"Manga page is too large for Mokuro staging: {name}")
+                    target.write_bytes(data)
+                    emit(index, "preparing")
+
+            heavy_lease = None
+            if self.work_scheduler is not None:
+                heavy_lease = self.work_scheduler.acquire_heavy(
+                    "mokuro-ocr-book",
+                    blocking=True,
+                    foreground_sensitive=True,
+                    wait_for_foreground=True,
+                    cancel_check=cancelled,
+                    priority=WorkPriority.BACKGROUND,
+                )
+                if heavy_lease is None:
+                    return {**self.ocr_cache_status(int(book_id)), "ok": False, "cancelled": True, "errors": []}
+            try:
+                code = (
+                    "from mokuro.run import run; import sys; "
+                    "run(sys.argv[1], disable_confirmation=True, no_cache=True, legacy_html=False)"
+                )
+                with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+                    "w", encoding="utf-8"
+                ) as stderr_handle:
+                    process = subprocess.Popen(
+                        [str(python), "-c", code, str(volume_dir)],
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        text=True,
+                        start_new_session=(os.name == "posix"),
+                    )
+                    last_done = -1
+                    while process.poll() is None:
+                        if cancelled is not None and cancelled():
+                            _stop_ocr_process_tree(process, run_dir / "STOP", grace_seconds=1.0)
+                            return {**self.ocr_cache_status(int(book_id)), "ok": False, "cancelled": True, "errors": []}
+                        cache_dir = run_dir / "_ocr" / "volume"
+                        try:
+                            done = sum(1 for item in cache_dir.rglob("*.json") if item.is_file())
+                        except OSError:
+                            done = 0
+                        if done != last_done:
+                            emit(done, "ocr")
+                            last_done = done
+                        time.sleep(0.35)
+                    returncode = int(process.returncode or 0)
+                if returncode != 0:
+                    stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.is_file() else ""
+                    detail = stderr.strip()[-2500:] or f"Mokuro exited with code {returncode}"
+                    raise RuntimeError(detail)
+                if not output_sidecar.is_file():
+                    raise RuntimeError("Mokuro completed without generating a .mokuro file")
+                emit(total, "publishing")
+                imported = self.import_mokuro(int(book_id), output_sidecar, require_full_coverage=True)
+                return {**imported, "ok": True, "errors": [], "backend": "mokuro"}
+            finally:
+                if heavy_lease is not None:
+                    heavy_lease.release()
+        finally:
+            # The validated OCR cache is durable. Mokuro's private extraction,
+            # model cache rows and stdout are only staging data.
+            shutil.rmtree(run_dir, ignore_errors=True)
 
     def ocr_book(
         self,
@@ -2690,7 +4691,10 @@ class MangaService:
                     [
                         self.python,
                         "-m",
-                        "pudge.manga_ocr_worker",
+                        (
+                            "pudge.manga_ocr_parallel"
+                            if len(missing) >= 6 else "pudge.manga_ocr_worker"
+                        ),
                         "--batch",
                         str(manifest_path),
                         str(output_path),
@@ -2700,6 +4704,7 @@ class MangaService:
                     stdout=stdout_handle,
                     stderr=stderr_handle,
                     text=True,
+                    start_new_session=(os.name == "posix"),
                 )
                 last_reported = -1
                 while process.poll() is None:
@@ -2721,12 +4726,7 @@ class MangaService:
                         except OSError:
                             pass
                     if stop_requested_at is not None and now - stop_requested_at >= 45.0:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait(timeout=5)
+                        _stop_ocr_process_tree(process, stop_path)
                         break
                     try:
                         payload = json.loads(progress_path.read_text(encoding="utf-8"))
@@ -2751,53 +4751,57 @@ class MangaService:
             page_updates: list[
                 tuple[int, list[dict[str, Any]] | None, str, str, bool]
             ] = []
-            if output_path.is_file():
-                cached_peer_pages = self._cached_peer_region_pages(int(book_id))
-                batch_peer_pages: list[list[dict[str, Any]]] = []
-                for line in output_path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        item = json.loads(line)
-                        page_index_value = int(item["page_index"])
-                    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-                        continue
-                    error = str(item.get("error") or "").strip()
-                    if error:
-                        errors.append(f"page {page_index_value + 1}: {error}")
-                        page_updates.append(
-                            (page_index_value, None, "failed", error, True)
+            output_lines = output_path.read_text(encoding="utf-8").splitlines() if output_path.is_file() else []
+            validated, invalid_pages, validation_errors = _validated_batch_ocr_rows(
+                output_lines, set(missing)
+            )
+            if not preempted and not cancelled_requested:
+                errors.extend(validation_errors)
+            cached_peer_pages = self._cached_peer_region_pages(int(book_id))
+            batch_peer_pages: list[list[dict[str, Any]]] = []
+            for page_index_value in missing:
+                item = validated.get(page_index_value)
+                if item is None:
+                    # A worker may exit normally despite truncating its JSONL
+                    # result. Keep the page retryable and expose the failure.
+                    if not preempted and not cancelled_requested:
+                        reason = (
+                            "invalid_or_duplicate_worker_output"
+                            if page_index_value in invalid_pages else "missing_worker_output"
                         )
-                        continue
-                    regions = item.get("regions") if isinstance(item, dict) else []
-                    normalized_regions = _finalize_recognized_regions(
-                        [dict(region) for region in regions if isinstance(region, dict)]
-                    ) if isinstance(regions, list) else []
-                    normalized_regions = _repair_repeated_latin_page_titles(
+                        errors.append(f"page {page_index_value + 1}: {reason}")
+                        page_updates.append((page_index_value, None, "failed", reason, True))
+                    continue
+                error = str(item.get("error") or "").strip()
+                if error:
+                    errors.append(f"page {page_index_value + 1}: {error}")
+                    page_updates.append((page_index_value, None, "failed", error, True))
+                    continue
+                regions = item["regions"]
+                normalized_regions = _finalize_recognized_regions(
+                    [dict(region) for region in regions]
+                )
+                normalized_regions = _repair_repeated_latin_page_titles(
+                    normalized_regions,
+                    cached_peer_pages + batch_peer_pages,
+                )
+                batch_peer_pages.append([dict(region) for region in normalized_regions])
+                partial = any(
+                    isinstance(region, dict) and bool(region.get("error"))
+                    for region in normalized_regions
+                )
+                status_name = (
+                    "partial" if partial else "ready" if normalized_regions else "empty_verified"
+                )
+                page_updates.append(
+                    (
+                        page_index_value,
                         normalized_regions,
-                        cached_peer_pages + batch_peer_pages,
+                        status_name,
+                        "batch_partial" if partial else "",
+                        bool(partial),
                     )
-                    batch_peer_pages.append(
-                        [dict(region) for region in normalized_regions]
-                    )
-                    partial = any(
-                        isinstance(region, dict) and bool(region.get("error"))
-                        for region in normalized_regions
-                    )
-                    status_name = (
-                        "partial"
-                        if partial
-                        else "ready"
-                        if normalized_regions
-                        else "empty_verified"
-                    )
-                    page_updates.append(
-                        (
-                            page_index_value,
-                            normalized_regions,
-                            status_name,
-                            "batch_partial" if partial else "",
-                            bool(partial),
-                        )
-                    )
+                )
             committed = self._commit_ocr_page_updates(
                 int(book_id),
                 source_fingerprint=source_fingerprint,
@@ -2838,6 +4842,8 @@ class MangaService:
                 }
             return {**status, "ok": not errors and bool(status["complete"]), "errors": errors}
         finally:
+            if process is not None:
+                _stop_ocr_process_tree(process, stop_path)
             for path in (
                 manifest_path,
                 output_path,
@@ -2847,12 +4853,5 @@ class MangaService:
                 stderr_path,
             ):
                 path.unlink(missing_ok=True)
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
             if heavy_lease is not None:
                 heavy_lease.release()

@@ -33,6 +33,38 @@ def test_artifact_v3_preserves_alignment_diagnostics_and_marks_unlabeled_geometr
     assert region["detector_geometry"]["x"] == 0.09
 
 
+def test_artifact_v3_preserves_bounded_retry_and_selection_evidence() -> None:
+    region = normalize_region(
+        {
+            "text": "理由が",
+            "raw_text": "理由",
+            "x": 0.1,
+            "y": 0.2,
+            "width": 0.2,
+            "height": 0.4,
+            "selected_hypothesis_id": "manga-ocr-context-retry",
+            "recognition_selection": "geometry-aware-retry-v1",
+            "recognizer_retry": "vertical-y-context-v1",
+            "recognition_correction": "mangaocr-small-kana-consensus-v1",
+            "geometry_correction": "trailing-ink-v1",
+            "recognizer_crop_policy": "tight-line-v2",
+            "hypotheses": [
+                {"id": "manga-ocr", "text": "理由"},
+                {"id": "manga-ocr-context-retry", "text": "理由が", "selected": True},
+            ],
+        },
+        page_index=2,
+        order=1,
+    )
+    assert region["selected_hypothesis_id"] == "manga-ocr-context-retry"
+    assert region["recognition_selection"] == "geometry-aware-retry-v1"
+    assert region["recognizer_retry"] == "vertical-y-context-v1"
+    assert region["recognition_correction"] == "mangaocr-small-kana-consensus-v1"
+    assert region["geometry_correction"] == "trailing-ink-v1"
+    assert region["recognizer_crop_policy"] == "tight-line-v2"
+    assert len(region["hypotheses"]) == 2
+
+
 def test_artifact_does_not_call_synthetic_grid_observed_geometry() -> None:
     region = normalize_region(
         {

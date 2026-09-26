@@ -5,6 +5,7 @@ from pathlib import Path
 from pudge.database import Database
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.providers.nyaa import (
+    NyaaError,
     parse_rss,
     release_episode,
     release_episode_range,
@@ -32,6 +33,119 @@ RSS = """<?xml version="1.0"?>
 </channel>
 </rss>"""
 
+
+
+
+def test_nyaa_rss_accepts_compatible_mirror_namespace() -> None:
+    mirror_rss = RSS.replace(
+        'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
+        'xmlns:nyaa="https://nyaa.net/xmlns/nyaa"',
+    ).replace("https://nyaa.si/", "https://nyaa.net/")
+    releases = parse_rss(mirror_rss)
+    assert len(releases) == 1
+    assert releases[0].seeders == 81
+    assert releases[0].info_hash == "abcdef0123456789"
+    assert releases[0].category_id == "1_2"
+    assert releases[0].trusted is True
+
+
+def test_default_nyaa_client_falls_back_to_read_only_mirror() -> None:
+    from pudge.providers.nyaa import NyaaClient
+
+    requested: list[str] = []
+    client = NyaaClient(proxy_mode="direct", timeout=0.01)
+
+    def fake_get(url: str, _proxy: str | None) -> str:
+        requested.append(url)
+        if url.startswith("https://nyaa.si/"):
+            raise NyaaError("primary timeout")
+        if url.startswith("https://nyaa.net/"):
+            return RSS.replace(
+                'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
+                'xmlns:nyaa="https://nyaa.net/xmlns/nyaa"',
+            ).replace("https://nyaa.si/", "https://nyaa.net/")
+        raise AssertionError(f"unexpected route: {url}")
+
+    client._get = fake_get  # type: ignore[method-assign]
+    try:
+        releases = client.search("Example Anime 06")
+    finally:
+        client.close()
+
+    assert len(releases) == 1
+    assert releases[0].info_hash == "abcdef0123456789"
+    assert requested[0].startswith("https://nyaa.si/")
+    assert requested[1].startswith("https://nyaa.net/")
+    assert client.search_base_urls[0] == "https://nyaa.net"
+
+    requested.clear()
+    client._get = fake_get  # type: ignore[method-assign]
+    try:
+        client.search("Example Anime 07")
+    finally:
+        client.close()
+    assert requested[0].startswith("https://nyaa.net/")
+
+
+def test_default_nyaa_client_continues_after_empty_mirror_response() -> None:
+    from pudge.providers.nyaa import NyaaClient
+
+    empty_rss = """<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>"""
+    requested: list[str] = []
+    client = NyaaClient(proxy_mode="direct", timeout=0.01)
+
+    def fake_get(url: str, _proxy: str | None) -> str:
+        requested.append(url)
+        if url.startswith("https://nyaa.si/"):
+            raise NyaaError("primary timeout")
+        if url.startswith("https://nyaa.net/"):
+            return empty_rss
+        if url.startswith("https://cn.nyaa.net/"):
+            return RSS.replace(
+                'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
+                'xmlns:nyaa="https://cn.nyaa.net/xmlns/nyaa"',
+            ).replace("https://nyaa.si/", "https://cn.nyaa.net/")
+        raise AssertionError(f"unexpected route: {url}")
+
+    client._get = fake_get  # type: ignore[method-assign]
+    try:
+        releases = client.search("Example Anime 06")
+    finally:
+        client.close()
+
+    assert len(releases) == 1
+    assert releases[0].info_hash == "abcdef0123456789"
+    assert [url.split('/?', 1)[0] for url in requested] == [
+        "https://nyaa.si",
+        "https://nyaa.net",
+        "https://cn.nyaa.net",
+    ]
+    assert client.search_base_urls[0] == "https://cn.nyaa.net"
+
+
+def test_custom_nyaa_base_url_returns_empty_without_public_fallback() -> None:
+    from pudge.providers.nyaa import NyaaClient
+
+    empty_rss = """<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>"""
+    requested: list[str] = []
+    client = NyaaClient("https://nyaa.invalid", proxy_mode="direct", timeout=0.01)
+    client._get = lambda url, _proxy: requested.append(url) or empty_rss  # type: ignore[method-assign]
+    try:
+        releases = client.search("Example Anime 06")
+    finally:
+        client.close()
+
+    assert releases == []
+    assert len(requested) == 1
+    assert requested[0].startswith("https://nyaa.invalid/")
+
+
+def test_custom_nyaa_base_url_does_not_silently_add_public_mirrors() -> None:
+    from pudge.providers.nyaa import NyaaClient
+
+    client = NyaaClient("https://nyaa.invalid", proxy_mode="direct")
+    assert client.search_base_urls == ["https://nyaa.invalid"]
+    client.close()
 
 def test_nyaa_rss_and_scoring() -> None:
     releases = parse_rss(RSS)

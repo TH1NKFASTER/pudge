@@ -1,4 +1,4 @@
-.pudge-review-gate{position:fixed;z-index:13020;inset:0;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(2,7,13,.78);backdrop-filter:blur(8px)}
+.pudge-review-gate{position:fixed;z-index:13020;inset:0;display:none;align-items:center;justify-content:center;padding:24px;background:rgba(2,7,13,.94)}
 .pudge-review-gate.open{display:flex}
 .pudge-review-gate-card{width:min(640px,calc(100vw - 32px));max-height:min(760px,calc(100vh - 32px));overflow:auto;border:1px solid #4b6482;border-radius:14px;background:#091321;color:#dce7f6;box-shadow:0 20px 64px rgba(0,0,0,.6);padding:18px}
 .pudge-review-gate-head{display:flex;gap:12px;align-items:flex-start}.pudge-review-gate-head-copy{min-width:0;flex:1}.pudge-review-gate-title{font-size:20px;font-weight:850;line-height:1.2}.pudge-review-gate-subtitle{margin-top:5px;color:#94a6bd;font-size:12px}.pudge-review-gate-close{width:34px;height:34px;padding:0;display:grid;place-items:center;border-radius:999px;font-size:20px}
@@ -7,6 +7,133 @@
 .pudge-review-gate-front{min-height:300px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;padding:34px 12px 18px;text-align:center}.pudge-review-gate-front .pudge-review-gate-word{font-size:42px;font-weight:850;line-height:1.22;overflow-wrap:anywhere}.pudge-review-gate-front-confusable{display:grid;gap:5px;max-width:720px;color:#b7c7db;font-size:18px;line-height:1.45}.pudge-review-gate-front-confusable small{color:#7890ad;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}.pudge-review-gate-front-confusable span{overflow-wrap:anywhere}.pudge-review-gate-show-answer{min-width:190px}.pudge-review-gate-show-answer kbd{margin-left:6px;padding:1px 5px;border:1px solid #526983;border-radius:5px;background:#101d2d;color:#aec0d5;font:10px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
 .pudge-review-gate-card.answer-shown .pudge-review-gate-front{display:none}.pudge-review-gate-back{padding-top:8px}.pudge-review-gate-back[hidden]{display:none}.pudge-review-gate-answer-word{font-family:"Hiragino Mincho ProN","Yu Mincho",serif;font-size:34px;font-weight:800;line-height:1.55;overflow-wrap:anywhere}.pudge-review-gate-answer-word ruby{ruby-position:over}.pudge-review-gate-answer-word rt{color:#9ec5ff;font-size:.45em;font-weight:650}.pudge-review-gate-reading{margin-top:2px;color:#9ec5ff;font-size:16px}.pudge-review-gate-meta{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;color:#94a6bd;font-size:11px}.pudge-review-gate-meta span{padding:3px 6px;border:1px solid #293d56;border-radius:999px}.pudge-review-gate-meanings{margin:14px 0 0;padding-left:22px;line-height:1.45}.pudge-review-gate-meanings li+li{margin-top:4px}.pudge-review-gate-example,.pudge-review-gate-source,.pudge-review-gate-confusable{display:grid;gap:4px;margin-top:13px;padding:10px 12px;border:1px solid #243a54;border-radius:9px;background:#0d1a2a;line-height:1.45}.pudge-review-gate-example small,.pudge-review-gate-source small,.pudge-review-gate-confusable small{color:#7890ad;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.06em}
 .pudge-review-gate-grades{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:18px}.pudge-review-gate-grades button{display:grid;gap:2px;font-weight:750}.pudge-review-gate-grades button small{color:#93a7c0;font-size:9px;font-weight:650}.pudge-review-gate-grades .again{border-color:#ff6b7d}.pudge-review-gate-grades .hard{border-color:#f4bd63}.pudge-review-gate-grades .good{border-color:#57d38c}.pudge-review-gate-grades .easy{border-color:#6f8cff}
-.pudge-review-gate-loading{min-height:180px;display:flex;align-items:center;justify-content:center;gap:10px;color:#aebfd4}.pudge-review-gate-loading .spinner{width:18px;height:18px;border:2px solid #314963;border-top-color:#86a0ff;border-radius:50%;animation:pudge-review-spin .8s linear infinite}@keyframes pudge-review-spin{to{transform:rotate(360deg)}}.pudge-review-gate-empty{padding:22px 4px;color:#c7d5e8}.pudge-review-gate-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.pudge-review-gate-busy{opacity:.72;pointer-events:none}
+.pudge-review-gate-grades button:focus,.pudge-review-gate-grades button:focus-visible{outline:2px solid #e8f0ff;outline-offset:2px;box-shadow:none!important}
+.pudge-review-gate-loading{min-height:180px;display:flex;align-items:center;justify-content:center;gap:10px;color:#aebfd4}.pudge-review-gate-loading .spinner{width:18px;height:18px;border:2px solid #314963;border-top-color:#86a0ff;border-radius:50%;animation:pudge-review-spin .8s linear infinite}@keyframes pudge-review-spin{to{transform:rotate(360deg)}}.pudge-review-gate-empty{padding:22px 4px;color:#c7d5e8}.pudge-review-gate-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.pudge-review-gate-busy{pointer-events:none}
 @media(max-width:560px){.pudge-review-gate{padding:10px}.pudge-review-gate-card{width:100%;max-height:calc(100vh - 20px);padding:14px}.pudge-review-gate-front{min-height:240px;padding-inline:4px}.pudge-review-gate-front .pudge-review-gate-word{font-size:34px}.pudge-review-gate-answer-word{font-size:30px}.pudge-review-gate-grades{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .pudge-review-gate-pitch{display:flex;align-items:center;margin-top:10px;min-height:24px}.pudge-review-gate-pitch .pudge-inline-pitch{font-size:16px;color:#9ec5ff}
+
+.pudge-review-gate-image{margin-top:12px;display:flex;justify-content:center;overflow:hidden;border:1px solid #243a54;border-radius:10px;background:#07101b}.pudge-review-gate-image img{display:block;max-width:100%;max-height:320px;width:auto;height:auto;object-fit:contain}
+.pudge-review-gate-card{isolation:isolate}
+.pudge-review-gate-grades button,.pudge-review-gate-grades button:hover,.pudge-review-gate-grades button:active{transform:none!important;filter:none!important;transition:none!important;box-shadow:none!important}
+/* G10 stable word slot + optimistic previous-review undo */
+.pudge-review-gate-front{
+  min-height:170px!important;
+  justify-content:flex-start!important;
+  gap:18px!important;
+  padding:18px 12px 12px!important;
+}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-front{display:flex!important}
+.pudge-review-gate-front .pudge-review-gate-word{
+  width:100%;
+  min-height:70px;
+  display:flex;
+  align-items:flex-start;
+  justify-content:center;
+  font-family:"Hiragino Mincho ProN","Yu Mincho",serif;
+  font-size:34px!important;
+  font-weight:800!important;
+  line-height:1.55!important;
+}
+.pudge-review-gate-front .pudge-review-gate-word ruby{ruby-position:over}
+.pudge-review-gate-front .pudge-review-gate-word rt{color:#9ec5ff;font-size:.45em;font-weight:650}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-show-answer,
+.pudge-review-gate-card.answer-shown .pudge-review-gate-front-confusable{display:none!important}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-back .pudge-review-gate-answer-word{display:none!important}
+.pudge-review-gate-previous{
+  display:grid;
+  grid-template-columns:auto minmax(0,1fr) auto auto;
+  align-items:center;
+  gap:8px;
+  min-height:32px;
+  margin:0 0 8px;
+  padding:5px 7px 5px 9px;
+  border:1px solid #263b55;
+  border-radius:8px;
+  background:#0d1928;
+  color:#aebfd4;
+  font-size:11px;
+}
+.pudge-review-gate-previous-label{color:#7188a5;font-size:9px;text-transform:uppercase;letter-spacing:.05em}
+.pudge-review-gate-previous strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dce7f6;font-family:"Hiragino Mincho ProN","Yu Mincho",serif;font-size:13px}
+.pudge-review-gate-previous-grade{font-weight:750}
+.pudge-review-gate-previous-grade.grade-again{color:#ff8897}
+.pudge-review-gate-previous-grade.grade-hard{color:#f4bd63}
+.pudge-review-gate-previous-grade.grade-good{color:#57d38c}
+.pudge-review-gate-previous-grade.grade-easy{color:#86a0ff}
+.pudge-review-gate-previous button{min-height:26px;padding:3px 8px;font-size:10px}
+@media(max-width:560px){
+  .pudge-review-gate-front{min-height:150px!important;padding-inline:4px!important}
+  .pudge-review-gate-front .pudge-review-gate-word{font-size:30px!important}
+  .pudge-review-gate-previous{grid-template-columns:minmax(0,1fr) auto auto}
+  .pudge-review-gate-previous-label{display:none}
+}
+
+/* G10b compact revealed ruby/pitch layout */
+/* Keep the question word at exactly the same top position after reveal, but
+   collapse the now-empty button/confusable area so ruby/pitch stay together. */
+.pudge-review-gate-card.answer-shown .pudge-review-gate-front{
+  min-height:70px!important;
+  gap:0!important;
+  padding:18px 12px 0!important;
+}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-back{padding-top:0}
+.pudge-review-gate-front .pudge-review-gate-word ruby{ruby-align:center}
+.pudge-review-gate-front .pudge-review-gate-word rt{line-height:1;letter-spacing:0}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-pitch{
+  justify-content:center;
+  margin-top:0;
+  margin-bottom:8px;
+}
+
+/* G10c fixed card geometry + aligned answer controls */
+/* Closed and revealed states reserve exactly the same body height.  The
+   question-word slot remains at the top after reveal, while Show Answer and
+   the four grade buttons occupy the same bottom control line. */
+.pudge-review-gate-card{
+  --pudge-review-stage-height:clamp(300px,calc(100vh - 250px),460px);
+  --pudge-review-word-slot-height:70px;
+  --pudge-review-control-height:50px;
+}
+.pudge-review-gate-front{
+  box-sizing:border-box;
+  height:var(--pudge-review-stage-height)!important;
+  min-height:var(--pudge-review-stage-height)!important;
+  padding-bottom:0!important;
+}
+.pudge-review-gate-show-answer{
+  margin-top:auto;
+  min-height:var(--pudge-review-control-height);
+  flex:0 0 var(--pudge-review-control-height);
+  align-self:center;
+}
+.pudge-review-gate-card.answer-shown .pudge-review-gate-front{
+  box-sizing:border-box;
+  height:var(--pudge-review-word-slot-height)!important;
+  min-height:var(--pudge-review-word-slot-height)!important;
+  flex:0 0 var(--pudge-review-word-slot-height)!important;
+}
+.pudge-review-gate-back:not([hidden]){
+  box-sizing:border-box;
+  display:flex;
+  flex-direction:column;
+  height:calc(var(--pudge-review-stage-height) - var(--pudge-review-word-slot-height));
+  min-height:calc(var(--pudge-review-stage-height) - var(--pudge-review-word-slot-height));
+  max-height:calc(var(--pudge-review-stage-height) - var(--pudge-review-word-slot-height));
+  overflow-y:auto;
+}
+.pudge-review-gate-back .pudge-review-gate-grades{
+  margin-top:auto;
+  min-height:var(--pudge-review-control-height);
+  flex:0 0 var(--pudge-review-control-height);
+  position:sticky;
+  bottom:0;
+  z-index:1;
+  background:#091321;
+}
+.pudge-review-gate-grades button{min-height:var(--pudge-review-control-height)}
+@media(max-width:560px){
+  .pudge-review-gate-card{
+    --pudge-review-stage-height:clamp(280px,calc(100vh - 210px),420px);
+    --pudge-review-control-height:48px;
+  }
+}

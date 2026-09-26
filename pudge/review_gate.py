@@ -54,11 +54,11 @@ def review_card_key(word_id: int, reading_index: int) -> str:
     return f"{int(word_id)}:{int(reading_index)}"
 
 
-def _state_key(account_key: str, identity: EpisodeReviewIdentity) -> str:
+def _state_key(account_key: str, identity: EpisodeReviewIdentity, prefix: str = _STATE_PREFIX) -> str:
     safe_account = str(account_key or "").strip()
     if not safe_account:
         raise ValueError("review gate requires an account key")
-    return f"{_STATE_PREFIX}:{safe_account}:{identity.logical_id}"
+    return f"{str(prefix or _STATE_PREFIX).strip()}:{safe_account}:{identity.logical_id}"
 
 
 class ReviewGateStore:
@@ -70,11 +70,12 @@ class ReviewGateStore:
     callers never have to retry the same card blindly.
     """
 
-    def __init__(self, state: StateStore) -> None:
+    def __init__(self, state: StateStore, *, prefix: str = _STATE_PREFIX) -> None:
         self._state = state
+        self._prefix = str(prefix or _STATE_PREFIX).strip()
 
     def _load_raw(self, account_key: str, identity: EpisodeReviewIdentity) -> dict[str, Any]:
-        raw = self._state.get_state(_state_key(account_key, identity), "")
+        raw = self._state.get_state(_state_key(account_key, identity, self._prefix), "")
         if not raw:
             return {}
         try:
@@ -106,9 +107,10 @@ class ReviewGateStore:
         data = self._load_raw(account_key, identity)
         confirmed = self._keys(data.get("confirmed"))
         unknown = [key for key in self._keys(data.get("unknown")) if key not in set(confirmed)]
-        granted = bool(data.get("granted")) or len(confirmed) >= max(1, int(required))
+        normalized_required = max(0, int(required))
+        granted = bool(data.get("granted")) or normalized_required == 0 or len(confirmed) >= normalized_required
         return ReviewGateProgress(
-            required=max(1, int(required)),
+            required=normalized_required,
             confirmed_card_keys=tuple(confirmed),
             unknown_card_keys=tuple(unknown),
             granted=granted,
@@ -127,10 +129,41 @@ class ReviewGateStore:
             "granted": bool(progress.granted),
         }
         self._state.set_state(
-            _state_key(account_key, identity),
+            _state_key(account_key, identity, self._prefix),
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
         )
         return progress
+
+    def snapshot(self, account_key: str, identity: EpisodeReviewIdentity) -> dict[str, Any]:
+        """Return durable progress without deriving a quota-based grant."""
+        data = self._load_raw(account_key, identity)
+        confirmed = self._keys(data.get("confirmed"))
+        confirmed_set = set(confirmed)
+        unknown = [key for key in self._keys(data.get("unknown")) if key not in confirmed_set]
+        return {
+            "confirmed_card_keys": confirmed,
+            "unknown_card_keys": unknown,
+            "granted": bool(data.get("granted")),
+        }
+
+    def grant(
+        self,
+        account_key: str,
+        identity: EpisodeReviewIdentity,
+        *,
+        required: int = 0,
+    ) -> ReviewGateProgress:
+        before = self.snapshot(account_key, identity)
+        return self._save(
+            account_key,
+            identity,
+            ReviewGateProgress(
+                required=max(0, int(required)),
+                confirmed_card_keys=tuple(before["confirmed_card_keys"]),
+                unknown_card_keys=tuple(before["unknown_card_keys"]),
+                granted=True,
+            ),
+        )
 
     def mark_confirmed(
         self,
@@ -148,12 +181,38 @@ class ReviewGateStore:
         if key and key not in confirmed:
             confirmed.append(key)
         unknown = [item for item in before.unknown_card_keys if item != key]
-        granted = len(confirmed) >= max(1, int(required))
+        normalized_required = max(0, int(required))
+        granted = normalized_required == 0 or len(confirmed) >= normalized_required
         return self._save(
             account_key,
             identity,
             ReviewGateProgress(
-                required=max(1, int(required)),
+                required=normalized_required,
+                confirmed_card_keys=tuple(confirmed),
+                unknown_card_keys=tuple(unknown),
+                granted=granted,
+            ),
+        )
+
+    def unmark_confirmed(
+        self,
+        account_key: str,
+        identity: EpisodeReviewIdentity,
+        *,
+        required: int,
+        card_key: str,
+    ) -> ReviewGateProgress:
+        before = self.status(account_key, identity, required=required)
+        key = str(card_key or "").strip()
+        confirmed = [item for item in before.confirmed_card_keys if item != key]
+        unknown = [item for item in before.unknown_card_keys if item != key]
+        normalized_required = max(0, int(required))
+        granted = normalized_required == 0 or len(confirmed) >= normalized_required
+        return self._save(
+            account_key,
+            identity,
+            ReviewGateProgress(
+                required=normalized_required,
                 confirmed_card_keys=tuple(confirmed),
                 unknown_card_keys=tuple(unknown),
                 granted=granted,
@@ -181,7 +240,7 @@ class ReviewGateStore:
             account_key,
             identity,
             ReviewGateProgress(
-                required=max(1, int(required)),
+                required=max(0, int(required)),
                 confirmed_card_keys=before.confirmed_card_keys,
                 unknown_card_keys=tuple(unknown),
                 granted=False,

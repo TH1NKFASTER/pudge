@@ -6,7 +6,7 @@ new episodes, prepare subtitles, play video through mpv, track progress, and
 pair audiobooks with Light Novels without turning the setup into a collection
 of separate scripts.
 
-Current version: **0.7.28**.
+Current version: **0.7.29**.
 
 ## What Pudge can do
 
@@ -50,7 +50,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.28.zip
+unzip pudge-macos-v0.7.29.zip
 cd pudge
 ./install.sh
 ```

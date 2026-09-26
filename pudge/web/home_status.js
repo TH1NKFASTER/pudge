@@ -3,11 +3,14 @@ function compactDownloadStatus(download){
   const state=String(download?.effective_state||download?.state||'');
   const progress=Math.max(0,Math.min(100,Math.round(Number(download?.progress||0)*100))),finished=progress>=100||/complete|completed|seeding|uploading/i.test(state);
   if(finished)return t('label.waitingSubs');
-  if(/paused|stopped/i.test(state))return ui.lang==='ru'?`Пауза ${progress}%`:`Paused ${progress}%`;
   const parts=[`${progress}%`];
   const eta=Number(download?.eta_seconds||0);
   const torrentTrafficActive=ui.torrentToggleDesired===false?false:Boolean(ui.state?.settings?.torrents_enabled&&ui.torrentTraffic?.enabled!==false);
-  if(torrentTrafficActive&&Number.isFinite(eta)&&eta>0)parts.push(`ETA ${torrentEta(eta)}`);
+  const offConfirmed=!torrentTrafficActive&&torrentTrafficFresh(ui.torrentTraffic,false)&&ui.torrentTraffic?.transition==='off_confirmed';
+  const kind=torrentUiState(download,torrentTrafficActive,offConfirmed?'off_confirmed':'unconfirmed');
+  if(kind==='paused'||kind==='unconfirmed'||kind==='waiting'||kind==='stalled'||kind==='checking'||kind==='error'||kind==='unknown')
+    return `${torrentUiLabel(kind,ui.lang)} · ${progress}%`;
+  if(torrentTrafficActive&&Number.isFinite(eta)&&eta>0&&torrentTrafficFresh(ui.torrentTraffic,true))parts.push(`ETA ${torrentEta(eta)}`);
   return parts.join(' · ');
 }
 function episodePresentationStatus(a,episode){

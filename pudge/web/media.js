@@ -800,6 +800,9 @@
       if (detail) detail.textContent = status.detail || '';
       const install = $('installMangaOcr');
       if (install) {
+        install.textContent = status.backend === 'mokuro'
+          ? (ru() ? 'Установить Mokuro' : 'Install Mokuro')
+          : (ru() ? 'Скачать MangaOCR' : 'Download MangaOCR');
         install.disabled = !!status.running || status.state === 'ready';
         install.hidden = status.state === 'ready';
       }

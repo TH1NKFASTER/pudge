@@ -430,6 +430,31 @@ class JitenReviewProvider:
             "result": result,
         }
 
+    def undo_review(self, word_id: int, reading_index: int) -> dict[str, Any]:
+        try:
+            response = httpx.post(
+                f"{JITEN_API_BASE}/srs/undo-review",
+                headers=self._headers(),
+                json={"wordId": int(word_id), "readingIndex": int(reading_index)},
+                timeout=30,
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ReviewProviderError(f"Jiten undo failed: {exc}") from exc
+        if response.status_code >= 400:
+            detail = _error_detail(response)
+            raise ReviewProviderError(
+                f"Jiten undo HTTP {response.status_code}{': ' + detail if detail else ''}"
+            )
+        payload = _json_or_error(response, "Jiten")
+        return {
+            "ok": True,
+            "outcome": "undone",
+            "provider": "jiten",
+            "account_key": self.account_key,
+            "card_id": {"word_id": int(word_id), "reading_index": int(reading_index)},
+            "result": payload if isinstance(payload, dict) else {},
+        }
+
     def reconcile_attempt(self, word_id: int, reading_index: int, attempt_id: str) -> dict[str, Any]:
         state = self.lookup_state(word_id, reading_index)
         return {

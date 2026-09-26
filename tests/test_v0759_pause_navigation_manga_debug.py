@@ -138,11 +138,17 @@ def test_manga_ocr_debug_export_writes_zip_and_visual_overlay(
 
     with zipfile.ZipFile(archive) as bundle:
         names = set(bundle.namelist())
-        assert {"snapshot.json", "overlay.html", "page.png"} <= names
+        assert {"snapshot.json", "quality-report.json", "overlay.html", "page.png"} <= names
         snapshot = json.loads(bundle.read("snapshot.json"))
         assert snapshot["backend_ocr"]["regions"][0]["text"] == "日本語"
+        quality = json.loads(bundle.read("quality-report.json"))
+        assert quality["schema"] == "pudge-manga-ocr-quality-report-v1"
+        assert quality["region_count"] == 1
+        assert quality["regions"][0]["text"] == "日本語"
+        assert "probabilities" in quality["note"]
         overlay = bundle.read("overlay.html").decode("utf-8")
         assert "Backend regions" in overlay
         assert "Rendered overlay" in overlay
         assert "B0" in overlay
         assert "F0" in overlay
+        assert "quality-report.json" in overlay

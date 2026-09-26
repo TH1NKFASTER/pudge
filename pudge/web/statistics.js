@@ -11,6 +11,16 @@
     loading: false,
     journalOffset: 0,
     journalLimit: 200,
+    journalRows: [],
+    journalHasMore: true,
+    displayedScope: null,
+    error: '',
+    requestEpoch: 0,
+    mutationEpoch: 0,
+    inflight: null,
+    inflightKey: '',
+    loadingMore: false,
+    mediaOptionsSignature: '',
   };
 
   const text = (en, r) => ru() ? r : en;
@@ -88,18 +98,60 @@
         <button id="statsDeleteHistory" class="stats-danger" type="button">${text('Delete history','Удалить историю')}</button>
       </div>
       <div class="stats-tabs"><button data-stats-tab="overview">${text('Overview','Обзор')}</button><button data-stats-tab="works">${text('Works','Произведения')}</button><button data-stats-tab="journal">${text('Journal','Журнал')}</button></div>
+      <div id="statsStatus" role="status" aria-live="polite"></div>
       <div id="statsBody"></div>
       <div id="statsModalHost"></div>
     </div>`;
     bindControls();syncControls();
   }
 
+  // Scope identity is distinct from the payload already displayed. Relative
+  // periods include the local calendar day and offset so crossing midnight or
+  // changing timezone cannot reuse yesterday's request.
+  function scopeKey(scope){
+    const period=String(scope.period||'30d');
+    const today=new Date();
+    return JSON.stringify([
+      period,String(scope.kind||'all'),String(scope.media_uuid||''),
+      period==='custom'?String(scope.start_date||''):'',
+      period==='custom'?String(scope.end_date||''):'',
+      period==='custom'||period==='all'?'':`${today.toDateString()}:${today.getTimezoneOffset()}`,
+    ]);
+  }
+  function changeScope(patch){
+    const next={...state.scope,...patch};
+    if(scopeKey(next)===scopeKey(state.scope))return false;
+    state.scope=next;
+    state.requestEpoch+=1;
+    state.journalOffset=0;
+    state.journalRows=[];
+    state.journalHasMore=true;
+    state.loadingMore=false;
+    state.error='';
+    syncControls();
+    return true;
+  }
+  function invalidateAfterMutation(){
+    state.mutationEpoch+=1;
+    state.requestEpoch+=1;
+    // Successful deletion/correction invalidates the displayed snapshot too.
+    // Do not show deleted journal rows or old totals while reloading.
+    state.payload=null;
+    state.displayedScope=null;
+    state.inflight=null;
+    state.inflightKey='';
+    state.journalOffset=0;
+    state.journalRows=[];
+    state.journalHasMore=true;
+    state.loadingMore=false;
+    state.error='';
+  }
   function bindControls(){
     const root=$('statisticsContent');if(!root)return;
     root.addEventListener('click',async event=>{
-      const period=event.target.closest?.('[data-stats-period]');if(period){state.scope.period=period.dataset.statsPeriod;state.journalOffset=0;syncControls();await load();return;}
-      const tab=event.target.closest?.('[data-stats-tab]');if(tab){state.tab=tab.dataset.statsTab;syncControls();render();return;}
-      const day=event.target.closest?.('[data-stats-day]');if(day){state.scope={...state.scope,period:'custom',start_date:day.dataset.statsDay,end_date:day.dataset.statsDay};state.tab='journal';syncControls();await load();return;}
+      const period=event.target.closest?.('[data-stats-period]');if(period){if(changeScope({period:period.dataset.statsPeriod}))await load();return;}
+      const tab=event.target.closest?.('[data-stats-tab]');if(tab){if(state.tab!==tab.dataset.statsTab){state.tab=tab.dataset.statsTab;syncControls();render();}return;}
+      const day=event.target.closest?.('[data-stats-day]');if(day){const changed=changeScope({period:'custom',start_date:day.dataset.statsDay,end_date:day.dataset.statsDay});const tabChanged=state.tab!=='journal';state.tab='journal';syncControls();if(changed)await load();else if(tabChanged)render();return;}
       const edit=event.target.closest?.('[data-stats-edit]');if(edit){openEdit(edit.dataset.statsEdit,edit.dataset.statsType);return;}
       if(event.target.closest?.('#statsManual')){openManual();return;}
       if(event.target.closest?.('#statsExport')){await exportCsv();return;}
@@ -107,12 +159,16 @@
       if(event.target.closest?.('[data-stats-modal-close]')){closeModal();return;}
       const saveManual=event.target.closest?.('[data-stats-save-manual]');if(saveManual){await saveManualEntry(saveManual);return;}
       const saveEdit=event.target.closest?.('[data-stats-save-edit]');if(saveEdit){await saveCorrection(saveEdit);return;}
-      const more=event.target.closest?.('[data-stats-more]');if(more){state.journalOffset+=state.journalLimit;await load();return;}
+      if(event.target.closest?.('[data-stats-retry]')){await load();return;}
+      if(event.target.closest?.('[data-stats-more]')){await load({more:true});return;}
     });
     root.addEventListener('change',async event=>{
-      if(event.target.id==='statsKind'){state.scope.kind=event.target.value;state.scope.media_uuid='';state.journalOffset=0;await load();}
-      else if(event.target.id==='statsMedia'){state.scope.media_uuid=event.target.value;state.journalOffset=0;await load();}
-      else if(event.target.id==='statsStartDate'||event.target.id==='statsEndDate'){state.scope.start_date=$('statsStartDate')?.value||'';state.scope.end_date=$('statsEndDate')?.value||state.scope.start_date;if(state.scope.start_date&&state.scope.end_date)await load();}
+      if(event.target.id==='statsKind'){if(changeScope({kind:event.target.value,media_uuid:''}))await load();}
+      else if(event.target.id==='statsMedia'){if(changeScope({media_uuid:event.target.value}))await load();}
+      else if(event.target.id==='statsStartDate'||event.target.id==='statsEndDate'){
+        const start=$('statsStartDate')?.value||'',end=$('statsEndDate')?.value||start;
+        if(start&&end&&changeScope({start_date:start,end_date:end}))await load();
+      }
     });
   }
 
@@ -124,32 +180,93 @@
     if($('statsStartDate'))$('statsStartDate').value=state.scope.start_date||'';
     if($('statsEndDate'))$('statsEndDate').value=state.scope.end_date||'';
   }
-
-  async function load(){
+  function updateMediaOptions(payload,scope){
+    const media=$('statsMedia');if(!media)return;
+    const options=(payload?.media_options||[]).filter(row=>scope.kind==='all'||row.kind===scope.kind);
+    const signature=JSON.stringify([scope.kind,options.map(row=>[row.media_uuid,row.title,row.kind])]);
+    if(signature!==state.mediaOptionsSignature){
+      media.innerHTML=`<option value="">${text('All works','Все произведения')}</option>`+options.map(row=>`<option value="${esc(row.media_uuid)}">${esc(row.title)} · ${esc(kindLabel(row.kind))}</option>`).join('');
+      state.mediaOptionsSignature=signature;
+    }
+    if(media.value!==scope.media_uuid)media.value=scope.media_uuid||'';
+  }
+  function renderStatus(){
+    const status=$('statsStatus');if(!status)return;
+    const stale=!!state.payload&&state.displayedScope&&scopeKey(state.displayedScope)!==scopeKey(state.scope);
+    const old=state.displayedScope?.period||'';
+    const shown=stale?text(`Showing ${old} until updated data arrives`,`Показан период ${old} до обновления данных`):'';
+    const progress=state.loading||state.loadingMore?text('Updating statistics…','Обновляю статистику…'):'';
+    const error=state.error?`<span class="stats-danger">${esc(state.error)}</span> <button type="button" data-stats-retry>${text('Retry','Повторить')}</button>`:'';
+    status.innerHTML=[shown,progress,error].filter(Boolean).join(' · ');
+    status.hidden=!status.innerHTML;
+    const body=$('statsBody');if(body)body.setAttribute('aria-busy',state.loading||state.loadingMore?'true':'false');
+    const more=document.querySelector('[data-stats-more]');if(more)more.disabled=state.loadingMore;
+  }
+  async function load({more=false}={}){
     if(!API()?.consumption_statistics_query)return;
     if(!$('statisticsContent')?.querySelector('.stats-shell'))staticShell();
-    state.loading=true;render();
-    try{
-      state.payload=await API().consumption_statistics_query({...state.scope},state.journalLimit,state.journalOffset);
-      const media=$('statsMedia'),options=state.payload?.media_options||[];
-      if(media){const selected=state.scope.media_uuid||'';media.innerHTML=`<option value="">${text('All works','Все произведения')}</option>`+options.filter(row=>state.scope.kind==='all'||row.kind===state.scope.kind).map(row=>`<option value="${esc(row.media_uuid)}">${esc(row.title)} · ${esc(kindLabel(row.kind))}</option>`).join('');media.value=selected;}
-    }catch(error){state.payload={error:String(error?.message||error)};}
-    finally{state.loading=false;syncControls();render();}
+    const scope={...state.scope},key=scopeKey(scope),mutation=state.mutationEpoch;
+    if(more&&(!state.payload||!state.displayedScope||scopeKey(state.displayedScope)!==key||state.loading||state.loadingMore||!state.journalHasMore))return;
+    const offset=more?state.journalOffset:0;
+    const flightKey=JSON.stringify([key,mutation,offset,more]);
+    if(state.inflight&&state.inflightKey===flightKey)return state.inflight;
+    const epoch=++state.requestEpoch;
+    if(more)state.loadingMore=true;else{state.loading=true;state.loadingMore=false;}
+    state.error='';
+    if(!state.payload)render();
+    renderStatus();
+    const isCurrent=()=>state.requestEpoch===epoch&&state.mutationEpoch===mutation&&scopeKey(state.scope)===key;
+    const request=(async()=>{
+      try{
+        const result=await API().consumption_statistics_query(scope,state.journalLimit,offset);
+        if(!isCurrent())return;
+        if(more){
+          const seen=new Set(state.journalRows.map(row=>`${row.type}:${row.id}`));
+          const added=[];
+          for(const row of result.journal||[]){const id=`${row.type}:${row.id}`;if(!seen.has(id)){seen.add(id);added.push(row);}}
+          state.journalRows.push(...added);
+          state.journalOffset=offset+(result.journal||[]).length;
+          state.journalHasMore=(result.journal||[]).length>0 && state.journalOffset<Number(result.journal_total||0);
+          state.payload={...state.payload,journal:[...state.journalRows],journal_total:result.journal_total};
+        }else{
+          const pageRows=result.journal||[];
+          const seen=new Set();
+          state.journalRows=pageRows.filter(row=>{const id=`${row.type}:${row.id}`;if(seen.has(id))return false;seen.add(id);return true;});
+          state.journalOffset=pageRows.length;
+          state.journalHasMore=state.journalRows.length>0 && state.journalOffset<Number(result.journal_total||0);
+          state.payload={...result,journal:[...state.journalRows]};
+          state.displayedScope=scope;
+          updateMediaOptions(result,scope);
+        }
+        render();
+      }catch(error){if(isCurrent())state.error=String(error?.message||error);}
+      finally{
+        if(isCurrent()){
+          if(more)state.loadingMore=false;else state.loading=false;
+          syncControls();renderStatus();
+        }
+        if(state.inflight===request)state.inflight=null;
+      }
+    })();
+    state.inflight=request;state.inflightKey=flightKey;
+    return request;
   }
 
   function render(){
     const body=$('statsBody');if(!body)return;
-    if(state.loading){body.innerHTML=`<div class="stats-empty">${text('Loading statistics…','Загружаю статистику…')}</div>`;return;}
-    if(state.payload?.error){body.innerHTML=`<div class="stats-empty stats-danger">${esc(state.payload.error)}</div>`;return;}
-    if(!state.payload){body.innerHTML='';return;}
+    if(!state.payload){
+      body.innerHTML=state.loading?`<div class="stats-empty">${text('Loading statistics…','Загружаю статистику…')}</div>`:'';
+      renderStatus();return;
+    }
     if(state.tab==='works')renderWorks(body);else if(state.tab==='journal')renderJournal(body);else renderOverview(body);
+    renderStatus();
   }
 
   function renderOverview(body){
     const p=state.payload,s=p.summary||{},days=p.days||[],max=Math.max(1,...days.map(d=>Number(d.seconds||0)));
     const timezoneNote=text(`Local time follows this computer automatically (${p.timezone?.label||'local'})`,`Локальное время определяется компьютером автоматически (${p.timezone?.label||'local'})`);
     let chart='';
-    if(state.scope.period==='year'){
+    if((state.displayedScope||state.scope).period==='year'){
       chart=`<div class="stats-calendar">${days.map(d=>`<button class="stats-day" data-stats-day="${esc(d.day)}" style="--heat:${Math.max(.08,Number(d.seconds||0)/max).toFixed(3)}" title="${esc(d.day)} · ${esc(duration(d.seconds))}"></button>`).join('')}</div>`;
     }else{
       chart=`<div class="stats-chart" style="--stats-columns:${Math.max(1,days.length)}">${days.length?days.map(d=>`<div class="stats-bar-wrap"><button class="stats-bar" data-stats-day="${esc(d.day)}" style="height:${Math.max(2,Number(d.seconds||0)/max*100)}%" title="${esc(duration(d.seconds))}"></button><small>${esc(d.day.slice(5))}</small></div>`).join(''):`<div class="stats-empty">${text('No recorded activity in this period','Нет записанной активности за период')}</div>`}</div>`;
@@ -167,7 +284,7 @@
 
   function renderJournal(body){
     const rows=state.payload.journal||[];
-    body.innerHTML=`<div class="stats-panel">${rows.length?`<table class="stats-table"><thead><tr><th>${text('Start','Начало')}</th><th>${text('End','Конец')}</th><th>${text('Time','Время')}</th><th>${text('Work','Произведение')}</th><th>${text('Format','Формат')}</th><th>${text('Source','Источник')}</th><th>${text('Device','Устройство')}</th><th></th></tr></thead><tbody>${rows.map(row=>`<tr class="${row.excluded?'excluded':''}"><td>${row.start_utc==null?text('No exact time','Без точного времени'):esc(new Date(Number(row.start_utc)*1000).toLocaleString())}</td><td>${row.end_utc==null?'—':esc(new Date(Number(row.end_utc)*1000).toLocaleString())}</td><td>${esc(duration(row.seconds))}</td><td>${esc(row.title)}</td><td>${esc(kindLabel(row.kind))}</td><td>${esc(row.origin==='manual'?text('Manual','Вручную'):(row.estimated?text('Estimated','Оценка'):text('Automatic','Автоматически')))}</td><td>${esc(row.device||'')}</td><td><button data-stats-edit="${esc(row.id)}" data-stats-type="${esc(row.type)}">${text('Edit','Исправить')}</button></td></tr>`).join('')}</tbody></table>${Number(state.payload.journal_total||0)>state.journalOffset+rows.length?`<div style="padding:12px"><button data-stats-more>${text('More','Ещё')}</button></div>`:''}`:`<div class="stats-empty">${text('Journal is empty','Журнал пуст')}</div>`}</div>`;
+    body.innerHTML=`<div class="stats-panel">${rows.length?`<table class="stats-table"><thead><tr><th>${text('Start','Начало')}</th><th>${text('End','Конец')}</th><th>${text('Time','Время')}</th><th>${text('Work','Произведение')}</th><th>${text('Format','Формат')}</th><th>${text('Source','Источник')}</th><th>${text('Device','Устройство')}</th><th></th></tr></thead><tbody>${rows.map(row=>`<tr class="${row.excluded?'excluded':''}"><td>${row.start_utc==null?text('No exact time','Без точного времени'):esc(new Date(Number(row.start_utc)*1000).toLocaleString())}</td><td>${row.end_utc==null?'—':esc(new Date(Number(row.end_utc)*1000).toLocaleString())}</td><td>${esc(duration(row.seconds))}</td><td>${esc(row.title)}</td><td>${esc(kindLabel(row.kind))}</td><td>${esc(row.origin==='manual'?text('Manual','Вручную'):(row.estimated?text('Estimated','Оценка'):text('Automatic','Автоматически')))}</td><td>${esc(row.device||'')}</td><td><button data-stats-edit="${esc(row.id)}" data-stats-type="${esc(row.type)}">${text('Edit','Исправить')}</button></td></tr>`).join('')}</tbody></table>${state.journalHasMore&&Number(state.payload.journal_total||0)>state.journalOffset?`<div style="padding:12px"><button data-stats-more>${text('More','Ещё')}</button></div>`:''}`:`<div class="stats-empty">${text('Journal is empty','Журнал пуст')}</div>`}</div>`;
   }
 
   function closeModal(){const host=$('statsModalHost');if(host)host.innerHTML='';}
@@ -177,14 +294,14 @@
     modal(`<h3>${text('Add activity manually','Добавить активность вручную')}</h3><label>${text('Format','Формат')}<select id="statsManualKind">${['anime','light_novel','manga','audiobook','visual_novel'].map(v=>`<option value="${v}">${kindLabel(v)}</option>`).join('')}</select></label><label>${text('Existing work (optional)','Существующее произведение (необязательно)')}<select id="statsManualMedia"><option value="">—</option>${options}</select></label><label>${text('Title for a new work','Название нового произведения')}<input id="statsManualTitle"></label><label>${text('Start time (optional)','Время начала (необязательно)')}<input id="statsManualStart" type="datetime-local"></label><label>${text('Duration, minutes','Длительность, минут')}<input id="statsManualMinutes" type="number" min="0.1" step="0.1" value="30"></label><label>${text('Note','Заметка')}<textarea id="statsManualNote"></textarea></label><footer><button data-stats-modal-close>${text('Cancel','Отмена')}</button><button class="primary" data-stats-save-manual>${text('Save','Сохранить')}</button></footer>`);
   }
   async function saveManualEntry(button){
-    button.disabled=true;try{const media=$('statsManualMedia')?.value||'',selected=$('statsManualMedia')?.selectedOptions?.[0],selectedKind=selected?.dataset?.kind;const kind=media?(selectedKind||$('statsManualKind')?.value):$('statsManualKind')?.value;await API().consumption_statistics_add_manual(kind,Number($('statsManualMinutes')?.value||0)*60,epochFromLocalInput($('statsManualStart')?.value),media,$('statsManualTitle')?.value||'',$('statsManualNote')?.value||'');closeModal();await load();}catch(error){window.toast?.(String(error?.message||error));button.disabled=false;}
+    button.disabled=true;try{const media=$('statsManualMedia')?.value||'',selected=$('statsManualMedia')?.selectedOptions?.[0],selectedKind=selected?.dataset?.kind;const kind=media?(selectedKind||$('statsManualKind')?.value):$('statsManualKind')?.value;await API().consumption_statistics_add_manual(kind,Number($('statsManualMinutes')?.value||0)*60,epochFromLocalInput($('statsManualStart')?.value),media,$('statsManualTitle')?.value||'',$('statsManualNote')?.value||'');closeModal();invalidateAfterMutation();await load();}catch(error){window.toast?.(String(error?.message||error));button.disabled=false;}
   }
   function openEdit(id,type){
     const row=(state.payload?.journal||[]).find(item=>String(item.id)===String(id)&&String(item.type)===String(type));if(!row)return;
     modal(`<h3>${text('Correct journal entry','Исправить запись журнала')}</h3><div><strong>${esc(row.title)}</strong><div class="stats-muted">${esc(kindLabel(row.kind))} · ${esc(duration(row.seconds))}</div></div><label>${text('Start','Начало')}<input id="statsEditStart" type="datetime-local" value="${esc(localDateTimeValue(row.start_utc))}"></label><label>${text('End','Конец')}<input id="statsEditEnd" type="datetime-local" value="${esc(localDateTimeValue(row.end_utc))}"></label><label><span><input id="statsEditExcluded" type="checkbox" ${row.excluded?'checked':''}> ${text('Exclude from statistics','Исключить из статистики')}</span></label><label>${text('Reason','Причина')}<input id="statsEditReason" value="${esc(row.correction_reason||'')}"></label><footer><button data-stats-modal-close>${text('Cancel','Отмена')}</button><button class="primary" data-stats-save-edit data-id="${esc(row.id)}" data-type="${esc(row.type)}" data-revision="${Number(row.correction_revision||0)}">${text('Save correction','Сохранить исправление')}</button></footer>`);
   }
   async function saveCorrection(button){
-    button.disabled=true;try{const start=epochFromLocalInput($('statsEditStart')?.value),end=epochFromLocalInput($('statsEditEnd')?.value);await API().consumption_statistics_correct(button.dataset.type,button.dataset.id,Number(button.dataset.revision||0),!!$('statsEditExcluded')?.checked,start,end,null,$('statsEditReason')?.value||'');closeModal();await load();}catch(error){window.toast?.(String(error?.message||error));button.disabled=false;}
+    button.disabled=true;try{const start=epochFromLocalInput($('statsEditStart')?.value),end=epochFromLocalInput($('statsEditEnd')?.value);await API().consumption_statistics_correct(button.dataset.type,button.dataset.id,Number(button.dataset.revision||0),!!$('statsEditExcluded')?.checked,start,end,null,$('statsEditReason')?.value||'');closeModal();invalidateAfterMutation();await load();}catch(error){window.toast?.(String(error?.message||error));button.disabled=false;}
   }
   async function exportCsv(){
     try{const result=await API().consumption_statistics_export({...state.scope});window.toast?.(text(`Exported ${result.rows} rows`,`Экспортировано строк: ${result.rows}`));}catch(error){window.toast?.(String(error?.message||error));}
@@ -192,7 +309,7 @@
 
   async function deleteHistory(){
     if(!await window.pudgeConfirm?.(text('Delete all Statistics history on every synced device? Library files and current progress stay untouched.','Удалить всю историю Statistics на всех синхронизируемых устройствах? Файлы библиотеки и текущий прогресс останутся.'),{danger:true}))return;
-    try{await API().consumption_statistics_delete_history();state.journalOffset=0;await load();window.toast?.(text('Statistics history deleted','История Statistics удалена'));}catch(error){window.toast?.(String(error?.message||error));}
+    try{await API().consumption_statistics_delete_history();invalidateAfterMutation();await load();window.toast?.(text('Statistics history deleted','История Statistics удалена'));}catch(error){window.toast?.(String(error?.message||error));}
   }
 
   // Reader recorder -------------------------------------------------------

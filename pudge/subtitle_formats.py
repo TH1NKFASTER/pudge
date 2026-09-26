@@ -48,6 +48,13 @@ _MIN_SUBTITLE_START_SECONDS = 0.100
 _SIMPLIFIED_CHINESE_HINTS = set(
     "这们还没吗为与听见说来过时会里对从后发头尽将让个门开关间无气学书车东业乐边变长处点电动国话画华万网现线压应张总导叶台号爱带办报宝贝笔毕标别产场称迟冲出传达单当党灯敌尔儿饭飞风该赶广归汉号合欢击际价见讲较节进经举据绝开课块来类礼离两临马买卖门难脑闹内农盘齐钱亲轻请让认扫声师实试书术树双说虽岁孙体条听厅头图团万为卫问无务习系戏县写兴须选严验阳样药业页义鱼语远云杂脏早战张只钟种众总组"
 )
+# Characters that are strong evidence of Simplified Chinese rather than
+# ordinary Japanese shinjitai/kanji.  The broader set above is useful for
+# corpus-level language profiling, but it is intentionally too permissive for
+# deleting a *single* Han-only line from an otherwise Japanese cue.
+_STRONG_SIMPLIFIED_CHINESE_HINTS = set(
+    "这们还没吗为与听说过对从尽将让门关间无车东业乐边变长处点电动话华网现线压应张总爱带办报贝笔毕标别产场迟冲传敌尔儿饭飞该赶广归汉欢击际价见讲较节进经举据绝课块类离两临马买卖难脑闹农盘齐钱亲轻请认扫师实试书术树双虽岁孙厅头图团问务习戏县兴须选严验阳样药页义鱼语远云杂脏战钟种众组译词继续"
+)
 
 
 _FILENAME_JAPANESE_MARKER_RE = re.compile(
@@ -335,6 +342,27 @@ def _filter_inline_chinese_lines(
     the whole cue as Japanese, so the old parallel-cue filter cannot remove the
     Chinese half. Keep short kanji-only Japanese fragments conservatively.
     """
+    # A normal Japanese subtitle can legitimately contain a kanji-only line
+    # next to a kana-containing line (e.g. 出発前 / ルーデルドルフ閣下が…).  Do not
+    # infer "Chinese translation" from line length alone.  Traditional JP+CN
+    # files without simplified-character hints are still detectable when this
+    # mixed-line shape is a consistent file-wide pattern rather than an
+    # occasional Japanese construction.
+    multiline_cues = 0
+    mixed_line_cues = 0
+    for _start, _end, text in cues:
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        multiline_cues += 1
+        kinds = [_cue_script_kind(line) for line in lines]
+        if "japanese" in kinds and "han_only" in kinds:
+            mixed_line_cues += 1
+    consistent_inline_bilingual = bool(
+        mixed_line_cues >= 2
+        and mixed_line_cues / max(len(cues), 1) >= 0.25
+    )
+
     filtered: list[tuple[float, float, str]] = []
     removed = 0
     for start, end, text in cues:
@@ -353,8 +381,12 @@ def _filter_inline_chinese_lines(
                 kept.append(line)
                 continue
             compact = re.sub(r"[^\u3400-\u4dbf\u4e00-\u9fff]", "", line)
-            has_simplified_hint = any(ch in _SIMPLIFIED_CHINESE_HINTS for ch in compact)
-            likely_translation = bool(has_simplified_hint or len(compact) >= 4)
+            strong_simplified_hints = sum(
+                ch in _STRONG_SIMPLIFIED_CHINESE_HINTS for ch in compact
+            )
+            likely_translation = bool(
+                consistent_inline_bilingual or strong_simplified_hints >= 2
+            )
             if likely_translation:
                 removed += 1
                 continue
@@ -557,17 +589,17 @@ def clean_srt_for_playback(
     output_dir = (cache_dir / "playback-srt").expanduser()
     try:
         subtitle.resolve().relative_to(output_dir.resolve())
-        if subtitle.name.startswith("v15-"):
+        if subtitle.name.startswith("v16-"):
             return subtitle, {"reason": "already_clean", "cleaned": False}
     except ValueError:
         pass
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v15".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-v16".encode()
     ).hexdigest()[:20]
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v15-{digest}.srt"
+    output = output_dir / f"v16-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
     if output.exists() and output.stat().st_size > 0:

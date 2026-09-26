@@ -105,10 +105,11 @@ def test_torrent_toggle_waiting_count_uses_real_backend_jobs_not_stale_intents()
     api._downloads_configured = lambda: True
 
     off = api.torrent_traffic_status()
-    assert off["waiting"] == 0
-    assert off["active"] == 0
-    assert off["download_speed"] == 0
-    assert off["upload_speed"] == 0
+    assert off["waiting"] is None
+    assert off["active"] is None
+    assert off["download_speed"] is None
+    assert off["upload_speed"] is None
+    assert off["observed_state"] == "unknown"
 
     api._torrent_session_enabled = True
     on = api.torrent_traffic_status()

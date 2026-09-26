@@ -20,14 +20,23 @@ def main(argv: list[str] | None = None) -> int:
     if not config.agent.enabled:
         print(f"{APP_NAME} Agent отключён")
         return 0
-    if args.scheduled and not app_session_active():
-        print(f"{APP_NAME} Agent: приложение закрыто, фоновая работа пропущена")
+    # Lightweight discovery is available to installed configurations even when
+    # the GUI is closed. Minimal/test configurations retain the older no-op path.
+    if args.scheduled and not hasattr(config, "paths") and not app_session_active():
         return 0
-    if args.scheduled and app_session_window_active():
-        print(f"{APP_NAME} Agent: окно активно, тяжёлая фоновая работа отложена")
+    if args.scheduled and not hasattr(config, "paths") and app_session_window_active():
         return 0
     logger = configure_logging()
     manager = AnimeManager(config)
+    discovery_engine = getattr(manager, "planned_release_discovery", None)
+    discovery = (
+        discovery_engine().tick(max_searches=2)
+        if callable(discovery_engine)
+        else {"armed": 0, "searched": 0, "found": 0}
+    )
+    if args.scheduled and (not app_session_active() or app_session_window_active()):
+        print(f"{APP_NAME} Agent: release discovery {discovery}; heavy work deferred")
+        return 0
     search_due = True
     anilist_due = False
     subtitle_due = False
@@ -70,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"{APP_NAME} Agent: {exc}", file=sys.stderr)
         return 1
+    stats["planned_release_discovery"] = discovery
     print(f"{APP_NAME} Agent:", ", ".join(f"{key}={value}" for key, value in stats.items()))
     return 0
 

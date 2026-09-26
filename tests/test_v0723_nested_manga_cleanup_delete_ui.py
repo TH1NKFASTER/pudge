@@ -365,7 +365,8 @@ def test_manga_state_backfills_missing_public_scores_once_per_process() -> None:
     assert "pudge-v0.7.23-manga-mean-score-backfill-v1" in web
     assert "media(id_in:$ids,type:MANGA){id meanScore}" in web
     assert 'book.get("mean_score") is None' in web
-    assert "return self._backfill_manga_mean_scores(self.manga.state())" in web
+    assert "self._backfill_manga_mean_scores(self.manga.state())" in web
+    assert "self._manga_state_payload(" in web
 
 
 def test_series_stats_use_remaining_header_width_before_wrapping() -> None:

@@ -14,6 +14,26 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    name: Quality
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[dev,sync]"
+
+      - name: Run quality gates
+        run: make quality PYTHON=python
+
   verify-and-test:
     name: Tests ${{ matrix.batch }}/4
     runs-on: macos-14
@@ -48,7 +68,7 @@ jobs:
 
   build-release:
     name: Build macOS release ZIP
-    needs: verify-and-test
+    needs: [quality, verify-and-test]
     runs-on: macos-14
 
     steps:
@@ -88,17 +108,46 @@ jobs:
             ${{ steps.archive.outputs.path }}
             ${{ steps.archive.outputs.checksum }}
 
+      - name: Extract release notes from changelog
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          python - "$RELEASE_TAG" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          tag = sys.argv[1].strip()
+          version = tag[1:] if tag.startswith("v") else tag
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          match = re.search(
+              rf"(?ms)^## v{re.escape(version)}(?:\s|—).*?(?=^## v|\Z)",
+              text,
+          )
+          if match is None:
+              raise SystemExit(f"CHANGELOG.md has no release section for {tag}")
+          lines = match.group(0).strip().splitlines()
+          notes = "\n".join(lines[1:]).strip() + "\n"
+          if not notes.strip():
+              raise SystemExit(f"release notes for {tag} are empty")
+          Path("dist/release-notes.md").write_text(notes, encoding="utf-8")
+          PY
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           ARCHIVE: ${{ steps.archive.outputs.path }}
           CHECKSUM: ${{ steps.archive.outputs.checksum }}
+          NOTES: dist/release-notes.md
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --title "Pudge $RELEASE_TAG" \
+              --notes-file "$NOTES"
           else
             gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" \
               --title "Pudge $RELEASE_TAG" \
-              --generate-notes
+              --notes-file "$NOTES"
           fi

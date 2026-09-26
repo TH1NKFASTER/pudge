@@ -84,7 +84,14 @@ class CacheRegistry:
                 (time.time(), str(cache_key)),
             )
 
-    def enforce(self, policies: dict[str, CachePolicy]) -> dict[str, int]:
+    def enforce(
+        self,
+        policies: dict[str, CachePolicy],
+        *,
+        protected_paths: set[Path] | None = None,
+    ) -> dict[str, int]:
+        # In-use media must never be evicted to satisfy a cache quota.
+        protected = {Path(path).expanduser().resolve() for path in (protected_paths or ())}
         now = time.time()
         removed = 0
         removed_bytes = 0
@@ -103,10 +110,11 @@ class CacheRegistry:
                         and now - float(row["accessed_at"] or 0) > policy.max_age_seconds
                     )
                     over_quota = retained + size > max(0, int(policy.max_bytes))
-                    if bool(row["pinned"]) or not (expired or too_old or over_quota):
+                    path = Path(str(row["path"])).expanduser().resolve()
+                    evictable = expired or too_old or over_quota
+                    if bool(row["pinned"]) or path in protected or not evictable:
                         retained += size
                         continue
-                    path = Path(str(row["path"])).expanduser().resolve()
                     if path != self.cache_root and self.cache_root in path.parents:
                         try:
                             if path.is_dir():

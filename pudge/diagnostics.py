@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import platform
+import re
 import time
 import zipfile
 from pathlib import Path
@@ -89,19 +90,87 @@ class DebugBundleBuilder:
         self.database = database
         self.recorder = recorder
 
+    @staticmethod
+    def _sanitize_text(text: str) -> str:
+        """Scrub credential *values* from old unstructured logs before export.
+
+        No regex is able to identify an arbitrary unlabeled secret. New process
+        snapshots avoid argv entirely; this defensive layer covers historical
+        labeled argv, HTTP headers and credentials embedded in common URLs.
+        """
+        # Authorization headers contain a scheme and a credential; scrub the
+        # entire value before generic key=value handling can leave the token.
+        scrubbed = re.sub(
+            r"(?im)\b(authorization|cookie)\s*:\s*[^\r\n]+",
+            r"\1: [REDACTED]",
+            text,
+        )
+        scrubbed = re.sub(
+            r"(?i)(?<![\w-])(--(?:rpc-secret|secret|password|api[-_]?key|access[-_]?token|token))"
+            r"(?:\s*=\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            r"\1=[REDACTED]",
+            scrubbed,
+        )
+        scrubbed = re.sub(
+            r"(?i)(?<![\w-])[\"']?(rpc[-_]?secret|api[-_]?key|access[-_]?token|password|authorization|cookie)"
+            r"[\"']?(?:\s*[=:]\s*|\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            r"\1=[REDACTED]",
+            scrubbed,
+        )
+        scrubbed = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9_./+~=-]+", r"\1 [REDACTED]", scrubbed)
+        scrubbed = re.sub(r"(?i)(https?://)[^\s/:@]+:[^\s/@]+@", r"\1[REDACTED]@", scrubbed)
+        return scrubbed
+
     @classmethod
     def _redact(cls, value: Any, *, key: str = "") -> Any:
-        sensitive = {"token", "password", "secret", "api_key", "authorization"}
+        sensitive = {
+            "token",
+            "password",
+            "secret",
+            "api_key",
+            "apikey",
+            "authorization",
+            "cookie",
+            "credential",
+            "rpcsecret",
+            "access_token",
+            "accesstoken",
+        }
         normalized = key.casefold().replace("-", "_")
-        if any(part in normalized for part in sensitive):
-            return "••••••••" if value else value
+        if any(part in normalized for part in sensitive) or normalized in {
+            "command",
+            "argv",
+            "environment",
+            "env",
+        }:
+            return "[REDACTED]" if value else value
         if isinstance(value, dict):
             return {
                 str(child_key): cls._redact(child, key=str(child_key)) for child_key, child in value.items()
             }
         if isinstance(value, list):
             return [cls._redact(child) for child in value]
+        if isinstance(value, str):
+            return cls._sanitize_text(value)
         return value
+
+    @classmethod
+    def _sanitized_log(cls, source: Path) -> str:
+        # Never copy raw log bytes directly into a support ZIP. Historical
+        # energy JSONL can contain command values even after logger upgrades.
+        output: list[str] = []
+        with source.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    item = json.loads(line)
+                except (ValueError, TypeError):
+                    output.append(cls._sanitize_text(line))
+                else:
+                    if isinstance(item, (dict, list)):
+                        output.append(json.dumps(cls._redact(item), ensure_ascii=False) + "\n")
+                    else:
+                        output.append(cls._sanitize_text(line))
+        return "".join(output)
 
     def _database_summary(self) -> dict[str, Any]:
         with self.database.connect() as conn:
@@ -162,7 +231,7 @@ class DebugBundleBuilder:
             "platform": platform.platform(),
             "frontend": self._redact(dict(frontend or {})),
             "database": self._database_summary(),
-            "energy": energy_summary,
+            "energy": self._redact(energy_summary),
         }
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))
@@ -177,7 +246,7 @@ class DebugBundleBuilder:
             )
             archive.writestr(
                 "energy-summary.json",
-                json.dumps(energy_summary, ensure_ascii=False, indent=2, default=str),
+                json.dumps(self._redact(energy_summary), ensure_ascii=False, indent=2, default=str),
             )
             for index, snapshot in enumerate(snapshot_rows, start=1):
                 archive.writestr(
@@ -192,15 +261,18 @@ class DebugBundleBuilder:
             for label, path in (logs or {}).items():
                 source = Path(path).expanduser()
                 if source.is_file():
-                    archive.write(source, f"logs/{label}{source.suffix or '.log'}")
+                    archive.writestr(
+                        f"logs/{label}{source.suffix or '.log'}",
+                        self._sanitized_log(source),
+                    )
                 if label not in {"runtime", "agent", "agent-error"}:
                     continue
                 for rotation in range(1, 4):
                     rotated = Path(f"{source}.{rotation}")
                     if rotated.is_file():
-                        archive.write(
-                            rotated,
+                        archive.writestr(
                             f"logs/{label}{source.suffix or '.log'}.{rotation}",
+                            self._sanitized_log(rotated),
                         )
             subtitle_paths: set[Path] = set()
             for snapshot in snapshot_rows:

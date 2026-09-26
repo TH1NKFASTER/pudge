@@ -173,3 +173,92 @@
 .manga-v2-page-label{white-space:nowrap;padding:5px 8px;font-variant-numeric:tabular-nums}
 .manga-v2-page-picker{position:absolute;z-index:40;top:calc(100% + 5px);left:50%;transform:translateX(-50%);width:92px;max-height:min(340px,52vh);overflow-y:auto;overscroll-behavior:contain;padding:5px;display:grid;gap:2px;border:1px solid #40516a;border-radius:9px;background:rgba(9,15,24,.99);box-shadow:0 14px 42px rgba(0,0,0,.5);scrollbar-gutter:stable}
 .manga-v2-page-picker[hidden]{display:none}.manga-v2-page-picker button{display:block;width:100%;padding:7px 8px;border-color:transparent;background:transparent;text-align:center;font-variant-numeric:tabular-nums}.manga-v2-page-picker button:hover,.manga-v2-page-picker button.active{border-color:rgba(87,211,140,.5);background:rgba(87,211,140,.12)}
+
+
+/* G15: Jiten learning-state image-space overlay.  Keep it above the page
+   image but below the interactive OCR text/hitbox layer. */
+.manga-v2-status-layer{position:absolute;z-index:1;pointer-events:none;overflow:visible}
+.manga-v2-status-word{
+  pointer-events:none;
+  fill-opacity:var(--manga-status-opacity,.35);
+  stroke:none;
+  vector-effect:non-scaling-stroke;
+}
+.manga-v2-status-word.state-new{fill:var(--manga-status-new,#ffdc46)}
+.manga-v2-status-word.state-learning{fill:var(--manga-status-learning,#4aa9ff)}
+.manga-v2-status-word.state-known{fill:var(--manga-status-known,#45cf80)}
+.manga-v2-status-word.is-approximate{filter:saturate(.92)}
+.manga-v2-status-word.is-due{
+  stroke:var(--manga-status-due,#ef8d3d);
+  stroke-width:3px;
+  stroke-opacity:.95;
+}
+.manga-v2-status-word.outline-only{fill-opacity:0}
+
+/* G29b: direct manual OCR hitbox editing in image space. */
+.manga-v2-reader.geometry-editing .manga-v2-selection-content{pointer-events:none}
+.manga-v2-geometry-editor{
+  position:absolute;
+  z-index:9;
+  box-sizing:border-box;
+  border:2px solid #ffd166;
+  background:rgba(255,209,102,.08);
+  box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 18px rgba(255,209,102,.22);
+  cursor:move;
+  pointer-events:auto;
+  touch-action:none;
+}
+.manga-v2-geometry-label{
+  position:absolute;
+  left:0;
+  top:0;
+  transform:translateY(-100%);
+  padding:2px 6px;
+  border-radius:6px 6px 0 0;
+  background:#ffd166;
+  color:#17120a;
+  font:700 11px/1.25 ui-monospace,SFMono-Regular,Menlo,monospace;
+  white-space:nowrap;
+  pointer-events:none;
+}
+.manga-v2-geometry-actions{
+  position:absolute;
+  left:50%;
+  bottom:-44px;
+  transform:translateX(-50%);
+  display:flex;
+  gap:6px;
+  padding:5px;
+  border:1px solid #40516a;
+  border-radius:9px;
+  background:rgba(9,15,24,.97);
+  box-shadow:0 10px 26px rgba(0,0,0,.45);
+  cursor:default;
+}
+.manga-v2-geometry-actions button{padding:5px 10px;white-space:nowrap}
+.manga-v2-geometry-editor [data-manga-geometry-handle]{
+  position:absolute;
+  display:block;
+  width:12px;
+  height:12px;
+  margin:-6px 0 0 -6px;
+  border:2px solid #17120a;
+  border-radius:50%;
+  background:#ffd166;
+  box-shadow:0 0 0 1px rgba(255,255,255,.8);
+}
+.manga-v2-geometry-editor [data-manga-geometry-handle="nw"]{left:0;top:0;cursor:nwse-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="n"]{left:50%;top:0;cursor:ns-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="ne"]{left:100%;top:0;cursor:nesw-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="e"]{left:100%;top:50%;cursor:ew-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="se"]{left:100%;top:100%;cursor:nwse-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="s"]{left:50%;top:100%;cursor:ns-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="sw"]{left:0;top:100%;cursor:nesw-resize}
+.manga-v2-geometry-editor [data-manga-geometry-handle="w"]{left:0;top:50%;cursor:ew-resize}
+
+/* G31: explicit manual OCR region selection; does not change ordinary study clicks. */
+.manga-v2-reader.manual-add-mode .manga-v2-page-frame img{cursor:crosshair!important}
+.manga-v2-reader.manual-add-mode .manga-v2-text-layer{pointer-events:none!important}
+
+.manga-v2-reader.manual-add-mode .manga-v2-selection-content{pointer-events:none!important}
+.manga-v2-reader.manual-merge-mode .manga-v2-text-region{cursor:crosshair!important;outline:2px solid rgba(96,165,250,.55)}

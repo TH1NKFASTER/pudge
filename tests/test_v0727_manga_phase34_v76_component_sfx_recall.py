@@ -159,7 +159,7 @@ def test_v76_component_isolated_sfx_removes_thin_background_art_before_ocr() -> 
         top_page_y = float(geometry["y"]) + float(geometry["height"])
         sample_y = int(round((top_page_y - line_page_y) * image.height))
         assert gray.getpixel((sample_x, sample_y)) > 240
-        assert sum(value < 128 for value in gray.getdata()) > 1000
+        assert sum(value < 128 for value in getattr(gray, "get_flattened_data", gray.getdata)()) > 1000
     finally:
         isolated.close()
 

@@ -109,6 +109,7 @@ max_events_per_request = 500
 
 [tools]
 mpv = "mpv"
+manga_ocr_backend = "pudge"
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 alass = "alass"

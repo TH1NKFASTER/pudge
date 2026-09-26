@@ -12,6 +12,9 @@
   let cardQueue = [];
   let currentStatus = null;
   let optimisticReviewed = 0;
+  let optimisticUndoCount = 0;
+  let undoing = false;
+  let reviewHistory = [];
   let authorizedCardKeys = new Set();
   let lastGradeStateSignature = '';
   let prefetchTimer = null;
@@ -55,6 +58,10 @@
         showAnswer();
         return;
       }
+      if (event.target.closest?.('[data-review-gate-undo]')) {
+        void undoLastReview();
+        return;
+      }
       const grade = event.target.closest?.('[data-review-gate-grade]');
       if (grade) void submitGrade(String(grade.dataset.reviewGateGrade || 'good'));
       const retry = event.target.closest?.('[data-review-gate-retry]');
@@ -74,6 +81,9 @@
     cardQueue = [];
     currentStatus = null;
     optimisticReviewed = 0;
+    optimisticUndoCount = 0;
+    undoing = false;
+    reviewHistory = [];
     authorizedCardKeys.clear();
     lastGradeStateSignature = '';
     overlay?.classList.remove('open', 'pudge-review-gate-busy');
@@ -88,10 +98,8 @@
   function showAnswer() {
     if (!overlay?.classList.contains('open') || revealed || !activeCardKey) return false;
     revealed = true;
+    render({}, {replaceCards:false});
     const root = overlay.querySelector('.pudge-review-gate-card');
-    root?.classList.add('answer-shown');
-    root?.querySelector('[data-review-gate-show-answer]')?.setAttribute('hidden', '');
-    root?.querySelector('.pudge-review-gate-back')?.removeAttribute('hidden');
     root?.querySelector('[data-review-gate-grade="good"]')?.focus?.({preventScroll:true});
     uiLog('show_answer', {card:activeCardKey, authorized:authorizedCardKeys.has(activeCardKey), authorizing, saving, queue:cardQueue.length});
     return true;
@@ -106,20 +114,66 @@
   }
 
   function handleKeydown(event) {
-    if (!overlay?.classList.contains('open') || revealed || !activeCardKey) return false;
-    if (event?.isComposing || event?.repeat || event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
-    if (event?.code !== 'Space' && event?.key !== ' ') return false;
-    event.preventDefault?.();
-    event.stopPropagation?.();
-    event.stopImmediatePropagation?.();
-    showAnswer();
-    return true;
+    if (!overlay?.classList.contains('open')) return false;
+    if (event?.isComposing || event?.repeat) return false;
+    if (event?.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return false;
+
+    const key = String(event?.key || '');
+    const code = String(event?.code || '');
+    const undoChord = event?.metaKey && !event?.ctrlKey && !event?.altKey && !event?.shiftKey
+      && key.toLowerCase() === 'z';
+    if (undoChord && reviewHistory.length && !undoing) {
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      void undoLastReview();
+      return true;
+    }
+
+    if (!activeCardKey) return false;
+    if (event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
+    if (!revealed) {
+      if (event?.code !== 'Space' && event?.key !== ' ') return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      showAnswer();
+      return true;
+    }
+
+    const gradeByKey = {
+      '1':'again', Digit1:'again', Numpad1:'again',
+      '2':'hard', Digit2:'hard', Numpad2:'hard',
+      '3':'good', Digit3:'good', Numpad3:'good',
+      '4':'easy', Digit4:'easy', Numpad4:'easy',
+    };
+    const grade = gradeByKey[key] || gradeByKey[code] || '';
+    if (grade) {
+      const button = overlay.querySelector(`[data-review-gate-grade="${grade}"]`);
+      if (!button || button.disabled) return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      button.focus?.({preventScroll:true});
+      return true;
+    }
+
+    if (code === 'Space' || key === ' ') {
+      const focused = document.activeElement?.closest?.('[data-review-gate-grade]');
+      if (!focused || !overlay.contains(focused) || focused.disabled) return false;
+      event.preventDefault?.();
+      event.stopPropagation?.();
+      event.stopImmediatePropagation?.();
+      focused.click();
+      return true;
+    }
+    return false;
   }
 
   function displayedCompleted(status) {
     const required = Math.max(1, Number(status?.required || 1));
     const confirmed = Math.max(0, Number(status?.completed || 0));
-    return Math.min(required, confirmed + Math.max(0, Number(optimisticReviewed || 0)));
+    return Math.max(0, Math.min(required, confirmed + Math.max(0, Number(optimisticReviewed || 0)) - Math.max(0, Number(optimisticUndoCount || 0))));
   }
 
   function progressText(status) {
@@ -138,7 +192,17 @@
 
   function readingText(card) {
     const rows = Array.isArray(card?.readings) ? card.readings : [];
-    return rows.map(row => String(row?.text || '').trim()).filter(Boolean).slice(0, 3).join(' ・ ');
+    const values = rows.map(row => String(row?.text || '').trim()).filter(Boolean);
+    const frontWord = String(card?.wordTextPlain || card?.wordText || rows[0]?.text || '').trim();
+
+    // Kana-only words already display their pronunciation in the main line,
+    // so a second reading line is pure duplication (やらかす -> やらかす).
+    if (!/[\u3400-\u9fff々]/u.test(frontWord)) return '';
+
+    // A single Jiten bracket-ruby line (e.g. 伏[ふ]せる) duplicates the
+    // properly rendered ruby answer directly above it, so do not show it twice.
+    if (values.length === 1 && /\[[^\]]+\]/.test(values[0])) return '';
+    return values.slice(0, 3).join(' ・ ');
   }
 
   function confusableReadings(card) {
@@ -240,12 +304,14 @@
         return title ? `${title}${count > 0 ? ` ×${count}` : ''}` : '';
       })
       .filter(Boolean);
-    const example = String(card?.exampleSentence?.text || '').replaceAll('**', '').trim();
+    const example = String(card?.exampleSentence?.text || card?.pudgeContextSentence || '').replaceAll('**', '').trim();
+    const contextImage = String(card?.pudgeContextImage || '').trim();
 
     return `
       <div class="pudge-review-gate-answer-word">${rubyHtml(rubySource)}</div>
       ${plainReading ? `<div class="pudge-review-gate-reading">${esc(plainReading)}</div>` : ''}
       ${pitchHtml ? `<div class="pudge-review-gate-pitch">${pitchHtml}</div>` : ''}
+      ${contextImage ? `<div class="pudge-review-gate-image"><img src="${esc(contextImage)}" alt="" loading="lazy"></div>` : ''}
       ${meta.length ? `<div class="pudge-review-gate-meta">${meta.map(value => `<span>${esc(value)}</span>`).join('')}</div>` : ''}
       ${meanings.length ? `<ol class="pudge-review-gate-meanings">${meanings.map(value => `<li>${esc(value)}</li>`).join('')}</ol>` : ''}
       ${example ? `<div class="pudge-review-gate-example"><small>${ru() ? 'Пример' : 'Example'}</small>${esc(example)}</div>` : ''}
@@ -255,6 +321,34 @@
         <button class="hard" data-review-gate-grade="hard">${gradeLabel(card, 'hard', 'Hard', 'Трудно')}</button>
         <button class="good" data-review-gate-grade="good">${gradeLabel(card, 'good', 'Good', 'Хорошо')}</button>
         <button class="easy" data-review-gate-grade="easy">${gradeLabel(card, 'easy', 'Easy', 'Легко')}</button>
+      </div>`;
+  }
+
+  function frontWordHtml(card, showReading) {
+    const primaryReading = selectedReading(card);
+    const frontWord = String(card?.wordTextPlain || card?.wordText || primaryReading?.text || '').trim();
+    if (!showReading) return esc(frontWord);
+    const primaryText = String(primaryReading?.text || '').trim();
+    const frontRuby = String(primaryReading?.rubyText || '').trim()
+      || (primaryText.includes('[') ? primaryText : frontWord);
+    return rubyHtml(frontRuby);
+  }
+
+  function previousReviewHtml() {
+    const entry = reviewHistory[reviewHistory.length - 1];
+    if (!entry) return '';
+    const card = entry.card || {};
+    const word = String(card.wordTextPlain || card.wordText || selectedReading(card)?.text || '').trim();
+    const labels = ru()
+      ? {again:'Снова', hard:'Трудно', good:'Хорошо', easy:'Легко'}
+      : {again:'Again', hard:'Hard', good:'Good', easy:'Easy'};
+    const grade = String(entry.grade || 'good').toLowerCase();
+    return `
+      <div class="pudge-review-gate-previous">
+        <span class="pudge-review-gate-previous-label">${ru() ? 'Предыдущее' : 'Previous'}</span>
+        <strong>${esc(word)}</strong>
+        <span class="pudge-review-gate-previous-grade grade-${esc(grade)}">${esc(labels[grade] || grade)}</span>
+        <button type="button" data-review-gate-undo ${undoing ? 'disabled' : ''}>${ru() ? 'Отменить' : 'Undo'}</button>
       </div>`;
   }
 
@@ -278,10 +372,11 @@
     let body = '';
     if (card) {
       const frontWord = String(card.wordTextPlain || card.wordText || selectedReading(card)?.text || '').trim();
+      const frontMarkup = frontWordHtml(card, revealed);
       const frontConfusable = confusableReadings(card);
       body = `
         <div class="pudge-review-gate-front">
-          <div class="pudge-review-gate-word">${esc(frontWord)}</div>
+          <div class="pudge-review-gate-word">${frontMarkup}</div>
           ${frontConfusable.length ? `<div class="pudge-review-gate-front-confusable"><small>${ru() ? 'Похожие чтения' : 'Confusable readings'}</small><span>${esc(frontConfusable.join(' ・ '))}</span></div>` : ''}
           <button class="primary pudge-review-gate-show-answer" data-review-gate-show-answer>${ru() ? 'Показать ответ' : 'Show answer'} <kbd>Space</kbd></button>
         </div>
@@ -301,28 +396,40 @@
         body = `<div class="pudge-review-gate-empty">${esc(message)}</div><div class="pudge-review-gate-actions"><button data-review-gate-retry>${ru() ? 'Повторить' : 'Retry'}</button></div>`;
       }
     }
-    const stateNote = saving && card
-      ? `<span class="pudge-review-gate-saving">${esc(ru() ? 'Сохраняю предыдущую…' : 'Saving previous…')}</span>`
-      : (card && !cardAuthorized
-        ? `<span class="pudge-review-gate-saving">${esc(authorizing ? (ru() ? 'Подтверждаю карточку…' : 'Authorizing card…') : (ru() ? 'Карточка ещё не подтверждена' : 'Card authorization pending'))}</span>`
-        : '');
+    const stateNote = undoing && card
+      ? `<span class="pudge-review-gate-saving">${esc(ru() ? 'Отменяю предыдущее повторение…' : 'Undoing previous review…')}</span>`
+      : (saving && card
+        ? `<span class="pudge-review-gate-saving">${esc(ru() ? 'Сохраняю предыдущую…' : 'Saving previous…')}</span>`
+        : (card && !cardAuthorized
+          ? `<span class="pudge-review-gate-saving">${esc(authorizing ? (ru() ? 'Подтверждаю карточку…' : 'Authorizing card…') : (ru() ? 'Карточка ещё не подтверждена' : 'Card authorization pending'))}</span>`
+          : ''));
+    // WebKit can retain the focus/hover compositor of a button that is removed
+    // by innerHTML. Blur it before replacing the card to avoid transient ghosts.
+    const focusedBeforeRender = document.activeElement;
+    if (focusedBeforeRender && root.contains(focusedBeforeRender)) {
+      focusedBeforeRender.blur?.();
+    }
     root.innerHTML = `
       <div class="pudge-review-gate-head">
         <div class="pudge-review-gate-head-copy">
           <div class="pudge-review-gate-title">${ru() ? `Повторение перед серией${episode ? ` ${episode}` : ''}` : `Review before episode${episode ? ` ${episode}` : ''}`}</div>
-          <div class="pudge-review-gate-subtitle">${ru() ? 'Только уже изученные карточки Jiten; новых слов не будет.' : 'Previously studied Jiten cards only; no new words are introduced.'}</div>
+          <div class="pudge-review-gate-subtitle">${view?.all_due_episode_words ? (ru() ? 'Все текущие due-карточки Jiten, встречающиеся именно в этой серии; новых слов не будет.' : 'All currently due Jiten cards found in this exact episode; no new words are introduced.') : (ru() ? 'Только уже изученные карточки Jiten; новых слов не будет.' : 'Previously studied Jiten cards only; no new words are introduced.')}</div>
         </div>
         <button class="pudge-review-gate-close" data-review-gate-close aria-label="Close">×</button>
       </div>
       <div class="pudge-review-gate-progress"><span style="width:${width}%"></span></div>
       <div class="pudge-review-gate-status${unknownCount ? ' warning' : ''}">${esc(progressText(view))}${unknownCount ? esc(ru() ? ` • ${unknownCount} неоднозначных попыток не засчитано` : ` • ${unknownCount} ambiguous attempt(s) not counted`) : ''}${stateNote}</div>
+      ${previousReviewHtml()}
       ${body}`;
     root.classList.toggle('answer-shown', revealed);
     root.dataset.wordId = card ? String(card.wordId ?? '') : '';
     root.dataset.readingIndex = card ? String(card.readingIndex ?? '') : '';
-    root.querySelectorAll('[data-review-gate-grade]').forEach(button => { button.disabled = saving || !cardAuthorized; });
+    root.querySelectorAll('[data-review-gate-grade]').forEach(button => {
+      button.disabled = saving || !cardAuthorized;
+      if (undoing) button.disabled = true;
+    });
     if (cardKey) {
-      const reason = saving ? 'saving_previous' : (cardAuthorized ? 'ready' : (authorizing ? 'authorizing' : 'not_authorized'));
+      const reason = undoing ? 'undoing_previous' : (saving ? 'saving_previous' : (cardAuthorized ? 'ready' : (authorizing ? 'authorizing' : 'not_authorized')));
       const signature = `${cardKey}|${reason}|${revealed ? 1 : 0}`;
       if (signature !== lastGradeStateSignature) {
         lastGradeStateSignature = signature;
@@ -335,7 +442,9 @@
     try {
       if (!window.pywebview?.api?.review_gate_prefetch) return null;
       const snapshot = await window.pywebview.api.review_gate_prefetch(Boolean(force));
-      if (Array.isArray(snapshot?.cards) && snapshot.cards.length) {
+      if (snapshot?.reason === 'episode_due_mode') {
+        window.__pudgeReviewGateWarmCards = [];
+      } else if (Array.isArray(snapshot?.cards) && snapshot.cards.length) {
         window.__pudgeReviewGateWarmCards = snapshot.cards.map(card => ({...card}));
       }
       return snapshot;
@@ -373,6 +482,9 @@
     cardQueue = [];
     currentStatus = null;
     optimisticReviewed = 0;
+    optimisticUndoCount = 0;
+    undoing = false;
+    reviewHistory = [];
     authorizedCardKeys.clear();
     lastGradeStateSignature = '';
     overlay?.classList.remove('open', 'pudge-review-gate-busy');
@@ -462,6 +574,21 @@
       return;
     }
 
+    const focusedGrade = document.activeElement?.closest?.('[data-review-gate-grade]');
+    if (focusedGrade && overlay?.contains(focusedGrade)) focusedGrade.blur?.();
+
+    const attemptId = globalThis.crypto?.randomUUID?.() || `pudge-gate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const historyEntry = {
+      card: {...submittedCard},
+      cardKey: submittedKey,
+      grade: String(grade || 'good'),
+      attemptId,
+      submitPromise: null,
+      result: null,
+      settled: false,
+      undone: false,
+    };
+
     // Advance visually before network IO. The remaining cards were already
     // prefetched and authorized by review_gate_begin(); the just-submitted card
     // is still counted only after the Jiten mutation is confirmed.
@@ -469,11 +596,11 @@
     authorizedCardKeys.delete(submittedKey);
     saving = true;
     optimisticReviewed += 1;
+    reviewHistory.push(historyEntry);
     revealed = false;
     activeCardKey = '';
     render({loading:false}, {replaceCards:false});
 
-    const attemptId = globalThis.crypto?.randomUUID?.() || `pudge-gate-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const submitStartedAt = performance?.now?.() ?? Date.now();
     uiLog('review_optimistic', {
       card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:attemptId,
@@ -481,9 +608,14 @@
     });
     uiLog('review_submit', {card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:attemptId});
     try {
+      historyEntry.submitPromise = new Promise(resolve => { historyEntry.resolveSubmit = resolve; });
       const result = await window.pywebview.api.review_gate_review(
         launch.path, wordId, readingIndex, String(grade || 'good'), attemptId,
       );
+      historyEntry.resolveSubmit?.(result);
+      historyEntry.resolveSubmit = null;
+      historyEntry.result = result;
+      historyEntry.settled = true;
       if (myGeneration !== generation || !launch) return;
       optimisticReviewed = Math.max(0, optimisticReviewed - 1);
       currentStatus = {...(currentStatus || {}), ...(result || {})};
@@ -494,11 +626,23 @@
       } else {
         uiLog('review_optimistic_confirm', {card:submittedKey, displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
       }
-      if (result?.granted || !result?.blocking) {
+      if ((result?.granted || !result?.blocking) && !historyEntry.undone) {
         await finishAndLaunch();
         return;
       }
     } catch (error) {
+      historyEntry.resolveSubmit?.({
+        ok:false,
+        outcome:'error',
+        message:String(error?.message || error || ''),
+      });
+      historyEntry.resolveSubmit = null;
+      historyEntry.settled = true;
+      historyEntry.error = error;
+      if (!historyEntry.undone) {
+        const historyIndex = reviewHistory.lastIndexOf(historyEntry);
+        if (historyIndex >= 0) reviewHistory.splice(historyIndex, 1);
+      }
       if (myGeneration !== generation || !launch) return;
       optimisticReviewed = Math.max(0, optimisticReviewed - 1);
       uiLog('review_optimistic_rollback', {card:submittedKey, reason:'exception', displayed_completed:displayedCompleted(currentStatus || {}), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed, error:String(error?.message || error || '')});
@@ -511,6 +655,66 @@
       }
     }
     if (myGeneration === generation && launch && cardQueue.length === 0) await loadBatch();
+  }
+
+  async function undoLastReview() {
+    if (!overlay?.classList.contains('open') || !launch || undoing || !reviewHistory.length) return false;
+
+    const entry = reviewHistory.pop();
+    entry.undone = true;
+    undoing = true;
+    optimisticUndoCount += 1;
+
+    cardQueue.unshift({...entry.card});
+    authorizedCardKeys.delete(entry.cardKey);
+    revealed = false;
+    activeCardKey = '';
+    render({loading:false}, {replaceCards:false});
+    uiLog('review_undo_optimistic', {card:entry.cardKey, grade:entry.grade, history_remaining:reviewHistory.length});
+
+    try {
+      const submitted = entry.submitPromise ? await entry.submitPromise : entry.result;
+      const outcome = String(submitted?.outcome || '');
+      const providerHasReview = Boolean(
+        submitted?.ok && (outcome === 'confirmed' || outcome === 'already_counted')
+      );
+      if (!providerHasReview) {
+        throw new Error(
+          submitted?.message
+          || (ru() ? 'Предыдущее повторение не было подтверждено сервером.' : 'The previous review was not confirmed by the server.')
+        );
+      }
+
+      const result = await window.pywebview.api.review_gate_undo(
+        launch.path,
+        Number(entry.card?.wordId || 0),
+        Number(entry.card?.readingIndex || 0),
+      );
+      if (!result?.ok || String(result?.outcome || '') !== 'undone') {
+        throw new Error(result?.message || `Undo failed: ${String(result?.outcome || 'unknown')}`);
+      }
+
+      currentStatus = {...(currentStatus || {}), ...(result || {})};
+      optimisticUndoCount = Math.max(0, optimisticUndoCount - 1);
+      authorizedCardKeys.add(entry.cardKey);
+      undoing = false;
+      render({}, {replaceCards:false});
+      uiLog('review_undo_confirm', {card:entry.cardKey, completed:Number(result?.completed || 0), remaining:Number(result?.remaining || 0)});
+      return true;
+    } catch (error) {
+      optimisticUndoCount = Math.max(0, optimisticUndoCount - 1);
+      undoing = false;
+      authorizedCardKeys.delete(entry.cardKey);
+      if (cardKeyOf(cardQueue[0]) === entry.cardKey) cardQueue.shift();
+      render({}, {replaceCards:false});
+      uiLog('review_undo_error', {card:entry.cardKey, error:String(error?.message || error || '')});
+      window.toast?.(
+        (ru() ? 'Не удалось отменить предыдущее повторение: ' : 'Could not undo previous review: ')
+        + String(error?.message || error || '')
+      );
+      if (launch && !busy && cardQueue.length === 0) void loadBatch();
+      return false;
+    }
   }
 
   async function open(nextLaunch, initialStatus = null) {
@@ -526,9 +730,14 @@
     lastGradeStateSignature = '';
     currentStatus = initialStatus ? {...initialStatus} : null;
     optimisticReviewed = 0;
+    optimisticUndoCount = 0;
+    undoing = false;
+    reviewHistory = [];
     const node = ensureUi();
     node.classList.add('open');
-    const warm = Array.isArray(window.__pudgeReviewGateWarmCards) ? window.__pudgeReviewGateWarmCards : [];
+    const warm = initialStatus?.all_due_episode_words
+      ? []
+      : (Array.isArray(window.__pudgeReviewGateWarmCards) ? window.__pudgeReviewGateWarmCards : []);
     const excludedWarm = new Set([
       ...(Array.isArray(initialStatus?.confirmed_card_keys) ? initialStatus.confirmed_card_keys : []),
       ...(Array.isArray(initialStatus?.unknown_card_keys) ? initialStatus.unknown_card_keys : []),
@@ -555,6 +764,7 @@
     handleEscape,
     handleKeydown,
     showAnswer,
+    undoLastReview,
     prefetch,
     startPrefetchLoop,
     isOpen:() => Boolean(overlay?.classList.contains('open')),

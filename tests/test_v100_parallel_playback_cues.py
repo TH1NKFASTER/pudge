@@ -43,7 +43,7 @@ def test_playback_clean_keeps_simultaneous_srt_cues(tmp_path: Path) -> None:
     output, result = clean_srt_for_playback(source, tmp_path / "cache")
 
     assert result["cleaned"] is True
-    assert output.name.startswith("v15-")
+    assert output.name.startswith("v16-")
     assert parse_srt(output) == [
         (366.0, 370.0, "パカパカ…"),
         (367.2, 369.2, "別の台詞"),

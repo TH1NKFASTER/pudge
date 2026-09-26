@@ -80,8 +80,10 @@ def test_torrent_status_off_counts_unfinished_jobs_as_paused() -> None:
     result = api.torrent_traffic_status()
 
     assert result["enabled"] is False
-    assert result["waiting"] == 0
-    assert result["paused"] == 2
+    # A local DB row is not proof that the backend completed its pause RPC.
+    assert result["waiting"] is None
+    assert result["paused"] is None
+    assert result["observed_state"] == "unknown"
 
 
 def test_enable_followup_resumes_existing_job_before_discovery() -> None:
@@ -145,7 +147,12 @@ def test_frontend_exposes_paused_job_state_and_count() -> None:
 
     assert "download?.effective_state||download?.state" in home
     assert "p.status==='paused_download'" in home
-    assert "Paused ${progress}%" in home
+    # The shared classifier localizes the paused label and appends progress.
+    helper = (web_app.Path(web_app.__file__).parent / "web" / "torrent_status_ui.js").read_text(
+        encoding="utf-8"
+    )
+    assert "torrentUiLabel(kind,ui.lang)" in home
+    assert "paused:'Paused'" in helper
     assert "compactDownloadStatus(download)" in index
     assert "live.paused" in index
-    assert "${paused} paused" in index
+    assert "fallbackPaused" in index

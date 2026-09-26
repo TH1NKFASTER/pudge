@@ -11,6 +11,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_FILES = (
+    "pudge/__init__.py",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "uv.lock",
+)
 
 
 class ReleaseError(RuntimeError):
@@ -71,12 +78,41 @@ def remote_tag_sha(tag: str) -> str:
     return line.split()[0] if line else ""
 
 
-def ensure_clean_index_after_stage() -> None:
+def changed_paths() -> set[str]:
+    result = git("status", "--porcelain=v1", "--untracked-files=all", capture=True)
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        raw = line[3:] if len(line) >= 4 else ""
+        if " -> " in raw:
+            raw = raw.split(" -> ", 1)[1]
+        if raw:
+            paths.add(raw)
+    return paths
+
+
+def ensure_safe_release_start(version: str) -> None:
+    dirty = changed_paths()
+    if not dirty:
+        return
+    unexpected = dirty.difference(RELEASE_FILES)
+    # Resume is allowed only after the requested version has already been bumped
+    # and only release-metadata files are dirty.  Unrelated work is never staged.
+    if unexpected or current_version() != version:
+        detail = ", ".join(sorted(unexpected or dirty))
+        raise ReleaseError(
+            "working tree must be clean before a version bump; unrelated changes: " + detail
+        )
+    print("Resuming release with reviewed metadata changes: " + ", ".join(sorted(dirty)))
+
+
+def ensure_clean_after_stage() -> None:
     unstaged = git("diff", "--quiet", check=False).returncode
     untracked = git_output("ls-files", "--others", "--exclude-standard")
     if unstaged or untracked:
         raise ReleaseError(
-            "working tree still has unstaged/untracked files after `git add -A`; "
+            "working tree contains files outside the explicitly staged release metadata; "
             "release aborted"
         )
 
@@ -93,8 +129,14 @@ def ensure_origin_not_ahead() -> None:
 def ensure_release_version(version: str, python: str) -> None:
     if current_version() != version:
         run(python, "scripts/bump_version.py", version)
+        run("uv", "lock")
     if current_version() != version:
         raise ReleaseError(f"version bump did not produce {version}")
+    unexpected = changed_paths().difference(RELEASE_FILES)
+    if unexpected:
+        raise ReleaseError(
+            "version bump changed unexpected paths: " + ", ".join(sorted(unexpected))
+        )
 
 
 def validate(python: str) -> None:
@@ -106,9 +148,9 @@ def validate(python: str) -> None:
 
 
 def commit_if_needed(version: str) -> str:
-    git("add", "-A")
+    git("add", "--", *RELEASE_FILES)
     git("diff", "--cached", "--check")
-    ensure_clean_index_after_stage()
+    ensure_clean_after_stage()
 
     staged = git("diff", "--cached", "--quiet", check=False).returncode != 0
     if staged:
@@ -186,6 +228,7 @@ def main() -> int:
     print(f"Pudge release {tag}")
     print(f"checkout: {ROOT}")
 
+    ensure_safe_release_start(version)
     git("fetch", "origin", "main", "--tags")
     ensure_origin_not_ahead()
 

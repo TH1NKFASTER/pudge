@@ -64,10 +64,10 @@ def _search(client, **extra):
 
 def test_empty_proxy_is_not_retried_as_duplicate_direct_route(monkeypatch):
     client = NyaaClient(proxy_mode="direct_then_proxy", proxy_url="", timeout=0.01)
-    calls: list[str | None] = []
+    calls: list[tuple[str, str | None]] = []
 
     def fail(url: str, proxy: str | None) -> str:
-        calls.append(proxy)
+        calls.append((url, proxy))
         raise NyaaError("504")
 
     monkeypatch.setattr(client, "_get", fail)
@@ -75,7 +75,14 @@ def test_empty_proxy_is_not_retried_as_duplicate_direct_route(monkeypatch):
     with pytest.raises(NyaaError):
         client.search("example")
 
-    assert calls == [None]
+    # Empty proxy must not duplicate a route, while the default nyaa.si client
+    # may still fail over once per distinct read-only mirror.
+    assert [proxy for _url, proxy in calls] == [None, None, None]
+    assert [url.split('/?', 1)[0] for url, _proxy in calls] == [
+        "https://nyaa.si",
+        "https://nyaa.net",
+        "https://cn.nyaa.net",
+    ]
 
 
 def test_automatic_nyaa_search_stops_when_wall_clock_budget_is_used(monkeypatch):

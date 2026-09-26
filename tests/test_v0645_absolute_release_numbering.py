@@ -5,7 +5,7 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, NyaaRelease
 from pudge.models import AniListAnime
 from pudge.providers.anilist import AniListClient
-from pudge.providers.nyaa import search_ranked
+from pudge.providers.nyaa import NyaaError, release_title_is_plausible, search_ranked
 
 
 def _node(media_id: int, title: str, episodes: int, year: int) -> AniListAnime:
@@ -142,3 +142,342 @@ def test_release_episode_context_uses_cached_relation_graph_without_anilist(tmp_
 
     assert episodes == (43,)
     assert "BLEACH: Sennen Kessen-hen" in titles
+
+
+def test_jojo_stage_accepts_s06e02_as_absolute_episode_two() -> None:
+    """AniList entry #210482 ep1 is released by scene groups as franchise S06E02."""
+    anime = LibraryAnime(
+        media_id=210482,
+        title="JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - 3rd STAGE",
+        titles=["JoJo's Bizarre Adventure: Steel Ball Run - 2nd - 3rd STAGE"],
+        synonyms=["JoJo no Kimyou na Bouken: Steel Ball Run"],
+        format="ONA",
+        season_year=2026,
+    )
+    release = NyaaRelease(
+        title=(
+            "[ToonsHub] JoJos Bizarre Adventure S06E02 1080p NF WEB-DL MULTi "
+            "AAC2.0 H.264 (JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - "
+            "3rd STAGE, Multi-Audio, Multi-Subs)"
+        ),
+        link="https://nyaa.si/view/2165948",
+        torrent_url="https://example.test/2165948.torrent",
+        info_hash="2165948",
+        size_text="1.0 GiB",
+        size_bytes=1024**3,
+        seeders=100,
+        leechers=2,
+        downloads=100,
+        trusted=True,
+        remake=False,
+        group="ToonsHub",
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def search(self, query: str):
+            self.queries.append(query)
+            return [release] if "E02" in query else []
+
+    client = FakeClient()
+    ranked = search_ranked(
+        client,  # type: ignore[arg-type]
+        anime,
+        episode=1,
+        batch=False,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="1080p",
+        min_seeders=1,
+        target_episode_min_bytes=250 * 1024**2,
+        target_episode_max_bytes=3500 * 1024**2,
+        alternative_episodes=(2,),
+        alternative_titles=("JoJo no Kimyou na Bouken: Steel Ball Run",),
+    )
+
+    assert ranked
+    assert ranked[0].title == release.title
+    assert "absolute-ep=2" in ranked[0].reasons
+    assert "relative-ep=1" in ranked[0].reasons
+    assert "wrong-season=6" in ranked[0].reasons
+    assert any("E02" in query for query in client.queries)
+
+    # The override is intentionally narrow: an S00 special with the same episode
+    # number must not become eligible merely because absolute episode #2 exists.
+    special = release.title.replace("S06E02", "S00E02")
+    assert not release_title_is_plausible(
+        anime,
+        special,
+        ("JoJo no Kimyou na Bouken: Steel Ball Run",),
+        (),
+        (2,),
+    )
+
+def test_jojo_real_graph_keeps_short_stage_alias_before_franchise_absolute() -> None:
+    """The real JoJo graph continues into Stone Ocean; SBR must still expose E02."""
+    from pudge.episode_numbering import episode_numbering_from_graph
+
+    anime = LibraryAnime(
+        media_id=210482,
+        title="JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+        titles=["JoJo's Bizarre Adventure: Steel Ball Run - 2nd & 3rd STAGE"],
+        synonyms=["JoJo no Kimyou na Bouken: Steel Ball Run"],
+        episodes=11,
+        format="ONA",
+        season_year=2026,
+    )
+    graph = {
+        "root_id": 210482,
+        "nodes": [
+            {
+                "media_id": 146722,
+                "title": "JoJo no Kimyou na Bouken: Stone Ocean Part 2",
+                "format": "ONA",
+                "episodes": 26,
+                "season_year": 2022,
+                "start_date": "2022-09-01",
+            },
+            {
+                "media_id": 190327,
+                "title": "JoJo no Kimyou na Bouken: Steel Ball Run - 1st STAGE",
+                "format": "ONA",
+                "episodes": 1,
+                "season_year": 2026,
+                "start_date": "2026-03-19",
+            },
+            {
+                "media_id": 210482,
+                "title": "JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+                "format": "ONA",
+                "episodes": 11,
+                "season_year": 2026,
+                "start_date": "2026-09-25",
+            },
+        ],
+        "edges": [
+            {"source": 146722, "target": 190327, "relation_type": "SEQUEL"},
+            {"source": 190327, "target": 210482, "relation_type": "SEQUEL"},
+        ],
+    }
+
+    result = episode_numbering_from_graph(graph, anime, 1)
+
+    assert result is not None
+    assert result.release_episode == 28
+    assert result.aliases == (2, 28)
+    assert result.chain == (146722, 190327, 210482)
+
+
+def test_normal_previous_season_does_not_create_near_stage_alias() -> None:
+    from pudge.episode_numbering import episode_numbering_from_graph
+
+    anime = LibraryAnime(
+        media_id=2,
+        title="Example Show Season 2",
+        episodes=12,
+        format="TV",
+        season_year=2026,
+    )
+    graph = {
+        "root_id": 2,
+        "nodes": [
+            {"media_id": 1, "title": "Example Show", "format": "TV", "episodes": 12, "season_year": 2025},
+            {"media_id": 2, "title": "Example Show Season 2", "format": "TV", "episodes": 12, "season_year": 2026},
+        ],
+        "edges": [
+            {"source": 1, "target": 2, "relation_type": "SEQUEL"},
+        ],
+    }
+
+    result = episode_numbering_from_graph(graph, anime, 1)
+
+    assert result is not None
+    assert result.aliases == (13,)
+
+
+def test_jojo_automatic_search_uses_title_only_probe_before_scene_number_guess() -> None:
+    """A scene S06E02 release must be discoverable without knowing the scene season."""
+    anime = LibraryAnime(
+        media_id=210482,
+        title="JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - 3rd STAGE",
+        titles=["JoJo's Bizarre Adventure: Steel Ball Run - 2nd - 3rd STAGE"],
+        synonyms=["JoJo no Kimyou na Bouken: Steel Ball Run"],
+        format="ONA",
+        season_year=2026,
+    )
+    release = NyaaRelease(
+        title=(
+            "[ToonsHub] JoJos Bizarre Adventure S06E02 1080p NF WEB-DL MULTi "
+            "AAC2.0 H.264 (JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - "
+            "3rd STAGE, Multi-Audio, Multi-Subs)"
+        ),
+        link="https://nyaa.si/view/2165948",
+        torrent_url="https://example.test/2165948.torrent",
+        info_hash="2165948",
+        size_text="1.0 GiB",
+        size_bytes=1024**3,
+        seeders=100,
+        leechers=2,
+        downloads=100,
+        trusted=True,
+        remake=False,
+        group="ToonsHub",
+    )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def search(self, query: str):
+            self.queries.append(query)
+            if query == "JoJo no Kimyou na Bouken: Steel Ball Run":
+                return [release]
+            raise NyaaError("later route timed out")
+
+    client = FakeClient()
+    ranked = search_ranked(
+        client,  # type: ignore[arg-type]
+        anime,
+        episode=1,
+        batch=False,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="1080p",
+        min_seeders=1,
+        target_episode_min_bytes=250 * 1024**2,
+        target_episode_max_bytes=3500 * 1024**2,
+        alternative_episodes=(2, 192),
+        alternative_titles=("JoJo no Kimyou na Bouken: Steel Ball Run",),
+        query_budget_seconds=18.0,
+    )
+
+    assert client.queries[0] == "JoJo no Kimyou na Bouken: Steel Ball Run"
+    assert ranked
+    assert ranked[0].title == release.title
+    assert "absolute-ep=2" in ranked[0].reasons
+
+
+def test_jojo_real_anilist_stage_title_searches_bare_series_alias_before_number_spam() -> None:
+    """Regression from the 2026-09-25 live release: Erai omits AniList's STAGE suffix."""
+    anime = LibraryAnime(
+        media_id=210482,
+        title="JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+        titles=[
+            "JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+            "STEEL BALL RUN JoJo's Bizarre Adventure 2nd - 3rd STAGE",
+            "ジョジョの奇妙な冒険 スティール・ボール・ラン 2nd＆3rd STAGE",
+        ],
+        synonyms=["JoJo's Bizarre Adventure: Part 7–Steel Ball Run", "SBR"],
+        episodes=11,
+        format="ONA",
+        season_year=2026,
+    )
+    release = NyaaRelease(
+        title=(
+            "[Erai-raws] JoJo no Kimyou na Bouken: Steel Ball Run - 02 "
+            "[1080p NF WEB-DL AVC AAC][MultiSub][78128421]"
+        ),
+        link="https://cn.nyaa.net/view/2165960",
+        torrent_url="https://nyaa.net/download/2165960.torrent",
+        info_hash="ac59c36fbf9b6ff9dafd3dfeccd4ff937f0785d4",
+        size_text="893.4 MiB",
+        size_bytes=int(893.4 * 1024**2),
+        seeders=100,
+        leechers=10,
+        downloads=200,
+        trusted=True,
+        remake=False,
+        group="Erai-raws",
+    )
+    bare = "JoJo no Kimyou na Bouken: Steel Ball Run"
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def search(self, query: str):
+            self.queries.append(query)
+            return [release] if query == bare else []
+
+    client = FakeClient()
+    ranked = search_ranked(
+        client,  # type: ignore[arg-type]
+        anime,
+        episode=1,
+        batch=False,
+        trusted_groups=["Erai-raws"],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="1080p",
+        min_seeders=1,
+        target_episode_min_bytes=250 * 1024**2,
+        target_episode_max_bytes=3500 * 1024**2,
+        alternative_episodes=(2, 192),
+        alternative_titles=("JoJo no Kimyou na Bouken: Steel Ball Run - 1st STAGE",),
+        query_budget_seconds=18.0,
+    )
+
+    assert client.queries[0] == bare
+    assert ranked
+    assert ranked[0].title == release.title
+    assert "absolute-ep=2" in ranked[0].reasons
+
+
+
+def test_jojo_toons_hub_stage_release_survives_relation_root_negative_title() -> None:
+    """Real 2165948 must not be rejected because generic JoJo root is a graph negative."""
+    anime = LibraryAnime(
+        media_id=210482,
+        title="JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+        titles=[
+            "JoJo no Kimyou na Bouken: Steel Ball Run - 2nd & 3rd STAGE",
+            "STEEL BALL RUN JoJo's Bizarre Adventure 2nd - 3rd STAGE",
+            "ジョジョの奇妙な冒険 スティール・ボール・ラン 2nd＆3rd STAGE",
+        ],
+        synonyms=["JoJo's Bizarre Adventure: Part 7–Steel Ball Run", "SBR"],
+        episodes=11,
+        format="ONA",
+        season_year=2026,
+    )
+    title = (
+        "[ToonsHub] JoJos Bizarre Adventure S06E02 1080p NF WEB-DL MULTi "
+        "AAC2.0 H.264 (JoJo no Kimyou na Bouken: Steel Ball Run - 2nd - "
+        "3rd STAGE, Multi-Audio, Multi-Subs)"
+    )
+    negatives = (
+        "JoJo no Kimyou na Bouken",
+        "JoJo no Kimyou na Bouken: Stardust Crusaders",
+        "JoJo no Kimyou na Bouken: Ougon no Kaze",
+        "JoJo no Kimyou na Bouken: Stone Ocean",
+        "JoJo no Kimyou na Bouken: Steel Ball Run - 1st STAGE",
+    )
+
+    assert release_title_is_plausible(
+        anime,
+        title,
+        alternative_titles=("JoJo no Kimyou na Bouken: Steel Ball Run - 1st STAGE",),
+        negative_titles=negatives,
+        alternative_episodes=(2, 192),
+    )
+
+
+def test_related_sequel_title_still_beats_generic_root_alias() -> None:
+    """Stage alias fix must not weaken the normal related-media fail-closed guard."""
+    anime = LibraryAnime(
+        media_id=1,
+        title="Kimetsu no Yaiba",
+        titles=["Demon Slayer"],
+        synonyms=[],
+        format="TV",
+        season_year=2019,
+    )
+
+    assert not release_title_is_plausible(
+        anime,
+        "Kimetsu no Yaiba: Yuukaku-hen - 01 [1080p]",
+        negative_titles=("Kimetsu no Yaiba: Yuukaku-hen",),
+    )

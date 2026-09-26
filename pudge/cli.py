@@ -1091,6 +1091,13 @@ def _find_online_subtitles(
                         f"    Jimaku penalty: {item.name} загружен раньше выхода "
                         f"серии на AniList"
                     )
+                hard_reject_reason = str(item.details.get("hard_reject_reason") or "").strip()
+                if hard_reject_reason:
+                    logger.info(
+                        "REJECT step=jimaku.file video=%s entry_id=%s reason=%s score=%.1f name=%r",
+                        video.name, entry.id, hard_reject_reason, item.score, item.name,
+                    )
+                    continue
                 exact_anilist_entry = bool(
                     anime is not None
                     and entry.anilist_id is not None

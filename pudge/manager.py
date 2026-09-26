@@ -38,9 +38,11 @@ from .episode_numbering import (
 from .episode_state import watched_by_anilist_progress
 from .presentation_state import derive_episode_presentation, download_complete
 from .work_scheduler import WorkPriority, WorkScheduler
+from .torrent_admission import TorrentAdmission
 from .logging_utils import configure_logging, timed_step
 from .maintenance_lock import maintenance_lock
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
+from .planned_release_discovery import PlannedReleaseDiscovery
 from .manager_services import ReleaseTelemetryService
 from .notifications import send_native_notification
 from .pipeline_cache import invalidate_final_pipeline_result
@@ -411,7 +413,7 @@ class AnimeManager:
                         float(next_item.unlock_at_utc) if next_item is not None else None,
                     )
                     return
-                episode_key = f"personal_schedule_notification:{personal_schedule.schedule_id}:{int(episode)}:ready"
+                episode_key = f"personal_schedule_notification:{personal_schedule.schedule_id}:{personal_schedule.cycle_id}:{int(episode)}:ready"
                 if self.db.get_state(episode_key, ""):
                     return
             else:
@@ -496,6 +498,14 @@ class AnimeManager:
             )
         if delivered:
             self.db.set_state(episode_key, "delivered")
+            if scheduled_release and personal_schedule is not None and episode is not None:
+                # Compatibility mirror for older diagnostics/tests. Routing and
+                # dedupe use the cycle-aware key above, so a new cycle is not
+                # suppressed by this legacy marker.
+                self.db.set_state(
+                    f"personal_schedule_notification:{personal_schedule.schedule_id}:{int(episode)}:ready",
+                    "delivered",
+                )
             if notify_full and full_key:
                 self.db.set_state(full_key, "delivered")
         self.logger.info(
@@ -1824,8 +1834,28 @@ class AnimeManager:
     def downloads_configured(self) -> bool:
         return bool(self.config.qbittorrent.enabled or self.config.aria2.enabled)
 
+    def _torrent_admission(self) -> TorrentAdmission | None:
+        path = getattr(self.config, "config_path", None)
+        return TorrentAdmission(Path(path)) if path is not None else None
+
+    def _torrent_network_start(self, client: Any, action: str, *args: Any, **kwargs: Any) -> Any:
+        """Fence each traffic-starting RPC against the GUI's shared Off transition."""
+        gate = self._torrent_admission()
+        if gate is None:
+            if not self.downloads_enabled():
+                raise ManagerError("Torrent traffic is off")
+            return getattr(client, action)(*args, **kwargs)
+        with gate.locked():
+            if not gate.enabled(fallback=bool(self.config.nyaa.torrents_enabled)):
+                raise ManagerError("Torrent traffic is off")
+            return getattr(client, action)(*args, **kwargs)
+
     def downloads_enabled(self) -> bool:
-        return bool(self.downloads_configured() and self.config.nyaa.torrents_enabled)
+        if not self.downloads_configured():
+            return False
+        gate = self._torrent_admission()
+        return bool(gate.enabled(fallback=bool(self.config.nyaa.torrents_enabled)) if gate
+                    else self.config.nyaa.torrents_enabled)
 
     def torrent_backend_name(self) -> str:
         if self.config.qbittorrent.enabled and self.config.aria2.enabled:
@@ -1871,6 +1901,25 @@ class AnimeManager:
                 vpn_kill_switch=aria.vpn_kill_switch,
             )
         raise ManagerError("Все torrent backend отключены")
+
+    def ensure_torrent_backend_ready(self) -> str:
+        """Prepare the preferred write backend before any write-path reads.
+
+        aria2 is a Pudge-managed sidecar, so a duplicate probe is already a
+        backend RPC and must not run before the sidecar has been started or
+        recovered. qBittorrent has no equivalent explicit readiness hook.
+        """
+        if not self.downloads_enabled():
+            raise ManagerError("Torrent traffic is off")
+        client = self.qbt_client()
+        backend = str(getattr(client, "backend_name", "qbittorrent") or "qbittorrent")
+        try:
+            ensure_running = getattr(client, "ensure_running", None)
+            if callable(ensure_running):
+                self._torrent_network_start(client, "ensure_running")
+            return backend
+        finally:
+            client.close()
 
     def torrent_clients(self) -> list[tuple[str, QBittorrentClient | Aria2Client]]:
         """Return every enabled backend; qBittorrent remains the add preference."""
@@ -1984,6 +2033,9 @@ class AnimeManager:
         )
         return result.aliases, result.prequel_titles
 
+    def planned_release_discovery(self) -> PlannedReleaseDiscovery:
+        return PlannedReleaseDiscovery(self)
+
     def poll_release_feeds(self) -> int:
         """Cheaply retain short RSS windows so release discovery survives feed rotation."""
         if os.getenv("PYTEST_CURRENT_TEST"):
@@ -2006,6 +2058,7 @@ class AnimeManager:
         episode: int | None = None,
         batch: bool = False,
         automatic: bool = False,
+        allow_anilist_network: bool = True,
     ) -> list[NyaaRelease]:
         anime = self.db.get_anime(media_id)
         if anime is None:
@@ -2013,9 +2066,18 @@ class AnimeManager:
         if not self.config.nyaa.enabled:
             raise ManagerError("Поиск релизов отключён")
 
-        alternative_episodes, alternative_titles = self._release_episode_context(
-            anime, episode
-        )
+        if not allow_anilist_network and episode is not None and episode >= 1:
+            # Planned-release polling is driven by cached premiere metadata.
+            # Resolve title/absolute-number aliases locally: no AniList calls.
+            context = resolve_episode_numbering(
+                anime, int(episode), self.config, self.logger,
+                db=self.db, allow_network=False,
+            )
+            alternative_episodes, alternative_titles = context.aliases, context.prequel_titles
+        else:
+            alternative_episodes, alternative_titles = self._release_episode_context(
+                anime, episode
+            )
         common_kwargs = {
             "alternative_episodes": alternative_episodes,
             "alternative_titles": alternative_titles,
@@ -2259,6 +2321,11 @@ class AnimeManager:
         if batch:
             tags.append("series pack")
 
+        # A managed aria2 duplicate probe is itself an RPC. Prepare the preferred
+        # write backend before *any* duplicate lookup, otherwise a stopped
+        # sidecar prevents us from ever reaching the later add/ensure path.
+        self.ensure_torrent_backend_ready()
+
         # Do not add the same request to the preferred client when it already
         # exists in the other enabled backend. This also covers users migrating
         # gradually from qBittorrent to aria2 (or the other way around).
@@ -2284,7 +2351,7 @@ class AnimeManager:
                     not paused_on_add
                     and str(existing_any.state or "").casefold().startswith(("paused", "stopped"))
                 ):
-                    candidate_client.start(existing_any.torrent_hash)
+                    self._torrent_network_start(candidate_client, "start", existing_any.torrent_hash)
                 self.log(
                     f"{backend_name}: {anime.title} уже скачивается — {existing_any.name}"
                 )
@@ -2294,6 +2361,9 @@ class AnimeManager:
         client = self.qbt_client()
         add_backend = str(getattr(client, "backend_name", "qbittorrent") or "qbittorrent")
         try:
+            # The preferred write backend was prepared before the cross-backend
+            # duplicate scan above. Reusing a fresh client here must remain a
+            # side-effect-free probe before the actual add.
             existing = self._existing_download_for_request(
                 client, anime, episode=episode, batch=batch,
                 release_hash=release.info_hash,
@@ -2306,7 +2376,11 @@ class AnimeManager:
                 repair = getattr(client, "repair_stalled_release", None)
                 if callable(repair):
                     try:
-                        repaired = bool(repair(existing.torrent_hash, release))
+                        repaired = bool(
+                            self._torrent_network_start(
+                                client, "repair_stalled_release", existing.torrent_hash, release
+                            )
+                        )
                     except QBittorrentError as exc:
                         self.logger.warning(
                             "FALLBACK step=aria2.metadata_source hash=%s error=%r",
@@ -2333,7 +2407,7 @@ class AnimeManager:
                     and state.startswith(("paused", "stopped"))
                     and hasattr(client, "start")
                 ):
-                    client.start(existing.torrent_hash)
+                    self._torrent_network_start(client, "start", existing.torrent_hash)
                     self.logger.info(
                         "REPAIR step=%s.start_existing hash=%s state=%s media_id=%s episode=%s",
                         add_backend, existing.torrent_hash, existing.state,
@@ -2351,8 +2425,8 @@ class AnimeManager:
                 batch=batch,
                 title=release.title,
             ):
-                client.add_release(
-                    release,
+                self._torrent_network_start(
+                    client, "add_release", release,
                     save_path=target,
                     category=self.config.qbittorrent.category,
                     tags=tags,
@@ -2386,7 +2460,7 @@ class AnimeManager:
                 verified.release_episode = selected_release_episode
                 self.db.upsert_download(verified)
                 if not self.torrent_paused_on_add() and hasattr(client, "start"):
-                    client.start(verified.torrent_hash)
+                    self._torrent_network_start(client, "start", verified.torrent_hash)
                     self.logger.info(
                         "DONE step=%s.start_after_add hash=%s media_id=%s episode=%s",
                         add_backend, verified.torrent_hash, media_id, episode,
@@ -3143,8 +3217,8 @@ class AnimeManager:
                     )
                     return False
             slot = race_root / f"candidate-{index + 1}"
-            torrent_hash = client.add_release(
-                release,
+            torrent_hash = self._torrent_network_start(
+                client, "add_release", release,
                 save_path=slot,
                 category=self.config.qbittorrent.category,
                 tags=[APP_SLUG, race_tag],
@@ -3152,7 +3226,7 @@ class AnimeManager:
             )
             if not torrent_hash:
                 return False
-            client.start(torrent_hash)
+            self._torrent_network_start(client, "start", torrent_hash)
             entries.append((release, str(torrent_hash), slot))
             self.logger.info(
                 "START step=torrent.race candidate=%s/%s hash=%s score=%.1f seeds=%s leechers=%s title=%r",
@@ -3236,7 +3310,7 @@ class AnimeManager:
                 category=self.config.qbittorrent.category,
                 tags=final_tags,
             )
-            client.start(winner_hash)
+            self._torrent_network_start(client, "start", winner_hash)
             try:
                 for item in client.torrents(category=""):
                     hashes = {
@@ -5135,7 +5209,7 @@ class AnimeManager:
                 # playback cleaner changed generations over time, so rebuild the
                 # deterministic filename for every generation that shipped with
                 # OCR instead of assuming only the current v12 name.
-                for generation in ("v10", "v11", "v12", "v13", "v14", "v15"):
+                for generation in ("v10", "v11", "v12", "v13", "v14", "v15", "v16"):
                     if not resolved_subtitle.name.startswith(f"{generation}-"):
                         continue
                     for ocr_srt in ocr_root.glob("*.srt"):
@@ -8377,7 +8451,7 @@ class AnimeManager:
                         stat = source.stat()
                     except OSError:
                         continue
-                    for playback_generation in ("v12", "v13", "v14", "v15"):
+                    for playback_generation in ("v12", "v13", "v14", "v15", "v16"):
                         digest = hashlib.sha1(
                             f"{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:playback-srt-{playback_generation}".encode()
                         ).hexdigest()[:20]
@@ -8442,7 +8516,7 @@ class AnimeManager:
                 try:
                     candidate_stat = candidate.stat()
                     direct_playback_names = set()
-                    for playback_generation in ("v12", "v13", "v14", "v15"):
+                    for playback_generation in ("v12", "v13", "v14", "v15", "v16"):
                         direct_digest = hashlib.sha1(
                             f"{candidate.resolve()}:{candidate_stat.st_size}:{candidate_stat.st_mtime_ns}:playback-srt-{playback_generation}".encode()
                         ).hexdigest()[:20]
@@ -8483,6 +8557,187 @@ class AnimeManager:
         self.db.set_state("subtitle_validation_generation", generation)
         if queued:
             self.log(f"Субтитры: повторно проверяю ранее подготовленных файлов — {queued}")
+        return queued
+
+    def _requeue_false_positive_tail_clocks(self) -> int:
+        """Rebuild old Jimaku selections with an unsupported large late clock jump.
+
+        v6.14 could accept a one/two-window positive tail transition after a
+        strongly established clock. The migration is intentionally data-driven:
+        it only matches the exact structural signature observed in stale history,
+        rather than any anime title or episode number.
+        """
+
+        generation = "1"
+        key = "subtitle_tail_clock_guard_generation"
+        if self.db.get_state(key, "") == generation:
+            return 0
+        queued = 0
+        for item in self.db.episodes():
+            if item.subtitle_path is None:
+                continue
+            latest = self.db.latest_selected_subtitle(item.video_path)
+            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
+                continue
+            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
+            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
+            segments = alignment.get("timeline_segments")
+            if not isinstance(segments, list) or len(segments) < 2:
+                continue
+            left = segments[-2] if isinstance(segments[-2], dict) else {}
+            right = segments[-1] if isinstance(segments[-1], dict) else {}
+            tail_guard = (
+                alignment.get("timeline_weak_tail_guard")
+                if isinstance(alignment.get("timeline_weak_tail_guard"), dict)
+                else {}
+            )
+            try:
+                left_offset = float(left.get("offset_seconds") or 0.0)
+                right_offset = float(right.get("offset_seconds") or 0.0)
+                left_support = int(left.get("support") or 0)
+                right_support = int(right.get("support") or 0)
+                boundary_ratio = float(tail_guard.get("boundary_ratio") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            stale_false_tail_shape = bool(
+                right_offset > left_offset
+                and abs(right_offset - left_offset) >= 15.0
+                and left_support >= 6
+                and 1 <= right_support <= 2
+                and boundary_ratio >= 0.80
+            )
+            if not stale_false_tail_shape:
+                continue
+            invalidate_final_pipeline_result(item.video_path, self.config)
+            self.db.invalidate_subtitle(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                "Повторная подготовка после исправления ложного скачка тайминга в конце серии",
+            )
+            queued += 1
+        self.db.set_state(key, generation)
+        if queued:
+            self.log(f"Субтитры: перепроверяю подозрительные поздние скачки тайминга — {queued}")
+        return queued
+
+    def _requeue_local_edge_timeline_upgrade(self) -> int:
+        """Rebuild v6.17 timelines with a large unverified opening-edge mismatch.
+
+        v6.17 allowed both edge hints to influence every timeline window and
+        required a literal long subtitle gap before escalating an opening clock
+        disagreement to Japanese speech. Requeue only the narrow stale signature
+        fixed by v6.19.
+        """
+
+        generation = "1"
+        key = "subtitle_local_edge_timeline_upgrade_generation"
+        if self.db.get_state(key, "") == generation:
+            return 0
+        queued = 0
+        for item in self.db.episodes():
+            if item.subtitle_path is None:
+                continue
+            latest = self.db.latest_selected_subtitle(item.video_path)
+            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
+                continue
+            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
+            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
+            if str(alignment.get("timeline_algorithm") or "") != "timeline-v6.17-decreasing-gap-anchor":
+                continue
+            risk = alignment.get("timeline_early_edit_audio_verification")
+            if not isinstance(risk, dict) or bool(risk.get("required")):
+                continue
+            try:
+                cold_delta = abs(float(risk.get("cold_start_delta_seconds") or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if not 4.0 <= cold_delta <= 15.0:
+                continue
+            invalidate_final_pipeline_result(item.video_path, self.config)
+            self.db.invalidate_subtitle(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                "Повторная подготовка после исправления локальности edge-hints и проверки opening clock по аудио",
+            )
+            queued += 1
+        self.db.set_state(key, generation)
+        if queued:
+            self.log(f"Субтитры: перепроверяю opening clock по японской аудиодорожке — {queued}")
+        return queued
+
+    def _requeue_decreasing_gap_timeline_upgrade(self) -> int:
+        """Rebuild old timelines whose monotonic repair dragged a clock switch forward.
+
+        timeline-v6.16 could resolve a real negative clock jump by extending the
+        old clock through many following cues.  Only requeue the narrow stale
+        signature: an early decreasing boundary moved forward by >=8 seconds by
+        repeated monotonic stabilization.  The rule is data-driven and does not
+        depend on a title or episode number.
+        """
+
+        generation = "1"
+        key = "subtitle_decreasing_gap_timeline_upgrade_generation"
+        if self.db.get_state(key, "") == generation:
+            return 0
+        queued = 0
+        for item in self.db.episodes():
+            if item.subtitle_path is None:
+                continue
+            latest = self.db.latest_selected_subtitle(item.video_path)
+            if not latest or str(latest.get("source") or "").casefold() != "jimaku":
+                continue
+            details = latest.get("details") if isinstance(latest.get("details"), dict) else {}
+            alignment = details.get("alignment") if isinstance(details.get("alignment"), dict) else {}
+            algorithm = str(alignment.get("timeline_algorithm") or "")
+            if algorithm != "timeline-v6.16-tail-clock-duration-anchors":
+                continue
+            refinements = alignment.get("timeline_monotonic_refinements")
+            if not isinstance(refinements, list):
+                continue
+            groups: dict[int, list[dict[str, object]]] = {}
+            for row in refinements:
+                if not isinstance(row, dict) or not bool(row.get("applied")):
+                    continue
+                if str(row.get("reason") or "") != "decreasing_boundary_extended_for_monotonicity":
+                    continue
+                try:
+                    index = int(row.get("boundary_index") or 0)
+                except (TypeError, ValueError):
+                    continue
+                groups.setdefault(index, []).append(row)
+            risky = False
+            for rows in groups.values():
+                if not rows:
+                    continue
+                try:
+                    first_old = float(rows[0].get("old_source_time") or 0.0)
+                    last_new = float(rows[-1].get("new_source_time") or first_old)
+                    left_offset = float(rows[0].get("left_offset_seconds") or 0.0)
+                    right_offset = float(rows[0].get("right_offset_seconds") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    0.0 < first_old <= 300.0
+                    and left_offset - right_offset >= 4.0
+                    and last_new - first_old >= 8.0
+                ):
+                    risky = True
+                    break
+            if not risky:
+                continue
+            invalidate_final_pipeline_result(item.video_path, self.config)
+            self.db.invalidate_subtitle(
+                item.video_path,
+                item.media_id,
+                item.episode,
+                "Повторная подготовка после исправления монтажной границы тайминга",
+            )
+            queued += 1
+        self.db.set_state(key, generation)
+        if queued:
+            self.log(f"Субтитры: пересобираю растянутые монтажные границы — {queued}")
         return queued
 
     def _requeue_stt_timeline_clock_conflicts(self) -> int:
@@ -8839,8 +9094,15 @@ class AnimeManager:
         try:
             with timed_step(self.logger, "qbittorrent.sync"):
                 stats["downloads"] = self.sync_downloads()
-        except QBittorrentError as exc:
+        except (QBittorrentError, ManagerError) as exc:
+            # Backend observation is advisory for maintenance. A temporarily
+            # unavailable torrent client must not abort release-feed polling,
+            # subtitle work, or the later automatic release search.
             self.log(str(exc))
+            self.logger.warning(
+                "FALLBACK step=torrent.sync_backend reason=unavailable continue=maintenance error=%r",
+                str(exc),
+            )
 
     def run_startup_once(self) -> dict[str, int]:
         """Run one startup maintenance pass unless recent user work already did it."""
@@ -9043,6 +9305,9 @@ class AnimeManager:
                 else:
                     self._reconcile_ocr_readiness_policy()
                 self._requeue_legacy_generated_subtitles()
+                self._requeue_false_positive_tail_clocks()
+                self._requeue_decreasing_gap_timeline_upgrade()
+                self._requeue_local_edge_timeline_upgrade()
                 self._requeue_stt_timeline_clock_conflicts()
                 self._requeue_stt_opening_plateau_semantic_upgrade()
                 self._requeue_unsafe_stt_transition_maps()

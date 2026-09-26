@@ -59,7 +59,8 @@ def test_live_torrent_status_reports_off_authoritatively() -> None:
     result = api.torrent_traffic_status()
 
     assert result["enabled"] is False
-    assert result["waiting"] == 0
+    assert result["waiting"] is None
+    assert result["stale"] is True
     assert manager_config.nyaa.torrents_enabled is False
 
 

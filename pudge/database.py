@@ -15,8 +15,11 @@ from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode
 from .episode_state import transition_episode_state, stronger_episode_state
 from .personal_schedule import (
     PersonalReleaseItem,
+    PersonalReleaseRule,
     PersonalReleaseSchedule,
-    materialize_weekly_items,
+    PersonalScheduleRevisionConflict,
+    materialize_schedule_items,
+    normalize_schedule_rule,
 )
 
 
@@ -234,6 +237,11 @@ CREATE TABLE IF NOT EXISTS personal_release_schedules (
     start_local_datetime TEXT NOT NULL,
     timezone_iana TEXT NOT NULL,
     cadence TEXT NOT NULL DEFAULT 'weekly',
+    rule_version INTEGER NOT NULL DEFAULT 1,
+    interval_unit TEXT NOT NULL DEFAULT 'weeks',
+    interval_every INTEGER NOT NULL DEFAULT 1,
+    interval_clock TEXT NOT NULL DEFAULT 'wall',
+    cycle_id INTEGER NOT NULL DEFAULT 1,
     first_episode_id INTEGER NOT NULL,
     revision INTEGER NOT NULL DEFAULT 1,
     rewatch INTEGER NOT NULL DEFAULT 0,
@@ -250,6 +258,7 @@ CREATE TABLE IF NOT EXISTS personal_release_items (
     unlock_at_utc REAL NOT NULL,
     nominal_local_datetime TEXT NOT NULL,
     schedule_revision INTEGER NOT NULL,
+    dst_adjusted INTEGER NOT NULL DEFAULT 0,
     unlocked_once INTEGER NOT NULL DEFAULT 0,
     watched_at REAL,
     updated_at REAL NOT NULL,
@@ -662,7 +671,7 @@ CREATE TABLE IF NOT EXISTS consumption_sync_receipts (
 );
 """
 
-LATEST_SCHEMA_VERSION = 11
+LATEST_SCHEMA_VERSION = 12
 
 
 def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
@@ -763,6 +772,9 @@ class Database:
             conn.execute("PRAGMA user_version=10")
         if version < 11:
             self._migrate_v11(conn)
+            conn.execute("PRAGMA user_version=11")
+        if version < 12:
+            self._migrate_v12(conn)
             conn.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
         # Keep additive compatibility checks idempotent for databases created by
         # local 0.7 checkpoints before the numbered v3 migration existed.
@@ -1007,6 +1019,11 @@ class Database:
                 start_local_datetime TEXT NOT NULL,
                 timezone_iana TEXT NOT NULL,
                 cadence TEXT NOT NULL DEFAULT 'weekly',
+                rule_version INTEGER NOT NULL DEFAULT 1,
+                interval_unit TEXT NOT NULL DEFAULT 'weeks',
+                interval_every INTEGER NOT NULL DEFAULT 1,
+                interval_clock TEXT NOT NULL DEFAULT 'wall',
+                cycle_id INTEGER NOT NULL DEFAULT 1,
                 first_episode_id INTEGER NOT NULL,
                 revision INTEGER NOT NULL DEFAULT 1,
                 rewatch INTEGER NOT NULL DEFAULT 0,
@@ -1022,6 +1039,7 @@ class Database:
                 unlock_at_utc REAL NOT NULL,
                 nominal_local_datetime TEXT NOT NULL,
                 schedule_revision INTEGER NOT NULL,
+                dst_adjusted INTEGER NOT NULL DEFAULT 0,
                 unlocked_once INTEGER NOT NULL DEFAULT 0,
                 watched_at REAL,
                 updated_at REAL NOT NULL,
@@ -1149,6 +1167,21 @@ class Database:
             INSERT OR IGNORE INTO consumption_history_state(profile_id,reset_epoch,reset_at_utc)
             VALUES('default',0,0);
             """,
+        )
+
+    def _migrate_v12(self, conn: sqlite3.Connection) -> None:
+        """Add versioned personal-release interval rules and cycle identity."""
+        self._ensure_column(conn, "personal_release_schedules", "rule_version", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "personal_release_schedules", "interval_unit", "TEXT NOT NULL DEFAULT 'weeks'")
+        self._ensure_column(conn, "personal_release_schedules", "interval_every", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "personal_release_schedules", "interval_clock", "TEXT NOT NULL DEFAULT 'wall'")
+        self._ensure_column(conn, "personal_release_schedules", "cycle_id", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column(conn, "personal_release_items", "dst_adjusted", "INTEGER NOT NULL DEFAULT 0")
+        # Every pre-v12 schedule was the original one-episode-per-week rule.
+        conn.execute(
+            "UPDATE personal_release_schedules "
+            "SET rule_version=1,interval_unit='weeks',interval_every=1,interval_clock='wall' "
+            "WHERE cadence='weekly'"
         )
 
     def _scope_local(self) -> threading.local:
@@ -3854,6 +3887,7 @@ class Database:
         *,
         profile_id: str = "default",
         now: float | None = None,
+        advance_unlocks: bool = True,
     ) -> PersonalReleaseSchedule | None:
         current = time.time() if now is None else float(now)
         with self.connect() as conn:
@@ -3863,7 +3897,7 @@ class Database:
             ).fetchone()
             if row is None:
                 return None
-            if bool(row["enabled"]):
+            if bool(row["enabled"]) and advance_unlocks:
                 conn.execute(
                     """
                     UPDATE personal_release_items
@@ -3879,6 +3913,18 @@ class Database:
                 """,
                 (int(row["schedule_id"]),),
             ).fetchall()
+            try:
+                rule = normalize_schedule_rule(
+                    str(row["interval_unit"] or "weeks"),
+                    int(row["interval_every"] or 1),
+                    version=int(row["rule_version"] or 1),
+                )
+            except (ValueError, TypeError):
+                # Legacy rows are always weekly. A corrupt future rule must not
+                # silently turn into an arbitrary custom cadence.
+                if str(row["cadence"] or "").casefold() != "weekly":
+                    raise
+                rule = PersonalReleaseRule()
             return PersonalReleaseSchedule(
                 schedule_id=int(row["schedule_id"]),
                 anime_id=int(row["anime_id"]),
@@ -3888,6 +3934,8 @@ class Database:
                 first_episode=int(row["first_episode_id"]),
                 revision=int(row["revision"]),
                 rewatch=bool(row["rewatch"]),
+                rule=rule,
+                cycle_id=max(1, int(row["cycle_id"] or 1)),
                 items=tuple(
                     PersonalReleaseItem(
                         episode=int(item["logical_episode_id"]),
@@ -3896,6 +3944,7 @@ class Database:
                         nominal_local_datetime=str(item["nominal_local_datetime"]),
                         unlocked=bool(item["unlocked_once"]),
                         watched_at=float(item["watched_at"]) if item["watched_at"] is not None else None,
+                        dst_adjusted=bool(item["dst_adjusted"]),
                     )
                     for item in items
                 ),
@@ -3924,42 +3973,57 @@ class Database:
         start_local_datetime: str,
         timezone_iana: str,
         rewatch: bool,
+        rule_unit: str = "weeks",
+        rule_every: int = 1,
+        expected_revision: int | None = None,
+        new_cycle: bool = False,
         profile_id: str = "default",
         now: float | None = None,
     ) -> PersonalReleaseSchedule:
         ordered = [int(value) for value in episodes]
         if not ordered or any(value < 1 for value in ordered) or len(set(ordered)) != len(ordered):
             raise ValueError("Personal schedule requires a unique ordered episode list")
+        rule = normalize_schedule_rule(rule_unit, rule_every)
         current = time.time() if now is None else float(now)
-        materialized = materialize_weekly_items(
+        materialized = materialize_schedule_items(
             ordered,
             start_local_datetime=start_local_datetime,
             timezone_iana=timezone_iana,
+            rule=rule,
         )
         with self.connect() as conn:
             previous = conn.execute(
                 "SELECT * FROM personal_release_schedules WHERE profile_id=? AND anime_id=?",
                 (str(profile_id), int(anime_id)),
             ).fetchone()
-            revision = int(previous["revision"]) + 1 if previous is not None else 1
+            actual_revision = int(previous["revision"]) if previous is not None else 0
+            if expected_revision is not None and int(expected_revision) != actual_revision:
+                raise PersonalScheduleRevisionConflict(int(expected_revision), actual_revision)
+            revision = actual_revision + 1
+            cadence = "weekly" if rule.is_default_weekly else "interval"
             if previous is None:
                 cursor = conn.execute(
                     """
                     INSERT INTO personal_release_schedules(
                         profile_id,anime_id,enabled,start_local_datetime,timezone_iana,cadence,
+                        rule_version,interval_unit,interval_every,interval_clock,cycle_id,
                         first_episode_id,revision,rewatch,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,'weekly',?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         str(profile_id), int(anime_id), 1, str(start_local_datetime),
-                        str(timezone_iana), ordered[0], revision, int(bool(rewatch)), current, current,
+                        str(timezone_iana), cadence, rule.version, rule.unit, rule.every, rule.clock,
+                        1, ordered[0], revision, int(bool(rewatch)), current, current,
                     ),
                 )
                 schedule_id = int(cursor.lastrowid)
+                cycle_id = 1
                 preserved: dict[int, sqlite3.Row] = {}
             else:
                 schedule_id = int(previous["schedule_id"])
-                preserved = {
+                previous_cycle = max(1, int(previous["cycle_id"] or 1))
+                cycle_id = previous_cycle + 1 if bool(new_cycle) else previous_cycle
+                preserved = {} if new_cycle else {
                     int(row["logical_episode_id"]): row
                     for row in conn.execute(
                         "SELECT * FROM personal_release_items WHERE schedule_id=?",
@@ -3970,17 +4034,23 @@ class Database:
                 conn.execute(
                     """
                     UPDATE personal_release_schedules
-                    SET enabled=1,start_local_datetime=?,timezone_iana=?,cadence='weekly',
+                    SET enabled=1,start_local_datetime=?,timezone_iana=?,cadence=?,
+                        rule_version=?,interval_unit=?,interval_every=?,interval_clock=?,cycle_id=?,
                         first_episode_id=?,revision=?,rewatch=?,updated_at=?
                     WHERE schedule_id=?
                     """,
-                    (str(start_local_datetime), str(timezone_iana), ordered[0], revision, int(bool(rewatch)), current, schedule_id),
+                    (
+                        str(start_local_datetime), str(timezone_iana), cadence,
+                        rule.version, rule.unit, rule.every, rule.clock, cycle_id,
+                        ordered[0], revision, int(bool(rewatch)), current, schedule_id,
+                    ),
                 )
                 conn.execute("DELETE FROM personal_release_items WHERE schedule_id=?", (schedule_id,))
             for item in materialized:
                 old = preserved.get(item.episode)
                 unlock_at = float(old["unlock_at_utc"]) if old is not None else item.unlock_at_utc
                 nominal = str(old["nominal_local_datetime"]) if old is not None else item.nominal_local_datetime
+                dst_adjusted = int(bool(old["dst_adjusted"])) if old is not None else int(item.dst_adjusted)
                 unlocked = int(bool(old["unlocked_once"])) if old is not None else int(item.unlock_at_utc <= current)
                 watched_at = old["watched_at"] if old is not None else None
                 item_revision = int(old["schedule_revision"]) if old is not None else revision
@@ -3988,10 +4058,13 @@ class Database:
                     """
                     INSERT INTO personal_release_items(
                         schedule_id,logical_episode_id,ordinal,unlock_at_utc,nominal_local_datetime,
-                        schedule_revision,unlocked_once,watched_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                        schedule_revision,dst_adjusted,unlocked_once,watched_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """,
-                    (schedule_id,item.episode,item.ordinal,unlock_at,nominal,item_revision,unlocked,watched_at,current),
+                    (
+                        schedule_id,item.episode,item.ordinal,unlock_at,nominal,item_revision,
+                        dst_adjusted,unlocked,watched_at,current,
+                    ),
                 )
             conn.execute(
                 "UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=? WHERE key='ui_state_version'",

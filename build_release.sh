@@ -38,14 +38,15 @@ uv export --locked --extra sync --no-dev --no-emit-project --format requirements
 
 STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"
 rm -rf "$PROJECT_DIR/dist/release"
-mkdir -p "$STAGE"
-cp -R pudge tests "$STAGE/"
-cp -R docs "$STAGE/"
-cp install.sh README.md config.example.toml pyproject.toml build_release.sh rename_brand.py brand_migration.py \
+mkdir -p "$STAGE" "$STAGE/.github"
+cp -R pudge tests docs scripts "$STAGE/"
+cp -R .github/workflows "$STAGE/.github/"
+cp install.sh README.md config.example.toml pyproject.toml build_release.sh Makefile MOBILE_SYNC_PROTOCOL.md \
   LICENSE SECURITY.md CONTRIBUTING.md DEVELOPMENT.md RELEASING.md CHANGELOG.md uv.lock "$STAGE/"
 cp "dist/pudge-${VERSION}-py3-none-any.whl" "$STAGE/"
 cp "dist/release-requirements.txt" "$STAGE/"
-chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh"
+chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh" "$STAGE/scripts/migrations/legacy_anime_mpv.py"
+python scripts/check_release_bundle.py "$STAGE"
 
 (
   cd "$PROJECT_DIR/dist/release"

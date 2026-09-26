@@ -211,7 +211,7 @@ def test_schema_version_contains_personal_schedule_tables(tmp_path: Path) -> Non
     assert "personal_release_schedules" in tables
     assert "personal_release_items" in tables
 
-def test_play_admission_blocks_future_and_out_of_order_items(tmp_path: Path) -> None:
+def test_play_admission_blocks_future_and_out_of_order_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db = Database(tmp_path / "db.sqlite3")
     anime = _anime()
     db.upsert_anime(anime)
@@ -241,6 +241,16 @@ def test_play_admission_blocks_future_and_out_of_order_items(tmp_path: Path) -> 
         now=0,
     )
     api = _api(db)
+    original_schedule = db.personal_release_schedule
+
+    def schedule_at_test_time(anime_id, *, profile_id="default", now=None):
+        return original_schedule(
+            anime_id,
+            profile_id=profile_id,
+            now=schedule.items[0].unlock_at_utc if now is None else now,
+        )
+
+    monkeypatch.setattr(db, "personal_release_schedule", schedule_at_test_time)
     db.personal_release_schedule(anime.media_id, now=schedule.items[0].unlock_at_utc)
     assert api._personal_schedule_play_admission(paths[0])["allowed"] is True
     second_early = api._personal_schedule_play_admission(paths[1])

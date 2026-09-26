@@ -174,6 +174,7 @@ def test_download_card_keeps_normal_height_and_hides_button_while_active() -> No
     assert ".download-available-card .airing-meta { height:68px; min-height:68px; }" in html
     assert "const download=a.download||null" in html
     assert "t('label.downloading'" in html
+    assert "compactDownloadStatus(download)" in html
     assert "t('label.preparingDownload')" in html
     assert "result?.already_downloading" in html
     assert "const ep=e.episode==null?t('label.movie')" in library

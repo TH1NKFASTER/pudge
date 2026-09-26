@@ -43,8 +43,16 @@ query ($mediaId: Int!) {
     synonyms
     seasonYear
     startDate { year month day }
+    endDate { year month day }
     episodes
     format
+    status
+    meanScore
+    duration
+    siteUrl
+    coverImage { extraLarge large medium }
+    studios { nodes { name isAnimationStudio } }
+    nextAiringEpisode { episode airingAt }
     mediaListEntry {
       id
       progress
@@ -276,6 +284,34 @@ query ($mediaId: Int!, $episode: Int!) {
   AiringSchedule(mediaId: $mediaId, episode: $episode) {
     episode
     airingAt
+  }
+}
+"""
+
+RELATED_MEDIA_ADDITION_NOTIFICATIONS_QUERY = """
+query ($page: Int!, $perPage: Int!) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage }
+    notifications(type: RELATED_MEDIA_ADDITION, resetNotificationCount: false) {
+      ... on RelatedMediaAdditionNotification {
+        id
+        type
+        mediaId
+        context
+        createdAt
+        media {
+          id
+          type
+          status
+          format
+          siteUrl
+          startDate { year month day }
+          mediaListEntry { status }
+          title { romaji english native userPreferred }
+          coverImage { extraLarge large medium }
+        }
+      }
+    }
   }
 }
 """
@@ -626,6 +662,55 @@ class AniListClient:
             raise AniListError("Не удалось определить пользователя AniList")
         return viewer
 
+    def related_media_addition_notifications(
+        self, *, page: int = 1, per_page: int = 20
+    ) -> list[dict[str, Any]]:
+        """Return AniList RELATED_MEDIA_ADDITION notifications without marking them read."""
+        data = self._post(
+            RELATED_MEDIA_ADDITION_NOTIFICATIONS_QUERY,
+            {
+                "page": max(1, int(page)),
+                "perPage": max(1, min(50, int(per_page))),
+            },
+        )
+        page_payload = data.get("Page") or {}
+        rows = page_payload.get("notifications") or []
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("id") or not row.get("mediaId"):
+                continue
+            media = row.get("media") or {}
+            if not isinstance(media, dict):
+                media = {}
+            titles = _as_title_list(media)
+            cover = media.get("coverImage") or {}
+            result.append(
+                {
+                    "id": int(row["id"]),
+                    "type": str(row.get("type") or "RELATED_MEDIA_ADDITION"),
+                    "media_id": int(row["mediaId"]),
+                    "media_type": str(media.get("type") or ""),
+                    "title": titles[0] if titles else str(row.get("mediaId")),
+                    "context": str(row.get("context") or ""),
+                    "created_at": int(row.get("createdAt") or 0),
+                    "cover": str(
+                        cover.get("extraLarge")
+                        or cover.get("large")
+                        or cover.get("medium")
+                        or ""
+                    ),
+                    "site_url": str(
+                        media.get("siteUrl")
+                        or f"https://anilist.co/anime/{int(row['mediaId'])}"
+                    ),
+                    "media_status": str(media.get("status") or ""),
+                    "format": str(media.get("format") or ""),
+                    "start_date": _as_date_string(media.get("startDate")),
+                    "list_status": str((media.get("mediaListEntry") or {}).get("status") or "").upper(),
+                }
+            )
+        return result
+
 
     def library(self, *, include_relations: bool = True) -> list[LibraryAnime]:
         viewer = self.viewer()
@@ -738,6 +823,38 @@ class AniListClient:
         if not isinstance(media, dict):
             raise AniListError(f"Аниме AniList id={media_id} не найдено")
         return _as_anime(media, score=1000.0)
+
+    def library_anime(self, media_id: int) -> LibraryAnime:
+        """Fetch one anime with enough list/airing metadata for download decisions."""
+        media = self._post(LIST_ENTRY_QUERY, {"mediaId": int(media_id)}).get("Media")
+        if not isinstance(media, dict):
+            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+        titles = _as_title_list(media)
+        cover = media.get("coverImage") or {}
+        entry = media.get("mediaListEntry") or {}
+        airing = media.get("nextAiringEpisode") or {}
+        return LibraryAnime(
+            media_id=int(media["id"]),
+            title=titles[0] if titles else str(media["id"]),
+            titles=titles,
+            synonyms=[str(value) for value in (media.get("synonyms") or []) if value],
+            cover_url=str(cover.get("extraLarge") or cover.get("large") or cover.get("medium") or ""),
+            site_url=str(media.get("siteUrl") or f"https://anilist.co/anime/{int(media['id'])}"),
+            status=str(entry.get("status") or ""),
+            progress=int(entry.get("progress") or 0),
+            episodes=int(media["episodes"]) if media.get("episodes") else None,
+            format=str(media.get("format") or "") or None,
+            season_year=int(media["seasonYear"]) if media.get("seasonYear") else None,
+            start_date=_as_date_string(media.get("startDate")),
+            studio=_primary_studio(media),
+            media_status=str(media.get("status") or "") or None,
+            end_date=_as_date_string(media.get("endDate")),
+            mean_score=int(media["meanScore"]) if media.get("meanScore") is not None else None,
+            user_score=float(entry["score"]) if entry.get("score") is not None else None,
+            duration=int(media["duration"]) if media.get("duration") is not None else None,
+            next_airing_episode=int(airing["episode"]) if airing.get("episode") else None,
+            next_airing_at=int(airing["airingAt"]) if airing.get("airingAt") else None,
+        )
 
     def episode_airing_at(self, media_id: int, episode: int) -> int | None:
         if media_id < 1 or episode < 1:

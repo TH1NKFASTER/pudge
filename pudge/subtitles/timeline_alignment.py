@@ -10,7 +10,7 @@ from pathlib import Path
 from ..subtitle_formats import parse_srt, write_srt
 
 
-_ALGORITHM_VERSION = "timeline-v6.14-opening-preclock-holdout"
+_ALGORITHM_VERSION = "timeline-v6.19-edge-zones-audio-verify"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -135,6 +135,20 @@ def _early_edit_audio_verification_risk(
         and cold_delta >= 1.5
     ):
         reasons.append("opening_gap_clock_ambiguity")
+
+    # An opening can contain continuous music/sign cues and therefore have no
+    # literal subtitle gap. A large first-edge/path clock disagreement is still
+    # risky enough to verify against Japanese speech instead of trusting a
+    # subtitle-only fit.
+    strong_early = any(
+        item.center <= 120.0
+        and item.matched >= 4
+        and item.score >= 2.40
+        and item.onset_coverage >= 0.65
+        for item in early
+    )
+    if 4.0 <= cold_delta <= 15.0 and strong_early:
+        reasons.append("opening_edge_clock_disagreement")
 
     payload = {
         "required": bool(reasons),
@@ -325,9 +339,50 @@ def _score_window(
 
     edge_hint_distance: float | None = None
     edge_hint_bonus = 0.0
-    if edge_hints is not None:
-        edge_hint_distance = min(abs(offset - hint) for hint in edge_hints)
-        edge_hint_bonus = 0.24 * math.exp(-edge_hint_distance / 5.0)
+    if edge_hints is not None and source_onsets:
+        start_hint = float(edge_hints[0])
+        end_hint = float(edge_hints[1])
+        edge_clock_gap = abs(end_hint - start_hint)
+
+        # When both edges agree, they describe one stable global clock and
+        # are a strong tie-breaker for periodic dialogue. A very large edge
+        # disagreement instead describes two distinct master clocks (for
+        # example a long inserted/removed opening), so both clocks remain
+        # useful candidates throughout the episode. Only medium disagreements
+        # are local-only evidence: letting a mismatched tail hint bias the
+        # middle caused false clocks around dense ASS signs.
+        if edge_clock_gap <= 3.0:
+            shared_hint = (start_hint + end_hint) / 2.0
+            edge_hint_distance = abs(offset - shared_hint)
+            edge_hint_bonus = 0.24 * math.exp(-edge_hint_distance / 5.0)
+        elif edge_clock_gap >= 24.0:
+            edge_hint_distance = min(
+                abs(offset - start_hint),
+                abs(offset - end_hint),
+            )
+            edge_hint_bonus = 0.24 * math.exp(-edge_hint_distance / 5.0)
+        else:
+            first_source = float(source_onsets[0])
+            last_source = float(source_onsets[-1])
+            span = max(1e-6, last_source - first_source)
+            edge_zone = min(180.0, max(_WINDOW_SECONDS, span * 0.20))
+            distance_from_start = max(0.0, center - first_source)
+            distance_from_end = max(0.0, last_source - center)
+            local_hint: float | None = None
+            locality_weight = 0.0
+            if distance_from_start <= edge_zone:
+                local_hint = start_hint
+                locality_weight = max(0.0, 1.0 - distance_from_start / edge_zone)
+            elif distance_from_end <= edge_zone:
+                local_hint = end_hint
+                locality_weight = max(0.0, 1.0 - distance_from_end / edge_zone)
+            if local_hint is not None and locality_weight > 0.0:
+                edge_hint_distance = abs(offset - local_hint)
+                edge_hint_bonus = (
+                    0.24
+                    * locality_weight
+                    * math.exp(-edge_hint_distance / 5.0)
+                )
 
     score = (
         1.35 * onset_coverage
@@ -603,6 +658,89 @@ def _suppress_weak_opening_path_excursion(
             return filtered, diagnostics
 
     diagnostics["reason"] = "no_weak_opening_path_excursion"
+    return path, diagnostics
+
+
+def _suppress_nonmonotonic_transient_path_excursion(
+    source_cues: list[tuple[float, float, str]],
+    path: list[_WindowMatch],
+) -> tuple[list[_WindowMatch], dict[str, object]]:
+    """Drop a short huge clock detour that cannot map dialogue monotonically.
+
+    Strong local aliases can appear for one or two windows, especially around
+    dense embedded signs. If the path immediately returns to the same clock, a
+    large temporary offset is only plausible when the source has a comparably
+    large subtitle gap around that transition.
+    """
+    diagnostics: dict[str, object] = {"applied": False, "reason": "not_applicable"}
+    if len(path) < 7 or len(source_cues) < 4:
+        return path, diagnostics
+
+    for run_length in (2, 1):
+        for start_index in range(3, len(path) - run_length - 2):
+            end_index = start_index + run_length
+            left_rows = path[start_index - 3:start_index]
+            middle_rows = path[start_index:end_index]
+            right_rows = path[end_index:end_index + 3]
+            left_values = [float(row.offset) for row in left_rows]
+            middle_values = [float(row.offset) for row in middle_rows]
+            right_values = [float(row.offset) for row in right_rows]
+            left_clock = float(statistics.median(left_values))
+            middle_clock = float(statistics.median(middle_values))
+            right_clock = float(statistics.median(right_values))
+
+            if max(left_values) - min(left_values) > 2.5:
+                continue
+            if max(right_values) - min(right_values) > 2.5:
+                continue
+            if max(middle_values) - min(middle_values) > 3.0:
+                continue
+            if abs(left_clock - right_clock) > 2.5:
+                continue
+
+            excursion = min(
+                abs(middle_clock - left_clock),
+                abs(middle_clock - right_clock),
+            )
+            if excursion < 20.0:
+                continue
+
+            low = float(left_rows[-1].center) - _WINDOW_STRIDE_SECONDS
+            high = float(right_rows[0].center) + _WINDOW_STRIDE_SECONDS
+            nearby = [
+                (float(start), float(end))
+                for start, end, _text in source_cues
+                if float(end) >= low and float(start) <= high
+            ]
+            largest_gap = max(
+                (right[0] - left[1] for left, right in zip(nearby, nearby[1:])),
+                default=0.0,
+            )
+
+            # A temporary D-second backward clock jump needs roughly D seconds
+            # without mapped dialogue to stay monotonic. Keep a generous 75%
+            # threshold for sparse subtitle segmentation.
+            if largest_gap >= 0.75 * excursion:
+                continue
+
+            filtered = path[:start_index] + path[end_index:]
+            diagnostics.update(
+                {
+                    "applied": True,
+                    "reason": "nonmonotonic_transient_clock_excursion",
+                    "removed_window_count": run_length,
+                    "removed_centers": [round(float(row.center), 3) for row in middle_rows],
+                    "removed_offsets": [round(float(row.offset), 3) for row in middle_rows],
+                    "left_clock_seconds": round(left_clock, 3),
+                    "right_clock_seconds": round(right_clock, 3),
+                    "middle_clock_seconds": round(middle_clock, 3),
+                    "excursion_seconds": round(excursion, 3),
+                    "largest_source_gap_seconds": round(largest_gap, 3),
+                }
+            )
+            return filtered, diagnostics
+
+    diagnostics["reason"] = "no_nonmonotonic_transient_clock_excursion"
     return path, diagnostics
 
 
@@ -1082,6 +1220,7 @@ def _suppress_weak_singleton_tail_transition(
     source_cues: list[tuple[float, float, str]],
     segments: list[dict[str, object]],
     boundaries: list[float],
+    reference_cues: list[tuple[float, float, str]] | None = None,
 ) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
     """Drop an unproven one-window clock switch at the very end.
 
@@ -1114,6 +1253,15 @@ def _suppress_weak_singleton_tail_transition(
     jump = abs(right_offset - left_offset)
     tail_duration = max(0.0, source_end - boundary)
     boundary_ratio = boundary / max(source_end, 0.001)
+    reference_end = (
+        max(float(end) for _start, end, _text in reference_cues)
+        if reference_cues else None
+    )
+    mapped_tail_end = source_end + right_offset
+    reference_overshoot = (
+        mapped_tail_end - reference_end
+        if reference_end is not None else None
+    )
     diagnostics.update(
         {
             "jump_seconds": round(jump, 3),
@@ -1127,6 +1275,14 @@ def _suppress_weak_singleton_tail_transition(
             "kept_offset_seconds": round(left_offset, 3),
         }
     )
+    if reference_end is not None and reference_overshoot is not None:
+        diagnostics.update(
+            {
+                "reference_end_seconds": round(reference_end, 3),
+                "mapped_tail_end_seconds": round(mapped_tail_end, 3),
+                "reference_overshoot_seconds": round(reference_overshoot, 3),
+            }
+        )
 
     # This is intentionally narrow: only a large, very-late singleton that
     # follows a strongly established clock.  Two windows are enough to keep a
@@ -1140,14 +1296,33 @@ def _suppress_weak_singleton_tail_transition(
     if jump < 8.0:
         diagnostics["reason"] = "tail_jump_not_large"
         return segments, boundaries, diagnostics
-    if boundary_ratio < 0.85 or tail_duration > 150.0:
+    ordinary_late_tail = boundary_ratio >= 0.85 and tail_duration <= 150.0
+    # Same-media timing references give us an independent physical bound. A
+    # large positive singleton clock that would push the source tens of seconds
+    # past that reference is not a credible late edit, even when the tail is a
+    # few seconds longer than the conservative 150 s heuristic. This catches
+    # the Assassination Classroom S01E01 +59 s false tail without weakening the
+    # rule for negative offsets or genuinely supported ending edits.
+    reference_overshoot_tail = bool(
+        reference_end is not None
+        and reference_overshoot is not None
+        and reference_end >= 60.0
+        and boundary_ratio >= 0.80
+        and right_offset > left_offset
+        and reference_overshoot >= max(8.0, jump * 0.35)
+    )
+    if not ordinary_late_tail and not reference_overshoot_tail:
         diagnostics["reason"] = "tail_not_late_or_short"
         return segments, boundaries, diagnostics
 
     diagnostics.update(
         {
             "applied": True,
-            "reason": "weak_singleton_tail_clock",
+            "reason": (
+                "weak_singleton_tail_clock_reference_overshoot"
+                if reference_overshoot_tail and not ordinary_late_tail
+                else "weak_singleton_tail_clock"
+            ),
         }
     )
     return [dict(segment) for segment in segments[:-1]], list(boundaries[:-1]), diagnostics
@@ -2182,6 +2357,69 @@ def _stabilize_decreasing_boundaries(
             if boundary_index + 1 < len(adjusted_boundaries)
             else float("inf")
         )
+
+        # A downward clock jump around a real source silence is usually an edit
+        # boundary, not evidence that the old clock should be dragged through
+        # the following dialogue.  If the first right-clock cue would map before
+        # the preceding cue, first try moving the switch *back* into the nearest
+        # substantial source gap.  This keeps the whole post-gap cue cluster on
+        # the new clock and avoids the pathological "extend through 10+ cues"
+        # behaviour seen on Youjo Senki II S02E12 (-37s -> -47s).
+        jump_seconds = left_offset - right_offset
+        previous_boundary = (
+            float(adjusted_boundaries[boundary_index - 1])
+            if boundary_index > 0
+            else float("-inf")
+        )
+        if jump_seconds >= 4.0 and bad_index >= 2:
+            minimum_gap = max(6.0, min(12.0, jump_seconds * 0.70))
+            candidate_index = bad_index - 1
+            gap_start = float(source_cues[candidate_index - 1][1])
+            gap_end = float(source_cues[candidate_index][0])
+            gap_seconds = gap_end - gap_start
+            gap_midpoint = (gap_start + gap_end) / 2.0
+            near_boundary = 0.0 <= old_boundary - gap_end <= max(18.0, jump_seconds * 2.0)
+            if (
+                gap_seconds >= minimum_gap
+                and near_boundary
+                and gap_midpoint > previous_boundary + 0.001
+            ):
+                trial_boundaries = list(adjusted_boundaries)
+                trial_boundaries[boundary_index] = gap_midpoint
+                trial_offsets = [
+                    _offset_for_time(midpoint, adjusted_segments, trial_boundaries)
+                    for midpoint in mids
+                ]
+                trial_mapped = [
+                    float(source_cues[index][0]) + trial_offsets[index]
+                    for index in range(len(source_cues))
+                ]
+                if all(
+                    trial_mapped[index] + 0.25 >= trial_mapped[index - 1]
+                    for index in range(1, len(trial_mapped))
+                ):
+                    adjusted_boundaries[boundary_index] = gap_midpoint
+                    adjusted_segments[boundary_index]["last_center"] = gap_midpoint
+                    adjusted_segments[boundary_index + 1]["first_center"] = gap_midpoint
+                    diagnostics.append(
+                        {
+                            "applied": True,
+                            "reason": "decreasing_boundary_reanchored_to_source_gap",
+                            "boundary_index": boundary_index,
+                            "old_source_time": round(old_boundary, 3),
+                            "new_source_time": round(gap_midpoint, 3),
+                            "left_offset_seconds": round(left_offset, 3),
+                            "right_offset_seconds": round(right_offset, 3),
+                            "cue_index": bad_index,
+                            "gap_seconds": round(gap_seconds, 3),
+                            "gap_start_seconds": round(gap_start, 3),
+                            "gap_end_seconds": round(gap_end, 3),
+                            "previous_mapped_start": round(mapped_starts[bad_index - 1], 3),
+                            "current_mapped_start": round(mapped_starts[bad_index], 3),
+                        }
+                    )
+                    continue
+
         target = max(old_boundary + 0.001, current_midpoint + 0.001)
         if target >= next_boundary - 0.001:
             diagnostics.append(
@@ -2718,6 +2956,81 @@ def _holdout_validation(
     }
 
 
+def _suppress_false_tail_jump_from_duration_anchors(
+    source_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
+    """Reject a spurious tail jump when actual cue edges confirm the old clock.
+
+    Layered ASS/English reference tracks can have thousands of overlapping sign
+    and karaoke cues. Their late activity-window match is not evidence that
+    already-synchronized Japanese dialogue suddenly needs a 59-second shift.
+    Match BOTH onset and duration, on several independent cues in the disputed
+    tail. A genuine edited master has no old-clock duration anchors there.
+    """
+    diagnostics: dict[str, object] = {"applied": False}
+    if len(segments) < 2 or len(boundaries) != len(segments) - 1:
+        return segments, boundaries, diagnostics
+    previous = segments[-2]
+    last = segments[-1]
+    old_offset = float(previous["offset_seconds"])
+    proposed_offset = float(last["offset_seconds"])
+    boundary = float(boundaries[-1])
+    if (abs(proposed_offset - old_offset) < 15.0
+            or int(previous.get("support") or 0) < 3
+            or boundary < 0):
+        return segments, boundaries, diagnostics
+    disputed = [
+        (float(start), float(end)) for start, end, _ in source_cues
+        if boundary <= start < boundary + 120.0 and end - start >= 0.5
+    ]
+    if len(disputed) < 10:
+        return segments, boundaries, diagnostics
+    observed = sorted(
+        (float(start), float(end)) for start, end, _ in reference_cues
+        if end - start >= 0.5
+    )
+    onsets = [start for start, _ in observed]
+
+    def duration_anchor_count(offset: float) -> int:
+        matched = 0
+        for source_start, source_end in disputed:
+            shifted = source_start + offset
+            left = bisect.bisect_left(onsets, shifted - 0.25)
+            right = bisect.bisect_right(onsets, shifted + 0.25)
+            if any(abs((ref_end - ref_start) - (source_end - source_start)) <= 0.65
+                   for ref_start, ref_end in observed[left:right]):
+                matched += 1
+        return matched
+
+    old_count = duration_anchor_count(old_offset)
+    new_count = duration_anchor_count(proposed_offset)
+    diagnostics.update({
+        "boundary_source_time": round(boundary, 3),
+        "old_offset_seconds": round(old_offset, 3),
+        "proposed_offset_seconds": round(proposed_offset, 3),
+        "source_cues_checked": len(disputed),
+        "old_clock_duration_anchors": old_count,
+        "proposed_clock_duration_anchors": new_count,
+    })
+    old_ratio = old_count / len(disputed) if disputed else 0.0
+    diagnostics["old_clock_duration_anchor_ratio"] = round(old_ratio, 4)
+    # Absolute edge agreement is the primary evidence here. A subtitle tail can
+    # legitimately contain many short/sign/song cues that have no matching
+    # duration in the reference, so requiring nearly half of every disputed cue
+    # to anchor the old clock was too strict (Sayonara Lara E04: 11/51 old-clock
+    # anchors, 0 at the proposed +82 s clock). Twenty percent plus at least eight
+    # independent duration matches and a large superiority margin remains narrow.
+    if (old_count < 8 or old_ratio < 0.20
+            or old_count - new_count < 6 or new_count > max(2, old_count // 4)):
+        return segments, boundaries, diagnostics
+    diagnostics["applied"] = True
+    diagnostics["reason"] = "old_clock_confirmed_by_independent_duration_anchors"
+    return segments[:-1], boundaries[:-1], diagnostics
+
+
 def align_subtitle_timelines(
     source: Path,
     reference: Path,
@@ -2821,6 +3134,10 @@ def align_subtitle_timelines(
         source_cues,
         path,
         edge_hints,
+    )
+    path, transient_path_guard = _suppress_nonmonotonic_transient_path_excursion(
+        source_cues,
+        path,
     )
     if len(path) < 4:
         return source, _result(
@@ -2977,6 +3294,7 @@ def align_subtitle_timelines(
         source_cues,
         segments,
         boundaries,
+        reference_cues,
     )
     if weak_tail_guard.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
@@ -3004,6 +3322,14 @@ def align_subtitle_timelines(
         opening_path_boundary_anchor,
     )
     if opening_preclock_refinement.get("applied"):
+        boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
+
+    segments, boundaries, false_tail_jump_guard = (
+        _suppress_false_tail_jump_from_duration_anchors(
+            source_cues, reference_cues, segments, boundaries,
+        )
+    )
+    if false_tail_jump_guard.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
 
     mapped_offsets = [
@@ -3099,6 +3425,7 @@ def align_subtitle_timelines(
             activity_f1=round(activity_f1, 4),
             holdout=holdout,
             layered_reference_acceptance=layered_reference_acceptance,
+            false_tail_jump_guard=false_tail_jump_guard,
             onset_count_ratio=round(onset_count_ratio, 3),
             dominant_support_ratio=round(dominant_support_ratio, 3),
             path=[item.as_dict() for item in path],
@@ -3205,6 +3532,7 @@ def align_subtitle_timelines(
         sync_was_successful=True,
         engine="embedded-reference+timeline",
         output=str(output),
+        false_tail_jump_guard=false_tail_jump_guard,
         timeline_alignment_reliable=True,
         timeline_algorithm=_ALGORITHM_VERSION,
         timeline_signal_counts={
@@ -3226,6 +3554,7 @@ def align_subtitle_timelines(
         timeline_transition_refinements=transition_refinements,
         timeline_opening_gap_reacquire=opening_gap_reacquire,
         timeline_weak_opening_path_guard=weak_opening_path_guard,
+        timeline_transient_path_guard=transient_path_guard,
         timeline_opening_path_boundary_anchor=opening_path_boundary_anchor,
         timeline_opening_preclock_refinement=opening_preclock_refinement,
         timeline_monotonic_refinements=monotonic_refinements,

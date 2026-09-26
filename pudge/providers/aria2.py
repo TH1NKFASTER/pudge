@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import secrets
+import signal
 import shutil
 import socket
 import subprocess
@@ -92,15 +93,93 @@ class Aria2Client:
     def close(self) -> None:
         self._http.close()
 
+    def _managed_sidecar_pids(self) -> list[int] | None:
+        """Return Pudge-owned aria2 PIDs, or None when process inspection failed.
+
+        Ownership is deliberately narrow: the argv must reference this exact
+        state directory's session file.  A user's unrelated aria2 process is
+        never selected just because it uses the same executable or RPC port.
+        """
+        session = str((self.state_dir / "session.txt").resolve())
+        needles = (f"--input-file={session}", f"--save-session={session}")
+        try:
+            completed = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                capture_output=True, text=True, timeout=2.0, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if completed.returncode != 0:
+            return None
+        result: list[int] = []
+        for raw in completed.stdout.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            command = parts[1]
+            if pid == os.getpid() or not any(needle in command for needle in needles):
+                continue
+            if "aria2" not in command.casefold():
+                continue
+            result.append(pid)
+        return sorted(set(result))
+
+    def managed_sidecar_running(self) -> bool | None:
+        """Tri-state observation of a process owned by this state directory."""
+        pids = self._managed_sidecar_pids()
+        return None if pids is None else bool(pids)
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _stop_unreachable_managed_sidecars(self) -> bool | None:
+        """Stop only stale aria2 processes tied to this exact Pudge session."""
+        pids = self._managed_sidecar_pids()
+        if pids is None:
+            return None
+        if not pids:
+            return True
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return False
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if not any(self._pid_alive(pid) for pid in pids):
+                return True
+            time.sleep(0.05)
+        for pid in pids:
+            if not self._pid_alive(pid):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                return False
+        time.sleep(0.05)
+        return not any(self._pid_alive(pid) for pid in pids)
+
     def traffic_stats(self) -> dict[str, int]:
         """Return current managed-sidecar traffic without starting aria2c."""
-        if not self._probe():
-            return {
-                "download_speed": 0,
-                "upload_speed": 0,
-                "active": 0,
-                "waiting": 0,
-            }
+        self._require_observable()
         result = self._rpc_raw("aria2.getGlobalStat") or {}
         return {
             "download_speed": max(0, int(result.get("downloadSpeed") or 0)),
@@ -113,7 +192,11 @@ class Aria2Client:
         """Stop the Pudge-owned aria2c sidecar without ever auto-starting it."""
         with self._lock:
             if not self._probe():
-                return False
+                # An older Pudge may still have a detached sidecar with a stale
+                # RPC secret/port.  RPC cannot shut that process down, but its
+                # exact session argv still proves ownership.
+                stopped = self._stop_unreachable_managed_sidecars()
+                return bool(stopped)
             if save_session:
                 try:
                     self._rpc_raw("aria2.saveSession")
@@ -411,10 +494,21 @@ class Aria2Client:
                 return
             if not self.auto_start:
                 raise Aria2Error("aria2 RPC не запущен")
+            # Repair a Pudge-owned orphan from an older RPC secret/port before
+            # starting the current sidecar.  Never kill a foreign aria2: the
+            # ownership matcher requires this exact state/session path.
+            stopped = self._stop_unreachable_managed_sidecars()
+            if stopped is False:
+                raise Aria2Error("Не удалось остановить старый Pudge aria2 sidecar")
             self._start()
 
+    def _require_observable(self) -> None:
+        """Read-only RPC guard: a status/inspection call must not launch or restart aria2."""
+        if not self._probe():
+            raise Aria2Error("aria2 RPC не запущен")
+
     def version(self) -> str:
-        self.ensure_running()
+        self._require_observable()
         result = self._rpc_raw("aria2.getVersion")
         return str((result or {}).get("version") or "unknown")
 
@@ -426,7 +520,7 @@ class Aria2Client:
         return source[:16].ljust(16, "0")
 
     def _all_statuses(self) -> list[dict[str, Any]]:
-        self.ensure_running()
+        self._require_observable()
         keys = [
             "gid", "status", "totalLength", "completedLength", "downloadSpeed",
             "uploadSpeed", "connections", "numSeeders", "seeder",
@@ -648,7 +742,7 @@ class Aria2Client:
         self._rpc_raw("aria2.unpause", [gid])
 
     def pause(self, torrent_hash: str) -> None:
-        self.ensure_running()
+        self._require_observable()
         gid = self._resolve_gid(torrent_hash)
         status = self._rpc_raw("aria2.tellStatus", [gid, ["status"]]) or {}
         if str(status.get("status") or "").casefold() not in {"active", "waiting"}:
@@ -870,7 +964,7 @@ class Aria2Client:
 
     def torrent_status(self, torrent_hash: str) -> dict[str, Any]:
         """Return the small progress surface used by the common release racer."""
-        self.ensure_running()
+        self._require_observable()
         gid = self._resolve_gid(torrent_hash)
         item = self._rpc_raw(
             "aria2.tellStatus",
@@ -1237,7 +1331,7 @@ class Aria2Client:
         return result
 
     def files(self, torrent_hash: str) -> list[dict[str, Any]]:
-        self.ensure_running()
+        self._require_observable()
         item = self._rpc_raw("aria2.tellStatus", [self._resolve_gid(torrent_hash), ["files"]]) or {}
         result: list[dict[str, Any]] = []
         for index, entry in enumerate(item.get("files") or []):
@@ -1281,7 +1375,7 @@ class Aria2Client:
         self._rpc_raw("aria2.changeOption", [gid, {"select-file": value}])
 
     def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
-        self.ensure_running()
+        self._require_observable()
         gid = self._resolve_gid(torrent_hash)
         status: dict[str, Any] = {}
         try:

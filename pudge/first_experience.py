@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,8 @@ JITEN_MPV_INSTALLER_URL = (
     "https://raw.githubusercontent.com/Sirush/JitenMPV/"
     f"{JITEN_MPV_INSTALLER_COMMIT}/installers/unix.sh"
 )
+JITEN_MPV_RELEASES_API = "https://api.github.com/repos/Sirush/JitenMPV/releases/latest"
+JITEN_MPV_VERSION_MARKER = ".pudge-version"
 
 
 class FirstExperienceError(RuntimeError):
@@ -68,6 +71,126 @@ def _jiten_paths() -> tuple[Path, Path, Path]:
         home / ".config" / "mpv" / "scripts" / "jiten-mpv.lua",
         home / ".config" / "jiten-mpv" / "config.json",
     )
+
+
+def _normalize_jiten_version(value: str) -> str:
+    text = str(value or "").strip().lstrip("vV")
+    match = re.match(r"^(\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.-]+)?)$", text)
+    return match.group(1) if match else ""
+
+
+def _jiten_version_key(value: str) -> tuple[int, int, int] | None:
+    normalized = _normalize_jiten_version(value)
+    if not normalized:
+        return None
+    core = re.split(r"[-+]", normalized, maxsplit=1)[0]
+    try:
+        parts = [int(item) for item in core.split(".")]
+    except ValueError:
+        return None
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _read_jiten_installed_version() -> str:
+    program_dir, _script_path, config_path = _jiten_paths()
+    marker = program_dir / JITEN_MPV_VERSION_MARKER
+    try:
+        value = _normalize_jiten_version(marker.read_text(encoding="utf-8"))
+    except OSError:
+        value = ""
+    if value:
+        return value
+
+    # JitenMPV writes its own current assembly version into this macOS TLS
+    # verdict cache.  It is a useful migration source for installations made
+    # before Pudge started keeping its own version marker.
+    verdict = config_path.parent / "tls-probe-verdict"
+    try:
+        first = verdict.read_text(encoding="utf-8").strip().split("|", 1)[0]
+    except OSError:
+        first = ""
+    return _normalize_jiten_version(first)
+
+
+def _write_jiten_installed_version(version: str) -> None:
+    normalized = _normalize_jiten_version(version)
+    if not normalized:
+        return
+    program_dir, _script_path, _config_path = _jiten_paths()
+    program_dir.mkdir(parents=True, exist_ok=True)
+    marker = program_dir / JITEN_MPV_VERSION_MARKER
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(normalized + "\n", encoding="utf-8")
+    os.replace(temporary, marker)
+
+
+def _latest_jiten_release() -> tuple[str, str]:
+    try:
+        response = httpx.get(
+            JITEN_MPV_RELEASES_API,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "pudge-jiten-mpv-update-check",
+            },
+            timeout=10,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
+        raise FirstExperienceError(f"Could not check JitenMPV updates: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise FirstExperienceError("Could not check JitenMPV updates: invalid GitHub response")
+    tag = str(payload.get("tag_name") or "").strip()
+    version = _normalize_jiten_version(tag)
+    if not tag or not version:
+        raise FirstExperienceError("Could not check JitenMPV updates: latest release has no version")
+    return version, tag
+
+
+def check_jiten_mpv_update(*, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str, Any]:
+    status = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
+    installed = bool(status["jiten_mpv"]["installed"])
+    current = _read_jiten_installed_version() if installed else ""
+    if not installed:
+        return {
+            "installed": False,
+            "reachable": True,
+            "current_version": "",
+            "latest_version": "",
+            "latest_tag": "",
+            "update_available": False,
+            "current_version_known": False,
+        }
+    try:
+        latest, tag = _latest_jiten_release()
+    except FirstExperienceError:
+        return {
+            "installed": True,
+            "reachable": False,
+            "current_version": current,
+            "latest_version": "",
+            "latest_tag": "",
+            "update_available": False,
+            "current_version_known": bool(current),
+        }
+    current_key = _jiten_version_key(current)
+    latest_key = _jiten_version_key(latest)
+    # A legacy install may not expose its version yet.  In that case offer a
+    # one-time sync to the latest release rather than incorrectly claiming it
+    # is current.  The updater is idempotent and writes the Pudge marker.
+    available = current_key is None or (latest_key is not None and latest_key > current_key)
+    return {
+        "installed": True,
+        "reachable": True,
+        "current_version": current,
+        "latest_version": latest,
+        "latest_tag": tag,
+        "update_available": bool(available),
+        "current_version_known": current_key is not None,
+    }
 
 
 def _mpv_script_roots() -> tuple[Path, ...]:
@@ -223,6 +346,7 @@ def mpv_study_status(
             "partial": script_path.is_file() != program_dir.is_dir(),
             "key_configured": jiten_key,
             "available": jiten_available,
+            "version": _read_jiten_installed_version() if jiten_installed else "",
             "script_path": str(script_path),
             "config_path": str(config_path),
         },
@@ -412,43 +536,63 @@ def mpv_study_script_plan(
     return {"exclusive": True, "selected": effective, "scripts": unique}
 
 
+def _run_jiten_mpv_installer() -> None:
+    try:
+        response = httpx.get(JITEN_MPV_INSTALLER_URL, timeout=30, follow_redirects=True)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise FirstExperienceError(f"Could not download the JitenMPV installer: {exc}") from exc
+    source = response.text
+    required_markers = ("Sirush/JitenMPV", "sha256", "JITEN_MPV_MPV_CONFIG_DIR")
+    if len(source) < 1000 or not all(marker in source for marker in required_markers):
+        raise FirstExperienceError("The downloaded JitenMPV installer was not recognized")
+    with tempfile.TemporaryDirectory(prefix="pudge-jiten-mpv-") as directory:
+        installer = Path(directory) / "install.sh"
+        installer.write_text(source, encoding="utf-8")
+        env = dict(os.environ)
+        env["JITEN_MPV_MPV_CONFIG_DIR"] = str(Path.home() / ".config" / "mpv")
+        try:
+            completed = subprocess.run(
+                ["/bin/sh", str(installer)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise FirstExperienceError(f"JitenMPV installation failed: {exc}") from exc
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout or "JitenMPV installer failed").strip()
+            raise FirstExperienceError(detail[-2000:])
+
+
 def install_jiten_mpv(
-    api_key: str = "", *, mpv: str = "mpv", ffmpeg: str = "ffmpeg"
+    api_key: str = "", *, mpv: str = "mpv", ffmpeg: str = "ffmpeg", force: bool = False
 ) -> dict[str, Any]:
     status = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
     if not status["mpv"]["installed"]:
         raise FirstExperienceError("Install mpv before JitenMPV")
-    if not status["jiten_mpv"]["installed"]:
+    latest_version = ""
+    if force or not status["jiten_mpv"]["installed"]:
         try:
-            response = httpx.get(JITEN_MPV_INSTALLER_URL, timeout=30, follow_redirects=True)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise FirstExperienceError(f"Could not download the JitenMPV installer: {exc}") from exc
-        source = response.text
-        required_markers = ("Sirush/JitenMPV", "sha256", "JITEN_MPV_MPV_CONFIG_DIR")
-        if len(source) < 1000 or not all(marker in source for marker in required_markers):
-            raise FirstExperienceError("The downloaded JitenMPV installer was not recognized")
-        with tempfile.TemporaryDirectory(prefix="pudge-jiten-mpv-") as directory:
-            installer = Path(directory) / "install.sh"
-            installer.write_text(source, encoding="utf-8")
-            env = dict(os.environ)
-            env["JITEN_MPV_MPV_CONFIG_DIR"] = str(Path.home() / ".config" / "mpv")
-            try:
-                completed = subprocess.run(
-                    ["/bin/sh", str(installer)],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                    env=env,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                raise FirstExperienceError(f"JitenMPV installation failed: {exc}") from exc
-            if completed.returncode:
-                detail = (completed.stderr or completed.stdout or "JitenMPV installer failed").strip()
-                raise FirstExperienceError(detail[-2000:])
+            latest_version, _tag = _latest_jiten_release()
+        except FirstExperienceError:
+            # The official installer has its own latest-release fallback, so a
+            # failed metadata lookup must not block installation/update.
+            latest_version = ""
+        _run_jiten_mpv_installer()
     _write_jiten_api_key(api_key)
     result = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
     if not result["jiten_mpv"]["installed"]:
         raise FirstExperienceError("JitenMPV did not finish installing")
+    if latest_version:
+        _write_jiten_installed_version(latest_version)
+        result["jiten_mpv"]["version"] = latest_version
     return result
+
+
+def update_jiten_mpv(
+    api_key: str = "", *, mpv: str = "mpv", ffmpeg: str = "ffmpeg"
+) -> dict[str, Any]:
+    return install_jiten_mpv(api_key, mpv=mpv, ffmpeg=ffmpeg, force=True)
