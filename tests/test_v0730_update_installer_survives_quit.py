@@ -70,3 +70,22 @@ def test_source_install_refreshes_build_identity_before_building_the_wheel():
     refresh = installer.index('.github/release/write_build_info.py" "$PROJECT_DIR/pudge"')
     assert refresh < installer.index('-m pip wheel "$PROJECT_DIR"')
     assert 'SOURCE_REVISION="$SOURCE_REVISION-dirty"' in installer
+
+
+def test_public_release_build_id_is_just_the_version(tmp_path):
+    import json
+    from pathlib import Path
+    from pudge.build_identity import read_build_identity
+    root = tmp_path / "pudge"
+    root.mkdir()
+    (root / "__init__.py").write_text('__version__ = "0.7.30"\n')
+    script = Path(__file__).resolve().parents[1] / ".github/release/write_build_info.py"
+    subprocess.run([sys.executable, str(script), str(root), "0.7.30", "--release"], check=True)
+    payload = json.loads((root / "build-info.json").read_text())
+    assert payload["id"] == "0.7.30" and payload["release"] is True
+    identity = read_build_identity(root)
+    assert identity["display"] == "0.7.30" and identity["release"] is True and identity["verified"] is True
+    repo = Path(__file__).resolve().parents[1]
+    assert 'write_build_info.py pudge "$VERSION" --release' in (repo / "build_release.sh").read_text()
+    html = (repo / "pudge/web/index.html").read_text(encoding="utf-8")
+    assert "s.build?.release&&s.build?.id===s.version?" in html

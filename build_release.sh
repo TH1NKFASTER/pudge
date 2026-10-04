@@ -27,7 +27,7 @@ PY
 
 rm -rf build dist pudge.egg-info
 find pudge tests .github/release -type d -name __pycache__ -prune -exec rm -rf {} +
-python .github/release/write_build_info.py pudge "$VERSION"
+python .github/release/write_build_info.py pudge "$VERSION" --release
 if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
   python -m pytest -q
 fi

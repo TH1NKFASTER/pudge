@@ -15,9 +15,11 @@ def main() -> int:
     parser.add_argument("package", type=Path)
     parser.add_argument("version")
     parser.add_argument("--revision")
+    parser.add_argument("--release", action="store_true",
+                        help="public release: the build id is just the version (no git revision)")
     args = parser.parse_args()
     revision = args.revision
-    if not revision:
+    if not revision and not args.release:
         result = subprocess.run(
             ["git", "rev-parse", "--short=12", "HEAD"], cwd=args.package.parent,
             capture_output=True, text=True, check=False, timeout=5,
@@ -32,7 +34,8 @@ def main() -> int:
         and not any(part.startswith(".") for part in path.relative_to(args.package).parts)
     }
     payload = {
-        "id": f"{args.version}-{revision}",
+        "id": str(args.version) if args.release else f"{args.version}-{revision}",
+        "release": bool(args.release),
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "installed_at": "",
         "files": files,

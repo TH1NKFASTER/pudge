@@ -33,6 +33,7 @@ def read_build_identity(package_root: Path) -> dict:
         "display": build_id + (" (modified)" if mismatches else ""),
         "built_at": str(payload.get("built_at") or ""),
         "installed_at": str(payload.get("installed_at") or ""),
+        "release": bool(payload.get("release")),
         "verified": not mismatches,
         "mismatches": mismatches,
     }
