@@ -155,10 +155,10 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" "$LEGACY" "$LEGACY_CHECKSUM" --clobber
             gh release edit "$RELEASE_TAG" \
-              --title "${RELEASE_TAG#v}" \
+              --title "Pudge v${RELEASE_TAG#v}" \
               --notes-file "$NOTES"
           else
             gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" "$LEGACY" "$LEGACY_CHECKSUM" \
-              --title "${RELEASE_TAG#v}" \
+              --title "Pudge v${RELEASE_TAG#v}" \
               --notes-file "$NOTES"
           fi

@@ -89,3 +89,10 @@ def test_public_release_build_id_is_just_the_version(tmp_path):
     assert 'write_build_info.py pudge "$VERSION" --release' in (repo / "build_release.sh").read_text()
     html = (repo / "pudge/web/index.html").read_text(encoding="utf-8")
     assert "s.build?.release&&s.build?.id===s.version?" in html
+
+
+def test_github_release_title_keeps_the_pudge_v_prefix():
+    from pathlib import Path
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    assert workflow.count('--title "Pudge v${RELEASE_TAG#v}"') == 2
+    assert '--title "${RELEASE_TAG#v}"' not in workflow
