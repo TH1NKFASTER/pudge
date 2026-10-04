@@ -1103,9 +1103,17 @@ class WebAppApi:
     def _prepare_update_shutdown(self) -> None:
         # The installer has not spawned yet. Keep every service usable if
         # preflight refuses the update or spawning the detached installer fails.
+        # Cancellable warm-up work must not block an update the user asked for.
+        cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
+        prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
+        if isinstance(cancel, threading.Event) and isinstance(prefetch, threading.Thread) and prefetch.is_alive():
+            cancel.set()
+            prefetch.join(timeout=3.0)
         blockers = self._restore_background_blockers()
         if blockers:
-            raise RuntimeError("Background work is still active; retry the update when it finishes")
+            raise RuntimeError(
+                "Background work is still active (" + ", ".join(blockers) + "); retry the update when it finishes"
+            )
         self._stop_scheduled_agent()
         supervisor = self.task_supervisor
         try:
@@ -1124,6 +1132,11 @@ class WebAppApi:
                  if process.poll() is None]
         roots.extend(int(row["pid"]) for row in list(getattr(self, "_play_registry", {}).values())
                      if row.get("pid"))
+        # A launched update installer waits for this process to exit and then
+        # installs; quitting must never kill it as a leftover child.
+        installer_pid = getattr(getattr(self, "app_updater", None), "installer_pid", None)
+        if installer_pid:
+            roots.append(int(installer_pid))
         tree.exclude_subtrees(roots)
 
     def _quit_after_update(self) -> None:

@@ -47,6 +47,7 @@ class AppUpdater:
 
     def __init__(self, *, logger: Any = None, before_install: Any = None, request_quit: Any = None) -> None:
         self.logger = logger
+        self.installer_pid: int | None = None
         self.before_install = before_install
         self.request_quit = request_quit
         self.marker_path = DATA_DIR / "install-source.json"
@@ -480,13 +481,16 @@ class AppUpdater:
         os.chmod(script, 0o700)
         if callable(self.before_install):
             self.before_install()
-        subprocess.Popen(
+        installer = subprocess.Popen(
             ["/bin/zsh", str(script)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        # The quitting app stops its leftover children; the installer is one of
+        # them and must survive that cleanup (it was silently killed before).
+        self.installer_pid = int(getattr(installer, "pid", 0) or 0) or None
         self._log("APP update installer launched from %s", project)
         self._set_state("restarting", "Installer started; Pudge will reopen automatically")
         if callable(self.request_quit):
