@@ -288,6 +288,16 @@ if (( BUILD_CURRENT_TREE )); then
   SOURCE_BUILD_ISOLATED=1
 
   "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
+  # A source checkout carries no (or a stale) build-info.json: fingerprint the
+  # tree being installed so Settings shows this build instead of "(modified)".
+  if [[ -f "$PROJECT_DIR/.github/release/write_build_info.py" ]]; then
+    SOURCE_REVISION="$(/usr/bin/git -C "$PROJECT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo source)"
+    if [[ -n "$(/usr/bin/git -C "$PROJECT_DIR" status --porcelain --untracked-files=no -- pudge 2>/dev/null)" ]]; then
+      SOURCE_REVISION="$SOURCE_REVISION-dirty"
+    fi
+    SOURCE_VERSION="$("$VENV_DIR/bin/python" -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$PROJECT_DIR/pyproject.toml")"
+    "$VENV_DIR/bin/python" -I "$PROJECT_DIR/.github/release/write_build_info.py" "$PROJECT_DIR/pudge" "$SOURCE_VERSION" --revision "$SOURCE_REVISION"
+  fi
   "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
     --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
   restore_source_build

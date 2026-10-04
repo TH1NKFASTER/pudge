@@ -49,3 +49,24 @@ def test_update_preflight_cancels_jiten_prefetch_and_names_real_blockers():
     finally:
         stop.set()
         startup.join(timeout=5)
+
+
+def test_build_info_ignores_finder_metadata(tmp_path):
+    import json
+    root = tmp_path / "pudge"
+    (root / "web").mkdir(parents=True)
+    (root / "__init__.py").write_text("x = 1\n")
+    (root / ".DS_Store").write_bytes(b"finder")
+    (root / "web" / ".DS_Store").write_bytes(b"finder")
+    script = __import__("pathlib").Path(__file__).resolve().parents[1] / ".github/release/write_build_info.py"
+    subprocess.run([sys.executable, str(script), str(root), "0.0.0", "--revision", "abc"], check=True)
+    files = json.loads((root / "build-info.json").read_text())["files"]
+    assert list(files) == ["__init__.py"]
+
+
+def test_source_install_refreshes_build_identity_before_building_the_wheel():
+    from pathlib import Path
+    installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text(encoding="utf-8")
+    refresh = installer.index('.github/release/write_build_info.py" "$PROJECT_DIR/pudge"')
+    assert refresh < installer.index('-m pip wheel "$PROJECT_DIR"')
+    assert 'SOURCE_REVISION="$SOURCE_REVISION-dirty"' in installer

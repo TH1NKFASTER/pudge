@@ -28,6 +28,8 @@ def main() -> int:
         for path in sorted(args.package.rglob("*"))
         if path.is_file() and path.name != "build-info.json"
         and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}
+        # Finder metadata (.DS_Store) and other dotfiles never ship in the wheel.
+        and not any(part.startswith(".") for part in path.relative_to(args.package).parts)
     }
     payload = {
         "id": f"{args.version}-{revision}",
