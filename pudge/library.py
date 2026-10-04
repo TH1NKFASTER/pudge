@@ -228,6 +228,7 @@ def scan_library(
     pipeline_cache_config: AppConfig | None = None,
     anime_resolver: Callable[[VideoIdentity], LibraryAnime | None] | None = None,
     media_episode_resolver: Callable[[LibraryAnime, int | None], int | None] | None = None,
+    file_episode_resolver: Callable[[LibraryAnime, Path, int | None], int | None] | None = None,
     require_anime_match: bool = False,
 ) -> list[LibraryEpisode]:
     root = root.expanduser()
@@ -327,6 +328,12 @@ def scan_library(
             if existing is not None
             else identity.episode
         )
+        if anime is not None and file_episode_resolver is not None:
+            media_number = file_episode_resolver(anime, resolved, media_number)
+            if media_number is None and release_number is not None:
+                # An ambiguous file stays available for manual identity review;
+                # it must not acquire a Ready episode from a numeric fallback.
+                continue
         if (
             not require_anime_match
             and anime is None

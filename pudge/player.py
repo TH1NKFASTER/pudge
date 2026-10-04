@@ -3,10 +3,48 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from .runtime import worker_environment
+
+
+_MPV_OPTION_CACHE: dict[tuple[str, int, int], frozenset[str]] = {}
+
+
+def mpv_supports_option(mpv: str, option: str) -> bool:
+    """Probe optional flags once per executable instead of assuming a build.
+
+    The option list is cached per executable identity (path, size, mtime), so
+    playback does not spawn ``mpv --list-options`` every time. A failing probe
+    only means "unsupported": it must never prevent playback.
+    """
+    resolved = shutil.which(mpv) or mpv
+    try:
+        stat = os.stat(resolved)
+        key = (os.path.realpath(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        key = None
+    options = _MPV_OPTION_CACHE.get(key) if key is not None else None
+    if options is None:
+        try:
+            result = subprocess.run(
+                [mpv, "--no-config", "--list-options"],
+                capture_output=True, text=True, timeout=3.0, check=False,
+            )
+        except Exception:  # noqa: BLE001 - optional capability probe
+            return False
+        if getattr(result, "returncode", 1) != 0:
+            return False
+        options = frozenset(
+            parts[0] for parts in (line.split() for line in str(result.stdout or "").splitlines()) if parts
+        )
+        if key is not None:
+            _MPV_OPTION_CACHE[key] = options
+    return f"--{option}" in options
 
 
 def build_mpv_command(
@@ -17,8 +55,21 @@ def build_mpv_command(
     extra_args: list[str],
     script: Path | None = None,
     ipc_socket: Path | None = None,
+    extra_scripts: list[Path] | None = None,
 ) -> list[str]:
     command = [mpv, *extra_args]
+    # A companion player belongs to Pudge's existing Dock application.
+    if (
+        sys.platform == "darwin"
+        and not any(arg.startswith("--macos-app-activation-policy") for arg in extra_args)
+        and mpv_supports_option(mpv, "macos-app-activation-policy")
+    ):
+        command.append("--macos-app-activation-policy=accessory")
+    # A Pudge playback session owns one video and must finish with it. Global
+    # mpv profiles must not leave an idle player/helper after its content closes.
+    command.append("--idle=no")
+    if not any(arg == "--keep-open" or arg.startswith("--keep-open=") or arg == "--no-keep-open" for arg in extra_args):
+        command.append("--keep-open=no")
     # mpv can collapse gaps shorter than 210 ms when sub-fix-timing is enabled
     # in the global mpv.conf. That recreates exact boundaries and makes libass
     # briefly retain both SRT cues. Disable it unless pudge arguments
@@ -38,6 +89,11 @@ def build_mpv_command(
         # Other explicitly selected scripts (for example JitenMPV) must not
         # suppress Pudge's playback/tracking script.
         command.append(f"--script={script}")
+    # Pudge's own companion scripts (e.g. the OP/ED skip button) are loaded
+    # explicitly, so they also run under --load-scripts=no.
+    for extra in extra_scripts or ():
+        if f"--script={extra}" not in command:
+            command.append(f"--script={extra}")
     if subtitle is not None:
         command.append(f"--sub-file={subtitle}")
     elif subtitle_id is not None:
@@ -92,6 +148,36 @@ def _focus_mpv_process(pid: int) -> None:
             return
 
 
+def _observe_decoder(process, ipc_socket, logger):
+    import socket
+    import threading
+    def sample():
+        for _ in range(12):
+            if process.poll() is not None:
+                return
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                    client.settimeout(1)
+                    client.connect(ipc_socket)
+                    client.sendall(b'{"command":["get_property","hwdec-current"],"request_id":91}\n{"command":["get_property","video-codec"],"request_id":92}\n')
+                    values = {}
+                    with client.makefile("r") as reader:
+                        for _ in range(32):
+                            line = reader.readline()
+                            if not line: break
+                            row = json.loads(line)
+                            if row.get("request_id") in {91,92} and row.get("error") == "success":
+                                values[row["request_id"]] = row.get("data")
+                            if len(values) == 2: break
+                    if values.get(92):
+                        logger.info("EVENT mpv.decoder pid=%s hwdec=%s codec=%s", process.pid, values.get(91), values[92])
+                        return
+            except (OSError, ValueError):
+                pass
+            time.sleep(.5)
+    threading.Thread(target=sample,name="mpv-decoder-probe",daemon=True).start()
+
+
 def run_mpv(
     command: list[str],
     dry_run: bool = False,
@@ -103,14 +189,9 @@ def run_mpv(
     if dry_run:
         return 0
 
-    env = os.environ.copy()
-    if env_overrides:
-        env.update({key: str(value) for key, value in env_overrides.items()})
+    env = worker_environment(env_overrides)
 
     try:
-        if not focus:
-            completed = subprocess.run(command, env=env, check=False)
-            return completed.returncode
         process = subprocess.Popen(command, env=env)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Не найден mpv: {command[0]}") from exc
@@ -127,9 +208,14 @@ def run_mpv(
         )
     except Exception:
         logger = None
-    _focus_mpv_process(process.pid)
+    if focus:
+        _focus_mpv_process(process.pid)
+    from .playback_process import wait_playback_process
+    ipc_socket = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--input-ipc-server=")), None)
     if logger is None:
-        return process.wait()
-    code = process.wait()
+        return wait_playback_process(process, ipc_socket=ipc_socket)
+    if ipc_socket:
+        _observe_decoder(process, ipc_socket, logger)
+    code = wait_playback_process(process, ipc_socket=ipc_socket)
     logger.info("EVENT mpv.exit pid=%s exit_code=%s", process.pid, code)
     return code

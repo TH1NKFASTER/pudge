@@ -292,7 +292,7 @@ def test_media_tabs_only_reload_after_actual_navigation() -> None:
     manga = (root / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
 
     assert "if(!force&&ui.page===page)return false" in html
-    assert "requestAnimationFrame(()=>loadActivatedPage(page))" in html
+    assert "if(generation!==ui.pageLoadGeneration||ui.page!==page)return;loadActivatedPage(page);" in html
     assert "if(b.dataset.page==='lightnovels')void loadLightNovels()" not in html
     assert "loadActivatedPage(page)" in html
     assert "const nav = event.target.closest('.nav button[data-page]')" not in media

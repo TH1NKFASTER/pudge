@@ -106,11 +106,17 @@ class WorkScheduler:
             if fcntl is not None:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
-            handle.close()
-            self._local_lock.release()
-            with self._queue_condition:
-                self._active_priority = None
-                self._queue_condition.notify_all()
+            try:
+                handle.close()
+            finally:
+                # Clear the active priority while this lease still owns the
+                # local lock; otherwise a lease acquired right after the lock
+                # release could have its priority reset by this old release.
+                with self._queue_condition:
+                    self._active_priority = None
+                self._local_lock.release()
+                with self._queue_condition:
+                    self._queue_condition.notify_all()
 
     def begin_priority_request(
         self,
@@ -358,13 +364,28 @@ class WorkScheduler:
                 raise
 
             if locked:
-                block_reason = (
-                    self.background_wait_reason(
-                        priority=requested_priority, resource=resource
+                try:
+                    block_reason = (
+                        self.background_wait_reason(
+                            priority=requested_priority, resource=resource
+                        )
+                        if foreground_sensitive
+                        else None
                     )
-                    if foreground_sensitive
-                    else None
-                )
+                except BaseException:
+                    try:
+                        if fcntl is not None:
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            handle.close()
+                        except OSError:
+                            pass
+                        self._local_lock.release()
+                        remove_waiter()
+                    raise
                 if block_reason is not None:
                     try:
                         if fcntl is not None:

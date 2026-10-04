@@ -65,7 +65,7 @@ def test_review_gate_uses_one_stable_word_slot_and_ruby_after_reveal() -> None:
     assert "const frontMarkup = frontWordHtml(card, revealed);" in js
     front_block = js.split("if (card) {", 1)[1].split("} else {", 1)[0]
     assert "rubyHtml(" not in front_block
-    assert "${frontMarkup}" in js
+    assert "jitenWordHtml(card, frontMarkup, 'pudge-review-gate-word-text')" in js
     assert "G10 stable word slot + optimistic previous-review undo" in css
     assert ".pudge-review-gate-card.answer-shown .pudge-review-gate-front{display:flex!important}" in css
     assert 'font-family:"Hiragino Mincho ProN","Yu Mincho",serif' in css
@@ -78,7 +78,7 @@ def test_previous_review_strip_and_command_z_are_wired() -> None:
     assert "async function undoLastReview()" in js
     assert "event?.metaKey" in js
     assert "key.toLowerCase() === 'z'" in js
-    assert "window.pywebview.api.review_gate_undo(" in js
+    assert "(launch.content?window.pywebview.api.content_review_undo:window.pywebview.api.review_gate_undo)(" in js
     assert "reviewHistory.push(historyEntry);" in js
     assert "cardQueue.unshift({...entry.card});" in js
 
@@ -90,4 +90,4 @@ def test_undo_repaints_before_waiting_for_server() -> None:
     undo = js[start:end]
     assert undo.index("cardQueue.unshift({...entry.card});") < undo.index("render({loading:false}, {replaceCards:false});")
     assert undo.index("render({loading:false}, {replaceCards:false});") < undo.index("await entry.submitPromise")
-    assert undo.index("await entry.submitPromise") < undo.index("await window.pywebview.api.review_gate_undo(")
+    assert undo.index("await entry.submitPromise") < undo.index("await (launch.content?window.pywebview.api.content_review_undo:window.pywebview.api.review_gate_undo)(")

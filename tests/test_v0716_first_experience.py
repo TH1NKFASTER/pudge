@@ -20,7 +20,7 @@ def test_anilist_credentials_are_revealed_in_two_steps() -> None:
     assert 'data-anilist-copy="${ANILIST_REDIRECT_URL}"' in html
     assert "syncAniListCredentialFlow('o_anilist_client','o_anilist_token')" in html
     assert "Get the key and paste it into the new field" in html
-    assert 'text="Создать Client ID"' in advanced
+    assert 'text=tr("Create Client ID", "Создать Client ID")' in advanced
     assert 'anilist_client_id_var.trace_add("write", update_anilist_token_step)' in advanced
 
 

@@ -98,9 +98,11 @@ def test_v135_library_selection_and_furigana_contracts() -> None:
     assert "#lnReader:not(.vertical){line-height:calc(var(--ln-line-height,1.9) + .5)}" in html
     assert "Words: " in html and "Jiten · words:" not in html
     assert "Слов: " in html and "Jiten · слов:" not in html
-    assert "ui.lnPairedStarted=!!book.paired_audio?.playing" in html
+    # Started now comes from the normalized nested link/handoff session
+    # (plan §4; behaviour in tests/js/ln_entry_contract.cjs).
+    assert "ui.lnPairedStarted=entry.active" in html
     assert "const startFromReader=desired&&ui.lnPairedStarted!==true;" in html
-    assert "if(!forceReaderStart&&state.alignment?.ready&&state.player_running&&state.audiobook_id){" in html
+    assert "if(!forceReaderStart&&state.player_running&&state.audiobook_id){" in html
 
     assert "data-audio-selection-mode" not in media
     assert "data-audio-select-all" not in media
@@ -114,8 +116,10 @@ def test_v135_library_selection_and_furigana_contracts() -> None:
     assert "PudgeMangaReaderV2?.selectAll" in html and "selectAll:" in manga
     assert ".audiobook-card:hover" in css
     assert "box-shadow:inset" in css
-    assert ".pudge-study-head{display:flex;align-items:flex-end" in study
-    assert ".pudge-study-head-actions{display:flex;align-items:flex-end" in study
+    # Plan §10: the header is a bounded grid (text column + controls); the
+    # header-actions cell keeps its bottom-aligned flex layout.
+    assert ".pudge-study-head{display:grid;grid-template-columns:minmax(0,1fr) auto auto" in study
+    assert ".pudge-study-head-actions{display:flex;align-items:center" in study
 
 
 def test_sorted_audiobook_cover_actions_bind_by_card_id_not_render_index() -> None:

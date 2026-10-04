@@ -117,7 +117,7 @@ def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(
     monkeypatch.setattr(api.manager, "cleanup_qbittorrent_tags", lambda: {})
     monkeypatch.setattr(api.manager.work_scheduler, "background_allowed", lambda: True)
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert calls == [("subs", 1)]
     assert result["stats"]["subs"] == 1

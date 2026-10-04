@@ -1,0 +1,11 @@
+:root{color-scheme:dark;--muted:#9aabc1;--accent:#6f8cff;--ln-reader-bg:#0b1420;--ln-reader-fg:#dce7f6}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:#0b1420;color:#dce7f6;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}
+button{font:inherit;color:inherit;background:#132237;border:1px solid #334862;border-radius:6px;cursor:pointer}button:hover{background:#22344b}button:disabled{opacity:.4;cursor:default}[hidden]{display:none!important}
+.sidebar{height:100%;display:flex;padding:8px;overflow:hidden}.sidebar-content{overflow:hidden}.sidebar-companion{margin:0;padding:0;height:100%;display:flex;flex-direction:column;overflow:hidden}
+[data-sidebar-audio]{flex:1;min-height:0;display:flex}[data-sidebar-due]{display:none!important}
+.sidebar-audio{flex:1;grid-template-rows:auto auto auto auto auto minmax(0,1fr);gap:6px;padding:8px;overflow:hidden}
+.sidebar-audio-cover{width:70px;height:98px;min-height:98px}.sidebar-ln-live{height:100%;max-height:none;min-height:0;font-size:15px;line-height:1.65}
+.energy-saving .sidebar-audio{grid-template-rows:auto auto auto auto auto;align-content:start}
+#floatEmpty{position:fixed;left:20px;right:20px;top:40%;text-align:center;color:var(--muted)}
+#floatError{position:fixed;bottom:10px;left:10px;right:10px;padding:8px;border-radius:8px;background:#3b2630;color:#ffd5d5;z-index:15000}
+@media(max-height:430px){.sidebar-audio-cover{width:50px;height:70px;min-height:70px}.sidebar-ln-live{font-size:14px}}

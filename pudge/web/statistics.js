@@ -196,7 +196,7 @@
     const old=state.displayedScope?.period||'';
     const shown=stale?text(`Showing ${old} until updated data arrives`,`Показан период ${old} до обновления данных`):'';
     const progress=state.loading||state.loadingMore?text('Updating statistics…','Обновляю статистику…'):'';
-    const error=state.error?`<span class="stats-danger">${esc(state.error)}</span> <button type="button" data-stats-retry>${text('Retry','Повторить')}</button>`:'';
+    const error=state.error?`<span class="stats-danger">${esc((window.PudgeUiLanguage?.message(state.error) ?? String(state.error)))}</span> <button type="button" data-stats-retry>${text('Retry','Повторить')}</button>`:'';
     status.innerHTML=[shown,progress,error].filter(Boolean).join(' · ');
     status.hidden=!status.innerHTML;
     const body=$('statsBody');if(body)body.setAttribute('aria-busy',state.loading||state.loadingMore?'true':'false');

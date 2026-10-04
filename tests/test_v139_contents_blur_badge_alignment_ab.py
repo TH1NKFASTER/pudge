@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
-import time
 import zipfile
 from pathlib import Path
 
 from pudge.audiobooks import AudiobookService
-from pudge.config import AppConfig, SyncConfig
+from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.light_novels import LightNovelService, _epub_metadata
 from pudge.reading_audio_alignment import normalize_reading_text
@@ -14,7 +13,6 @@ from pudge.reading_audio_alignment import normalize_reading_text
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "pudge" / "web" / "index.html"
 SYNCING = ROOT / "pudge" / "syncing.py"
-COMPARE = ROOT / "scripts" / "compare_subtitle_alignment.py"
 
 
 def _cfg(tmp_path: Path) -> AppConfig:
@@ -180,16 +178,3 @@ def test_pre_v139_alignment_cache_migrates_after_contents_chapter_index_shift(tm
     assert loaded is not None
     assert [row["chapter_index"] for row in loaded["chapters"]] == [0, 1, 2, 3]
     assert [row["title"] for row in loaded["chapters"]] == [row["title"] for row in source[:4]]
-
-def test_ab_comparator_has_pre_v138_toggle_and_downloads_output() -> None:
-    script = COMPARE.read_text(encoding="utf-8")
-    syncing = SYNCING.read_text(encoding="utf-8")
-    assert SyncConfig().japanese_stt_text_clock is True
-    assert "if config.japanese_stt_text_clock:" in syncing
-    assert "text_clock_disabled" in syncing
-    assert "japanese_stt_text_clock=bool(text_clock)" in script
-    assert "text_clock=False" in script
-    assert "text_clock=True" in script
-    assert 'Path.home() / "Downloads" / f"pudge-subtitle-alignment-ab-' in script
-    assert '"differences.json"' in script and '"differences.csv"' in script
-    assert '["open", "-R", str(log_path)]' in script

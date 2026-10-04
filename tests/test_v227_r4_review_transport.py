@@ -177,7 +177,8 @@ def test_jpdb_native_review_uses_v1_endpoint_once(
         "review",
         555,
         777,
-        grade="good",
+        # S2: the UI sends the jpdb-native action id of the active mode.
+        grade="okay",
         attempt_id="jpdb-attempt-1",
         id_namespace="jpdb",
     )
@@ -324,3 +325,71 @@ def test_review_ui_has_single_flight_attempt_and_generation_guard() -> None:
     assert "lnLegacyReviewPending" in index
     assert "attempt_id:attemptId" in index
     assert "id_namespace:'jiten'" in index
+
+
+def test_jpdb_capabilities_match_official_openapi_contract() -> None:
+    from pudge.review_providers import JPDB_GRADES
+
+    jpdb = provider_capabilities("jpdb", "secret-b")
+    # Official /api/v1/review grade enum (jpdb.stoplight.io, 2026-09-27).
+    assert JPDB_GRADES == ("nothing", "something", "hard", "okay", "easy", "fail", "pass")
+    assert jpdb["grades"] == list(JPDB_GRADES)
+    assert jpdb["grade_modes"] == {
+        "native": ["nothing", "something", "hard", "okay", "easy"],
+        "binary": ["fail", "pass"],
+    }
+    assert jpdb["source_revision"] != "unverified"
+    assert jpdb["undo"].startswith("unsupported")
+    assert jpdb["previous_review_evidence"] is False
+    assert jpdb["strict_gate_supported"] is False
+
+    jiten = provider_capabilities("jiten", "secret-a")
+    assert jiten["grade_modes"] == {"native": ["again", "hard", "good", "easy"]}
+    assert "binary" not in jiten["grade_modes"]
+
+
+@pytest.mark.parametrize(
+    ("grade", "wire"),
+    [
+        ("nothing", "nothing"),
+        ("something", "something"),
+        ("hard", "hard"),
+        ("okay", "okay"),
+        ("easy", "easy"),
+        ("pass", "pass"),
+        ("fail", "fail"),
+        ("PASS", "pass"),
+        # Legacy 4-button names keep their v0.7.29 wire mapping.
+        ("again", "fail"),
+        ("good", "okay"),
+    ],
+)
+def test_jpdb_submit_review_sends_native_grade(
+    monkeypatch: pytest.MonkeyPatch, grade: str, wire: str
+) -> None:
+    from pudge.review_providers import JpdbReviewProvider
+
+    calls: list[dict] = []
+
+    def fake_post(url, *, headers, json, timeout):
+        calls.append(dict(json))
+        return _Response(200, {})
+
+    monkeypatch.setattr("pudge.review_providers.httpx.post", fake_post)
+    result = JpdbReviewProvider("tok").submit_review(1, 2, grade, attempt_id="a1")
+    assert result["outcome"] == "confirmed"
+    assert calls == [{"vid": 1, "sid": 2, "grade": wire}]
+
+
+@pytest.mark.parametrize("grade", ["", "good-ish", "1", "blacklist", "know"])
+def test_jpdb_submit_review_rejects_unknown_grade_before_network(
+    monkeypatch: pytest.MonkeyPatch, grade: str
+) -> None:
+    from pudge.review_providers import JpdbReviewProvider, ReviewProviderError
+
+    def fake_post(*_args, **_kwargs):
+        raise AssertionError("invalid grade must not reach the network")
+
+    monkeypatch.setattr("pudge.review_providers.httpx.post", fake_post)
+    with pytest.raises(ReviewProviderError, match="Unsupported JPDB review grade"):
+        JpdbReviewProvider("tok").submit_review(1, 2, grade, attempt_id="a1")

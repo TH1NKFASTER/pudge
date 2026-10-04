@@ -102,8 +102,8 @@ def test_llm_semantic_validation_rejects_different_episode(tmp_path: Path, monke
             "usable_for_timing": False,
             "similarity": 0.21,
             "matched_samples": 1,
-            "total_samples": 6,
-            "sample_scores": [0.1, 0.2],
+            "total_samples": 3,
+            "sample_scores": [0.1, 0.8, 0.2],
             "reason": "different episode",
         },
     )

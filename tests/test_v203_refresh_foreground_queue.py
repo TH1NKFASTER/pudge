@@ -38,7 +38,7 @@ def test_foreground_poll_reports_manual_subtitle_queue_blocked_by_playback(
     )
     api.manager._last_missing_episode_rows = 0
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert result["skipped"] is False
     assert result["stats"]["subtitle_waiting_for_foreground"] == 1

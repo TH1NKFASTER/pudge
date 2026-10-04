@@ -8,14 +8,13 @@ from pudge.database import Database
 from pudge.library import scan_library
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime
-from pudge.pipeline_cache import _CACHE_SCHEMA
 from pudge.subtitle_formats import clean_srt_for_playback
 
 ROOT = Path(__file__).parents[1]
 HTML = ROOT / "pudge" / "web" / "index.html"
 
 
-def test_ln_reader_exit_stops_paired_audiobook_process() -> None:
+def test_explicit_stop_stops_audio_and_reader_close_hands_audio_to_sidebar() -> None:
     service = object.__new__(AudiobookService)
     calls: list[int] = []
     service.link_for_light_novel = lambda _ln, include_alignment=False: {"book": {"id": 75}}  # type: ignore[method-assign]
@@ -28,7 +27,9 @@ def test_ln_reader_exit_stops_paired_audiobook_process() -> None:
     html = HTML.read_text(encoding="utf-8")
     close = html[html.index("if(target.id==='lnReaderClose')"):]
     close = close[: close.index("return;") + len("return;")]
-    assert "light_novel_stop_paired(closingBookId)" in close
+    assert "acceptPairedState?.(closingPairedState||{},closingLnBook)" in close
+    assert "light_novel_stop_paired(" not in close
+    assert "light_novel_cancel_reader_background()" in close
     assert "ui.lnPairedState=null" in close
 
 
@@ -151,4 +152,17 @@ def test_same_cue_japanese_chinese_second_line_is_removed_and_cache_is_new(tmp_p
     assert "次の日本語です" in payload
     assert result["bilingual_cjk"] is True
     assert result["bilingual_profile"]["removed_inline_chinese_lines"] == 2
-    assert _CACHE_SCHEMA == "final-pipeline-v10"
+    from pudge import pipeline_cache
+
+    video = tmp_path / "video.mkv"
+    video.write_bytes(b"fixture")
+    config = AppConfig(config_path=tmp_path / "config.toml")
+    config.paths.cache_dir = tmp_path / "cache"
+    manifest = pipeline_cache.save_final_pipeline_result(
+        video, config, subtitle=cleaned, subtitle_id=None, source="jimaku",
+    )
+    import json
+    old = json.loads(manifest.read_text())
+    old["schema"] = "final-pipeline-v9"
+    manifest.write_text(json.dumps(old))
+    assert pipeline_cache.load_final_pipeline_result(video, config) is None

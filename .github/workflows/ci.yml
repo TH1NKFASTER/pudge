@@ -28,7 +28,7 @@ jobs:
         run: python -m pip install -e ".[dev,sync]"
 
       - name: Run test batch
-        run: python scripts/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4 --results-dir "test-results/batch-${{ matrix.batch }}"
+        run: python .github/release/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4 --results-dir "test-results/batch-${{ matrix.batch }}"
 
       - name: Upload test batch results
         if: always()
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m compileall -q pudge scripts
+      - run: python -m compileall -q pudge .github/release
 
   lint:
     name: Lint and UI modules
@@ -61,13 +61,13 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Check Python
         run: |
-          python -m ruff check --select E9,F pudge scripts
+          python -m ruff check --select E9,F pudge .github/release
           python -m ruff check --select E9,F63,F7 tests
           python -m ruff check --select BLE001 pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/web_controllers.py pudge/manager_services.py pudge/providers/base.py
-          python -m ruff format --check pudge/alignment_replay.py pudge/cache_registry.py pudge/diagnostics.py pudge/identity.py pudge/manager_services.py pudge/providers/base.py pudge/safe_mode.py pudge/secrets_store.py pudge/subtitles/pipeline.py pudge/task_supervisor.py pudge/web_controllers.py pudge/web_state.py scripts/check_release_metadata.py scripts/sync_config_example.py scripts/torrent_backtest.py tests/test_audit_properties.py tests/test_audit_v0722_stabilization.py tests/test_performance_budgets.py
-          python scripts/sync_config_example.py --check
+          python -m ruff format --check pudge/alignment_replay.py pudge/cache_registry.py pudge/diagnostics.py pudge/identity.py pudge/manager_services.py pudge/providers/base.py pudge/safe_mode.py pudge/secrets_store.py pudge/subtitles/pipeline.py pudge/task_supervisor.py pudge/web_controllers.py pudge/web_state.py .github/release/check_release_metadata.py .github/release/sync_config_example.py tests/test_audit_properties.py tests/test_audit_v0722_stabilization.py tests/test_performance_budgets.py
+          python .github/release/sync_config_example.py --check
           python -m mypy --follow-imports=skip pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/providers/base.py
-          python scripts/check_release_metadata.py
+          python .github/release/check_release_metadata.py
       - uses: actions/setup-node@v4
         with:
           node-version: "22"

@@ -13,6 +13,18 @@ ROOT = Path(__file__).parents[1]
 HTML = ROOT / "pudge/web/index.html"
 
 
+def _shared_offsets(state: dict, times: list[float]) -> list[float]:
+    """Evaluate the shared PudgePairedAudioClock (LN and sidebar use the same math)."""
+    import json
+    script = (
+        "const vm=require('vm'),fs=require('fs');const c={performance:{now:()=>0}};c.globalThis=c;vm.createContext(c);"
+        f"vm.runInContext(fs.readFileSync({json.dumps(str(ROOT / 'pudge/web/paired_audio_clock.js'))},'utf8'),c);"
+        f"const s={json.dumps(state)};console.log(JSON.stringify({json.dumps(times)}.map(t=>c.PudgePairedAudioClock.offsetAtTime(s,t))));"
+    )
+    out = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout
+    return json.loads(out)
+
+
 def _alignment() -> dict[str, object]:
     return {
         "schema": "reading-audio-v3",
@@ -55,17 +67,20 @@ def test_frontend_uses_piecewise_anchor_path() -> None:
     source = HTML.read_text(encoding="utf-8")
 
     assert "function lnPairedAnchorPath(anchor)" in source
-    assert "Array.isArray(anchor?.path)" in source
+    # The anchor path is parsed by the shared clock module (plan §7).
+    assert "PudgePairedAudioClock?.pathFor?.({anchor_window:anchor||{}})" in source
     assert "function lnPairedOffsetAtTime(state,time)" in source
-    assert "for(let index=0;index<path.length-1;index++)" in source
+    state = {"anchor_window": {"path": [{"time": 0, "offset": 0}, {"time": 1, "offset": 10}, {"time": 3, "offset": 12}]}}
+    assert _shared_offsets(state, [0.5, 1, 2, 3]) == pytest.approx([5, 10, 11, 12])
     assert "path[path.length-1]?.time" in source
 
 
 def test_forward_clamp_remains_only_as_a_safety_net() -> None:
     source = HTML.read_text(encoding="utf-8")
 
-    assert "function lnPairedSmoothOffset(" in source
-    assert "clamp_forward" in source
+    # Plan §7 removed the LN-only forward clamp from the timing path.
+    assert "function lnPairedSmoothOffset(" not in source
+    assert "clamp_forward" not in source
     assert "function lnPairedAnchorPath(anchor)" in source
 
 

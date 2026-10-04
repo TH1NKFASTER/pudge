@@ -258,7 +258,7 @@ def test_safe_mode_blocks_foreground_download_and_subtitle_poll() -> None:
     api.get_state_fast = lambda: {"safe_mode": {"active": True}}
     api.manager = SimpleNamespace(sync_downloads=lambda: pytest.fail("safe mode must not touch downloads"))
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert result["skipped"] is True
     assert result["safe_mode"] is True

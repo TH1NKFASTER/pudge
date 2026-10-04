@@ -190,7 +190,7 @@ def test_macos_quit_runs_background_quiet_once():
     assert lifecycle.handle_closing() is True
 
 
-def test_webapp_close_enters_background_quiet_before_other_shutdown(monkeypatch):
+def test_webapp_close_silences_audio_before_background_quiet(monkeypatch):
     events: list[str] = []
 
     api = web_app.WebAppApi.__new__(web_app.WebAppApi)
@@ -207,7 +207,7 @@ def test_webapp_close_enters_background_quiet_before_other_shutdown(monkeypatch)
 
     api.close()
 
-    assert events[0] == "quiet"
+    assert events[:2] == ["audio", "quiet"]
 
 
 def test_frontend_polls_live_torrent_speed_without_full_render():

@@ -1,8 +1,9 @@
 """Synthetic regressions for v96p35. No manga page images or extracted OCR fixtures.
 
-Full-volume, page-specific OCR acceptance is an optional private integration check,
-not a requirement for the public unit suite.
+Regression scenes must be generated in the test; real pages and extracted OCR
+fixtures are not part of this suite.
 """
+
 from __future__ import annotations
 
 from copy import deepcopy
@@ -10,8 +11,8 @@ from copy import deepcopy
 import pytest
 from PIL import Image, ImageDraw
 
-from pudge import manga, manga_ocr_worker as worker
-
+from pudge import manga
+from pudge import manga_ocr_worker as worker
 
 WIDTH, HEIGHT = 760, 1200
 LAYOUT = worker._LAYOUT_LINE_SOURCE
@@ -46,7 +47,8 @@ class Model:
 def full_lane(monkeypatch):
     image = Image.new("RGB", (WIDTH, HEIGHT), "white")
     clipped = region(
-        "ねェだと！？", (200, 190, 234, 445),
+        "ねェだと！？",
+        (200, 190, 234, 445),
         source="expanded-vision-rectangle",
         recognizer_retry="vertical-leading-ink-v1",
     )
@@ -55,7 +57,8 @@ def full_lane(monkeypatch):
     # Segment construction is already covered by the dedicated layout tests;
     # keep this regression about candidate geometry and consensus.
     monkeypatch.setattr(
-        worker, "_layout_line_character_segments",
+        worker,
+        "_layout_line_character_segments",
         lambda _row, text, **_kw: [{"text": char} for char in text],
     )
     yield image, clipped, independent
@@ -83,15 +86,20 @@ def test_full_lane_only_accepts_matching_ocr_consensus(full_lane):
     assert manga._finalize_recognized_regions(worker._finalize_worker_output_regions(recovered))
 
 
-@pytest.mark.parametrize("responses", [
-    ["許さねェだと！？", "許さねェだと！？別", "別の言葉"],
-    ["ねェだと！？"] * 3,
-    ["", "", ""],
-])
+@pytest.mark.parametrize(
+    "responses",
+    [
+        ["許さねェだと！？", "許さねェだと！？別", "別の言葉"],
+        ["ねェだと！？"] * 3,
+        ["", "", ""],
+    ],
+)
 def test_unverified_full_lane_does_not_overwrite_old_text(full_lane, responses):
     image, clipped, _ = full_lane
     original = deepcopy(clipped)
-    assert worker._recover_full_lane_above_clipped_vision_tail(Model(responses), image, [clipped]) == [original]
+    assert worker._recover_full_lane_above_clipped_vision_tail(Model(responses), image, [clipped]) == [
+        original
+    ]
 
 
 @pytest.fixture
@@ -103,7 +111,8 @@ def ruby_lane(monkeypatch):
     for top in (1048, 1070, 1092, 1114):
         draw.rectangle((373, top, 396, top + 12), fill="black")
     monkeypatch.setattr(
-        worker, "_layout_line_character_segments",
+        worker,
+        "_layout_line_character_segments",
         lambda _row, text, **_kw: [{"text": char} for char in text],
     )
     yield image, ruby
@@ -132,11 +141,14 @@ def test_short_ruby_recovers_main_text_without_removing_furigana(ruby_lane):
     assert len(result[1]["segments"]) == 3
 
 
-@pytest.mark.parametrize("responses", [
-    ["充分だ", "充分です", "充分かな"],
-    ["じゅうぶん"] * 3,
-    ["", "", ""],
-])
+@pytest.mark.parametrize(
+    "responses",
+    [
+        ["充分だ", "充分です", "充分かな"],
+        ["じゅうぶん"] * 3,
+        ["", "", ""],
+    ],
+)
 def test_unverified_ruby_candidate_cannot_create_text(ruby_lane, responses):
     image, ruby = ruby_lane
     assert worker._recover_short_ruby_adjacent_lower_main(Model(responses), image, [ruby]) == [ruby]

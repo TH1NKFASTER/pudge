@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.audiobooks import (
     AudiobookService,
     _audiobook_series_title,
@@ -92,8 +94,8 @@ def test_ready_play_with_missing_cache_requeues_instead_of_launching_without_sub
         "pudge.web_app.resolve_episode_subtitle",
         lambda *_a, **_k: SimpleNamespace(found=False),
     )
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    patch_webapp_popen(
+        monkeypatch,
         lambda *_a, **_k: pytest.fail("mpv must not launch without a prepared subtitle"),
     )
 

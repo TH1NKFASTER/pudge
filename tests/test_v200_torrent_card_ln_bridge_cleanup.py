@@ -72,8 +72,26 @@ def test_frontend_does_not_apply_vad_ratio_to_marked_wall_clock_bridge() -> None
     offset_fn = html.split("function lnPairedOffsetAtTime", 1)[1].split(
         "function lnPairedResetWordProgress", 1
     )[0]
-    assert "wall_clock_from_previous:row?.wall_clock_from_previous===true" in path_fn
-    assert "right.wall_clock_from_previous!==true" in offset_fn
+    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
+    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
+    import json
+    import subprocess
+
+    assert "PudgePairedAudioClock?.pathFor" in path_fn
+    assert "shared.offsetAtTime(state||{},Number(time))" in offset_fn
+    clock = (ROOT / "pudge" / "web" / "paired_audio_clock.js").read_text(encoding="utf-8")
+    assert "right.wall_clock_from_previous !== true" in clock
+    # Marked wall-clock bridge: linear; unmarked segment: follows VAD activity.
+    script = clock + "\n" + (
+        "function lnPairedAnchorPath" + path_fn + "function lnPairedOffsetAtTime" + offset_fn
+    ) + """
+const activity=[{start:0,end:1}];
+const bridge={anchor_window:{activity_clock:true,activity,path:[{time:0,offset:0},{time:4,offset:8,wall_clock_from_previous:true}]}};
+const vad={anchor_window:{activity_clock:true,activity,path:[{time:0,offset:0},{time:4,offset:8}]}};
+console.log(JSON.stringify([lnPairedOffsetAtTime(bridge,2),lnPairedOffsetAtTime(vad,2)]));
+"""
+    out = json.loads(subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout)
+    assert out == pytest.approx([4, 8])
 
 
 def test_torrent_cleanup_keeps_single_capture_http_owner() -> None:

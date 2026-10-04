@@ -62,7 +62,7 @@ def test_legacy_poll_caller_still_receives_state(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(api, "get_state_fast", lambda: marker)
     monkeypatch.setattr(api.manager, "sync_downloads", lambda: 0)
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert result["state"] is marker
 
@@ -76,7 +76,7 @@ def test_idle_download_poll_uses_60_second_qbt_network_cadence(tmp_path: Path, m
     monkeypatch.setattr("pudge.web_app.time.monotonic", lambda: 120.0)
     version = api.manager.db.get_state("ui_state_version", "")
 
-    result = api.poll_downloads_and_subtitles(version, False)
+    result = api._poll_downloads_and_subtitles_sync(version, False)
 
     assert calls == []
     assert result["state"] is None
@@ -91,7 +91,7 @@ def test_active_download_keeps_15_second_qbt_network_cadence(tmp_path: Path, mon
     monkeypatch.setattr("pudge.web_app.time.monotonic", lambda: 120.0)
     version = api.manager.db.get_state("ui_state_version", "")
 
-    api.poll_downloads_and_subtitles(version, True)
+    api._poll_downloads_and_subtitles_sync(version, True)
 
     assert calls == ["sync"]
 

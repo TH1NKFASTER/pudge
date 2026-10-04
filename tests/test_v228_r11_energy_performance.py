@@ -56,7 +56,7 @@ def test_foreground_noop_poll_reuses_versioned_fast_state(tmp_path: Path, monkey
         lambda: (_ for _ in ()).throw(AssertionError("no-op foreground poll must not rebuild full state")),
     )
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert result["skipped"] is False
     assert result["state"] is marker
@@ -73,7 +73,7 @@ def test_foreground_busy_poll_also_uses_fast_state(tmp_path: Path, monkeypatch) 
     )
     api._download_poll_lock.acquire()
     try:
-        result = api.poll_downloads_and_subtitles()
+        result = api._poll_downloads_and_subtitles_sync()
     finally:
         api._download_poll_lock.release()
 

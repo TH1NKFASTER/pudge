@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -100,8 +102,19 @@ def test_punctuation_holds_offset_through_acoustic_pause() -> None:
 def test_frontend_supports_equal_offset_pause_segments() -> None:
     source = HTML.read_text(encoding="utf-8")
 
-    assert "if(Math.abs(right.offset-left.offset)<.0001)return left.offset;" in source
-    assert "right.offset<left.offset" in source
+    # Plan §7: LN uses the shared PudgePairedAudioClock; check its behaviour
+    # for an equal-offset (pause) segment and a backwards segment.
+    assert "return shared.offsetAtTime(state||{},Number(time));" in source
+    script = (
+        "const vm=require('vm'),fs=require('fs');const c={performance:{now:()=>0}};c.globalThis=c;vm.createContext(c);"
+        f"vm.runInContext(fs.readFileSync({json.dumps(str(ROOT / 'pudge/web/paired_audio_clock.js'))},'utf8'),c);"
+        "const f=c.PudgePairedAudioClock.offsetAtTime;"
+        "const pause={anchor_window:{path:[{time:0,offset:0},{time:1,offset:5},{time:3,offset:5},{time:4,offset:9}]}};"
+        "const back={chapter_char_offset_exact:42,anchor_window:{path:[{time:0,offset:9},{time:2,offset:3}]}};"
+        "console.log(JSON.stringify([f(pause,1.5),f(pause,2.9),f(pause,3.5),f(back,1)]));"
+    )
+    out = json.loads(subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout)
+    assert out == pytest.approx([5, 5, 7, 42])
 
 
 def test_alignment_fingerprint_rebuilds_old_cached_clock() -> None:

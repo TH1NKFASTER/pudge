@@ -9,7 +9,8 @@ def test_settings_render_before_experimental_pages_and_have_error_boundary() -> 
     html = web_html()
     assert "function renderSettingsSafely()" in html
     assert "function renderSafely(name,renderer)" in html
-    assert "function renderAll(){applyStaticLanguage();renderSettingsSafely();applyStaticLanguage();renderDataPages();" in html
+    render = html.split("function renderAll(){", 1)[1].split("}", 1)[0]
+    assert render.index("renderSettingsSafely();") < render.index("renderDataPages();")
     assert "EVENT ui.render.fail page=settings" in html
     assert "EVENT ui.render.fail page=${name}" in html
 

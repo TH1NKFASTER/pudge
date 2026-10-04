@@ -111,4 +111,4 @@ def test_old_cache_48_is_upgraded_to_72(tmp_path, monkeypatch):
         ).read_text(encoding="utf-8")
     )
     assert payload["offset"] == 72
-    assert payload["resolver_version"] == 2
+    assert payload["resolver_version"] >= 2  # bumped to 3 for external episode rules

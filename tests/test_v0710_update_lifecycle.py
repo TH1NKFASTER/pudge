@@ -10,16 +10,10 @@ def test_release_download_retries_transport_failures() -> None:
     assert "target.unlink(missing_ok=True)" in updater
 
 
-def test_updater_waits_for_old_managed_app_before_install() -> None:
-    updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
+def test_updater_waits_for_old_managed_app_before_install(tmp_path,monkeypatch) -> None:
+    from test_v16_updater_script import run_update_scenario
+    run_update_scenario(tmp_path,monkeypatch,source_exits=False)
 
-    capture = updater.index("source_pid = os.getpid()")
-    hard_kill = updater.index("/bin/kill -9 {source_pid}")
-    verify = updater.index("/bin/kill -0 {source_pid}")
-    installer = updater.index("/bin/zsh ./install.sh --update")
-    reopen = updater.index("/usr/bin/open -n")
-
-    assert capture < hard_kill < verify < installer < reopen
 
 def test_update_install_does_not_use_native_webview_confirm() -> None:
     html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")

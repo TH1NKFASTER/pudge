@@ -19,7 +19,7 @@
 
     const style = document.createElement('style');
     style.textContent = `
-      .pudge-confirm-backdrop{position:fixed;z-index:12050;inset:0;display:none;place-items:center;padding:24px;background:rgba(2,7,13,.72);backdrop-filter:blur(3px)}
+      .pudge-confirm-backdrop{position:fixed;z-index:12050;inset:0;display:none;place-items:center;padding:24px;background:rgba(2,7,13,.8)}
       .pudge-confirm-backdrop.open{display:grid}
       .pudge-confirm-dialog{width:min(470px,calc(100vw - 32px));display:grid;gap:16px;padding:18px;border:1px solid #405675;border-radius:14px;background:#101b2a;color:#edf4ff;box-shadow:0 24px 70px rgba(0,0,0,.58)}
       .pudge-confirm-head{display:flex;align-items:center;gap:12px}

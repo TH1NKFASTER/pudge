@@ -75,7 +75,7 @@ def test_manga_jiten_status_overlay_contract() -> None:
     assert "Due is an orthogonal review flag" in reading
     assert "['blacklisted','redundant','ignored']" in reading
     assert "invalidateJitenStatePair(token)" in reading
-    assert "refreshJitenPairAfterMutation(token)" in reading
+    assert "refreshJitenPairAfterMutation(token, attempt = 0, before = null)" in reading
     assert "pudge-study-states-changed" in manga
     assert "data-occurrence-id" in manga
     assert "alignment_revision" in manga

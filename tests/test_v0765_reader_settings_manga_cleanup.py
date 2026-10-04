@@ -16,7 +16,7 @@ def test_pause_is_fire_and_forget_and_frontend_hot_path_precedes_state_read() ->
     method = audio[audio.index("    def set_paused("):audio.index("    def set_speed(")]
     assert "_ipc_commands_no_wait" in method
     assert "_ipc_command(" not in method
-    toggle = html[html.index("async function toggleLnPairedPlayback(){"):html.index("async function openLightNovel(bookId){")]
+    toggle = html[html.index("async function toggleLnPairedPlayback(){"):html.index("async function openLightNovel(")]
     hot = toggle.index("pywebview.api.audiobook_set_paused")
     first_state = toggle.index("pywebview.api.light_novel_paired_state")
     assert hot < first_state

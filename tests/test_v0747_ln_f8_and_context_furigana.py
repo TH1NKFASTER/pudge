@@ -77,9 +77,36 @@ def test_ln_f8_pause_keeps_polling_and_cancels_animation() -> None:
     source = HTML.read_text(encoding="utf-8")
 
     assert "if(!desiredPlaying)cancelLnPairedInterpolation()" in source
-    assert "desiredPlaying||state.player_running||" in source
-    assert "state.player_running?350:700" in source
-    assert "state.alignment?.ready&&state.player_running&&state.audiobook_id" in source
+    from test_v0106_ln_optimistic_transport_clock import _function, _run_node
+    result = _run_node("""
+let state={},timer=null,cancelled=0,applied=0;
+global.ui={lnBook:{id:7,paired_audio:true},lnPairedPollGeneration:0};
+global.$=()=>({classList:{contains:()=>true}});
+global.setTimeout=(fn,delay)=>{timer={fn,delay};return 1;};
+global.clearTimeout=()=>{};
+global.pywebview={api:{light_novel_paired_state:async()=>state}};
+global.lnPairedTransportClockReconcile=()=>({position:10,snap:false});
+global.syncLnPairedTray=()=>{};
+global.cancelLnPairedInterpolation=()=>{cancelled++;};
+global.applyLnPairedPosition=async()=>{applied++;};
+""" + _function(source, "pollLnPaired") + """
+(async()=>{
+ const rows=[];
+ for(const sample of [{playing:true,player_running:true},
+    {playing:false,player_running:true},
+    {playing:false,player_running:false,alignment:{status:'aligning'}},
+    {playing:false,player_running:false,alignment:{status:'ready'}}]){
+   state=sample;pollLnPaired();const callback=timer.fn;timer=null;
+   await callback();rows.push(timer?.delay??null);
+ }
+ console.log(JSON.stringify({rows,cancelled,applied}));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+""")
+    assert result["rows"] == [250, 350, 700, None]
+    assert result["cancelled"] == 3
+    assert result["applied"] == 1
+    # Pause/resume of a live player no longer waits for alignment (plan §6).
+    assert "if(!forceReaderStart&&state.player_running&&state.audiobook_id){" in source
     assert "if(appliedDesired!==wanted){" in source
     assert "ui.lnPairedTransportPromise" in source
     assert "pywebview.api.audiobook_set_paused" in source

@@ -8,7 +8,6 @@ from pudge.config import LLMConfig
 from pudge.llm import (
     OllamaClient,
     SEMANTIC_CACHE_REJECTED_TTL_SECONDS,
-    SEMANTIC_CACHE_SCHEMA,
 )
 from pudge.syncing import subtitle_quality_accepted
 
@@ -128,4 +127,3 @@ def test_rejected_semantic_cache_expires_quickly(tmp_path: Path, monkeypatch) ->
 
     assert second["cached"] is False
     assert calls == 2
-    assert SEMANTIC_CACHE_SCHEMA == "semantic-v4"

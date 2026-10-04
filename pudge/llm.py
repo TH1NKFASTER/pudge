@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import uuid
 import re
 import time
 from dataclasses import asdict
@@ -17,7 +19,9 @@ from .logging_utils import configure_logging, timed_step
 from .subtitle_formats import parse_srt
 
 
-SEMANTIC_CACHE_SCHEMA = "semantic-v4"
+# (base_url, model) -> what that model rejected, learned during this process.
+_MODEL_ADAPTATIONS: dict[tuple[str, str], dict[str, Any]] = {}
+SEMANTIC_CACHE_SCHEMA = "semantic-v5-strict-evidence"
 SEMANTIC_CACHE_ACCEPTED_TTL_SECONDS = 30 * 24 * 3600
 SEMANTIC_CACHE_REJECTED_TTL_SECONDS = 6 * 3600
 OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
@@ -26,6 +30,28 @@ OPENAI_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
 def _openai_reasoning_effort(value: Any) -> str:
     effort = str(value or "low").strip().lower()
     return effort if effort in OPENAI_REASONING_EFFORTS else "low"
+
+
+def _semantic_evidence_valid(result: Any, total: int) -> bool:
+    """Validate the provider's evidence without coercing strings or booleans."""
+    def score(value: Any) -> bool:
+        return type(value) in {int, float} and 0 <= value <= 1 and math.isfinite(value)
+
+    if not isinstance(result, dict):
+        return False
+    scores = result.get("sample_scores")
+    return bool(
+        type(result.get("same_episode")) is bool
+        and type(result.get("usable_for_timing")) is bool
+        and score(result.get("similarity"))
+        and type(result.get("matched_samples")) is int
+        and 0 <= result["matched_samples"] <= total
+        and type(result.get("total_samples")) is int
+        and result["total_samples"] == total
+        and isinstance(scores, list)
+        and len(scores) == total
+        and all(score(value) for value in scores)
+    )
 
 
 def build_chat_payload(config: LLMConfig, system: str, user: str) -> dict[str, Any]:
@@ -60,6 +86,10 @@ def build_openai_chat_payload(config: LLMConfig, system: str, user: str) -> dict
         "model": config.model,
         "stream": False,
         "reasoning_effort": effort,
+        # Every json_chat caller needs a JSON object; ask the API for it instead
+        # of relying on prompt wording alone (retried without it by gateways
+        # that reject the field).
+        "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -96,6 +126,25 @@ def _response_error_detail(response: Any) -> str:
 
 
 def _reasoning_parameter_unsupported(response: Any) -> bool:
+    return _parameter_unsupported(response, ("reasoning_effort", "reasoning effort"))
+
+
+def _response_format_unsupported(response: Any) -> bool:
+    names = ("response_format", "response format", "json_object")
+    if _parameter_unsupported(response, names):
+        return True
+    if getattr(response, "status_code", None) not in {400, 404, 422}:
+        return False
+    detail = _response_error_detail(response).casefold()
+    # LM Studio validates this as an enum instead of calling it unsupported.
+    return (
+        any(name in detail for name in names)
+        and "json_schema" in detail and "text" in detail
+        and any(marker in detail for marker in ("must be", "should be", "expected", "literal_error"))
+    )
+
+
+def _parameter_unsupported(response: Any, names: tuple[str, ...]) -> bool:
     try:
         status = int(response.status_code)
     except Exception:
@@ -103,7 +152,7 @@ def _reasoning_parameter_unsupported(response: Any) -> bool:
     if status not in {400, 404, 422}:
         return False
     detail = _response_error_detail(response).casefold()
-    if "reasoning_effort" not in detail and "reasoning effort" not in detail:
+    if not any(name in detail for name in names):
         return False
     return any(
         marker in detail
@@ -324,47 +373,127 @@ class OllamaClient:
         except (httpx.HTTPError, TypeError, ValueError):
             return False
 
+    # Optional per-call overrides (set by callers such as the reading assistant).
+    effort_override: str = ""
+    operation: str = ""
+
+    def _complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        json_mode: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        """One logical LLM call -> (content, meta). Raises httpx/KeyError etc."""
+        provider = str(getattr(self.config, "provider", "ollama") or "ollama").lower()
+        meta: dict[str, Any] = {"provider": provider, "attempts": 0, "finish_reason": "", "refusal": ""}
+        if provider == "openai":
+            endpoint = _openai_url(self.base_url, "chat/completions")
+            payload = build_openai_chat_payload(self.config, "", "")
+            payload["messages"] = messages
+            effort = _openai_reasoning_effort(self.effort_override) if self.effort_override else ""
+            if effort:
+                payload["reasoning_effort"] = effort
+                if effort == "none":
+                    payload["temperature"] = self.config.temperature
+                else:
+                    payload.pop("temperature", None)
+            if not json_mode:
+                payload.pop("response_format", None)
+            # Route requests that share a prompt prefix (same operation) to the
+            # same cache shard; OpenAI caches prompts >= 1024 tokens.
+            payload["prompt_cache_key"] = f"pudge-{self.operation or 'json'}"
+            response = self._post_openai_with_fallbacks(endpoint, payload, meta)
+        else:
+            payload = build_chat_payload(self.config, "", "")
+            payload["messages"] = messages
+            if not json_mode:
+                payload.pop("format", None)
+            meta["attempts"] = 1
+            response = self.client.post(f"{self.base_url}/api/chat", json=payload)
+        meta["http_status"] = int(getattr(response, "status_code", 0) or 0)
+        headers = getattr(response, "headers", None) or {}
+        try:
+            meta["request_id"] = str(headers.get("x-request-id") or headers.get("request-id") or "")
+        except Exception:
+            meta["request_id"] = ""
+        response.raise_for_status()
+        body = response.json()
+        if provider == "openai":
+            choice = body["choices"][0]
+            meta["finish_reason"] = str(choice.get("finish_reason") or "") if isinstance(choice, dict) else ""
+            message = choice["message"]
+            meta["refusal"] = str(message.get("refusal") or "") if isinstance(message, dict) else ""
+            content = message["content"]
+            usage = body.get("usage") if isinstance(body, dict) else None
+            if isinstance(usage, dict):
+                meta["prompt_tokens"] = usage.get("prompt_tokens")
+                meta["completion_tokens"] = usage.get("completion_tokens")
+                details = usage.get("completion_tokens_details") or {}
+                if isinstance(details, dict):
+                    meta["reasoning_tokens"] = details.get("reasoning_tokens")
+                prompt_details = usage.get("prompt_tokens_details") or {}
+                if isinstance(prompt_details, dict):
+                    meta["cached_tokens"] = prompt_details.get("cached_tokens")
+        else:
+            content = body["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text") or "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        return str(content or ""), meta
+
+    def _log_call(self, call_id: str, started: float, meta: dict[str, Any], *, ok: bool, request_chars: int) -> None:
+        fields = " ".join(
+            f"{key}={meta.get(key)}"
+            for key in ("provider", "attempts", "effort", "http_status", "finish_reason", "prompt_tokens",
+                        "completion_tokens", "reasoning_tokens", "cached_tokens", "request_id")
+            if meta.get(key) not in (None, "")
+        )
+        self.logger.info(
+            "RESULT step=llm.call id=%s operation=%s model=%s ok=%s total_ms=%.1f request_chars=%s %s",
+            call_id, self.operation or "json", self.model, ok, (time.perf_counter() - started) * 1000.0, request_chars, fields,
+        )
+
     def _json_chat(self, system: str, user: str) -> dict[str, Any] | None:
+        call_id = uuid.uuid4().hex[:8]
+        started = time.perf_counter()
+        meta: dict[str, Any] = {}
         try:
             with timed_step(
                 self.logger,
                 "llm.chat",
                 model=self.model,
                 request_chars=len(user),
+                call_id=call_id,
+                operation=self.operation or "json",
             ):
-                provider = str(getattr(self.config, "provider", "ollama") or "ollama").lower()
-                if provider == "openai":
-                    endpoint = _openai_url(self.base_url, "chat/completions")
-                    request_payload = build_openai_chat_payload(self.config, system, user)
-                    response = self.client.post(endpoint, json=request_payload)
-                    if _reasoning_parameter_unsupported(response):
-                        # Preserve broad OpenAI-compatible support: older gateways
-                        # may reject the OpenAI reasoning knob entirely.
-                        fallback_payload = dict(request_payload)
-                        fallback_payload.pop("reasoning_effort", None)
-                        fallback_payload.setdefault("temperature", self.config.temperature)
-                        response = self.client.post(endpoint, json=fallback_payload)
-                else:
-                    response = self.client.post(
-                        f"{self.base_url}/api/chat",
-                        json=build_chat_payload(self.config, system, user),
-                    )
-                response.raise_for_status()
-                payload = response.json()
-                content = (
-                    payload["choices"][0]["message"]["content"]
-                    if provider == "openai"
-                    else payload["message"]["content"]
+                content, meta = self._complete(
+                    [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    json_mode=True,
                 )
-                if isinstance(content, list):
-                    content = "".join(
-                        str(part.get("text") or "") if isinstance(part, dict) else str(part)
-                        for part in content
-                    )
+                parse_started = time.perf_counter()
                 decoded = _decode_json_content(content)
+                meta["parse_ms"] = round((time.perf_counter() - parse_started) * 1000.0, 1)
                 self.last_error = ""
+                finish_reason = str(meta.get("finish_reason") or "")
                 if decoded is None:
-                    self.last_error = "LLM returned non-JSON content"
+                    if meta.get("refusal"):
+                        self.last_error = f"LLM refused: {str(meta['refusal'])[:200]}"
+                    elif not content.strip():
+                        self.last_error = f"LLM returned empty content (finish_reason={finish_reason or 'unknown'})"
+                    else:
+                        self.last_error = (
+                            "LLM returned non-JSON content"
+                            + (f" (finish_reason={finish_reason})" if finish_reason and finish_reason != "stop" else "")
+                        )
+                    # The HTTP call succeeded; make the decode failure visible
+                    # instead of a bare DONE step=llm.chat.
+                    self.logger.warning(
+                        "FAIL step=llm.decode id=%s model=%s finish_reason=%s error=%r content_prefix=%r",
+                        call_id, self.model, finish_reason, self.last_error, content[:600],
+                    )
+                self._log_call(call_id, started, meta, ok=decoded is not None, request_chars=len(user))
                 return decoded
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             if isinstance(exc, httpx.HTTPStatusError):
@@ -373,7 +502,99 @@ class OllamaClient:
                 self.last_error = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
             else:
                 self.last_error = str(exc).strip() or exc.__class__.__name__
+            self._log_call(call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=len(user))
             return None
+
+    def chat_text(self, messages: list[dict[str, str]]) -> str | None:
+        """Free-text chat completion (reading assistant). None on failure; see last_error."""
+        call_id = uuid.uuid4().hex[:8]
+        started = time.perf_counter()
+        chars = sum(len(str(m.get("content") or "")) for m in messages)
+        meta: dict[str, Any] = {}
+        try:
+            content, meta = self._complete(messages, json_mode=False)
+            self.last_error = ""
+            if not content.strip():
+                self.last_error = f"LLM returned empty content (finish_reason={meta.get('finish_reason') or 'unknown'})"
+            self._log_call(call_id, started, meta, ok=bool(content.strip()), request_chars=chars)
+            return content if content.strip() else None
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                detail = _response_error_detail(exc.response)
+                status = getattr(exc.response, "status_code", None)
+                self.last_error = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+            else:
+                self.last_error = str(exc).strip() or exc.__class__.__name__
+            self._log_call(call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=chars)
+            return None
+
+    _EFFORT_LADDER = ("max", "xhigh", "high", "medium", "low")
+
+    def _post_openai_with_fallbacks(self, endpoint: str, payload: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
+        """POST, adapting to what this model/gateway rejects (bounded retries).
+
+        * ``response_format`` unsupported -> drop it;
+        * an unsupported ``reasoning_effort`` *value* (e.g. ``max``) -> step
+          down the effort ladder instead of dropping reasoning;
+        * ``reasoning_effort`` unsupported as a parameter -> drop it and use
+          the configured temperature (legacy gateways);
+        * ``temperature`` unsupported (reasoning models accept only the
+          default) -> drop it.
+
+        What a model rejected is remembered per (base URL, model) for the
+        process, so later calls do not repeat the same failing requests.
+        """
+        meta = meta if meta is not None else {}
+        memory_key = (self.base_url, self.model)
+        learned = _MODEL_ADAPTATIONS.setdefault(memory_key, {"drop": set(), "effort": ""})
+        payload = dict(payload)
+        # Copy the set atomically before iteration: concurrent requests can
+        # learn another rejected parameter while this payload is prepared.
+        for name in learned["drop"].copy():
+            payload.pop(name, None)
+        if learned["effort"] and "reasoning_effort" in payload:
+            ladder = self._EFFORT_LADDER
+            current = str(payload.get("reasoning_effort") or "")
+            if current in ladder and ladder.index(current) < ladder.index(learned["effort"]):
+                payload["reasoning_effort"] = learned["effort"]
+        attempts = 1
+        response = self.client.post(endpoint, json=payload)
+        for _attempt in range(6):
+            detail = _response_error_detail(response).casefold() if int(getattr(response, "status_code", 200) or 200) in {400, 404, 422} else ""
+            if not detail:
+                break
+            if "prompt_cache_key" in payload and _parameter_unsupported(response, ("prompt_cache_key",)):
+                payload.pop("prompt_cache_key", None)
+                learned["drop"].add("prompt_cache_key")
+                self.logger.info("FALLBACK step=llm.prompt_cache_key model=%s reason=unsupported", self.model)
+            elif "response_format" in payload and _response_format_unsupported(response):
+                payload.pop("response_format", None)
+                learned["drop"].add("response_format")
+                self.logger.info("FALLBACK step=llm.response_format model=%s reason=unsupported", self.model)
+            elif "temperature" in payload and _parameter_unsupported(response, ("temperature",)):
+                payload.pop("temperature", None)
+                learned["drop"].add("temperature")
+                self.logger.info("FALLBACK step=llm.temperature model=%s reason=unsupported", self.model)
+            elif "reasoning_effort" in payload and _reasoning_parameter_unsupported(response):
+                effort = str(payload.get("reasoning_effort") or "")
+                if "value" in detail and effort in self._EFFORT_LADDER and effort != "low":
+                    lower = self._EFFORT_LADDER[self._EFFORT_LADDER.index(effort) + 1]
+                    payload["reasoning_effort"] = lower
+                    learned["effort"] = lower
+                    self.logger.info("FALLBACK step=llm.reasoning_effort model=%s from=%s to=%s", self.model, effort, lower)
+                else:
+                    payload.pop("reasoning_effort", None)
+                    learned["drop"].add("reasoning_effort")
+                    if "temperature" not in learned["drop"]:
+                        payload.setdefault("temperature", self.config.temperature)
+                    self.logger.info("FALLBACK step=llm.reasoning_effort model=%s reason=unsupported_parameter", self.model)
+            else:
+                break
+            attempts += 1
+            response = self.client.post(endpoint, json=payload)
+        meta["attempts"] = attempts
+        meta["effort"] = str(payload.get("reasoning_effort") or "")
+        return response
 
     def json_chat(self, system: str, user: str) -> dict[str, Any] | None:
         return self._json_chat(system, user)
@@ -423,7 +644,19 @@ class OllamaClient:
                             else SEMANTIC_CACHE_REJECTED_TTL_SECONDS
                         )
                         age = time.time() - float(payload.get("cached_at") or 0)
-                        if result and age < ttl:
+                        total = result.get("total_samples")
+                        cached_scores = result.get("sample_scores")
+                        cache_valid = (
+                            type(total) is int and total >= 2
+                            and _semantic_evidence_valid(result, total)
+                            and type(result.get("accepted")) is bool
+                            and (not result["accepted"] or (
+                                sum(score >= 0.55 for score in cached_scores) >= total - int(total >= 5)
+                                and statistics.median(sorted(cached_scores, reverse=True)[:total - int(total >= 5)]) >= effective_threshold
+                                and result["similarity"] >= effective_threshold
+                            ))
+                        )
+                        if cache_valid and age < ttl:
                             result["cached"] = True
                             self.logger.info(
                                 "RESULT step=llm.semantic cache=hit japanese=%s english=%s accepted=%s",
@@ -487,12 +720,7 @@ class OllamaClient:
                 "matched_samples": 0,
                 "total_samples": len(samples),
             }
-        try:
-            similarity = max(0.0, min(1.0, float(result.get("similarity", 0.0))))
-            same_episode = bool(result.get("same_episode", False))
-            usable = bool(result.get("usable_for_timing", False))
-            matched = max(0, min(len(samples), int(result.get("matched_samples", 0))))
-        except (TypeError, ValueError):
+        if not _semantic_evidence_valid(result, len(samples)):
             return {
                 "accepted": False,
                 "reason": "invalid_llm_response",
@@ -500,14 +728,11 @@ class OllamaClient:
                 "matched_samples": 0,
                 "total_samples": len(samples),
             }
-        raw_scores = result.get("sample_scores", [])
-        sample_scores: list[float] = []
-        if isinstance(raw_scores, list):
-            for value in raw_scores[: len(samples)]:
-                try:
-                    sample_scores.append(max(0.0, min(1.0, float(value))))
-                except (TypeError, ValueError):
-                    sample_scores.append(0.0)
+        similarity = float(result["similarity"])
+        same_episode = result["same_episode"]
+        usable = result["usable_for_timing"]
+        matched = result["matched_samples"]
+        sample_scores = [float(value) for value in result["sample_scores"]]
 
         # Treat the per-sample score vector as the auditable evidence. Some local
         # models produce internally contradictory aggregate fields (for example,
@@ -542,6 +767,11 @@ class OllamaClient:
                 )
 
         strict_accepted = same_episode and usable and similarity >= threshold
+        if strict_accepted and (matched < required_matches or robust_matches < required_matches or robust_similarity < threshold):
+            return {
+                "accepted": False, "reason": "invalid_llm_response", "similarity": 0.0,
+                "matched_samples": 0, "total_samples": len(samples),
+            }
         accepted = strict_accepted or robust_accepted
         reason = str(result.get("reason") or ("accepted" if accepted else "semantic_mismatch"))
         if robust_accepted:

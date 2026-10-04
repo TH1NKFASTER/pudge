@@ -46,10 +46,13 @@ pudge/assets/jimaku-trial-key
 *~
 
 .venv-test/
+.venv-install-tests/
+.install-test-logs/
 
-# Private OCR evaluation data and dependent tests
+# Local patch backups may contain retired private test materials
+.patch-backups/
+
+# Retired private OCR fixture directories must never be published
 /tests/golden/
-/tests/test_v0727_manga_golden_p00_39.py
-/tests/test_v0727_manga_phase34_v96p21_peer_supported_wide_exact_crop.py
-/tests/test_v0727_manga_phase34_v96p21_wide_donor_physical_lane.py
-/tests/test_v0727_manga_phase34_v96p24_unsupported_art_retry.py
+/tests/fixtures/v96p*/
+!/tests/fixtures/v96p37_ruby_click_synthetic.cjs

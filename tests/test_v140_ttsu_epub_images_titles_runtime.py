@@ -7,7 +7,6 @@ from pudge.light_novels import LightNovelService, _epub_metadata, _ln_epub_image
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "pudge" / "web" / "index.html"
-COMPARE = ROOT / "scripts" / "compare_subtitle_alignment.py"
 
 
 def _write_epub(path: Path, *, title: str, spine_rows: list[tuple[str, str]], files: dict[str, str | bytes], nav_rows: list[tuple[str, str]] | None = None) -> None:
@@ -107,12 +106,3 @@ def test_reader_images_follow_ttsu_fit_principles_and_badge_moves_back_up() -> N
     assert "width:auto" in image_rule and "height:auto" in image_rule
     assert "transform:translateY(.5px)" in html
     assert "transform:translateY(1.5px)" not in html.split(".ln-paired-audio-badge{", 1)[1].split("}", 1)[0]
-
-
-def test_ab_comparator_self_reexecs_into_pudge_python_when_system_python_has_no_pillow() -> None:
-    script = COMPARE.read_text(encoding="utf-8")
-    assert 'importlib.util.find_spec("PIL")' in script
-    assert 'PROJECT_ROOT / ".venv-patch-v0725" / "bin" / "python"' in script
-    assert 'Path.home() / ".local" / "share" / "pudge" / "venv" / "bin" / "python"' in script
-    assert 'os.execve(str(candidate)' in script
-    assert 'PUDGE_SUBTITLE_AB_REEXEC' in script

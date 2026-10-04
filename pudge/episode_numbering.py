@@ -1,20 +1,33 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .config import AppConfig
-from .filename import title_similarity
+from .filename import normalize_title, title_similarity
 from .models import AniListAnime
+from .release_parser import parse_release_name
 from .providers.anilist import AniListClient, AniListError
+from . import external_episode_numbering as external
 
 
-RESOLVER_VERSION = 2
+RESOLVER_VERSION = 4  # scoped release continuity and reversible cached rules
 _CACHE_TTL_SECONDS = 7 * 24 * 3600
 _COUNTED_FORMATS = {"TV", "TV_SHORT", "ONA", ""}
 _BRIDGE_FORMATS = {"OVA", "SPECIAL", "MOVIE"}
+_STAGE_SUFFIX_RE = re.compile(r"(?i)\s*[-:]?\s*\d{1,2}(?:st|nd|rd|th)(?:\s*(?:&|＆|and|[-–—])\s*\d{1,2}(?:st|nd|rd|th))?\s+STAGE\s*$")
+
+
+def release_series_identity(title: str) -> str:
+    return normalize_title(_STAGE_SUFFIX_RE.sub("", str(title)))
+
+
+def is_split_stage(anime: Any) -> bool:
+    return bool(_STAGE_SUFFIX_RE.search(_title(anime)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +40,97 @@ class EpisodeNumbering:
     chain: tuple[int, ...]
     source: str
     resolver_version: int = RESOLVER_VERSION
+    # v3, backward compatible: "resolved" | "conflict" (external rule and the
+    # AniList chain disagree: no numeric alias is trusted) and the rule used.
+    status: str = "resolved"
+    rule: str = ""
+    # Season-scoped context, e.g. (("tvdb", 2, 5),): only meaningful together
+    # with a season marker in a release name; never a global numeric alias.
+    season_aliases: tuple[tuple[str, int, int], ...] = ()
+    series_identity: str = ""
+    alias_offsets: tuple[int, ...] = ()
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseEpisodeMatch:
+    status: str
+    media_id: int
+    requested_media_episode: int | None
+    mapped_media_episode: int | None
+    raw_release_episode: int | None
+    raw_release_season: int | None
+    scheme_id: str
+    rule_id: str
+    rule_revision: int = RESOLVER_VERSION
+    evidence: tuple[str, ...] = ()
+    rejection_reason: str = ""
+
+
+def match_release_episode(
+    anime: Any,
+    parsed_release: Any,
+    requested_media_episode: int | None,
+    numbering_context: EpisodeNumbering | None = None,
+    *,
+    alternative_episodes: tuple[int, ...] = (),
+    trusted_source: bool = True,
+) -> ReleaseEpisodeMatch:
+    """Map a release once, then validate the requested local identity.
+
+    Split-stage overlap uses a bounded continuity rule for this storyline.
+    Unknown sources retain an ambiguous result for manual inspection.
+    Numeric aliases remain discovery hints for other season conventions.
+    """
+    raw = parsed_release.episode
+    season = parsed_release.season
+    requested = int(requested_media_episode) if requested_media_episode is not None else None
+    scheme, rule, evidence = "local", "explicit-local", ()
+    mapped = raw
+    status = "resolved"
+    if parsed_release.unsafe_single_episode or season == 0:
+        mapped, status = None, "rejected"
+    elif raw is None or not parsed_release.explicit_episode:
+        status = "ambiguous"
+    elif is_split_stage(anime):
+        offset = numbering_context.offset if numbering_context is not None else 0
+        if not offset and requested is not None:
+            offsets = [int(value) - requested for value in alternative_episodes if 0 < int(value) - requested <= 3]
+            offset = offsets[0] if offsets else 0
+        if offset:
+            mapped = int(raw) - offset
+            group = str(parsed_release.group or "").casefold()
+            # The confirmed continuing scale belongs to this release storyline,
+            # uploader and notation. Catalog adjacency alone is a proposal.
+            bare_scope = _media_id(anime) == 210482 and group == "erai-raws" and season is None
+            scene_scope = _media_id(anime) == 210482 and group == "toonshub" and season == 6
+            names = [_title(anime), *_value(anime, "titles", [])]
+            release_text = normalize_title(parsed_release.raw_name)
+            same_story = any(release_series_identity(name) in release_text for name in names if len(release_series_identity(name)) >= 12)
+            scheme = "continuous-stage:" + release_series_identity(_title(anime)) + ":" + group + (":bare" if season is None else f":s{season}")
+            rule, evidence = "continuous-stage", ("same-storyline", "adjacent-stage-count", "release-source")
+            total = _episodes(anime)
+            if not same_story:
+                mapped, status = None, "rejected"
+            elif not trusted_source or not (bare_scope or scene_scope):
+                mapped, status = None, "ambiguous"
+            elif mapped < 1 or (total and mapped > total):
+                mapped, status = None, "rejected"
+        elif not re.search(r"(?i)\b1st\s+STAGE\s*$", _title(anime)):
+            status = "ambiguous"
+    elif requested is not None and raw in alternative_episodes and raw != requested:
+        mapped, scheme, rule = requested, "absolute-alias", "discovery-alias"
+    if numbering_context is not None and numbering_context.status == "conflict":
+        status = "conflict"
+    reason = ""
+    if mapped is not None and requested is not None and mapped != requested:
+        status = "rejected"
+        reason = f"mapped-local={mapped} requested-local={requested}"
+    revision = RESOLVER_VERSION
+    if rule == "continuous-stage":
+        scope = json.dumps([RESOLVER_VERSION, _media_id(anime), scheme, offset, _episodes(anime)], separators=(",", ":"))
+        revision = int(hashlib.sha256(scope.encode()).hexdigest()[:8], 16)
+    return ReleaseEpisodeMatch(status, _media_id(anime), requested, mapped, raw, season, scheme, rule, revision, evidence=evidence, rejection_reason=reason)
 
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
@@ -190,6 +294,9 @@ def episode_numbering_from_graph(
             if source_id in visited:
                 continue
             candidate = nodes[source_id]
+            candidate_title = str(candidate.get("title") or "")
+            if (_STAGE_SUFFIX_RE.search(current_title) or _STAGE_SUFFIX_RE.search(candidate_title)) and release_series_identity(current_title) != release_series_identity(candidate_title):
+                continue
             fmt = str(candidate.get("format") or "").upper()
             try:
                 count = int(candidate.get("episodes") or 0)
@@ -269,6 +376,10 @@ def episode_numbering_from_graph(
         prequel_titles=titles,
         chain=tuple(chain),
         source="relation_graph",
+        rule="continuous-stage" if is_split_stage(anime) and offset else "graph-offset",
+        series_identity=release_series_identity(_title(anime)),
+        alias_offsets=tuple(value - media_episode for value in aliases),
+        evidence=("adjacent-stage-count",) if is_split_stage(anime) and offset else (),
     )
 
 
@@ -289,7 +400,7 @@ def _read_cache(
         if not isinstance(payload, dict) or "offset" not in payload:
             return None
         version = int(payload.get("resolver_version", 0))
-        if version < 2 and not allow_legacy:
+        if version < RESOLVER_VERSION and not allow_legacy:
             return None
         # v1 caches did not write resolver_version. They are still useful as an
         # offline basis for absolute -> season-local conversion, but live
@@ -308,11 +419,16 @@ def _read_cache(
         media_episode=int(media_episode),
         release_episode=absolute,
         offset=offset,
-        aliases=(absolute,) if offset else (),
+        aliases=tuple(int(media_episode) + int(value) for value in payload.get("alias_offsets", [offset] if offset else [])),
         prequel_titles=titles,
         chain=chain,
         source=path.parent.name,
         resolver_version=max(2, int(payload.get("resolver_version", 2))),
+        status=str(payload.get("status") or "resolved"),
+        rule=str(payload.get("rule") or ""),
+        series_identity=str(payload.get("series_identity") or ""),
+        alias_offsets=tuple(int(value) for value in payload.get("alias_offsets", [])),
+        evidence=tuple(str(value) for value in payload.get("evidence", [])),
     )
 
 
@@ -329,6 +445,11 @@ def _write_caches(
         "chain": list(result.chain),
         "prequel_titles": list(result.prequel_titles),
         "resolver_version": RESOLVER_VERSION,
+        "alias_offsets": list(result.alias_offsets or tuple(value - result.media_episode for value in result.aliases)),
+        "rule": result.rule,
+        "status": result.status,
+        "series_identity": result.series_identity,
+        "evidence": list(result.evidence),
         "updated_at": time.time(),
     }
     for path in (release_path, jimaku_path):
@@ -344,7 +465,70 @@ def _write_caches(
             continue
 
 
+def _external_rules(anime: Any, config: AppConfig) -> tuple[external.EpisodeMappingRule, ...]:
+    try:
+        return external.rules_for_media(_media_id(anime), config.paths.cache_dir)
+    except Exception:  # noqa: BLE001 - optional index: never block numbering
+        return ()
+
+
+def has_external_rules(anime: Any, config: AppConfig) -> bool:
+    return bool(_external_rules(anime, config))
+
+
 def resolve_episode_numbering(
+    anime: Any,
+    media_episode: int,
+    config: AppConfig,
+    logger: Any,
+    *,
+    db: Any | None = None,
+    allow_network: bool = True,
+) -> EpisodeNumbering:
+    """AniList-local episode → release numbering.
+
+    An exact external rule (Anime-Lists, via the local index) is applied
+    first. It never overwrites the offset caches. When it contradicts the
+    AniList relation chain, the result is marked ``status="conflict"`` and
+    carries no numeric alias instead of silently picking one.
+    """
+    base = _resolve_base(anime, media_episode, config, logger, db=db, allow_network=allow_network)
+    if _format(anime) not in _COUNTED_FORMATS:
+        return base
+    rules = _external_rules(anime, config)
+    if not rules:
+        return base
+    target = external.to_target(rules, int(media_episode))
+    if target is None:
+        return base
+    season, target_episode = target
+    season_alias = (("tvdb", int(season), int(target_episode)),)
+    rule_text = f"tvdb:{rules[0].tvdb_id} S{season:02d}E{target_episode:02d}"
+    if season != 1:
+        # A later TVDB season is season-local: "S02E05" needs the season marker.
+        return replace(base, season_aliases=season_alias, rule=rule_text)
+    external_offset = int(target_episode) - int(media_episode)
+    if base.offset and external_offset != base.offset:
+        if logger is not None:
+            logger.info(
+                "CONFLICT step=episode_numbering media_id=%s episode=%s graph_offset=%s external=%s",
+                _media_id(anime), media_episode, base.offset, rule_text,
+            )
+        return replace(base, aliases=(), status="conflict", rule=rule_text, season_aliases=season_alias)
+    if external_offset <= 0:
+        return replace(base, season_aliases=season_alias, rule=rule_text)
+    return replace(
+        base,
+        release_episode=int(target_episode),
+        offset=external_offset,
+        aliases=(int(target_episode),),
+        source=base.source if base.offset else "external-tvdb",
+        rule=rule_text,
+        season_aliases=season_alias,
+    )
+
+
+def _resolve_base(
     anime: Any,
     media_episode: int,
     config: AppConfig,
@@ -401,22 +585,22 @@ def resolve_episode_numbering(
             _read_cache(
                 release_path,
                 media_episode=media_episode,
-                allow_legacy=(not allow_network or media_episode == 1),
+                allow_legacy=(not is_split_stage(anime) and (not allow_network or media_episode == 1)),
             ),
             _read_cache(
                 jimaku_path,
                 media_episode=media_episode,
-                allow_legacy=(not allow_network or media_episode == 1),
+                allow_legacy=(not is_split_stage(anime) and (not allow_network or media_episode == 1)),
             ),
         )
         if item is not None and item.offset > 0
+        and (not is_split_stage(anime) or item.rule == "continuous-stage")
     ]
     if cached:
         best = max(
             cached,
             key=lambda item: (
                 item.resolver_version,
-                item.offset,
                 item.source == "anilist-release-numbering",
             ),
         )
@@ -452,6 +636,23 @@ def resolve_episode_numbering(
                 )
         else:
             offset = max(0, int(absolute) - media_episode)
+            stage_rule = ""
+            if is_split_stage(anime):
+                # A split-stage entry continues only its own storyline: the live
+                # franchise chain (e.g. every earlier JoJo part) is not its scale.
+                story = release_series_identity(_title(anime))
+                offset = 0
+                kept = [chain[-1]] if chain else []
+                for item in reversed(chain[:-1]):
+                    if str(item.format or "").upper() in _BRIDGE_FORMATS:
+                        continue
+                    if not any(release_series_identity(name) == story for name in [*item.titles, *item.synonyms] if name):
+                        break
+                    offset += max(0, int(item.episodes or 0))
+                    kept.insert(0, item)
+                chain = kept
+                absolute = media_episode + offset
+                stage_rule = "continuous-stage"
             predecessor_titles: list[str] = []
             for item in chain[:-1]:
                 if str(item.format or "").upper() in _BRIDGE_FORMATS:
@@ -468,6 +669,8 @@ def resolve_episode_numbering(
                 prequel_titles=tuple(predecessor_titles),
                 chain=tuple(int(item.id) for item in chain),
                 source="anilist-live-v2",
+                rule=stage_rule if offset else "",
+                evidence=("same-storyline", "adjacent-stage-count", "live-chain") if stage_rule and offset else (),
             )
             _write_caches(config, anime, result)
             if logger is not None:
@@ -523,6 +726,13 @@ def episode_aliases_for_hint(
         return ()
     total = _episodes(anime)
     if total and hint > total:
+        rules = _external_rules(anime, config)
+        if rules:
+            # Piecewise inverse: the rule that actually covers this number,
+            # not the offset of episode 1.
+            local = external.from_target(rules, 1, hint, total_episodes=total)
+            if local is not None:
+                return (local,)
         basis = resolve_episode_numbering(
             anime,
             1,
@@ -556,18 +766,40 @@ def media_episode_from_release(
     requested_media_episode: int | None = None,
     db: Any | None = None,
     allow_network: bool = False,
+    release_season: int | None = None,
+    release_name: str = "",
 ) -> int | None:
-    if requested_media_episode is not None:
-        return int(requested_media_episode)
-    if release_episode is None:
+    if release_name:
+        parsed = parse_release_name(release_name)
+        release_season = parsed.season
+        if parsed.unsafe_single_episode:
+            return None
+    if release_episode is None or release_season == 0:
         return None
     value = int(release_episode)
     if anime is None:
-        return value
+        return value if requested_media_episode in (None, value) else None
     total = _episodes(anime)
+    rules = _external_rules(anime, config) if _format(anime) in _COUNTED_FORMATS else ()
+    basis = _resolve_base(anime, 1, config, logger, db=db, allow_network=allow_network)
+    if is_split_stage(anime) and release_name:
+        match = match_release_episode(anime, parsed, requested_media_episode, basis, trusted_source=True)
+        return match.mapped_media_episode if match.status == "resolved" else None
+    if is_split_stage(anime) and basis.offset:
+        local = value - basis.offset
+        if local < 1 or (total and local > total) or requested_media_episode not in (None, local):
+            return None
+        return local
+    if release_season is not None and rules:
+        if int(release_season) == 0:
+            return None  # S00Exx is a special, never a regular episode
+        local = external.from_target(rules, int(release_season), value, total_episodes=total or None)
+        if local is not None:
+            return local
     if value >= 1 and (not total or value <= total):
-        return value
-    basis = resolve_episode_numbering(
+        return value if requested_media_episode in (None, value) else None
+    external_local = external.from_target(rules, 1, value, total_episodes=total or None) if rules else None
+    basis = _resolve_base(
         anime,
         1,
         config,
@@ -575,8 +807,28 @@ def media_episode_from_release(
         db=db,
         allow_network=allow_network,
     )
+    graph_local = None
     if basis.offset:
         local = value - basis.offset
         if local >= 1 and (not total or local <= total):
-            return local
-    return None
+            graph_local = local
+    if external_local is not None and graph_local is not None and external_local != graph_local:
+        # Ambiguous: never import/track progress on a guess.
+        if logger is not None:
+            logger.info(
+                "CONFLICT step=episode_numbering.inverse media_id=%s release=%s external=%s graph=%s",
+                _media_id(anime), value, external_local, graph_local,
+            )
+        return None
+    resolved = external_local if external_local is not None else graph_local
+    if requested_media_episode is not None:
+        requested = int(requested_media_episode)
+        if resolved is not None:
+            return resolved if resolved == requested else None
+        # Managed completed downloads retain their explicit season-local owner
+        # when an offline catalog lacks the rule for an out-of-range filename.
+        # Split-stage overlaps took the guarded path above; an unresolved stage
+        # must never inherit the historical request as identity evidence.
+        if not is_split_stage(anime) and requested >= 1 and (not total or requested <= total):
+            return requested
+    return resolved

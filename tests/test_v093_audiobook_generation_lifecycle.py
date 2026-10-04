@@ -29,6 +29,7 @@ def test_ordinary_linked_audiobook_blocks_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     monkeypatch.setattr(api, "_audiobook_generation_runtime", lambda *_a, **_k: {"provider": "external"})
     monkeypatch.setattr(api.audiobooks, "link_for_light_novel", lambda *_a, **_k: {"book": {"id": 9, "path": str(tmp_path / "ordinary")}})
     monkeypatch.setattr(api, "_audiobook_link_kind", lambda *_a, **_k: "ordinary")
@@ -41,6 +42,7 @@ def test_generated_link_is_identified_separately_from_ordinary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     generated = api._audiobook_generation_root() / "Book [Generated 4]"
     generated.mkdir(parents=True)
     (generated / ".pudge-audiobook-profile.json").write_text("{}", encoding="utf-8")
@@ -55,6 +57,7 @@ def test_partial_generation_is_resumable_but_not_automatic(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     output = api._audiobook_generation_root() / "Book [Generated 5]"
     api._write_audiobook_generation_manifest(
         output,
@@ -83,6 +86,7 @@ def test_pause_preserves_partial_files_and_writes_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     output = api._audiobook_generation_root() / "Book [Generated 6]"
     output.mkdir(parents=True)
     partial = output / ".pudge-audiobook-parts" / "0001-x" / "0001.mp3"
@@ -112,6 +116,7 @@ def test_cancel_deletes_partial_generation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     output = api._audiobook_generation_root() / "Book [Generated 7]"
     api._write_audiobook_generation_manifest(
         output,
@@ -159,6 +164,7 @@ def test_regenerate_keeps_old_audiobook_until_new_one_is_linked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     book_id = 8
     old_id = 88
     staging = api._audiobook_generation_root() / "Book [Regenerating 8-test]"

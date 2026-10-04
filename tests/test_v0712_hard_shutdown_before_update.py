@@ -1,23 +1,10 @@
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_release_updater_targets_the_exact_source_app_pid() -> None:
-    updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
-    assert "source_pid = os.getpid()" in updater
-    assert "/bin/kill -9 {source_pid}" in updater
-    assert "/bin/kill -0 {source_pid}" in updater
-    assert "Updater: stopping source Pudge PID" in updater
+# Regression contract updated: common cleanup replaced the old forced SIGKILL.
+from test_v16_updater_script import run_update_scenario
 
 
-def test_release_updater_verifies_source_exit_before_install_and_reopen() -> None:
-    updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
+def test_release_updater_preserves_unrelated_processes(tmp_path,monkeypatch):
+    run_update_scenario(tmp_path,monkeypatch,source_exits=True)
 
-    capture = updater.index("source_pid = os.getpid()")
-    hard_kill = updater.index("/bin/kill -9 {source_pid}")
-    verify = updater.index("/bin/kill -0 {source_pid}")
-    installer = updater.index("/bin/zsh ./install.sh --update")
-    reopen = updater.index("/usr/bin/open -n")
 
-    assert capture < hard_kill < verify < installer < reopen
+def test_release_updater_refuses_install_before_source_exit(tmp_path,monkeypatch):
+    run_update_scenario(tmp_path,monkeypatch,source_exits=False)

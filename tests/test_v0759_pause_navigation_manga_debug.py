@@ -5,6 +5,8 @@ import json
 import zipfile
 from pathlib import Path
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.web_app import WebAppApi
 
 
@@ -100,7 +102,7 @@ def test_manga_ocr_debug_export_writes_zip_and_visual_overlay(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", lambda *args, **kwargs: None)
+    patch_webapp_popen(monkeypatch, lambda *args, **kwargs: None)
 
     api = WebAppApi.__new__(WebAppApi)
     api.manga = _FakeManga()

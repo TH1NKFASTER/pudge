@@ -4,6 +4,8 @@ onboarding_completed = false
 escape_exits_fullscreen = true
 notifications_enabled = true
 permissions_requested = false
+sidebar_review_interval = "180000"
+
 
 [paths]
 watched_media_dirs = []
@@ -48,6 +50,9 @@ auto_upgrade_downloaded = true
 upgrade_min_score_gain = 30.0
 upgrade_check_hours = 24.0
 max_upgrade_checks_per_run = 2
+seadex_enabled = true
+seadex_timeout_seconds = 3.0
+seadex_cache_hours = 24.0
 
 [qbittorrent]
 enabled = false
@@ -81,6 +86,13 @@ keep_batch_until_completed = true
 enabled = true
 rewind_seconds = 15.0
 save_interval_seconds = 30.0
+# Detect openings/endings locally from the audio of finished episodes
+# (background, only when nothing else runs; needs FFmpeg).
+intro_detection_enabled = true
+# Skip button in mpv while a detected opening/ending plays (manual by default).
+skip_segments_enabled = true
+auto_skip_intro = false
+auto_skip_outro = false
 
 [shortcuts]
 app_watching = "Cmd+1"
@@ -89,6 +101,8 @@ app_library = "Cmd+3"
 app_settings = "Cmd+4"
 app_planning_search = "Cmd+F"
 mpv_mark_watched = "Ctrl+a"
+# Skip the opening/ending; bound only while the skip button is visible.
+mpv_skip_segment = "Tab"
 
 [diagnostics]
 energy_monitoring_enabled = true

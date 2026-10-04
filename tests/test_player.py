@@ -1,9 +1,14 @@
 from pathlib import Path
 
+import pytest
+
 from pudge.player import build_mpv_command, run_mpv
 
 
-def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path):
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path, monkeypatch, platform):
+    monkeypatch.setattr("pudge.player.sys.platform", platform)
+    monkeypatch.setattr("pudge.player.mpv_supports_option", lambda *_args: True)
     socket_path = tmp_path / "mpv.sock"
     command = build_mpv_command(
         "mpv",
@@ -17,6 +22,9 @@ def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path
     assert command == [
         "mpv",
         "--pause",
+        *(["--macos-app-activation-policy=accessory"] if platform == "darwin" else []),
+        "--idle=no",
+        "--keep-open=no",
         "--sub-fix-timing=no",
         "--secondary-sid=no",
         "--secondary-sub-visibility=no",
@@ -27,7 +35,10 @@ def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path
     ]
 
 
-def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path):
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path, monkeypatch, platform):
+    monkeypatch.setattr("pudge.player.sys.platform", platform)
+    monkeypatch.setattr("pudge.player.mpv_supports_option", lambda *_args: True)
     script = tmp_path / "pudge_anilist.lua"
     command = build_mpv_command(
         "mpv",
@@ -40,6 +51,9 @@ def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path):
 
     assert command == [
         "mpv",
+        *(["--macos-app-activation-policy=accessory"] if platform == "darwin" else []),
+        "--idle=no",
+        "--keep-open=no",
         "--sub-fix-timing=no",
         "--secondary-sid=no",
         "--secondary-sub-visibility=no",
@@ -100,13 +114,19 @@ def test_run_mpv_focus_uses_direct_process_and_waits(monkeypatch):
     class FakeProcess:
         pid = 4321
 
-        def wait(self):
+        def poll(self):
             return 0
 
+        def wait(self, timeout=None):
+            calls.append(["wait", str(self.pid)])
+            return 0
+
+    # The PID is invented: never inspect or signal the host's process tree.
+    monkeypatch.setattr("pudge.process_cleanup.process_snapshot", lambda: {})
     monkeypatch.setattr("pudge.player.subprocess.Popen", lambda command, env=None: calls.append(command) or FakeProcess())
     monkeypatch.setattr("pudge.player._focus_mpv_process", lambda pid: calls.append(["focus", str(pid)]))
 
     result = run_mpv(["mpv", "--fs", "--", "episode.mkv"], focus=True)
 
     assert result == 0
-    assert calls == [["mpv", "--fs", "--", "episode.mkv"], ["focus", "4321"]]
+    assert calls == [["mpv", "--fs", "--", "episode.mkv"], ["focus", "4321"], ["wait", "4321"]]

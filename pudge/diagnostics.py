@@ -9,8 +9,10 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from .build_identity import build_identity
 from .database import Database
 from .energy_diagnostics import summarize_energy_log
+from .runtime import mac_app_instances
 
 
 class DiagnosticRecorder:
@@ -119,6 +121,10 @@ class DebugBundleBuilder:
         )
         scrubbed = re.sub(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9_./+~=-]+", r"\1 [REDACTED]", scrubbed)
         scrubbed = re.sub(r"(?i)(https?://)[^\s/:@]+:[^\s/@]+@", r"\1[REDACTED]@", scrubbed)
+        scrubbed = re.sub(
+            r"(?i)([?&](?:pair|token|access_token|api_key)=)[^\s&#\"']+", r"\1[REDACTED]", scrubbed
+        )
+        scrubbed = re.sub(r"(?i)(/api/v1/media/)[^/\s?\"']+", r"\1[REDACTED]", scrubbed)
         return scrubbed
 
     @classmethod
@@ -228,10 +234,12 @@ class DebugBundleBuilder:
             "schema": 2,
             "generated_at": time.time(),
             "pudge_version": str(version),
+            "pudge_build": dict(build_identity()),
             "platform": platform.platform(),
             "frontend": self._redact(dict(frontend or {})),
             "database": self._database_summary(),
             "energy": self._redact(energy_summary),
+            "mac_app_instances": self._redact(mac_app_instances()),
         }
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, default=str))

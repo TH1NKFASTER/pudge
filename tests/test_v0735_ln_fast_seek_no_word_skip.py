@@ -26,7 +26,9 @@ def test_resume_catchup_visits_word_boundaries() -> None:
     assert "resumeSnap=resumedAfterPause&&Number.isFinite(lastDisplay)" in source
     assert "resumeCatchup=false" in source
     assert "word_safe:true" in source
-    assert "lnPairedSmoothOffset(offset,state,{sameChapter,seekJump,speechActive,resumeSnap})" in source
+    # Plan §7: the LN-only forward clamp lnPairedSmoothOffset was removed from
+    # the timing path (behaviour: tests/js/ln_entry_contract.cjs no_forward_clamp).
+    assert "lnPairedSmoothOffset(" not in source
 
 
 def test_inline_javascript_parses_after_seek_and_word_skip_fix() -> None:
@@ -53,9 +55,9 @@ def test_inline_javascript_parses_after_seek_and_word_skip_fix() -> None:
 def test_rapid_pause_resume_snaps_visual_clock_and_does_not_replay_stale_anchor() -> None:
     source = HTML.read_text(encoding="utf-8")
 
-    assert "previousRaw===null||previousRaw===undefined?NaN:Number(previousRaw)" in source
     assert "lastDisplayRaw===null||lastDisplayRaw===undefined?NaN:Number(lastDisplayRaw)" in source
-    assert "if(value-previous>4)return value;" in source
+    # Plan §7: the LN-only forward clamp lnPairedSmoothOffset was removed from
+    # the timing path (behaviour: tests/js/ln_entry_contract.cjs no_forward_clamp).
     assert "ui.lnPairedResumeNeedsSnap=false;" in source
     assert "if(!desired)cancelLnPairedInterpolation();" not in source
     assert "function lnPairedTransportClockNow(state={})" in source

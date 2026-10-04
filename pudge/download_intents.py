@@ -94,7 +94,15 @@ class DownloadIntentStore:
             "score": float(getattr(item, "score", 0.0) or 0.0),
             "seeders": int(getattr(item, "seeders", 0) or 0),
             "leechers": int(getattr(item, "leechers", 0) or 0),
+            **DownloadIntentStore.numbering_metadata(item),
         }
+
+    @staticmethod
+    def numbering_metadata(item: Any) -> dict[str, Any]:
+        return {name: getattr(item, name, None) for name in (
+            "mapped_media_episode", "raw_release_episode", "numbering_status",
+            "numbering_scheme", "numbering_rule", "numbering_revision", "group",
+        )}
 
     def begin(
         self,
@@ -109,6 +117,8 @@ class DownloadIntentStore:
         key = self.key(media_id, episode, batch)
 
         def replace(current: dict[str, Any]) -> dict[str, Any]:
+            if current.get("owned_candidates"):
+                raise ValueError("Unconfirmed acquisition candidates must be recovered before retry")
             try:
                 previous_revision = int(current.get("revision") or 0)
             except (TypeError, ValueError):
@@ -142,6 +152,8 @@ class DownloadIntentStore:
         backend: str | None = None,
         detail: str = "",
         expected_revision: int | None = None,
+        owned_candidates: list[dict[str, Any]] | None = None,
+        winner_finalized: bool | None = None,
     ) -> dict[str, Any] | None:
         key = self.key(media_id, episode, batch)
 
@@ -175,6 +187,11 @@ class DownloadIntentStore:
                 payload["selected_hash"] = str(getattr(selected, "info_hash", "") or "")
                 payload["selected_title"] = str(getattr(selected, "title", "") or "")
                 payload["selected_score"] = float(getattr(selected, "score", 0.0) or 0.0)
+                payload["selected_numbering"] = self.numbering_metadata(selected)
+            if owned_candidates is not None:
+                payload["owned_candidates"] = owned_candidates
+            if winner_finalized is not None:
+                payload["winner_finalized"] = bool(winner_finalized)
             return payload
 
         return self._mutate(key, mutate)
@@ -188,6 +205,17 @@ class DownloadIntentStore:
         with self._lock:
             payload = self._decode(self._get_state(self.key(media_id, episode, batch), ""))
         return payload or None
+
+    def recoverable(self) -> list[dict[str, Any]]:
+        connector = getattr(self.db, "connect", None)
+        if callable(connector):
+            with connector() as conn:
+                values = [row["value"] for row in conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'")]
+        else:
+            values = list(self._memory.values())
+        return [payload for raw in values if (payload := self._decode(raw))
+                and payload.get("owned_candidates")
+                and payload.get("state") in {"recovery_required", "trying", "selecting"}]
 
     def clear(self, media_id: int, episode: int | None, batch: bool) -> None:
         with self._lock:
@@ -228,6 +256,7 @@ class DownloadIntentStore:
                 if not selected_hash and revision > 1:
                     return None
             payload["state"] = "complete"
+            payload["owned_candidates"] = []
             payload["updated_at"] = time.time()
             payload["detail"] = str(detail)[:500]
             completed = True

@@ -156,6 +156,40 @@ def test_embedded_timing_reference_is_published_atomically(monkeypatch, tmp_path
     assert not list(output.parent.glob(".*.tmp.srt"))
 
 
+def test_embedded_timing_reference_removes_exact_duplicate_cues(monkeypatch, tmp_path):
+    video = tmp_path / "episode.mkv"
+    video.write_bytes(b"video")
+    monkeypatch.setattr(syncing, "_resolve_command", lambda command: command)
+
+    def fake_run(command, **kwargs):
+        if command[0] == "ffprobe":
+            import json
+            payload = {"streams": [{
+                "index": 4,
+                "codec_type": "subtitle",
+                "codec_name": "ass",
+                "tags": {"language": "eng", "title": "Full Dialogue"},
+                "disposition": {"default": 1},
+            }]}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        Path(command[-1]).write_text(
+            "1\n00:00:00,326 --> 00:00:03,146\nBank of Tatehama\n\n"
+            "2\n00:00:00,326 --> 00:00:03,146\nBank of Tatehama\n\n"
+            "3\n00:00:03,146 --> 00:00:04,000\nDialogue\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    monkeypatch.setattr(syncing.subprocess, "run", fake_run)
+    output, result = syncing.extract_embedded_timing_reference(video, tmp_path / "cache")
+
+    assert output is not None
+    cues = syncing.parse_srt(output)
+    assert cues == [(0.326, 3.146, "Bank of Tatehama"), (3.146, 4.0, "Dialogue")]
+    assert result["duplicate_cues_removed"] == 1
+    assert result["cue_count"] == 2
+
+
 def test_fuzzy_global_ln_alignment_recovers_when_no_four_char_anchor_exists():
     novel = "".join(chr(0x4E00 + index) for index in range(120))
     transcript = "".join("ゑ" if index % 4 == 3 else char for index, char in enumerate(novel))
@@ -190,7 +224,7 @@ def test_invalid_cached_timing_reference_is_rebuilt(monkeypatch, tmp_path):
     digest = hashlib.sha1(
         (
             f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-            "stream=4:timing-reference-v1"
+            "stream=4:timing-reference-v2-exact-dedupe"
         ).encode()
     ).hexdigest()[:20]
     cached = tmp_path / "cache" / "timing-reference" / f"{digest}.srt"

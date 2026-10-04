@@ -149,6 +149,9 @@ def test_exact_anilist_jimaku_match_skips_name_search(tmp_path: Path, monkeypatc
             pass
 
     monkeypatch.setattr("pudge.cli.JimakuClient", FakeJimaku)
+    # This case exercises exact Jimaku matching, not the unrelated AniList
+    # relation graph lookup used to calculate absolute episode aliases.
+    monkeypatch.setattr("pudge.cli._jimaku_episode_aliases", lambda *_: ())
     anime = AniListAnime(
         id=123,
         titles=["Anime"],

@@ -25,9 +25,9 @@ def test_ci_checks_all_python_and_javascript() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
-    assert "ruff check --select E9,F pudge scripts" in workflow
+    assert "ruff check --select E9,F pudge .github/release" in workflow
     assert "find pudge/web -type f -name '*.js'" in workflow
-    assert "ruff check --select E9,F pudge scripts" in makefile
+    assert "ruff check --select E9,F pudge .github/release" in makefile
     assert "find pudge/web -type f -name '*.js'" in makefile
 
 

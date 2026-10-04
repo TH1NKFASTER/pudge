@@ -81,7 +81,8 @@ def _run_node(source: str) -> dict[str, object]:
 
 def test_button_has_listen_then_stop_resume_session_states() -> None:
     source = HTML.read_text(encoding="utf-8")
-    sync = _function(source, "syncLnPairedTray")
+    # syncLnPairedTray now consults lnPairedSnapshotActive (live session reveal).
+    sync = _function(source, "syncLnPairedTray") + "\n" + _function(source, "lnPairedSnapshotActive")
     script = f"""
 const classes={{}};
 const button={{disabled:false,textContent:'',title:'',classList:{{toggle(name,value){{classes[name]=Boolean(value);}}}}}};
@@ -111,6 +112,7 @@ def _transport_case(*, started: bool) -> dict[str, object]:
     script = f"""
 const calls=[]; let livePlaying=false;
 global.ui={{lnBook:{{id:6,paired_audio:{{}}}},lnChapter:{{chapter_index:1}},lnPairedState:{{audiobook_id:75,alignment:{{ready:true}},playing:false,player_running:true,paused:true,speed:1}},lnPairedStarted:{str(started).lower()},lnPairedExpanded:false}};
+global.lnPairedTransportClockReset=state=>calls.push(['clockReset',state.position||0]);
 global.invalidateLnPairedPoll=()=>calls.push('invalidate');
 global.syncLnPairedTray=state=>calls.push(['sync',state.playing,state.player_running]);
 global.applyLnPairedPosition=async()=>calls.push('apply');

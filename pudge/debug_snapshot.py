@@ -8,8 +8,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from .build_identity import build_identity
 from .logging_utils import DEFAULT_LOG_PATH, tail_log
-
 
 DEBUG_SCHEMA = 1
 
@@ -79,6 +79,7 @@ def write_prepare_debug_result(
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": DEBUG_SCHEMA,
+        "runtime_build": build_identity(),
         "command": [str(item) for item in command],
         "returncode": int(returncode),
         "started_at": float(started_at),
@@ -407,6 +408,7 @@ class DebugSnapshotService:
         return {
             "schema": DEBUG_SCHEMA,
             "generated_at": time.time(),
+            "runtime_build": build_identity(),
             "anime": _jsonable(anime),
             "requested_episode": episode,
             "selected_episode": selected_episode,

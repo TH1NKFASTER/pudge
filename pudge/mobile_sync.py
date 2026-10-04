@@ -709,7 +709,14 @@ class MobileSyncService:
             "AND id NOT IN (SELECT event_id FROM sync_snapshots)",
             (int(cutoff["id"]),),
         )
-        return max(0, int(cursor.rowcount or 0))
+        removed = max(0, int(cursor.rowcount or 0))
+        if removed:
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES('mobile_sync_pruned_through',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(state.value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT),updated_at=excluded.updated_at",
+                (str(int(cutoff["id"])), time.time()),
+            )
+        return removed
 
     def _consumption_media_uuid_for_entity(
         self, kind: str, local_key: str, external_key: str, title: str, metadata: dict[str, Any]
@@ -969,6 +976,8 @@ class MobileSyncService:
         page_size = max(1, min(self.max_events_per_request, int(limit)))
         with self.database.connect() as conn:
             earliest_row = conn.execute("SELECT COALESCE(MIN(id),0) AS cursor FROM sync_events").fetchone()
+            floor_row = conn.execute("SELECT value FROM state WHERE key='mobile_sync_pruned_through'").fetchone()
+            pruned_through = int(floor_row["value"] or 0) if floor_row else 0
             rows = conn.execute(
                 """
                 SELECT id,event_uuid,device_id,entity_id,event_type,payload_json,
@@ -986,7 +995,8 @@ class MobileSyncService:
             "cursor": next_cursor,
             "has_more": has_more,
             "earliest_cursor": earliest_cursor,
-            "reset_required": bool(start > 0 and earliest_cursor > 0 and start < earliest_cursor - 1),
+            "reset_required": bool(start < pruned_through or (start > 0 and earliest_cursor > 0 and start < earliest_cursor - 1)),
+            "pruned_through": pruned_through,
             "events": [
                 {
                     "cursor": int(row["id"]),
@@ -1070,6 +1080,7 @@ class MobileSyncService:
         raw: dict[str, Any],
         *,
         now: float,
+        resolve_completed: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raise MobileSyncValidationError("Each event must be an object")
@@ -1098,6 +1109,7 @@ class MobileSyncService:
         status = str(payload.get("status") or "in_progress").strip().lower()
         if status not in {"not_started", "in_progress", "completed"}:
             raise MobileSyncValidationError("Unsupported progress status")
+        normalized = self._validated_position(conn, str(entity["kind"]), str(entity["local_key"]), position)
         occurred_at = _bounded_timestamp(raw.get("occurred_at"), now=now)
         event_id = self._record_event(
             conn,
@@ -1105,7 +1117,7 @@ class MobileSyncService:
             device_id=device_id,
             entity_id=entity_id,
             event_type=event_type,
-            payload={"position": position, "status": status},
+            payload={"position": normalized, "status": status},
             occurred_at=occurred_at,
             received_at=now,
         )
@@ -1126,7 +1138,6 @@ class MobileSyncService:
             base_revision = int(raw.get("base_revision") or payload.get("base_revision") or 0)
         except (TypeError, ValueError):
             base_revision = 0
-        normalized = self._normalize_position(str(entity["kind"]), position)
         incoming_json = _json_dumps(normalized)
         current_revision = int(snapshot["revision"] or 0) if snapshot is not None else 0
         completed_downgrade = bool(
@@ -1162,7 +1173,7 @@ class MobileSyncService:
                 )
             )
         conflict = bool(
-            completed_downgrade
+            (completed_downgrade and not resolve_completed)
             or (
                 snapshot is not None
                 and base_revision > 0
@@ -1257,17 +1268,33 @@ class MobileSyncService:
             rows = conn.execute(
                 "SELECT * FROM sync_conflicts WHERE resolved_at=0 ORDER BY created_at DESC"
             ).fetchall()
-        return [
-            {
-                **dict(row),
-                "incoming": _json_loads(str(row["incoming_json"] or "{}"), {}),
-            }
-            for row in rows
-        ]
+            conflicts = []
+            for row in rows:
+                incoming = _json_loads(str(row["incoming_json"] or "{}"), {})
+                reason = self._incoming_resolution_block_reason(conn, row, incoming)
+                conflicts.append({**dict(row), "incoming": incoming,
+                    "accept_incoming_allowed": not reason, "accept_incoming_block_reason": reason})
+        return conflicts
+
+    @staticmethod
+    def _incoming_resolution_block_reason(conn: sqlite3.Connection, conflict: Any, incoming: dict[str, Any]) -> str:
+        entity_id = str(conflict["entity_id"])
+        snapshot = conn.execute("SELECT revision FROM sync_snapshots WHERE entity_id=?", (entity_id,)).fetchone()
+        if int(snapshot["revision"] if snapshot else 0) != int(conflict["current_revision"]):
+            return "Progress changed since this conflict; reload before resolving"
+        entity = conn.execute("SELECT kind,local_key FROM sync_entities WHERE entity_id=?", (entity_id,)).fetchone()
+        if entity and entity["kind"] == "anime_episode" and incoming.get("status") != "completed":
+            media_id, episode = (int(value) for value in str(entity["local_key"]).split(":", 1))
+            anime = conn.execute("SELECT progress,episodes,format FROM anime WHERE media_id=?", (media_id,)).fetchone()
+            if anime and watched_by_anilist_progress(episode, anime["progress"], total_episodes=anime["episodes"], media_format=anime["format"]):
+                return "AniList marks this episode completed; change that progress before accepting an incomplete position"
+        return ""
 
     def resolve_conflict(self, conflict_id: int, *, accept_incoming: bool) -> dict[str, Any]:
+        self.capture_local_changes()
         now = time.time()
         with self.database.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT * FROM sync_conflicts WHERE id=? AND resolved_at=0",
                 (int(conflict_id),),
@@ -1277,6 +1304,9 @@ class MobileSyncService:
             result: dict[str, Any] = {"status": "kept_current"}
             if accept_incoming:
                 incoming = _json_loads(str(row["incoming_json"] or "{}"), {})
+                blocked = self._incoming_resolution_block_reason(conn, row, incoming)
+                if blocked:
+                    raise MobileSyncValidationError(blocked)
                 snapshot = conn.execute(
                     "SELECT revision FROM sync_snapshots WHERE entity_id=?",
                     (str(row["entity_id"]),),
@@ -1292,12 +1322,65 @@ class MobileSyncService:
                     "occurred_at": now,
                     "base_revision": int(snapshot["revision"] if snapshot else 0),
                 }
-                result = self._push_one(conn, str(row["device_id"]), raw, now=now)
+                result = self._push_one(conn, str(row["device_id"]), raw, now=now, resolve_completed=True)
+                if result.get("status") != "applied":
+                    raise MobileSyncValidationError("Incoming progress was not applied; conflict remains open")
             conn.execute(
                 "UPDATE sync_conflicts SET resolved_at=? WHERE id=?",
                 (now, int(conflict_id)),
             )
         return {"conflict_id": int(conflict_id), **result}
+
+    def _validated_position(self, conn: sqlite3.Connection, kind: str, local_key: str, position: dict[str, Any]) -> dict[str, Any]:
+        try:
+            canonical = dict(position)
+            if kind == "manga":
+                row = conn.execute("SELECT page_count FROM manga_books WHERE id=?", (int(local_key),)).fetchone()
+                if row is None or not 0 <= int(position.get("page_index") or 0) < int(row["page_count"]):
+                    raise MobileSyncValidationError("Manga page is outside the current book")
+                if position.get("page_count") is not None and int(position["page_count"]) != int(row["page_count"]):
+                    raise MobileSyncValidationError("Manga content changed; refresh the library")
+                canonical["page_count"] = int(row["page_count"])
+            elif kind == "light_novel":
+                index = int(position.get("chapter_index") or 0)
+                row = conn.execute("SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index=?", (int(local_key), index)).fetchone()
+                if row is None:
+                    raise MobileSyncValidationError("Chapter is not in the current book")
+                length = len(str(row["text"] or ""))
+                if position.get("chapter_hash") and str(position["chapter_hash"]) != str(row["text_hash"]):
+                    raise MobileSyncValidationError("Chapter content changed; refresh the library")
+                if position.get("chapter_length") is not None and int(position["chapter_length"]) != length:
+                    raise MobileSyncValidationError("Chapter length changed; refresh the library")
+                offset = int(position.get("character_offset") or 0)
+                if not 0 <= offset <= length:
+                    raise MobileSyncValidationError("Character offset is outside the chapter")
+                if "character_offset" not in position:
+                    fraction = float(position.get("fraction") or 0.0)
+                    if not 0.0 <= fraction <= 1.0:
+                        raise MobileSyncValidationError("Fraction is outside the chapter")
+                    offset = round(fraction * length)
+                canonical.update(chapter_length=length,chapter_hash=str(row["text_hash"]),character_offset=offset)
+            elif kind in {"audiobook", "anime_episode"}:
+                if kind == "audiobook":
+                    row = conn.execute("SELECT duration FROM audiobooks WHERE id=?", (int(local_key),)).fetchone()
+                    duration = float(row["duration"] or 0) if row else 0
+                else:
+                    media_id, episode = (int(value) for value in local_key.split(":", 1))
+                    if position.get("episode") is not None and int(position["episode"]) != episode:
+                        raise MobileSyncValidationError("Episode does not match this entity")
+                    row = conn.execute("SELECT playback_duration AS duration FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? ORDER BY updated_at DESC LIMIT 1", (media_id, episode)).fetchone()
+                    duration = float(row["duration"] or 0) if row else 0
+                    canonical["episode"] = episode
+                if row is None:
+                    raise MobileSyncValidationError("Media is no longer in the library")
+                maximum = round(duration * 1000)
+                offset = int(position.get("position_ms") or 0)
+                if offset < 0 or (maximum > 0 and offset > maximum):
+                    raise MobileSyncValidationError("Position is outside the current media")
+                canonical["duration_ms"] = maximum
+            return self._normalize_position(kind, canonical)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MobileSyncValidationError("Invalid progress position") from exc
 
     @staticmethod
     def _normalize_position(kind: str, position: dict[str, Any]) -> dict[str, Any]:

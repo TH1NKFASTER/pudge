@@ -16,6 +16,7 @@ class SubtitleJobStage(StrEnum):
     SELECTING = "selecting"
     READY = "ready"
     WAITING_SOURCE = "waiting_source"
+    WAITING_VERIFICATION = "waiting_verification"
     RETRY_SCHEDULED = "retry_scheduled"
     NEEDS_ACTION = "needs_action"
 
@@ -41,6 +42,7 @@ class SubtitleQuality:
     structure_score: float = 0.0
     activity_score: float = 0.0
     holdout_p95_seconds: float | None = None
+    flags: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)

@@ -29,22 +29,17 @@ def test_app_bundle_is_built_before_the_working_bundle_is_replaced() -> None:
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
     build = installer.index('NEW_APP="$BUILD_DIR/dist/$APP_NAME.app"')
     compile_native = installer.index("/usr/bin/clang", build)
-    stop = installer.index('pkill -f "pudge.cli --app"', compile_native)
-    swap = installer.index("APP_SWAP_BACKUP=", stop)
-    assert build < compile_native < stop < swap
+    stop = installer.index("PUDGE_GRACEFUL_QUIT")
+    swap = installer.index("APP_SWAP_BACKUP=", compile_native)
+    assert stop < installer.index("-m pip install") < build < compile_native < swap
     assert "unsetenv(\"TCL_LIBRARY\")" in installer
 
 
-def test_updater_uses_fast_installer_with_sanitized_environment() -> None:
+def test_updater_uses_fast_installer_with_sanitized_environment(tmp_path,monkeypatch) -> None:
     updater = (ROOT / "pudge/updater.py").read_text(encoding="utf-8")
 
     assert '"if ! /bin/zsh ./install.sh --update; then"' in updater
     assert '"unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE"' in updater
 
-    rollback = updater.index("/usr/bin/ditto")
-    stop = updater.index("/bin/kill -9 {source_pid}", rollback)
-    verify = updater.index("/bin/kill -0 {source_pid}", stop)
-    install = updater.index("/bin/zsh ./install.sh --update")
-    reopen = updater.index("/usr/bin/open -n")
-
-    assert rollback < stop < verify < install < reopen
+    from test_v16_updater_script import run_update_scenario
+    run_update_scenario(tmp_path,monkeypatch,source_exits=True)

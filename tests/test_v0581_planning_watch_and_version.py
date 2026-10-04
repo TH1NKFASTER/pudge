@@ -131,7 +131,7 @@ def test_version_is_exposed_in_regular_and_advanced_settings(tmp_path: Path) -> 
     html = Path("pudge/web/index.html").read_text(encoding="utf-8")
     advanced = Path("pudge/settings_ui.py").read_text(encoding="utf-8")
     assert "${t('settings.version')}: ${escapeHtml(s.version||'—')}" in html
-    assert 'text=f"Версия: {__version__}"' in advanced
+    assert 'text=tr("Version: {0}", "Версия: {0}").format(__version__)' in advanced
 
 
 def test_confirmed_watch_updates_planned_local_entry_and_episode(tmp_path: Path, monkeypatch) -> None:

@@ -1,0 +1,170 @@
+[
+ {
+  "type": "TV",
+  "anidb_id": 1,
+  "anilist_id": 290,
+  "animecountdown_id": 36462,
+  "animenewsnetwork_id": 14,
+  "anime-planet_id": "crest-of-the-stars",
+  "anisearch_id": 3039,
+  "imdb_id": [
+   "tt0286390"
+  ],
+  "kitsu_id": 265,
+  "livechart_id": 4157,
+  "mal_id": 290,
+  "simkl_id": 36462,
+  "themoviedb_id": {
+   "tv": 26209
+  },
+  "tvdb_id": 72025,
+  "season": {
+   "tvdb": 1,
+   "tmdb": 1
+  }
+ },
+ {
+  "type": "OVA",
+  "anidb_id": 2,
+  "anilist_id": 300,
+  "animecountdown_id": 38433,
+  "animenewsnetwork_id": 382,
+  "anime-planet_id": "3x3-eyes",
+  "anisearch_id": 2747,
+  "imdb_id": [
+   "tt0102847"
+  ],
+  "kitsu_id": 7749,
+  "livechart_id": 5777,
+  "mal_id": 300,
+  "simkl_id": 38433,
+  "themoviedb_id": {
+   "tv": 62913
+  },
+  "tvdb_id": 70973,
+  "season": {
+   "tvdb": 1,
+   "tmdb": 1
+  }
+ },
+ {
+  "type": "OVA",
+  "anidb_id": 3,
+  "anilist_id": 1225,
+  "animecountdown_id": 40976,
+  "animenewsnetwork_id": 792,
+  "anime-planet_id": "3x3-eyes-seima-densetsu",
+  "anisearch_id": 3354,
+  "imdb_id": [
+   "tt0102847"
+  ],
+  "kitsu_id": 1102,
+  "livechart_id": 6605,
+  "mal_id": 1225,
+  "simkl_id": 40976,
+  "themoviedb_id": {
+   "tv": 62913
+  },
+  "tvdb_id": 70973,
+  "season": {
+   "tvdb": 2,
+   "tmdb": 2
+  }
+ },
+ {
+  "type": "TV",
+  "anidb_id": 5,
+  "anilist_id": 397,
+  "animecountdown_id": 36399,
+  "animenewsnetwork_id": 448,
+  "anime-planet_id": "banner-of-the-stars-ii",
+  "anisearch_id": 772,
+  "imdb_id": [
+   "tt0286390"
+  ],
+  "kitsu_id": 364,
+  "livechart_id": 5589,
+  "mal_id": 397,
+  "simkl_id": 36399,
+  "themoviedb_id": {
+   "tv": 26209
+  },
+  "tvdb_id": 72025,
+  "season": {
+   "tvdb": 3,
+   "tmdb": 3
+  }
+ },
+ {
+  "type": "OVA",
+  "anidb_id": 11,
+  "anilist_id": 821,
+  "animecountdown_id": 36955,
+  "animenewsnetwork_id": 1155,
+  "anime-planet_id": "initial-d-battle-stage",
+  "anisearch_id": 806,
+  "imdb_id": [
+   "tt7941838"
+  ],
+  "kitsu_id": 728,
+  "livechart_id": 8274,
+  "mal_id": 821,
+  "simkl_id": 36955,
+  "themoviedb_id": {
+   "movie": [
+    1390599
+   ]
+  },
+  "tvdb_id": 70900,
+  "season": {
+   "tvdb": 0
+  },
+  "episode_offset": {
+   "tvdb": 2
+  }
+ },
+ {
+  "type": "TV",
+  "anidb_id": 23,
+  "anilist_id": 1,
+  "animecountdown_id": 37089,
+  "animenewsnetwork_id": 13,
+  "anime-planet_id": "cowboy-bebop",
+  "anisearch_id": 1572,
+  "imdb_id": [
+   "tt0213338"
+  ],
+  "kitsu_id": 1,
+  "livechart_id": 3418,
+  "mal_id": 1,
+  "simkl_id": 37089,
+  "themoviedb_id": {
+   "tv": 30991
+  },
+  "tvdb_id": 76885,
+  "season": {
+   "tvdb": 1,
+   "tmdb": 1
+  }
+ },
+ {
+  "type": "TV",
+  "anidb_id": 69,
+  "anilist_id": 21,
+  "animecountdown_id": 38636,
+  "animenewsnetwork_id": 836,
+  "anime-planet_id": "one-piece",
+  "anisearch_id": 2227,
+  "imdb_id": [
+   "tt0388629"
+  ],
+  "kitsu_id": 12,
+  "livechart_id": 321,
+  "mal_id": 21,
+  "simkl_id": 38636,
+  "themoviedb_id": {
+   "tv": 37854
+  },
+  "tvdb_id": 81797
+ }
+]

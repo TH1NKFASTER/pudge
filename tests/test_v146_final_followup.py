@@ -1,30 +1,13 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HTML = ROOT / "pudge" / "web" / "index.html"
 COVER_PREVIEW = ROOT / "pudge" / "web" / "cover_preview.js"
-POLICY_SCRIPT = ROOT / "scripts" / "compare_subtitle_alignment_stt_policies.py"
-AB_SCRIPT = ROOT / "scripts" / "compare_subtitle_alignment.py"
-
-
-def _load_ab():
-    scripts = str(ROOT / "scripts")
-    if scripts not in sys.path:
-        sys.path.insert(0, scripts)
-    spec = importlib.util.spec_from_file_location("pudge_alignment_ab_v146", AB_SCRIPT)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def test_reader_uses_native_scroll_and_cover_preview_waits_for_real_drag() -> None:
@@ -217,45 +200,8 @@ def test_stt_rejected_text_clock_is_preserved_with_explicit_gate_failures(monkey
     assert "shift_spread_seconds" in diagnostics
 
 
-def test_benchmark_hard_identity_gate_rejects_known_pollution_and_keeps_generic_filename() -> None:
-    ab = _load_ab()
-
-    ok, why = ab._benchmark_identity_check(
-        {"title": "Boku no Hero Academia", "episode": 5, "media_id": 21459},
-        Path("[Judas] Vigilantes - S01E05.mkv"),
-        ["Boku no Hero Academia - 05.srt", "My Hero Academia - 05.srt"],
-    )
-    assert ok is False and why["reason"] == "title_identity_mismatch"
-
-    ok, why = ab._benchmark_identity_check(
-        {"title": "Another", "episode": 4, "media_id": 11111},
-        Path("[SubsPlease] 16bit Sensation - Another Layer - 04 (1080p).mkv"),
-    )
-    assert ok is False and why["reason"] == "title_identity_mismatch"
-
-    ok, why = ab._benchmark_identity_check(
-        {"title": "BOFURI", "episode": 2, "media_id": 116867},
-        Path("BOFURI S2E05 English Dub.mkv"),
-        ["BOFURI S02E02.ja.srt"],
-    )
-    assert ok is False and why["reason"] == "episode_identity_mismatch"
-
-    ok, why = ab._benchmark_identity_check(
-        {"title": "Munou na Nana", "episode": 7, "media_id": 117343},
-        Path("S01E07-Necromancer Part 2.mkv"),
-    )
-    assert ok is True and why["reason"] == "episode_identity_only"
 
 
-def test_stt_policy_matrix_exports_forensic_fields_and_passes_ffprobe() -> None:
-    source = POLICY_SCRIPT.read_text(encoding="utf-8")
-    assert "ffprobe_path=config.tools.ffprobe" in source
-    for field in (
-        "stt_reject_reason", "stt_gate_failures", "stt_audio_stream_index",
-        "video_content_fingerprint", "audio_sha256", "reference_sha256", "source_sha256",
-        "benchmark-identity-rejections.json",
-    ):
-        assert field in source
 
 
 def test_stt_cache_key_is_path_independent_for_same_content_identity() -> None:
@@ -327,10 +273,3 @@ def test_manual_speaker_markup_accepts_character_owned_narration(tmp_path: Path)
     source = (ROOT / "pudge" / "web_app.py").read_text(encoding="utf-8")
     assert "Also annotate a `narration` span when it is clearly voiced by a specific character" in source
     assert '"narration_ids": narration_ids' in source
-
-
-def test_stt_policy_benchmark_supports_clean_ten_minute_partial_run() -> None:
-    source = POLICY_SCRIPT.read_text(encoding="utf-8")
-    assert '"--time-limit-minutes"' in source
-    assert '"stopped_by_time_limit"' in source
-    assert '"cases_discovered"' in source

@@ -73,12 +73,14 @@ def test_parsed_chapter_rerender_reuses_already_loaded_image_nodes() -> None:
     assert "lnReplaceReaderHtmlPreservingImages(html)" in html
 
 
-def test_reader_shell_opens_before_python_book_metadata_returns() -> None:
+def test_reader_shell_waits_for_review_and_metadata_stays_lightweight() -> None:
     html = INDEX.read_text(encoding="utf-8")
-    function = html.split("async function openLightNovel(bookId)", 1)[1].split("async function loadLightNovelChapter", 1)[0]
+    function = html.split("async function openLightNovel(", 1)[1].split("async function loadLightNovelChapter", 1)[0]
     show_at = function.index("$('lnReaderShell').classList.add('open')")
     await_at = function.index("await pywebview.api.light_novel_open")
-    assert show_at < await_at
+    review_at = function.index("await window.PudgeReviewGate.require")
+    cancel_at = function.index("if(!approved)")
+    assert await_at < review_at < cancel_at < show_at
     backend = WEB_APP.read_text(encoding="utf-8")
     open_fn = backend.split("def light_novel_open", 1)[1].split("def light_novel_chapter", 1)[0]
     assert "include_alignment=False" in open_fn
@@ -143,6 +145,6 @@ def test_punctuation_pause_clock_uses_indexed_ranges_and_keeps_expected_clock() 
 def test_reader_wheel_uses_native_webkit_scrolling() -> None:
     html = INDEX.read_text(encoding="utf-8")
     assert "function lnSmoothCoarseWheel" not in html
-    wheel = "$('lnReaderScroll').addEventListener('wheel',()=>markLnPairedManualNavigation('scroll',2000),{passive:true});"
+    wheel = "$('lnReaderScroll').addEventListener('wheel',()=>{ui.lnPairedAutoScrollUntil=0;markLnPairedManualNavigation('scroll',2000);},{passive:true});"
     assert wheel in html
     assert "{passive:false}" not in html.split("$('lnReaderScroll').addEventListener('wheel'", 1)[1][:220]

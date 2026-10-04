@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<anime-list>
+  <anime anidbid="1" tvdbid="72025" defaulttvdbseason="1" episodeoffset="" tmdbtv="26209" tmdbseason="1" tmdboffset="" tmdbid="" imdbid="">
+    <name>Seikai no Monshou</name>
+    <supplemental-info>
+      <studio>Sunrise</studio>
+    </supplemental-info>
+  </anime>
+  <anime anidbid="2" tvdbid="70973" defaulttvdbseason="1" episodeoffset="" tmdbtv="62913" tmdbseason="1" tmdboffset="" tmdbid="" imdbid="">
+    <name>3x3 Eyes</name>
+  </anime>
+  <anime anidbid="3" tvdbid="70973" defaulttvdbseason="2" episodeoffset="" tmdbtv="62913" tmdbseason="2" tmdboffset="" tmdbid="" imdbid="">
+    <name>3x3 Eyes: Seima Densetsu</name>
+    <supplemental-info>
+      <studio>Toei Douga</studio>
+    </supplemental-info>
+  </anime>
+  <anime anidbid="5" tvdbid="72025" defaulttvdbseason="3" episodeoffset="" tmdbtv="26209" tmdbseason="3" tmdboffset="" tmdbid="" imdbid="">
+    <name>Seikai no Senki II</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-4;</mapping>
+    </mapping-list>
+    <supplemental-info>
+      <studio>Sunrise</studio>
+    </supplemental-info>
+  </anime>
+  <anime anidbid="11" tvdbid="70900" defaulttvdbseason="0" episodeoffset="2" tmdbtv="" tmdbseason="" tmdboffset="" tmdbid="1390599" imdbid="tt7941838">
+    <name>Initial D Battle Stage</name>
+  </anime>
+  <anime anidbid="23" tvdbid="76885" defaulttvdbseason="1" episodeoffset="" tmdbtv="30991" tmdbseason="1" tmdboffset="" tmdbid="" imdbid="">
+    <name>Cowboy Bebop</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0" start="1" end="3" offset="1">;4-0;</mapping>
+    </mapping-list>
+    <supplemental-info>
+      <studio>Sunrise</studio>
+    </supplemental-info>
+  </anime>
+  <anime anidbid="69" tvdbid="81797" defaulttvdbseason="a" episodeoffset="" tmdbtv="37854" tmdbseason="a" tmdboffset="" tmdbid="" imdbid="">
+    <name>One Piece</name>
+    <mapping-list>
+      <mapping anidbseason="0" tvdbseason="0">;1-27;2-3;3-9;4-10;5-14;6-0;7-0;8-0;9-0;10-0;11-0;12-0;13-0;14-0;15-0;16-31;17-23;18-24;19-28;20-29;21-30;22-0;23-32;24-34;25-0;26-36;27-37;28-40;29-41;30-42;31-43;32-44;33-45;34-47;35-48;36-49;37-50;38-51;39-52;40-53;41-54;42-55;43-56;44-57;45-0;46-58;47-59;48-60;49-61;50-62;51-63;</mapping>
+      <mapping anidbseason="1" tmdbseason="1" start="1" end="61" offset="0"/>
+      <mapping anidbseason="1" tmdbseason="2" start="62" end="77" offset="-61"/>
+      <mapping anidbseason="1" tmdbseason="3" start="78" end="91" offset="-77"/>
+      <mapping anidbseason="1" tmdbseason="4" start="92" end="130" offset="-91"/>
+      <mapping anidbseason="1" tmdbseason="5" start="131" end="143" offset="-130"/>
+      <mapping anidbseason="1" tmdbseason="6" start="144" end="195" offset="-143"/>
+      <mapping anidbseason="1" tmdbseason="7" start="196" end="228" offset="-195"/>
+      <mapping anidbseason="1" tmdbseason="8" start="229" end="263" offset="-228"/>
+      <mapping anidbseason="1" tmdbseason="9" start="264" end="336" offset="-263"/>
+      <mapping anidbseason="1" tmdbseason="10" start="337" end="381" offset="-336"/>
+      <mapping anidbseason="1" tmdbseason="11" start="382" end="407" offset="-381"/>
+      <mapping anidbseason="1" tmdbseason="12" start="408" end="421" offset="-407"/>
+      <mapping anidbseason="1" tmdbseason="13" start="422" end="522" offset="-421"/>
+    </mapping-list>
+  </anime>
+</anime-list>

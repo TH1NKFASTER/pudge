@@ -8,7 +8,10 @@ def test_ln_uses_short_listen_label_and_optimistic_toggle() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
 
     assert "Listen together" not in html
-    assert "Читать и слушать" not in html
+    # "Читать и слушать" is now the requested LN context-menu label for the
+    # read-together action (plan item 12); the transport button stays short.
+    assert html.count("Читать и слушать") == 1
+    assert 'data-ln-context-action="read-together">${ui.lang===\'ru\'?\'Читать и слушать\':\'Read and listen\'}' in html
     assert "ui.lang==='ru'?'Слушать':'Listen'" in html
     assert "async function toggleLnPairedPlayback()" in html
     assert "syncLnPairedTransportIntent(desired)" in html
@@ -30,8 +33,10 @@ def test_ln_and_audiobook_pages_share_playback_shortcuts() -> None:
     shortcut_map = "{ArrowLeft:-5,ArrowRight:5,ArrowUp:-15,ArrowDown:15}"
 
     assert f"const lnAudioShortcuts={shortcut_map};" in html
-    assert "event.code==='Space'" in html
-    assert "void toggleLnPairedPlayback()" in html
+    # Space arbitration moved into lnPairedSpaceTransportEvent; its behaviour
+    # is executed in tests/js/ln_entry_contract.cjs (space_keydown).
+    assert "event.code!=='Space'" in html
+    assert "if(lnPairedSpaceTransportEvent(event)){event.preventDefault();event.stopPropagation();if(!event.repeat)void toggleLnPairedPlayback();return;}" in html
 
     assert f"const audioShortcuts={shortcut_map};" in media
     assert "event.code==='Space'" in media

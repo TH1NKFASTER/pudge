@@ -43,7 +43,8 @@ def test_asset_server_torrent_post_bypasses_pywebview_and_reaches_backend(tmp_pa
         def torrent_traffic_status(self):
             return {"enabled": bool(calls[-1]) if calls else False, "waiting": 1, "updated_at": 1.0}
 
-    handler = web_app._asset_handler_for_api(Api(), tmp_path)
+    api=Api()
+    handler = web_app._asset_handler_for_api(api, tmp_path)
     server = web_app.http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -52,7 +53,7 @@ def test_asset_server_torrent_post_bypasses_pywebview_and_reaches_backend(tmp_pa
         request = urllib.request.Request(
             f"http://{host}:{port}/api/torrents/enabled",
             data=json.dumps({"enabled": True}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Pudge-Token":api._http_session_token},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=2) as response:
@@ -87,6 +88,28 @@ def test_asset_server_http_api_is_same_origin_and_no_store() -> None:
     source = WEB_APP.read_text(encoding="utf-8")
     section = source.split("def _asset_handler_for_api", 1)[1].split("def _start_asset_server", 1)[0]
     assert 'path == "/api/torrents/status"' in section
-    assert 'path != "/api/torrents/enabled"' in section
+    assert 'path not in {"/api/torrents/enabled", "/api/mpv/explain", "/api/mpv/playback-save"}' in section
     assert '"Cache-Control", "no-store"' in section
     assert "api.set_torrents_enabled(desired)" in section
+
+
+def test_mpv_save_http_checks_token_and_owner_status(tmp_path):
+    import urllib.error
+    calls=[]
+    api=SimpleNamespace(logger=_Logger(),mpv_playback_save=lambda payload:calls.append(payload) or {'ok':payload.get('live',False)})
+    server=web_app.http.server.ThreadingHTTPServer(('127.0.0.1',0),web_app._asset_handler_for_api(api,tmp_path))
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        url=f'http://127.0.0.1:{server.server_address[1]}/api/mpv/playback-save'
+        def post(token,live):
+            return urllib.request.urlopen(urllib.request.Request(url,data=json.dumps({'live':live}).encode(),
+                headers={'Content-Type':'application/json','X-Pudge-Token':token},method='POST'),timeout=2)
+        try:post('incorrect',True)
+        except urllib.error.HTTPError as error:assert error.code==403
+        else:raise AssertionError('unauthorized save accepted')
+        assert not calls
+        with post(api._http_session_token,True) as response:assert json.loads(response.read())['ok']
+        try:post(api._http_session_token,False)
+        except urllib.error.HTTPError as error:assert error.code==410
+        else:raise AssertionError('ended owner accepted')
+    finally:server.shutdown();server.server_close()

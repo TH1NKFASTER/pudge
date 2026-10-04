@@ -52,7 +52,26 @@ def policy(pmset: Pmset, clock: Clock, *, manual: bool = False, auto: bool = Tru
         platform="darwin",
         monotonic=clock.monotonic,
         wall_time=clock.wall,
+        # This fixture tests the pmset fallback with a fake command runner.
+        # A real NSProcessInfo reading must not override the simulated state.
+        native_probe=lambda: (None, None),
     )
+
+
+def test_pmset_fixture_is_independent_of_host_native_power_state(monkeypatch) -> None:
+    native_calls = []
+
+    def host_power_state():
+        native_calls.append(True)
+        return True, True
+
+    monkeypatch.setattr(PowerPolicy, "_native_power_state", staticmethod(host_power_state))
+    clock, pmset = Clock(), Pmset(percent=80, thermal=False)
+    snap = policy(pmset, clock).snapshot(refresh=True)
+    assert snap.mode == "normal"
+    assert snap.thermal_limited is False
+    assert pmset.calls == 2
+    assert native_calls == []
 
 
 def test_auto_enters_below_20_not_at_20() -> None:

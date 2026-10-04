@@ -18,7 +18,10 @@ def test_planning_suggestions_and_reader_controls_have_requested_order() -> None
     assert "tray.hidden=!ui.lnBook?.paired_audio" in html
     assert "toolbar.insertBefore(tray,toolbar.querySelector('.ln-reader-actions')||$('lnReaderAppearanceToggle'))" in html
     assert "lnCharacterNames" not in html
-    assert "node.hidden=!ready||!ui.lnPairedExpanded" in html
+    # Basic transport controls require an expanded tray and either alignment
+    # or a live session; alignment-only controls still require alignment
+    # (behaviour: ln_entry_contract nested_playing).
+    assert "node.hidden=!ui.lnPairedExpanded||!(node.id==='lnPairedAutoScrollLabel'?ready:transport)" in html
     assert "ui.lnPairedExpanded=true" in html
     assert "await showLnPopup(target.dataset.lnToken,target)" in html
     assert "Play from here" in html

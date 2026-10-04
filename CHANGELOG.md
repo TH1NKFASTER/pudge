@@ -2,6 +2,142 @@
 
 ## Unreleased
 
+## v0.7.30 — Read and listen, reviews before content, release identity, and timing safety
+
+Range: [v0.7.29 → 0.7.30](https://github.com/TH1NKFASTER/pudge/compare/v0.7.29...0.7.30).
+
+These notes are derived from the complete source diff against v0.7.29, including files that were still untracked in the development checkout before release. The database schema moves from v12 to v13; a backup is taken before migration.
+
+### Light novels with audiobooks
+- Added a "Read and listen" entry for light novels that have a paired audiobook. It opens the reader with the audio transport ready, Space plays and pauses, and the session is restored after an app restart.
+- Paired reading offsets now come from one shared paired-audio clock in the reader and the sidebar, so the highlighted position and the audio no longer drift apart between the two.
+- Improved text–audio alignment: every spoken character gets at least 80 ms of audio, so syllables no longer flash past after a slow stretch, and a sentence pause that speech recognition placed inside the previous clause is moved to the real silence. Existing alignments benefit without re-aligning.
+- Fixed highlight problems: the reader's own auto-follow scroll no longer freezes the highlight, the word just finished is shown as finished, and changing the speed while paused keeps the highlight in place.
+- Fixed audiobook playback: a confirmed seek survives late mpv clock updates, an immediate Stop and paused seeks into another file; the position is read consistently across file boundaries; mpv IPC replies are matched to their request.
+- Added a drop overlay for adding EPUB/TXT files to the Light Novels page; other file types are rejected with a message.
+- Reworked the Light Novel library into equal-height franchise tiles with a Continue button. A tile opens a side panel with all volumes; standalone multi-volume series keep the classic card. Panel covers are cached, so reopening it does not reload or flicker.
+- Added direct Jiten deck binding for light novels by Jiten URL, ID or title search, without needing an AniList match. Jiten statistics appear on library cards once loaded.
+
+### Sidebar companion and floating audiobook player
+- Added a sidebar companion that shows due Jiten reviews between activities. Cards can appear every 1, 3, 5, 10 or 30 minutes or continuously; the next cards are prefetched and a review can be undone for 10 seconds. Loading, empty, error, interval and not-configured states are shown explicitly.
+- Added a compact audiobook player to the sidebar while an audiobook is playing or paused: play/pause, ±15 s, previous/next chapter, scrubber, speed menu, bookmarks and Stop. When the audiobook is linked to a light novel, it shows the currently spoken text.
+- Added an optional "Always on top" floating audiobook window. It is a non-activating macOS panel that follows you across Spaces and full-screen apps and can bring the main window back to the audiobook or to the linked light novel.
+- The floating player hides itself while the light-novel reader for the same audiobook is open, without touching playback, and does not reappear on its own or on another Space after it was hidden or closed.
+- Hovering a chapter on the main audiobook card highlights that chapter's range on the sidebar scrubber without moving playback.
+- Clicking the sidebar audiobook cover opens the audiobook; the cover zooms with a pinch like other covers, and Jiten card images open the image viewer. The sidebar no longer rebuilds the light-novel text after alt-tab or while the window is hidden.
+
+### Reviews before content
+- Added an optional Jiten review step before each light-novel chapter and before each 20-page manga part, with separate settings. Each can require a fixed number of due cards (1–50) or every due word in that part.
+- Review progress is saved per Jiten account and per version of the text. Content with no matching due words opens right away and is checked again on the next visit; changing accounts or content invalidates an open session.
+- During read-and-listen with the light-novel review step enabled, crossing into a new chapter pauses the audio at the chapter start until the review is done. Moving playback to the sidebar or floating player dismisses the pending prompt.
+- Words in the review step link to their Jiten page, loaded cards stay visible while the session is authorised, and a review that is still loading can always be cancelled.
+- Preparing a review fails with a "retry" message when Jiten's parse or word states are incomplete or stale, instead of building a partial set of cards.
+
+### Jiten and jpdb study cards
+- Added a review-mode setting: all native grades (four for Jiten, five for jpdb) or two buttons, Fail / Pass. Grade keys can be reassigned per provider and mode, and the episode review step uses the same mode.
+- jpdb now uses the grades from its official API, including native pass/fail; unsupported grades are rejected before sending.
+- Added native jpdb parsing when jpdb is the study provider: words carry jpdb's own IDs and can be reviewed or added without a Jiten key. Parse results are cached per jpdb account, and a parse keeps the account it started with.
+- Word colours follow the live card state from Jiten or jpdb. After a review the colour updates immediately, retrying briefly while Jiten still reports the old state, and the light-novel reader is recoloured as well.
+- A deck is needed only to add a new word; due or known words review without a deck. Unavailable grades are greyed out with the reason on hover, and the chosen deck is remembered across app relaunches.
+- Improved the card: the header row is vertically centred and wraps when there is no room, grades highlight on hover, jpdb's five grades get their own row, and Escape closes the card first even with text selected.
+- Word details are cached per account and shared between readers, and the next eight cards are loaded ahead of time.
+
+### Reading assistant and grammar
+- Added "Explain grammar" to the translation popup in light novels, manga and visual novels, available before the translation finishes. Every grammar point is matched to an exact quote in the sentence and highlighted; points that cannot be matched are marked.
+- Added a chat-style reading assistant panel: the grammar analysis is its first answer, follow-up questions continue the same context, the panel collapses to an edge tab (also with Escape), up to 100 messages are kept across restarts, Japanese in answers gets furigana and opens word cards, and answers can be copied.
+- Added a separate reasoning level for the assistant (default: low), which makes grammar answers much faster.
+- Fixed "Explain grammar" never sending a request and a pending answer clearing a newly typed question; the ✦ button in the light-novel reader opens and closes the assistant.
+
+### Manga reader
+- Added a Continue button to manga series cards; a series opens the same volumes side panel as light novels.
+- Fixed progress saving: progress is committed locally only after the save succeeds, a failed save shows a message and is retried, and vertical strips save the most visible page.
+- Pages beyond a part that has not been reviewed are no longer preloaded or shown, and far pages are unloaded in vertical mode.
+
+### Deleting content in use, and menus
+- Deleting a manga cancels its running OCR job and clears its review progress; a late OCR result can no longer recreate the book.
+- In a bulk audiobook delete, a paused or failing audiobook no longer leaves a player running or loses its history. Deleting a light novel unlinks its audio review checkpoints, and deleting the same item again does nothing. Reading and watch history is kept when library content is removed.
+- Dropdowns open on press: WebKit could drop the click, so menus such as the light-novel speed list sometimes ignored the first click. An open menu is no longer rebuilt under the pointer.
+
+### Release discovery, numbering, and SeaDex
+- Added a shared release-name parser built on Anitomy (`anitopy`). It never reads `12.5`, ranges such as `01-12` / `01 ~ 25`, NCOP/NCED/PV extras or SP specials as a regular episode, and it fills gaps such as `[03]`, `第03話` and `S1 - 01`. Without `anitopy` the previous parsers work unchanged.
+- Added a local, rebuildable index of external anime IDs (AniList ↔ AniDB/MAL/TVDB/TMDB) from the Fribb and Anime-Lists mapping projects. It refreshes in the background at most once a day, validates each build and keeps the last good index if a download fails.
+- Improved episode numbering: exact Anime-Lists rules apply piecewise before the relation-graph heuristic, later TVDB seasons count only with a season marker in the release name, S00 specials never become regular episodes, and when a rule and the AniList chain disagree nothing is imported.
+- Fixed split-stage numbering (for example JoJo Steel Ball Run 2nd & 3rd STAGE): such an entry counts only its own storyline, and a release's episode identity is checked again just before the torrent is added.
+- Added SeaDex (releases.moe) recommendations to interactive searches. Only an exact info-hash or Nyaa-ID match counts, "best" gets a larger bonus than "alternative", and SeaDex never makes a release trusted or bypasses auto-download filters. When SeaDex is unreachable, the last good snapshot is used.
+- Improved quality upgrades: each search result stores a score-formula version and a hash of every scoring input, and an upgrade is considered only when both scores come from the same inputs.
+- Fixed PLANNING titles followed while airing losing their final episodes when AniList switched them to FINISHED.
+- A failing Nyaa mirror is skipped for five minutes while other mirrors answer, and an empty result from a fallback mirror is no longer treated as proof that a release doesn't exist.
+- Tightened Nyaa title identity: a broadcast year identifies a TV season, named continuations stay separate entries, and partial matches no longer count.
+- AniList related-media notifications and planned-release offers no longer include music videos; planned-release offers can be dismissed.
+
+### Downloads, cleanup, and library repair
+- Torrent removal is confirmed through the backend that owns the torrent before files are cleaned up or Pudge switches candidates. Interrupted candidate races are recovered through their recorded owner.
+- aria2 treats a torrent as missing only when aria2 explicitly rejects that torrent; connection failures stay errors. Resuming an already-complete torrent no longer fails on an unchanged file selection.
+- Download-leftover cleanup deletes a folder only with proof that Pudge made it; your own `.torrent` files, unknown folders and quarantine files are kept. Disk-limit cleanup no longer deletes files protected by an identity repair.
+- Added `pudge repair-episode-identity` for existing misnumbered downloads: a read-only JSON plan for review, then `--apply-plan` after a database backup. `--migrate-history` relabels the file's single watch-history entry to the corrected episode.
+
+### Subtitle timing and alignment safety
+- Added a mandatory output check for every aligned subtitle. It rejects new 0 s clamps, new overlaps, order inversions, many lines collapsed onto one start and large scattered shift maps, while constant or piecewise shifts (cold opens, ad cuts) stay allowed. A broken result is never handed out; older cached outputs are rechecked before reuse.
+- A large multi-block alignment map is no longer accepted on subtitle-activity overlap alone; without a confirmed edit boundary Pudge requires independent Japanese speech recognition, and rejects the subtitle when it is unavailable.
+- Subtitles rejected by the output check, the embedded-reference discontinuity check or a content mismatch are no longer offered as automatic raw fallbacks. Manual `--sub` still works.
+- Advanced timeline alignment: shared opening anchors resolve ambiguity in the subtitle-free opening, weak single-line endings contradicted by the reference are rejected, and short edits are searched for in the real source gap.
+- Embedded reference tracks collapse only exact duplicate lines before alignment, and paired OP/ED music markers (`♪〜` / `〜♪`) stay on one clock supported by nearby dialogue.
+- Speech verification that cannot finish retries a limited number of times; worker failures and timeouts are reported separately from speech recognition being unavailable.
+- SRT output is written atomically, positioned ASS captions are converted with Pudge's own parser, and audio-activity analysis has a timeout so a stalled decoder cannot hang subtitle preparation.
+
+### OP/ED detection and skipping
+- Added local OP/ED detection for finished episodes on disk: audio fingerprints of each episode's opening and ending minutes are compared with neighbouring episodes, and a shared 30–180 s stretch is treated as the OP or ED. It runs as low-priority background maintenance and can be turned off with `[playback] intro_detection_enabled`.
+- Added a "Skip opening/ending" button in mpv for detected segments. A click or the shortcut (`[shortcuts] mpv_skip_segment`, Tab by default) jumps to the exact end of the segment. Automatic skipping is opt-in (`[playback] auto_skip_intro` / `auto_skip_outro`), happens once per segment and never after you seek back. Skipped time never counts as watched time.
+
+### Playback and mpv
+- Added an "Explain current subtitle line" shortcut in mpv (`[shortcuts] mpv_explain_subtitle`, Ctrl+Shift+T by default). It sends the current line with context to the reading assistant in a panel that stays visible over fullscreen mpv; it is available only when an LLM is configured.
+- Closing the mpv window, including with ⌘W, ends that playback session even when `input.conf` overrides the default close action, and helper processes started by the player are stopped.
+- Playback saves carry a session and sequence number, so a retried save is never counted twice, and run through a lighter entry point.
+- Subtitle prewarming during playback is limited to the next few lines, pauses while playback is paused or in Low Power Mode, and stops when the LLM is disabled.
+- A ready notification for the next episode is no longer shown if that episode was already prepared when playback started.
+- The video decoder in use is logged to help diagnose playback performance, and background-work scheduler races around lock release were fixed.
+
+### App shell and macOS integration
+- Rebuilt Cmd+Q shutdown: cleanup runs in the background while macOS waits, each step is logged, a 20-second watchdog stops leftover child processes, and running mpv launchers are detached so they can still save the final position.
+- Clicking Pudge in the Dock or Finder always brings back the main window, including when it is minimised or a companion window is visible.
+- Installing points old Dock pins at the current app bundle and removes hidden compatibility `.app` symlinks, so they no longer appear as extra Spotlight or Launchpad entries.
+- Background workers (CLI, mpv, notification helper) no longer take on the GUI bundle identity, so they don't appear as extra Pudge icons in the Dock. Diagnostics list the running Pudge and mpv app instances.
+- Assistant and "Read together" preferences are saved in the Pudge database and survive WebKit private storage and local port changes.
+- The local HTTP endpoints require a per-session token, matching host and origin, a JSON content type and a bounded body size.
+
+### Visual novels and screen capture
+- Added capture through the macOS system window picker (ScreenCaptureKit). The picked window stays authorised for the whole session, and frames come from a live stream.
+- The visual novel window list is cached and loaded in the background at startup.
+- Capture failures record the error domain and code, the Screen Recording permission check and the requesting app; a failed capture closes its reading-time session, and cancelling the picker is not reported as an error.
+
+### Settings, LLM, localization, and power
+- URL, model and API key are remembered separately for Ollama and OpenAI-compatible servers; API keys are stored in Keychain and left out of backups.
+- LLM calls request JSON output where needed and retry without it on servers that reject the option; a rejected reasoning-effort value steps down one level; every call logs status, token usage, finish reason and request id; empty, refused or non-JSON replies produce a specific error.
+- Embedded-reference checks reject malformed LLM evidence instead of coercing it.
+- The advanced Settings window and known backend errors are shown in English or Russian to match the UI language.
+- Settings show the exact build and whether its files changed after packaging.
+- Added settings for reviews before light-novel chapters and manga parts, the sidebar review interval, SeaDex, opening/ending detection and skipping, and their shortcuts. MangaOCR settings no longer offer an install-log button.
+- Automatic power saving follows macOS Low Power Mode and reads the thermal state from macOS. Storage status refreshes at most every 30 seconds, UI state requests no longer re-check downloads and subtitles each time, polling runs off the UI thread, and a scheduled agent run exits immediately when no work is due.
+
+### Backup, restore, and Companion sync
+- Before a restore, Pudge stops the Companion server, waits for open requests, closes the light-novel services and drains in-flight database writes; services are rebuilt after a restore or rollback.
+- Clearing a saved credential deletes it from Keychain. Diagnostic logs and bundles redact Companion pairing and access tokens.
+- Mobile sync marks how far its history has been pruned and tells an older device to do a full reset. Pushed positions are checked against the current page count, chapter hash and length, and media duration.
+- "Accept incoming" in a sync conflict is refused when progress changed since the conflict appeared or AniList already marks the episode completed.
+
+### Installer, updater, and build identity
+- `install.sh` restarts itself under zsh when started with bash or sh, and by default runs a short offline check (version agreement, compile, wheel). `PUDGE_INSTALL_FULL_TESTS=1` runs the full developer suite.
+- The installer quits a running Pudge the normal way and waits up to 30 seconds; it refuses to replace the app while a session is still open.
+- Each package records a build id and file fingerprints (`build-info.json`); the installer adds the install time, and the build is shown in Settings, the startup log and diagnostics.
+- Self-update checks that background work is idle, asks the app to quit normally, refuses the update and reopens the old app if it has not exited, and removes downloaded update sources after 7 days.
+- Release archives are named `x.y.z.zip`; a `pudge-macos-vX.Y.Z.zip` copy is still published for older updaters.
+- Added `anitopy` as a dependency.
+
+### Release tooling and repository
+- Release and CI helpers moved from `scripts/` to `.github/release/`. The release workflow accepts `x.y.z` and `vX.Y.Z` tags and uses the bare version as the release title.
+- Retired private research tools from the public repository: subtitle and manga OCR benchmark modules and CLIs, their Makefile targets, comparison scripts, internal docs and plans, and stray placeholder files. README and CONTRIBUTING were shortened.
+- About 100 new test modules cover the changes above.
+
 ## v0.7.29 — Manga editing, review workflow, release discovery, and timing reliability
 
 Range: [v0.7.28 → v0.7.29](https://github.com/TH1NKFASTER/pudge/compare/v0.7.28...v0.7.29).
@@ -56,7 +192,7 @@ These notes are derived from the complete source diff against v0.7.28, including
 ### UI, installation, and release engineering
 - Flattened advanced settings so power-saving and review-gate controls are first-class sections instead of being hidden behind an “Additional settings” wrapper; select enhancement and click-away/Escape ownership were tightened.
 - Updated the macOS application icon/padding and made installation use the same canonical icon asset.
-- Replaced the old root-level generic brand migration scripts with the scoped `scripts/migrations/legacy_anime_mpv.py` migration used by installation.
+- Replaced the old root-level generic brand migration scripts with the scoped `pudge/legacy_install.py` migration used by installation.
 - Expanded the release source bundle to include documented developer paths (`tests`, `docs`, `scripts`, `Makefile`, protocol docs, and workflow fixtures) and added a bundle validator for required files and local Markdown links.
 - Added the same quality gate to GitHub release CI that runs locally before the four test batches, and hardened release staging so unrelated dirty files are not accidentally included in a normal release metadata commit.
 - GitHub Release bodies are now sourced from the matching `CHANGELOG.md` version section. Re-running a release workflow also refreshes the existing Release body, fixing the behavior that left v0.7.28 with only GitHub’s generated “Full Changelog” link.
@@ -872,8 +1008,8 @@ Range: [v0.6.68 → v0.6.69](https://github.com/TH1NKFASTER/pudge/compare/v0.6.6
 
 ## Development and GitHub
 
-Source development instructions are in [`DEVELOPMENT.md`](DEVELOPMENT.md).
-Release/tag workflow is in [`RELEASING.md`](RELEASING.md).
+Source development instructions are in `DEVELOPMENT.md` (archived locally).
+Release/tag workflow is in `RELEASING.md` (archived locally).
 
 GitHub Actions runs the full test suite in four deterministic macOS batches. Pushing a version tag such as `v0.6.68` builds and publishes the matching macOS release ZIP automatically.
 

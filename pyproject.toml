@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.29"
+version = "0.7.30"
 description = "A local-first Mac app for anime, Japanese subtitles, manga, Light Novels, and audiobooks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,6 +12,7 @@ authors = [{ name = "pudge" }]
 dependencies = [
   "httpx>=0.27,<1",
   "rapidfuzz>=3.9,<4",
+  "anitopy>=2.1.1,<3",
   "charset-normalizer>=3.3,<4",
   "pillow>=10,<13",
   "socksio>=1.0,<2",
@@ -48,7 +49,7 @@ pudge-agent = "pudge.agent:main"
 include = ["pudge*"]
 
 [tool.setuptools.package-data]
-pudge = ["brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "web/companion/*", "assets/*", "THIRD_PARTY_NOTICES.md"]
+pudge = ["build-info.json", "brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "web/companion/*", "subtitles/*.json", "assets/*", "THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

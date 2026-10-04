@@ -3,10 +3,11 @@
 (() => {
   const API = () => window.pywebview && window.pywebview.api;
   const $ = id => document.getElementById(id);
+  const uiRef = () => typeof ui !== 'undefined' ? ui : window.ui;
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[ch]));
-  const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
+  const ru = () => document.documentElement.lang === 'ru' || uiRef()?.lang === 'ru';
 
   const SETTINGS_KEY = 'pudge.manga.reader.v2';
   const COVER_CACHE_KEY = 'pudge.manga.anilist.covers.v1';
@@ -59,6 +60,7 @@
   let libraryRendering = false;
   let libraryRenderSignature = '';
   let verticalObserver = null;
+  let verticalPreloadObserver = null;
   let verticalPersistTimer = null;
   let pageRenderGeneration = 0;
   let preparationPollTimer = null;
@@ -136,6 +138,29 @@
 
   function mangaSeriesForKey(key) {
     return groupBooks(state.books || []).find(group => String(group.key) === String(key || '')) || null;
+  }
+
+  function mangaVolumesPanelContent(key) {
+    const group = mangaSeriesForKey(key);
+    if (!group || group.books.length < 2) return null;
+    const books = group.books;
+    const current = mangaCurrentSeriesBook(books);
+    const unfinished = current && Number(current.read_pages || 0) < Number(current.page_count || 0);
+    return {
+      title: group.title || seriesTitle(books[0]),
+      body: `<div class="ln-volume-grid">${books.map(book => mangaLibraryCard(book, true)).join('')}</div>`,
+      continueHtml: unfinished
+        ? `<button type="button" class="primary" data-manga-v2-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(volumeNumber(current))}</button>`
+        : '',
+      afterRender: panel => {
+        paintLibraryCovers(panel, books);
+        applyLibrarySelection();
+      },
+    };
+  }
+
+  function openMangaVolumesPanel(key) {
+    window.PudgeLnLibrary?.openCustom?.(`manga:${key}`, () => mangaVolumesPanelContent(key));
   }
 
   function toggleSeriesSelection(books) {
@@ -399,6 +424,30 @@
     return `<article class="ln-card ln-entry ${compact ? 'compact' : ''} ${selectedBookIds.has(id) ? 'selected' : ''}" data-manga-book="${id}" data-manga-v2-action="read" data-id="${id}">${cover}<div class="ln-card-body"><h3>${title}</h3><div class="ln-card-meta">${facts}</div><div class="ln-card-progress" data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}"><span style="width:${percent}%"></span></div>${jiten}</div></article>`;
   }
 
+  // Covers resolve asynchronously and are cached by resolveCover(); the same
+  // painter serves the library grid and the volumes side panel.
+  function paintLibraryCovers(root, books, stillCurrent = () => true) {
+    for (const book of books) {
+      void resolveCover(book).then(async url => {
+        if (!url || !stillCurrent()) return;
+        const ready = await decodeCover(url);
+        if (!ready || !stillCurrent()) return;
+        const img = root.querySelector(`img[data-cover-book="${Number(book.id)}"]`);
+        const placeholder = root.querySelector(`[data-cover-placeholder="${Number(book.id)}"]`);
+        if (!img?.isConnected) return;
+        // Keep the placeholder visible until the candidate has decoded. A
+        // slow localhost asset or remote AniList response must never expose a
+        // broken-image frame in the library grid.
+        img.src = url;
+        img.hidden = false;
+        if (placeholder) placeholder.hidden = true;
+        console.debug('cover.thumbnail.ready', {kind:'manga', id:Number(book.id), source:url});
+      }).catch(error => {
+        console.debug('cover.thumbnail.fallback', {kind:'manga', id:Number(book.id), error:String(error?.message || error)});
+      });
+    }
+  }
+
   function mangaCurrentSeriesBook(books) {
     const unfinished = book => Number(book.read_pages || 0) < Number(book.page_count || 0);
     return books.find(unfinished) || books[books.length - 1];
@@ -415,7 +464,11 @@
     const seriesMean = Number(first.mean_score || 0);
     const seriesScore = window.PudgeAniListScore?.chip && seriesMean ? window.PudgeAniListScore.chip(seriesMean, 'percent') : '';
     const seriesStats = (seriesJiten || seriesScore) ? `<div class="ln-series-stats">${seriesJiten}${seriesScore}</div>` : '';
-    return `<section class="ln-series-group" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}</strong>${seriesStats}</div><span class="ln-series-count">${group.books.length} ${ru() ? 'тома/томов' : 'volumes'}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
+    const unfinished = current && Number(current.read_pages || 0) < Number(current.page_count || 0);
+    const continueButton = unfinished
+      ? `<button type="button" class="ln-group-continue manga-series-continue" data-manga-v2-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(volumeNumber(current))}</button>`
+      : '';
+    return `<section class="ln-series-group" data-manga-group-open="series" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}</strong>${seriesStats}${continueButton}</div><span class="ln-series-count">${group.books.length} ${ru() ? 'тома/томов' : 'volumes'}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
   }
 
   function mangaShelfContinue(groups) {
@@ -510,35 +563,17 @@
       const scrollAnchor = scrollHost ? window.PudgeLibraryShelves?.captureScrollAnchor?.(root, scrollHost) : null;
       root.innerHTML = `<div class="manga-v2-library"><button id="mangaImportV2" hidden>Import</button>${books.length ? `<div class="ln-grid">${mangaLibraryGroups(books)}</div>` : `<div class="empty">${ru() ? 'Добавьте CBZ/ZIP с изображениями страниц.' : 'Add a CBZ/ZIP containing page images.'}</div>`}</div>`;
       libraryRenderSignature = renderSignature;
-      for (const book of books) {
-        const expectedSignature = renderSignature;
-        void resolveCover(book).then(async url => {
-          if (!url || expectedSignature !== libraryRenderSignature) return;
-          const ready = await decodeCover(url);
-          if (!ready || expectedSignature !== libraryRenderSignature) return;
-          const img = root.querySelector(`img[data-cover-book="${Number(book.id)}"]`);
-          const placeholder = root.querySelector(`[data-cover-placeholder="${Number(book.id)}"]`);
-          if (!img?.isConnected) return;
-          // Keep the placeholder visible until the candidate has decoded. A
-          // slow localhost asset or remote AniList response must never expose a
-          // broken-image frame in the library grid.
-          img.src = url;
-          img.hidden = false;
-          if (placeholder) placeholder.hidden = true;
-          console.debug('cover.thumbnail.ready', {kind:'manga', id:Number(book.id), source:url});
-        }).catch(error => {
-          console.debug('cover.thumbnail.fallback', {kind:'manga', id:Number(book.id), error:String(error?.message || error)});
-        });
-      }
+      paintLibraryCovers(root, books, () => renderSignature === libraryRenderSignature);
       applyLibrarySelection();
       hydrateLibraryJiten(root, books);
+      if (window.PudgeLnLibrary?.state?.()?.kind === 'custom') window.PudgeLnLibrary.refresh?.();
       requestAnimationFrame(() => {
         window.PudgeSeriesScroll?.focus?.(root);
         if (scrollHost && scrollAnchor) window.PudgeLibraryShelves?.restoreScrollAnchor?.(root, scrollHost, scrollAnchor);
       });
       if (selectionChanged) emitSelection();
     } catch (error) {
-      root.innerHTML = `<div class="empty">${esc(error?.message || error)}</div>`;
+      root.innerHTML = `<div class="empty">${esc((window.PudgeUiLanguage?.message(error?.message || error) ?? String(error?.message || error)))}</div>`;
     } finally {
       setTimeout(() => { libraryRendering = false; }, 0);
     }
@@ -732,24 +767,78 @@
   }
 
   // pudge-v0.7.23-manga-explicit-read-progress-v1
+  // Progress is committed to the book object only after the bridge confirms
+  // the save. In-flight saves are tracked per book so identical concurrent
+  // calls are not duplicated, while a failed save leaves state unchanged and
+  // the next identical call retries it.
+  const mangaProgressSaves = new WeakMap();
+  let mangaProgressSaveFailing = false;
+  function mangaProgressSaveState(book) {
+    let state = mangaProgressSaves.get(book);
+    if (!state) {
+      state = {positionSeq: 0, position: null, readPages: new Map()};
+      mangaProgressSaves.set(book, state);
+    }
+    return state;
+  }
+  function mangaProgressSaveSucceeded() {
+    mangaProgressSaveFailing = false;
+  }
+  function mangaProgressSaveFailed(error) {
+    console.warn?.('[pudge] manga progress save failed', error);
+    if (mangaProgressSaveFailing) return;
+    mangaProgressSaveFailing = true;
+    const detail = String(error?.message || error || '').trim();
+    window.toast?.(ru()
+      ? `Не удалось сохранить прогресс манги${detail ? `: ${detail}` : ''}`
+      : `Could not save manga progress${detail ? `: ${detail}` : ''}`);
+  }
+
   async function setResumePage(pageIndex) {
     if (!currentBook || currentPageCount <= 0 || !API()?.manga_set_position) return;
     const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
-    if (Number(currentBook.position || 0) === index) return;
-    currentBook.position = index;
-    try { await API().manga_set_position(Number(currentBook.id), index); } catch (_) {}
+    const book = currentBook;
+    const bookId = Number(book.id);
+    const pending = mangaProgressSaveState(book);
+    if (pending.position === index) return;
+    if (pending.position == null && Number(book.position || 0) === index) return;
+    const seq = ++pending.positionSeq;
+    pending.position = index;
+    try {
+      const result = await API().manga_set_position(bookId, index);
+      if (result?.ok === false) throw new Error(String(result.message || result.error || 'manga_set_position failed'));
+      if (pending.positionSeq === seq) book.position = index;
+      mangaProgressSaveSucceeded();
+    } catch (error) {
+      mangaProgressSaveFailed(error);
+    } finally {
+      if (pending.positionSeq === seq) pending.position = null;
+    }
   }
 
   async function markReadThrough(pageIndex) {
     if (!currentBook || currentPageCount <= 0 || !API()?.manga_mark_read) return;
     const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
     const targetPages = index + 1;
-    if (targetPages <= Number(currentBook.read_pages || 0)) return;
-    currentBook.read_pages = targetPages;
+    const book = currentBook;
+    const bookId = Number(book.id);
+    const pending = mangaProgressSaveState(book);
+    const inFlight = Math.max(0, ...pending.readPages.values());
+    if (targetPages <= Math.max(Number(book.read_pages || 0), inFlight)) return;
+    const token = Symbol('mark-read');
+    pending.readPages.set(token, targetPages);
     try {
-      const updated = await API().manga_mark_read(Number(currentBook.id), index);
-      if (updated?.read_pages != null) currentBook.read_pages = Number(updated.read_pages);
-    } catch (_) {}
+      const updated = await API().manga_mark_read(bookId, index);
+      if (updated?.ok === false) throw new Error(String(updated.message || updated.error || 'manga_mark_read failed'));
+      const confirmed = updated?.read_pages != null && (updated.id == null || Number(updated.id) === bookId)
+        ? Number(updated.read_pages) || 0 : targetPages;
+      book.read_pages = Math.max(Number(book.read_pages || 0), confirmed);
+      mangaProgressSaveSucceeded();
+    } catch (error) {
+      mangaProgressSaveFailed(error);
+    } finally {
+      pending.readPages.delete(token);
+    }
   }
 
   async function persistVisiblePage() {
@@ -772,7 +861,7 @@
   function currentStudyBackend(payload = null) {
     return String(
       payload?.settings?.study_backend ||
-      window.ui?.lnState?.settings?.study_backend ||
+      uiRef()?.lnState?.settings?.study_backend ||
       'jiten'
     );
   }
@@ -2064,7 +2153,7 @@
       const allRows = [...textRows, ...geometryRows, ...suppressionRows, ...additionRows, ...orderRows];
       body.innerHTML = allRows.length ? allRows.join('') : `<div class="empty">${ru() ? 'Ручных исправлений нет' : 'No manual corrections'}</div>`;
     } catch (error) {
-      body.innerHTML = `<div class="empty danger">${esc(error?.message || error)}</div>`;
+      body.innerHTML = `<div class="empty danger">${esc((window.PudgeUiLanguage?.message(error?.message || error) ?? String(error?.message || error)))}</div>`;
     }
   }
 
@@ -2230,6 +2319,7 @@
     clearMangaTransientOverlays();
     currentPage = requested - 1;
     await showCurrent();
+    if(currentPage!==requested-1)return false;
     await setResumePage(currentPage);
     updatePageLabel();
     closePagePicker();
@@ -2247,7 +2337,7 @@
     const loaded = [firstPage];
     if (settings.mode === 'double' && !isDoublePage(firstPage) && currentPage + 1 < currentPageCount) {
       const secondPage = await getPage(currentPage + 1);
-      if (!isDoublePage(secondPage)) loaded.push(secondPage);
+      if (!isDoublePage(secondPage) && (Math.floor((currentPage+1)/20)===Math.floor(currentPage/20) || await requireMangaPart(currentPage+1))) loaded.push(secondPage);
     }
     pagedVisibleCount = Math.max(1, loaded.length);
     if (generation !== pageRenderGeneration || !currentBook || Number(currentBook.id) !== bookId) return;
@@ -2265,6 +2355,7 @@
       parse: true,
     });
     await persistVisiblePage();
+    const step = Math.max(1, loaded.length);
     const preload = [];
     for (const offset of [-step, step]) {
       const n = currentPage + offset;
@@ -2279,17 +2370,17 @@
     const bookId = Number(currentBook.id);
     const pages = $('mangaV2Pages');
     if (verticalObserver) verticalObserver.disconnect();
+    if (verticalPreloadObserver) verticalPreloadObserver.disconnect();
     pages.innerHTML = Array.from({length: currentPageCount}, (_, i) => `
       <figure class="manga-v2-page-frame manga-v2-lazy" data-page-index="${i}">
         <div class="manga-v2-page-placeholder">${i + 1}</div>
       </figure>`).join('');
 
-    verticalObserver = new IntersectionObserver(entries => {
-      let best = null;
-      for (const entry of entries) {
-        const frame = entry.target;
+    const nearbyFrames = new Set();
+    const preloadApprovedPart = () => {
+      for (const frame of nearbyFrames) {
         const index = Number(frame.dataset.pageIndex);
-        if (entry.isIntersecting && !frame.dataset.loaded) {
+        if (Math.floor(index/20)===Math.floor(approvedPage/20) && !frame.dataset.loaded) {
           frame.dataset.loaded = 'loading';
           void getPage(index).then(page => {
             if (generation !== pageRenderGeneration || !currentBook || Number(currentBook.id) !== bookId) return;
@@ -2298,50 +2389,126 @@
             void loadTextRegions(index, {cachedOnly:true, parse:true});
           }).catch(() => { frame.dataset.loaded = ''; });
         }
-        if (entry.isIntersecting && (!best || entry.intersectionRatio > best.ratio)) {
-          best = {index, ratio: entry.intersectionRatio};
+      }
+    };
+    verticalPreloadObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) nearbyFrames.add(entry.target);
+        else nearbyFrames.delete(entry.target);
+      }
+      preloadApprovedPart();
+    }, {root:$('mangaV2Viewport'), rootMargin:'120% 0px'});
+
+    const updateVisiblePage = index => {
+      approvedPage=index;
+      if (index !== currentPage) clearMangaTransientOverlays();
+      if (index > currentPage) void markReadThrough(index - 1);
+      currentPage = index;
+      updatePageLabel();
+      preloadApprovedPart();
+      for (const frame of pages.querySelectorAll('.manga-v2-page-frame[data-loaded="1"]')) {
+        const frameIndex = Number(frame.dataset.pageIndex);
+        if (nearbyFrames.has(frame) || Math.abs(frameIndex - currentPage) <= 3) continue;
+        frame.innerHTML = `<div class="manga-v2-page-placeholder">${frameIndex + 1}</div>`;
+        delete frame.dataset.loaded;
+        pageCache.delete(`${bookId}:${frameIndex}`);
+      }
+      clearTimeout(verticalPersistTimer);
+      verticalPersistTimer = setTimeout(() => void persistVisiblePage(), 250);
+    };
+    let partApprovalPending = false;
+    // IntersectionObserver only reports entries whose visibility changed. Keep
+    // the last ratio of every tracked page and pick the most visible page among
+    // all of them, not just among the changed entries.
+    const pageVisibility = new Map();
+    verticalObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        const index = Number(entry.target?.dataset?.pageIndex);
+        if (!Number.isInteger(index)) continue;
+        if (entry.isIntersecting && entry.intersectionRatio > 0) pageVisibility.set(index, Number(entry.intersectionRatio));
+        else pageVisibility.delete(index);
+      }
+      let best = null;
+      for (const [index, ratio] of pageVisibility) {
+        // Ties keep the current page, otherwise the lower index (reading order).
+        if (!best || ratio > best.ratio ||
+            (ratio === best.ratio && index !== best.index && (index === currentPage || (best.index !== currentPage && index < best.index)))) {
+          best = {index, ratio};
         }
       }
+      if (best && Math.floor(best.index/20)!==Math.floor(approvedPage/20)) {
+        if (partApprovalPending) return;
+        partApprovalPending = true;
+        const target=best.index;
+        void requireMangaPart(target).then(ok=>{
+          if (generation!==pageRenderGeneration || Number(currentBook?.id)!==bookId) return;
+          if(ok) updateVisiblePage(target);
+          else pages.querySelector(`[data-page-index="${approvedPage}"]`)?.scrollIntoView({block:'center'});
+        }).finally(()=>{partApprovalPending=false;});
+        return;
+      }
       if (best) {
-        if (best.index !== currentPage) clearMangaTransientOverlays();
-        if (best.index > currentPage) void markReadThrough(best.index - 1);
-        currentPage = best.index;
-        updatePageLabel();
-        for (const frame of pages.querySelectorAll('.manga-v2-page-frame[data-loaded="1"]')) {
-          const index = Number(frame.dataset.pageIndex);
-          if (Math.abs(index - currentPage) <= 3) continue;
-          frame.innerHTML = `<div class="manga-v2-page-placeholder">${index + 1}</div>`;
-          delete frame.dataset.loaded;
-          pageCache.delete(`${bookId}:${index}`);
-        }
-        clearTimeout(verticalPersistTimer);
-        verticalPersistTimer = setTimeout(() => void persistVisiblePage(), 250);
+        updateVisiblePage(best.index);
       }
     }, {
       root: $('mangaV2Viewport'),
-      rootMargin: '120% 0px 120% 0px',
+      rootMargin: '0px',
       threshold: [0.05, 0.25, 0.5, 0.75]
     });
-    for (const frame of pages.querySelectorAll('.manga-v2-page-frame')) verticalObserver.observe(frame);
+    for (const frame of pages.querySelectorAll('.manga-v2-page-frame')) {
+      verticalObserver.observe(frame);
+      verticalPreloadObserver.observe(frame);
+    }
     requestAnimationFrame(() => {
       const target = pages.querySelector(`[data-page-index="${currentPage}"]`);
       target?.scrollIntoView({block: 'center'});
     });
   }
 
-  async function showCurrent() {
+  let approvedPage = 0;
+  let mangaGatePromise = null;
+  const approvedMangaParts = new Set();
+  let bookOpenGeneration = 0;
+  async function requireMangaPart(index){
+    const bookId=Number(currentBook?.id);if(!bookId)return false;
+    const requested=Math.floor(Number(index)/20)*20;
+    const key=`${bookId}:${requested}`;
+    if(approvedMangaParts.has(key))return true;
+    if(mangaGatePromise)return false;
+    mangaGatePromise=window.PudgeReviewGate.require('manga',bookId,requested);
+    try{
+      const approved=await mangaGatePromise && Number(currentBook?.id)===bookId;
+      if(approved)approvedMangaParts.add(key);
+      return approved;
+    }
+    finally{mangaGatePromise=null;}
+  }
+  async function showCurrent(options = {}) {
+    if(!options.reviewApproved&&!await requireMangaPart(currentPage)){currentPage=approvedPage;updatePageLabel();return false;}
+    approvedPage=currentPage;
     applyReaderSettings();
     if (settings.mode === 'vertical') await renderVertical();
     else await renderPaged();
   }
 
-  async function openBook(bookId) {
+  async function openBook(bookId, options = {}) {
+    const entryGeneration = ++bookOpenGeneration;
+    const pendingState = await API().manga_state();
+    if (entryGeneration !== bookOpenGeneration) return false;
+    const pendingBook = (pendingState.books || []).find(book => Number(book.id) === Number(bookId));
+    if (!pendingBook) return false;
+    const approved = await window.PudgeReviewGate.require('manga', Number(bookId), Math.floor(Number(pendingBook.position || 0) / 20) * 20);
+    if (entryGeneration !== bookOpenGeneration || !approved) return false;
+    approvedMangaParts.clear();
+    approvedMangaParts.add(`${Number(bookId)}:${Math.floor(Number(pendingBook.position || 0) / 20) * 20}`);
+    if (options.pageOnOpen) window.setPage?.(options.pageOnOpen);
     clearMangaTransientOverlays();
-    state = await API().manga_state();
+    state = pendingState;
     hydratePersistedStatusPreferences(state?.reader_preferences);
-    currentBook = (state.books || []).find(book => Number(book.id) === Number(bookId));
+    currentBook = pendingBook;
     if (!currentBook) return;
     currentPage = Number(currentBook.position || 0);
+    approvedPage=currentPage;
     currentPageCount = Number(currentBook.page_count || 0);
     pageCache = new Map();
     textRegionCache = new Map();
@@ -2397,19 +2564,24 @@
         }
       }
     })();
-    await showCurrent();
+    await showCurrent({reviewApproved:true});
     void ocrStatusPromise;
     void ensureCurrentBookPrepared();
   }
 
   function closeReader() {
+    bookOpenGeneration += 1;
+    approvedMangaParts.clear();
+    window.PudgeAssistant?.close?.();
     textGeneration += 1;
     pageRenderGeneration += 1;
     stopPreparationPoll();
     closePagePicker();
     if (toolbarPeekTimer) clearTimeout(toolbarPeekTimer);
     if (verticalObserver) verticalObserver.disconnect();
+    if (verticalPreloadObserver) verticalPreloadObserver.disconnect();
     verticalObserver = null;
+    verticalPreloadObserver = null;
     window.PudgeReadingTools?.closeAll?.();
     $('mangaV2Pages')?.replaceChildren();
     pageCache = new Map();
@@ -3614,6 +3786,10 @@
       if (group) {
         event.preventDefault();
         event.stopImmediatePropagation();
+        if (!event.metaKey && window.PudgeLnLibrary?.openCustom) {
+          openMangaVolumesPanel(String(group.key));
+          return;
+        }
         toggleSeriesSelection(group.books);
         return;
       }
@@ -3979,7 +4155,7 @@
 
   document.addEventListener('keydown', event => {
     if (!$('mangaReaderV2')?.classList.contains('open')) return;
-    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
+    if (event.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
 
     const nextKey = settings.direction === 'rtl' ? 'ArrowLeft' : 'ArrowRight';
     const previousKey = settings.direction === 'rtl' ? 'ArrowRight' : 'ArrowLeft';
@@ -4243,6 +4419,7 @@
   document.addEventListener('keydown', event => {
     const reader = mangaReaderNode();
     if (!reader?.classList.contains('open')) return;
+    if (event.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
     if (!event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
     if (event.key !== 'D' && event.key !== 'd') return;
     event.preventDefault();

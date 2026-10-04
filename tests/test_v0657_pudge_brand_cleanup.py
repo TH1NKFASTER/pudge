@@ -9,7 +9,7 @@ from pudge.database import Database
 from pudge.library import scan_library
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from scripts.migrations.legacy_anime_mpv import migrate_paths, rewrite_config
+from pudge.legacy_install import migrate_paths, rewrite_config
 
 ROOT = Path(__file__).parents[1]
 
@@ -22,10 +22,11 @@ def test_product_is_now_pudge_with_legacy_migration_metadata() -> None:
     assert "anime-mpv" in LEGACY_APP_SLUGS
 
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'scripts/migrations/legacy_anime_mpv.py" paths' in installer
-    assert 'scripts/migrations/legacy_anime_mpv.py" config' in installer
+    assert 'pudge/legacy_install.py" paths' in installer
+    assert 'pudge/legacy_install.py" config' in installer
     assert 'killall Dock' in installer
-    assert 'ln -s "$APP_PATH" "$legacy_app"' in installer
+    assert 'pudge/mac_app_aliases.py' in installer
+    assert 'ln -s "$APP_PATH" "$legacy_app"' not in installer
     assert 'APP_PATH="$APP_DIR/$APP_NAME.app"' in installer
 
 

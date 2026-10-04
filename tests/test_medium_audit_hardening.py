@@ -13,7 +13,10 @@ from pudge.download_intents import DownloadIntentStore
 from pudge.light_novels import LightNovelError, LightNovelService
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem
-from scripts import run_test_batch
+import importlib.util
+_batch_spec = importlib.util.spec_from_file_location("pudge_release_batch", Path(__file__).resolve().parents[1] / ".github/release/run_test_batch.py")
+run_test_batch = importlib.util.module_from_spec(_batch_spec)
+_batch_spec.loader.exec_module(run_test_batch)
 
 
 def _ln_service(tmp_path: Path) -> LightNovelService:

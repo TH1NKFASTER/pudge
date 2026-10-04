@@ -3,6 +3,8 @@ from __future__ import annotations
 import urllib.request
 from pathlib import Path
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime
@@ -176,7 +178,7 @@ def test_play_deduplicates_same_video(tmp_path: Path, monkeypatch) -> None:
         calls.append((command, kwargs))
         return process
 
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
+    patch_webapp_popen(monkeypatch, fake_popen)
 
     first = api.play(str(video))
     second = api.play(str(video))
@@ -410,7 +412,7 @@ def test_foreground_poll_checks_downloads_without_running_heavy_subtitles(tmp_pa
         lambda limit=4: (_ for _ in ()).throw(AssertionError("foreground must not run subtitle jobs")),
     )
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert calls == ["downloads"]
     assert result["stats"] == {"downloads": 2, "subs": 0}
@@ -531,7 +533,7 @@ def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, mo
         calls.append(command)
         return FakeProcess()
 
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
+    patch_webapp_popen(monkeypatch, fake_popen)
 
     api.play(str(video))
     command = calls[0]
@@ -672,7 +674,7 @@ def test_play_does_not_use_stale_subtitle_from_non_ready_episode(
         calls.append(command)
         return FakeProcess()
 
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", fake_popen)
+    patch_webapp_popen(monkeypatch, fake_popen)
 
     api.play(str(video))
     command = calls[0]
@@ -1025,10 +1027,19 @@ def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> No
     assert "if(ui.state.settings.onboarding_completed)void startupSequence();else showOnboarding(false);" in html
 
 
-def test_final_pipeline_cache_schema_bumped_for_cold_open_fix() -> None:
+def test_final_pipeline_cache_schema_bumped_for_cold_open_fix(tmp_path: Path, monkeypatch) -> None:
     from pudge import pipeline_cache
 
-    assert pipeline_cache._CACHE_SCHEMA == "final-pipeline-v10"
+    video = tmp_path / "video.mkv"
+    video.write_bytes(b"fixture")
+    config = AppConfig(config_path=tmp_path / "config.toml")
+    config.paths.cache_dir = tmp_path / "cache"
+    current = pipeline_cache._CACHE_SCHEMA
+    monkeypatch.setattr(pipeline_cache, "_CACHE_SCHEMA", "final-pipeline-v9")
+    pipeline_cache.save_final_pipeline_result(video, config, subtitle=None, subtitle_id=2, source="embedded")
+    assert pipeline_cache.load_final_pipeline_result(video, config) is not None
+    monkeypatch.setattr(pipeline_cache, "_CACHE_SCHEMA", current)
+    assert pipeline_cache.load_final_pipeline_result(video, config) is None
 
 
 
@@ -1221,7 +1232,7 @@ def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -
     subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
     calls: list[list[str]] = []
 
-    monkeypatch.setattr("pudge.web_app.subprocess.Popen", lambda command, *args, **kwargs: calls.append(command))
+    patch_webapp_popen(monkeypatch, lambda command, *args, **kwargs: calls.append(command))
 
     result = api.reveal_subtitle_file(str(subtitle))
 

@@ -4,6 +4,8 @@ import logging
 import threading
 from pathlib import Path
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryEpisode
@@ -98,8 +100,8 @@ def test_play_uses_history_subtitle_on_same_recovery_launch(
         def poll(self):
             return None
 
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    patch_webapp_popen(
+        monkeypatch,
         lambda command, **_kwargs: calls.append(command) or FakeProcess(),
     )
 

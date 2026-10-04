@@ -9,10 +9,10 @@ from pudge.manager import AnimeManager
 def test_open_book_never_pre_disables_volume_ocr_before_page_render() -> None:
     root = Path(__file__).resolve().parents[1]
     js = (root / 'pudge/web/manga_reader_v2.js').read_text(encoding='utf-8')
-    start = js.index('async function openBook(bookId)')
+    start = js.index('async function openBook(')
     end = js.index('function closeReader()', start)
     block = js[start:end]
-    show_at = block.index('await showCurrent();')
+    show_at = block.index('await showCurrent({reviewApproved:true});')
     before_render = block[:show_at]
     assert 'ocrButton.disabled = true' not in before_render
     assert 'ocrButton.disabled = false' in before_render

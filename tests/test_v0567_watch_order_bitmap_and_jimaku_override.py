@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.cli import _find_online_subtitles
 from pudge.config import AppConfig, write_config
 from pudge.database import Database
@@ -123,8 +125,8 @@ def test_bitmap_subtitle_is_not_on_ready_home_and_only_library_can_enable_it(
             return None
 
     commands: list[list[str]] = []
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    patch_webapp_popen(
+        monkeypatch,
         lambda command, **kwargs: commands.append(command) or FakeProcess(),
     )
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pudge.config import AppConfig
+from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, NyaaRelease
 from pudge.providers.nyaa import _leecher_activity_bonus
@@ -58,6 +59,8 @@ class FakeQbt:
 
     def torrent_status(self, torrent_hash: str):
         key = torrent_hash.casefold()
+        if key in {value.casefold() for value in self.deleted}:
+            return None
         if key not in {value.casefold() for value in self.added}:
             return None
         if key in self.live:
@@ -93,20 +96,6 @@ class FakeQbt:
         pass
 
 
-class FakeDb:
-    def __init__(self) -> None:
-        self.recorded: list[str] = []
-
-    def get_anime(self, media_id: int):
-        return ANIME if media_id == ANIME.media_id else None
-
-    def record_release(self, info_hash, media_id, episode, title, score) -> None:
-        self.recorded.append(info_hash)
-
-    def upsert_download(self, item) -> None:
-        pass
-
-
 def manager(tmp_path: Path, qbt: FakeQbt) -> AnimeManager:
     obj = object.__new__(AnimeManager)
     cfg = AppConfig()
@@ -115,7 +104,8 @@ def manager(tmp_path: Path, qbt: FakeQbt) -> AnimeManager:
     cfg.library.root_dir = tmp_path / "library"
     cfg.paths.cache_dir = tmp_path / "cache"
     obj.config = cfg
-    obj.db = FakeDb()
+    obj.db = Database(tmp_path / "library.sqlite3")
+    obj.db.upsert_anime(ANIME)
     obj.log = lambda _message: None
     obj.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
     obj.qbt_client = lambda: qbt
@@ -183,3 +173,7 @@ def test_race_starts_alternatives_after_dead_top_one_and_keeps_best_live(
     assert qbt.added == ["best", "second", "third"]
     assert set(qbt.deleted) == {"best", "third"}
     assert qbt.metadata == ["second"]
+    assert m.db.release_metadata_by_hash("second") is not None
+    assert m.db.download_by_hash("best") is None
+    assert m.db.download_by_hash("third") is None
+    assert "_race_id" not in m.db.download_by_hash("second").raw

@@ -193,5 +193,5 @@ def test_frontend_bundled_key_and_documentation_contracts() -> None:
     assert "secrets.PUDGE_TRIAL_JIMAKU_API_KEY" in workflow
     assert 'test -n "$PUDGE_TRIAL_JIMAKU_API_KEY"' in workflow
     assert "PUDGE_TRIAL_JIMAKU_PROXY_URL" not in trial + build
-    assert (ROOT / "docs/USER_GUIDE.md").is_file()
-    assert (ROOT / "docs/ALGORITHMS.md").is_file()
+    assert not (ROOT / "docs").exists()
+    assert (ROOT / "CONTRIBUTING.md").is_file()

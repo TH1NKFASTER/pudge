@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from desktop_isolation import patch_webapp_popen
+
 from pudge.relation_graphs import compact_relations_from_graph
 from pudge.web_app import WebAppApi
 
@@ -50,8 +52,8 @@ def test_image_subtitle_click_reveals_external_or_embedded_source() -> None:
 def test_reveal_subtitle_accepts_pgs_and_embedded_video(tmp_path: Path, monkeypatch) -> None:
     api = WebAppApi(tmp_path / "config.toml")
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    patch_webapp_popen(
+        monkeypatch,
         lambda command, *args, **kwargs: calls.append(command),
     )
 

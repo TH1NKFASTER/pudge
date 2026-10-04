@@ -169,7 +169,7 @@ def test_review_gate_front_back_contract_and_jiten_details() -> None:
 def test_review_gate_advances_to_prefetched_next_card_before_network_result() -> None:
     source = (WEB / "review_gate.js").read_text(encoding="utf-8")
     shift = source.index("cardQueue.shift();")
-    submit = source.index("await window.pywebview.api.review_gate_review(", shift)
+    submit = source.index("await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(", shift)
     render_next = source.index("render({loading:false}, {replaceCards:false});", shift)
     assert shift < render_next < submit
     assert "button.disabled = saving || !cardAuthorized" in source
@@ -253,6 +253,10 @@ class _PlaybackLauncher:
     def terminate(self) -> None:
         self.terminated = True
 
+    def wait(self, timeout=None):
+        self.code = 0
+        return self.code
+
 
 def _play_api(tmp_path: Path, *, age: float, ack_file: Path) -> tuple[WebAppApi, str, _PlaybackLauncher]:
     api = object.__new__(WebAppApi)
@@ -276,7 +280,7 @@ def test_review_count_is_optimistic_before_jiten_round_trip() -> None:
     submit = source.split("  async function submitGrade(grade) {", 1)[1].split("\n  async function open(", 1)[0]
     optimistic = submit.index("optimisticReviewed += 1;")
     repaint = submit.index("render({loading:false}, {replaceCards:false});", optimistic)
-    network = submit.index("await window.pywebview.api.review_gate_review(", repaint)
+    network = submit.index("await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(", repaint)
     assert optimistic < repaint < network
     assert "review_optimistic" in submit
     assert "review_optimistic_confirm" in submit
@@ -321,7 +325,10 @@ def test_play_starting_times_out_instead_of_sticking_forever(tmp_path: Path) -> 
 def test_run_mpv_writes_spawn_ack_and_logs_lifecycle(tmp_path: Path, monkeypatch) -> None:
     ack = tmp_path / "spawn.json"
     fake = _PlaybackLauncher(pid=7777, code=0)
-    fake.wait = lambda: 0  # type: ignore[attr-defined]
+    waited = []
+    fake.wait = lambda: waited.append(fake.pid) or 0  # type: ignore[attr-defined]
+    # Isolate fake playback PIDs from macOS's ps and real host processes.
+    monkeypatch.setattr("pudge.process_cleanup.process_snapshot", lambda: {})
     monkeypatch.setattr(player.subprocess, "Popen", lambda *_args, **_kwargs: fake)
     monkeypatch.setattr(player, "_focus_mpv_process", lambda _pid: None)
     monkeypatch.setenv("PUDGE_MPV_START_ACK", str(ack))
@@ -329,6 +336,7 @@ def test_run_mpv_writes_spawn_ack_and_logs_lifecycle(tmp_path: Path, monkeypatch
     code = player.run_mpv(["mpv", "--", "video.mkv"], focus=True)
 
     assert code == 0
+    assert waited == [7777]
     payload = json.loads(ack.read_text(encoding="utf-8"))
     assert payload["pid"] == 7777
     assert float(payload["started_at"]) > 0

@@ -168,6 +168,9 @@ def test_cleanup_repairs_missing_hash_before_deleting_koukaku(tmp_path: Path, mo
         def __init__(self) -> None:
             self.deleted: list[tuple[str, bool]] = []
 
+        def torrent_status(self, torrent_hash: str):
+            return None if any(hash_ == torrent_hash for hash_, _delete_files in self.deleted) else {"hash": torrent_hash, "progress": 1.0}
+
         def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
             self.deleted.append((torrent_hash, delete_files))
 

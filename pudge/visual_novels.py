@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import sys
+import json
 import platform
 import re
 import tempfile
@@ -46,6 +49,8 @@ class VisualNovelService:
         self._generation = 0
         self._window_id = 0
         self._window_title = ""
+        self._picker_session: Any = None
+        self._selection_stop = threading.Event()
         self._dialogue_region = self._DEFAULT_DIALOGUE_REGION
         self._state: dict[str, Any] = {
             "running": False,
@@ -262,7 +267,34 @@ class VisualNovelService:
             state["running"] = bool(self._thread and self._thread.is_alive())
         return state
 
-    def start(self, window_id: int, title: str = "") -> dict[str, Any]:
+    def start_with_picker(self, title: str = "") -> dict[str, Any]:
+        if platform.system() != "Darwin":
+            raise VisualNovelError("The Visual Novel reader requires macOS", code="unsupported_platform")
+        from .screen_capture_picker import WindowPickerSession
+
+        self.stop()
+        selection_stop = threading.Event()
+        with self._lock:
+            self._selection_stop = selection_stop
+        session = WindowPickerSession()
+        try:
+            content_filter = session.select(selection_stop)
+            configuration = self._configuration_for_filter(content_filter, content_filter.contentRect())
+            getter = getattr(content_filter, "includedWindows", None)
+            windows = list(getter() or []) if getter is not None else []
+            window = windows[0] if windows else None
+            window_id = int(window.windowID()) if window is not None else 0
+            selected_title = str(window.title() or "") if window is not None else ""
+            if selection_stop.is_set():
+                raise VisualNovelError("Window selection cancelled", code="cancelled")
+            return self.start(window_id, title or selected_title or "Visual Novel",
+                              capture_target=(content_filter, configuration), picker_session=session)
+        except BaseException:
+            session.close()
+            raise
+
+    def start(self, window_id: int, title: str = "", *, capture_target: Any = None,
+              picker_session: Any = None) -> dict[str, Any]:
         if platform.system() != "Darwin":
             raise VisualNovelError("The Visual Novel reader requires macOS", code="unsupported_platform")
         self.stop()
@@ -281,6 +313,7 @@ class VisualNovelService:
             generation = self._generation
             self._window_id = int(window_id)
             self._window_title = str(title or "Visual Novel")
+            self._picker_session = picker_session
             self._transcript.clear()
             stop_event = threading.Event()
             self._stop_event = stop_event
@@ -291,6 +324,7 @@ class VisualNovelService:
                 "error_code": "",
                 "capture_backend": "screencapturekit",
                 "screen_recording_preflight": preflight,
+                "capture_selection": "system_picker" if picker_session is not None else "window_list",
                 "current_text": "",
                 "current_text_id": 0,
                 "speaker_text": "",
@@ -306,7 +340,8 @@ class VisualNovelService:
             }
             thread = threading.Thread(
                 target=self._capture_loop,
-                args=(stop_event, generation, int(window_id)),
+                args=((stop_event, generation, int(window_id), capture_target) if capture_target is not None
+                      else (stop_event, generation, int(window_id))),
                 name=f"visual-novel-reader-{generation}",
                 daemon=True,
             )
@@ -318,9 +353,14 @@ class VisualNovelService:
         with self._lock:
             stop_event = self._stop_event
             thread = self._thread
+            self._selection_stop.set()
+            picker_session = self._picker_session
+            self._picker_session = None
         stop_event.set()
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=self._ASYNC_TIMEOUT_SECONDS + 0.5)
+        if picker_session is not None:
+            picker_session.close()
         with self._lock:
             if self._thread is thread and (thread is None or not thread.is_alive()):
                 self._thread = None
@@ -384,6 +424,32 @@ class VisualNovelService:
             if time.monotonic() >= deadline:
                 raise VisualNovelError(timeout_message, code="capture_timeout")
 
+    def _capture_error_diagnostic(self, error: Any, phase: str) -> dict[str, Any]:
+        def field(name: str) -> Any:
+            try:
+                value = getattr(error, name, None)
+                return value() if callable(value) else value
+            except Exception:
+                return None
+        identity = {"pid": os.getpid(), "executable": sys.executable, "bundle_id": ""}
+        try:
+            from Foundation import NSBundle
+            identity["bundle_id"] = str(NSBundle.mainBundle().bundleIdentifier() or "")
+            identity["bundle_path"] = str(NSBundle.mainBundle().bundlePath() or "")
+            from AppKit import NSRunningApplication
+            executable_url = NSRunningApplication.currentApplication().executableURL()
+            identity["native_executable"] = str(executable_url.path() or "") if executable_url else ""
+        except Exception:
+            pass
+        diagnostic = {"phase": phase, "domain": str(field("domain") or ""),
+                      "code": field("code"), "preflight": self._screen_recording_access(),
+                      "caller": identity}
+        with self._lock:
+            self._state["capture_error_diagnostic"] = diagnostic
+        if self.logger:
+            self.logger.warning("EVENT vn.capture_error %s", json.dumps(diagnostic, default=str))
+        return diagnostic
+
     def _shareable_content(self, stop_event: threading.Event) -> Any:
         try:
             from ScreenCaptureKit import SCShareableContent  # type: ignore
@@ -412,6 +478,7 @@ class VisualNovelService:
             else:
                 SCShareableContent.getShareableContentWithCompletionHandler_(completed)
         except Exception as exc:
+            self._capture_error_diagnostic(exc, "enumerate")
             code = self._screen_capture_error_code(exc)
             raise VisualNovelError(
                 f"ScreenCaptureKit could not enumerate shareable windows: {exc}",
@@ -427,6 +494,7 @@ class VisualNovelService:
         error = result.get("error")
         content = result.get("content")
         if error is not None or content is None:
+            self._capture_error_diagnostic(error, "enumerate")
             detail = self._objc_error_text(error) or "shareable content was unavailable"
             code = self._screen_capture_error_code(error)
             raise VisualNovelError(
@@ -437,7 +505,7 @@ class VisualNovelService:
 
     def _capture_target(self, window_id: int, stop_event: threading.Event) -> tuple[Any, Any]:
         try:
-            from ScreenCaptureKit import SCContentFilter, SCStreamConfiguration  # type: ignore
+            from ScreenCaptureKit import SCContentFilter  # type: ignore
         except ImportError as exc:
             raise VisualNovelError(
                 "ScreenCaptureKit support is not installed in the Pudge runtime.",
@@ -462,31 +530,34 @@ class VisualNovelService:
 
         try:
             content_filter = SCContentFilter.alloc().initWithDesktopIndependentWindow_(target)
-            configuration = SCStreamConfiguration.alloc().init()
-            frame = target.frame()
-            point_scale = 1.0
-            scale_getter = getattr(content_filter, "pointPixelScale", None)
-            if scale_getter is not None:
-                try:
-                    point_scale = max(1.0, float(scale_getter()))
-                except Exception:
-                    point_scale = 1.0
-            width = max(1, int(round(float(frame.size.width) * point_scale)))
-            height = max(1, int(round(float(frame.size.height) * point_scale)))
-            largest = max(width, height)
-            if largest > self._MAX_CAPTURE_DIMENSION:
-                shrink = self._MAX_CAPTURE_DIMENSION / float(largest)
-                width = max(1, int(round(width * shrink)))
-                height = max(1, int(round(height * shrink)))
-            configuration.setWidth_(width)
-            configuration.setHeight_(height)
-            configuration.setShowsCursor_(False)
+            configuration = self._configuration_for_filter(content_filter, target.frame())
         except Exception as exc:
             raise VisualNovelError(
                 f"ScreenCaptureKit could not configure the selected window: {exc}",
                 code="capture_backend_error",
             ) from exc
         return content_filter, configuration
+
+    def _configuration_for_filter(self, content_filter: Any, frame: Any) -> Any:
+        from ScreenCaptureKit import SCStreamConfiguration
+
+        configuration = SCStreamConfiguration.alloc().init()
+        scale_getter = getattr(content_filter, "pointPixelScale", None)
+        try:
+            point_scale = max(1.0, float(scale_getter())) if scale_getter is not None else 1.0
+        except Exception:
+            point_scale = 1.0
+        width = max(1, int(round(float(frame.size.width) * point_scale)))
+        height = max(1, int(round(float(frame.size.height) * point_scale)))
+        if max(width, height) > self._MAX_CAPTURE_DIMENSION:
+            shrink = self._MAX_CAPTURE_DIMENSION / float(max(width, height))
+            width, height = max(1, int(round(width * shrink))), max(1, int(round(height * shrink)))
+        configuration.setWidth_(width)
+        configuration.setHeight_(height)
+        configuration.setShowsCursor_(False)
+        if hasattr(configuration, "setCapturesAudio_"):
+            configuration.setCapturesAudio_(False)
+        return configuration
 
     def _capture_window(
         self,
@@ -531,6 +602,7 @@ class VisualNovelService:
                 completed,
             )
         except Exception as exc:
+            self._capture_error_diagnostic(exc, "capture")
             code = self._screen_capture_error_code(exc)
             raise VisualNovelError(
                 f"ScreenCaptureKit screenshot request failed: {exc}",
@@ -545,6 +617,7 @@ class VisualNovelService:
         )
         error = result.get("error")
         if error is not None:
+            self._capture_error_diagnostic(error, "capture")
             detail = self._objc_error_text(error) or "screenshot failed"
             code = self._screen_capture_error_code(error)
             raise VisualNovelError(
@@ -670,6 +743,7 @@ class VisualNovelService:
         stop_event: threading.Event,
         generation: int,
         window_id: int,
+        capture_target: Any = None,
     ) -> None:
         last_hash = ""
         last_change = time.monotonic()
@@ -680,12 +754,27 @@ class VisualNovelService:
         candidate_since = 0.0
         committed_candidate = ""
         first_frame_logged = False
+        stream_source = None
+        with self._lock:
+            picker_session = self._picker_session if generation == self._generation else None
         try:
-            content_filter, configuration = self._capture_target(window_id, stop_event)
+            content_filter, configuration = capture_target or self._capture_target(window_id, stop_event)
+            if capture_target is not None:
+                from .screen_capture_stream import StreamFrameSource
+                stream_source = StreamFrameSource(diagnostic=self._capture_error_diagnostic)
+                with self._lock:
+                    if generation == self._generation:
+                        self._state["capture_method"] = "stream"
+                stream_source.start(content_filter, configuration, stop_event, timeout=self._ASYNC_TIMEOUT_SECONDS)
+                if self.logger:
+                    self.logger.info("EVENT vn.stream_started generation=%s picker=%s", generation, picker_session is not None)
             with tempfile.TemporaryDirectory(prefix="pudge-vn-") as temp_dir:
                 frame_path = Path(temp_dir) / "frame.png"
                 while not stop_event.is_set() and self._is_current_generation(generation):
-                    self._capture_window(frame_path, content_filter, configuration, stop_event)
+                    if stream_source is not None:
+                        stream_source.capture(frame_path, stop_event, timeout=self._ASYNC_TIMEOUT_SECONDS)
+                    else:
+                        self._capture_window(frame_path, content_filter, configuration, stop_event)
                     with Image.open(frame_path) as opened:
                         image = opened.convert("RGBA")
                     fingerprint = self._frame_roi_fingerprint(image)
@@ -789,3 +878,13 @@ class VisualNovelService:
                             "error_code": "capture_error",
                         }
                     )
+        finally:
+            try:
+                if stream_source is not None:
+                    stream_source.close()
+            finally:
+                if picker_session is not None:
+                    with self._lock:
+                        if self._picker_session is picker_session:
+                            self._picker_session = None
+                    picker_session.close()

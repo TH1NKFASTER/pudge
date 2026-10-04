@@ -28,6 +28,7 @@ def test_provider_settings_are_migrated_and_managed_irodori_hides_api_details(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     api.light_novels.save_settings({"irodori_tts_enabled": True, "irodori_tts_caption": "calm"})
     settings = api.light_novels.settings_payload()
     assert settings["audiobook_generation_provider"] == "irodori"
@@ -109,6 +110,7 @@ def test_generation_progress_uses_characters_chunks_long_chapters_and_survives_c
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     api.light_novels.save_settings({"audiobook_generation_provider": "irodori"})
     text = "猫が好きです。" * 1000
     book_id = 77
@@ -158,6 +160,7 @@ def test_422_error_body_is_preserved_and_managed_caption_has_compat_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     runtime = {
         "provider": "irodori",
         "base_url": "http://127.0.0.1:8088",
@@ -196,6 +199,7 @@ def test_failed_generation_state_remains_visible_until_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     job_id = api.job_center.start("audiobook_generation", "test", total=100)
     api.job_center.update(job_id, current=40, total=100)
     api.job_center.fail(job_id, RuntimeError("HTTP 422 — bad request"))
@@ -213,6 +217,7 @@ def test_install_status_only_marks_update_when_remote_revision_differs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
     repo = api._irodori_repo_dir()
     (repo / ".git").mkdir(parents=True)
     python = api._irodori_managed_python()

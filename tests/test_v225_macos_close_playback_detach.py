@@ -54,4 +54,7 @@ def test_detached_cli_owns_foreground_marker_for_full_playback_lifetime() -> Non
 
     player = Path("pudge/player.py").read_text(encoding="utf-8")
     run = player[player.index("def run_mpv(") :]
-    assert "return process.wait()" in run
+    assert "wait_playback_process(process" in run
+    supervisor = Path("pudge/playback_process.py").read_text(encoding="utf-8")
+    assert "return process.wait()" in supervisor
+    assert "stop_playback_process(process, tree=tree" in supervisor

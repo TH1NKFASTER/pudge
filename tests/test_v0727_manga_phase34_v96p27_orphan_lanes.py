@@ -1,193 +1,171 @@
-"""v96p27: physical candidate discovery and strict OCR-consensus guards."""
-from __future__ import annotations
+"""Generated regressions for missed leading/fused lanes and clipped donors."""
 
-import json
-import os
+from copy import deepcopy
+
 import pytest
-from pathlib import Path
-
 from PIL import Image, ImageDraw
+from synthetic_ocr import Readings, forbidden, glyphs, leading_scene, merged_scene, region
 
+from pudge import manga
 from pudge import manga_ocr_worker as worker
 
-_FIXTURES = Path(os.environ.get("PUDGE_V96P27_FIXTURES", Path(__file__).resolve().parents[2] / "v96p27-work"))
+
+@pytest.mark.parametrize("offset", [-120, 0, 160])
+def test_three_independent_components_recover_leading_text_and_keep_tail(offset):
+    image, rows = leading_scene(offset=offset)
+    with image:
+        before = deepcopy(rows)
+        proposals = worker._orphan_bold_leading_lanes(image, rows)
+        assert len(proposals) == 1
+        assert len(proposals[0]["provenance"]["component_bboxes_px"]) == 3
+        model = Readings(["星を見る"] * 3)
+        result = worker._recover_orphan_vertical_lanes(model, image, rows)
+        assert result[: len(rows)] == before == rows
+        assert result[-1]["text"] == "星を見る"
+        assert result[-1]["recognizer_retry"] == "orphan-vertical-consensus-v1"
+        assert result[-1]["segments"] and len(model.calls) == 3
+        assert worker._recover_orphan_vertical_lanes(forbidden, image, result) == result
 
 
-def _baseline(page: int):
-    if not (_FIXTURES / "pages" / f"page_{page:03d}.png").is_file():
-        pytest.skip("v96p27 real-image fixtures are only supplied by installer")
-    image = Image.open(_FIXTURES / "pages" / f"page_{page:03d}.png").convert("RGB")
-    result = json.loads((_FIXTURES / "fresh" / f"page_{page:02d}.json").read_text())
-    return image, result["data"].get("regions", [])
+@pytest.mark.parametrize("count", [0, 1, 2, 4])
+def test_leading_lane_requires_exactly_three_separate_components(count):
+    image, rows = leading_scene(count=count)
+    with image:
+        assert worker._orphan_bold_leading_lanes(image, rows) == []
+        assert worker._recover_orphan_vertical_lanes(forbidden, image, rows) == rows
 
 
-def test_physical_candidates_only_on_three_verified_pages():
-    leading = {}
-    merged = {}
-    for page in range(40):
-        image, rows = _baseline(page)
-        try:
-            a = worker._orphan_bold_leading_lanes(image, rows)
-            b = worker._orphan_merged_vertical_lanes(image, rows)
-            if a:
-                leading[page] = [tuple(round(n) for n in worker._pixel_bbox(r, *image.size)) for r in a]
-            if b:
-                merged[page] = [tuple(round(n) for n in worker._pixel_bbox(r, *image.size)) for r in b]
-        finally:
-            image.close()
-    assert leading == {24: [(307, 112, 338, 202)]}
-    assert merged == {39: [(107, 46, 140, 244)]}
+def test_leading_lane_rejects_joined_ink_or_existing_coverage():
+    image, rows = leading_scene()
+    with image:
+        proposal = worker._orphan_bold_leading_lanes(image, rows)[0]
+        assert worker._orphan_bold_leading_lanes(image, [*rows, proposal]) == []
+        ImageDraw.Draw(image).rectangle((320, 148, 321, 226), fill="black")
+        assert worker._orphan_bold_leading_lanes(image, rows) == []
 
 
-def test_real_p24_leading_recovery_preserves_existing_tail():
-    image, old = _baseline(24)
-    try:
-        candidate = worker._recover_orphan_vertical_lanes(lambda crop: "食えば", image, old)
-        assert len(candidate) == len(old) + 1
-        assert any(row.get("text") == "食えば" and row["recognizer_retry"] == "orphan-vertical-consensus-v1" for row in candidate)
-        assert [r.get("text") for r in candidate[:len(old)]] == [r.get("text") for r in old]
-        assert worker._recover_orphan_vertical_lanes(lambda crop: "食えば", image, candidate) == candidate
-    finally:
-        image.close()
+@pytest.mark.parametrize("offset", [-100, 0, 200])
+def test_fused_lane_is_detected_from_generated_pixels(offset):
+    image, rows = merged_scene(offset=offset)
+    with image:
+        proposals = worker._orphan_merged_vertical_lanes(image, rows)
+        assert len(proposals) == 1
+        assert proposals[0]["provenance"]["component_count"] == 1
+        result = worker._recover_orphan_vertical_lanes(Readings(["空には星がある"] * 3), image, rows)
+        assert len(result) == 1 and result[0]["text"] == "空には星がある"
+        assert result[0]["segments"]
+        assert worker._recover_orphan_vertical_lanes(forbidden, image, result) == result
 
 
-def test_real_p39_complete_sentence_not_short_suffix():
-    image, old = _baseline(39)
-    try:
-        repaired = worker._recover_orphan_vertical_lanes(lambda crop: "うぬぼれるなよ", image, old)
-        assert [r.get("text") for r in repaired[len(old):]] == ["うぬぼれるなよ"]
-        assert not any(r.get("text") == "なよ" for r in repaired)
-        bad = iter(("うぬぼれるなよ", "うぬぼれるな", "うぬほれるなよ"))
-        assert worker._recover_orphan_vertical_lanes(lambda crop: next(bad), image, old) == old
-    finally:
-        image.close()
+@pytest.mark.parametrize("bad_read", ["", "ARTWORK", "星"])
+def test_unsupported_readings_do_not_create_text(bad_read):
+    for make_scene in (leading_scene, merged_scene):
+        image, rows = make_scene()
+        with image:
+            assert worker._recover_orphan_vertical_lanes(lambda _crop: bad_read, image, rows) == rows
 
 
-def test_real_p25_only_low_confidence_clipped_donor_is_reexamined():
-    image, old = _baseline(25)
-    try:
-        repaired = worker._recover_low_confidence_clipped_vertical_donors(
-            lambda crop: "一生海から", image, old,
+def test_merged_lane_uses_asymmetric_context_only_with_independent_agreement():
+    image, rows = merged_scene()
+    with image:
+        model = Readings(["空に星", "空の星", "空と星", "空には星がある", "空には星がある", "空には花がある"])
+        result = worker._recover_orphan_vertical_lanes(model, image, rows)
+        assert result[-1]["text"] == "空には星がある"
+        assert len(model.calls) == 6 and len(set(model.calls)) == 6
+        disagree = Readings(
+            ["空に星", "空の星", "空と星", "空には星がある", "空には花がある", "空にも星がある"]
         )
-        changed = [(i, row) for i, row in enumerate(repaired) if row.get("text") != old[i].get("text")]
-        assert len(changed) == 1
-        i, row = changed[0]
-        assert old[i]["text"] == "ら落ちな"
-        assert row["text"] == "一生海から"
-        assert row["recognizer_retry"] == "clipped-low-confidence-donor-consensus-v1"
-        assert row["provenance"]["observed_leading_dark_pixels"] >= 20
-        assert len(row["segments"]) >= 1
-        wrong = iter(("一生海から", "一生海まら", "一生梅から"))
-        assert worker._recover_low_confidence_clipped_vertical_donors(
-            lambda crop: next(wrong), image, old,
-        ) == old
-    finally:
-        image.close()
+        assert worker._recover_orphan_vertical_lanes(disagree, image, rows) == rows
 
 
-def test_orphan_recognizer_rejects_art_english_and_failed_consensus():
-    for page in (24, 39):
-        image, old = _baseline(page)
-        try:
-            assert worker._recover_orphan_vertical_lanes(lambda crop: "ARTWORK", image, old) == old
-            assert worker._recover_orphan_vertical_lanes(lambda crop: "", image, old) == old
-        finally:
-            image.close()
-
-
-def test_no_leading_proposal_without_three_independent_ink_components():
-    image = Image.new("RGB", (760, 1200), "white")
-    tail = {"text": "ゴム人間！！！", "source": worker._LAYOUT_LINE_SOURCE,
-            "detector": worker._LAYOUT_DETECTOR, "x":306/760,"y":1-403/1200,
-            "width":41/760,"height":144/1200}
-    try:
-        assert worker._orphan_bold_leading_lanes(image, [tail]) == []
+@pytest.mark.parametrize("obstruction", ["upstream", "both_sides"])
+def test_fused_lane_rejects_context_art(obstruction):
+    image, rows = merged_scene()
+    with image:
         draw = ImageDraw.Draw(image)
-        draw.rectangle((310,115,335,198), fill="black")
-        assert worker._orphan_bold_leading_lanes(image, [tail]) == []
-    finally:
-        image.close()
+        if obstruction == "upstream":
+            draw.rectangle((243, 122, 266, 131), fill="black")
+        else:
+            draw.rectangle((225, 150, 233, 320), fill="black")
+            draw.rectangle((276, 150, 283, 320), fill="black")
+        assert worker._orphan_merged_vertical_lanes(image, rows) == []
 
 
-def test_real_p39_asymmetric_context_recovers_when_standard_views_disagree():
-    """The actual detected merged lane extends past a symmetric crop's edge."""
-    image, old = _baseline(39)
-    try:
-        calls = []
-        def read(crop):
-            calls.append(crop.size)
-            # Existing symmetric views have widths 33, 39, 47 on this image.
-            # Independent full/tight context views recover the same 7 glyphs.
-            return "うぬぼれるなよ" if crop.size in ((36, 208), (32, 200)) else f"異読{len(calls)}"
-        repaired = worker._recover_orphan_vertical_lanes(read, image, old)
-        assert any(r.get("text") == "うぬぼれるなよ" and
-                   r.get("recognizer_retry") == "orphan-vertical-consensus-v1"
-                   for r in repaired[len(old):])
-        assert len(calls) == 6
-        assert calls[-3:] == [(36, 208), (32, 200), (39, 212)]
-    finally:
-        image.close()
+@pytest.mark.parametrize("agree", [True, False])
+def test_cleanup_retries_newly_unblocked_lane_without_dropping_input(monkeypatch, agree):
+    image, _ = merged_scene()
+    with image:
+        blocker = {**worker._orphan_merged_vertical_lanes(image, [])[0], "text": ""}
+        raw = [blocker]
+        assert worker._orphan_merged_vertical_lanes(image, raw) == []
+        monkeypatch.setattr(worker, "_finalize_worker_output_regions", lambda _rows: [])
+        monkeypatch.setattr(manga, "_finalize_recognized_regions", lambda rows: rows)
+        answers = (
+            ["空には星がある"] * 3
+            if agree
+            else ["空に星", "空の星", "空と星", "空には星がある", "空には花がある", "空にも星がある"]
+        )
+        model = Readings(answers)
+        result = worker._recover_orphan_after_worker_cleanup(model, image, raw)
+        assert result[: len(raw)] == raw
+        assert len(result) == 1 + int(agree)
+        assert len(model.calls) == (3 if agree else 6)
 
 
-def test_real_p39_contextual_retry_still_rejects_inconsistent_text():
-    image, old = _baseline(39)
-    try:
-        reads = iter(("うぬぼれ", "うぬほれ", "うぬぼれる", "うぬぼれるなよ",
-                      "うぬほれるなよ", "うぬぼれるな"))
-        assert worker._recover_orphan_vertical_lanes(lambda crop: next(reads), image, old) == old
-    finally:
-        image.close()
+def test_unchanged_cleanup_does_not_repeat_ocr():
+    image, rows = merged_scene()
+    with image:
+        assert worker._recover_orphan_after_worker_cleanup(forbidden, image, rows) == rows
 
 
-def test_real_p39_cleanup_rechecks_merged_orphan_after_transient_overlap(monkeypatch):
-    """A raw-only peer may block a genuine orphan until output suppression."""
-    image, old = _baseline(39)
-    try:
-        blocked = dict(old[0])
-        blocked.update({"text": "", "x": 105/760, "width": 38/760,
-                        "y": 1-249/1200, "height": 205/1200})
-        raw = [*old, blocked]
-        assert not worker._orphan_merged_vertical_lanes(image, raw)
-        original = worker._finalize_worker_output_regions
-        monkeypatch.setattr(worker, "_finalize_worker_output_regions",
-                            lambda rows: original([r for r in rows if r is not blocked]))
-        calls = []
-        def model(crop):
-            calls.append(crop.size)
-            return "うぬぼれるなよ"
-        repaired = worker._recover_orphan_after_worker_cleanup(model, image, raw)
-        added = repaired[len(raw):]
-        assert len(added) == 1
-        assert added[0]["text"] == "うぬぼれるなよ"
-        assert added[0]["recognizer_retry"] == "orphan-vertical-consensus-v1"
-        assert len(added[0]["segments"]) >= 5
-        assert repaired[:len(raw)] == raw
-        assert calls == [(33, 198), (39, 204), (47, 212)]
-    finally:
-        image.close()
+def _clipped_scene():
+    image = Image.new("RGB", (760, 1200), "white")
+    glyphs(image, (510, 203, 530, 290), 5)
+    row = region("には星が", (510, 220, 530, 290), confidence=0.20)
+    row.update(
+        detector="wide-vertical-text-donor-v1",
+        provenance={
+            "proposal_kind": "vertical_text_line_raw",
+            "component_count": 4,
+            "component_coverage": 0.95,
+        },
+    )
+    return image, row
 
 
-def test_real_p39_cleanup_never_invents_missing_consensus(monkeypatch):
-    image, old = _baseline(39)
-    try:
-        blocker = {"text": "", "x": 105/760, "width": 38/760,
-                   "y": 1-249/1200, "height": 205/1200}
-        raw = [*old, blocker]
-        monkeypatch.setattr(worker, "_finalize_worker_output_regions",
-                            lambda rows: [r for r in rows if r is not blocker])
-        readings = iter(("うぬぼれ", "うぬほれ", "うぬぼれる", "うぬぼれるなよ",
-                         "うぬほれるなよ", "うぬぼれるな"))
-        assert worker._recover_orphan_after_worker_cleanup(
-            lambda crop: next(readings), image, raw) == raw
-    finally:
-        image.close()
+def test_clipped_donor_recovers_only_observed_upper_ink_and_consensus():
+    image, row = _clipped_scene()
+    with image:
+        original = deepcopy(row)
+        result = worker._recover_low_confidence_clipped_vertical_donors(
+            Readings(["空には星が"] * 3), image, [row]
+        )[0]
+        assert row == original and result["text"] == "空には星が"
+        assert result["recognizer_retry"] == "clipped-low-confidence-donor-consensus-v1"
+        assert result["provenance"]["observed_leading_dark_pixels"] >= 20
+        assert result["segments"] and result["y"] == pytest.approx(row["y"], abs=1e-6)
+        assert result["height"] > row["height"]
+        assert worker._recover_low_confidence_clipped_vertical_donors(
+            Readings(["空には星が", "空には花が", "空にも星が"]), image, [row]
+        ) == [row]
 
 
-def test_real_p39_cleanup_has_no_extra_model_calls_without_removed_peers():
-    image, old = _baseline(39)
-    try:
-        def forbidden(_):
-            raise AssertionError("no OCR on unchanged output")
-        assert worker._recover_orphan_after_worker_cleanup(forbidden, image, old) == old
-    finally:
-        image.close()
+@pytest.mark.parametrize(
+    "guard", ["confidence", "detector", "count", "coverage", "prior_trim", "no_upper_ink"]
+)
+def test_clipped_donor_guards_prevent_extra_model_calls(guard):
+    image, row = _clipped_scene()
+    with image:
+        if guard == "confidence":
+            row["confidence"] = 0.9
+        elif guard == "detector":
+            row["detector"] = "other"
+        elif guard == "count":
+            row["provenance"]["component_count"] = 3
+        elif guard == "coverage":
+            row["provenance"]["component_coverage"] = 0.4
+        elif guard == "prior_trim":
+            row["provenance"]["bidirectional_peer_bleed_trim"] = True
+        else:
+            ImageDraw.Draw(image).rectangle((508, 200, 533, 219), fill="white")
+        assert worker._recover_low_confidence_clipped_vertical_donors(forbidden, image, [row]) == [row]

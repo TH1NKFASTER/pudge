@@ -5,7 +5,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HTML = ROOT / "pudge" / "web" / "index.html"
 MANGA_JS = ROOT / "pudge" / "web" / "manga_reader_v2.js"
-POLICY = ROOT / "scripts" / "compare_subtitle_alignment_stt_policies.py"
 
 
 def test_ln_and_manga_no_longer_depend_on_dense_masonry_layout() -> None:
@@ -32,10 +31,3 @@ def test_jiten_words_stop_hover_hit_testing_only_while_ln_is_actively_scrolling(
         "setTimeout(()=>{lnReaderScrollSettleTimer=null;scroller?.classList.remove('ln-reader-scrolling');},140)" in html
         or ("if(!lnReaderScrollSettleTimer)" in html and "remaining=140-(performance.now()-Number(ui.lnLastReaderScrollAt||0))" in html)
     )
-
-
-def test_stt_matrix_uses_rejected_artifact_for_offline_arbitration_and_mixes_populations() -> None:
-    source = POLICY.read_text(encoding="utf-8")
-    assert 'probe.get("output") or probe.get("rejected_output")' in source
-    assert "cases = _interleave_case_kinds(deduped)" in source
-    assert 'preferred = [key for key in ("benchmark", "library") if buckets.get(key)]' in source

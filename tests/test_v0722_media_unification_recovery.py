@@ -219,4 +219,6 @@ def test_ln_paired_resume_snaps_visual_clock_without_catchup() -> None:
     assert "resumeSnap=resumedAfterPause&&Number.isFinite(lastDisplay)" in section
     assert "resumeCatchup=false" in section
     assert "!resumeSnap&&Number.isFinite(lastDisplay)&&offset<lastDisplay" in section
-    assert "lnPairedSmoothOffset(offset,state,{sameChapter,seekJump,speechActive,resumeSnap})" in section
+    # Plan §7: the LN-only forward clamp was removed from the timing path; the
+    # rendered offset follows the canonical one (ln_entry_contract no_forward_clamp).
+    assert "lnPairedSmoothOffset" not in section

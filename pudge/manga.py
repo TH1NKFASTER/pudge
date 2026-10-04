@@ -2781,6 +2781,10 @@ class MangaService:
                 [(self._manual_additions_state_key(book_id),) for book_id in existing_ids],
             )
             conn.execute(f"DELETE FROM manga_books WHERE id IN ({placeholders})", existing_ids)
+            # P10: invalidate in-flight OCR so a late publish can never land in
+            # a re-imported book that reuses this id with the same file.
+            for book_id in existing_ids:
+                self._bump_ocr_generation_in_conn(conn, book_id)
         generated_root = (self.cache_dir / "manga-imports").resolve()
         for row in rows:
             try:

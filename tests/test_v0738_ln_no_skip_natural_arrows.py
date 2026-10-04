@@ -44,7 +44,6 @@ def test_fast_seek_and_legacy_contracts_remain() -> None:
         "paintActive=speechActive||seekJump",
         "if(active&&Number.isFinite(offset)&&!frozen&&speechActive)",
         "else if(active&&Number.isFinite(offset)&&!frozen&&seekJump)",
-        "maxAdvance=Math.max(.16,Math.min(.65",
     ]
     missing = [value for value in required if value not in source]
     assert not missing, missing

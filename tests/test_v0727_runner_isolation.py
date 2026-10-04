@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-RUNNER = ROOT / "scripts" / "run_test_batch.py"
+RUNNER = ROOT / ".github" / "release" / "run_test_batch.py"
 
 
 def test_isolated_runner_recurses_continues_and_times_out(tmp_path: Path) -> None:

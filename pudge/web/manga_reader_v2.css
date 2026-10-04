@@ -63,8 +63,8 @@
   .manga-v2-viewport{padding-inline:48px}
 }
 
-.manga-v2-volume.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.42);background:rgba(65,87,145,.24)}
-.manga-v2-series.selected{border-color:var(--accent);box-shadow:0 0 0 2px rgba(111,140,255,.38);background:rgba(65,87,145,.18)}
+.manga-v2-volume.selected{border-color:var(--accent);box-shadow:inset 0 0 0 2px rgba(111,140,255,.55);background:rgba(65,87,145,.24)}
+.manga-v2-series.selected{border-color:var(--accent);box-shadow:inset 0 0 0 2px rgba(111,140,255,.5);background:rgba(65,87,145,.18)}
 
 
 /* pudge-v0.7.27-manga-debug-overlay-v1 */

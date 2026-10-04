@@ -471,11 +471,10 @@ def test_review_gate_keyboard_and_stale_warm_pool_contract() -> None:
     reading = (package / "web" / "reading_tools.js").read_text(encoding="utf-8")
     html = (package / "web" / "index.html").read_text(encoding="utf-8")
 
-    for code, grade in (("Digit1", "again"), ("Digit2", "hard"), ("Digit3", "good"), ("Digit4", "easy")):
-        assert code in gate
-        assert grade in gate
-        assert code in reading
-        assert grade in reading
+    # S2: grade keys come from the shared review action set (per provider and
+    # mode); Digit/Numpad handling is exercised in tests/js/review_actions_s2.cjs.
+    assert "PudgeReviewActions?.matchAction?.(event, activeGateActions())" in gate
+    assert "PudgeReviewActions?.matchAction?.(event, activeToken.reviewActions)" in reading
     assert "focused.click()" in gate
     assert "focused.click()" in reading
     assert "snapshot?.reason === 'episode_due_mode'" in gate

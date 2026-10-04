@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 from pathlib import Path
 
 from PIL import Image
@@ -10,7 +11,6 @@ from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.manga import MangaService, _natural_key
-
 
 ROOT = Path(__file__).parents[1]
 
@@ -365,7 +365,9 @@ def test_manga_state_backfills_missing_public_scores_once_per_process() -> None:
     assert "pudge-v0.7.23-manga-mean-score-backfill-v1" in web
     assert "media(id_in:$ids,type:MANGA){id meanScore}" in web
     assert 'book.get("mean_score") is None' in web
-    assert "self._backfill_manga_mean_scores(self.manga.state())" in web
+    # Backfill runs in the background, never on the Manga tab's state read.
+    assert "self._schedule_manga_mean_score_backfill(state)" in web
+    assert "target=self._backfill_manga_mean_scores" in web
     assert "self._manga_state_payload(" in web
 
 
@@ -435,7 +437,7 @@ def test_manga_double_mode_keeps_physical_spreads_alone(tmp_path: Path) -> None:
 
     manga = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
     assert "if (settings.mode === 'double' && !isDoublePage(firstPage)" in manga
-    assert "if (!isDoublePage(secondPage)) loaded.push(secondPage);" in manga
+    assert "if (!isDoublePage(secondPage) && (Math.floor((currentPage+1)/20)===Math.floor(currentPage/20) || await requireMangaPart(currentPage+1))) loaded.push(secondPage);" in manga
     assert "pagedVisibleCount = Math.max(1, loaded.length);" in manga
     assert "settings.mode === 'double' && !spreadFrame" in manga
 
@@ -487,20 +489,11 @@ def test_manga_page_fetch_is_read_only_and_read_pages_are_monotonic(tmp_path: Pa
 
 
 def test_manga_reader_marks_only_flipped_or_final_pages_read() -> None:
-    manga = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
-    web = (ROOT / "pudge" / "web_app.py").read_text(encoding="utf-8")
-    service = (ROOT / "pudge" / "manga.py").read_text(encoding="utf-8")
-
-    assert "pudge-v0.7.23-manga-explicit-read-progress-v1" in manga
-    assert "def manga_set_position(self, book_id: int, page_index: int)" in web
-    assert "def manga_mark_read(self, book_id: int, page_index: int)" in web
-    assert "def mark_read(self, book_id: int, page_index: int)" in service
-    page_start = service.index("    def page(self, book_id: int, page_index: int)")
-    page_end = service.index("    def set_position(", page_start)
-    assert "self.set_position(book_id, index)" not in service[page_start:page_end]
-    assert "await markReadThrough(visibleEnd);" in manga
-    assert "if (visibleEnd >= currentPageCount - 1) await markReadThrough(currentPageCount - 1);" in manga
-    assert "if (best.index > currentPage) void markReadThrough(best.index - 1);" in manga
+    result = subprocess.run(
+        ["node", str(ROOT / "tests/js/frontend_audit.cjs"), str(ROOT / "pudge/web"), "manga_read_progress"],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_primary_click_on_ln_and_manga_series_selects_all_volumes() -> None:

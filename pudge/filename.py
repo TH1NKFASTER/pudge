@@ -7,6 +7,7 @@ from pathlib import Path
 from rapidfuzz import fuzz
 
 from .models import VideoIdentity
+from .release_parser import parse_release_name
 
 
 BRACKET_RE = re.compile(r"\[[^\]]*\]")
@@ -180,6 +181,17 @@ def parse_anime_filename(path_or_name: str | Path) -> VideoIdentity:
         title_part = _clean_display_name(season_parent.parent.name)
     elif len(normalized_title) < 2:
         title_part = cleaned
+
+    # Anitomy cross-check (see pudge/release_parser.py). The historical parser
+    # above stays primary for regular names; the adapter only removes unsafe
+    # single-episode reads and fills what the old parser could not see.
+    parsed = parse_release_name(raw_name)
+    if parsed.unsafe_single_episode:
+        episode = None  # 12.5, 01 ~ 25, NCOP1, SP1: never a regular episode
+    elif episode is None and parsed.episode is not None and parsed.explicit_episode:
+        episode = parsed.episode
+    if season is None and parsed.season is not None and season_parent is None:
+        season = parsed.season
 
     return VideoIdentity(title=title_part, episode=episode, season=season, year=year, raw_name=raw_name)
 

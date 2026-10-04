@@ -143,7 +143,7 @@
     const status=String(transcription?.status||'');
     if (!status || transcription?.ready) return '';
     if (status==='idle') return `<div class="audiobook-preparation idle"><div><strong>${ru()?'Разбор аудио ещё не запущен':'Audio analysis has not started yet'}</strong></div></div>`;
-    if (status==='error') return `<div class="audiobook-preparation danger">${ru()?'Разбор аудио завершился ошибкой':'Audio analysis failed'}${transcription.error?`: ${esc(transcription.error)}`:''}</div>`;
+    if (status==='error') return `<div class="audiobook-preparation danger">${ru()?'Разбор аудио завершился ошибкой':'Audio analysis failed'}${transcription.error?`: ${esc((window.PudgeUiLanguage?.message(transcription.error) ?? String(transcription.error)))}`:''}</div>`;
     if (status==='cancelled') return `<div class="audiobook-preparation idle"><div><strong>${ru()?'Разбор аудио отменён':'Audio analysis cancelled'}</strong></div></div>`;
     const percent=Math.max(0,Math.min(100,Math.round(Number(transcription.progress_percent||0))));
     if(status==='queued'){
@@ -163,6 +163,17 @@
   };
   const nextPaint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 
+  // Mirror of the hovered chapter on the sidebar timeline (visual only, no transport).
+  let sidebarChapterHover=null,sidebarChapterHoverSeq=0;
+  const clearSidebarChapterHover = chapter => {
+    const current=sidebarChapterHover;
+    if(!current||(chapter&&current.node!==chapter))return;
+    sidebarChapterHover=null;
+    try{window.PudgeSidebarCompanion?.clearChapterHoverRange?.(current.source);}catch(error){console.debug('sidebar chapter hover',error);}
+  };
+  const dropDetachedSidebarChapterHover = () => {
+    if(sidebarChapterHover&&!sidebarChapterHover.node?.isConnected)clearSidebarChapterHover();
+  };
   const renderAudio = () => {
     const root = $('audiobooksContent');
     if (!root) return;
@@ -229,6 +240,7 @@
       const targetId=Number(node.dataset.firstUnfinishedId||0),target=targetId?node.querySelector(`[data-audiobook-id="${targetId}"]`):null;
       if(target)node.scrollTop=Math.max(0,target.offsetTop-node.offsetTop-4);
     });
+    dropDetachedSidebarChapterHover();
   };
 
   const loadManga = async () => {
@@ -237,8 +249,21 @@
     await window.PudgeMangaReaderV2?.renderLibrary?.();
     window.updateCount?.();
   };
-  const loadAudio = async () => {
-    audioState = await pywebview.api.audiobook_state();
+  let audioFullRefreshAt = 0;
+  const loadAudio = async ({playbackOnly = false} = {}) => {
+    if (playbackOnly && pywebview.api.sidebar_audio_state && audioState?.books
+      && Date.now() - audioFullRefreshAt < (document.documentElement.classList.contains('energy-saving') ? 30000 : 15000)) {
+      const focused = await pywebview.api.sidebar_audio_state();
+      const live = new Map((focused.books || []).map(book => [Number(book.id), book]));
+      audioState = {...audioState, books:audioState.books.map(book => {
+        const update = live.get(Number(book.id));
+        return update ? {...book, ...update, transcription:book.transcription} : {...book, playing:false, player_running:false, paused:false};
+      })};
+    } else {
+      audioState = await pywebview.api.audiobook_state();
+      audioFullRefreshAt = Date.now();
+    }
+    window.PudgeSidebarCompanion?.acceptAudioState?.(audioState);
     counts.audiobooks = (audioState.books||[]).length;
     const playingBook=(audioState.books||[]).find(book=>book.playing);
     if(playingBook)activeAudioBookId=Number(playingBook.id);
@@ -258,12 +283,12 @@
     const covers=(audioState.books||[]).some(book=>book.cover_pending);
     const queued=(audioState.books||[]).some(book=>String(book.transcription?.status||'')==='queued');
     const busy=playing||transcribing||covers||queued;
-    if (active && busy) {
+    if (active && busy && !document.getElementById('lnReaderShell')?.classList.contains('open')) {
       // A 200-book queued library used to rebuild the whole Audiobooks page
       // every 1.2 s forever. Poll active work quickly, but a passive queue only
       // needs occasional position updates.
-      const delay=playing?750:transcribing?1400:covers?2200:5000;
-      audioPollTimer=setTimeout(()=>void loadAudio(),delay);
+      const delay=document.documentElement.classList.contains('energy-saving')?5000:playing?1000:transcribing?1400:covers?2200:5000;
+      audioPollTimer=setTimeout(()=>void loadAudio({playbackOnly:playing&&!transcribing&&!covers&&!queued}),delay);
     }
   };
 
@@ -292,7 +317,9 @@
   const optimisticAudioPlaying = (id, playing) => {
     activeAudioBookId=Number(id);
     const book=audiobookById(id);
-    if(book)book.playing=!!playing;
+    if(book){book.playing=!!playing;book.player_running=!!playing;}
+    if(playing)for(const other of audioState.books||[]){if(Number(other.id)!==Number(id)){other.playing=false;other.player_running=false;}}
+    window.PudgeSidebarCompanion?.acceptAudioState?.(audioState,{optimistic:!!playing,stop:!playing});
     renderAudio();
     return book;
   };
@@ -310,7 +337,8 @@
       await loadAudio();
       if(notify)window.toast?.(ru()?'Воспроизведение запущено':'Playback started');
     }catch(error){
-      if(book)book.playing=previous;
+      if(book){book.playing=previous;book.player_running=previous;}
+      window.PudgeSidebarCompanion?.acceptAudioState?.(audioState,{rollback:true});
       renderAudio();
       throw error;
     }
@@ -328,7 +356,8 @@
         ru()?'Остановлено; позиция сохранена':'Stopped; position saved'
       );
     }catch(error){
-      if(book)book.playing=previous;
+      if(book){book.playing=previous;book.player_running=previous;}
+      window.PudgeSidebarCompanion?.acceptAudioState?.(audioState,{rollback:true});
       renderAudio();
       throw error;
     }
@@ -420,7 +449,7 @@
         : `<div class="empty">${ru()?'Ничего не найдено.':'No matching manga found.'}</div>`;
       modalBody.innerHTML = unlink + matches;
     } catch (error) {
-      modalBody.innerHTML = unlink + `<div class="empty danger">${esc(error?.message || error)}</div>`;
+      modalBody.innerHTML = unlink + `<div class="empty danger">${esc((window.PudgeUiLanguage?.message(error?.message || error) ?? String(error?.message || error)))}</div>`;
     }
   };
 
@@ -617,10 +646,19 @@
       const result=await pywebview.api.audiobook_delete(Number(action.dataset.id));applyAudioActionResult(result);counts.audiobooks=(audioState.books||[]).length;renderAudio();window.updateCount?.();
     }
   });
+  const showSidebarChapterHover = chapter => {
+    const card=chapter?.closest?.('.audiobook-card');
+    const audiobookId=Number(card?.dataset?.audiobookId||0);
+    const start=Number(chapter?.dataset?.audioChapterStart),end=Number(chapter?.dataset?.audioChapterEnd);
+    const source=`media-chapter:${++sidebarChapterHoverSeq}`;
+    sidebarChapterHover={node:chapter,source};
+    try{window.PudgeSidebarCompanion?.showChapterHoverRange?.({audiobookId,start,end,source});}catch(error){console.debug('sidebar chapter hover',error);}
+  };
   const showAudioChapterHover = chapter => {
     const card=chapter?.closest?.('.audiobook-card');
     const timeline=card?.querySelector?.('[data-audio-timeline]');
     const marker=timeline?.querySelector?.('.audiobook-chapter-hover');
+    showSidebarChapterHover(chapter);
     if(!timeline||!marker)return;
     const duration=Math.max(0,Number(timeline.dataset.duration||0));
     if(!duration)return;
@@ -634,7 +672,16 @@
   const hideAudioChapterHover = chapter => {
     const marker=chapter?.closest?.('.audiobook-card')?.querySelector?.('.audiobook-chapter-hover');
     if(marker)marker.classList.remove('show');
+    clearSidebarChapterHover(chapter);
   };
+  // Closing the chapter list (pointer still inside) or a re-render removing the
+  // hovered node never fires pointerout: clear the mirrored range explicitly.
+  document.addEventListener('toggle',event=>{
+    const details=event.target;
+    if(details?.open||!details?.matches?.('.audiobook-chapters'))return;
+    const node=sidebarChapterHover?.node;
+    if(node&&details.contains(node))hideAudioChapterHover(node);
+  },true);
   document.addEventListener('pointerover',event=>{
     const chapter=event.target.closest?.('[data-audio-chapter-start]');
     if(!chapter||chapter.contains(event.relatedTarget))return;
@@ -806,8 +853,6 @@
         install.disabled = !!status.running || status.state === 'ready';
         install.hidden = status.state === 'ready';
       }
-      const log = $('openMangaOcrLog');
-      if (log) log.hidden = !status.log_path || status.state === 'not_installed';
       const block = statusNode.closest('.setting-block');
       if (block) {
         block.dataset.settingsCategory = status.state === 'ready' ? 'advanced' : 'essential';
@@ -817,7 +862,7 @@
       return status;
     } catch (error) {
       const detail = $('mangaOcrDetail');
-      if (detail) detail.textContent = String(error?.message || error);
+      if (detail) detail.textContent = (window.PudgeUiLanguage?.message(String(error?.message || error)) ?? String(String(error?.message || error)));
       return null;
     }
   };
@@ -830,12 +875,9 @@
         await refreshMangaOcrStatus();
       } catch (error) {
         const detail = $('mangaOcrDetail');
-        if (detail) detail.textContent = String(error?.message || error);
+        if (detail) detail.textContent = (window.PudgeUiLanguage?.message(String(error?.message || error)) ?? String(String(error?.message || error)));
         event.target.disabled = false;
       }
-    }
-    if (event.target.id === 'openMangaOcrLog') {
-      await pywebview.api.reveal_manga_ocr_install_log();
     }
   });
 
@@ -853,5 +895,5 @@
     }
   };
 
-  window.PudgeMedia = {counts, loadManga, loadAudio, refreshMangaOcrStatus, showMangaAniListSearch};
+  window.PudgeMedia = {audioSnapshot:()=>audioState, counts, loadManga, loadAudio, refreshMangaOcrStatus, showMangaAniListSearch};
 })();

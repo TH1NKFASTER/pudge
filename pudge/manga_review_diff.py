@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from .manga_benchmark import box_iou, normalize_text
+from .ocr_geometry import box_iou, normalize_text
 
 SCHEMA_VERSION = "pudge_manga_review_diff/v1"
 _PAGE_RE = re.compile(r"^page_(\d{3})\.json$")

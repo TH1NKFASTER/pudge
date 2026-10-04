@@ -141,11 +141,17 @@ def test_maintenance_lock_prevents_parallel_gui_and_agent_runs(tmp_path: Path):
             assert second is False
 
 
-def test_startup_maintenance_returns_before_heavy_pass_finishes():
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_startup_maintenance_returns_before_heavy_pass_finishes(monkeypatch, platform):
+    monkeypatch.setattr("pudge.web_app.sys.platform", platform)
     started = threading.Event()
     release = threading.Event()
 
     class Manager:
+        # Keep this timing test independent of native OCR prewarming and the
+        # host's battery/thermal state, including when it runs on macOS.
+        work_scheduler = SimpleNamespace(background_wait_reason=lambda: "energy_saving")
+
         def run_startup_once(self):
             started.set()
             assert release.wait(2)

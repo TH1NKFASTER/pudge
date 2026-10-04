@@ -142,6 +142,8 @@ def test_prepare_only_skips_alignment_when_candidate_set_is_unchanged(
             "--offline",
             "--previous-candidate-fingerprint",
             fingerprint,
+            "--previous-candidate-outcome",
+            "terminal",
             str(video),
         ]
     )

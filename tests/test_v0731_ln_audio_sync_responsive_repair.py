@@ -19,7 +19,9 @@ def test_repaired_sync_features_remain_present() -> None:
     source = HTML.read_text(encoding="utf-8")
 
     assert "function lnPairedResetWordProgress(reader)" in source
-    assert "function lnPairedSmoothOffset(" in source
+    # Plan §7: the LN-only forward clamp lnPairedSmoothOffset was removed from
+    # the timing path (behaviour: tests/js/ln_entry_contract.cjs no_forward_clamp).
+    assert "function lnPairedSmoothOffset(" not in source
     assert "until:performance.now()+34" not in source
     assert "surface:lnPairedSurface(current)" in source
     assert 'class="ln-reader-actions"' in source

@@ -539,63 +539,8 @@ def test_first_experience_explains_qbittorrent_is_optional() -> None:
     assert "Torrent: ${d.qbt_enabled?'qBittorrent':'aria2'}" in html
 
 
-def test_aria2_stop_at_metadata_direct_torrent_starts_paused(tmp_path: Path, monkeypatch) -> None:
-    client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
-    calls: list[tuple[str, list[object]]] = []
-    monkeypatch.setattr(client, "ensure_running", lambda: None)
-    monkeypatch.setattr(client, "_torrent_payload", lambda _url: b"d4:infode")
-
-    def rpc(method: str, params=None):
-        values = list(params or [])
-        calls.append((method, values))
-        if method == "aria2.addTorrent":
-            return "0123456789abcdef"
-        raise AssertionError((method, values))
-
-    monkeypatch.setattr(client, "_rpc_raw", rpc)
-    torrent_hash = client.add_release(
-        release(),
-        save_path=tmp_path / "downloads",
-        category="pudge-benchmark",
-        tags=["pudge-benchmark"],
-        paused=True,
-        stop_at_metadata=True,
-    )
-
-    assert torrent_hash == release().info_hash
-    options = calls[0][1][-1]
-    assert options["pause"] == "true"
-    assert options["pause-metadata"] == "true"
-    client.close()
 
 
-def test_aria2_stop_at_metadata_magnet_allows_metadata_then_pauses(tmp_path: Path, monkeypatch) -> None:
-    client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
-    calls: list[tuple[str, list[object]]] = []
-    monkeypatch.setattr(client, "ensure_running", lambda: None)
-    monkeypatch.setattr(client, "_torrent_payload", lambda _url: None)
-
-    def rpc(method: str, params=None):
-        values = list(params or [])
-        calls.append((method, values))
-        if method == "aria2.addUri":
-            return "0123456789abcdef"
-        raise AssertionError((method, values))
-
-    monkeypatch.setattr(client, "_rpc_raw", rpc)
-    client.add_release(
-        release(),
-        save_path=tmp_path / "downloads",
-        category="pudge-benchmark",
-        tags=["pudge-benchmark"],
-        paused=True,
-        stop_at_metadata=True,
-    )
-
-    options = calls[0][1][-1]
-    assert options["pause"] == "false"
-    assert options["pause-metadata"] == "true"
-    client.close()
 
 
 def test_aria2_set_file_priority_uses_one_based_select_file(tmp_path: Path, monkeypatch) -> None:

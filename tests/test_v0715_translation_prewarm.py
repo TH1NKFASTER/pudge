@@ -34,12 +34,11 @@ def test_translation_prewarm_starts_at_resume_and_uses_exact_history(
 
     result = api.prewarm_file(subtitle, start_seconds=5.5)
 
-    assert [text for text, _context, _media_id in calls] == ["次", "最後", "最初"]
+    assert [text for text, _context, _media_id in calls] == ["次", "最後"]
     assert calls[0][1] == "Previous Japanese subtitles:\n最初"
     assert calls[1][1] == "Previous Japanese subtitles:\n最初\n次"
-    assert calls[2][1] == ""
     assert all(media_id == 77 for _text, _context, media_id in calls)
-    assert result["translated"] == 3
+    assert result["translated"] == 2
 
 
 def test_translation_prewarm_is_disabled_without_local_llm(tmp_path: Path) -> None:

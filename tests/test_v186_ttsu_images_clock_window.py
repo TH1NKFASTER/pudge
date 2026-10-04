@@ -36,7 +36,9 @@ def test_activity_path_carries_vad_through_lookahead_anchors() -> None:
     fn = html.split("function lnPairedOffsetAtTime", 1)[1].split(
         "function lnPairedResetWordProgress", 1
     )[0]
-    assert "lnPairedSpeechRatioRange(anchor,left.time,right.time,value)" in fn
+    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
+    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
+    assert "shared.offsetAtTime(state||{},Number(time))" in fn
     assert "value>=windowRight" not in fn
 
 
@@ -52,13 +54,13 @@ def test_backend_poll_correction_keeps_monotonic_clock_on_stale_backward_sample(
 
 def test_lookahead_path_advances_smoothly_and_holds_only_inside_real_vad_gap() -> None:
     html = HTML.read_text(encoding="utf-8")
-    start = html.index("function lnPairedSpeechRatioRange")
+    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
+    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
+    start = html.index("function lnPairedAnchorPath")
     end = html.index("function lnPairedResetWordProgress", start)
     source = html[start:end]
-    script = """
-const lnPairedWeightedPosition=x=>x;
-const lnPairedSourcePosition=x=>x;
-""" + source + """
+    clock = (ROOT / "pudge" / "web" / "paired_audio_clock.js").read_text(encoding="utf-8")
+    script = clock + "\n" + source + """
 const state={chapter_char_offset_exact:125,anchor_window:{
   left_time:14084.195,left_offset:125,right_time:14084.415,right_offset:126,
   activity_clock:true,

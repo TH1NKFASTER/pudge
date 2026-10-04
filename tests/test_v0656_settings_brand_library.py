@@ -120,4 +120,4 @@ def test_branding_is_centralized_for_install_and_runtime() -> None:
     assert 'STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"' in release
     assert "ui.state?.branding?.name||document.getElementById('appBrandName')?.textContent||'__APP_NAME__'" in html
     assert not (ROOT / "rename_brand.py").exists()
-    assert (ROOT / "scripts" / "migrations" / "legacy_anime_mpv.py").is_file()
+    assert (ROOT / "pudge" / "legacy_install.py").is_file()

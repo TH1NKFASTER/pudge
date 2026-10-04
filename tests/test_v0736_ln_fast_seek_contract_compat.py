@@ -17,7 +17,9 @@ def test_new_seek_behavior_keeps_historical_silence_contracts() -> None:
     assert "paintActive=speechActive||seekJump" in source
     assert "if(active&&Number.isFinite(offset)&&!frozen&&speechActive)" in source
     assert "else if(active&&Number.isFinite(offset)&&!frozen&&seekJump)" in source
-    assert "maxAdvance=Math.max(.16,Math.min(.65" in source
+    # Plan §7: the LN-only forward clamp lnPairedSmoothOffset was removed from
+    # the timing path (behaviour: tests/js/ln_entry_contract.cjs no_forward_clamp).
+    assert "maxAdvance=Math.max(.16,Math.min(.65" not in source
 
     assert "ui.lnPairedLastAudioPosition=NaN" in source
     assert "function lnPairedResumeCatchupOffset(" not in source

@@ -48,7 +48,8 @@ def test_dropped_ln_is_injected_without_full_library_reload() -> None:
     assert "injectLnBook(focus.book)" in focus
     assert "setTimeout(()=>void loadLightNovels(true)" not in focus
     inject = _function(html, "injectLnBook")
-    assert "lnSeriesGroupHtml(group)" in inject
+    # L1: series render as one tile (ln_library.js); legacy group markup is the fallback.
+    assert "lnLibraryEntryHtml(group)" in inject
     assert "replaceWith(fresh)" in inject
     assert "renderLightNovels();return;" in inject
 

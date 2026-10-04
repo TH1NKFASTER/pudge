@@ -67,6 +67,16 @@ class NyaaRelease:
     reasons: list[str] = field(default_factory=list)
     is_batch: bool = False
     group: str = ""
+    # Score formula version + hash of every scoring input (settings, aliases,
+    # SeaDex snapshot) — two scores are comparable only when both match.
+    score_formula: str = field(default="", compare=False)
+    score_context: str = field(default="", compare=False)
+    mapped_media_episode: int | None = None
+    raw_release_episode: int | None = None
+    numbering_status: str = ""
+    numbering_scheme: str = ""
+    numbering_rule: str = ""
+    numbering_revision: int = 0
 
     @property
     def magnet(self) -> str:

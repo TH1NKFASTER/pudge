@@ -12,6 +12,31 @@ from typing import Any
 from ..subtitle_formats import write_srt
 
 
+def _worker_availability(python: str) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            [python, "-m", "pudge.subtitles.stt_worker", "--check"],
+            text=True, capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"available": False, "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_unavailable", "error": str(exc)}
+    if completed.returncode:
+        return {
+            "available": False,
+            "reason": "stt_unavailable" if completed.returncode == 3 else "stt_worker_failed",
+            "error": (completed.stderr or completed.stdout).strip()[-1000:],
+        }
+    return {"available": True}
+
+
+def japanese_stt_available(*, enabled: bool = True) -> bool:
+    """Only invalidate prepared subtitles when the configured worker can run."""
+    if not enabled:
+        return False
+    python = os.getenv("PUDGE_PYTHON", "").strip() or sys.executable
+    return bool(_worker_availability(python)["available"])
+
+
 def _sampled_content_fingerprint(path: Path, *, chunk_size: int = 128 * 1024) -> str:
     """Path-independent fingerprint sampled from the beginning/middle/end."""
     size = path.stat().st_size
@@ -164,43 +189,37 @@ def prepare_japanese_stt_reference(
 
     root.mkdir(parents=True, exist_ok=True)
     python = os.getenv("PUDGE_PYTHON", "").strip() or sys.executable
-    availability = subprocess.run(
-        [python, "-m", "pudge.subtitles.stt_worker", "--check"],
-        text=True,
-        capture_output=True,
-        timeout=15,
-        check=False,
-    )
-    if availability.returncode != 0:
-        return None, {
-            "available": False,
-            "reason": "stt_unavailable",
-            "error": (availability.stderr or availability.stdout).strip()[-1000:],
-        }
+    availability = _worker_availability(python)
+    if not availability["available"]:
+        return None, availability
     audio = root / "audio.flac"
     result_path = root / "transcription.json"
-    extract = subprocess.run(
-        [
-            ffmpeg_path,
-            "-v",
-            "error",
-            "-y",
-            "-i",
-            str(video),
-            *(["-map", f"0:{audio_stream_index}"] if audio_stream_index is not None else []),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-compression_level",
-            "8",
-            str(audio),
-        ],
-        text=True,
-        capture_output=True,
-        timeout=min(max(60.0, timeout_seconds), 15 * 60),
-    )
+    try:
+        extract = subprocess.run(
+            [
+                ffmpeg_path,
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(video),
+                *(["-map", f"0:{audio_stream_index}"] if audio_stream_index is not None else []),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-compression_level",
+                "8",
+                str(audio),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=min(max(60.0, timeout_seconds), 15 * 60),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        audio.unlink(missing_ok=True)
+        return None, {"available": False, "reason": "audio_extract_failed", "error": str(exc)}
     if extract.returncode != 0 or not audio.is_file():
         audio.unlink(missing_ok=True)
         return None, {
@@ -228,10 +247,10 @@ def prepare_japanese_stt_reference(
             capture_output=True,
             timeout=max(60.0, float(timeout_seconds)),
         )
-    except subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         audio.unlink(missing_ok=True)
         return None, {
-            "available": False, "reason": "stt_timeout",
+            "available": False, "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_worker_failed",
             "audio_stream": audio_stream,
             "video_content_fingerprint": content_fingerprint,
             "audio_sha256": audio_sha256,
@@ -243,7 +262,7 @@ def prepare_japanese_stt_reference(
     if completed.returncode != 0 or not result_path.is_file():
         return None, {
             "available": False,
-            "reason": "stt_unavailable",
+            "reason": "stt_unavailable" if completed.returncode == 3 else "stt_worker_failed",
             "audio_stream": audio_stream,
             "video_content_fingerprint": content_fingerprint,
             "audio_sha256": audio_sha256,

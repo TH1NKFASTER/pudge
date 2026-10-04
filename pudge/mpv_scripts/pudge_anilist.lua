@@ -35,6 +35,9 @@ local playback_timer = nil
 local active_timer = nil
 local last_saved_position = -1
 local active_since_save = 0.0
+local active_total = 0.0
+local save_sequence = 0
+local save_session = tostring(utils.getpid()) .. ":" .. tostring(mp.get_time())
 local last_active_clock = nil
 local deferred_until = 0.0
 
@@ -313,6 +316,33 @@ local function translate_visible_subtitle()
     end)
 end
 
+local function explain_current_subtitle()
+    if (os.getenv('PUDGE_LLM_CONFIGURED') or '0') ~= '1' then
+        mp.osd_message(tr('Configure the LLM in Settings', 'Настройте LLM'), 4)
+        return
+    end
+    local text = study_current_subtitle ~= '' and study_current_subtitle or (mp.get_property('sub-text', '') or '')
+    if not text:match('%S') then mp.osd_message(tr('No current subtitle line', 'Нет текущего субтитра'), 3); return end
+    local payload = utils.format_json({text=text, context=translation_context(), video=playback_video,
+                                      position=mp.get_property_number('time-pos', 0) or 0})
+    mp.set_property_bool('pause', true)
+    mp.command_native_async({name='subprocess', args={python, '-m', 'pudge.mpv_assistant_request', payload},
+        capture_stdout=true, capture_stderr=true, playback_only=false}, function(success, result)
+        if not success or not result or result.status ~= 0 then
+            mp.osd_message(tr('Could not open subtitle assistant', 'Не удалось открыть помощника'), 4)
+        end
+    end)
+end
+mp.add_key_binding(os.getenv('PUDGE_SHORTCUT_EXPLAIN_SUBTITLE') or 'Ctrl+Shift+t', 'pudge-explain-subtitle', explain_current_subtitle)
+-- Closing this companion window ends its owned playback session even when
+-- input.conf disables or overrides mpv's default close action.
+local function close_playback_window()
+    mp.set_property_native('user-data/pudge/closing', true)
+    mp.commandv('quit')
+end
+mp.add_forced_key_binding('CLOSE_WIN', 'pudge-close-window', close_playback_window)
+mp.add_forced_key_binding('Meta+w', 'pudge-close-window-shortcut', close_playback_window)
+
 local function start_translation_prewarm()
     if translation_prewarm_started or subtitle_path == '' then return end
     translation_prewarm_started = true
@@ -320,6 +350,7 @@ local function start_translation_prewarm()
         python, '-m', 'pudge.cli',
         '--subtitle-prewarm-file', subtitle_path,
         '--subtitle-prewarm-from', tostring(mp.get_property_number('time-pos', 0) or 0),
+        '--subtitle-prewarm-ipc', mp.get_property('options/input-ipc-server', '') or '',
     }
     if media_id ~= '' then
         table.insert(args, '--subtitle-study-media-id')
@@ -451,7 +482,10 @@ local function accumulate_active_time()
     end
     local delta = math.max(0, math.min(5, now - last_active_clock))
     last_active_clock = now
-    if not paused then active_since_save = active_since_save + delta end
+    if not paused then
+        active_since_save = active_since_save + delta
+        active_total = active_total + delta
+    end
 end
 
 local function save_playback(force)
@@ -465,15 +499,19 @@ local function save_playback(force)
 
     playback_busy = true
     last_saved_position = position
+    save_sequence = save_sequence + 1
     local captured_active = active_since_save
     active_since_save = 0.0
     local args = {
-        python, '-m', 'pudge.cli',
+        python, '-m', 'pudge.playback_save',
         '--playback-save',
         '--playback-video', playback_video,
         '--playback-position', string.format('%.3f', position),
         '--playback-duration', string.format('%.3f', duration or 0),
         '--playback-active-seconds', string.format('%.3f', captured_active),
+        '--playback-session', save_session,
+        '--playback-sequence', tostring(save_sequence),
+        '--playback-active-total', string.format('%.3f', active_total),
     }
     if config_path ~= '' then
         table.insert(args, '--config')
@@ -486,21 +524,41 @@ local function save_playback(force)
         capture_stderr = true,
         playback_only = false,
     }
-    if force then
-        local result = mp.command_native(request)
+    local fallback_request = request
+    local owner_url = os.getenv('PUDGE_ASSISTANT_URL') or ''
+    local owner_token = os.getenv('PUDGE_ASSISTANT_TOKEN') or ''
+    local use_owner = owner_token ~= '' and owner_url:match('^http://127%.0%.0%.1:%d+/api/mpv/explain$')
+    if use_owner then
+        request = {
+            name='subprocess', capture_stdout=true, capture_stderr=true, playback_only=false,
+            args={'/usr/bin/curl','--noproxy','*','--max-time','3','--silent','--show-error','--fail',
+                  '--request','POST','--header','Content-Type: application/json','--header','X-Pudge-Token: '..owner_token,
+                  '--data-raw',utils.format_json({video=playback_video,position=position,duration=duration or 0,
+                     session=save_session,sequence=save_sequence,active_total=active_total}),
+                  (owner_url:gsub('/explain$','/playback-save'))}
+        }
+    end
+    local function completed(success,result)
         playback_busy = false
-        if not result or result.status ~= 0 then
+        if not success or not result or result.status ~= 0 then
             active_since_save = active_since_save + captured_active
             mp.msg.warn(app_name .. ' playback position save failed')
             return false
         end
         return true
     end
-    mp.command_native_async(request, function(success, result)
-        playback_busy = false
-        if not success or not result or result.status ~= 0 then
-            active_since_save = active_since_save + captured_active
-            mp.msg.warn(app_name .. ' playback position save failed')
+    if force then
+        local result = mp.command_native(request)
+        if use_owner and (not result or result.status ~= 0) then result=mp.command_native(fallback_request) end
+        return completed(true,result)
+    end
+    mp.command_native_async(request,function(success,result)
+        if use_owner and (not success or not result or result.status ~= 0) then
+            -- A lost HTTP reply may follow a committed save. The identical
+            -- cumulative marker makes this fallback safe without double time.
+            mp.command_native_async(fallback_request,completed)
+        else
+            completed(success,result)
         end
     end)
 end
@@ -659,6 +717,15 @@ mp.register_event('shutdown', function()
     save_playback(true)
     if active_timer then active_timer:stop() end
 end)
+-- OP/ED skip (pudge_skip_segments.lua): close the active-time interval at
+-- the jump.  Active seconds are wall-clock play time, so the skipped part is
+-- never counted as watched; percent/remaining checks stay as they are and the
+-- helper still requires real active time before an automatic AniList update.
+mp.register_script_message('pudge-segment-skip', function(kind, from, to, reason)
+    accumulate_active_time()
+    mp.msg.info(string.format('pudge segment skip: %s %s -> %s (%s)',
+        tostring(kind), tostring(from), tostring(to), tostring(reason)))
+end)
 mp.observe_property('pause', 'bool', on_pause)
 mp.observe_property('sub-text', 'string', on_subtitle_text)
 local function add_reliable_binding(key, name, callback)
@@ -681,3 +748,9 @@ if shortcut_translate_subtitle ~= '' then
 end
 
 add_reliable_binding('Meta+Shift+l', 'pudge_episode_debug_export', export_episode_debug)
+
+-- Capture the actual decoder choice once the video is configured.
+mp.register_event('video-reconfig', function()
+    mp.msg.info('EVENT mpv.decoder hwdec=' .. tostring(mp.get_property('hwdec-current', 'unknown'))
+        .. ' codec=' .. tostring(mp.get_property('video-codec', 'unknown')))
+end)

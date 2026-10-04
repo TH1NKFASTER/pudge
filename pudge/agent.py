@@ -11,6 +11,29 @@ from .manager import AnimeManager
 from .logging_utils import configure_logging, timed_step
 
 
+def scheduled_work_due(config, *, now=None):
+    from .database import Database
+    current = time.time() if now is None else float(now)
+    if not config.library.database_path.is_file():
+        return True
+    try:
+        db = Database(config.library.database_path, initialize=False)
+        with db.connect() as conn:
+            if conn.execute("SELECT 1 FROM anime WHERE status='PLANNING' LIMIT 1").fetchone():
+                return True
+            if conn.execute("SELECT 1 FROM subtitle_jobs WHERE state IN ('pending','processing') AND COALESCE(next_check,0)<=? LIMIT 1", (current,)).fetchone():
+                return True
+            last_run = float(db.get_state("agent_last_run", "0") or 0)
+            if current-last_run >= max(5,config.agent.poll_minutes)*60:
+                return True
+            if config.anilist.enabled and config.anilist.access_token.strip():
+                last = max(float(db.get_state("anilist_synced_at", "0") or 0), float(db.get_state("anilist_last_attempt_at", "0") or 0))
+                return current-last >= max(5,config.agent.anilist_refresh_minutes)*60
+        return False
+    except (ValueError, OSError):
+        return True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=APP_AGENT_CLI)
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
@@ -25,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.scheduled and not hasattr(config, "paths") and not app_session_active():
         return 0
     if args.scheduled and not hasattr(config, "paths") and app_session_window_active():
+        return 0
+    if args.scheduled and hasattr(config, "library") and not scheduled_work_due(config):
+        print(f"{APP_NAME} Agent: no work due")
         return 0
     logger = configure_logging()
     manager = AnimeManager(config)

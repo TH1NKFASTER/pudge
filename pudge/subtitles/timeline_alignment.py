@@ -3,14 +3,15 @@ from __future__ import annotations
 import bisect
 import hashlib
 import math
+import re
 import statistics
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..subtitle_formats import parse_srt, write_srt
 
-
-_ALGORITHM_VERSION = "timeline-v6.19-edge-zones-audio-verify"
+_ALGORITHM_VERSION = "timeline-v6.20-shared-opening-anchors"
 _GRID_SECONDS = 0.5
 _COARSE_OFFSET_STEP = 1.0
 _FINE_OFFSET_STEP = 0.25
@@ -161,7 +162,12 @@ def _early_edit_audio_verification_risk(
         "cold_start_gap_seconds": round(cold_gap, 3),
         "cold_start_boundary_seconds": round(cold_boundary, 3),
     }
-    if resolved_by:
+    # Text anchors resolve only the path alias inside an opening gap. Other
+    # evidence of an early edit must still go through Japanese speech checking.
+    if resolved_by and (
+        resolved_by != "shared_opening_text_anchors"
+        or set(reasons) <= {"early_path_clock_change"}
+    ):
         payload.update(
             {
                 "required": False,
@@ -1294,6 +1300,47 @@ def _suppress_weak_singleton_tail_transition(
         diagnostics["reason"] = "preceding_clock_not_dominant"
         return segments, boundaries, diagnostics
     if jump < 8.0:
+        # A small singleton can also be a false tail (translated signs often
+        # overlap the final speech). Require independent end-bound and local
+        # matching evidence before overriding it; never lower the large-jump
+        # threshold for an ordinary or supported ending edit.
+        kept_end_error = source_end + left_offset - reference_end if reference_end else None
+        eligible = (
+            reference_cues and 2.5 <= jump < 8.0 and left_support >= 8
+            and boundary_ratio >= 0.90 and 60.0 <= tail_duration <= 120.0
+            and reference_overshoot is not None and reference_overshoot >= 2.0
+            and kept_end_error is not None and -3.0 <= kept_end_error <= 1.0
+        )
+        if eligible:
+            source_onsets = sorted(start for start, _end, _text in source_cues)
+            reference_onsets = sorted(start for start, _end, _text in reference_cues)
+            source_bins = _activity_bins(_merge_activity(source_cues))
+            reference_bins = _activity_bins(_merge_activity(reference_cues))
+
+            def score(offset: float, length: float) -> _WindowMatch:
+                return _score_window(
+                    center=source_end - length / 2.0, offset=offset,
+                    source_onsets=source_onsets, reference_onsets=reference_onsets,
+                    source_bins=source_bins, reference_bins=reference_bins,
+                    window_seconds=length,
+                )
+
+            kept, shifted = score(left_offset, 60.0), score(right_offset, 60.0)
+            whole_kept, whole_shifted = score(left_offset, tail_duration), score(right_offset, tail_duration)
+            diagnostics["local_tail_comparison"] = {
+                "kept": kept.as_dict(), "shifted": shifted.as_dict(),
+                "whole_kept": whole_kept.as_dict(), "whole_shifted": whole_shifted.as_dict(),
+                "kept_end_error_seconds": round(kept_end_error, 3),
+            }
+            if (
+                kept.matched >= 4 and kept.onset_coverage >= 0.60 and kept.mean_error <= 0.60
+                and kept.score - shifted.score >= 0.40
+                and kept.activity_f1 - shifted.activity_f1 >= 0.08
+                and whole_shifted.mean_error - whole_kept.mean_error >= 0.15
+                and whole_kept.activity_f1 - whole_shifted.activity_f1 >= 0.08
+            ):
+                diagnostics.update(applied=True, reason="weak_singleton_tail_contradicted_by_reference")
+                return [dict(segment) for segment in segments[:-1]], list(boundaries[:-1]), diagnostics
         diagnostics["reason"] = "tail_jump_not_large"
         return segments, boundaries, diagnostics
     ordinary_late_tail = boundary_ratio >= 0.85 and tail_duration <= 150.0
@@ -1934,6 +1981,72 @@ def _local_transition_refinement(
 
 
 
+def _shared_opening_text_anchors(
+    source_cues: list[tuple[float, float, str]],
+    reference_cues: list[tuple[float, float, str]],
+    first_post: float,
+    current_offset: float,
+    candidate_offset: float,
+) -> dict[str, object]:
+    """Match unique whole-cue acronyms shared by both subtitle languages.
+
+    Timing overlap alone is weak when the broadcast source includes songs or
+    sound effects absent from the translation. Two distinct, ordered textual
+    identities provide an independent clock check. Restrict this to short
+    uppercase Latin cues; do not attempt fuzzy cross-language text matching.
+    """
+    def unique(cues: list[tuple[float, float, str]]) -> dict[str, float]:
+        grouped: dict[str, list[float]] = {}
+        for start, _end, text in cues:
+            value = unicodedata.normalize("NFKC", text).strip()
+            if not re.fullmatch(r"[A-Z][A-Z\s.!?\-–—]*", value):
+                continue
+            key = re.sub(r"[^A-Z]", "", value)
+            if 3 <= len(key) <= 8:
+                grouped.setdefault(key, []).append(float(start))
+        return {key: times[0] for key, times in grouped.items() if len(times) == 1}
+
+    source, reference = unique(source_cues), unique(reference_cues)
+    rows = []
+    for key, start in sorted(source.items(), key=lambda item: item[1]):
+        if key not in reference or not first_post <= start <= first_post + 90.0:
+            continue
+        reference_start = reference[key]
+        rows.append({
+            "key": key, "source_start_seconds": start,
+            "reference_start_seconds": reference_start,
+            "candidate_error_seconds": round(abs(start + candidate_offset - reference_start), 3),
+            "current_error_seconds": round(abs(start + current_offset - reference_start), 3),
+        })
+    supported = bool(
+        len(rows) >= 2
+        and float(rows[-1]["source_start_seconds"]) - float(rows[0]["source_start_seconds"]) >= 20.0
+        and all(float(row["candidate_error_seconds"]) <= 0.75 for row in rows)
+        and all(float(row["current_error_seconds"]) >= 3.0 for row in rows)
+        and all(float(a["reference_start_seconds"]) < float(b["reference_start_seconds"])
+                for a, b in zip(rows, rows[1:]))
+    )
+    return {"supported": supported, "anchors": rows}
+
+
+def _shared_opening_anchors_resolve_path(
+    path: list[_WindowMatch], diagnostics: dict[str, object],
+) -> bool:
+    if not diagnostics.get("applied") or not diagnostics.get("shared_text_anchors", {}).get("supported"):
+        return False
+    gap_end = float(diagnostics["first_post_gap_source_time"])
+    gap_start = gap_end - float(diagnostics["gap_seconds"])
+    before = float(diagnostics["current_offset_seconds"])
+    after = float(diagnostics["candidate_offset_seconds"])
+    # Ignore a path alias centred in the subtitle-free opening, but do not
+    # suppress any ambiguity in the spoken sections on either side of it.
+    return all(
+        gap_start <= item.center <= gap_end
+        or abs(item.offset - (before if item.center < gap_start else after)) <= 1.5
+        for item in path if item.center <= 360.0 and item.matched >= 3
+    )
+
+
 def _post_opening_gap_reacquire(
     source_cues: list[tuple[float, float, str]],
     source_onsets: list[float],
@@ -1942,6 +2055,7 @@ def _post_opening_gap_reacquire(
     reference_bins: set[int],
     segments: list[dict[str, object]],
     boundaries: list[float],
+    reference_cues: list[tuple[float, float, str]] | None = None,
 ) -> tuple[list[dict[str, object]], list[float], dict[str, object]]:
     """Move a dominant post-opening clock into the opening silence.
 
@@ -2023,9 +2137,16 @@ def _post_opening_gap_reacquire(
         diagnostics["reason"] = "no_strong_later_clock"
         return segments, boundaries, diagnostics
 
+    text_evidence = {
+        index: _shared_opening_text_anchors(
+            source_cues, reference_cues or [], first_post, current_offset, offset,
+        ) if int(segments[index].get("support") or 0) >= 8 else {"supported": False, "anchors": []}
+        for index, offset, _metrics in candidates
+    }
     candidate_index, candidate_offset, candidate_metrics = max(
         candidates,
         key=lambda item: (
+            bool(text_evidence[item[0]]["supported"]),
             item[2]["activity"],
             -item[2]["mean_error"],
             item[2]["coverage"],
@@ -2049,9 +2170,10 @@ def _post_opening_gap_reacquire(
             "current_mean_error_seconds": round(current_metrics["mean_error"], 4),
             "candidate_mean_error_seconds": round(candidate_metrics["mean_error"], 4),
             "candidate_coverage": round(candidate_metrics["coverage"], 4),
+            "shared_text_anchors": text_evidence[candidate_index],
         }
     )
-    if (
+    if not text_evidence[candidate_index]["supported"] and (
         candidate_metrics["activity"] < 0.90
         or candidate_metrics["coverage"] < 0.65
         or activity_gain < 0.018
@@ -2077,7 +2199,11 @@ def _post_opening_gap_reacquire(
         return segments, boundaries, diagnostics
 
     diagnostics["applied"] = True
-    diagnostics["reason"] = "dominant_clock_reacquired_after_opening_gap"
+    diagnostics["reason"] = (
+        "dominant_clock_confirmed_by_shared_text_anchors"
+        if text_evidence[candidate_index]["supported"]
+        else "dominant_clock_reacquired_after_opening_gap"
+    )
     return new_segments, new_boundaries, diagnostics
 
 def _suppress_weak_opening_bridge_excursion(
@@ -2269,10 +2395,97 @@ def _suppress_weak_opening_bridge_excursion(
     return segments, boundaries, diagnostics
 
 
+# A coarse window transition cannot localize a short edit: the real source gap
+# can lie well before the window boundary (Hyakkano S03E12: coarse ~97.5s,
+# real edit gap 49.116..62.095s).  Search this far back for a real gap.
+_DECREASING_GAP_SEARCH_BACK_SECONDS = 60.0
+_DECREASING_GAP_MIN_MAPPED_SECONDS = 0.3
+
+
+def _wide_decreasing_gap_candidate(
+    source_cues: list[tuple[float, float, str]],
+    segments: list[dict[str, object]],
+    boundaries: list[float],
+    boundary_index: int,
+    bad_index: int,
+    jump_seconds: float,
+    reference_onsets: list[float] | None,
+) -> dict[str, object] | None:
+    """Pick the best real source gap for a downward clock jump.
+
+    Candidates are every source gap large enough to absorb the jump (mapped
+    gap >= 0.3 s) backward within a bounded window and the first such gap
+    forward (what cue-by-cue forward extension would eventually reach).  With
+    reference onsets the candidate that matches the most reference onsets
+    wins; otherwise the one that moves the fewest cues to the other clock.
+    Returns None when no candidate keeps the whole map monotonic.
+    """
+    old_boundary = float(boundaries[boundary_index])
+    previous_boundary = float(boundaries[boundary_index - 1]) if boundary_index > 0 else float("-inf")
+    next_boundary = (
+        float(boundaries[boundary_index + 1]) if boundary_index + 1 < len(boundaries) else float("inf")
+    )
+    back_limit = max(
+        previous_boundary,
+        old_boundary - max(_DECREASING_GAP_SEARCH_BACK_SECONDS, jump_seconds * 6.0),
+    )
+    mids = [(float(start) + float(end)) / 2.0 for start, end, _text in source_cues]
+    starts = [float(start) for start, _end, _text in source_cues]
+    base_offsets = [_offset_for_time(midpoint, segments, boundaries) for midpoint in mids]
+
+    gap_indices: list[int] = []
+    for index in range(1, len(source_cues)):
+        gap_start = float(source_cues[index - 1][1])
+        gap_end = float(source_cues[index][0])
+        if gap_end - gap_start - jump_seconds < _DECREASING_GAP_MIN_MAPPED_SECONDS:
+            continue
+        midpoint = (gap_start + gap_end) / 2.0
+        if midpoint <= back_limit + 0.001 or midpoint >= next_boundary - 0.001:
+            continue
+        gap_indices.append(index)
+    backward = [index for index in gap_indices if index <= bad_index]
+    forward = [index for index in gap_indices if index > bad_index][:1]
+
+    best: dict[str, object] | None = None
+    for index in backward + forward:
+        gap_start = float(source_cues[index - 1][1])
+        gap_end = float(source_cues[index][0])
+        midpoint = (gap_start + gap_end) / 2.0
+        trial = list(boundaries)
+        trial[boundary_index] = midpoint
+        offsets = [_offset_for_time(value, segments, trial) for value in mids]
+        mapped = [starts[i] + offsets[i] for i in range(len(starts))]
+        if not all(mapped[i] + 0.25 >= mapped[i - 1] for i in range(1, len(mapped))):
+            continue
+        reassigned = sum(
+            1 for i in range(len(offsets)) if abs(offsets[i] - base_offsets[i]) > 1e-9
+        )
+        matched = (
+            int(_global_onset_metrics(starts, reference_onsets, offsets=offsets)["matched"])
+            if reference_onsets
+            else 0
+        )
+        candidate = {
+            "cue_index": index,
+            "midpoint": midpoint,
+            "gap_start": gap_start,
+            "gap_end": gap_end,
+            "direction": "backward" if index <= bad_index else "forward",
+            "reassigned_cues": reassigned,
+            "reference_matched": matched,
+        }
+        if best is None or (matched, -reassigned) > (
+            int(best["reference_matched"]), -int(best["reassigned_cues"])
+        ):
+            best = candidate
+    return best
+
+
 def _stabilize_decreasing_boundaries(
     source_cues: list[tuple[float, float, str]],
     segments: list[dict[str, object]],
     boundaries: list[float],
+    reference_onsets: list[float] | None = None,
 ) -> tuple[list[dict[str, object]], list[float], list[dict[str, object]]]:
     """Move downward-offset boundaries past dense cues when needed.
 
@@ -2419,6 +2632,45 @@ def _stabilize_decreasing_boundaries(
                         }
                     )
                     continue
+
+        if jump_seconds >= 4.0:
+            wide = _wide_decreasing_gap_candidate(
+                source_cues,
+                adjusted_segments,
+                adjusted_boundaries,
+                boundary_index,
+                bad_index,
+                jump_seconds,
+                sorted(reference_onsets) if reference_onsets else None,
+            )
+            if wide is not None:
+                midpoint = float(wide["midpoint"])
+                adjusted_boundaries[boundary_index] = midpoint
+                adjusted_segments[boundary_index]["last_center"] = midpoint
+                adjusted_segments[boundary_index + 1]["first_center"] = midpoint
+                diagnostics.append(
+                    {
+                        "applied": True,
+                        "reason": "decreasing_boundary_anchored_to_wide_source_gap",
+                        "boundary_index": boundary_index,
+                        "old_source_time": round(old_boundary, 3),
+                        "new_source_time": round(midpoint, 3),
+                        "left_offset_seconds": round(left_offset, 3),
+                        "right_offset_seconds": round(right_offset, 3),
+                        "cue_index": bad_index,
+                        "gap_cue_index": int(wide["cue_index"]),
+                        "direction": wide["direction"],
+                        "gap_seconds": round(float(wide["gap_end"]) - float(wide["gap_start"]), 3),
+                        "gap_start_seconds": round(float(wide["gap_start"]), 3),
+                        "gap_end_seconds": round(float(wide["gap_end"]), 3),
+                        "mapped_gap_seconds": round(
+                            float(wide["gap_end"]) - float(wide["gap_start"]) - jump_seconds, 3
+                        ),
+                        "reassigned_cues": int(wide["reassigned_cues"]),
+                        "reference_matched": int(wide["reference_matched"]),
+                    }
+                )
+                continue
 
         target = max(old_boundary + 0.001, current_midpoint + 0.001)
         if target >= next_boundary - 0.001:
@@ -3259,6 +3511,7 @@ def align_subtitle_timelines(
         reference_bins,
         segments,
         boundaries,
+        reference_cues=reference_cues,
     )
     if opening_gap_reacquire.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
@@ -3276,6 +3529,7 @@ def align_subtitle_timelines(
         source_cues,
         segments,
         boundaries,
+        reference_onsets,
     )
     if monotonic_refinements:
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
@@ -3449,6 +3703,8 @@ def align_subtitle_timelines(
         resolved_by=(
             "weak_opening_bridge_excursion"
             if weak_opening_bridge_guard.get("applied")
+            else "shared_opening_text_anchors"
+            if _shared_opening_anchors_resolve_path(path, opening_gap_reacquire)
             else None
         ),
     )

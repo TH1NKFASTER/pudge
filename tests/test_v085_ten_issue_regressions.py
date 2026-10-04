@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import subprocess
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from pudge import agent
+from desktop_isolation import patch_webapp_popen
+
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode, NyaaRelease
@@ -156,9 +162,7 @@ def test_scheduled_agent_runs_due_subtitle_job_without_general_poll(monkeypatch,
     assert calls == [("subs", 8)]
 
 
-def test_couldnt_sync_raw_play_bypasses_resolver_and_uses_original_file(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_couldnt_sync_raw_play_bypasses_resolver_and_uses_original_file(tmp_path: Path, monkeypatch) -> None:
     api = make_api(tmp_path)
     video = (tmp_path / "episode.mkv").resolve()
     raw = (tmp_path / "raw-jimaku.srt").resolve()
@@ -187,8 +191,8 @@ def test_couldnt_sync_raw_play_bypasses_resolver_and_uses_original_file(
         "pudge.web_app.resolve_episode_subtitle",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("raw watch must bypass resolver")),
     )
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    patch_webapp_popen(
+        monkeypatch,
         lambda command, **kwargs: calls.append(command) or FakeProcess(),
     )
 
@@ -200,7 +204,8 @@ def test_couldnt_sync_raw_play_bypasses_resolver_and_uses_original_file(
     assert "--no-sync" in command
 
 
-def test_resume_within_two_minutes_has_no_rewind(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("diagnostics_running", [False, True])
+def test_resume_within_two_minutes_has_no_rewind(tmp_path: Path, monkeypatch, diagnostics_running) -> None:
     api = make_api(tmp_path)
     video = (tmp_path / "resume.mkv").resolve()
     subtitle = (tmp_path / "resume.srt").resolve()
@@ -225,13 +230,34 @@ def test_resume_within_two_minutes_has_no_rewind(tmp_path: Path, monkeypatch) ->
             return None
 
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        "pudge.web_app.subprocess.Popen",
+    real_popen = subprocess.Popen
+    diagnostic_commands = []
+
+    def diagnostic_popen(command, *args, **kwargs):
+        diagnostic_commands.append(command)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", diagnostic_popen)
+    patch_webapp_popen(
+        monkeypatch,
         lambda command, **kwargs: calls.append(command) or FakeProcess(),
     )
 
+    if diagnostics_running:
+        from pudge.energy_diagnostics import EnergyDiagnosticsMonitor
+
+        # Force a diagnostics spawn while the playback mock is installed. With
+        # the old global patch this ps call deterministically became calls[0].
+        probe = threading.Thread(target=EnergyDiagnosticsMonitor._process_rows)
+        probe.start()
+        probe.join(timeout=10)
+        assert not probe.is_alive()
+        assert calls == []
+        assert diagnostic_commands[0][:2] == ["ps", "axo"]
+
     api.play(str(video), resume=True)
 
+    assert len(calls) == 1
     command = calls[0]
     assert command[command.index("--start-at") + 1] == "321.500"
 
@@ -247,12 +273,10 @@ def test_active_mpv_registry_is_restored_after_webapp_restart(tmp_path: Path, mo
         def poll(self):
             return None
 
-    # Keep the mpv process mock scoped to api.play(). WebAppApi startup also uses
-    # subprocess.run() for launchctl on macOS, and subprocess.run() internally
-    # delegates to subprocess.Popen. Leaving this mock active would therefore
-    # break unrelated scheduled-agent startup during the restart assertion.
+    # Patch only WebApp's Popen namespace; startup and diagnostics subprocess.run
+    # calls must still retain the stdlib Popen protocol.
     with monkeypatch.context() as mpv_patch:
-        mpv_patch.setattr("pudge.web_app.subprocess.Popen", lambda *args, **kwargs: FakeProcess())
+        patch_webapp_popen(mpv_patch, lambda *args, **kwargs: FakeProcess())
         api.play(str(video))
 
     monkeypatch.setattr("pudge.web_app.os.kill", lambda pid, signal: None)

@@ -11,6 +11,9 @@
   let activeCardKey = '';
   let cardQueue = [];
   let currentStatus = null;
+  // Jiten action set of the active review mode (native 4 / binary 2). The
+  // server sends it with every gate status; the fallback covers old payloads.
+  let gateActions = null;
   let optimisticReviewed = 0;
   let optimisticUndoCount = 0;
   let undoing = false;
@@ -23,7 +26,8 @@
   const WARM_SYNC_INTERVAL_MS = 250;
   const WARM_SYNC_MAX_MS = 15_000;
 
-  const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
+  const uiRef = () => typeof ui !== 'undefined' ? ui : window.ui;
+  const ru = () => document.documentElement.lang === 'ru' || uiRef()?.lang === 'ru';
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[ch]));
@@ -50,8 +54,21 @@
     overlay.innerHTML = '<div class="pudge-review-gate-card"></div>';
     document.body.appendChild(overlay);
     overlay.addEventListener('click', event => {
+      const jiten = event.target.closest?.('[data-review-gate-jiten]');
+      if (jiten) {
+        event.preventDefault();
+        void window.PudgeJitenWords?.openInJiten?.({wordId:jiten.dataset.wordId, readingIndex:jiten.dataset.readingIndex})
+          .catch(error => window.toast?.(error?.message || String(error)));
+        return;
+      }
       if (event.target === overlay || event.target.closest?.('[data-review-gate-close]')) {
+        event.preventDefault();
+        event.stopPropagation();
         close();
+        return;
+      }
+      if (event.target.closest?.('[data-review-gate-continue]') && currentStatus?.checked && currentStatus?.reason === 'no_due_cards' && currentStatus?.granted) {
+        void finishAndLaunch();
         return;
       }
       if (event.target.closest?.('[data-review-gate-show-answer]')) {
@@ -63,7 +80,7 @@
         return;
       }
       const grade = event.target.closest?.('[data-review-gate-grade]');
-      if (grade) void submitGrade(String(grade.dataset.reviewGateGrade || 'good'));
+      if (grade) void submitGrade(String(grade.dataset.reviewGateGrade || ''));
       const retry = event.target.closest?.('[data-review-gate-retry]');
       if (retry) void loadBatch();
     });
@@ -71,7 +88,9 @@
   }
 
   function close() {
+    const onCancel = launch?.onCancel;
     generation += 1;
+    gateActions = null;
     busy = false;
     saving = false;
     authorizing = false;
@@ -87,6 +106,7 @@
     authorizedCardKeys.clear();
     lastGradeStateSignature = '';
     overlay?.classList.remove('open', 'pudge-review-gate-busy');
+    onCancel?.();
   }
 
   function closeIfOpen() {
@@ -100,7 +120,8 @@
     revealed = true;
     render({}, {replaceCards:false});
     const root = overlay.querySelector('.pudge-review-gate-card');
-    root?.querySelector('[data-review-gate-grade="good"]')?.focus?.({preventScroll:true});
+    const defaultAction = activeGateActions().actions.find(action => action.wire === 'good');
+    if (defaultAction) root?.querySelector(`[data-review-gate-grade="${defaultAction.id}"]`)?.focus?.({preventScroll:true});
     uiLog('show_answer', {card:activeCardKey, authorized:authorizedCardKeys.has(activeCardKey), authorizing, saving, queue:cardQueue.length});
     return true;
   }
@@ -131,8 +152,8 @@
     }
 
     if (!activeCardKey) return false;
-    if (event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
     if (!revealed) {
+      if (event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
       if (event?.code !== 'Space' && event?.key !== ' ') return false;
       event.preventDefault?.();
       event.stopPropagation?.();
@@ -141,15 +162,10 @@
       return true;
     }
 
-    const gradeByKey = {
-      '1':'again', Digit1:'again', Numpad1:'again',
-      '2':'hard', Digit2:'hard', Numpad2:'hard',
-      '3':'good', Digit3:'good', Numpad3:'good',
-      '4':'easy', Digit4:'easy', Numpad4:'easy',
-    };
-    const grade = gradeByKey[key] || gradeByKey[code] || '';
-    if (grade) {
-      const button = overlay.querySelector(`[data-review-gate-grade="${grade}"]`);
+    // A grade shortcut only selects its button; Space confirms (unchanged).
+    const action = globalThis.PudgeReviewActions?.matchAction?.(event, activeGateActions());
+    if (action) {
+      const button = overlay.querySelector(`[data-review-gate-grade="${action.id}"]`);
       if (!button || button.disabled) return false;
       event.preventDefault?.();
       event.stopPropagation?.();
@@ -158,6 +174,7 @@
       return true;
     }
 
+    if (event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey) return false;
     if (code === 'Space' || key === ' ') {
       const focused = document.activeElement?.closest?.('[data-review-gate-grade]');
       if (!focused || !overlay.contains(focused) || focused.disabled) return false;
@@ -177,6 +194,7 @@
   }
 
   function progressText(status) {
+    if (status?.checked && status?.reason === 'no_due_cards') return ru() ? 'Карточки проверены' : 'Cards checked';
     const completed = displayedCompleted(status);
     const required = Math.max(1, Number(status?.required || 1));
     return ru()
@@ -191,18 +209,9 @@
   }
 
   function readingText(card) {
+    if (window.PudgeJitenWords) return window.PudgeJitenWords.readingsLine(card);
     const rows = Array.isArray(card?.readings) ? card.readings : [];
-    const values = rows.map(row => String(row?.text || '').trim()).filter(Boolean);
-    const frontWord = String(card?.wordTextPlain || card?.wordText || rows[0]?.text || '').trim();
-
-    // Kana-only words already display their pronunciation in the main line,
-    // so a second reading line is pure duplication (やらかす -> やらかす).
-    if (!/[\u3400-\u9fff々]/u.test(frontWord)) return '';
-
-    // A single Jiten bracket-ruby line (e.g. 伏[ふ]せる) duplicates the
-    // properly rendered ruby answer directly above it, so do not show it twice.
-    if (values.length === 1 && /\[[^\]]+\]/.test(values[0])) return '';
-    return values.slice(0, 3).join(' ・ ');
+    return [...new Set(rows.map(row => String(row?.text || '').trim()).filter(Boolean))].join(' ・ ');
   }
 
   function confusableReadings(card) {
@@ -270,11 +279,29 @@
     return `${Math.round(seconds / 86400)}d`;
   }
 
-  function gradeLabel(card, grade, en, ruText) {
+  function activeGateActions() {
+    if (gateActions?.actions?.length) return gateActions;
+    const api = globalThis.PudgeReviewActions;
+    return api?.actionSet ? api.actionSet('jiten') : {provider:'jiten', mode:'native', actions:[]};
+  }
+
+  function actionLabel(action) {
+    const api = globalThis.PudgeReviewActions;
+    return api?.label ? api.label(action) : String(action?.id || '');
+  }
+
+  function gradeLabel(card, action) {
     const preview = card?.intervalPreview || {};
-    const field = `${grade}Seconds`;
-    const interval = secondsText(preview?.[field]);
-    return `${ru() ? ruText : en}${interval ? `<small>${esc(interval)}</small>` : ''}`;
+    // Interval previews are keyed by the provider-native (wire) grade.
+    const interval = secondsText(preview?.[`${action.wire}Seconds`]);
+    return `${esc(actionLabel(action))}${interval ? `<small>${esc(interval)}</small>` : ''}`;
+  }
+
+  function gradeButtonsHtml(card) {
+    const set = activeGateActions();
+    return `<div class="pudge-review-gate-grades" data-count="${set.actions.length}">
+        ${set.actions.map(action => `<button class="${esc(action.tone)}" data-review-gate-grade="${esc(action.id)}"${action.shortcut ? ` title="${esc(action.shortcut)}"` : ''}>${gradeLabel(card, action)}</button>`).join('')}
+      </div>`;
   }
 
   function backDetails(card) {
@@ -308,7 +335,7 @@
     const contextImage = String(card?.pudgeContextImage || '').trim();
 
     return `
-      <div class="pudge-review-gate-answer-word">${rubyHtml(rubySource)}</div>
+      <div class="pudge-review-gate-answer-word">${jitenWordHtml(card, rubyHtml(rubySource))}</div>
       ${plainReading ? `<div class="pudge-review-gate-reading">${esc(plainReading)}</div>` : ''}
       ${pitchHtml ? `<div class="pudge-review-gate-pitch">${pitchHtml}</div>` : ''}
       ${contextImage ? `<div class="pudge-review-gate-image"><img src="${esc(contextImage)}" alt="" loading="lazy"></div>` : ''}
@@ -316,12 +343,14 @@
       ${meanings.length ? `<ol class="pudge-review-gate-meanings">${meanings.map(value => `<li>${esc(value)}</li>`).join('')}</ol>` : ''}
       ${example ? `<div class="pudge-review-gate-example"><small>${ru() ? 'Пример' : 'Example'}</small>${esc(example)}</div>` : ''}
       ${(source || occurrences.length) ? `<div class="pudge-review-gate-source"><small>${ru() ? 'Источник' : 'Source'}</small>${esc(source || occurrences.join(' · '))}</div>` : ''}
-      <div class="pudge-review-gate-grades">
-        <button class="again" data-review-gate-grade="again">${gradeLabel(card, 'again', 'Again', 'Снова')}</button>
-        <button class="hard" data-review-gate-grade="hard">${gradeLabel(card, 'hard', 'Hard', 'Трудно')}</button>
-        <button class="good" data-review-gate-grade="good">${gradeLabel(card, 'good', 'Good', 'Хорошо')}</button>
-        <button class="easy" data-review-gate-grade="easy">${gradeLabel(card, 'easy', 'Easy', 'Легко')}</button>
-      </div>`;
+      ${gradeButtonsHtml(card)}`;
+  }
+
+  function jitenWordHtml(card, markup, className = '') {
+    const wordId = Number(card?.wordId), readingIndex = Number(card?.readingIndex);
+    if (!Number.isSafeInteger(wordId) || wordId <= 0 || !Number.isSafeInteger(readingIndex) || readingIndex < 0) return markup;
+    const label = ru() ? 'Открыть слово на Jiten' : 'Open word on Jiten';
+    return `<button type="button" class="pudge-review-gate-word-link ${className}" data-review-gate-jiten data-word-id="${wordId}" data-reading-index="${readingIndex}" title="${esc(label)}" aria-label="${esc(label)}">${markup}</button>`;
   }
 
   function frontWordHtml(card, showReading) {
@@ -339,15 +368,14 @@
     if (!entry) return '';
     const card = entry.card || {};
     const word = String(card.wordTextPlain || card.wordText || selectedReading(card)?.text || '').trim();
-    const labels = ru()
-      ? {again:'Снова', hard:'Трудно', good:'Хорошо', easy:'Легко'}
-      : {again:'Again', hard:'Hard', good:'Good', easy:'Easy'};
-    const grade = String(entry.grade || 'good').toLowerCase();
+    const grade = String(entry.grade || '').toLowerCase();
+    const action = (entry.actions?.actions || activeGateActions().actions).find(row => row.id === grade);
+    const tone = String(action?.tone || grade);
     return `
       <div class="pudge-review-gate-previous">
         <span class="pudge-review-gate-previous-label">${ru() ? 'Предыдущее' : 'Previous'}</span>
         <strong>${esc(word)}</strong>
-        <span class="pudge-review-gate-previous-grade grade-${esc(grade)}">${esc(labels[grade] || grade)}</span>
+        <span class="pudge-review-gate-previous-grade grade-${esc(tone)}">${esc(action ? actionLabel(action) : grade)}</span>
         <button type="button" data-review-gate-undo ${undoing ? 'disabled' : ''}>${ru() ? 'Отменить' : 'Undo'}</button>
       </div>`;
   }
@@ -355,6 +383,7 @@
   function render(status, {replaceCards = true} = {}) {
     const root = ensureUi().querySelector('.pudge-review-gate-card');
     if (replaceCards && Array.isArray(status?.cards)) cardQueue = status.cards.map(card => ({...card}));
+    if (status?.review_actions?.actions?.length) gateActions = status.review_actions;
     currentStatus = {...(currentStatus || {}), ...(status || {})};
     const view = currentStatus || {};
     const completed = displayedCompleted(view);
@@ -376,7 +405,7 @@
       const frontConfusable = confusableReadings(card);
       body = `
         <div class="pudge-review-gate-front">
-          <div class="pudge-review-gate-word">${frontMarkup}</div>
+          <div class="pudge-review-gate-word">${jitenWordHtml(card, frontMarkup, 'pudge-review-gate-word-text')}</div>
           ${frontConfusable.length ? `<div class="pudge-review-gate-front-confusable"><small>${ru() ? 'Похожие чтения' : 'Confusable readings'}</small><span>${esc(frontConfusable.join(' ・ '))}</span></div>` : ''}
           <button class="primary pudge-review-gate-show-answer" data-review-gate-show-answer>${ru() ? 'Показать ответ' : 'Show answer'} <kbd>Space</kbd></button>
         </div>
@@ -393,7 +422,11 @@
         const message = String(view?.message || (ru()
           ? 'Нет доступных уже изученных карточек. Новые карточки здесь никогда не создаются.'
           : 'No previously studied cards are available. This gate never creates new cards.'));
-        body = `<div class="pudge-review-gate-empty">${esc(message)}</div><div class="pudge-review-gate-actions"><button data-review-gate-retry>${ru() ? 'Повторить' : 'Retry'}</button></div>`;
+        const checkedEmpty = view.checked && view.reason === 'no_due_cards' && view.granted;
+        const action = checkedEmpty
+          ? `<button class="primary" data-review-gate-continue>${ru() ? 'Продолжить чтение' : 'Continue reading'}</button>`
+          : `<button data-review-gate-retry>${ru() ? 'Повторить' : 'Retry'}</button>`;
+        body = `<div class="pudge-review-gate-empty">${esc(message)}</div><div class="pudge-review-gate-actions">${action}</div>`;
       }
     }
     const stateNote = undoing && card
@@ -412,8 +445,8 @@
     root.innerHTML = `
       <div class="pudge-review-gate-head">
         <div class="pudge-review-gate-head-copy">
-          <div class="pudge-review-gate-title">${ru() ? `Повторение перед серией${episode ? ` ${episode}` : ''}` : `Review before episode${episode ? ` ${episode}` : ''}`}</div>
-          <div class="pudge-review-gate-subtitle">${view?.all_due_episode_words ? (ru() ? 'Все текущие due-карточки Jiten, встречающиеся именно в этой серии; новых слов не будет.' : 'All currently due Jiten cards found in this exact episode; no new words are introduced.') : (ru() ? 'Только уже изученные карточки Jiten; новых слов не будет.' : 'Previously studied Jiten cards only; no new words are introduced.')}</div>
+          <div class="pudge-review-gate-title">${launch?.content?(ru()?'Повторение перед чтением':'Review before reading'):(ru() ? `Повторение перед серией${episode ? ` ${episode}` : ''}` : `Review before episode${episode ? ` ${episode}` : ''}`)}</div>
+
         </div>
         <button class="pudge-review-gate-close" data-review-gate-close aria-label="Close">×</button>
       </div>
@@ -424,6 +457,8 @@
     root.classList.toggle('answer-shown', revealed);
     root.dataset.wordId = card ? String(card.wordId ?? '') : '';
     root.dataset.readingIndex = card ? String(card.readingIndex ?? '') : '';
+    if (card) window.PudgeJitenWords?.hydrateReadings?.(card, root, ".pudge-review-gate-back", "pudge-review-gate-reading", () => cardQueue[0]);
+    if (card) void window.PudgeJitenWords?.prefetch?.(cardQueue);
     root.querySelectorAll('[data-review-gate-grade]').forEach(button => {
       button.disabled = saving || !cardAuthorized;
       if (undoing) button.disabled = true;
@@ -489,6 +524,7 @@
     lastGradeStateSignature = '';
     overlay?.classList.remove('open', 'pudge-review-gate-busy');
     if (!pending) return;
+    if(pending.onComplete){pending.onComplete();return;}
     await window.startPlay?.(
       pending.path,
       !!pending.resume,
@@ -504,9 +540,8 @@
     const startedAt = performance?.now?.() ?? Date.now();
     busy = true;
     authorizing = true;
-    // A warm front card is already useful while backend authorization catches up.
-    // Never blanket-disable pointer events in that state; only cold/no-card loading
-    // uses the old busy overlay treatment.
+    // Warm cards remain visible during authorization. The backdrop stays
+    // interactive so a loading review can always cancel content entry.
     overlay?.classList.toggle('pudge-review-gate-busy', cardQueue.length === 0);
     render({}, {replaceCards:false});
     uiLog('begin_start', {
@@ -514,13 +549,26 @@
       completed:Number(currentStatus?.completed || 0), remaining:Number(currentStatus?.remaining || 0),
     });
     try {
-      const status = await window.pywebview.api.review_gate_begin(launch.path);
+      const status = await (launch.content ? window.pywebview.api.content_review_begin(launch.kind,launch.bookId,launch.part) : window.pywebview.api.review_gate_begin(launch.path));
       if (myGeneration !== generation || !launch) return;
-      if (status?.granted || !status?.blocking) {
-        uiLog('begin_done', {granted:true, duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt)});
+      if (!status || (status.granted !== true && status.blocking !== true)) {
+        throw new Error(ru() ? 'Ревью ещё не проверено. Повторите запрос.' : 'Review status has not been checked. Retry.');
+      }
+      if (launch.content && status.checked && status.reason === 'no_due_cards' && status.granted) {
+        authorizing = false;
+        busy = false;
+        overlay?.classList.remove('pudge-review-gate-busy');
+        render({...status, loading:false, message:ru() ? 'В этой части нет карточек для повторения.' : 'No cards are due in this part.'}, {replaceCards:true});
+        uiLog('begin_done', {granted:true, checked:true, reason:'no_due_cards', awaiting_continue:true,
+          duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt)});
+        return;
+      }
+      if (status.granted === true) {
+        uiLog('begin_done', {granted:true, reason:String(status.reason || 'granted'), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt)});
         await finishAndLaunch();
         return;
       }
+      if(launch.content)launch.token=status.token;
       const issuedCards = Array.isArray(status?.cards) ? status.cards : [];
       authorizedCardKeys = new Set(issuedCards.map(cardKeyOf).filter(Boolean));
       authorizing = false;
@@ -540,7 +588,7 @@
       authorizing = false;
       busy = false;
       overlay?.classList.remove('pudge-review-gate-busy');
-      render({required:1, completed:0, cards:[], message:error?.message || String(error)}, {replaceCards:true});
+      render({required:1, completed:0, cards:[], loading:false, message:error?.message || String(error)}, {replaceCards:true});
       uiLog('begin_error', {duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt), error:String(error?.message || error || '')});
     } finally {
       if (myGeneration === generation) {
@@ -554,6 +602,10 @@
   }
 
   async function submitGrade(grade) {
+    if (!activeGateActions().actions.some(action => action.id === String(grade || ''))) {
+      uiLog('grade_blocked', {grade:String(grade || ''), reason:'inactive_action'});
+      return;
+    }
     const root = overlay?.querySelector('.pudge-review-gate-card');
     const wordId = Number(root?.dataset.wordId || 0);
     const readingIndex = Number(root?.dataset.readingIndex || 0);
@@ -581,7 +633,8 @@
     const historyEntry = {
       card: {...submittedCard},
       cardKey: submittedKey,
-      grade: String(grade || 'good'),
+      grade: String(grade || ''),
+      actions: activeGateActions(),
       attemptId,
       submitPromise: null,
       result: null,
@@ -609,8 +662,8 @@
     uiLog('review_submit', {card:submittedKey, grade:String(grade || 'good'), queue_remaining:cardQueue.length, attempt_id:attemptId});
     try {
       historyEntry.submitPromise = new Promise(resolve => { historyEntry.resolveSubmit = resolve; });
-      const result = await window.pywebview.api.review_gate_review(
-        launch.path, wordId, readingIndex, String(grade || 'good'), attemptId,
+      const result = await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(
+        launch.content?launch.token:launch.path, wordId, readingIndex, String(grade || 'good'), attemptId,
       );
       historyEntry.resolveSubmit?.(result);
       historyEntry.resolveSubmit = null;
@@ -625,6 +678,7 @@
         window.toast?.(result?.message || (ru() ? 'Результат неизвестен; карточка не засчитана и не будет автоматически повторена.' : 'Review outcome is unknown; it was not counted and will not be retried automatically.'));
       } else {
         uiLog('review_optimistic_confirm', {card:submittedKey, displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
+        window.dispatchEvent?.(new CustomEvent('pudge-review-completed',{detail:{backend:'jiten',wordId,readingIndex}}));
       }
       if ((result?.granted || !result?.blocking) && !historyEntry.undone) {
         await finishAndLaunch();
@@ -685,8 +739,8 @@
         );
       }
 
-      const result = await window.pywebview.api.review_gate_undo(
-        launch.path,
+      const result = await (launch.content?window.pywebview.api.content_review_undo:window.pywebview.api.review_gate_undo)(
+        launch.content?launch.token:launch.path,
         Number(entry.card?.wordId || 0),
         Number(entry.card?.readingIndex || 0),
       );
@@ -735,7 +789,7 @@
     reviewHistory = [];
     const node = ensureUi();
     node.classList.add('open');
-    const warm = initialStatus?.all_due_episode_words
+    const warm = launch.content || initialStatus?.all_due_episode_words
       ? []
       : (Array.isArray(window.__pudgeReviewGateWarmCards) ? window.__pudgeReviewGateWarmCards : []);
     const excludedWarm = new Set([
@@ -759,6 +813,15 @@
 
   window.PudgeReviewGate = {
     open,
+    require:async(kind,bookId,part)=>{
+      const settings=uiRef()?.state?.settings;
+      if(settings?.[`review_gate_${kind}_enabled`] === false)return true;
+      if(overlay?.classList.contains('open'))return false;
+      return await new Promise(resolve=>{
+        void open({content:true,kind,bookId:Number(bookId),part:Number(part),onComplete:()=>resolve(true),onCancel:()=>resolve(false)},{blocking:true,required:1,all_due_episode_words:true})
+          .catch(error=>{window.toast?.(error?.message||String(error));close();resolve(false);});
+      });
+    },
     close,
     closeIfOpen,
     handleEscape,

@@ -178,5 +178,21 @@ def test_vn_and_audio_frontend_contracts_are_live_and_specific() -> None:
     assert "ScreenCaptureKit" in vn
     assert '"playing": player_running and not paused' in audio
     assert '"player_running": player_running' in audio
-    assert "const delay=playing?750" in media
+    import json
+    import re
+    import subprocess
+
+    expression = re.search(r"const delay=([^;]+);", media[media.index("const delay=document.documentElement"):]).group(1)
+    payload = subprocess.run(["node", "-e", """
+let saving=false;
+const document={documentElement:{classList:{contains:()=>saving}}};
+const delay=(playing,transcribing,covers)=>""" + expression + """;
+const active=delay(true,false,false),idle=delay(false,false,false);
+saving=true;const energy=delay(true,false,false);
+console.log(JSON.stringify({active,idle,energy}));
+"""], capture_output=True, text=True, check=True)
+    timing = json.loads(payload.stdout)
+    assert timing["active"] <= 1000
+    assert timing["idle"] >= 5000
+    assert timing["energy"] >= 5000
     assert '"pyobjc-framework-ScreenCaptureKit>=10.3; sys_platform == \'darwin\'"' in pyproject

@@ -35,14 +35,15 @@ def test_shared_study_card_is_single_ruby_copyable_and_structured() -> None:
     assert 'class="pudge-study-header-action"' in js
     assert "action.placement === 'header'" in js
     assert "placement:'header'" in html
-    assert 'class="pudge-study-grade grade-again"' in js
-    assert 'class="pudge-study-grade grade-hard"' in js
-    assert 'class="pudge-study-grade grade-good"' in js
-    assert 'class="pudge-study-grade grade-easy"' in js
+    # S2: grade buttons are rendered from the active review action set
+    # (tones again/something/hard/good/easy); behaviour is covered by
+    # tests/js/review_actions_s2.cjs.
+    assert 'class="pudge-study-grade grade-${esc(action.tone)}"' in js
     assert ".grade-again{border-color:#ef4444" in css
     assert ".grade-hard{border-color:#f59e0b" in css
     assert ".grade-good{border-color:#22c55e" in css
     assert ".grade-easy{border-color:#3b82f6" in css
+    assert ".grade-something{border-color:#f97316" in css
     assert "pudge-study-add-wrap" in js and "border-left:1px solid #334862" in css
     assert "-webkit-user-select:text;user-select:text" in css
     assert ".pudge-study-card button *{-webkit-user-select:none;user-select:none}" in css

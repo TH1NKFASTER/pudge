@@ -4,7 +4,7 @@
   const $ = id => document.getElementById(id);
   const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
   const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
-  let windows = [], activeWindow = null, pollTimer = null, pollGeneration = 0, renderRequestId = 0;
+  let activeWindow = null, selecting = false, pollTimer = null, pollGeneration = 0, renderRequestId = 0;
   let lastLineId = 0, lastCurrentKey = '', transcriptRows = [];
   const regionPresets={lower62:[0,0.38,1,0.62],lower50:[0,0.5,1,0.5],lower40:[0,0.6,1,0.4],full:[0,0,1,1]};
   const parsed = new Map();
@@ -12,22 +12,8 @@
   function shell() {
     const root = $('visualNovelsContent');
     if (!root) return null;
-    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${ru()?'Окно игры':'Game window'}<select id="vnWindow"></select></label><label>${ru()?'Название игры':'Game title'}<input id="vnGameTitle" type="text" placeholder="Visual Novel"></label><label>${ru()?'Область диалога':'Dialogue area'}<select id="vnRegion"><option value="lower62">${ru()?'Нижние 62%':'Lower 62%'}</option><option value="lower50">${ru()?'Нижние 50%':'Lower 50%'}</option><option value="lower40">${ru()?'Нижние 40%':'Lower 40%'}</option><option value="full">${ru()?'Всё окно':'Full window'}</option></select></label><button id="vnRefresh">${ru()?'Обновить окна':'Refresh windows'}</button><button id="vnStart" class="primary">${ru()?'Начать чтение':'Start reader'}</button><button id="vnStop" hidden>${ru()?'Остановить':'Stop'}</button></div><div id="vnStatus" class="vn-status"></div><div class="vn-grid"><section class="vn-live"><h3>${ru()?'Текущая реплика':'Current line'}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3>${ru()?'История':'Transcript'}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
+    if (!root.firstChild) root.innerHTML = `<div class="vn-shell"><div class="vn-head"><label>${ru()?'Название игры':'Game title'}<input id="vnGameTitle" type="text" placeholder="Visual Novel"></label><label>${ru()?'Область диалога':'Dialogue area'}<select id="vnRegion"><option value="lower62">${ru()?'Нижние 62%':'Lower 62%'}</option><option value="lower50">${ru()?'Нижние 50%':'Lower 50%'}</option><option value="lower40">${ru()?'Нижние 40%':'Lower 40%'}</option><option value="full">${ru()?'Всё окно':'Full window'}</option></select></label><button id="vnStart" class="primary">${ru()?'Выбрать окно игры':'Choose game window'}</button><button id="vnStop" hidden>${ru()?'Остановить':'Stop'}</button></div><div id="vnStatus" class="vn-status"></div><div class="vn-grid"><section class="vn-live"><h3>${ru()?'Текущая реплика':'Current line'}</h3><div id="vnSpeaker" class="vn-speaker"></div><div id="vnCurrent" class="vn-current" data-pudge-study-hover data-pudge-translate-root></div></section><section class="vn-transcript"><h3>${ru()?'История':'Transcript'}</h3><div id="vnTranscript" class="vn-transcript-list"></div></section></div></div>`;
     return root;
-  }
-
-  async function loadWindows() {
-    shell();
-    const select = $('vnWindow'); select.innerHTML=`<option>${ru()?'Ищу окна…':'Finding windows…'}</option>`;
-    try {
-      windows = await pywebview.api.visual_novel_windows();
-      select.innerHTML=windows.length?windows.map(row=>`<option value="${Number(row.id)}">${esc(row.label)}</option>`).join(''):`<option>${ru()?'Подходящих окон нет':'No suitable windows'}</option>`;
-      const first=windows[0]||null;
-      if(first&&$('vnGameTitle')&&!String($('vnGameTitle').value||'').trim())$('vnGameTitle').value=String(first.title||first.owner||'Visual Novel');
-    } catch (error) {
-      $('vnStatus').textContent=error.message||error;
-      $('vnStatus').classList.add('error');
-    }
   }
 
   function studyContextOptions(text,lineId){
@@ -70,7 +56,7 @@
       pollTimer=null;
       void update(generation).catch(error=>{
         const status=$('vnStatus');
-        if(status){status.textContent=String(error?.message||error);status.classList.add('error');}
+        if(status){status.textContent=(window.PudgeUiLanguage?.message(String(error?.message||error)) ?? String(String(error?.message||error)));status.classList.add('error');}
       });
     },500);
   }
@@ -83,7 +69,9 @@
     if(errored){
       const permission=code==='permission_required';
       const windowGone=code==='window_unavailable';
-      status.innerHTML=`${esc(state.detail||'Capture failed')}${permission?` <button id="vnPermission">${ru()?'Открыть доступ к записи экрана':'Open Screen Recording settings'}</button>`:''}${windowGone?` <button id="vnRefreshError">${ru()?'Обновить окна':'Refresh windows'}</button>`:''}`;
+      const picker=state.capture_selection==='system_picker';
+      const detail=permission?(picker?(ru()?'Окно выбрано, но macOS отказала в получении кадров. Выберите окно игры снова.':'The window was selected, but macOS refused to deliver frames. Choose the game window again.'):(ru()?'macOS отказала в захвате выбранного окна.':'macOS declined capture of the selected window.')):(state.detail||'Capture failed');
+      status.innerHTML=`${esc(detail)}${permission?` <button id="vnPermission">${ru()?'Открыть доступ к записи экрана':'Open Screen Recording settings'}</button>`:''}${permission||windowGone||code==='capture_timeout'?` <button id="vnPickAgain">${ru()?'Выбрать окно через macOS':'Choose window with macOS'}</button>`:''}`;
       return;
     }
     if(state.running){
@@ -101,7 +89,7 @@
           :`Reading through ScreenCaptureKit · frames ${captures} · OCR ${ocrCount}`;
       }
     }else{
-      status.textContent=ru()?'Захват выключен. Выберите окно и нажмите «Начать».':'Capture is off. Select a window and press Start.';
+      status.textContent=ru()?'Выберите окно игры в системном меню macOS.':'Choose the game window in the macOS picker.';
     }
   }
 
@@ -137,16 +125,24 @@
   }
 
   async function start(){
-    const id=Number($('vnWindow')?.value||0),row=windows.find(item=>Number(item.id)===id);
-    if(!id||!row)return;
+    if(selecting)return;
+    selecting=true;
+    const button=$('vnStart');if(button)button.disabled=true;
     pollGeneration+=1;renderRequestId+=1;
+    const generation=pollGeneration;
     if(pollTimer)clearTimeout(pollTimer);pollTimer=null;
-    await applyRegionPreset($('vnRegion')?.value||'lower62');
-    const gameTitle=String($('vnGameTitle')?.value||row.title||row.label||'Visual Novel').trim()||'Visual Novel';
-    activeWindow={id,title:gameTitle,owner:String(row.owner||'')};
-    lastLineId=0;lastCurrentKey='';parsed.clear();
-    await pywebview.api.visual_novel_start(id,activeWindow.title,activeWindow.owner);
-    await update(pollGeneration);
+    try{
+      await applyRegionPreset($('vnRegion')?.value||'lower62');
+      const gameTitle=String($('vnGameTitle')?.value||'').trim();
+      const state=await pywebview.api.visual_novel_start(0,gameTitle,'',true);
+      if(generation!==pollGeneration)return;
+      if(!state.selection_cancelled){
+        activeWindow={id:Number(state.window_id||0),title:String(state.window_title||'Visual Novel')};
+        if($('vnGameTitle'))$('vnGameTitle').value=activeWindow.title;
+        lastLineId=0;lastCurrentKey='';parsed.clear();
+      }
+      await update(generation);
+    }finally{selecting=false;if(button)button.disabled=false;}
   }
 
   async function stop(){
@@ -156,7 +152,7 @@
     await update(pollGeneration);
   }
 
-  document.addEventListener('change',event=>{if(event.target.id==='vnRegion')void applyRegionPreset(event.target.value).catch(error=>window.toast?.(String(error?.message||error)));else if(event.target.id==='vnWindow'){const row=windows.find(item=>Number(item.id)===Number(event.target.value||0));if(row&&$('vnGameTitle'))$('vnGameTitle').value=String(row.title||row.owner||'Visual Novel');}});
-  document.addEventListener('click',event=>{void (async()=>{if(event.target.id==='vnRefresh'||event.target.id==='vnRefreshError')await loadWindows();else if(event.target.id==='vnStart')await start();else if(event.target.id==='vnStop')await stop();else if(event.target.id==='vnPermission')await pywebview.api.open_screen_recording_settings();else{const line=event.target.closest?.('[data-vn-line]');if(line){const state=await pywebview.api.visual_novel_state();transcriptRows=state.transcript||[];const row=transcriptRows.find(item=>Number(item.id)===Number(line.dataset.vnLine));if(row){lastLineId=Number(row.id);lastCurrentKey='';void renderCurrent(row.text,lastLineId,pollGeneration);}}}})().catch(error=>window.toast?.(String(error?.message||error)));});
-  window.PudgeVisualNovels={load:async()=>{shell();pollGeneration+=1;renderRequestId+=1;await loadWindows();await update(pollGeneration);},stop};
+  document.addEventListener('change',event=>{if(event.target.id==='vnRegion')void applyRegionPreset(event.target.value).catch(error=>window.toast?.(String(error?.message||error)));});
+  document.addEventListener('click',event=>{void (async()=>{if(event.target.id==='vnStart'||event.target.id==='vnPickAgain')await start();else if(event.target.id==='vnStop')await stop();else if(event.target.id==='vnPermission')await pywebview.api.open_screen_recording_settings();else{const line=event.target.closest?.('[data-vn-line]');if(line){const state=await pywebview.api.visual_novel_state();transcriptRows=state.transcript||[];const row=transcriptRows.find(item=>Number(item.id)===Number(line.dataset.vnLine));if(row){lastLineId=Number(row.id);lastCurrentKey='';void renderCurrent(row.text,lastLineId,pollGeneration);}}}})().catch(error=>window.toast?.(String(error?.message||error)));});
+  window.PudgeVisualNovels={load:async()=>{shell();pollGeneration+=1;renderRequestId+=1;await update(pollGeneration);},stop};
 })();

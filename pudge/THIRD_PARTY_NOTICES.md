@@ -25,6 +25,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## anitopy / Anitomy
+
+Release and file names are parsed with `anitopy`
+(<https://github.com/igorcmoura/anitopy>), a Python port of Anitomy
+(<https://github.com/erengy/anitomy>). anitopy is installed as a separate
+Python dependency, not copied into Pudge; it is distributed under the Mozilla
+Public License 2.0 (<https://mozilla.org/MPL/2.0/>). Its source is available
+from the repository above.
+
 ## SubPlz
 
 Pudge's subtitle-track ranking hardening, atomic embedded-subtitle extraction,

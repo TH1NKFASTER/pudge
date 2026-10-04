@@ -21,6 +21,8 @@ _CONFIG_SECRET_KEYS = {
     ("jimaku", "api_key"),
     ("anilist", "access_token"),
     ("llm", "api_key"),
+    ("llm.profiles.ollama", "api_key"),
+    ("llm.profiles.openai", "api_key"),
     ("qbittorrent", "password"),
     ("qbittorrent", "api_key"),
     ("nyaa", "proxy_url"),

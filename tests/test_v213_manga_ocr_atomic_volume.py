@@ -13,10 +13,10 @@ def test_reader_keeps_volume_ocr_progress_visible_and_button_disabled() -> None:
     assert "button.disabled = active" in js
     assert "OCR идёт…" in js
     assert "const status = await API().manga_ocr_book_status(Number(bookId));" in js
-    open_start = js.index("async function openBook(bookId)")
+    open_start = js.index("async function openBook(")
     open_end = js.index("function closeReader()", open_start)
     open_block = js[open_start:open_end]
-    show_at = open_block.index("await showCurrent();")
+    show_at = open_block.index("await showCurrent({reviewApproved:true});")
     before_render = open_block[:show_at]
     assert "ocrButton.disabled = true" not in before_render
     assert "ocrButton.disabled = false" in before_render

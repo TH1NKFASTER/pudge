@@ -15,7 +15,8 @@ def test_all_ln_frontend_features_are_restored() -> None:
         "function lnAudioReadingWeights(",
         "function lnPairedSpeechActive(",
         "function lnPairedResetWordProgress(",
-        "function lnPairedSmoothOffset(",
+        # lnPairedSmoothOffset removed by plan §7 (shared canonical offset).
+        "function lnPairedOffsetAtTime(",
         "function exportLnPairedTrace()",
         "light_novel_export_audio_sync_trace",
         "event.code!=='KeyL'",

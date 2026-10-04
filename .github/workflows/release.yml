@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
       - "v*"
   workflow_dispatch:
     inputs:
@@ -58,13 +59,13 @@ jobs:
       - name: Verify tag version
         env:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: python scripts/check_release_tag.py "$RELEASE_TAG"
+        run: python .github/release/check_release_tag.py "$RELEASE_TAG"
 
       - name: Verify release metadata and lockfile
-        run: python scripts/check_release_metadata.py
+        run: python .github/release/check_release_metadata.py
 
       - name: Run test batch
-        run: python scripts/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4
+        run: python .github/release/run_test_batch.py --batch $(( ${{ matrix.batch }} - 1 )) --batches 4
 
   build-release:
     name: Build macOS release ZIP
@@ -94,11 +95,17 @@ jobs:
         id: archive
         shell: bash
         run: |
-          archive=$(find dist -maxdepth 1 -name 'pudge-macos-v*.zip' -print -quit)
+          archive=$(find dist -maxdepth 1 -name '[0-9]*.[0-9]*.[0-9]*.zip' -print -quit)
           test -n "$archive"
           test -f "$archive.sha256"
+          version=$(basename "$archive" .zip)
+          legacy="dist/pudge-macos-v${version}.zip"
+          test -f "$legacy"
+          test -f "$legacy.sha256"
           echo "path=$archive" >> "$GITHUB_OUTPUT"
           echo "checksum=$archive.sha256" >> "$GITHUB_OUTPUT"
+          echo "legacy=$legacy" >> "$GITHUB_OUTPUT"
+          echo "legacy_checksum=$legacy.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -107,6 +114,8 @@ jobs:
           path: |
             ${{ steps.archive.outputs.path }}
             ${{ steps.archive.outputs.checksum }}
+            ${{ steps.archive.outputs.legacy }}
+            ${{ steps.archive.outputs.legacy_checksum }}
 
       - name: Extract release notes from changelog
         env:
@@ -121,7 +130,7 @@ jobs:
           version = tag[1:] if tag.startswith("v") else tag
           text = Path("CHANGELOG.md").read_text(encoding="utf-8")
           match = re.search(
-              rf"(?ms)^## v{re.escape(version)}(?:\s|—).*?(?=^## v|\Z)",
+              rf"(?ms)^## v?{re.escape(version)}(?:\s|—).*?(?=^## (?:v?\d|Unreleased)|\Z)",
               text,
           )
           if match is None:
@@ -139,15 +148,17 @@ jobs:
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
           ARCHIVE: ${{ steps.archive.outputs.path }}
           CHECKSUM: ${{ steps.archive.outputs.checksum }}
+          LEGACY: ${{ steps.archive.outputs.legacy }}
+          LEGACY_CHECKSUM: ${{ steps.archive.outputs.legacy_checksum }}
           NOTES: dist/release-notes.md
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" --clobber
+            gh release upload "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" "$LEGACY" "$LEGACY_CHECKSUM" --clobber
             gh release edit "$RELEASE_TAG" \
-              --title "Pudge $RELEASE_TAG" \
+              --title "${RELEASE_TAG#v}" \
               --notes-file "$NOTES"
           else
-            gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" \
-              --title "Pudge $RELEASE_TAG" \
+            gh release create "$RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" "$LEGACY" "$LEGACY_CHECKSUM" \
+              --title "${RELEASE_TAG#v}" \
               --notes-file "$NOTES"
           fi

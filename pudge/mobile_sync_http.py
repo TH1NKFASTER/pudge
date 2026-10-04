@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.server
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
@@ -45,7 +46,43 @@ class MobileSyncHTTPServer(http.server.ThreadingHTTPServer):
         self.streaming = streaming
         self.study_parser = study_parser
         self.logger = logger
+        self._request_condition = threading.Condition()
+        self._active_requests: set[Any] = set()
         super().__init__(server_address, MobileSyncRequestHandler)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Register before starting the daemon thread: shutdown must also see
+        # accepted requests whose handler has not begun running yet.
+        request.settimeout(5.0)
+        with self._request_condition:
+            self._active_requests.add(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_finished(request)
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_finished(request)
+
+    def _request_finished(self, request: Any) -> None:
+        with self._request_condition:
+            self._active_requests.discard(request)
+            self._request_condition.notify_all()
+
+    def wait_for_requests(self, *, timeout: float = 5.0) -> bool:
+        """Drain admitted requests after shutdown has stopped new admission."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._request_condition:
+            while self._active_requests:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._request_condition.wait(remaining)
+            return True
 
 
 class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -55,7 +92,10 @@ class MobileSyncRequestHandler(http.server.BaseHTTPRequestHandler):
         logger = getattr(self.server, "logger", None)
         if logger is not None:
             try:
-                logger.info("COMPANION http " + format, *args)
+                route = urlparse(getattr(self, "path", "")).path
+                if route.startswith("/api/v1/media/"):
+                    route = "/api/v1/media/{ticket}/{asset}"
+                logger.info("COMPANION http method=%s route=%s", getattr(self, "command", ""), route)
             except Exception:
                 pass
 

@@ -56,6 +56,19 @@ class SecretStore:
         )
         return completed.returncode == 0
 
+    def delete(self, account: str) -> None:
+        if self.available:
+            completed = subprocess.run(
+                ["security", "delete-generic-password", "-s", self.service, "-a", account],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            # security uses 44 for an absent item; clearing it is already done.
+            if completed.returncode not in {0, 44}:
+                raise RuntimeError(f"Could not delete Keychain credential: {account}")
+
     def resolve(
         self,
         account: str,
@@ -77,6 +90,9 @@ class SecretStore:
 
     def persisted_config_value(self, account: str, value: object, *, use_keychain: bool = True) -> str:
         secret = str(value or "")
+        if use_keychain and not secret:
+            self.delete(account)
+            return ""
         return "" if use_keychain and secret and self.set(account, secret) else secret
 
 

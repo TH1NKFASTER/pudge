@@ -84,14 +84,16 @@ for(const [time,desired] of events){{now=time;lnPairedTransportClockSetDesired(d
 now=9612;
 const local=lnPairedTransportClockNow(state);
 const reconciled=lnPairedTransportClockReconcile({{...state,position:341.886417,playing:true}},{{settled:true}});
-console.log(JSON.stringify({{local,reconciled}}));
+now+=150;const later=lnPairedTransportClockNow(state);
+console.log(JSON.stringify({{local,reconciled,later}}));
 """
     result = _run_node(script)
     assert abs(float(result["local"]) - 341.563454) < 0.01
     reconciled = result["reconciled"]
     assert reconciled["snap"] is False
     assert 0.30 < float(reconciled["drift"]) < 0.35
-    assert float(reconciled["position"]) > float(result["local"])
+    assert float(reconciled["position"]) == float(result["local"])
+    assert float(result["later"]) > float(result["local"]) + 0.15
 
 
 def test_pending_playing_state_does_not_roll_visual_clock_back_to_stale_backend() -> None:

@@ -1,69 +1,121 @@
-"""v96p34: image-verified short OCR hallucinations, no page/text hardcoding."""
-from __future__ import annotations
+"""Generated drawing connections and title/dialogue conflicts, no page corpus."""
 
-import json
-import os
-from pathlib import Path
+from copy import deepcopy
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
+from synthetic_ocr import region
 
 from pudge import manga_ocr_worker as worker
 
 
-ROOT = Path(os.environ.get("PUDGE_V96P34_FIXTURES", ""))
+def _scene(*, scale=1, offset=0, connected=True):
+    size = (round(760 * scale), round(1200 * scale))
+    image = Image.new("RGB", size, "white")
+
+    def box(values):
+        return tuple(round(v * scale) for v in values)
+
+    left = 330 + offset
+    row = region("ほら", box((left, 450, left + 8, 478)), size=size, raw_text="", confidence=0.4)
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(box((left - 36, 414, left - 1, 513)), fill="black")
+    # Just four pixels enter the claimed text, connected to a much bigger drawing.
+    x = left if connected else left + 2
+    draw.rectangle(box((x, 462, x, 465)), fill="black")
+    return image, row
 
 
-def _fixture_dir() -> Path:
-    if not ROOT.is_dir() or not (ROOT / "pages/page_029.png").is_file():
-        pytest.skip("v96p34 PNG/JSON fixtures absent")
-    return ROOT
+@pytest.mark.parametrize("scale,offset", [(1, -180), (1, 0), (1, 220), (1.5, 0)])
+def test_weak_guess_on_connected_drawing_is_removed(scale, offset):
+    image, suspect = _scene(scale=scale, offset=offset)
+    with image:
+        dialogue = region("空がきれい", (100, 700, 140, 900), confidence=0.99)
+        rows = [suspect, dialogue]
+        before = deepcopy(rows)
+        assert worker._art_connected_short_vertical_noise(image, suspect, rows)
+        result = worker._suppress_art_connected_short_vertical_noise(image, rows)
+        assert result == [dialogue] and result[0] is dialogue
+        assert rows == before
 
 
-def _regions(number: int) -> list[dict]:
-    return json.loads((_fixture_dir()/"fresh"/f"page_{number:02d}.json").read_text())['data']['regions']
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"raw_text": "ほら"},
+        {"confidence": 0.92},
+        {"detector": "other"},
+        {"source": "other"},
+        {"orientation": "horizontal"},
+        {"width": 0.08},
+        {"text": "星"},
+        {"text": "今日は星を見る"},
+    ],
+)
+def test_durable_reading_or_geometry_guard_protects_text(change):
+    image, suspect = _scene()
+    with image:
+        suspect.update(change)
+        assert not worker._art_connected_short_vertical_noise(image, suspect, [suspect])
+        assert worker._suppress_art_connected_short_vertical_noise(image, [suspect]) == [suspect]
 
 
-@pytest.mark.parametrize(('page','surface'), ((29, '・しかし'), (31, 'こん'), (34, 'あァ！')))
-def test_real_art_candidate_suppressed(page, surface):
-    with Image.open(_fixture_dir()/"pages"/f"page_{page:03d}.png") as image:
-        before = _regions(page)
-        after = worker._suppress_art_connected_short_vertical_noise(image, before)
-    removed = [r for r in before if all(r is not surviving for surviving in after)]
-    assert [r['text'] for r in removed] == [surface]
+@pytest.mark.parametrize("kind", ["blank", "disconnected", "independent_glyphs", "too_much_inside"])
+def test_art_needs_physical_connection_and_large_outside_support(kind):
+    image, suspect = _scene(connected=kind != "disconnected")
+    with image:
+        draw = ImageDraw.Draw(image)
+        if kind == "blank":
+            draw.rectangle((0, 0, 759, 1199), fill="white")
+        elif kind == "independent_glyphs":
+            draw.rectangle((294, 414, 370, 514), fill="white")
+            draw.rectangle((331, 451, 336, 458), fill="black")
+            draw.rectangle((331, 466, 336, 474), fill="black")
+        elif kind == "too_much_inside":
+            draw.rectangle((330, 450, 337, 477), fill="black")
+        assert not worker._art_connected_short_vertical_noise(image, suspect, [suspect])
 
 
-@pytest.mark.parametrize('page', range(40))
-def test_old_forty_page_corpus_only_three_weak_art_guesses(page):
-    with Image.open(_fixture_dir()/"pages"/f"page_{page:03d}.png") as image:
-        before = _regions(page)
-        after = worker._suppress_art_connected_short_vertical_noise(image, before)
-    removed = [r['text'] for r in before if all(r is not surviving for surviving in after)]
-    expected = {29:['・しかし'], 31:['こん'], 34:['あァ！']}
-    assert removed == expected.get(page, [])
+def _title_rows():
+    donor = region(
+        "あれ", (310, 500, 335, 570), raw_text="", confidence=0.4, detector="wide-vertical-text-donor-v1"
+    )
+    title = region("SAMPLE TITLE", (260, 515, 430, 557), orientation="horizontal", confidence=0.99)
+    return donor, title
 
 
-def test_p34_actual_dialogue_and_title_retained():
-    with Image.open(_fixture_dir()/"pages/page_034.png") as image:
-        before = _regions(34)
-        after = worker._suppress_art_connected_short_vertical_noise(image, before)
-    assert sum(row['text'] == 'あァ！？' for row in after) == 1
-    assert any('ONE PIECE' in row['text'] for row in after)
+def test_weak_vertical_donor_borrowing_horizontal_latin_title_is_removed():
+    with Image.new("RGB", (760, 1200), "white") as image:
+        donor, title = _title_rows()
+        dialogue = region("空がきれい", (100, 500, 130, 620), confidence=0.99)
+        rows = [donor, title, dialogue]
+        before = deepcopy(rows)
+        assert worker._suppress_art_connected_short_vertical_noise(image, rows) == [title, dialogue]
+        assert rows == before
+        assert not worker._art_connected_short_vertical_noise(image, donor, [donor, dialogue])
 
 
-@pytest.mark.parametrize('page,surface', ((29,'・しかし'),(31,'こん')))
-def test_durable_raw_observation_and_high_confidence_protected(page,surface):
-    with Image.open(_fixture_dir()/"pages"/f"page_{page:03d}.png") as image:
-        original = next(row for row in _regions(page) if row.get('text') == surface)
-        for change in ({'raw_text':surface},{'confidence':0.92},{'detector':'other'}):
-            row = dict(original,**change)
-            assert not worker._art_connected_short_vertical_noise(image,row,[row])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"confidence": 0.8},
+        {"orientation": "vertical"},
+        {"text": "空がきれい"},
+        {"width": 0.1},
+        {"height": 0.1},
+        {"x": 0.8},
+        {"y": 0.1},
+    ],
+)
+def test_title_conflict_requires_independently_verified_overlapping_latin_peer(change):
+    with Image.new("RGB", (760, 1200), "white") as image:
+        donor, title = _title_rows()
+        title.update(change)
+        assert not worker._art_connected_short_vertical_noise(image, donor, [donor, title])
 
 
-def test_donor_not_removed_without_horizontal_verified_latin_peer():
-    with Image.open(_fixture_dir()/"pages/page_034.png") as image:
-        rows = _regions(34)
-        suspect = next(row for row in rows if row.get('text') == 'あァ！')
-        assert worker._art_connected_short_vertical_noise(image,suspect,rows)
-        assert not worker._art_connected_short_vertical_noise(
-            image,suspect,[r for r in rows if r.get('orientation')!='horizontal'])
+def test_strong_vertical_donor_over_title_is_protected():
+    with Image.new("RGB", (760, 1200), "white") as image:
+        donor, title = _title_rows()
+        donor["confidence"] = 0.99
+        assert worker._suppress_art_connected_short_vertical_noise(image, [donor, title]) == [donor, title]

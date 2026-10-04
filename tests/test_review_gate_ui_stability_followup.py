@@ -6,7 +6,8 @@ WEB = ROOT / "pudge" / "web"
 
 def test_loading_gate_is_not_made_translucent() -> None:
     css = (WEB / "review_gate.css").read_text(encoding="utf-8")
-    assert ".pudge-review-gate-busy{pointer-events:none}" in css
+    assert ".pudge-review-gate-busy{cursor:progress}" in css
+    assert ".pudge-review-gate-busy{pointer-events:none}" not in css
     assert ".pudge-review-gate-busy{opacity:" not in css
     assert "backdrop-filter:blur(" not in css
 
@@ -33,10 +34,8 @@ def test_review_gate_blurs_old_grade_before_dom_replacement() -> None:
 
 
 def test_single_bracket_ruby_reading_is_not_rendered_twice() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    assert "values.length === 1" in source
-    assert "/\\[[^\\]]+\\]/.test(values[0])" in source
-    assert "return '';" in source
+    from test_review_gate_kana_reading import line
+    assert line({"wordTextPlain":"伏せる","readingIndex":0,"readings":[{"text":"伏[ふ]せる","readingIndex":0}]}) == ""
 
 
 def test_normal_jiten_card_blurs_focus_before_close() -> None:

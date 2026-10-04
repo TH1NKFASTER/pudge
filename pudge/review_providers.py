@@ -47,10 +47,16 @@ class ProviderCapabilities:
     mutation_retry: str
     strict_gate_supported: bool
     strict_gate_reason: str
+    # Provider-native grade sets per interface mode. A mode missing here has no
+    # native wire grades; the UI must not invent a mapping for it silently.
+    grade_modes: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    undo: str = "unsupported"
+    native_parse: str = "unsupported"
 
     def as_dict(self, *, configured: bool, account_key: str) -> dict[str, Any]:
         payload = asdict(self)
         payload["grades"] = list(self.grades)
+        payload["grade_modes"] = {mode: list(grades) for mode, grades in self.grade_modes}
         payload["configured"] = bool(configured)
         payload["account_key"] = account_key
         return payload
@@ -78,29 +84,47 @@ JITEN_CAPABILITIES = ProviderCapabilities(
         "Pudge uses study-batch with extraNewCards=0, requires prior review history, revalidates the card "
         "immediately before submit, and never counts or blindly retries ambiguous outcomes"
     ),
+    grade_modes=(("native", ("again", "hard", "good", "easy")),),
+    undo="POST /srs/undo-review",
+    native_parse="POST /reader/parse",
 )
+
+# Source: official jpdb.io public API OpenAPI document published at
+# https://jpdb.stoplight.io/docs/jpdb (node /reference/jpdb.json), retrieved
+# 2026-09-27. /api/v1/review request: {vid, sid, grade}; grade enum is
+# nothing|something|hard|okay|easy|pass|fail; the 200 response body is `{}`.
+JPDB_GRADES_NATIVE = ("nothing", "something", "hard", "okay", "easy")
+JPDB_GRADES_BINARY = ("fail", "pass")
+JPDB_GRADES = JPDB_GRADES_NATIVE + JPDB_GRADES_BINARY
+JPDB_SOURCE_REVISION = "jpdb.stoplight.io /reference/jpdb.json retrieved 2026-09-27"
 
 JPDB_CAPABILITIES = ProviderCapabilities(
     provider="jpdb",
     api_base=JPDB_API_BASE,
-    api_source="JPDB v1 endpoints corroborated by maintained clients; no reviewed official exactly-once contract",
-    source_revision="unverified",
+    api_source="jpdb.io public API (official OpenAPI on jpdb.stoplight.io)",
+    source_revision=JPDB_SOURCE_REVISION,
     auth="Bearer",
     account_identity="credential_fingerprint",
     card_id_namespace="jpdb",
     card_id_shape="(vid, sid)",
+    # No due-queue endpoint: only deck/list-vocabulary + lookup-vocabulary.
     enumerate_existing_reviewable=False,
+    # No review-history endpoint; card_state/card_level are state, not history.
     previous_review_evidence=False,
-    due_state=False,
-    grades=("fail", "hard", "okay", "easy"),
-    idempotency="not proven",
-    review_history="not proven for attempt reconciliation",
-    reconciliation="unsupported",
+    # lookup-vocabulary / parse expose card_state and due_at.
+    due_state=True,
+    grades=JPDB_GRADES,
+    idempotency="none: /review has no request-id field",
+    review_history="no review-history endpoint in the public API",
+    reconciliation="unsupported: /review returns {} and no attempt echo",
     mutation_retry="single-send; timeout/network/5xx => outcome_unknown",
     strict_gate_supported=False,
     strict_gate_reason=(
-        "native review enumeration, previous-review evidence and exactly-once/reconciliation semantics are not proven"
+        "public API has no due-queue enumeration, no review history and no idempotency key"
     ),
+    grade_modes=(("native", JPDB_GRADES_NATIVE), ("binary", JPDB_GRADES_BINARY)),
+    undo="unsupported: no undo endpoint in the public API",
+    native_parse="POST /parse (vid/sid/rid, card_state, due_at; utf16/utf32 positions)",
 )
 
 
@@ -499,14 +523,15 @@ class JpdbReviewProvider:
         attempt = str(attempt_id or "").strip()
         if not attempt:
             raise ReviewProviderError("JPDB review requires a local attempt_id")
-        mapped = {
-            "again": "fail",
-            "hard": "hard",
-            "good": "okay",
-            "easy": "easy",
-            "fail": "fail",
-            "okay": "okay",
-        }.get(str(grade).casefold())
+        requested = str(grade).casefold()
+        # Native jpdb grades pass through verbatim. The legacy Jiten-style
+        # names are kept only for the existing 4-button UI until the shared
+        # review action set (S2) sends native jpdb grades itself.
+        mapped = (
+            requested
+            if requested in JPDB_GRADES
+            else {"again": "fail", "good": "okay"}.get(requested)
+        )
         if mapped is None:
             raise ReviewProviderError("Unsupported JPDB review grade")
         try:

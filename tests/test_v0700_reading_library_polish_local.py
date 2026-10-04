@@ -148,7 +148,6 @@ def test_frontend_uses_one_manga_renderer_and_cover_only_ln_anilist_click() -> N
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
     media = (ROOT / "pudge/web/media.js").read_text(encoding="utf-8")
     manga = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    docs = (ROOT / "DEVELOPMENT.md").read_text(encoding="utf-8")
 
     assert "Series are grouped by volumes. AniList artwork is preferred when linked." not in manga
     assert "Серии сгруппированы по томам" not in manga
@@ -165,5 +164,3 @@ def test_frontend_uses_one_manga_renderer_and_cover_only_ln_anilist_click() -> N
     assert 'data-ln-book="${book.id}" data-ln-action="read"' in html
     assert 'data-ln-book="${book.id}" data-ln-anilist-url=' not in html
     assert ".ln-card-cover[data-ln-anilist-url]" in html
-
-    assert "Keep implementation details out of user-facing copy." in docs

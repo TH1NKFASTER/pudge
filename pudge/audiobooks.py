@@ -29,6 +29,7 @@ from .audio_activity import (
 )
 from .database import Database
 from .metadata_cache import MetadataCache
+from .player import mpv_supports_option
 from .work_scheduler import WorkPriority
 from .reading_audio_alignment import (
     align_light_novel_to_transcript,
@@ -918,12 +919,16 @@ class AudiobookService:
         self._players: dict[int, subprocess.Popen[Any]] = {}
         self._ipc_paths: dict[int, Path] = {}
         self._playback_sessions: dict[int, str] = {}
+        self._review_contexts: dict[int, dict[str, Any]] = {}
+        self.review_gate_enabled = lambda: False
         # Serialize playback ownership transitions.  A previous monitor may
         # finish after a new player has already started for the same book.
         self._playback_lock = threading.RLock()
         self._last_positions: dict[int, float] = {}
+        self._position_generations: dict[int, int] = {}
         self._last_motion_at: dict[int, float] = {}
         self._startup_targets: dict[int, dict[str, float | int]] = {}
+        self._pending_seek_targets: dict[int, dict[str, float | int]] = {}
         self._speeds: dict[int, float] = {}
         self._sleep_deadlines: dict[int, float] = {}
         self._sleep_chapter_ends: dict[int, float] = {}
@@ -946,6 +951,7 @@ class AudiobookService:
         self._worker_threads: list[threading.Thread] = []
         self._tempo_filter_args_cache: tuple[str, ...] | None = None
         self._fingerprint_cache: dict[tuple[str, int, int], tuple[float, str]] = {}
+        self._transcription_summary_cache: dict[Path, tuple[tuple[int, int], dict[str, Any]]] = {}
         self._alignment_payload_cache: dict[tuple[int, int, str], dict[str, Any]] = {}
         self._alignment_report_cache: dict[tuple[int, int, str], dict[str, Any] | None] = {}
         self._reader_parse_alignment_refresh_seen: set[tuple[int, int, str]] = set()
@@ -1549,6 +1555,15 @@ class AudiobookService:
             ):
                 self._last_motion_at[book_id] = now
 
+    def _publish_seek_position(self, book_id: int, position: float) -> None:
+        # The transition lock is held by the caller. Invalidate reads started
+        # before this accepted seek, and publish the same clock to Stop and UI.
+        with self._lock:
+            self._position_generations[book_id] = self._position_generations.get(book_id, 0) + 1
+            self._last_positions[book_id] = float(position)
+            self._last_motion_at[book_id] = time.monotonic()
+        self.set_position(book_id, position)
+
     def is_playing(self, book_id: int) -> bool:
         with self._lock:
             process = self._players.get(int(book_id))
@@ -2021,6 +2036,18 @@ class AudiobookService:
                     )
         return {"books": books}
 
+    def sidebar_state(self) -> dict[str, Any]:
+        """Focused playback state; never scan inactive books or their transcripts."""
+        with self._lock:
+            ids = [book_id for book_id, process in self._players.items() if process.poll() is None]
+        books = []
+        for book_id in ids:
+            try:
+                books.append(self.book(book_id, include_transcription=False))
+            except KeyError:
+                continue  # Deleted while its player was being stopped.
+        return {"books": books}
+
     def resume_pending_transcriptions(self) -> int:
         """Resume only analysis needed by an explicit LN↔audiobook link."""
         self._drop_invalid_managed_links()
@@ -2070,13 +2097,40 @@ class AudiobookService:
 
     @staticmethod
     def _ipc_command(ipc_path: Path, command: list[Any]) -> dict[str, Any] | None:
+        deadline = time.monotonic() + 1.0
+        request_id = time.monotonic_ns()
+        maximum_bytes = 1024 * 1024
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(1.0)
                 client.connect(str(ipc_path))
-                client.sendall(json.dumps({"command": command}).encode("utf-8") + b"\n")
-                payload = json.loads(client.recv(4096).decode("utf-8"))
-            return payload if isinstance(payload, dict) else None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                client.settimeout(remaining)
+                client.sendall(json.dumps({"command": command, "request_id": request_id}).encode("utf-8") + b"\n")
+                buffer = b""
+                received_bytes = 0
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                    client.settimeout(remaining)
+                    chunk = client.recv(min(4096, maximum_bytes + 1 - received_bytes))
+                    if not chunk:
+                        return None
+                    received_bytes += len(chunk)
+                    if received_bytes > maximum_bytes:
+                        return None
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, _, buffer = buffer.partition(b"\n")
+                        try:
+                            payload = json.loads(line)
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if isinstance(payload, dict) and payload.get("request_id") == request_id:
+                            return payload
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
 
@@ -2128,23 +2182,42 @@ class AudiobookService:
         return payload.get("data") if payload else None
 
     def _global_position(self, book_id: int, ipc_path: Path) -> float | None:
-        raw = self._ipc_get(ipc_path, "time-pos")
-        try:
-            local = float(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            local = None
-        if local is None:
-            return None
+        def read_local() -> float | None:
+            raw = self._ipc_get(ipc_path, "time-pos")
+            try:
+                return float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def read_index() -> int:
+            raw_index = self._ipc_get(ipc_path, "playlist-pos")
+            try:
+                return int(raw_index) if raw_index is not None else 0
+            except (TypeError, ValueError):
+                return 0
+
         files = self._file_rows(book_id)
         if len(files) <= 1:
-            return local
-        raw_index = self._ipc_get(ipc_path, "playlist-pos")
-        try:
-            index = int(raw_index) if raw_index is not None else 0
-        except (TypeError, ValueError):
-            index = 0
+            return read_local()
+        # time-pos and playlist-pos are separate IPC reads.  Bracket the clock
+        # read with two index reads so a file transition between them cannot
+        # combine the old file's local time with the new file's start offset.
+        index = read_index()
+        local = read_local()
+        after = read_index()
+        if after != index:
+            index = read_index()
+            local = read_local()
+            after = read_index()
+            if after != index:
+                index = after
+                local = 0.0
+        if local is None:
+            return None
         match = next((row for row in files if int(row["file_index"]) == index), None)
-        return float(match["start"] if match else 0.0) + local
+        if match is None:
+            return local
+        return float(match["start"] or 0.0) + local
 
     def _reconcile_startup_position(
         self,
@@ -2164,7 +2237,19 @@ class AudiobookService:
         book_id = int(book_id)
         now = time.monotonic()
         with self._lock:
+            pending = dict(getattr(self, "_pending_seek_targets", {}).get(book_id) or {})
             target = dict(getattr(self, "_startup_targets", {}).get(book_id) or {})
+        if pending:
+            elapsed = max(0.0, now - float(pending["accepted_at"]))
+            requested = float(pending["position"])
+            allowance = 2.0 + elapsed * float(pending["speed"])
+            if elapsed <= 6.0 and not (requested - 2.0 <= live_position <= requested + allowance):
+                # An IPC acknowledgement can precede the property update even
+                # when this sample was begun after the seek generation changed.
+                return requested
+            with self._lock:
+                getattr(self, "_pending_seek_targets", {}).pop(book_id, None)
+            return float(live_position)
         if not target:
             return float(live_position)
         launched_at = float(target.get("launched_at") or now)
@@ -2201,8 +2286,14 @@ class AudiobookService:
         )
         if response is None or response.get("error") != "success":
             return float(live_position)
+        paused = bool(self._ipc_get(ipc_path, "pause"))
         with self._lock:
             getattr(self, "_startup_targets", {}).pop(book_id, None)
+            self._pending_seek_targets[book_id] = {
+                "position": requested,
+                "accepted_at": now,
+                "speed": 0.0 if paused else speed,
+            }
             self._last_positions[book_id] = requested
             self._last_motion_at[book_id] = now
         # Do not persist the stale pre-seek IPC sample.  The next monitor poll
@@ -2235,6 +2326,61 @@ class AudiobookService:
                 and self._ipc_paths.get(book_id) == ipc_path
             )
 
+    def set_review_consumer(self, book_id: int, consumer: str) -> dict[str, Any]:
+        if consumer not in {"ln", "sidebar", "float"}:
+            raise ValueError("Unsupported audiobook consumer")
+        with self._lock:
+            context = getattr(self, "_review_contexts", {}).get(int(book_id))
+            if context is not None:
+                context["consumer"] = consumer
+                # Leaving the reader dismisses a pending prompt; never replay it
+                # later for a chapter consumed from the sidebar/floating window.
+                if consumer != "ln":
+                    context["pending_chapter"] = None
+            return {"ok": True, "context": dict(context or {})}
+
+    def _reader_audio_started(self, ln_book_id: int, audiobook_id: int, chapter: int, *, fresh: bool) -> None:
+        alignment = self._load_alignment(ln_book_id, audiobook_id)
+        ranges = self._paired_light_novel_chapter_ranges(ln_book_id, audiobook_id,
+                     float(self.book(audiobook_id)["duration"]), alignment=alignment) if alignment else []
+        with self._lock:
+            context = self._review_contexts.setdefault(audiobook_id, {"origin": "audio"})
+            if fresh:
+                context["origin"] = "ln"
+            context.update(consumer="ln", ln_book_id=ln_book_id, chapter=int(chapter),
+                           ranges=ranges, pending_chapter=None)
+
+    def _refresh_reader_review_alignment_locked(self, ln_book_id: int, audiobook_id: int,
+                                               duration: float, alignment: dict[str, Any]) -> None:
+        """Publication holds _lock; newly mapped past chapters never prompt late."""
+        context = getattr(self, "_review_contexts", {}).get(int(audiobook_id))
+        if not context or context.get("ln_book_id") != int(ln_book_id):
+            return
+        ranges = self._paired_light_novel_chapter_ranges(ln_book_id,audiobook_id,duration,alignment=alignment)
+        context["ranges"] = ranges
+        if context.get("pending_chapter") is None:
+            position = getattr(self,"_last_positions",{}).get(int(audiobook_id),0)
+            reached = [int(row["chapter_index"]) for row in ranges if float(row["start"]) <= position]
+            context["chapter"] = max([int(context.get("chapter",0)),*reached])
+
+    def _check_reader_review_boundary(self, book_id: int, position: float) -> None:
+        with self._lock:
+            context = getattr(self, "_review_contexts", {}).get(book_id)
+            if not context or context.get("pending_chapter") is not None:
+                return
+            reached = [r for r in context.get("ranges", []) if float(r["start"]) <= position
+                       and int(r["chapter_index"]) > int(context.get("chapter", 0))]
+            if not reached:
+                return
+            target = max(reached, key=lambda r: float(r["start"]))
+            context["chapter"] = int(target["chapter_index"])
+            should_pause = context.get("origin") == "ln" and context.get("consumer") == "ln" and self.review_gate_enabled()
+            if should_pause:
+                context["pending_chapter"] = int(target["chapter_index"])
+        if should_pause:
+            self.set_paused(book_id, True)
+            self.seek_to(book_id, float(target["start"]))
+
     def _monitor(
         self,
         book_id: int,
@@ -2243,26 +2389,35 @@ class AudiobookService:
         session_id: str,
     ) -> None:
         last_saved = 0.0
-        last_position: float | None = None
         try:
             while process.poll() is None:
                 if not self._playback_session_owned(book_id, process, ipc_path, session_id):
                     break
+                with self._lock:
+                    generation = self._position_generations.get(book_id, 0)
                 position = self._global_position(book_id, ipc_path)
                 with self._playback_lock:
                     if not self._playback_session_owned(
                         book_id, process, ipc_path, session_id
                     ):
                         break
-                    if position is not None:
+                    with self._lock:
+                        sample_current = generation == self._position_generations.get(book_id, 0)
+                    if position is not None and sample_current:
                         position = self._reconcile_startup_position(
                             book_id, ipc_path, position
                         )
-                        last_position = position
-                        self._record_playback_position(book_id, position)
-                        if time.monotonic() - last_saved >= _POSITION_WRITE_INTERVAL:
-                            self.set_position(book_id, position)
-                            last_saved = time.monotonic()
+                        self._check_reader_review_boundary(book_id, position)
+                        with self._lock:
+                            sample_current = generation == self._position_generations.get(book_id, 0)
+                        if sample_current:
+                            self._record_playback_position(book_id, position)
+                            if time.monotonic() - last_saved >= _POSITION_WRITE_INTERVAL:
+                                self.set_position(book_id, position)
+                                last_saved = time.monotonic()
+                    if not sample_current:
+                        with self._lock:
+                            position = self._last_positions.get(book_id)
                     if self._sleep_reached(book_id, position):
                         self._ipc_commands_no_wait(
                             ipc_path,
@@ -2287,8 +2442,10 @@ class AudiobookService:
                     book_id, process, ipc_path, session_id
                 )
                 if owned:
-                    if last_position is not None:
-                        self.set_position(book_id, last_position)
+                    with self._lock:
+                        final_position = self._last_positions.get(book_id)
+                    if final_position is not None:
+                        self.set_position(book_id, final_position)
                     with self._lock:
                         if (
                             self._playback_sessions.get(int(book_id)) == session_id
@@ -2300,6 +2457,7 @@ class AudiobookService:
                             self._playback_sessions.pop(int(book_id), None)
                             self._last_positions.pop(int(book_id), None)
                             self._startup_targets.pop(int(book_id), None)
+                            self._pending_seek_targets.pop(int(book_id), None)
                             self._last_motion_at.pop(int(book_id), None)
                             self._sleep_deadlines.pop(int(book_id), None)
                             self._sleep_chapter_ends.pop(int(book_id), None)
@@ -2344,10 +2502,12 @@ class AudiobookService:
 
             # Position is continuously cached by the monitor, so Stop never performs
             # the former sequence of blocking IPC reads before silencing playback.
-            if final_position is not None:
-                self.set_position(book_id, final_position)
-
-            self._wait_or_kill(process)
+            try:
+                if final_position is not None:
+                    self.set_position(book_id, final_position)
+            finally:
+                # Persistence errors must never leave a player sounding.
+                self._wait_or_kill(process)
 
             with self._lock:
                 sessions = getattr(self, "_playback_sessions", {})
@@ -2360,6 +2520,7 @@ class AudiobookService:
                     sessions.pop(book_id, None)
                     self._last_positions.pop(book_id, None)
                     getattr(self, "_startup_targets", {}).pop(book_id, None)
+                    getattr(self, "_pending_seek_targets", {}).pop(book_id, None)
                     getattr(self, "_last_motion_at", {}).pop(book_id, None)
                     self._sleep_deadlines.pop(book_id, None)
                     self._sleep_chapter_ends.pop(book_id, None)
@@ -2390,10 +2551,16 @@ class AudiobookService:
             return self._play_locked(int(book_id), start=start, speed=speed)
 
     def _play_locked(
-        self, book_id: int, start: float | None = None, speed: float = 1.0
+        self, book_id: int, start: float | None = None, speed: float = 1.0,
+        *, preserve_transport: bool = False,
     ) -> dict[str, Any]:
         book_id = int(book_id)
         speed = max(0.5, min(3.0, float(speed or 1.0)))
+        paused = preserve_transport and self.is_paused(book_id)
+        with self._lock:
+            review_context = dict(self._review_contexts.get(book_id) or {}) if preserve_transport else {}
+            sleep_deadline = self._sleep_deadlines.get(book_id) if preserve_transport else None
+            sleep_chapter_end = self._sleep_chapter_ends.get(book_id) if preserve_transport else None
         if self.is_playing(book_id):
             # _playback_lock is re-entrant, so the public Stop path retains its
             # fast-stop contract while serializing this ownership transition.
@@ -2448,6 +2615,10 @@ class AudiobookService:
             "--force-window=no",
         ]
         command.extend(self._tempo_filter_args())
+        if paused:
+            # Apply pause before opening the new file; an IPC pause afterwards
+            # would briefly play audio during a paused cross-file seek.
+            command.append("--pause=yes")
         command.extend(
             [
                 f"--speed={speed:.3f}",
@@ -2474,17 +2645,26 @@ class AudiobookService:
                 )
             else:
                 command.append(path_value)
-        process = subprocess.Popen(command)
-        with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE audiobooks SET speed=?,last_played_at=?,updated_at=? WHERE id=?",
-                (speed, time.time(), time.time(), book_id),
-            )
         with self._lock:
+            if self._closed_event.is_set():
+                raise RuntimeError("Audiobook service is closed")
+            from .runtime import worker_environment
+            if sys.platform == "darwin" and mpv_supports_option(self.mpv, "macos-app-activation-policy"):
+                command.insert(1, "--macos-app-activation-policy=accessory")
+            process = subprocess.Popen(command, env=worker_environment())
+            self._review_contexts[book_id] = {
+                **(review_context or {"origin": "audio", "consumer": "sidebar", "pending_chapter": None}),
+                "session": session_id,
+            }
+            if sleep_deadline is not None:
+                self._sleep_deadlines[book_id] = sleep_deadline
+            if sleep_chapter_end is not None:
+                self._sleep_chapter_ends[book_id] = sleep_chapter_end
             self._players[book_id] = process
             self._ipc_paths[book_id] = ipc_path
             self._playback_sessions[book_id] = session_id
             self._last_positions[book_id] = position
+            self._position_generations[book_id] = self._position_generations.get(book_id, 0) + 1
             launched_at = time.monotonic()
             self._last_motion_at[book_id] = launched_at
             self._startup_targets[book_id] = {
@@ -2494,7 +2674,13 @@ class AudiobookService:
                 "speed": speed,
                 "launched_at": launched_at,
             }
+            self._pending_seek_targets.pop(book_id, None)
             self._speeds[book_id] = speed
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE audiobooks SET speed=?,last_played_at=?,updated_at=? WHERE id=?",
+                (speed, time.time(), time.time(), book_id),
+            )
         monitor = self._tracked_thread(
             target=self._monitor,
             args=(book_id, process, ipc_path, session_id),
@@ -2587,62 +2773,64 @@ class AudiobookService:
 
     def seek(self, book_id: int, seconds: float) -> dict[str, Any]:
         book_id = int(book_id)
-        with self._lock:
-            getattr(self, "_startup_targets", {}).pop(book_id, None)
-        delta = float(seconds)
-        with self._lock:
-            ipc_path = self._ipc_paths.get(book_id)
-        if ipc_path is not None and self.is_playing(book_id):
-            self._ipc_command(ipc_path, ["seek", delta, "relative", "exact"])
-            time.sleep(0.03)
-            position = self._global_position(book_id, ipc_path)
-            if position is not None:
-                self.set_position(book_id, position)
-        else:
-            book = self.book(book_id)
-            self.set_position(book_id, float(book["position"] or 0.0) + delta)
-        return {"ok": True, "book": self.book(book_id)}
+        with self._playback_lock:
+            # The accepted clock is authoritative until the monitor observes
+            # the new position. A seek acknowledgement can precede mpv's clock
+            # update, and a relative jump can cross a playlist file boundary.
+            position = float(self.book(book_id)["position"] or 0.0)
+            return self.seek_to(book_id, position + float(seconds))
 
     def seek_to(self, book_id: int, position: float) -> dict[str, Any]:
         book_id = int(book_id)
-        with self._lock:
-            getattr(self, "_startup_targets", {}).pop(book_id, None)
-        book = self.book(book_id)
-        value = max(0.0, min(float(position), float(book["duration"] or position)))
-        if self.is_playing(book_id):
-            files = self._file_rows(book_id)
-            selected = next(
-                (
-                    row
-                    for row in files
-                    if float(row.get("start") or 0.0)
-                    <= value
-                    < float(row.get("end") or value + 0.001)
-                ),
-                files[-1] if files else None,
-            )
+        with self._playback_lock:
             with self._lock:
-                ipc_path = self._ipc_paths.get(book_id)
-            current_index = self._ipc_get(ipc_path, "playlist-pos") if ipc_path else None
-            selected_index = int(selected.get("file_index") or 0) if selected else 0
-            same_file = len(files) <= 1 or (
-                current_index is not None and int(current_index) == selected_index
-            )
-            local_position = value - float(selected.get("start") or 0.0) if selected else value
-            response = (
-                self._ipc_command(
-                    ipc_path,
-                    ["seek", max(0.0, local_position), "absolute", "exact"],
+                getattr(self, "_startup_targets", {}).pop(book_id, None)
+            book = self.book(book_id)
+            value = max(0.0, min(float(position), float(book["duration"] or position)))
+            if self.is_playing(book_id):
+                files = self._file_rows(book_id)
+                selected = next(
+                    (
+                        row
+                        for row in files
+                        if float(row.get("start") or 0.0)
+                        <= value
+                        < float(row.get("end") or value + 0.001)
+                    ),
+                    files[-1] if files else None,
                 )
-                if ipc_path is not None and same_file
-                else None
-            )
-            if response is None or response.get("error") != "success":
-                self.play(book_id, start=value, speed=float(book["speed"] or 1.0))
-            self.set_position(book_id, value)
-        else:
-            self.set_position(book_id, value)
-        return {"ok": True, "book": self.book(book_id)}
+                with self._lock:
+                    ipc_path = self._ipc_paths.get(book_id)
+                current_index = self._ipc_get(ipc_path, "playlist-pos") if ipc_path else None
+                selected_index = int(selected.get("file_index") or 0) if selected else 0
+                same_file = len(files) <= 1 or (
+                    current_index is not None and int(current_index) == selected_index
+                )
+                local_position = value - float(selected.get("start") or 0.0) if selected else value
+                response = (
+                    self._ipc_command(
+                        ipc_path,
+                        ["seek", max(0.0, local_position), "absolute", "exact"],
+                    )
+                    if ipc_path is not None and same_file
+                    else None
+                )
+                if response is None or response.get("error") != "success":
+                    self._play_locked(
+                        book_id, start=value, speed=float(book["speed"] or 1.0), preserve_transport=True,
+                    )
+                else:
+                    paused = bool(ipc_path and self._ipc_get(ipc_path, "pause"))
+                    with self._lock:
+                        self._pending_seek_targets[book_id] = {
+                            "position": value,
+                            "accepted_at": time.monotonic(),
+                            "speed": 0.0 if paused else float(book["speed"] or 1.0),
+                        }
+                self._publish_seek_position(book_id, value)
+            else:
+                self.set_position(book_id, value)
+            return {"ok": True, "book": self.book(book_id)}
 
     def set_sleep_timer(
         self,
@@ -2971,14 +3159,40 @@ class AudiobookService:
 
     def transcription_status(self, audiobook_id: int) -> dict[str, Any]:
         audiobook_id = int(audiobook_id)
+        path = self._transcript_path(audiobook_id)
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = None
+        with self._lock:
+            summaries = getattr(self, "_transcription_summary_cache", {})
+            entry = summaries.get(path)
+        if stamp is not None and entry is not None and entry[0] == stamp:
+            return dict(entry[1])
         cached = self._load_transcript(audiobook_id)
         if cached is not None:
-            return {
+            summary = {
                 "status": "ready",
                 "ready": True,
                 "model": str(cached.get("model") or self.stt_model),
                 "segment_count": len(cached.get("segments") or []),
             }
+            # Legacy migration may have just created the current path.
+            try:
+                stat = path.stat()
+                current_stamp = (stat.st_mtime_ns, stat.st_size)
+                # Do not pin an old read to a newer file written concurrently.
+                if stamp is None or stamp == current_stamp:
+                    with self._lock:
+                        if not hasattr(self, "_transcription_summary_cache"):
+                            self._transcription_summary_cache = {}
+                        if len(self._transcription_summary_cache) >= 64:
+                            self._transcription_summary_cache.pop(next(iter(self._transcription_summary_cache)))
+                        self._transcription_summary_cache[path] = (current_stamp, dict(summary))
+            except OSError:
+                pass
+            return summary
         with self._lock:
             job = dict(self._transcription_jobs.get(audiobook_id) or {})
             queue = list(self._transcription_queue)
@@ -4021,19 +4235,22 @@ class AudiobookService:
                     cancel_event=None,
                 )
                 parts.append(part)
-            concat_file = work / "concat.txt"
-            concat_file.write_text(
-                "".join(f"file '{part.as_posix()}'\\n" for part in parts),
-                encoding="utf-8",
-            )
+            # The concat *filter* decodes every part and joins the samples. The
+            # concat demuxer trusted per-file container durations, which newer
+            # FFmpeg (macOS Homebrew) reads from FLAC headers so that only the
+            # first part survived. Paths are plain -i arguments: no list-file
+            # quoting for apostrophes or backslashes.
+            command = [self._resolved_ffmpeg(), "-v", "error", "-nostdin", "-y"]
+            for part in parts:
+                command.extend(["-i", str(part)])
+            graph = "".join(f"[{index}:a]" for index in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1[out]"
+            command.extend([
+                "-filter_complex", graph, "-map", "[out]",
+                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
+                str(destination),
+            ])
             completed = subprocess.run(
-                [
-                    self._resolved_ffmpeg(),
-                    "-v", "error", "-nostdin", "-y",
-                    "-f", "concat", "-safe", "0", "-i", str(concat_file),
-                    "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
-                    str(destination),
-                ],
+                command,
                 text=True,
                 capture_output=True,
                 timeout=max(60.0, actual_duration * 3.0),
@@ -4831,6 +5048,7 @@ class AudiobookService:
                     report_temporary.replace(report_output)
                     self._alignment_payload_cache.clear()
                     self._alignment_report_cache.clear()
+                    self._refresh_reader_review_alignment_locked(ln_book_id,audiobook_id,book_duration,alignment)
             finally:
                 attempt_output.unlink(missing_ok=True)
                 report_temporary.unlink(missing_ok=True)
@@ -5055,6 +5273,11 @@ class AudiobookService:
             process.terminate()
         with self.db.connect() as conn:
             conn.execute("DELETE FROM reading_audio_links WHERE ln_book_id=?", (int(ln_book_id),))
+        # P10: audio keeps playing, but reader review/sync control is disconnected.
+        with self._lock:
+            contexts = getattr(self, "_review_contexts", {})
+            for audiobook_id in [key for key, ctx in contexts.items() if ctx.get("ln_book_id") == int(ln_book_id)]:
+                contexts.pop(audiobook_id, None)
         return {"ok": True}
 
     def stop_for_light_novel(self, ln_book_id: int) -> dict[str, Any]:
@@ -5129,7 +5352,15 @@ class AudiobookService:
     ) -> dict[str, Any]:
         audiobook_id, position = self._paired_audio_position(ln_book_id, chapter_index, chapter_progress)
         book = self.book(audiobook_id)
-        self.play(audiobook_id, start=position, speed=float(speed or book["speed"] or 1.0))
+        fresh = not self.is_playing(audiobook_id)
+        if fresh:
+            self.play(audiobook_id, start=position, speed=float(speed or book["speed"] or 1.0))
+        else:
+            self.seek_to(audiobook_id, position)
+            if speed is not None:
+                self.set_speed(audiobook_id, float(speed))
+            self.set_paused(audiobook_id, False)
+        self._reader_audio_started(int(ln_book_id), audiobook_id, int(chapter_index), fresh=fresh)
         return self.paired_state(int(ln_book_id))
 
     def play_paired_at_offset(
@@ -5166,7 +5397,8 @@ class AudiobookService:
                 max(0.0, min(1.0, int(character_offset) / length)),
             )
         book = self.book(audiobook_id)
-        if self.is_playing(audiobook_id):
+        fresh = not self.is_playing(audiobook_id)
+        if not fresh:
             self.seek_to(audiobook_id, max(0.0, float(position)))
             if speed is not None:
                 self.set_speed(audiobook_id, float(speed))
@@ -5180,6 +5412,7 @@ class AudiobookService:
                 speed=float(speed or book["speed"] or 1.0),
             )
             self.set_position(audiobook_id, max(0.0, float(position)))
+        self._reader_audio_started(int(ln_book_id), audiobook_id, int(chapter_index), fresh=fresh)
         return self.paired_state(int(ln_book_id))
 
     def _paired_light_novel_chapter_ranges(
@@ -5233,11 +5466,25 @@ class AudiobookService:
         position = float(book["position"] or 0.0)
         with self._lock:
             ipc_path = self._ipc_paths.get(audiobook_id)
+            generation = self._position_generations.get(audiobook_id, 0)
+            session_id = self._playback_sessions.get(audiobook_id)
         if ipc_path is not None:
             live = self._global_position(audiobook_id, ipc_path)
-            if live is not None:
-                position = self._reconcile_startup_position(audiobook_id, ipc_path, live)
-                self._record_playback_position(audiobook_id, position)
+            with self._playback_lock:
+                with self._lock:
+                    sample_current = (
+                        generation == self._position_generations.get(audiobook_id, 0)
+                        and session_id == self._playback_sessions.get(audiobook_id)
+                        and ipc_path == self._ipc_paths.get(audiobook_id)
+                    )
+                    latest_position = self._last_positions.get(audiobook_id)
+                if live is not None and sample_current:
+                    position = self._reconcile_startup_position(audiobook_id, ipc_path, live)
+                    self._record_playback_position(audiobook_id, position)
+                elif latest_position is not None:
+                    position = float(latest_position)
+                elif not sample_current:
+                    position = float(self.book(audiobook_id)["position"] or 0.0)
         alignment = self._load_alignment(int(ln_book_id), audiobook_id)
         lookup_started = time.perf_counter()
         exact = light_novel_position_for_audio(alignment, position) if alignment is not None else None
@@ -5321,6 +5568,7 @@ class AudiobookService:
             "anchor_window": exact.get("anchor_window") if exact else None,
             "alignment_mode": "stt" if exact is not None else "chapter",
             "alignment": alignment_state,
+            "review_context": dict(getattr(self, "_review_contexts", {}).get(audiobook_id, {})),
             "ln_chapter_ranges": self._paired_light_novel_chapter_ranges(
                 int(ln_book_id), audiobook_id, float(book["duration"] or 0.0), alignment=alignment
             ),
@@ -5332,6 +5580,11 @@ class AudiobookService:
         if not ids:
             return {"ok": True, "removed": [], "errors": []}
 
+        with self.db.connect() as conn:
+            placeholders = ",".join("?" for _ in ids)
+            links = conn.execute(f"SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})", ids).fetchall()
+        for link in links:
+            self.unlink_light_novel(int(link["ln_book_id"]))
         # Only touch expensive runtime state for jobs/players that actually exist.
         with self._lock:
             active_transcriptions = {book_id for book_id in ids if book_id in self._transcription_cancel_events}
@@ -5341,11 +5594,16 @@ class AudiobookService:
             }
         for book_id in active_transcriptions:
             self.cancel_transcription(book_id)
+        errors = []
         for book_id in active_players:
             try:
                 self.stop(book_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append({"book_id": book_id, "error": str(exc)})
+        failed = {item["book_id"] for item in errors}
+        ids = [book_id for book_id in ids if book_id not in failed]
+        if not ids:
+            return {"ok": False, "removed": [], "errors": errors}
 
         placeholders = ",".join("?" for _ in ids)
         with self.db.connect() as conn:
@@ -5363,6 +5621,11 @@ class AudiobookService:
             conn.execute(f"DELETE FROM audiobooks WHERE id IN ({placeholders})", ids)
 
         removed = [book_id for book_id in ids if book_id in found]
+        # P10: no review boundary, speed or position sample may outlive the row.
+        with self._lock:
+            for book_id in ids:
+                for name in ("_review_contexts", "_speeds", "_position_generations", "_last_positions"):
+                    getattr(self, name, {}).pop(book_id, None)
         if delete_files:
             for source in found.values():
                 try:
@@ -5370,26 +5633,11 @@ class AudiobookService:
                     elif source.is_file(): source.unlink(missing_ok=True)
                 except OSError:
                     pass
-        return {"ok": True, "removed": removed, "errors": []}
+        return {"ok": not errors, "removed": removed, "errors": errors}
 
     def delete(self, book_id: int, *, delete_files: bool = False) -> dict[str, Any]:
         book_id = int(book_id)
-        book = self.book(book_id)
-        self.cancel_transcription(book_id)
-        self.stop(book_id)
-        source = Path(str(book["path"])).expanduser()
-        with self.db.connect() as conn:
-            conn.execute("DELETE FROM reading_audio_links WHERE audiobook_id=?", (book_id,))
-            conn.execute("DELETE FROM audiobook_bookmarks WHERE book_id=?", (book_id,))
-            conn.execute("DELETE FROM audiobook_files WHERE book_id=?", (book_id,))
-            conn.execute("DELETE FROM audiobook_chapters WHERE book_id=?", (book_id,))
-            conn.execute("DELETE FROM audiobooks WHERE id=?", (book_id,))
-        if delete_files:
-            try:
-                if source.is_dir():
-                    shutil.rmtree(source)
-                elif source.is_file():
-                    source.unlink(missing_ok=True)
-            except OSError:
-                pass
+        result = self.delete_many([book_id], delete_files=delete_files)
+        if result.get("errors"):
+            return result
         return {"ok": True, "book_id": book_id, "files_kept": not bool(delete_files)}

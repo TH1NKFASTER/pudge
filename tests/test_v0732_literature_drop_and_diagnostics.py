@@ -34,7 +34,8 @@ def test_dropped_literature_skips_parallel_full_library_load() -> None:
     assert "ui.skipActivatedPageLoadOnce=true" in focus
     assert "setPage(page);" in focus
     page = _function(html, "setPage")
-    assert "if(ui.skipActivatedPageLoadOnce)ui.skipActivatedPageLoadOnce=false;else requestAnimationFrame(()=>loadActivatedPage(page))" in page
+    assert "if(ui.skipActivatedPageLoadOnce)ui.skipActivatedPageLoadOnce=false;else{const generation=ui.pageLoadGeneration=" in page
+    assert "if(generation!==ui.pageLoadGeneration||ui.page!==page)return;loadActivatedPage(page);" in page
 
 
 def test_drop_handler_stops_default_webkit_drop_processing() -> None:

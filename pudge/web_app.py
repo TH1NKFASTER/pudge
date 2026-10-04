@@ -9,6 +9,8 @@ import os
 import platform
 import re
 import shutil
+import secrets
+import hmac
 import socket
 import subprocess
 import sys
@@ -28,6 +30,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from . import __version__
+from .build_identity import build_identity
 from .app_session import mark_app_running, mark_app_stopped, set_app_window_active
 from .cache_management import cleanup_segment_audio_cache
 from .audiobooks import (
@@ -37,6 +40,7 @@ from .audiobooks import (
     audiobook_torrent_pack_plan,
     audiobook_series_path_matches,
 )
+from .audiobook_float import AudiobookFloatWindow
 from .backup import create_backup, restore_backup
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG, DATA_DIR
 from .cache_registry import CacheRegistry
@@ -68,6 +72,7 @@ from .first_experience import (
 from .jimaku_trial import apply_jimaku_trial
 from .job_center import JobCenter
 from .language import IMAGE_SUBTITLE_EXTENSIONS
+from .ui_localization import ui_text
 from .light_novels import LightNovelError, LightNovelService
 from .llm import OllamaClient, list_models
 from .library import VIDEO_EXTENSIONS
@@ -88,6 +93,7 @@ from .providers.qbittorrent import QBittorrentClient
 from .runtime import python_executable
 from .review_gate import EpisodeReviewIdentity, ReviewGateStore, review_card_key
 from .review_episode_due import build_episode_due_review_cards, resolve_episode_review_subtitle
+from .review_actions import action_set_payload, normalize_shortcuts, resolve_wire_grade
 from .review_providers import ReviewOutcomeUnknown
 from .safe_mode import SafeModeController
 from .secrets_store import keep_masked_secret, masked_secret
@@ -97,7 +103,7 @@ from .torrent_admission import TorrentAdmission
 from .task_supervisor import TaskSupervisor
 from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
-from .visual_novels import VisualNovelService
+from .visual_novels import VisualNovelError, VisualNovelService
 from .work_scheduler import WorkPriority
 from .web_controllers import CompanionController, DiagnosticsController
 from .web_state import UIStateSnapshotCache
@@ -258,6 +264,10 @@ class WebAppApi:
         self.config_path = config_path.expanduser()
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
+        self._close_lock = threading.RLock()
+        self._close_completed = False
+        self._closing = False
+        self._owning_pid = os.getpid()
         startup_was_enabled = _disable_torrents_for_startup(self.config)
         # Publish Off before backend shutdown so an agent with a stale config
         # cannot issue a new start while this GUI session is coming up.
@@ -277,6 +287,8 @@ class WebAppApi:
         self.safe_mode.begin()
         mark_app_running()
         self.task_supervisor = TaskSupervisor(logger=self.logger)
+        self._watching_download_lock = threading.RLock()
+        self._watching_download_jobs: dict[int, dict[str, Any]] = {}
         cleanup_debug_logs()
         cache_cleanup = cleanup_segment_audio_cache(self.config.paths.cache_dir, force=True)
         if int(cache_cleanup.get("removed_files") or 0):
@@ -313,6 +325,7 @@ class WebAppApi:
             job_center=self.job_center,
             work_scheduler=self.manager.work_scheduler,
         )
+        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
         if not self.safe_mode.active:
             self.task_supervisor.start(
                 name="audiobook-stt-resume",
@@ -367,14 +380,17 @@ class WebAppApi:
         self._ln_audiobook_download_jobs: dict[int, dict[str, Any]] = {}
         self._ln_audiobook_recovery_lock = threading.Lock()
         self._ln_audiobook_last_recovery_at = 0.0
-        self.app_updater = AppUpdater(logger=self.logger)
+        self.app_updater = AppUpdater(logger=self.logger, before_install=self._prepare_update_shutdown, request_quit=self._quit_after_update)
         self.debug_snapshots = DebugSnapshotService(
             self.manager,
             cache_dir=self.config.paths.cache_dir,
             runtime_log_path=DEFAULT_LOG_PATH,
         )
-        self.logger.info("APP session_start version=%s platform=%s", __version__, platform.platform())
+
+        self.logger.info("APP session_start version=%s build=%s installed_at=%s platform=%s", __version__, build_identity()["display"], build_identity().get("installed_at", ""), platform.platform())
         self.window: Any | None = None
+        self._audiobook_float = AudiobookFloatWindow(self)
+        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
         self._macos_window_lifecycle: _MacWindowLifecycle | None = None
         self._macos_app_delegate_proxy: Any | None = None
         self.asset_base = ""
@@ -416,6 +432,7 @@ class WebAppApi:
         self._restore_lock = threading.Lock()
         self._startup_maintenance_lock = threading.Lock()
         self._download_poll_lock = threading.Lock()
+        self._download_poll_schedule_lock = threading.Lock()
         self._torrent_traffic_lock = threading.Lock()
         self._last_torrent_traffic: dict[str, Any] = {
             "download_speed": 0,
@@ -980,6 +997,7 @@ class WebAppApi:
             job_center=self.job_center,
             work_scheduler=self.manager.work_scheduler,
         )
+        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
         self._ui_state_cache.invalidate()
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
@@ -992,60 +1010,132 @@ class WebAppApi:
             runtime_log_path=DEFAULT_LOG_PATH,
         )
 
+        with self._review_gate_lock:
+            self._review_gate_store = ReviewGateStore(self.manager.db)
+            self._review_gate_candidates = {}
+            self._review_gate_pending = set()
+            self._review_gate_prefetch_cards = []
+            self._review_gate_prefetch_account_key = ""
+            self._review_gate_prefetch_session_id = ""
+            for name in ("_content_review_service", "_review_gate_due_store", "_review_gate_due_targets"):
+                if hasattr(self, name):
+                    delattr(self, name)
+        self._last_storage_status = None
+
     def close(self) -> None:
-        # Cmd+Q means Pudge goes fully idle: no scheduled maintenance and no
-        # detached torrent sidecar continuing to download or seed in the background.
-        cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
-        if isinstance(cancel, threading.Event):
-            cancel.set()
-        prefetch_thread = getattr(self, "_jiten_state_prefetch_thread", None)
-        if isinstance(prefetch_thread, threading.Thread) and prefetch_thread.is_alive():
-            prefetch_thread.join(timeout=2.0)
-        self._enter_background_quiet(reason="close")
-        cache_cleanup = {"removed_files": 0}
-        config = getattr(self, "config", None)
-        cache_dir = getattr(getattr(config, "paths", None), "cache_dir", None)
-        if cache_dir is not None:
-            cache_cleanup = cleanup_segment_audio_cache(cache_dir, force=True)
-        if int(cache_cleanup.get("removed_files") or 0):
-            self.logger.info(
-                "EVENT cache.segment_audio_quiet removed=%s",
-                cache_cleanup.get("removed_files", 0),
-            )
-        self._stop_companion_server()
-        streaming = getattr(self, "companion_streaming", None)
-        if streaming is not None:
-            streaming.close()
-        self.energy_monitor.stop()
-        manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
-        supervisor = getattr(self, "task_supervisor", None)
-        cancel_task = getattr(supervisor, "cancel", None) if supervisor is not None else None
-        if callable(cancel_task):
-            cancel_task("consumption-runtime-recorder")
-        audiobook_close = getattr(self.audiobooks, "close", None)
-        if callable(audiobook_close):
-            audiobook_lingering = list(audiobook_close(timeout=5.0) or [])
-        else:
-            self.audiobooks.stop_all()
-            audiobook_lingering = []
+        lock = getattr(self, "_close_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._close_lock = lock
+        with lock:
+            if getattr(self, "_close_completed", False):
+                return
+            self._closing = True
+            started = time.monotonic()
+            failures: list[str] = []
+
+            def step(name: str, callback: Any) -> Any:
+                at = time.monotonic()
+                self.logger.info("START step=app.shutdown.%s pid=%s", name, os.getpid())
+                try:
+                    result = callback()
+                except Exception as exc:
+                    failures.append(name)
+                    self.logger.warning("FAIL step=app.shutdown.%s error=%r", name, str(exc))
+                    return None
+                self.logger.info("RESULT step=app.shutdown.%s duration_ms=%.1f", name, (time.monotonic()-at)*1000)
+                return result
+
+            # Capture ownership before stopping coordinators can orphan workers.
+            tree = None
+            if getattr(self, "_owning_pid", None) == os.getpid():
+                from .process_cleanup import OwnedProcessTree
+
+                tree = step("capture_children", OwnedProcessTree)
+                if tree is not None:
+                    step("preserve_playback", lambda: self._preserve_playback_processes(tree))
+                self._shutdown_process_tree = tree
+            supervisor = getattr(self, "task_supervisor", None)
+            if callable(getattr(supervisor, "suspend", None)):
+                step("stop_admission", supervisor.suspend)
+            # Silence audio first; slower joins and network cleanup follow.
+            audiobook_close = getattr(self.audiobooks, "close", None)
+            if callable(audiobook_close):
+                audiobook_lingering = list(step("audiobooks", lambda: audiobook_close(timeout=3.0)) or [])
+            else:
+                step("audiobooks", self.audiobooks.stop_all)
+                audiobook_lingering = []
+            step("background_quiet", lambda: self._enter_background_quiet(reason="close"))
+            cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
+            if isinstance(cancel, threading.Event):
+                cancel.set()
+            prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
+            if isinstance(prefetch, threading.Thread) and prefetch.is_alive():
+                step("jiten_prefetch", lambda: prefetch.join(timeout=2.0))
+            step("companion_server", self._stop_companion_server)
+            streaming = getattr(self, "companion_streaming", None)
+            if streaming is not None:
+                step("streaming", streaming.close)
+            step("energy", self.energy_monitor.stop)
+            manga_lingering = list(step("manga", lambda: self._quiesce_manga_ocr(timeout=3.0)) or [])
+            step("visual_novel", self.visual_novel_stop)
+            if getattr(self, "_irodori_server_lock", None) is not None:
+                step("tts_server", self._stop_managed_irodori_server)
+            supervisor_lingering = list(step("tasks", lambda: supervisor.shutdown(timeout=3.0)) or []) if supervisor is not None else []
+            config = getattr(self, "config", None)
+            cache_dir = getattr(getattr(config, "paths", None), "cache_dir", None)
+            if cache_dir is not None:
+                step("segment_cache", lambda: cleanup_segment_audio_cache(cache_dir, force=True))
+            process_lingering = list(step("remaining_children", tree.stop) or []) if tree is not None else []
+            lingering = [*manga_lingering, *audiobook_lingering, *supervisor_lingering]
+            lingering.extend(f"pid:{pid}" for pid in process_lingering)
+            if lingering:
+                self.logger.warning("WAIT step=app.shutdown lingering=%s", ",".join(sorted(set(lingering))))
+            safe_mode = getattr(self, "safe_mode", None)
+            if safe_mode is not None and not lingering and not failures:
+                step("safe_mode", safe_mode.finish_cleanly)
+            self._shutdown_failures = failures
+            self._shutdown_lingering = lingering
+            self._close_completed = True
+            self.logger.info("EVENT app.shutdown_complete pid=%s duration_ms=%.1f failures=%s lingering=%s",
+                             os.getpid(), (time.monotonic()-started)*1000, failures, lingering)
+
+    def _prepare_update_shutdown(self) -> None:
+        # The installer has not spawned yet. Keep every service usable if
+        # preflight refuses the update or spawning the detached installer fails.
+        blockers = self._restore_background_blockers()
+        if blockers:
+            raise RuntimeError("Background work is still active; retry the update when it finishes")
+        self._stop_scheduled_agent()
+        supervisor = self.task_supervisor
         try:
-            self.visual_novel_stop()
-        except Exception as exc:
-            self.logger.warning("FAIL consumption.vn_stop_on_close error=%r", str(exc))
-            self.visual_novels.stop()
-        supervisor = getattr(self, "task_supervisor", None)
-        supervisor_lingering = list(
-            (supervisor.shutdown(timeout=5.0) if supervisor is not None else []) or []
-        )
-        lingering = [*manga_lingering, *audiobook_lingering, *supervisor_lingering]
-        if lingering:
-            self.logger.warning(
-                "WAIT step=app.shutdown lingering=%s",
-                ",".join(sorted(set(lingering))),
-            )
-        safe_mode = getattr(self, "safe_mode", None)
-        if safe_mode is not None and not lingering:
-            safe_mode.finish_cleanly()
+            lingering = supervisor.quiesce(timeout=3.0)
+            lingering.extend(self._quiesce_manga_ocr(timeout=3.0))
+            if lingering:
+                raise RuntimeError("Background tasks did not quiesce; update paused before installation")
+        finally:
+            supervisor.resume()
+            self._start_scheduled_agent()
+
+    def _preserve_playback_processes(self, tree: Any) -> None:
+        # Anime launchers run in their own session and own mpv's final save.
+        # A GUI quit detaches them; their own lifecycle still cleans helpers.
+        roots = [process.pid for process in list(getattr(self, "_play_processes", {}).values())
+                 if process.poll() is None]
+        roots.extend(int(row["pid"]) for row in list(getattr(self, "_play_registry", {}).values())
+                     if row.get("pid"))
+        tree.exclude_subtrees(roots)
+
+    def _quit_after_update(self) -> None:
+        lifecycle = getattr(self, "_macos_window_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.request_quit("update")
+        if sys.platform == "darwin":
+            from AppKit import NSApplication
+            from PyObjCTools import AppHelper
+            AppHelper.callAfter(NSApplication.sharedApplication().terminate_, None)
+        elif self.window is not None:
+            self.window.destroy()
 
     def _close_window_for_uninstall(self) -> None:
         lifecycle = self._macos_window_lifecycle
@@ -1137,15 +1227,21 @@ class WebAppApi:
 
     def _stop_companion_server(self) -> None:
         server = getattr(self, "_companion_server", None)
+        if server is None:
+            return
+        server.shutdown()
+        if not server.wait_for_requests(timeout=5.0):
+            if not getattr(self, "_closing", False):
+                thread = threading.Thread(target=server.serve_forever, name="pudge-companion-api", daemon=True)
+                self._companion_thread = thread
+                thread.start()
+                raise RuntimeError("Companion requests did not quiesce; retry restore after they finish")
+            server.server_close()
+            raise RuntimeError("Companion requests did not finish during shutdown")
+        server.server_close()
         self._companion_server = None
         self._companion_thread = None
         self.companion_base_url = ""
-        if server is None:
-            return
-        try:
-            server.shutdown()
-        finally:
-            server.server_close()
 
     def companion_enable_lan(self) -> dict[str, Any]:
         cfg = self.config.companion
@@ -1330,16 +1426,46 @@ class WebAppApi:
     def consumption_statistics_delete_history(self) -> dict[str, Any]:
         return self.consumption_statistics.delete_history()
 
-    def visual_novel_windows(self) -> list[dict[str, Any]]:
-        return self.visual_novels.windows()
+    def visual_novel_windows(self, force: bool = False) -> list[dict[str, Any]]:
+        # Entering the VN tab repeatedly must not enumerate native windows every
+        # time; the first Quartz import is prewarmed at startup.
+        now = time.monotonic()
+        cached = getattr(self, "_vn_windows_cache", None)
+        if not force and cached is not None and now - cached[0] < 3.0:
+            return [dict(row) for row in cached[1]]
+        started = time.perf_counter()
+        rows = self.visual_novels.windows()
+        self._vn_windows_cache = (now, [dict(row) for row in rows])
+        self.logger.info("TIMING step=vn.windows duration_ms=%.1f windows=%s", (time.perf_counter() - started) * 1000.0, len(rows))
+        return rows
+
+    def _prewarm_visual_novel_windows(self) -> None:
+        started = time.perf_counter()
+        try:
+            self.visual_novels.windows()
+        except Exception as exc:
+            self.logger.info("SKIP step=vn.prewarm error=%r", str(exc))
+            return
+        self.logger.info("DONE step=vn.prewarm duration_ms=%.1f", (time.perf_counter() - started) * 1000.0)
 
     def visual_novel_state(self) -> dict[str, Any]:
         state = self.visual_novels.state()
+        if state.get("status") == "error" and not state.get("running"):
+            self._end_vn_consumption()
         state["vn_title_id"] = str(self._vn_title_id or "")
         return state
 
+    def _end_vn_consumption(self) -> None:
+        session_id = str(getattr(self, "_vn_consumption_session_id", "") or "")
+        if session_id:
+            self._vn_consumption_session_id = ""
+            try:
+                self.consumption.end_vn_capture(session_id)
+            except Exception as exc:
+                self.logger.warning("FAIL consumption.vn_stop error=%r", str(exc))
+
     def visual_novel_start(
-        self, window_id: int, title: str = "", executable_hint: str = ""
+        self, window_id: int, title: str = "", executable_hint: str = "", use_system_picker: bool = False
     ) -> dict[str, Any]:
         # End a previous capture session first; window IDs are ephemeral and
         # must never become the game identity.
@@ -1348,7 +1474,18 @@ class WebAppApi:
                 self.consumption.end_vn_capture(self._vn_consumption_session_id)
             finally:
                 self._vn_consumption_session_id = ""
-        state = self.visual_novels.start(int(window_id), str(title or ""))
+        try:
+            state = (self.visual_novels.start_with_picker(str(title or "")) if use_system_picker
+                     else self.visual_novels.start(int(window_id), str(title or "")))
+        except VisualNovelError as exc:
+            self.logger.warning("EVENT vn.start_failed code=%s picker=%s error=%s", exc.code, use_system_picker, exc)
+            if exc.code == "cancelled":
+                return {**self.visual_novels.state(), "selection_cancelled": True}
+            raise
+        window_id = int(state.get("window_id") or 0)
+        if state.get("status") == "error":
+            state["vn_title_id"] = str(self._vn_title_id or "")
+            return state
         try:
             capture = self.consumption.begin_vn_capture(
                 title=str(title or state.get("window_title") or "Visual Novel"),
@@ -1816,17 +1953,30 @@ class WebAppApi:
     def _local_episode_for_relative(
         self, anime: LibraryAnime, relative_episode: int | None
     ):
-        if relative_episode is None:
-            return self.manager.db.ready_episode(anime.media_id, None)
         exact = self.manager.db.ready_episode(anime.media_id, relative_episode)
-        if exact is not None:
+        if exact is not None and not AnimeManager._library_path_is_ignored(exact.video_path):
             return exact
         for item in self.manager.db.episodes(anime.media_id):
             if item.state not in {"ready", "local", "watched", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
                 continue
-            if self._display_episode_number(anime, item.episode) == int(relative_episode):
+            if AnimeManager._library_path_is_ignored(item.video_path):
+                continue
+            if relative_episode is None or self._display_episode_number(anime, item.episode) == int(relative_episode):
                 return item
         return None
+
+    def _download_is_hidden_from_home(self, item: Any) -> bool:
+        # Isolated corpora may keep their episode/download rows for replay.
+        # Honour the existing scan marker without deleting those rows or
+        # hiding ordinary copies of the same anime outside the marked tree.
+        return any(
+            AnimeManager._library_path_is_ignored(Path(value))
+            for value in (
+                str(getattr(item, "content_path", "") or "").strip(),
+                str(getattr(item, "save_path", "") or "").strip(),
+            )
+            if value
+        )
 
     def _ready_subtitle_is_usable(self, item: Any) -> bool:
         if item is None:
@@ -1859,6 +2009,8 @@ class WebAppApi:
         for item in rows:
             if item.media_id is None or int(item.media_id) != int(anime.media_id):
                 continue
+            if self._download_is_hidden_from_home(item):
+                continue
             if AnimeManager._download_is_complete(item):
                 return True
             state = str(item.state or "").strip().casefold()
@@ -1881,6 +2033,8 @@ class WebAppApi:
         local_numbers: set[int] = set()
         for item in self.manager.db.episodes(anime.media_id):
             if not item.video_path.is_file():
+                continue
+            if AnimeManager._library_path_is_ignored(item.video_path):
                 continue
             if self.manager._path_within(item.video_path, incomplete):
                 continue
@@ -1911,6 +2065,22 @@ class WebAppApi:
         # numbering mismatches rather than blindly trusting filenames.
         return list(range(1, total + 1)), ""
 
+    def _personal_schedule_local_state(self, anime: LibraryAnime, local: Any, *, rewatch: bool) -> str:
+        if local is None or not local.video_path.is_file():
+            return ""
+        japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
+        local_state = str(local.state or "")
+        if rewatch and local_state == "watched":
+            # Personal rewatch progress is independent of the old local ledger.
+            local_state = "ready"
+        if not japanese_subtitles_required and local_state != "watched":
+            local_state = "ready"
+        if local_state == "ready" and japanese_subtitles_required and not self._ready_subtitle_is_usable(local):
+            local_state = "waiting_subtitles"
+        if local_state == "ready" and str(local.subtitle_origin or "").casefold() == "ocr" and not self.config.matching.ocr_counts_as_ready:
+            local_state = "waiting_text_subtitles"
+        return local_state
+
     def _personal_schedule_snapshot(self, anime: LibraryAnime, *, now: float | None = None) -> dict[str, Any]:
         current = time.time() if now is None else float(now)
         order, reason = self._personal_schedule_episode_order(anime)
@@ -1934,6 +2104,8 @@ class WebAppApi:
             "watched_count": 0,
             "total_count": len(schedule.items) if schedule else len(order),
             "unlocked_count": 0,
+            "ready_episodes": [],
+            "ready_count": 0,
         }
         if not schedule or not schedule.enabled:
             return payload
@@ -1957,21 +2129,23 @@ class WebAppApi:
         if local is None or not local.video_path.is_file():
             payload["status"] = "download_available"
             return payload
-        japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
-        local_state = str(local.state or "")
-        if schedule.rewatch and local_state == "watched":
-            # Rewatch has its own progress ledger; old AniList/local watched state
-            # must not make a newly unlocked personal-release item disappear.
-            local_state = "ready"
-        if not japanese_subtitles_required and local_state != "watched":
-            local_state = "ready"
-        if local_state == "ready" and japanese_subtitles_required and not self._ready_subtitle_is_usable(local):
-            local_state = "waiting_subtitles"
-        if local_state == "ready" and str(local.subtitle_origin or "").casefold() == "ocr" and not self.config.matching.ocr_counts_as_ready:
-            local_state = "waiting_text_subtitles"
+        local_state = self._personal_schedule_local_state(anime, local, rewatch=schedule.rewatch)
         payload["local_state"] = local_state
         payload["video_path"] = str(local.video_path)
         payload["status"] = "new_ready" if local_state == "ready" else "waiting"
+        if local_state == "ready":
+            # Missed releases accumulate. The playback target remains the
+            # nearest unwatched item, while the card lists every unlocked,
+            # unwatched release whose local video/subtitles are usable.
+            ready = [int(next_item.episode)]
+            for item in unlocked:
+                if item.watched_at is not None or item.episode == next_item.episode:
+                    continue
+                candidate = self._local_episode_for_relative(anime, int(item.episode))
+                if self._personal_schedule_local_state(anime, candidate, rewatch=schedule.rewatch) == "ready":
+                    ready.append(int(item.episode))
+            payload["ready_episodes"] = ready
+            payload["ready_count"] = len(ready)
         return payload
 
     def _apply_personal_schedule_to_payload(self, anime: LibraryAnime, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2120,6 +2294,7 @@ class WebAppApi:
             if (
                 not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
+                or AnimeManager._library_path_is_ignored(item.video_path)
             ):
                 continue
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
@@ -2310,6 +2485,7 @@ class WebAppApi:
                 )
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
+                or AnimeManager._library_path_is_ignored(item.video_path)
                 or self._watched_on_anilist(anime, item.episode)
             ):
                 continue
@@ -2417,6 +2593,7 @@ class WebAppApi:
                 (item.state in {"ready", "watched"} and not effective_ocr_waiting)
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
+                or AnimeManager._library_path_is_ignored(item.video_path)
                 or self._watched_on_anilist(anime, item.episode)
             ):
                 continue
@@ -2833,6 +3010,9 @@ class WebAppApi:
             if self.manager._path_within(item.video_path, incomplete):
                 continue
 
+            if AnimeManager._library_path_is_ignored(item.video_path):
+                continue
+
             media_id = int(item.media_id)
             previous = latest.get(media_id)
             if (
@@ -2916,6 +3096,7 @@ class WebAppApi:
             for row in self.manager.db.subtitle_jobs()
             if (
                 str(row["state"] or "") == "needs_action"
+                or str(row["stage"] or "") == "waiting_verification"
                 or str(row["action_code"] or "") == "enable_subtitle_ocr"
             )
         }
@@ -2928,7 +3109,7 @@ class WebAppApi:
         downloads_by_media: dict[int, Any] = {}
         downloads_by_episode: dict[tuple[int, int], Any] = {}
         for item in self.manager.db.downloads():
-            if item.media_id is None:
+            if item.media_id is None or self._download_is_hidden_from_home(item):
                 continue
             media_id = int(item.media_id)
             # downloads() is newest-first; retain the newest matching job.
@@ -2968,8 +3149,8 @@ class WebAppApi:
             snapshot = card.get("personal_schedule") if isinstance(card.get("personal_schedule"), dict) else {}
             status = str(snapshot.get("status") or "")
             if status == "new_ready" and isinstance(card.get("local"), dict):
-                card["ready_episodes"] = [int(snapshot["next_episode"])]
-                card["ready_count"] = 1
+                card["ready_episodes"] = list(snapshot.get("ready_episodes") or [int(snapshot["next_episode"])])
+                card["ready_count"] = len(card["ready_episodes"])
                 card["all_episodes_ready"] = False
                 sections["new_ready"].append(card)
             elif status == "waiting":
@@ -3133,7 +3314,10 @@ class WebAppApi:
                 sections["waiting"].append(item)
 
         for anime in self.manager.db.anime_list(("DROPPED",)):
-            local_items = [item for item in self.manager.db.episodes(anime.media_id) if item.video_path.is_file()]
+            local_items = [
+                item for item in self.manager.db.episodes(anime.media_id)
+                if item.video_path.is_file() and not AnimeManager._library_path_is_ignored(item.video_path)
+            ]
             if not local_items:
                 continue
             card = self._anime_payload(anime)
@@ -3190,6 +3374,8 @@ class WebAppApi:
                 action_job = None
                 if local is not None and local.get("video_path"):
                     action_job = needs_action_by_path.get(str(local.get("video_path")))
+                if action_job is not None:
+                    action_job = dict(action_job)
                 card["presentation"] = derive_episode_presentation(
                     local=local_for_state,
                     download=download,
@@ -3294,17 +3480,13 @@ class WebAppApi:
             manager = getattr(self, "manager", None)
             db = getattr(manager, "db", None)
             version = str(payload.get("ui_state_version") or "")
+            current = str(db.get_state("ui_state_version", version) or version) if db is not None else version
             pending = bool(getattr(self, "_torrent_ui_version_pending", False))
-            if pending:
-                try:
-                    version = str(int(version or "0") + 1)
-                except (TypeError, ValueError):
-                    version = str(time.time_ns())
-                payload["ui_state_version"] = version
-                self._torrent_ui_version_pending = False
-            elif db is not None:
-                version = str(db.get_state("ui_state_version", version) or version)
-                payload["ui_state_version"] = version
+            if pending or current != version:
+                # A write raced the read, or a toggle is not yet persisted.
+                # Return the old marker and force the next poll to rebuild.
+                self._ui_state_cache.invalidate()
+                return payload
             return self._ui_state_cache.store(version, payload)
 
     def _settings_payload(self) -> dict[str, Any]:
@@ -3337,6 +3519,7 @@ class WebAppApi:
             }
         return {
             "version": __version__,
+            "build": dict(build_identity()),
             "language": cfg.ui.language,
             "onboarding_completed": cfg.ui.onboarding_completed,
             "escape_exits_fullscreen": cfg.ui.escape_exits_fullscreen,
@@ -3345,6 +3528,13 @@ class WebAppApi:
             "jiten_developer_tools_confirmed": cfg.ui.jiten_developer_tools_confirmed,
             "review_gate_enabled": cfg.ui.review_gate_enabled,
             "review_gate_count": max(1, min(50, int(cfg.ui.review_gate_count))),
+            "review_gate_ln_enabled": cfg.ui.review_gate_ln_enabled,
+            "review_gate_ln_all_due": cfg.ui.review_gate_ln_all_due,
+            "review_gate_ln_count": cfg.ui.review_gate_ln_count,
+            "review_gate_manga_enabled": cfg.ui.review_gate_manga_enabled,
+            "review_gate_manga_all_due": cfg.ui.review_gate_manga_all_due,
+            "review_gate_manga_count": cfg.ui.review_gate_manga_count,
+            "sidebar_review_interval": cfg.ui.sidebar_review_interval,
             "review_gate_all_due_episode_words": bool(getattr(cfg.ui, "review_gate_all_due_episode_words", False)),
             "library_root": str(cfg.library.root_dir),
             "watched_folders": "\n".join(str(path) for path in cfg.paths.download_dirs),
@@ -3422,16 +3612,19 @@ class WebAppApi:
             "max_subtitle_upgrade_checks_per_run": cfg.matching.max_subtitle_upgrade_checks_per_run,
             "llm_enabled": cfg.llm.enabled,
             "llm_provider": cfg.llm.provider,
+            "llm_profiles": {protocol:{"url":profile.get("url", ""),"model":profile.get("model", ""),"key":masked_secret(profile.get("api_key", ""))} for protocol,profile in cfg.llm.profiles.items()},
             "llm_url": cfg.llm.base_url,
             "llm_api_key": masked_secret(cfg.llm.api_key),
             "llm_model": cfg.llm.model,
             "llm_reasoning_effort": cfg.llm.reasoning_effort,
+            "llm_assistant_reasoning_effort": cfg.llm.assistant_reasoning_effort,
             "subtitle_semantic_checks": cfg.llm.validate_embedded_reference,
             "use_container_chapters": cfg.sync.use_container_chapters,
             "japanese_stt_fallback": cfg.sync.japanese_stt_fallback,
             "japanese_stt_model": cfg.sync.japanese_stt_model,
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
             "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
+            "shortcut_mpv_explain_subtitle": cfg.shortcuts.mpv_explain_subtitle,
             "mpv_study_plugin": cfg.tools.mpv_study_plugin,
             "manga_ocr_backend": cfg.tools.manga_ocr_backend,
             "mpv_study_plugins": study_plugins,
@@ -3448,8 +3641,10 @@ class WebAppApi:
         return self.manager.work_scheduler.power_snapshot(refresh=bool(refresh))
 
     def _storage_payload(self, *, refresh: bool) -> dict[str, int | float | bool]:
-        if refresh or self._last_storage_status is None:
+        now = time.monotonic()
+        if refresh or self._last_storage_status is None or now - getattr(self, "_last_storage_checked_at", 0.0) >= 30.0:
             self._last_storage_status = self.manager.storage_status()
+            self._last_storage_checked_at = now
         return dict(self._last_storage_status)
 
     @staticmethod
@@ -3544,7 +3739,10 @@ class WebAppApi:
         # per-thread SQLite connection avoids reparsing the full schema for every
         # helper while keeping ordinary DB calls independently transactional.
         with self.manager.db.connection_scope():
-            return self._get_state_scoped(refresh_storage=refresh_storage)
+            version = self.manager.db.get_state("ui_state_version", "")
+            payload = self._get_state_scoped(refresh_storage=refresh_storage)
+            payload["ui_state_version"] = version
+            return payload
 
     def _get_state_scoped(self, *, refresh_storage: bool) -> dict[str, Any]:
         all_anime = self.manager.db.anime_list()
@@ -3564,7 +3762,9 @@ class WebAppApi:
                 -float(download.get("added_on") or 0),
             )
 
-        for download in downloads:
+        for row, download in zip(download_rows, downloads):
+            if self._download_is_hidden_from_home(row):
+                continue
             media_id = download.get("media_id")
             if media_id is None:
                 continue
@@ -3770,10 +3970,8 @@ class WebAppApi:
         # follows reuses one SQLite connection instead of reopening/reparsing the
         # schema for every repository helper.
         with timed_step(self.logger, "web.get_state"):
-            self.manager.reconcile_completed_download_rows()
-            self.manager.reconcile_prepared_subtitle_rows()
             with self.manager.db.connection_scope():
-                payload = self._get_state(refresh_storage=True)
+                payload = self._get_state(refresh_storage=False)
                 return self._store_ui_state_snapshot(payload)
 
     def get_state_fast(self) -> dict[str, Any]:
@@ -4159,6 +4357,9 @@ class WebAppApi:
                         "aria2_shutdown_confirmed": bool(quiet_result.get("aria2_stopped", False)),
                         "checked_at": 0.0,
                     }
+        with lock:
+            if self._torrent_toggle_generation == generation:
+                self._torrent_ui_version_pending = False
         if logger is not None:
             logger.info(
                 "EVENT torrent.toggle_transition source=persist desired=%s effective=%s",
@@ -4707,6 +4908,14 @@ class WebAppApi:
                 )
                 self._startup_maintenance_thread = thread
                 thread.start()
+                if sys.platform == "darwin" and self.manager.work_scheduler.background_wait_reason() is None and not getattr(self, "_vn_prewarm_started", False):
+                    # First PyObjC/Quartz import costs seconds; do it off the tab click.
+                    self._vn_prewarm_started = True
+                    threading.Thread(
+                        target=self._prewarm_visual_novel_windows,
+                        name=f"{APP_SLUG}-vn-prewarm",
+                        daemon=True,
+                    ).start()
         return {
             "skipped": False,
             "running": True,
@@ -4754,6 +4963,37 @@ class WebAppApi:
         }
 
     def poll_downloads_and_subtitles(
+        self, known_ui_state_version: str = "", has_active_downloads: bool = True,
+        window_active: bool = True,
+    ) -> dict[str, Any]:
+        """Coalesce expensive work; never await subtitle preparation on the bridge."""
+        lock = getattr(self, "_download_poll_schedule_lock", None)
+        if lock is None:
+            lock = self._download_poll_schedule_lock = threading.Lock()
+        with lock:
+            worker = getattr(self, "_download_poll_worker", None)
+            if worker is None or not worker.is_alive():
+                def run() -> None:
+                    try:
+                        result = self._poll_downloads_and_subtitles_sync(
+                            known_ui_state_version, has_active_downloads, window_active)
+                        self._download_poll_result = result.get("stats", {})
+                    except Exception as exc:
+                        self.logger.exception("foreground.worker failed: %s", exc)
+                        self._download_poll_result = {"error": str(exc)}
+                worker = threading.Thread(target=run, name="pudge-download-subtitles", daemon=True)
+                self._download_poll_worker = worker
+                worker.start()
+        try:
+            hint = self.manager.db.subtitle_job_poll_hint()
+        except Exception:
+            hint = {}
+        return {"skipped": False, "running": worker.is_alive(),
+                "stats": dict(getattr(self, "_download_poll_result", {})),
+                "subtitle_poll_hint": hint,
+                **self._foreground_poll_state_payload(known_ui_state_version)}
+
+    def _poll_downloads_and_subtitles_sync(
         self,
         known_ui_state_version: str = "",
         has_active_downloads: bool = True,
@@ -4797,6 +5037,8 @@ class WebAppApi:
         try:
             with timed_step(self.logger, "foreground.poll", mode="downloads-only"):
                 try:
+                    self.manager.reconcile_completed_download_rows()
+                    self.manager.reconcile_prepared_subtitle_rows()
                     completed_paths: tuple[Path, ...] = ()
                     qbt_synced = False
                     now_mono = time.monotonic()
@@ -5034,6 +5276,8 @@ class WebAppApi:
                         if (
                             irodori.irodori_tts_enabled
                             and irodori.irodori_tts_auto_generate
+                    and self.manager.work_scheduler.background_wait_reason() is None
+                            and self.manager.work_scheduler.background_wait_reason() is None
                             and self._audiobook_link_kind(book_id) == "none"
                         ):
                             try:
@@ -5315,7 +5559,36 @@ class WebAppApi:
         return state
 
     def manga_state(self) -> dict[str, Any]:
-        return self._manga_state_payload(self._backfill_manga_mean_scores(self.manga.state()))
+        # Opening the Manga tab renders from local state only; the optional
+        # AniList mean-score backfill (network) runs in the background and the
+        # next state read shows its result.
+        started = time.perf_counter()
+        state = self.manga.state()
+        self._schedule_manga_mean_score_backfill(state)
+        payload = self._manga_state_payload(state)
+        self.logger.info("TIMING step=manga.state duration_ms=%.1f books=%s", (time.perf_counter() - started) * 1000.0, len(state.get("books") or []))
+        return payload
+
+    def _schedule_manga_mean_score_backfill(self, state: dict[str, Any]) -> None:
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
+            return
+        attempted = set(getattr(self, "_manga_mean_score_attempted", set()))
+        if not any(
+            book.get("anilist_id") and book.get("mean_score") is None and int(book["anilist_id"]) not in attempted
+            for book in state.get("books", [])
+        ):
+            return
+        thread = getattr(self, "_manga_backfill_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        thread = threading.Thread(
+            target=self._backfill_manga_mean_scores,
+            args=(state,),
+            name=f"{APP_SLUG}-manga-score-backfill",
+            daemon=True,
+        )
+        self._manga_backfill_thread = thread
+        thread.start()
 
     def manga_save_reader_preferences(self, values: dict[str, Any]) -> dict[str, Any]:
         return self.manga.save_reader_preferences(dict(values or {}))
@@ -5340,17 +5613,58 @@ class WebAppApi:
                     ] or [target_id]
         except Exception:
             ids = [target_id]
+        self._cancel_manga_ocr_for_deleted(ids)
         removed = self.manga.remove_series(target_id)
+        self._forget_deleted_content_reviews("manga", ids)
         for local_id in ids:
             self.consumption.detach_library_media(kind="manga", local_id=str(local_id))
         return {"removed": removed}
 
     def manga_remove_books(self, book_ids: list[int]) -> dict[str, Any]:
         ids = [int(value) for value in (book_ids or [])]
+        # P10: stop OCR owners before the rows disappear; a late worker result
+        # cannot publish because the book row and its OCR generation are gone.
+        self._cancel_manga_ocr_for_deleted(ids)
         removed = self.manga.remove_books(ids)
+        self._forget_deleted_content_reviews("manga", ids)
         for local_id in ids:
             self.consumption.detach_library_media(kind="manga", local_id=str(local_id))
         return {"removed": removed}
+
+    def _cancel_manga_ocr_for_deleted(self, book_ids: list[int]) -> None:
+        lock = getattr(self, "_manga_book_ocr_lock", None)
+        if lock is None:
+            return
+        job_ids: list[str] = []
+        with lock:
+            for book_id in {int(value) for value in book_ids}:
+                event = self._manga_ocr_cancel_events.get(book_id)
+                if event is not None:
+                    event.set()
+                self._manga_book_ocr_state.pop(book_id, None)
+                job_id = self._manga_ocr_job_ids.pop(book_id, "")
+                if job_id:
+                    job_ids.append(job_id)
+        for job_id in job_ids:
+            try:
+                # Terminal now, so a restart never offers to resume a deleted book.
+                self.job_center.cancelled(job_id, message="Manga removed")
+            except Exception:
+                self.logger.exception("FAIL step=manga.delete.cancel_ocr job_id=%s", job_id)
+
+    def _forget_deleted_content_reviews(self, kind: str, book_ids: list[int]) -> None:
+        from .content_review import ContentReviewService
+
+        service = getattr(self, "_content_review_service", None)
+        try:
+            if service is not None:
+                service.forget(kind, book_ids)
+            else:
+                ContentReviewService.forget_persisted(self.manager.db, kind, book_ids)
+        except Exception:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.exception("FAIL step=content_review.forget kind=%s", kind)
 
     @staticmethod
     def _manga_anilist_search_text(value: str) -> str:
@@ -5633,13 +5947,6 @@ class WebAppApi:
                 thread.start()
         return self.manga_ocr_status()
 
-    def reveal_manga_ocr_install_log(self) -> dict[str, Any]:
-        path = self._manga_ocr_log_path()
-        if not path.exists():
-            return {"ok": False, "path": str(path)}
-        subprocess.run(["open", "-R", str(path)], check=False)
-        return {"ok": True, "path": str(path)}
-
     def manga_ocr_book_status(self, book_id: int) -> dict[str, Any]:
         book_id = int(book_id)
         cache = self.manga.ocr_cache_status(book_id)
@@ -5887,7 +6194,10 @@ class WebAppApi:
         except Exception as exc:
             self.logger.exception("FAIL step=manga_ocr.book book_id=%s error=%r", book_id, str(exc))
             cache_status = getattr(self.manga, "ocr_cache_status", None)
-            cache = cache_status(book_id) if callable(cache_status) else {}
+            try:
+                cache = cache_status(book_id) if callable(cache_status) else {}
+            except Exception:
+                cache = {}
             with self._manga_book_ocr_lock:
                 self._manga_book_ocr_state[book_id] = {
                     **cache,
@@ -5900,6 +6210,16 @@ class WebAppApi:
                 self.job_center.fail(job_id, exc)
         finally:
             self._manga_ocr_cancel_events.pop(book_id, None)
+            # P10: a worker finishing after its book was deleted must not leave
+            # a resurrected status/job entry behind.
+            try:
+                self.manga._book(book_id)
+            except KeyError:
+                with self._manga_book_ocr_lock:
+                    self._manga_book_ocr_state.pop(book_id, None)
+                    self._manga_ocr_job_ids.pop(book_id, None)
+            except Exception:
+                pass
 
     def _run_serialized_manga_book_ocr(self, book_id: int) -> None:
         # MangaOCR is a large model. Serializing volumes prevents two imports
@@ -6452,6 +6772,7 @@ class WebAppApi:
             "schema": 1,
             "generated_at": time.time(),
             "pudge_version": __version__,
+            "pudge_build": dict(build_identity()),
             "page": page_meta,
             "backend_ocr": backend,
             "frontend": source,
@@ -6692,7 +7013,105 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
 
     def audiobook_state(self) -> dict[str, Any]:
-        return self.audiobooks.state()
+        # Tab activation reads display state only. Queueing missing metadata /
+        # linked transcriptions is maintenance: at most once a minute, off the
+        # UI call.
+        started = time.perf_counter()
+        state = self.audiobooks.state(queue_missing=False)
+        now = time.monotonic()
+        if now - float(getattr(self, "_audiobook_queue_at", 0.0) or 0.0) >= 60.0:
+            self._audiobook_queue_at = now
+            threading.Thread(
+                target=self._audiobook_queue_missing,
+                name=f"{APP_SLUG}-audiobook-queue-missing",
+                daemon=True,
+            ).start()
+        self.logger.info("TIMING step=audiobook.state duration_ms=%.1f books=%s", (time.perf_counter() - started) * 1000.0, len(state.get("books") or []))
+        return state
+
+    def sidebar_audio_state(self) -> dict[str, Any]:
+        """Read only active players, without scanning the library or STT files."""
+        state = self.audiobooks.sidebar_state()
+        floating = getattr(self, "_audiobook_float", None)
+        state["float_open"] = bool(floating and floating.opened)
+        return state
+
+    def audiobook_float_open(self, book_id: int | None = None) -> dict[str, Any]:
+        """Detach the activity into an always-on-top window; audio stays untouched."""
+        with self.audiobooks._lock:
+            ids = list(self.audiobooks._players)
+            contexts = getattr(self.audiobooks, "_review_contexts", {}) or {}
+            consumers = {book: (contexts.get(book) or {}).get("consumer") for book in ids}
+        result = self._audiobook_float.show(book_id)
+        if result.get("opened"):
+            for player_id in ids:
+                # Per player: an open reader keeps its "ln" consumer.
+                if consumers.get(player_id) != "ln":
+                    self.audiobooks.set_review_consumer(player_id, "float")
+        return result
+
+    def audiobook_float_display(self, book_id: int) -> dict[str, Any]:
+        """The float reports the audiobook it renders (only when it changes)."""
+        return self._audiobook_float.set_display_book(int(book_id or 0))
+
+    def audiobook_reader_context(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Hide the float while the matching light novel is read; never touches playback.
+
+        ``payload``: ``{open, ln_book_id, audiobook_id, generation}``.  Older
+        generations are ignored.  Closing the reader lifts suppression but does
+        not re-show a hidden or user-closed float.
+        """
+        data = payload if isinstance(payload, dict) else {}
+        try:
+            generation = int(data.get("generation") or 0)
+            ln_book_id = int(data.get("ln_book_id") or 0)
+            audiobook_id = int(data.get("audiobook_id") or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Invalid reader context"}
+        floating = getattr(self, "_audiobook_float", None)
+        if floating is None:
+            return {"ok": True, "opened": False}
+        result = floating.reader_context(open=bool(data.get("open")), ln_book_id=ln_book_id,
+                                         audiobook_id=audiobook_id, generation=generation)
+        self.logger.info("audiobook.reader_context open=%s ln=%s audio=%s generation=%s stale=%s float_open=%s",
+                         bool(data.get("open")), ln_book_id, audiobook_id, generation,
+                         result.get("stale"), result.get("opened"))
+        return result
+
+    def audiobook_float_settings(self) -> dict[str, Any]:
+        return {"language": self.config.ui.language}
+
+    def audiobook_float_show_main(self, action: str, book_id: int) -> dict[str, Any]:
+        if action not in {"open", "read"} or self.window is None:
+            return {"ok": False}
+        lifecycle = getattr(self, "_macos_window_lifecycle", None)
+        if lifecycle is not None:
+            lifecycle.reopen()
+        else:
+            self.window.show()
+        script = "window.PudgeSidebarCompanion?.navigateAudio(" + json.dumps(action) + "," + str(int(book_id)) + ")"
+        self.window.evaluate_js(script)
+        return {"ok": True}
+
+    def sidebar_reader_book(self, book_id: int) -> dict[str, Any]:
+        """Warm reader metadata without touching the active audio transport."""
+        return self.light_novels.open_book(int(book_id))
+
+    def sidebar_review_settings(self, interval: str | None = None) -> dict[str, Any]:
+        """Persist the sidebar preference independently of the window's origin."""
+        if interval is not None:
+            value = str(interval)
+            if value not in {"60000", "180000", "300000", "600000", "1800000", "continuous"}:
+                raise ValueError("Invalid sidebar review interval")
+            self.config.ui.sidebar_review_interval = value
+            write_config(self.config, self.config_path)
+        return {"interval": self.config.ui.sidebar_review_interval}
+
+    def _audiobook_queue_missing(self) -> None:
+        try:
+            self.audiobooks.state(queue_missing=True)
+        except Exception as exc:
+            self.logger.warning("FAIL step=audiobook.queue_missing error=%r", str(exc))
 
 
     def _retry_import_worker(
@@ -6724,6 +7143,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         if (
                             irodori.irodori_tts_enabled
                             and irodori.irodori_tts_auto_generate
+                    and self.manager.work_scheduler.background_wait_reason() is None
+                            and self.manager.work_scheduler.background_wait_reason() is None
                             and self._audiobook_link_kind(int(book["id"])) == "none"
                         ):
                             self.generate_light_novel_tts(int(book["id"]))
@@ -6960,8 +7381,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def audiobook_delete_many(self, book_ids: list[int]) -> dict[str, Any]:
         ids = [int(value) for value in book_ids]
         result = self.audiobooks.delete_many(ids, delete_files=False)
+        # A book whose player failed to stop is kept, so keep its history link too.
+        failed = {int(item.get("book_id") or 0) for item in result.get("errors") or []}
         for local_id in ids:
-            self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
+            if local_id not in failed:
+                self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
         return result
 
     def light_novel_audiobook_candidates(self, book_id: int, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
@@ -7042,6 +7466,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "schema": 1,
             "generated_at": time.time(),
             "pudge_version": __version__,
+            "pudge_build": dict(build_identity()),
             "trace": source,
         }
         output.write_text(
@@ -7057,15 +7482,43 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def light_novel_refresh(self) -> dict[str, Any]:
         return self.light_novels.refresh_state()
 
+    def study_word(self, card: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        result = self.light_novels.jiten_word(dict(card or {}))
+        self.logger.info("EVENT review_card_ready_ms=%.1f", (time.perf_counter() - started) * 1000)
+        return result
+
     def study_parse_text(self, text: str) -> dict[str, Any]:
-        return self.light_novels.parse_study_text(str(text or ""))
+        result = self.light_novels.parse_study_text(str(text or ""))
+        if str(self.light_novels.settings().study_backend or "jiten") == "jiten":
+            self.light_novels.cache_jiten_words(result.get("vocabulary") or [])
+        return result
 
     def study_decks(self, backend: str) -> list[dict[str, Any]]:
         return self.light_novels.decks(str(backend or "jiten"))
 
+    # The webview runs in private mode (localStorage is wiped on relaunch), so
+    # the chosen study deck is persisted in the app database.
+    @staticmethod
+    def _study_deck_key(backend: Any) -> str:
+        name = "".join(ch for ch in str(backend or "jiten").casefold() if ch.isalnum()) or "jiten"
+        return f"study_deck:{name}"
+
+    def study_deck_preference(self, backend: str = "jiten") -> dict[str, Any]:
+        return {"ok": True, "deck_id": self.manager.db.get_state(self._study_deck_key(backend), "")}
+
+    def set_study_deck_preference(self, backend: str = "jiten", deck_id: Any = "") -> dict[str, Any]:
+        value = str(deck_id or "").strip()
+        if value and not value.isdigit() and len(value) > 64:
+            return {"ok": False, "message": "Invalid deck id"}
+        self.manager.db.set_state(self._study_deck_key(backend), value)
+        return {"ok": True, "deck_id": value}
+
     def study_state(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = payload or {}
         backend = str(data.get("backend") or self.light_novels.settings().study_backend or "jiten").casefold()
+        if backend == "jpdb":
+            return self._jpdb_study_state(data)
         if backend != "jiten":
             return {"ok": False, "provider": backend, "unsupported": True}
         result = self.light_novels.jiten_live_state(
@@ -7084,7 +7537,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def study_states(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         data = payload or {}
         backend = str(data.get("backend") or self.light_novels.settings().study_backend or "jiten").casefold()
-        if backend != "jiten":
+        if backend not in {"jiten", "jpdb"}:
             return {"ok": False, "provider": backend, "unsupported": True, "states": []}
         raw_words = data.get("words") or data.get("pairs") or []
         pairs: list[tuple[int, int]] = []
@@ -7104,6 +7557,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     continue
             if len(pairs) >= 500:
                 break
+        if backend == "jpdb":
+            return self._jpdb_study_states(pairs)
         states = self.light_novels.jiten_live_states(
             pairs,
             force=bool(data.get("force")),
@@ -7125,6 +7580,42 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             except Exception:
                 pass
         return result
+
+    def _jpdb_account_scope(self) -> str:
+        try:
+            return str(self.light_novels.study_provider_capabilities("jpdb").get("account_key") or "")
+        except Exception:
+            return ""
+
+    def _jpdb_study_states(self, pairs: list[tuple[int, int]]) -> dict[str, Any]:
+        # Account scope is taken before the network call so a slow answer for a
+        # previous jpdb token can be discarded by the WebView.
+        scope = self._jpdb_account_scope()
+        try:
+            states = self.light_novels.jpdb_live_states(pairs)
+        except Exception as exc:
+            return {"ok": False, "provider": "jpdb", "states": [], "message": str(exc)}
+        result: dict[str, Any] = {"ok": True, "provider": "jpdb", "states": states}
+        if scope:
+            result["account_scope"] = scope
+        return result
+
+    def _jpdb_study_state(self, data: dict[str, Any]) -> dict[str, Any]:
+        try:
+            pair = (
+                int(data.get("word_id") or data.get("wordId") or 0),
+                int(data.get("reading_index") or data.get("readingIndex") or 0),
+            )
+        except (TypeError, ValueError):
+            return {"ok": False, "provider": "jpdb", "reason": "invalid_id"}
+        batch = self._jpdb_study_states([pair])
+        rows = batch.get("states") or []
+        if not batch.get("ok") or not rows:
+            return {"ok": False, "provider": "jpdb", "message": batch.get("message", "")}
+        row = dict(rows[0])
+        if batch.get("account_scope"):
+            row["account_scope"] = batch["account_scope"]
+        return row
 
     def study_provider_capabilities(self, backend: str = "") -> dict[str, Any]:
         return self.light_novels.study_provider_capabilities(
@@ -7732,7 +8223,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if not hasattr(self, "light_novels"):
             payload["reason"] = "review service is unavailable"
             return payload
-        payload["provider"] = str(self.light_novels.settings().study_backend or "jiten").casefold()
+        ln_settings = self.light_novels.settings()
+        payload["provider"] = str(ln_settings.study_backend or "jiten").casefold()
+        # The strict gate submits Jiten grades; expose the Jiten action set of
+        # the active review mode so the gate UI renders exactly those buttons.
+        payload["review_actions"] = action_set_payload(
+            "jiten",
+            str(getattr(ln_settings, "review_mode", "native")),
+            normalize_shortcuts(getattr(ln_settings, "review_shortcuts", "{}")),
+        )
         identity = self._review_gate_identity(video_path)
         if identity is None:
             payload["reason"] = "logical episode identity is unavailable"
@@ -7807,6 +8306,39 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
         )
         return payload
+
+    def _content_reviews(self):
+        from .content_review import ContentReviewService
+        with self._review_gate_lock:
+            if not hasattr(self, "_content_review_service"):
+                self._content_review_service = ContentReviewService(self)
+            return self._content_review_service
+
+    def content_review_begin(self, kind: str, book_id: int, part: int) -> dict[str, Any]:
+        return self._content_reviews().begin(str(kind), int(book_id), int(part))
+
+    def content_review_review(self, token: str, word_id: int, reading_index: int, grade: str, attempt_id: str) -> dict[str, Any]:
+        return self._content_reviews().review(token, int(word_id), int(reading_index), str(grade), str(attempt_id))
+
+    def content_review_undo(self, token: str, word_id: int, reading_index: int) -> dict[str, Any]:
+        return self._content_reviews().undo(token, int(word_id), int(reading_index))
+
+    def content_review_boundary_done(self, book_id: int, chapter: int) -> dict[str, Any]:
+        with self.audiobooks._lock:
+            context = dict(self.audiobooks._review_contexts.get(int(book_id), {}))
+        if context.get("pending_chapter") != int(chapter):
+            return {"ok": False}
+        status = self._content_reviews().begin("ln", int(context["ln_book_id"]), int(chapter))
+        if not status.get("granted"):
+            return {"ok": False}
+        with self.audiobooks._lock:
+            current = self.audiobooks._review_contexts.get(int(book_id), {})
+            if current.get("session") == context.get("session"):
+                current["pending_chapter"] = None
+        return {"ok": True}
+
+    def audiobook_review_context(self, book_id: int, consumer: str) -> dict[str, Any]:
+        return self.audiobooks.set_review_consumer(int(book_id), str(consumer))
 
     def review_gate_status(self, video_path: str) -> dict[str, Any]:
         with self._review_gate_lock:
@@ -7982,6 +8514,181 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.review_gate_prefetch(force=True)
             return refreshed
 
+    @staticmethod
+    def _sidebar_review_title_key(value: Any) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+        return re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+
+    def _sidebar_review_anime_titles(self) -> set[str]:
+        titles: set[str] = set()
+        try:
+            rows = self.manager.db.anime_list()
+        except Exception:
+            return titles
+        for anime in rows:
+            for value in [
+                getattr(anime, "title", ""),
+                *(getattr(anime, "titles", None) or []),
+                *(getattr(anime, "synonyms", None) or []),
+            ]:
+                key = self._sidebar_review_title_key(value)
+                if len(key) >= 2:
+                    titles.add(key)
+        return titles
+
+    def _sidebar_review_is_anime_card(self, card: dict[str, Any], anime_titles: set[str]) -> bool:
+        if not anime_titles:
+            return False
+        sources: list[str] = [str(card.get("sourceDeckName") or "")]
+        for row in card.get("deckOccurrences") or []:
+            if not isinstance(row, dict):
+                continue
+            sources.extend([
+                str(row.get("originalTitle") or ""),
+                str(row.get("englishTitle") or ""),
+                str(row.get("romajiTitle") or ""),
+            ])
+        for source in sources:
+            key = self._sidebar_review_title_key(source)
+            if not key:
+                continue
+            if key in anime_titles:
+                return True
+            # Deck names often append season/episode labels.  Require a reasonably
+            # distinctive title before accepting containment to avoid tiny-title
+            # false positives.
+            if len(key) >= 6 and any(
+                len(title) >= 6 and (title in key or key in title)
+                for title in anime_titles
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _sidebar_review_age_rank(state: dict[str, Any]) -> int:
+        raw = {str(value or "").casefold() for value in (state.get("states") or [])}
+        # "New" here means the newer/learning part of the existing due queue.
+        # strict_review_candidates deliberately never creates an unseen card.
+        if raw & {"new", "learning", "young"}:
+            return 0
+        if "mature" in raw:
+            return 1
+        return 2
+
+    def sidebar_due_review_cards(
+        self, limit: int = 8, exclude_keys: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Prefetch and rank existing due Jiten cards for the persistent sidebar.
+
+        Anime-source cards are preferred.  Within that group, Young/Learning
+        cards are issued before Mature cards.  Provider order remains the final
+        tie-breaker so the local queue does not reshuffle constantly.
+        """
+        wanted = max(1, min(int(limit or 8), 16))
+        sample = max(wanted, min(32, wanted * 3))
+        excluded = {
+            key for key in (exclude_keys or [])[:256]
+            if isinstance(key, str) and re.fullmatch(r"[1-9][0-9]*:[0-9]+", key)
+        }
+        settings = self.light_novels.settings()
+        if not settings.jiten_api_key or settings.study_backend != "jiten":
+            return {"ok": True, "configured": False, "cards": [], "card": None}
+        try:
+            result = self.light_novels.strict_review_candidates(
+                required=sample, exclude_keys=excluded
+            )
+            cards = [
+                dict(card) for card in (result.get("cards") or [])
+                if isinstance(card, dict)
+                and f"{card.get('wordId')}:{card.get('readingIndex')}" not in excluded
+            ]
+            anime_titles = self._sidebar_review_anime_titles()
+            states_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+            pairs: list[tuple[int, int]] = []
+            for card in cards:
+                try:
+                    pairs.append((int(card.get("wordId")), int(card.get("readingIndex"))))
+                except (TypeError, ValueError):
+                    continue
+            if pairs and hasattr(self.light_novels, "jiten_live_states"):
+                try:
+                    rows = self.light_novels.jiten_live_states(pairs, force=False)
+                    for row in rows or []:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            pair = (int(row.get("wordId")), int(row.get("readingIndex")))
+                        except (TypeError, ValueError):
+                            continue
+                        states_by_pair[pair] = row
+                except Exception as exc:
+                    self.logger.info("Sidebar due state ranking unavailable: %s", exc)
+
+            ranked: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+            for order, card in enumerate(cards):
+                try:
+                    pair = (int(card.get("wordId")), int(card.get("readingIndex")))
+                except (TypeError, ValueError):
+                    pair = (0, -1)
+                anime = self._sidebar_review_is_anime_card(card, anime_titles)
+                state = states_by_pair.get(pair, {})
+                age_rank = self._sidebar_review_age_rank(state)
+                card["pudgeSidebarAnimeSource"] = bool(anime)
+                card["pudgeSidebarAge"] = "newer" if age_rank == 0 else ("older" if age_rank == 1 else "other")
+                ranked.append(((0 if anime else 1, age_rank, order), card))
+            ranked.sort(key=lambda item: item[0])
+            selected = [card for _rank, card in ranked[:wanted]]
+            return {
+                "ok": True,
+                "cards": selected,
+                "card": selected[0] if selected else None,
+                "available": len(cards),
+                "prefetched": len(selected),
+            }
+        except Exception as exc:
+            self.logger.info("Sidebar due review unavailable: %s", exc)
+            return {"ok": False, "cards": [], "card": None, "error": str(exc)}
+
+    def sidebar_due_review_card(self) -> dict[str, Any]:
+        """Backward-compatible one-card endpoint for older WebViews."""
+        result = self.sidebar_due_review_cards(1)
+        cards = result.get("cards") if isinstance(result, dict) else []
+        return {**result, "card": cards[0] if isinstance(cards, list) and cards else None}
+
+    def sidebar_due_review_submit(
+        self,
+        word_id: int,
+        reading_index: int,
+        grade: str,
+        attempt_id: str,
+    ) -> dict[str, Any]:
+        wire_grade = resolve_wire_grade(
+            "jiten", str(getattr(self.light_novels.settings(), "review_mode", "native")), str(grade)
+        )
+        result = self.light_novels.strict_review_submit(
+            int(word_id), int(reading_index), wire_grade, attempt_id=str(attempt_id)
+        )
+        self._sidebar_due_last_review = (
+            int(word_id), int(reading_index), time.monotonic()
+        )
+        return {"ok": True, "outcome": "confirmed", **(result if isinstance(result, dict) else {})}
+
+    def sidebar_due_review_undo(self, word_id: int, reading_index: int) -> dict[str, Any]:
+        """Undo only the immediately preceding sidebar review, for ten seconds."""
+        marker = getattr(self, "_sidebar_due_last_review", None)
+        if not isinstance(marker, tuple) or len(marker) != 3:
+            return {"ok": False, "outcome": "expired", "message": "No sidebar review is available to undo"}
+        previous_word, previous_reading, reviewed_at = marker
+        if (
+            int(previous_word) != int(word_id)
+            or int(previous_reading) != int(reading_index)
+            or time.monotonic() - float(reviewed_at) > 10.0
+        ):
+            return {"ok": False, "outcome": "expired", "message": "Sidebar undo window expired"}
+        result = self.light_novels.strict_review_undo(int(word_id), int(reading_index))
+        self._sidebar_due_last_review = None
+        return {"ok": True, "outcome": "undone", **(result if isinstance(result, dict) else {})}
+
     def review_gate_review(
         self,
         video_path: str,
@@ -7990,6 +8697,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         grade: str,
         attempt_id: str,
     ) -> dict[str, Any]:
+        # The strict gate is Jiten-only; map the UI action of the active
+        # review mode (native Again..Easy or binary Fail/Pass) to the Jiten
+        # grade before any gate state is touched.
+        grade = resolve_wire_grade(
+            "jiten", str(getattr(self.light_novels.settings(), "review_mode", "native")), grade
+        )
         card_key = review_card_key(int(word_id), int(reading_index))
         with self._review_gate_lock:
             status = self._review_gate_local_status(video_path)
@@ -8261,6 +8974,80 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             int(media_id) if media_id else None,
         )
 
+    def analyze_grammar(
+        self,
+        text: str,
+        context: str = "",
+        request_id: str = "",
+    ) -> dict[str, Any]:
+        return self.light_novels.analyze_grammar(str(text or ""), str(context or ""), str(request_id or ""))
+
+    def mpv_playback_save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .playback_save import save_playback
+        key = self._play_key(str(payload.get("video") or ""))
+        with self._play_lock:
+            process = self._play_processes.get(key)
+            if getattr(self, "_closing", False) or process is None or process.poll() is not None:
+                return {"ok":False,"error":"Playback ended"}
+        save_playback(self.manager.db,Path(key),position=float(payload.get("position") or 0),
+                      duration=float(payload.get("duration") or 0),session=str(payload.get("session") or "")[:128],
+                      sequence=int(payload.get("sequence") or 0),active_total=float(payload.get("active_total") or 0),
+                      ledger=self.consumption)
+        return {"ok":True}
+
+    def mpv_assistant_snapshot(self) -> dict[str, Any]:
+        from .mpv_assistant import llm_configured
+        return {"snapshot": dict(getattr(self, "_mpv_assistant_snapshot", {})),
+                "settings": {"language": self.config.ui.language, "llm_enabled": llm_configured(self.config),
+                             "llm_provider": self.config.llm.provider, "llm_url": self.config.llm.base_url,
+                             "llm_model": self.config.llm.model, "llm_api_key": "configured" if self.config.llm.api_key else ""}}
+
+    def mpv_explain_subtitle(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .mpv_assistant import MpvAssistantWindow, llm_configured
+        if not llm_configured(self.config):
+            return {"ok": False, "error": "Configure the LLM in Settings"}
+        key = self._play_key(str(payload.get("video") or ""))
+        with self._play_lock:
+            if key not in self._play_processes or self._play_processes[key].poll() is not None:
+                return {"ok": False, "error": "Playback ended"}
+        text = str(payload.get("text") or "").strip()[:8192]
+        if not text:
+            return {"ok": False, "error": "No current subtitle line"}
+        episode = self.manager.db.episode_by_path(Path(key))
+        anime = self.manager.db.get_anime(episode.media_id) if episode and episode.media_id else None
+        context = str(payload.get("context") or "")[:24000]
+        if episode and episode.media_id and hasattr(self, "light_novels"):
+            service = self.light_novels
+            cached = service._character_cache.get({"media_id":int(episode.media_id),"schema":3},ttl_seconds=30*24*3600)
+            glossary = service._merge_character_glossary(int(episode.media_id),cached if isinstance(cached,list) else [])
+            if glossary:
+                context += "\nCharacter glossary: " + json.dumps(glossary[:50],ensure_ascii=False)
+
+        metadata = {"kind": "anime", "media_id": episode.media_id if episode else None,
+                    "episode": episode.media_episode if episode else None, "title": anime.title if anime else Path(key).stem,
+                    "position": float(payload.get("position") or 0)}
+        self._mpv_assistant_snapshot = {"text": text, "context": json.dumps(metadata, ensure_ascii=False) + "\n" + context,
+                                        "metadata": metadata, "request_id": secrets.token_hex(12)}
+        with self._play_lock:
+            if not hasattr(self, "_mpv_assistant_window"):
+                self._mpv_assistant_window = MpvAssistantWindow(self)
+            window = self._mpv_assistant_window
+        return window.show()
+
+    def mpv_assistant_close(self) -> dict[str, Any]:
+        window = getattr(self, "_mpv_assistant_window", None)
+        if window is not None:
+            window.close()
+        return {"ok": True}
+
+    def assistant_chat(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = payload or {}
+        messages = data.get("messages") if isinstance(data.get("messages"), list) else []
+        grammar = data.get("grammar") if isinstance(data.get("grammar"), dict) else None
+        return self.light_novels.assistant_chat(
+            messages, str(data.get("sentence") or ""), str(data.get("context") or ""), grammar
+        )
+
     def light_novel_translate(
         self,
         text: str,
@@ -8308,6 +9095,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if (
                     irodori.irodori_tts_enabled
                     and irodori.irodori_tts_auto_generate
+                    and self.manager.work_scheduler.background_wait_reason() is None
                     and self._audiobook_link_kind(int(book["id"])) == "none"
                 ):
                     self.generate_light_novel_tts(int(book["id"]))
@@ -8457,14 +9245,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # audiobook unlinking is allowed to finish after the durable LN tombstone
         # and row deletion are committed. Consumption history is detached, never deleted.
         local_id = int(book_id)
-        result = self.light_novels.delete_book(local_id, delete_file=False)
+        self.light_novels.cancel_reader_background()
+        # Serialize deletion with generated-audio publication. Cancellation is
+        # checked again before import/link so a late worker cannot restore it.
+        with self._irodori_tts_lock:
+            self._audiobook_generation_controls[local_id] = "cancel_requested"
+            self.audiobooks.unlink_light_novel(local_id)
+            try:
+                result = self.light_novels.delete_book(local_id, delete_file=False)
+            except LightNovelError:
+                # Repeat delete (or a concurrent bulk delete) is a no-op.
+                result = {"ok": True, "book_id": local_id, "file_kept": True, "missing": True}
+        self._forget_deleted_content_reviews("ln", [local_id])
         self.consumption.detach_library_media(kind="light_novel", local_id=str(local_id))
-        threading.Thread(
-            target=self.audiobooks.unlink_light_novel,
-            args=(local_id,),
-            name=f"ln-unlink-delete-{local_id}",
-            daemon=True,
-        ).start()
         return result
 
     def light_novel_bind_anilist(self, book_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -8476,6 +9269,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def light_novel_unbind_anilist(self, book_id: int) -> dict[str, Any]:
         return self.light_novels.unbind_anilist(int(book_id))
+
+    def light_novel_search_jiten(self, query: str) -> list[dict[str, Any]]:
+        return self.light_novels.search_jiten_books(str(query))
+
+    def light_novel_bind_jiten(self, book_id: int, deck_id: int | None) -> dict[str, Any]:
+        return self.light_novels.bind_jiten_book(int(book_id), None if deck_id is None else int(deck_id))
+
+    def light_novel_jiten_stats(self, book_id: int) -> dict[str, Any]:
+        return self.light_novels.jiten_book_stats(int(book_id))
 
     def light_novel_search_anilist(self, query: str) -> list[dict[str, Any]]:
         return self.light_novels.search_anilist_novels(str(query or "").strip())
@@ -10072,6 +10874,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "jiten_api_key": values.get("ln_jiten_api_key", ln_current.jiten_api_key),
             "jpdb_api_token": values.get("ln_jpdb_api_token", ln_current.jpdb_api_token),
             "study_backend": values.get("ln_study_backend", ln_current.study_backend),
+            "review_mode": values.get("ln_review_mode", ln_current.review_mode),
+            "review_shortcuts": values.get("ln_review_shortcuts", ln_current.review_shortcuts),
             "show_furigana": values.get("ln_show_furigana", ln_current.show_furigana),
             "show_pitch_accent": values.get(
                 "ln_show_pitch_accent", ln_current.show_pitch_accent
@@ -10157,6 +10961,17 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.ui.review_gate_all_due_episode_words = bool(
             values.get("review_gate_all_due_episode_words", getattr(cfg.ui, "review_gate_all_due_episode_words", False))
         )
+        cfg.ui.review_gate_ln_enabled = bool(values.get("review_gate_ln_enabled", cfg.ui.review_gate_ln_enabled))
+        cfg.ui.review_gate_ln_all_due = bool(values.get("review_gate_ln_all_due", cfg.ui.review_gate_ln_all_due))
+        cfg.ui.review_gate_ln_count = max(1, min(50, int(values.get("review_gate_ln_count", cfg.ui.review_gate_ln_count))))
+        cfg.ui.review_gate_manga_enabled = bool(values.get("review_gate_manga_enabled", cfg.ui.review_gate_manga_enabled))
+        cfg.ui.review_gate_manga_all_due = bool(values.get("review_gate_manga_all_due", cfg.ui.review_gate_manga_all_due))
+        cfg.ui.review_gate_manga_count = max(1, min(50, int(values.get("review_gate_manga_count", cfg.ui.review_gate_manga_count))))
+        if "sidebar_review_interval" in values:
+            interval = str(values["sidebar_review_interval"])
+            if interval not in {"60000", "180000", "300000", "600000", "1800000", "continuous"}:
+                raise ValueError("Invalid sidebar review interval")
+            cfg.ui.sidebar_review_interval = interval
         cfg.library.root_dir = Path(str(values.get("library_root", cfg.library.root_dir))).expanduser()
         def _folder_list(value: object) -> list[Path]:
             raw = str(value or "").replace(";", "\n")
@@ -10305,6 +11120,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
         )
         cfg.shortcuts.mpv_mark_watched = str(values.get("shortcut_mpv_mark_watched", cfg.shortcuts.mpv_mark_watched)).strip()
+        cfg.shortcuts.mpv_explain_subtitle = str(values.get("shortcut_mpv_explain_subtitle", cfg.shortcuts.mpv_explain_subtitle)).strip()
         cfg.shortcuts.mpv_translate_subtitle = str(values.get("shortcut_mpv_translate_subtitle", cfg.shortcuts.mpv_translate_subtitle)).strip()
         requested_study_plugin = str(
             values.get("mpv_study_plugin", cfg.tools.mpv_study_plugin)
@@ -10344,13 +11160,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.matching.subtitle_upgrade_min_score_gain = 25.0
         cfg.matching.subtitle_upgrade_check_hours = 6.0
         cfg.matching.max_subtitle_upgrade_checks_per_run = 2
+        cfg.llm.profiles[cfg.llm.provider] = {"url":cfg.llm.base_url,"model":cfg.llm.model,"api_key":cfg.llm.api_key}
+        for protocol, profile in (values.get("llm_profiles") or {}).items():
+            if protocol in {"ollama", "openai"} and isinstance(profile,dict):
+                previous = cfg.llm.profiles.get(protocol,{})
+                cfg.llm.profiles[protocol] = {"url":str(profile.get("url") or ""),"model":str(profile.get("model") or ""),
+                    "api_key":keep_masked_secret(profile.get("key", ""),previous.get("api_key", ""))}
         cfg.llm.enabled = bool(values.get("llm_enabled", cfg.llm.enabled))
         cfg.llm.provider = str(values.get("llm_provider", cfg.llm.provider)).strip().lower() or "ollama"
         if cfg.llm.provider not in {"ollama", "openai"}:
             cfg.llm.provider = "ollama"
         cfg.llm.base_url = str(values.get("llm_url", cfg.llm.base_url)).strip().rstrip("/")
         cfg.llm.api_key = keep_masked_secret(
-            values.get("llm_api_key", cfg.llm.api_key), cfg.llm.api_key
+            values.get("llm_api_key", cfg.llm.api_key), cfg.llm.profiles.get(cfg.llm.provider,{}).get("api_key", cfg.llm.api_key)
         ).strip()
         cfg.llm.model = str(values.get("llm_model", cfg.llm.model)).strip()
         reasoning_effort = str(values.get("llm_reasoning_effort", cfg.llm.reasoning_effort)).strip().lower() or "low"
@@ -10358,6 +11180,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             reasoning_effort
             if reasoning_effort in {"none", "low", "medium", "high", "xhigh", "max"}
             else "low"
+        )
+        assistant_effort = str(values.get("llm_assistant_reasoning_effort", cfg.llm.assistant_reasoning_effort)).strip().lower() or "low"
+        cfg.llm.assistant_reasoning_effort = (
+            assistant_effort if assistant_effort in {"none", "low", "medium", "high", "xhigh", "max"} else "low"
         )
         cfg.llm.validate_embedded_reference = bool(
             values.get("subtitle_semantic_checks", cfg.llm.validate_embedded_reference)
@@ -10391,6 +11217,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             job_center=self.job_center,
             work_scheduler=self.manager.work_scheduler,
         )
+        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
         if not self.safe_mode.active:
             self.task_supervisor.start(
             name="audiobook-stt-resume",
@@ -10739,9 +11566,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         try:
             stats = self.manager.refresh_anilist_cache()
         except Exception as exc:
-            warning = (
-                "AniList сохранил изменение, но не отдал обновлённый список; "
-                "используются локальные данные"
+            warning = ui_text(
+                self.config.ui.language,
+                "AniList saved the change, but did not return the updated list; using local data",
+                "AniList сохранил изменение, но не отдал обновлённый список; используются локальные данные",
             )
             self.logger.warning(
                 "FALLBACK step=anilist.post_mutation_refresh error=%r",
@@ -10823,6 +11651,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def poll_planned_release_discovery(self) -> dict[str, Any]:
         """Return already-discovered Planning releases without mutating discovery state."""
         return {"offers": self.manager.planned_release_discovery().offers()}
+
+    def dismiss_planned_release_offers(self, media_ids: list[int]) -> dict[str, Any]:
+        """Acknowledge displayed offers locally; keep their Planning entries."""
+        discovery = self.manager.planned_release_discovery()
+        available = {int(row["media_id"]) for row in discovery.offers()}
+        dismissed = set()
+        for value in (media_ids or [])[:100]:
+            try:
+                media_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if media_id in available and media_id not in dismissed:
+                discovery.dismiss(media_id)
+                dismissed.add(media_id)
+        return {"ok": True, "dismissed": len(dismissed)}
 
     @staticmethod
     def _final_sequel_sort_key(node: dict[str, Any]) -> tuple[str, int]:
@@ -11070,6 +11913,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             row
             for row in rows
             if str(row.get("media_type") or "").upper() == "ANIME"
+            # Music videos are not watchable episodes: never announce them.
+            and str(row.get("format") or "").upper() != "MUSIC"
             and int(row.get("id") or 0) not in seen
             and int(row.get("created_at") or 0) >= cutoff
         ][:12]
@@ -11104,21 +11949,68 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {"ok": True}
 
     def move_planned_to_watching(self, media_id: int) -> dict[str, Any]:
+        media_id = int(media_id)
         client = self._anilist_client()
         try:
-            client.set_list_status(int(media_id), "CURRENT")
+            client.set_list_status(media_id, "CURRENT")
         finally:
             client.close()
-        self._set_local_anilist_status(int(media_id), "CURRENT")
-        release = None
+        self._set_local_anilist_status(media_id, "CURRENT")
+        download_pending = False
+        download_error = ""
         if self.config.nyaa.enabled and self._downloads_enabled():
-            release = self.manager.download_planned(int(media_id))
+            # Provider searches can take tens of seconds. The AniList mutation
+            # is already saved; let the UI render CURRENT before searching.
+            with self._watching_download_lock:
+                previous = self._watching_download_jobs.get(media_id)
+                if previous and previous["running"]:
+                    download_pending = True
+                else:
+                    job = {"ok": True, "running": True, "download_started": False,
+                           "release": "", "error": ""}
+                    self._watching_download_jobs[media_id] = job
+                    try:
+                        self.task_supervisor.start(
+                            name=f"watching-download-{media_id}-{time.monotonic_ns()}",
+                            target=self._download_after_watching,
+                            args=(media_id, job),
+                            pass_cancel_event=True,
+                        )
+                        download_pending = True
+                    except RuntimeError as exc:
+                        download_error = str(exc)
+                        job.update(running=False, error=download_error)
         return {
             "ok": True,
-            "download_started": release is not None,
-            "release": release.title if release is not None else "",
-            "state": self.get_state(),
+            "download_pending": download_pending,
+            "download_error": download_error,
+            "state": self.get_state_fast(),
         }
+
+    def _download_after_watching(
+        self, cancel_event: threading.Event, media_id: int, job: dict[str, Any],
+    ) -> None:
+        result: dict[str, Any] = {}
+        try:
+            if cancel_event.is_set():
+                result["error"] = "Download search cancelled"
+                return
+            release = self.manager.download_planned(media_id)
+            result.update(download_started=release is not None,
+                          release=release.title if release is not None else "")
+        except Exception as exc:  # noqa: BLE001 - report background errors to the UI.
+            result["error"] = str(exc)
+            self.logger.exception("FAIL step=watching.download media_id=%s", media_id)
+        finally:
+            with self._watching_download_lock:
+                job.update(result, running=False)
+
+    def watching_download_status(self, media_id: int) -> dict[str, Any]:
+        with self._watching_download_lock:
+            job = self._watching_download_jobs.get(int(media_id))
+            if job is None:
+                return {"ok": False, "running": False, "error": "Download search not found"}
+            return dict(job)
 
     def set_anime_watching(self, media_id: int) -> dict[str, Any]:
         """Move an AniList entry to CURRENT without implicitly starting a download."""
@@ -11267,6 +12159,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 continue
             episodes_by_media.setdefault(int(item.media_id), []).append(item)
 
+        # Anime rows that are neither on the user's AniList list (empty status)
+        # nor present locally nor downloading are leftovers of old imports and
+        # benchmark corpora (often titled with a release name, e.g.
+        # "[Erai-raws] ... - 01 ~ 12"). They must not appear as library hits.
+        try:
+            downloading_ids = {
+                int(item.media_id)
+                for item in self.manager.db.downloads()
+                if getattr(item, "media_id", None) is not None
+            }
+        except Exception:
+            downloading_ids = set()
+
         results: list[dict[str, Any]] = []
         episode_hint = re.search(
             r"(?:\b(?:ep(?:isode)?|e|сер(?:ия)?)\s*)?(\d{1,3})\s*$",
@@ -11291,8 +12196,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     ]
                 )
             )
-            score, matched = _global_search_score(cleaned, names)
             local_eps = episodes_by_media.get(int(anime.media_id), [])
+            if (
+                not str(anime.status or "").strip()
+                and not local_eps
+                and int(anime.media_id) not in downloading_ids
+            ):
+                continue
+            score, matched = _global_search_score(cleaned, names)
 
             chosen = next(
                 (
@@ -11901,7 +12812,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     if text and text not in seen:
                         seen.add(text)
                         digest = hashlib.sha256(("study-v1\0" + text).encode("utf-8")).hexdigest()
-                        if self.light_novels._cached_parse(digest) is None:
+                        if self.light_novels._cached_parse(digest, provider="jiten") is None:
                             manga_pending.append(text)
             except Exception as exc:
                 self.logger.info("Jiten manga preparse discovery skipped: %s", exc)
@@ -12169,48 +13080,53 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return {"ok": True, "path": str(path)}
 
     def _start_managed_irodori_server(self, url: str) -> bool:
+        if getattr(self, "_closing", False):
+            return False
         if not self._irodori_local_url(url) or not self._irodori_managed_python().is_file():
             return False
         parsed = urlparse(url)
         port = int(parsed.port or (443 if parsed.scheme == "https" else 80))
         if parsed.scheme == "http" and port == 80 and not parsed.port:
             port = 8088
-        with self._irodori_server_lock:
-            process = self._irodori_server_process
-            if process is not None and process.poll() is None:
-                return True
-            log_path = self._irodori_server_log_path()
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            log = log_path.open("a", encoding="utf-8")
-            try:
-                managed_env = {
-                    **os.environ,
-                    "IRODORI_ALLOW_NO_REF_VOICE": "true",
-                    "IRODORI_MODEL_NAME": "irodori-tts",
-                }
-                self._irodori_server_process = subprocess.Popen(
-                    [
-                        str(self._irodori_managed_python()),
-                        "-m",
-                        "irodori_openai_tts",
-                        "--host",
-                        "127.0.0.1",
-                        "--port",
-                        str(port),
-                    ],
-                    cwd=self._irodori_repo_dir(),
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    start_new_session=True,
-                    env=managed_env,
-                )
-                self.logger.info(
-                    "START step=irodori.managed_server pid=%s reason=generation_or_explicit_test",
-                    self._irodori_server_process.pid,
-                )
-            finally:
-                log.close()
+        with getattr(self, "_close_lock", threading.RLock()):
+            if getattr(self, "_closing", False):
+                return False
+            with self._irodori_server_lock:
+                process = self._irodori_server_process
+                if process is not None and process.poll() is None:
+                    return True
+                log_path = self._irodori_server_log_path()
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log = log_path.open("a", encoding="utf-8")
+                try:
+                    managed_env = {
+                        **os.environ,
+                        "IRODORI_ALLOW_NO_REF_VOICE": "true",
+                        "IRODORI_MODEL_NAME": "irodori-tts",
+                    }
+                    self._irodori_server_process = subprocess.Popen(
+                        [
+                            str(self._irodori_managed_python()),
+                            "-m",
+                            "irodori_openai_tts",
+                            "--host",
+                            "127.0.0.1",
+                            "--port",
+                            str(port),
+                        ],
+                        cwd=self._irodori_repo_dir(),
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        start_new_session=True,
+                        env=managed_env,
+                    )
+                    self.logger.info(
+                        "START step=irodori.managed_server pid=%s reason=generation_or_explicit_test",
+                        self._irodori_server_process.pid,
+                    )
+                finally:
+                    log.close()
         return True
 
     def _stop_managed_irodori_server(self) -> None:
@@ -13554,16 +14470,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 total=total_characters,
             ):
                 return
-            audiobook = self.audiobooks.import_folder(
-                output_dir,
-                auto_link=False,
-                prepare_transcription=False,
-            )
-            self.audiobooks.link_light_novel(
-                int(book_id),
-                int(audiobook["id"]),
-                prepare_alignment=False,
-            )
+            with self._irodori_tts_lock:
+                if self._audiobook_generation_controls.get(int(book_id)) == "cancel_requested":
+                    self.job_center.cancelled(job_id, message="Source removed")
+                    shutil.rmtree(output_dir, ignore_errors=True)
+                    return
+                self.light_novels.book(int(book_id))
+                audiobook = self.audiobooks.import_folder(
+                    output_dir,
+                    auto_link=False,
+                    prepare_transcription=False,
+                )
+                self.audiobooks.link_light_novel(
+                    int(book_id),
+                    int(audiobook["id"]),
+                    prepare_alignment=False,
+                )
             if mode == "regenerate" and old_audiobook_id and int(audiobook["id"]) != old_audiobook_id:
                 try:
                     self.audiobooks.delete(old_audiobook_id, delete_files=True)
@@ -14051,10 +14973,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=False",
                     Path(key).name, process.pid, age * 1000.0, str((record or {}).get("ack_file") or ""),
                 )
+                from .playback_process import stop_playback_process
+                from .process_cleanup import OwnedProcessTree
                 try:
-                    process.terminate()
+                    tree = OwnedProcessTree(process.pid)
                 except OSError:
-                    pass
+                    tree = None
+                try:
+                    stop_playback_process(process, tree=tree)
+                except OSError as exc:
+                    self.logger.warning("Playback cleanup failed pid=%s reason=%s", process.pid, exc)
                 self._play_processes.pop(key, None)
                 self._play_started_at.pop(key, None)
                 self._cleanup_play_ack(record)
@@ -14350,9 +15278,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         key = self._play_key(video_path)
         path = Path(key)
         if not path.is_file():
-            raise FileNotFoundError(f"Видео не найдено: {path}")
+            raise FileNotFoundError(ui_text(self.config.ui.language, f"Video not found: {path}", f"Видео не найдено: {path}"))
 
         with self._play_lock:
+            if getattr(self, "_closing", False):
+                raise RuntimeError("Pudge is shutting down")
             state = self._play_state_locked(key)
             if state["status"] in {"starting", "running"}:
                 return {"ok": True, "duplicate": True, **state}
@@ -14474,6 +15404,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         episode.subtitle_path is not None
                         and episode.subtitle_path.is_file()
                     )
+                    if (
+                        usable_external
+                        and episode.subtitle_path is not None
+                        and episode.subtitle_path.suffix.casefold() == ".srt"
+                    ):
+                        # A file prepared before the alignment guard existed may
+                        # carry a destroyed time map (dozens of lines piled at 0 s).
+                        from .alignment_guard import validate_final_standalone
+
+                        guard = validate_final_standalone(episode.subtitle_path)
+                        if guard.get("status") == "rejected":
+                            self.logger.warning(
+                                "REJECT step=play.subtitle_guard video=%s subtitle=%s reason=%s diagnostics=%s",
+                                path.name, episode.subtitle_path.name, guard.get("reason"), guard.get("diagnostics"),
+                            )
+                            usable_external = False
                     usable_embedded = episode.embedded_subtitle_id is not None
                     if (
                         episode.state == "ready"
@@ -14614,18 +15560,22 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     episode.episode if episode else None,
                     bool(allow_image_subtitles),
                 )
+                self.manager.remember_ready_before_playback(path)
                 ack_dir = self.config.paths.cache_dir / "playback-start"
                 ack_dir.mkdir(parents=True, exist_ok=True)
                 ack_path = ack_dir / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()[:20]}-{time.time_ns()}.json"
-                env = os.environ.copy()
-                env["PUDGE_MPV_START_ACK"] = str(ack_path)
-                process = subprocess.Popen(
-                    command,
-                    start_new_session=True,
-                    env=env,
-                )
+                from .runtime import worker_environment
+                env = worker_environment({"PUDGE_MPV_START_ACK": str(ack_path), "PUDGE_ASSISTANT_URL": getattr(self, "asset_base", "") + "/api/mpv/explain", "PUDGE_ASSISTANT_TOKEN": getattr(self, "_http_session_token", "")})
+                with getattr(self, "_close_lock", threading.RLock()):
+                    if getattr(self, "_closing", False):
+                        raise RuntimeError("Pudge is shutting down")
+                    process = subprocess.Popen(
+                        command,
+                        start_new_session=True,
+                        env=env,
+                    )
             except OSError as exc:
-                raise RuntimeError(f"Не удалось запустить {APP_NAME}: {exc}") from exc
+                raise RuntimeError(ui_text(self.config.ui.language, f"Could not start {APP_NAME}: {exc}", f"Не удалось запустить {APP_NAME}: {exc}")) from exc
             self._play_processes[key] = process
             self._play_started_at[key] = time.time()
             self._play_registry[key] = {
@@ -15008,6 +15958,35 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         webbrowser.open(str(url))
         return {"ok": True}
 
+    _UI_PREFERENCE_KEYS = ("pudge.assistant.v1", "pudge.assistant.geometry.v1", "pudge.readTogether.v1")
+
+    def ui_preferences(self) -> dict[str, Any]:
+        result = {}
+        for key in self._UI_PREFERENCE_KEYS:
+            raw = self.manager.db.get_state("ui_preference_v1:" + key, "")
+            if raw:
+                try:
+                    result[key] = json.loads(raw)
+                except (ValueError, TypeError):
+                    pass
+        return {"schema": 1, "values": result}
+
+    def ui_preference_save(self, key: str, value: Any) -> dict[str, Any]:
+        if key not in self._UI_PREFERENCE_KEYS:
+            raise ValueError("Unknown UI preference")
+        if value is not None and not isinstance(value, dict):
+            raise ValueError("UI preference must be an object or null")
+        if key == "pudge.assistant.v1" and value is not None:
+            value = dict(value)
+            if not isinstance(value.get("messages"), list):
+                raise ValueError("Assistant messages must be an array")
+            value["messages"] = value["messages"][-100:]
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        if len(encoded.encode("utf-8")) > 2 * 1024 * 1024:
+            raise ValueError("UI preference is too large")
+        self.manager.db.set_state("ui_preference_v1:" + key, encoded)
+        return {"ok": True}
+
     def app_update_status(self, force: bool = True) -> dict[str, Any]:
         return self.app_updater.check(force=bool(force))
 
@@ -15309,6 +16288,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     continue
                 if not episode.video_path.is_file():
                     continue
+                if AnimeManager._library_path_is_ignored(episode.video_path):
+                    continue
                 path = str(episode.video_path)
                 if path in seen_paths:
                     continue
@@ -15478,19 +16459,29 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             "workers": manga_lingering,
                         }
 
-                    audiobook_lingering = self.audiobooks.close(timeout=5.0)
-                    if audiobook_lingering:
-                        supervisor.resume()
-                        self._start_scheduled_agent()
-                        return {
-                            "ok": False,
-                            "busy": True,
-                            "error": "Audiobook workers did not stop",
-                            "workers": audiobook_lingering,
-                            "restart_required": True,
-                        }
-
+                    needs_rebind = False
+                    self._restoring = True
                     try:
+                        # Stop HTTP admission and join every accepted request
+                        # before removing WAL/SHM or closing its dependencies.
+                        self._stop_companion_server()
+                        needs_rebind = True
+                        self.companion_streaming.close()
+                        close_ln = getattr(self.light_novels, "close", None)
+                        if callable(close_ln):
+                            close_ln(timeout=5.0)
+                        audiobook_lingering = self.audiobooks.close(timeout=5.0)
+                        if audiobook_lingering:
+                            return {
+                                "ok": False,
+                                "busy": True,
+                                "error": "Audiobook workers did not stop",
+                                "workers": audiobook_lingering,
+                            }
+                        # Direct pywebview calls are outside HTTP request tracking.
+                        # Retire the shared repository to drain their transactions
+                        # and keep late calls from reopening the replaced database.
+                        self.manager.db.retire(timeout=5.0)
                         restored = restore_backup(
                             archive_path=selected,
                             config_path=self.config_path,
@@ -15498,14 +16489,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             cache_dir=self.config.paths.cache_dir,
                             post_commit=self._reload_runtime_services_after_restore,
                         )
+                        needs_rebind = False
                     except Exception:
                         # restore_backup also rolls back failures during runtime
                         # rebind; reopen the original services after rollback.
-                        self._reload_runtime_services_after_restore()
+                        if needs_rebind:
+                            needs_rebind = False
+                            self._reload_runtime_services_after_restore()
                         raise
                     finally:
-                        supervisor.resume()
-                        self._start_scheduled_agent()
+                        try:
+                            if needs_rebind:
+                                self._reload_runtime_services_after_restore()
+                        finally:
+                            supervisor.resume()
+                            self._start_scheduled_agent()
+                            if self.config.companion.enabled:
+                                self._start_companion_server()
+                            self._restoring = False
 
                     if not self.safe_mode.active:
                         self.task_supervisor.start(
@@ -15933,6 +16934,8 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler]:
+    if not getattr(api, "_http_session_token", None):
+        api._http_session_token = secrets.token_urlsafe(32)
     class _AppAssetHandler(_QuietHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, directory=str(web_root), **kwargs)
@@ -15945,6 +16948,16 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
+
+        # Stored covers are content-addressed (``ln-<sha256[:24]>.jpg`` etc.): the
+        # same URL never changes bytes, so WebKit may keep them for good instead
+        # of re-requesting every time a cover is shown again.
+        _IMMUTABLE_COVER = re.compile(r"/covers/[A-Za-z0-9_.-]*[0-9a-f]{24}\.(?:jpg|png|webp|gif)")
+
+        def end_headers(self) -> None:
+            if self.command == "GET" and self._IMMUTABLE_COVER.fullmatch(urlparse(self.path).path or ""):
+                self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            super().end_headers()
 
         def _send_asset(self, path: Path, content_type: str, revision: str) -> None:
             size = path.stat().st_size
@@ -15982,14 +16995,43 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
-            if path != "/api/torrents/enabled":
+            if path not in {"/api/torrents/enabled", "/api/mpv/explain", "/api/mpv/playback-save"}:
                 self._send_json({"ok": False, "error": "not_found"}, status=404)
                 return
+            expected_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+            token = str(self.headers.get("X-Pudge-Token") or "")
+            if (self.headers.get("Host") != expected_origin.removeprefix("http://")
+                    or self.headers.get("Origin", expected_origin) != expected_origin
+                    or not hmac.compare_digest(token, api._http_session_token)):
+                self._send_json({"ok": False, "error": "forbidden"}, status=403)
+                return
+            if self.headers.get_content_type() != "application/json":
+                self._send_json({"ok": False, "error": "json_required"}, status=415)
+                return
             try:
-                size = min(max(int(self.headers.get("Content-Length", "0") or 0), 0), 4096)
+                size = int(self.headers.get("Content-Length", "0") or 0)
+                if not 0 < size <= (65536 if path == "/api/mpv/explain" else 4096):
+                    self._send_json({"ok": False, "error": "invalid_body_size"}, status=400)
+                    return
                 raw = self.rfile.read(size) if size else b"{}"
                 payload = json.loads(raw.decode("utf-8"))
-                desired = bool(payload.get("enabled"))
+                if path == "/api/mpv/playback-save":
+                    if not isinstance(payload,dict):
+                        self._send_json({"ok":False,"error":"object_required"},status=400)
+                    else:
+                        result=api.mpv_playback_save(payload)
+                        self._send_json(result,status=200 if result.get("ok") else 410)
+                    return
+                if path == "/api/mpv/explain":
+                    if not isinstance(payload, dict):
+                        self._send_json({"ok": False, "error": "object_required"}, status=400)
+                    else:
+                        self._send_json(api.mpv_explain_subtitle(payload))
+                    return
+                if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
+                    self._send_json({"ok": False, "error": "enabled_must_be_boolean"}, status=400)
+                    return
+                desired = payload["enabled"]
                 api.logger.info("EVENT torrent.http_toggle desired=%s", desired)
                 result = dict(api.set_torrents_enabled(desired))
                 result["ok"] = True
@@ -16002,6 +17044,7 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
 
 
 def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer, str]:
+    api._http_session_token = secrets.token_urlsafe(32)
     web_root = api.config.paths.cache_dir / "web-ui"
     web_root.mkdir(parents=True, exist_ok=True)
     source_dir = Path(__file__).resolve().parent / "web"
@@ -16011,7 +17054,9 @@ def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer
         target = web_root / source.name
         if source.name == "index.html":
             target.write_text(
-                source.read_text(encoding="utf-8").replace("__APP_NAME__", APP_NAME),
+                source.read_text(encoding="utf-8").replace("__APP_NAME__", APP_NAME)
+                    .replace("__PUDGE_HTTP_TOKEN__", api._http_session_token)
+                    .replace("__PUDGE_UI_BOOTSTRAP__", json.dumps(api.ui_preferences(), ensure_ascii=True).replace("<", "\\u003c")),
                 encoding="utf-8",
             )
         else:
@@ -16072,7 +17117,23 @@ class _MacWindowLifecycle:
         return False
 
     def reopen(self) -> bool:
+        if self.quit_requested:
+            return False
         try:
+            native = getattr(self.window, "native", None)
+            if sys.platform == "darwin" and native is not None:
+                # Cocoa considers a miniaturized window visible for reopen
+                # events. Restore it explicitly before showing the main UI.
+                def restore() -> None:
+                    if not self.quit_requested and native.isMiniaturized():
+                        native.deminiaturize_(None)
+
+                if threading.current_thread() is threading.main_thread():
+                    restore()
+                else:
+                    from PyObjCTools import AppHelper
+
+                    AppHelper.callAfter(restore)
             self.window.show()
             self.logger.info("EVENT app.window_reopen action=show")
             return True
@@ -16085,10 +17146,16 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
     if sys.platform != "darwin":
         return False
     try:
-        from AppKit import NSApplication
-        from Foundation import NSObject, YES
+        from AppKit import NSApplication, NSTerminateLater, NSModalPanelRunLoopMode
+        from Foundation import NSObject, YES, NSDefaultRunLoopMode
+        from webview.platforms.cocoa import BrowserView
 
         application = NSApplication.sharedApplication()
+        proxy = getattr(api, "_macos_app_delegate_proxy", None)
+        if proxy is not None and getattr(proxy, "_pudge_lifecycle", None) is lifecycle:
+            BrowserView._shared_app_delegate = proxy
+            application.setDelegate_(proxy)
+            return True
         original_delegate = application.delegate()
         if original_delegate is None:
             api.logger.warning("FALLBACK step=app.macos_delegate reason=no_original_delegate")
@@ -16096,17 +17163,86 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
 
         class PudgeApplicationDelegateV41(NSObject):
             def applicationShouldTerminate_(self, app):
+                if getattr(api, "_macos_quit_thread", None) is not None:
+                    return NSTerminateLater
                 lifecycle.request_quit("macos_quit")
                 handler = getattr(original_delegate, "applicationShouldTerminate_", None)
-                return handler(app) if callable(handler) else YES
+                accepted = handler(app) if callable(handler) else YES
+                if not accepted:
+                    lifecycle.quit_requested = False
+                    return accepted
+
+                reply_claimed = threading.Event()
+                reply_lock = threading.Lock()
+                watchdog = None
+
+                def finish() -> None:
+                    with reply_lock:
+                        if reply_claimed.is_set():
+                            return
+                        reply_claimed.set()
+                    # Explicit modes include the modal loop of NSTerminateLater.
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_modes_(
+                        "pudgeFinishQuit:", app, False,
+                        [NSModalPanelRunLoopMode, NSDefaultRunLoopMode],
+                    )
+
+                def stop_remaining() -> None:
+                    from .process_cleanup import OwnedProcessTree
+
+                    tree = getattr(api, "_shutdown_process_tree", None)
+                    if tree is None:
+                        tree = OwnedProcessTree()
+                        api._preserve_playback_processes(tree)
+                    remaining = tree.stop()
+                    api.logger.info("EVENT app.quit_remaining_children pid=%s remaining=%s", os.getpid(), remaining)
+
+                def timed_out() -> None:
+                    api.logger.warning("WAIT step=app.quit_cleanup_timeout pid=%s", os.getpid())
+                    try:
+                        stop_remaining()
+                    except Exception:
+                        api.logger.exception("FAIL step=app.quit_remaining_children")
+                    finally:
+                        finish()
+
+                def shutdown() -> None:
+                    try:
+                        api.close()
+                    except Exception:
+                        api.logger.exception("FAIL step=app.macos_quit_cleanup")
+                        try:
+                            stop_remaining()
+                        except Exception:
+                            api.logger.exception("FAIL step=app.quit_remaining_children")
+                    finally:
+                        if watchdog is not None:
+                            watchdog.cancel()
+                        finish()
+
+                if getattr(api, "_owning_pid", None) == os.getpid():
+                    watchdog = threading.Timer(20.0, timed_out)
+                    watchdog.daemon = True
+                    watchdog.start()
+                worker = threading.Thread(target=shutdown, name="pudge-quit-cleanup", daemon=True)
+                api._macos_quit_thread = worker
+                api.logger.info("EVENT app.quit_cleanup_begin pid=%s", os.getpid())
+                worker.start()
+                return NSTerminateLater
+
+            def pudgeFinishQuit_(self, app):
+                api.logger.info("EVENT app.quit_cleanup_reply pid=%s", os.getpid())
+                app.replyToApplicationShouldTerminate_(YES)
 
             def applicationSupportsSecureRestorableState_(self, app):
                 handler = getattr(original_delegate, "applicationSupportsSecureRestorableState_", None)
                 return handler(app) if callable(handler) else YES
 
             def applicationShouldHandleReopen_hasVisibleWindows_(self, app, has_visible_windows):
-                if not bool(has_visible_windows):
-                    lifecycle.reopen()
+                # The flag describes all application windows, including a
+                # minimized main window or a visible companion. A Dock/Finder
+                # reopen should always bring back the main Pudge window.
+                lifecycle.reopen()
                 handler = getattr(original_delegate, "applicationShouldHandleReopen_hasVisibleWindows_", None)
                 if callable(handler):
                     try:
@@ -16120,6 +17256,10 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
         proxy._pudge_original_delegate = original_delegate
         proxy._pudge_lifecycle = lifecycle
         api._macos_app_delegate_proxy = proxy
+        # Cocoa installs this shared delegate every time BrowserView creates a
+        # child window. Keeping only NSApplication.delegate() was insufficient:
+        # opening the audiobook companion replaced our quit/reopen handlers.
+        BrowserView._shared_app_delegate = proxy
         application.setDelegate_(proxy)
         api.logger.info("EVENT app.macos_close_to_hide installed=true")
         return True
@@ -16238,15 +17378,24 @@ def launch_web_app(config_path: Path) -> int:
         background_color="#0b1320",
     )
     api.set_window(window)
+    api.logger.info("EVENT app.window_created pid=%s uid=%s", os.getpid(), window.uid)
+
+    def on_shown() -> None:
+        api.logger.info("EVENT app.window_shown pid=%s", os.getpid())
+
+    def on_loaded() -> None:
+        api.logger.info("EVENT app.window_loaded pid=%s", os.getpid())
+
+    window.events.shown += on_shown
+    window.events.loaded += on_loaded
 
     if sys.platform == "darwin":
-        lifecycle = _MacWindowLifecycle(
-            window, api.logger, lambda source: api._enter_background_quiet(reason=source)
-        )
+        lifecycle = _MacWindowLifecycle(window, api.logger)
         api._macos_window_lifecycle = lifecycle
         window.events.closing += lifecycle.handle_closing
 
         def on_before_show() -> None:
+            api.logger.info("EVENT app.window_before_show pid=%s native=%s", os.getpid(), type(getattr(window, "native", None)).__name__)
             _install_macos_app_delegate_proxy(api, lifecycle)
 
         window.events.before_show += on_before_show

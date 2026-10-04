@@ -25,4 +25,5 @@ def test_selection_trace_records_pointer_and_selectionchange():
 def test_debug_export_contains_selection_debug():
     text=source()
     assert "selection_debug:{history:Array.isArray(ui.lnSelectionTrace)?ui.lnSelectionTrace:[],current:lnSelectionState()}" in text
-    assert "async function openLightNovel(bookId){installLnSelectionDiagnostics();" in text
+    function = text.split("async function openLightNovel(", 1)[1].split("async function loadLightNovelChapter", 1)[0]
+    assert function.index("installLnSelectionDiagnostics();") < function.index("await pywebview.api.light_novel_open")

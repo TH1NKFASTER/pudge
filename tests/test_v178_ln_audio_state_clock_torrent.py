@@ -91,8 +91,27 @@ def test_transport_reconcile_does_not_pull_playing_clock_backward_on_stale_poll(
         "function lnPairedTransportClockReset", 1
     )[0]
     assert "drift<0&&Math.abs(drift)<=1.5){position=local;staleBackward=true;}" in fn
-    assert "drift>=0&&drift<=.45)position=local+drift*.35" in fn
-    assert "drift>.45&&drift<=.9)position=local+drift*.2" in fn
+    # Forward correction is spread across animation frames; a poll must not jump.
+    from test_v0106_ln_optimistic_transport_clock import _function, _run_node
+    functions = "\n".join(_function(html, name) for name in (
+        "lnPairedTransportClockDesired", "lnPairedTransportClockNow",
+        "lnPairedTransportClockReconcile", "lnPairedTransportClockReset",
+    ))
+    result = _run_node("""
+let now=0;global.performance={now:()=>now};global.ui={};
+""" + functions + """
+const state={position:10,playing:true,speed:1};
+lnPairedTransportClockReset(state);now=1000;
+const before=lnPairedTransportClockNow(state);
+const stale=lnPairedTransportClockReconcile({...state,position:10.8});
+const forward=lnPairedTransportClockReconcile({...state,position:11.3});
+now+=100;const later=lnPairedTransportClockNow(state);
+console.log(JSON.stringify({before,stale,forward,later}));
+""")
+    assert result["stale"]["position"] == pytest.approx(result["before"])
+    assert result["forward"]["position"] == pytest.approx(result["before"])
+    assert result["stale"]["snap"] is False
+    assert 11.1 < result["later"] < 11.3
 
 
 def test_furigana_expires_100ms_after_word_reaches_100_percent_even_on_plateau() -> None:
@@ -223,7 +242,16 @@ def test_backend_torrent_session_state_is_single_owner_and_stale_snapshot_cannot
     assert result["enabled"] is True
     stored = api._store_ui_state_snapshot(stale)
     assert stored["settings"]["torrents_enabled"] is True
-    assert stored["ui_state_version"] == "8"
+    # The quick acknowledgement does not access SQLite. An old response must
+    # keep its old version rather than masquerading as a fresh full snapshot.
+    assert stored["ui_state_version"] == "7"
+    assert db.values["ui_state_version"] == "7"
+    api._bump_ui_state_version()  # Background bookkeeping completes later.
+    assert api._store_ui_state_snapshot(stale)["ui_state_version"] == "7"
+    assert api._ui_state_cache.payload is None
+    fresh = {"ui_state_version": "8", "settings": {"torrents_enabled": False}}
+    assert api._store_ui_state_snapshot(fresh)["settings"]["torrents_enabled"] is True
+    assert api._ui_state_cache.payload == ("8", fresh)
 
 
 def test_generic_settings_no_longer_owns_torrent_toggle_and_scroll_freezes_dom() -> None:

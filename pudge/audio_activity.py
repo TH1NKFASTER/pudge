@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,7 @@ def analyze_audio_activity(
     *,
     ffmpeg: str,
     sample_rate: int = 8_000,
+    timeout: float | None = 3600.0,
 ) -> dict[str, Any]:
     """Decode a low-rate waveform and build an energy/FFT speech clock."""
 
@@ -192,6 +194,40 @@ def analyze_audio_activity(
     if process.stdout is None or process.stderr is None:
         process.kill()
         raise RuntimeError("ffmpeg did not expose the audiobook waveform")
+
+    # Drain stderr concurrently: a decoder that fills the stderr pipe before
+    # writing stdout would otherwise deadlock against our stdout reader.
+    stderr_chunks: list[bytes] = []
+    stderr_stream = process.stderr
+
+    def drain_stderr() -> None:
+        try:
+            while True:
+                chunk = stderr_stream.read(65536)
+                if not chunk:
+                    break
+                stderr_chunks.append(chunk)
+                # Keep only a bounded tail for diagnostics.
+                if len(stderr_chunks) > 64:
+                    del stderr_chunks[:-32]
+        except (OSError, ValueError):
+            pass
+
+    stderr_thread = threading.Thread(target=drain_stderr, name="audio-activity-stderr", daemon=True)
+    stderr_thread.start()
+    timed_out = threading.Event()
+    watchdog: threading.Timer | None = None
+    if timeout is not None and float(timeout) > 0:
+        def kill_on_timeout() -> None:
+            timed_out.set()
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        watchdog = threading.Timer(float(timeout), kill_on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
 
     window = np.hanning(frame_size).astype(np.float32)
     buffer = np.empty(0, dtype=np.float32)
@@ -228,12 +264,19 @@ def analyze_audio_activity(
                 fluxes.append(flux.astype(np.float32))
                 previous_spectrum = spectrum[-1:]
                 buffer = buffer[take * hop_size :]
-        stderr = process.stderr.read().decode("utf-8", errors="replace")
         returncode = process.wait(timeout=30)
-    except Exception:
+        stderr_thread.join(timeout=5)
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+    except BaseException:
         process.kill()
         process.wait(timeout=5)
         raise
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        stderr_thread.join(timeout=5)
+    if timed_out.is_set():
+        raise TimeoutError(f"ffmpeg audio activity analysis exceeded {float(timeout):g}s")
     if returncode != 0:
         raise RuntimeError(stderr.strip()[-1200:] or "ffmpeg could not analyze audiobook audio")
     if not energies:

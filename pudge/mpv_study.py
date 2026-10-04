@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+import socket
+import json
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,9 @@ class SubtitleStudyApi:
         *,
         start_seconds: float = 0.0,
         delay_seconds: float = 1.25,
+        ipc_socket: str | None = None,
+        lookahead_seconds: float = 60.0,
+        max_cues: int = 8,
     ) -> dict[str, Any]:
         """Lazily fill the exact contextual translation cache for an episode."""
         if not self.service.config.llm.enabled:
@@ -44,12 +49,61 @@ class SubtitleStudyApi:
             ),
             0,
         )
-        order = [*range(first, len(cues)), *range(0, first)]
+        order = [i for i in range(first, min(len(cues), first + max_cues)) if cues[i][0] <= start + lookahead_seconds]
         translated = 0
         cached = 0
         failures = 0
         google_fallbacks = 0
-        for index in order:
+        from .power_policy import PowerPolicy
+        import subprocess
+        policy = PowerPolicy(manual_enabled=getattr(getattr(self.service.config,"power",None),"manual_energy_saving",False),
+                             auto_enabled=getattr(getattr(self.service.config,"power",None),"auto_battery_energy_saving",True),
+                             run_command=subprocess.run)
+        done = set()
+        last_policy_settings = 0.0
+        def player_state():
+            if not ipc_socket:
+                return start, False
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1)
+                client.connect(ipc_socket)
+                client.sendall(b'{"command":["get_property","time-pos"],"request_id":1}\n{"command":["get_property","pause"],"request_id":2}\n')
+                values = {}
+                with client.makefile("r") as reader:
+                    for _ in range(32):
+                        raw = reader.readline()
+                        if not raw: raise OSError("Player closed")
+                        row = json.loads(raw)
+                        if row.get("request_id") in {1,2}:
+                            values[row["request_id"]] = row.get("data")
+                        if len(values) == 2:
+                            return float(values[1] or 0), bool(values[2])
+                raise OSError("Player did not return state")
+        while True:
+            if ipc_socket and time.monotonic()-last_policy_settings>=30:
+                last_policy_settings=time.monotonic()
+                config_path=getattr(self.service.config,"config_path",None)
+                if config_path:
+                    from .config import load_config
+                    current=load_config(config_path)
+                    policy.update_settings(manual_enabled=current.power.manual_energy_saving,
+                                           auto_enabled=current.power.auto_battery_energy_saving)
+                    if not current.llm.enabled: break
+            if not ipc_socket and len(done) >= max_cues: break
+            try:
+                position, paused = player_state()
+            except (OSError, ValueError):
+                break
+            if paused or policy.background_block_reason():
+                if not ipc_socket: break
+                time.sleep(2); continue
+            order = [i for i in range(len(cues)) if i not in done and cues[i][1] >= position
+                     and cues[i][0] <= position + lookahead_seconds][:max_cues]
+            if not order:
+                if not ipc_socket: break
+                time.sleep(2); continue
+            index = order[0]
+            done.add(index)
             text = str(cues[index][2] or "").strip()
             history = [
                 str(item[2] or "").strip()

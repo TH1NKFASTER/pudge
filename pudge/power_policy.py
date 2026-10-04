@@ -50,6 +50,7 @@ class PowerPolicy:
         platform: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_time: Callable[[], float] = time.time,
+        native_probe: Callable[[], tuple[bool | None, bool | None]] | None = None,
     ) -> None:
         self.manual_enabled = bool(manual_enabled)
         self.auto_enabled = bool(auto_enabled)
@@ -57,6 +58,8 @@ class PowerPolicy:
         self._platform = str(platform or sys.platform)
         self._monotonic = monotonic
         self._wall_time = wall_time
+        self._native_probe = native_probe
+        self._system_energy_saving: bool | None = None
         self._auto_latched = False
         self._cache_at = 0.0
         self._cache: PowerSnapshot | None = None
@@ -91,11 +94,26 @@ class PowerPolicy:
         )
         return str(getattr(completed, "stdout", "") or "")
 
+    @staticmethod
+    def _native_power_state() -> tuple[bool | None, bool | None]:
+        try:
+            from Foundation import NSProcessInfo
+            info = NSProcessInfo.processInfo()
+            low = bool(info.isLowPowerModeEnabled()) if hasattr(info, "isLowPowerModeEnabled") else None
+            thermal = int(info.thermalState()) >= 2 if hasattr(info, "thermalState") else None
+            return low, thermal
+        except (ImportError, AttributeError, TypeError, ValueError):
+            return None, None
+
     def _observe(self) -> tuple[bool | None, int | None, bool | None, bool]:
         if self._platform != "darwin":
             return False, None, False, True
 
         now = self._monotonic()
+        try:
+            self._system_energy_saving, native_thermal = (self._native_probe or self._native_power_state)()
+        except Exception:
+            self._system_energy_saving, native_thermal = None, None
         battery_ok = False
         thermal_ok = False
         on_battery: bool | None = None
@@ -119,14 +137,14 @@ class PowerPolicy:
             pass
 
         try:
-            thermal_text = self._run(["pmset", "-g", "therm"])
+            thermal_text = "" if native_thermal is not None else self._run(["pmset", "-g", "therm"])
             limits = [
                 int(value)
                 for value in re.findall(
                     r"(?:CPU|GPU)_Speed_Limit\s*=\s*(\d+)", thermal_text
                 )
             ]
-            thermal = bool(limits and min(limits) < 100)
+            thermal = bool(native_thermal) if native_thermal is not None else bool(limits and min(limits) < 100)
             thermal_ok = True
             self._last_good_thermal = bool(thermal)
             self._last_good_thermal_at = now
@@ -191,12 +209,15 @@ class PowerPolicy:
                 # low-battery block indefinitely.
                 self._auto_latched = False
 
-        energy_saving = self.manual_enabled or self._auto_latched
+        system_energy_saving = self.auto_enabled and bool(self._system_energy_saving)
+        energy_saving = self.manual_enabled or self._auto_latched or system_energy_saving
         reasons: list[str] = []
         if self.manual_enabled:
             reasons.append("manual")
         if self._auto_latched:
             reasons.append("low_battery")
+        if system_energy_saving:
+            reasons.append("system_low_power")
         if thermal is True:
             reasons.append("thermal")
         if stale:

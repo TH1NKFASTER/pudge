@@ -54,7 +54,7 @@ def test_noop_poll_throttles_filesystem_inbox_and_tag_cleanup(tmp_path: Path, mo
     monkeypatch.setattr("pudge.web_app.time.monotonic", lambda: 120.0)
     version = api.manager.db.get_state("ui_state_version", "")
 
-    result = api.poll_downloads_and_subtitles(version, False, True)
+    result = api._poll_downloads_and_subtitles_sync(version, False, True)
 
     assert calls == []
     assert result["stats"]["subtitle_inbox_throttled"] == 1
@@ -76,7 +76,7 @@ def test_hidden_poll_uses_longer_inbox_and_tag_cadence(tmp_path: Path, monkeypat
     monkeypatch.setattr("pudge.web_app.time.monotonic", lambda: 100.0)
     version = api.manager.db.get_state("ui_state_version", "")
 
-    api.poll_downloads_and_subtitles(version, False, False)
+    api._poll_downloads_and_subtitles_sync(version, False, False)
 
     # 90 seconds is enough for the visible cadence, but not hidden 120-second work.
     assert calls == []

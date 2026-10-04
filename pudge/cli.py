@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -25,12 +26,13 @@ from .anilist_tracking import (
 )
 from .config import DEFAULT_CONFIG_PATH, AppConfig, load_config, write_default_config
 from .branding import APP_CLI, APP_NAME
-from .database import Database
+from .database import Database, LATEST_SCHEMA_VERSION
 from .consumption import ConsumptionLedger
 from .filename import fold_search_title, normalize_title, parse_anime_filename
 from .episode_numbering import (
     aliases_from_offset,
     episode_aliases_for_hint,
+    has_external_rules,
     media_episode_from_release as shared_media_episode_from_release,
     resolve_episode_numbering,
 )
@@ -49,6 +51,7 @@ from .pipeline_cache import (
     save_final_pipeline_result,
 )
 from .player import build_mpv_command, run_mpv
+from .runtime import python_executable
 from .providers.anilist import AniListClient, AniListError
 from .providers.jimaku import JimakuClient, JimakuError, find_7zip, materialize_jimaku_files
 from .subtitle_formats import clean_srt_for_playback, convert_to_plain_srt
@@ -112,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-format", default="", help=argparse.SUPPRESS)
     parser.add_argument("--episode-hint", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--skip-airing-lookup", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--previous-candidate-outcome", default="unknown", help=argparse.SUPPRESS)
     parser.add_argument("--previous-candidate-fingerprint", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--anilist-correct",
@@ -132,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fullscreen", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-translate", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-prewarm-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-prewarm-ipc", default="", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-prewarm-from", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-study-text", default="", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-study-context", default="", help=argparse.SUPPRESS)
@@ -199,6 +204,7 @@ def _confident_raw_unsynced_candidate(
     expected_episode: int | None,
     manually_selected: bool,
     minimum_score: float,
+    alignment_result: dict[str, object] | None = None,
 ) -> SubtitleCandidate | None:
     """Return a text candidate safe to expose *raw* after sync failure.
 
@@ -206,6 +212,19 @@ def _confident_raw_unsynced_candidate(
     enough about the subtitle identity that offering it for manual mpv timing is
     preferable to hiding it completely.
     """
+    disqualified_paths: set[str] = set()
+    if isinstance(alignment_result, dict):
+        for key in ("quality_fallback_attempts", "guard_rejected_candidates"):
+            attempts = alignment_result.get(key)
+            if not isinstance(attempts, list):
+                continue
+            for attempt in attempts:
+                if not isinstance(attempt, dict) or not bool(attempt.get("raw_fallback_disqualified")):
+                    continue
+                raw_path = str(attempt.get("path") or "").strip()
+                if raw_path:
+                    disqualified_paths.add(str(Path(raw_path).expanduser().resolve()))
+
     for candidate in candidates:
         if candidate.path.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS:
             continue
@@ -213,6 +232,8 @@ def _confident_raw_unsynced_candidate(
             continue
         if manually_selected:
             return candidate
+        if str(candidate.path.expanduser().resolve()) in disqualified_paths:
+            continue
         if not candidate.verified_japanese:
             continue
         if expected_episode is None or candidate.episode != int(expected_episode):
@@ -589,8 +610,8 @@ def _run_anilist_action(args: argparse.Namespace, config: AppConfig) -> int:
         if result.get("updated"):
             print("OSD:" + _osd(
                 config,
-                f"AniList: entry {payload.episode} counted ({result.get('status') or '-'})",
-                f"AniList: серия {payload.episode} засчитана ({result.get('status') or '-'})",
+                "Entry counted",
+                "Серия засчитана",
             ))
         elif reason == "already_at_or_above":
             print("OSD:" + _osd(
@@ -784,6 +805,10 @@ def _jimaku_episode_aliases(
 ) -> tuple[int, ...]:
     if anime is None or requested_episode is None or requested_episode < 1:
         return ()
+    if has_external_rules(anime, config):
+        # Exact piecewise rules first; the single graph offset below would
+        # apply episode 1's offset to every episode.
+        return episode_aliases_for_hint(anime, int(requested_episode), config, logger, allow_network=False)
     graph_offset = _cached_relation_graph_episode_offset(anime, config)
     if graph_offset is not None:
         aliases = aliases_from_offset(anime, int(requested_episode), graph_offset)
@@ -1336,6 +1361,9 @@ def _print_sync_result(path: Path, result: dict[str, object]) -> None:
         detail = f": {result.get('error')}" if result.get("error") else ""
         print(f"Синхронизация не выполнена ({reason}){detail}")
 
+    runs = result.get("final_timing_runs")
+    if isinstance(runs, list) and runs:
+        print("Итоговые участки тайминга: " + json.dumps(runs, ensure_ascii=False))
     embedded_failure = result.get("embedded_reference_failure_reason")
     if embedded_failure:
         detail = result.get("embedded_reference_failure_error")
@@ -1818,10 +1846,10 @@ def process_video(
         previous_candidate_fingerprint = str(
             getattr(args, "previous_candidate_fingerprint", "") or ""
         ).strip()
+        from .subtitles.verification import unchanged_candidates_can_skip
         if (
             args.prepare_only
-            and previous_candidate_fingerprint
-            and candidate_fingerprint == previous_candidate_fingerprint
+            and unchanged_candidates_can_skip(previous_candidate_fingerprint, candidate_fingerprint, getattr(args, "previous_candidate_outcome", "unknown"))
             and not args.force_search
             and not args.resync
             and args.sub is None
@@ -1932,6 +1960,7 @@ def process_video(
                 float(config.matching.local_min_score),
                 float(config.matching.jimaku_min_score),
             ),
+            alignment_result=alignment_result,
         )
 
         pipeline_timer.mark("candidate_selection", selected=subtitle or "")
@@ -2148,6 +2177,15 @@ def process_video(
 
     if subtitle is None and subtitle_id is None:
         if args.prepare_only:
+            from .subtitles.verification import verification_failure
+            failure = verification_failure(alignment_result)
+            if failure and (failure["retryable"] or raw_unsynced_candidate is None):
+                metadata = {"alignment": alignment_result, "verification_failure": failure, "quality": {"accepted": False, "reason": failure["reason"]}}
+                reporter.update(SubtitleJobStage.WAITING_VERIFICATION, video=video.name, **failure)
+                print("Проверка японской речи не завершена: " + failure["reason"])
+                print("PREPARED_SUBTITLE_META=" + json.dumps(metadata, ensure_ascii=False, default=str))
+                print("PREPARE_STATUS=waiting_verification")
+                return 4
             if raw_unsynced_candidate is not None:
                 metadata = {
                     "source": raw_unsynced_candidate.source,
@@ -2160,6 +2198,8 @@ def process_video(
                     "alignment": alignment_result,
                     "quality": {"accepted": False, "reason": "couldnt_sync"},
                 }
+                if failure:
+                    metadata["verification_failure"] = failure
                 reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
                 print(
                     "Субтитры уверенно относятся к этой серии, но автоматический "
@@ -2206,6 +2246,7 @@ def process_video(
             subtitle_id=subtitle_id,
             dependency=subtitle,
             source=("ocr" if generated_by_ocr else "external" if subtitle is not None else "embedded"),
+            raw_source=(selected_candidate.path if selected_candidate is not None else None),
         )
         logger.info(
             "RESULT step=pipeline.final_cache video=%s cache=write manifest=%s subtitle=%s embedded_sid=%s",
@@ -2289,7 +2330,7 @@ def process_video(
         str(files("pudge").joinpath("mpv_scripts/pudge_anilist.lua"))
     )
     tracker_env: dict[str, str] = {
-        "PUDGE_PYTHON": sys.executable,
+        "PUDGE_PYTHON": python_executable(),
         "PUDGE_CONFIG": str(config.config_path),
         "PUDGE_UI_LANGUAGE": config.ui.language,
         "PUDGE_APP_NAME": APP_NAME,
@@ -2298,6 +2339,8 @@ def process_video(
         "PUDGE_PLAYBACK_INTERVAL": str(config.playback.save_interval_seconds),
         "PUDGE_SHORTCUT_MARK_WATCHED": config.shortcuts.mpv_mark_watched,
         "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE": config.shortcuts.mpv_translate_subtitle,
+        "PUDGE_SHORTCUT_EXPLAIN_SUBTITLE": config.shortcuts.mpv_explain_subtitle,
+        "PUDGE_LLM_CONFIGURED": "1" if config.llm.enabled and config.llm.base_url and config.llm.model else "0",
         "PUDGE_SUBTITLE_PATH": str(subtitle or ""),
     }
     if tracking_anime is not None and tracking_episode is not None and config.anilist.access_token:
@@ -2322,9 +2365,30 @@ def process_video(
             "PUDGE_ANILIST_MEDIA_ID": str(tracking_anime.id),
             "PUDGE_ANILIST_TITLE": title,
             "PUDGE_ANILIST_AUTO_UPDATE": "1" if tracking_auto else "0",
-            "PUDGE_PYTHON": sys.executable,
+            "PUDGE_PYTHON": python_executable(),
             "PUDGE_CONFIG": str(config.config_path),
         })
+
+    # OP/ED skip button: only already detected segments; never analyse here.
+    segments_file: Path | None = None
+    skip_scripts: list[Path] = []
+    if getattr(config.playback, "skip_segments_enabled", True):
+        skip_scripts.append(Path(str(files("pudge").joinpath("mpv_scripts/pudge_skip_segments.lua"))))
+        tracker_env.update({
+            "PUDGE_SHORTCUT_SKIP_SEGMENT": config.shortcuts.mpv_skip_segment,
+            "PUDGE_AUTO_SKIP_INTRO": "1" if config.playback.auto_skip_intro else "0",
+            "PUDGE_AUTO_SKIP_OUTRO": "1" if config.playback.auto_skip_outro else "0",
+        })
+        if not args.dry_run:
+            try:
+                from .intro_skipper import write_playback_session
+
+                segments_file = write_playback_session(config.paths.cache_dir, video)
+            except Exception as exc:  # noqa: BLE001 - skipping is optional
+                configure_logging().warning("FAIL step=intro_skipper.session error=%r", str(exc)[:200])
+                segments_file = None
+        if segments_file is not None:
+            tracker_env["PUDGE_SEGMENTS_FILE"] = str(segments_file)
 
     mpv_extra_args = list(config.tools.mpv_extra_args)
     try:
@@ -2362,6 +2426,11 @@ def process_video(
     if args.fullscreen and not any(arg in {"--fs", "--fullscreen"} or arg.startswith("--fs=") for arg in mpv_extra_args):
         mpv_extra_args.append("--fs")
 
+    import tempfile
+    import secrets
+    ipc_socket = Path(tempfile.gettempdir()) / f"pudge-mpv-{secrets.token_hex(10)}.sock"
+    from .mpv_assistant import llm_configured
+    tracker_env["PUDGE_LLM_CONFIGURED"] = "1" if llm_configured(config) else "0"
     command = build_mpv_command(
         config.tools.mpv,
         video,
@@ -2369,17 +2438,20 @@ def process_video(
         subtitle_id,
         mpv_extra_args,
         script=tracker_script,
+        ipc_socket=ipc_socket,
+        extra_scripts=skip_scripts,
     )
     pipeline_timer.mark("ready_to_launch", subtitle=subtitle or "", embedded_sid=subtitle_id)
     # Keep the foreground marker alive for the full mpv lifetime. Background
     # subtitle workers use it as a preemption signal; clearing it here allowed
     # the scheduled agent to start ffmpeg/ffsubsync while the user was watching.
     configure_logging().info(
-        "EVENT mpv.launch video=%s subtitle=%s embedded_sid=%s sub_fix_timing=%s",
+        "EVENT mpv.launch video=%s subtitle=%s embedded_sid=%s sub_fix_timing=%s skip_segments=%s",
         video,
         subtitle or "",
         subtitle_id,
         next((arg for arg in command if arg.startswith("--sub-fix-timing")), ""),
+        "session" if segments_file is not None else "none",
     )
     try:
         return run_mpv(
@@ -2389,9 +2461,15 @@ def process_video(
             focus=args.fullscreen,
         )
     finally:
+        ipc_socket.unlink(missing_ok=True)
         if tracking_file is not None and not args.dry_run:
             try:
                 tracking_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if segments_file is not None:
+            try:
+                segments_file.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -2495,7 +2573,51 @@ def doctor(config: AppConfig) -> int:
     return status
 
 
+def _repair_episode_identity(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog=f"{APP_CLI} repair-episode-identity", description="Review a local file identity repair, then explicitly apply the saved plan. Close playback before applying.")
+    parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument("--apply-plan", type=Path, help="Apply a previously reviewed JSON plan; creates a database backup")
+    parser.add_argument("--plan-file", type=Path, help="Write a read-only repair plan for review")
+    parser.add_argument("--video", type=Path)
+    parser.add_argument("--torrent-hash")
+    for name in ("media-id", "expected-media-episode", "media-episode", "release-episode"):
+        parser.add_argument("--" + name, type=int)
+    parser.add_argument("--migrate-history", action="store_true", help="Relabel the single watch-history entry of this file to the corrected episode (shown in the plan)")
+    args = parser.parse_args(argv)
+    database_path = args.database.expanduser().resolve()
+    try:
+        if not database_path.is_file():
+            raise ValueError("The selected database does not exist")
+        # Do not initialize/migrate a user's database as a side effect of a dry-run.
+        with sqlite3.connect(f"{database_path.as_uri()}?mode=ro", uri=True) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] != LATEST_SCHEMA_VERSION:
+                raise ValueError("Open the current app once to migrate this database before repairing")
+        db = Database(database_path, initialize=False)
+        if args.apply_plan:
+            if args.plan_file or args.video or args.torrent_hash or args.migrate_history or any(getattr(args, name) is not None for name in ("media_id", "expected_media_episode", "media_episode", "release_episode")):
+                parser.error("--apply-plan must be used without dry-run parameters")
+            plan = json.loads(args.apply_plan.read_text(encoding="utf-8"))
+            result = db.apply_episode_identity_repair(plan)
+        else:
+            required = ("plan_file", "video", "torrent_hash", "media_id", "expected_media_episode", "media_episode", "release_episode")
+            if any(getattr(args, name) is None for name in required):
+                parser.error("dry-run requires --plan-file, --video, --torrent-hash and all episode identity parameters")
+            result = db.plan_episode_identity_repair(args.torrent_hash, args.video, media_id=args.media_id, expected_media_episode=args.expected_media_episode, media_episode=args.media_episode, release_episode=args.release_episode, migrate_history=args.migrate_history)
+            # A reviewed plan must not be silently overwritten by a fresh snapshot.
+            with args.plan_file.open("x", encoding="utf-8") as stream:
+                json.dump(result, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if result.get("conflicts") else 0
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        print(f"Identity repair failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    command_args = list(sys.argv[1:] if argv is None else argv)
+    if command_args and command_args[0] == "repair-episode-identity":
+        return _repair_episode_identity(command_args[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -2545,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
             ).prewarm_file(
                 args.subtitle_prewarm_file,
                 start_seconds=args.subtitle_prewarm_from,
+                ipc_socket=args.subtitle_prewarm_ipc or None,
             )
         except Exception as exc:
             print(f"Subtitle translation prewarm failed: {exc}", file=sys.stderr)

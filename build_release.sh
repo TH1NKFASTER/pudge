@@ -26,11 +26,12 @@ PY
 )
 
 rm -rf build dist pudge.egg-info
-find pudge tests -type d -name __pycache__ -prune -exec rm -rf {} +
+find pudge tests .github/release -type d -name __pycache__ -prune -exec rm -rf {} +
+python .github/release/write_build_info.py pudge "$VERSION"
 if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
   python -m pytest -q
 fi
-find pudge tests -type d -name __pycache__ -prune -exec rm -rf {} +
+find pudge tests .github/release -type d -name __pycache__ -prune -exec rm -rf {} +
 python -m pip wheel . --no-deps --no-build-isolation -w dist
 command -v uv >/dev/null 2>&1 || { echo "uv is required to build a release" >&2; exit 1; }
 uv lock --check
@@ -39,21 +40,21 @@ uv export --locked --extra sync --no-dev --no-emit-project --format requirements
 STAGE="$PROJECT_DIR/dist/release/$APP_SLUG"
 rm -rf "$PROJECT_DIR/dist/release"
 mkdir -p "$STAGE" "$STAGE/.github"
-cp -R pudge tests docs scripts "$STAGE/"
-cp -R .github/workflows "$STAGE/.github/"
-cp install.sh README.md config.example.toml pyproject.toml build_release.sh Makefile MOBILE_SYNC_PROTOCOL.md \
-  LICENSE SECURITY.md CONTRIBUTING.md DEVELOPMENT.md RELEASING.md CHANGELOG.md uv.lock "$STAGE/"
+cp -R pudge tests "$STAGE/"
+cp -R .github/workflows .github/release "$STAGE/.github/"
+cp install.sh README.md config.example.toml pyproject.toml build_release.sh Makefile \
+  LICENSE SECURITY.md CONTRIBUTING.md CHANGELOG.md uv.lock "$STAGE/"
 cp "dist/pudge-${VERSION}-py3-none-any.whl" "$STAGE/"
 cp "dist/release-requirements.txt" "$STAGE/"
-chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh" "$STAGE/scripts/migrations/legacy_anime_mpv.py"
-python scripts/check_release_bundle.py "$STAGE"
+chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh" "$STAGE/pudge/legacy_install.py"
+python .github/release/check_release_bundle.py "$STAGE"
 
 (
   cd "$PROJECT_DIR/dist/release"
-  zip -qr "../${APP_SLUG}-macos-v${VERSION}.zip" "$APP_SLUG"
+  zip -qr "../${VERSION}.zip" "$APP_SLUG"
 )
 
-ARCHIVE="$PROJECT_DIR/dist/${APP_SLUG}-macos-v${VERSION}.zip"
-shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+ARCHIVE="$PROJECT_DIR/dist/${VERSION}.zip"
+python .github/release/finish_release_archives.py "$ARCHIVE" "$APP_SLUG-macos-v${VERSION}.zip"
 
 echo "$ARCHIVE"

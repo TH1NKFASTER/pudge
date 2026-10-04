@@ -33,6 +33,13 @@ class UIConfig:
     review_gate_enabled: bool = False
     review_gate_count: int = 5
     review_gate_all_due_episode_words: bool = False
+    review_gate_ln_enabled: bool = False
+    review_gate_ln_all_due: bool = False
+    review_gate_ln_count: int = 5
+    review_gate_manga_enabled: bool = False
+    review_gate_manga_all_due: bool = False
+    review_gate_manga_count: int = 5
+    sidebar_review_interval: str = ""
 
 
 @dataclass(slots=True)
@@ -103,6 +110,10 @@ class NyaaConfig:
     upgrade_min_score_gain: float = 30.0
     upgrade_check_hours: float = 24.0
     max_upgrade_checks_per_run: int = 2
+    # SeaDex (releases.moe) recommendations in interactive release search.
+    seadex_enabled: bool = True
+    seadex_timeout_seconds: float = 3.0
+    seadex_cache_hours: float = 24.0
 
 
 @dataclass(slots=True)
@@ -152,6 +163,23 @@ class PlaybackConfig:
     enabled: bool = True
     rewind_seconds: float = 15.0
     save_interval_seconds: float = 30.0
+    # Local OP/ED detection from audio fingerprints (background, low priority).
+    intro_detection_enabled: bool = True
+    # Skip button in mpv for detected OP/ED; automatic skipping is opt-in.
+    skip_segments_enabled: bool = True
+    auto_skip_intro: bool = False
+    auto_skip_outro: bool = False
+
+
+_RESERVED_MPV_SHORTCUTS = {"ctrl+a", "ctrl+t", "meta+shift+l"}
+
+
+def _skip_shortcut(value: object) -> str:
+    """The skip key must not take over Pudge's own mpv bindings."""
+    text = str(value or "").strip()
+    if text.casefold() in _RESERVED_MPV_SHORTCUTS:
+        return "Tab"
+    return text
 
 
 @dataclass(slots=True)
@@ -161,6 +189,9 @@ class ShortcutsConfig:
     # focuses Planning search. Only mpv bindings are user-configurable.
     mpv_mark_watched: str = "Ctrl+a"
     mpv_translate_subtitle: str = "Ctrl+t"
+    mpv_explain_subtitle: str = "Ctrl+Shift+t"
+    # Active only while the skip button is visible (inside an OP/ED).
+    mpv_skip_segment: str = "Tab"
 
 
 @dataclass(slots=True)
@@ -227,6 +258,7 @@ class AniListConfig:
 
 @dataclass(slots=True)
 class LLMConfig:
+    profiles: dict[str, dict[str, str]] = field(default_factory=dict)
     enabled: bool = False
     provider: str = "ollama"
     base_url: str = "http://127.0.0.1:11434"
@@ -237,6 +269,9 @@ class LLMConfig:
     keep_alive: str = "10m"
     temperature: float = 0.0
     reasoning_effort: str = "low"
+    # Reading assistant (grammar + chat): answers are interactive, so keep
+    # reasoning low by default independently of translation/subtitle work.
+    assistant_reasoning_effort: str = "low"
     num_ctx: int = 8192
     timeout_seconds: float = 90.0
     # Subtitle processing is deterministic by default. The local LLM remains
@@ -400,6 +435,12 @@ def load_config(path: Path | None = None) -> AppConfig:
     jimaku = _section(raw, "jimaku")
     anilist = _section(raw, "anilist")
     llm = _section(raw, "llm")
+    llm_profiles = {}
+    for protocol, profile in (llm.get("profiles") or {}).items():
+        if protocol in {"ollama", "openai"} and isinstance(profile, dict):
+            llm_profiles[protocol] = {"url":str(profile.get("url") or ""), "model":str(profile.get("model") or ""),
+                "api_key":_SECRET_STORE.resolve("llm-profile-"+protocol,profile.get("api_key", ""),use_keychain=use_keychain)}
+
     matching = _section(raw, "matching")
     sync = _section(raw, "sync")
 
@@ -414,6 +455,13 @@ def load_config(path: Path | None = None) -> AppConfig:
             review_gate_enabled=bool(ui.get("review_gate_enabled", False)),
             review_gate_count=max(1, min(50, int(ui.get("review_gate_count", 5)))),
             review_gate_all_due_episode_words=bool(ui.get("review_gate_all_due_episode_words", False)),
+            review_gate_ln_enabled=bool(ui.get("review_gate_ln_enabled", False)),
+            review_gate_ln_all_due=bool(ui.get("review_gate_ln_all_due", False)),
+            review_gate_ln_count=max(1, min(50, int(ui.get("review_gate_ln_count", 5)))),
+            review_gate_manga_enabled=bool(ui.get("review_gate_manga_enabled", False)),
+            review_gate_manga_all_due=bool(ui.get("review_gate_manga_all_due", False)),
+            review_gate_manga_count=max(1, min(50, int(ui.get("review_gate_manga_count", 5)))),
+            sidebar_review_interval=str(ui.get("sidebar_review_interval", "")),
         ),
         paths=PathsConfig(
             download_dirs=_load_watched_media_dirs(paths),
@@ -471,6 +519,9 @@ def load_config(path: Path | None = None) -> AppConfig:
             upgrade_min_score_gain=30.0,
             upgrade_check_hours=float(nyaa.get("upgrade_check_hours", 24.0)),
             max_upgrade_checks_per_run=int(nyaa.get("max_upgrade_checks_per_run", 2)),
+            seadex_enabled=bool(nyaa.get("seadex_enabled", True)),
+            seadex_timeout_seconds=max(0.5, min(10.0, float(nyaa.get("seadex_timeout_seconds", 3.0)))),
+            seadex_cache_hours=max(1.0, float(nyaa.get("seadex_cache_hours", 24.0))),
         ),
         qbittorrent=QBittorrentConfig(
             enabled=bool(qbittorrent.get("enabled", False)),
@@ -523,10 +574,16 @@ def load_config(path: Path | None = None) -> AppConfig:
             enabled=True,
             rewind_seconds=10.0,
             save_interval_seconds=max(10.0, float(playback.get("save_interval_seconds", 30.0))),
+            intro_detection_enabled=bool(playback.get("intro_detection_enabled", True)),
+            skip_segments_enabled=bool(playback.get("skip_segments_enabled", True)),
+            auto_skip_intro=bool(playback.get("auto_skip_intro", False)),
+            auto_skip_outro=bool(playback.get("auto_skip_outro", False)),
         ),
         shortcuts=ShortcutsConfig(
             mpv_mark_watched=str(shortcuts.get("mpv_mark_watched", "Ctrl+a")).strip(),
+            mpv_explain_subtitle=str(shortcuts.get("mpv_explain_subtitle", "Ctrl+Shift+t")).strip(),
             mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
+            mpv_skip_segment=_skip_shortcut(shortcuts.get("mpv_skip_segment", "Tab")),
         ),
         diagnostics=DiagnosticsConfig(
             # Always-on, low-overhead diagnostics. Kept out of Settings UI.
@@ -592,12 +649,13 @@ def load_config(path: Path | None = None) -> AppConfig:
             relations_by_release_date=bool(anilist.get("relations_by_release_date", True)),
         ),
         llm=LLMConfig(
+            profiles=llm_profiles,
             enabled=bool(llm.get("enabled", False)),
             provider=str(llm.get("provider", "ollama")).strip().lower() or "ollama",
             base_url=str(llm.get("base_url", "http://127.0.0.1:11434")).rstrip("/"),
             api_key=_SECRET_STORE.resolve(
-                "llm-api-key",
-                llm.get("api_key", ""),
+                "llm-profile-"+str(llm.get("provider", "ollama")) if str(llm.get("provider", "ollama")) in llm_profiles else "llm-api-key",
+                llm_profiles.get(str(llm.get("provider", "ollama")), {}).get("api_key", llm.get("api_key", "")),
                 env="PUDGE_LLM_API_KEY",
                 use_keychain=use_keychain,
             ),
@@ -607,6 +665,7 @@ def load_config(path: Path | None = None) -> AppConfig:
             keep_alive=str(llm.get("keep_alive", "10m")),
             temperature=float(llm.get("temperature", 0.0)),
             reasoning_effort=str(llm.get("reasoning_effort", "low")).strip().lower() or "low",
+            assistant_reasoning_effort=str(llm.get("assistant_reasoning_effort", "low")).strip().lower() or "low",
             num_ctx=int(llm.get("num_ctx", 8192)),
             timeout_seconds=float(llm.get("timeout_seconds", 90.0)),
             validate_embedded_reference=bool(llm.get("subtitle_semantic_checks", False)),
@@ -804,6 +863,15 @@ def write_config(config: AppConfig, destination: Path | None = None) -> Path:
     llm_api_key = _SECRET_STORE.persisted_config_value(
         "llm-api-key", config.llm.api_key, use_keychain=use_keychain
     )
+    profiles = dict(config.llm.profiles)
+    profiles[config.llm.provider] = {"url":config.llm.base_url,"model":config.llm.model,"api_key":config.llm.api_key}
+    profile_sections = []
+    for protocol, profile in profiles.items():
+        if protocol not in {"ollama", "openai"}: continue
+        key = str(profile.get("api_key") or "")
+        persisted = _SECRET_STORE.persisted_config_value("llm-profile-"+protocol,key,use_keychain=use_keychain)
+        profile_sections.append(f"[llm.profiles.{protocol}]\nurl = {_toml_string(profile.get('url',''))}\nmodel = {_toml_string(profile.get('model',''))}\napi_key = {_toml_string(persisted)}\n")
+    profile_text = "\n".join(profile_sections)
     text = f'''[ui]
 language = {_toml_string(config.ui.language)}
 onboarding_completed = {_toml_bool(config.ui.onboarding_completed)}
@@ -814,6 +882,13 @@ jiten_developer_tools_confirmed = {_toml_bool(config.ui.jiten_developer_tools_co
 review_gate_enabled = {_toml_bool(config.ui.review_gate_enabled)}
 review_gate_count = {max(1, min(50, int(config.ui.review_gate_count)))}
 review_gate_all_due_episode_words = {_toml_bool(config.ui.review_gate_all_due_episode_words)}
+review_gate_ln_enabled = {_toml_bool(config.ui.review_gate_ln_enabled)}
+review_gate_ln_all_due = {_toml_bool(config.ui.review_gate_ln_all_due)}
+review_gate_ln_count = {max(1, min(50, int(config.ui.review_gate_ln_count)))}
+review_gate_manga_enabled = {_toml_bool(config.ui.review_gate_manga_enabled)}
+review_gate_manga_all_due = {_toml_bool(config.ui.review_gate_manga_all_due)}
+review_gate_manga_count = {max(1, min(50, int(config.ui.review_gate_manga_count)))}
+sidebar_review_interval = {_toml_string(config.ui.sidebar_review_interval)}
 
 [paths]
 watched_media_dirs = {_toml_string_list(config.paths.download_dirs)}
@@ -859,6 +934,9 @@ auto_upgrade_downloaded = {_toml_bool(config.nyaa.auto_upgrade_downloaded)}
 upgrade_min_score_gain = {config.nyaa.upgrade_min_score_gain}
 upgrade_check_hours = {config.nyaa.upgrade_check_hours}
 max_upgrade_checks_per_run = {config.nyaa.max_upgrade_checks_per_run}
+seadex_enabled = {_toml_bool(config.nyaa.seadex_enabled)}
+seadex_timeout_seconds = {config.nyaa.seadex_timeout_seconds}
+seadex_cache_hours = {config.nyaa.seadex_cache_hours}
 
 [qbittorrent]
 enabled = {_toml_bool(config.qbittorrent.enabled)}
@@ -898,10 +976,16 @@ keep_batch_until_completed = {_toml_bool(config.agent.keep_batch_until_completed
 enabled = {_toml_bool(config.playback.enabled)}
 rewind_seconds = {config.playback.rewind_seconds}
 save_interval_seconds = {config.playback.save_interval_seconds}
+intro_detection_enabled = {_toml_bool(config.playback.intro_detection_enabled)}
+skip_segments_enabled = {_toml_bool(config.playback.skip_segments_enabled)}
+auto_skip_intro = {_toml_bool(config.playback.auto_skip_intro)}
+auto_skip_outro = {_toml_bool(config.playback.auto_skip_outro)}
 
 [shortcuts]
 mpv_mark_watched = {_toml_string(config.shortcuts.mpv_mark_watched)}
+mpv_explain_subtitle = {_toml_string(config.shortcuts.mpv_explain_subtitle)}
 mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
+mpv_skip_segment = {_toml_string(config.shortcuts.mpv_skip_segment)}
 
 [diagnostics]
 energy_monitoring_enabled = {_toml_bool(config.diagnostics.energy_monitoring_enabled)}
@@ -958,6 +1042,7 @@ think = {_toml_bool(config.llm.think)}
 keep_alive = {_toml_string(config.llm.keep_alive)}
 temperature = {config.llm.temperature}
 reasoning_effort = {_toml_string(config.llm.reasoning_effort)}
+assistant_reasoning_effort = {_toml_string(config.llm.assistant_reasoning_effort)}
 num_ctx = {config.llm.num_ctx}
 timeout_seconds = {config.llm.timeout_seconds}
 subtitle_semantic_checks = {_toml_bool(config.llm.validate_embedded_reference)}
@@ -965,6 +1050,7 @@ embedded_reference_sample_count = {config.llm.embedded_reference_sample_count}
 embedded_reference_phrases_per_sample = {config.llm.embedded_reference_phrases_per_sample}
 embedded_reference_min_similarity = {config.llm.embedded_reference_min_similarity}
 
+{profile_text}
 [matching]
 local_min_score = {config.matching.local_min_score}
 jimaku_min_score = {config.matching.jimaku_min_score}

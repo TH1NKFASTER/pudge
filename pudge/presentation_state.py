@@ -130,6 +130,8 @@ def derive_episode_presentation(
             "ready": False,
             "action_code": action_code,
         }
+    if local_exists and str(_value(action_job, "stage", "")) == "waiting_verification":
+        return {"status": "waiting_verification", "ready": False, "action_code": action_code}
     if local_exists and local_state == "waiting_text_subtitles":
         return {
             "status": "waiting_text_subtitles",

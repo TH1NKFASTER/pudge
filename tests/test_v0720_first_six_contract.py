@@ -26,7 +26,7 @@ def test_ln_auto_download_is_advanced_and_default_false_contract() -> None:
 
 
 def test_transport_edge_precedes_slow_verification() -> None:
-    toggle = HTML[HTML.index("async function toggleLnPairedPlayback(){"):HTML.index("async function openLightNovel(bookId)")]
+    toggle = HTML[HTML.index("async function toggleLnPairedPlayback(){"):HTML.index("async function openLightNovel(")]
     assert "lnPairedTransportEdgePromise" in toggle
     assert "audiobook_set_paused(Number(live.audiobook_id),!wanted)" in toggle
     assert toggle.index("audiobook_set_paused(Number(live.audiobook_id),!wanted)") < toggle.index("light_novel_paired_state")

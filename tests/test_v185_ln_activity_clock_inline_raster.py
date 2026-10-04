@@ -81,9 +81,11 @@ def test_frontend_activity_clock_uses_vad_for_every_lookahead_segment() -> None:
     fn = html.split("function lnPairedOffsetAtTime", 1)[1].split(
         "function lnPairedResetWordProgress", 1
     )[0]
-    assert "lnPairedSpeechRatioRange(anchor,left.time,right.time,value)" in fn
-    assert "value>=windowRight" not in fn
-    assert "value<=windowLeft" not in fn
+    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
+    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
+    assert "shared.offsetAtTime(state||{},Number(time))" in fn
+    clock = (ROOT / "pudge" / "web" / "paired_audio_clock.js").read_text(encoding="utf-8")
+    assert "activityDuration(anchor.activity, left.time, time) / duration" in clock
 
     render = html.split("function renderLnPairedPosition", 1)[1].split(
         "function cancelLnPairedInterpolation", 1

@@ -118,14 +118,14 @@ def test_v11_database_migrates_weekly_rule_to_v12(tmp_path: Path) -> None:
 
     db = Database(path)
     with db.connect() as migrated:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION == 12
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION >= 12
         row = migrated.execute("SELECT * FROM personal_release_schedules WHERE anime_id=42").fetchone()
         assert row["rule_version"] == 1
         assert row["interval_unit"] == "weeks"
         assert row["interval_every"] == 1
         assert row["interval_clock"] == "wall"
         assert row["cycle_id"] == 1
-    assert path.with_name(f"{path.name}.pre-v12.backup").exists()
+    assert path.with_name(f"{path.name}.pre-v{LATEST_SCHEMA_VERSION}.backup").exists()
 
 
 def test_custom_rule_persists_and_revision_prevents_lost_update(tmp_path: Path) -> None:

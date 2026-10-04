@@ -22,6 +22,7 @@ function episodePresentationStatus(a,episode){
     if(a?.download)return compactDownloadStatus(a.download);
     return episode!==null?t('label.episodeNotReady',{episode}):t('label.notReady');
   }
+  if(p.status==='waiting_verification')return ui.lang==='ru'?'Ожидание проверки японской речи':'Waiting for Japanese speech verification';
   if(p.status==='needs_action')return ui.lang==='ru'?'Требуется действие':'Action required';
   if(p.status==='couldnt_sync')return ui.lang==='ru'?"Couldn't sync — можно смотреть сырые":'Couldn\'t sync — raw subtitles available';
   if(p.status==='waiting_text_subtitles')return t('label.waitingTextSubs');

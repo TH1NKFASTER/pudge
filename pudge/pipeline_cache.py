@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import AppConfig
 
-_CACHE_SCHEMA = "final-pipeline-v10"
+_CACHE_SCHEMA = "final-pipeline-v13-ass-geometry-speech-recovery"
 _DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 
 
@@ -108,9 +108,28 @@ def load_final_pipeline_result(
         dependency = payload.get("dependency")
         if dependency is not None and not _snapshot_valid(dependency):
             return None
+        if not _guard_still_valid(payload, subtitle_path):
+            invalidate_final_pipeline_result(video, config)
+            return None
     elif subtitle_id is None:
         return None
     return payload
+
+
+def _guard_still_valid(payload: dict[str, object], subtitle_path: Path) -> bool:
+    """A cached result written before the current alignment guard is re-checked."""
+    from .alignment_guard import GUARD_VERSION, validate_alignment_output, validate_final_standalone
+
+    if payload.get("alignment_guard_version") == GUARD_VERSION:
+        return True
+    if subtitle_path.suffix.casefold() != ".srt" or str(payload.get("source") or "") == "embedded":
+        return True
+    raw = str(payload.get("raw_source") or "").strip()
+    if raw and Path(raw).is_file() and Path(raw).resolve() != subtitle_path.resolve():
+        verdict = validate_alignment_output(Path(raw), subtitle_path)
+    else:
+        verdict = validate_final_standalone(subtitle_path)
+    return verdict.get("status") != "rejected"
 
 
 def final_pipeline_cache_available(video: Path, config: AppConfig) -> bool:
@@ -128,6 +147,7 @@ def save_final_pipeline_result(
     subtitle_id: int | None,
     dependency: Path | None = None,
     source: str = "",
+    raw_source: Path | None = None,
 ) -> Path:
     manifest = _manifest_path(video, config)
     manifest.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +159,8 @@ def save_final_pipeline_result(
         "subtitle_id": subtitle_id,
         "dependency": _path_snapshot(dependency),
         "source": source,
+        "raw_source": str(raw_source) if raw_source is not None else "",
+        "alignment_guard_version": _guard_version(),
     }
     temporary = manifest.with_suffix(".tmp")
     temporary.write_text(
@@ -147,6 +169,12 @@ def save_final_pipeline_result(
     )
     temporary.replace(manifest)
     return manifest
+
+
+def _guard_version() -> str:
+    from .alignment_guard import GUARD_VERSION
+
+    return GUARD_VERSION
 
 
 def invalidate_final_pipeline_result(video: Path, config: AppConfig) -> None:

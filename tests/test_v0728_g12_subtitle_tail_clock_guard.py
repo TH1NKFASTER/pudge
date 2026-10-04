@@ -65,7 +65,7 @@ def test_g12_short_ambiguous_tail_does_not_guess() -> None:
     assert len(segments) == 2 and boundaries == [1216.0]
 
 
-def test_g12_alignment_cache_signature_changes(tmp_path: Path) -> None:
+def test_g12_alignment_cache_signature_changes(tmp_path: Path, monkeypatch) -> None:
     source = [(20 + index * 4.0, 21.3 + index * 4.0 + index % 3 * .25, str(index)) for index in range(80)]
     japanese = tmp_path / "ja.srt"
     english = tmp_path / "en.srt"
@@ -73,5 +73,10 @@ def test_g12_alignment_cache_signature_changes(tmp_path: Path) -> None:
     write_srt([(start + 7.5, end + 7.5, text) for start, end, text in source], english, preserve_order=True)
     output, report = align_subtitle_timelines(japanese, english, tmp_path, force=True)
     assert report["accepted"] is True
-    assert report["timeline_algorithm"] == "timeline-v6.19-edge-zones-audio-verify"
+    from pudge.subtitles import timeline_alignment
+    assert report["timeline_algorithm"] == timeline_alignment._ALGORITHM_VERSION
+    assert report["timeline_algorithm"] != "timeline-v6.19-edge-zones-audio-verify"
+    monkeypatch.setattr(timeline_alignment, "_ALGORITHM_VERSION", "timeline-v6.19-edge-zones-audio-verify")
+    old_output, _old_report = align_subtitle_timelines(japanese, english, tmp_path)
+    assert old_output != output
     assert abs(parse_srt(output)[-1][0] - source[-1][0] - 7.5) <= 1.0

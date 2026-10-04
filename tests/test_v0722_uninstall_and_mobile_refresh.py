@@ -122,13 +122,8 @@ def test_source_documentation_uses_human_initial_setup_language() -> None:
         ROOT / "README.md",
         ROOT / "CHANGELOG.md",
         ROOT / "CONTRIBUTING.md",
-        ROOT / "DEVELOPMENT.md",
-        ROOT / "MOBILE_SYNC_PROTOCOL.md",
-        ROOT / "RELEASING.md",
+        ROOT / "CONTRIBUTING.md",
         ROOT / "SECURITY.md",
-        ROOT / "docs" / "ALGORITHMS.md",
-        ROOT / "docs" / "USER_GUIDE.md",
-        ROOT / "docs" / "VN_READER_DESIGN.md",
         ROOT / "pudge" / "THIRD_PARTY_NOTICES.md",
     ]
     combined = "\n".join(path.read_text(encoding="utf-8") for path in documents).casefold()

@@ -96,13 +96,17 @@ def test_study_card_starts_at_old_width_and_can_expand_to_long_term_limit() -> N
         ".pudge-study-card{width:min(var(--pudge-study-width,440px),calc(100vw - 24px));"
         "max-width:min(620px,calc(100vw - 24px))"
     ) in css
+    # Plan §10: the headword wraps inside its bounded column instead of
+    # overflowing under the ↗/★/action controls; width stays 440..620.
     assert (
-        ".pudge-study-term{min-width:0;flex:1;padding-top:0;font-size:25px;"
-        "font-weight:700;line-height:1.15;white-space:nowrap;"
-        "overflow-wrap:normal;word-break:keep-all}"
+        ".pudge-study-term{min-width:0;flex:0 1 auto;padding-top:0;font-size:25px;"
+        "font-weight:700;line-height:1.15;white-space:normal;"
+        "overflow-wrap:anywhere;word-break:normal}"
     ) in css
     assert "function sizeStudyCard(el)" in js
-    assert "Math.max(440, Math.min(620, required))" in js
+    assert "const STUDY_CARD_MIN_WIDTH = 440;" in js
+    assert "const STUDY_CARD_MAX_WIDTH = 620;" in js
+    assert "Math.max(STUDY_CARD_MIN_WIDTH, Math.min(STUDY_CARD_MAX_WIDTH, required))" in js
     assert "sizeStudyCard(pop);" in js
     # Small windows remain usable instead of overflowing off-screen.
     assert (

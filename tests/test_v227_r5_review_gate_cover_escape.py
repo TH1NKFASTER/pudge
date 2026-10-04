@@ -316,4 +316,6 @@ def test_manga_cover_placeholder_waits_for_successful_decode() -> None:
     assert "coverLoadInflight" in source
     assert "COVER_DECODE_TIMEOUT_MS = 8000" in source
     assert "Promise.race([load, timeout])" in source
-    assert "if (!ready || expectedSignature !== libraryRenderSignature) return;" in source
+    # The shared cover painter checks that its render (grid or volumes panel) is still current.
+    assert "if (!ready || !stillCurrent()) return;" in source
+    assert "paintLibraryCovers(root, books, () => renderSignature === libraryRenderSignature);" in source

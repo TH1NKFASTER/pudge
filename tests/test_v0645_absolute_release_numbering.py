@@ -216,8 +216,8 @@ def test_jojo_stage_accepts_s06e02_as_absolute_episode_two() -> None:
         (2,),
     )
 
-def test_jojo_real_graph_keeps_short_stage_alias_before_franchise_absolute() -> None:
-    """The real JoJo graph continues into Stone Ocean; SBR must still expose E02."""
+def test_jojo_real_graph_limits_release_numbering_to_steel_ball_run() -> None:
+    """The related Stone Ocean arc has a separate release numbering scale."""
     from pudge.episode_numbering import episode_numbering_from_graph
 
     anime = LibraryAnime(
@@ -266,9 +266,9 @@ def test_jojo_real_graph_keeps_short_stage_alias_before_franchise_absolute() -> 
     result = episode_numbering_from_graph(graph, anime, 1)
 
     assert result is not None
-    assert result.release_episode == 28
-    assert result.aliases == (2, 28)
-    assert result.chain == (146722, 190327, 210482)
+    assert result.release_episode == 2
+    assert result.aliases == (2,)
+    assert result.chain == (190327, 210482)
 
 
 def test_normal_previous_season_does_not_create_near_stage_alias() -> None:

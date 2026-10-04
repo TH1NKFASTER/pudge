@@ -19,6 +19,64 @@ def _candidate_context(result: Mapping[str, Any]) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def unresolved_early_edit(result: Mapping[str, Any]) -> bool:
+    """A detected early source edit that the final transform cannot express.
+
+    The subtitle timeline flagged an early clock change for audio
+    verification, but the final result is a single constant shift and no
+    opening-clock scaffold restored the alternate clock.  A strong full-episode
+    score must not hide that the opening is on the wrong clock
+    (Hyakkano S03E12: ~10 s early for the first dialogue).
+    """
+    risk = result.get("timeline_early_edit_audio_verification")
+    if not isinstance(risk, Mapping) or not risk.get("required"):
+        return False
+    scaffold = result.get("embedded_opening_clock_scaffold")
+    if isinstance(scaffold, Mapping) and scaffold.get("applied"):
+        return False
+    plateau = result.get("stt_opening_plateau_refinement")
+    if (isinstance(plateau, Mapping) and plateau.get("applied")
+            and plateau.get("sparse_consensus_accepted")
+            and not result.get("alignment_output_rejected")):
+        return False
+    engine = str(result.get("engine") or "")
+    if "timeline" in engine and "alass" not in engine:
+        return False  # piecewise timeline output keeps both clocks
+    distinct = result.get("alass_distinct_shifts")
+    try:
+        return distinct is not None and int(distinct) <= 1
+    except (TypeError, ValueError):
+        return False
+
+
+def unverified_timeline_edit(result: Mapping[str, Any]) -> bool:
+    if result.get("unverified_timeline_edit"):
+        return True
+    risk = result.get("timeline_early_edit_audio_verification")
+    if not isinstance(risk, Mapping) or not risk.get("required"):
+        return False
+    if "timeline" not in str(result.get("engine") or ""):
+        return False
+    proof = result.get("embedded_timeline_audio_verification")
+    if isinstance(proof, Mapping) and proof.get("accepted"):
+        return False
+    for key in ("embedded_opening_clock_scaffold", "opening_plateau_refinement"):
+        proof = result.get(key)
+        if isinstance(proof, Mapping) and proof.get("applied"):
+            return False
+    speech = result.get("speech_verification")
+    if isinstance(speech, Mapping):
+        attempts = speech.get("attempts")
+        if (speech.get("accepted") or (speech.get("engine") and speech.get("sync_was_successful") is not False)
+                or (isinstance(attempts, list) and any(isinstance(row, Mapping) and row.get("accepted") for row in attempts))):
+            return False
+        guard = result.get("unsafe_stt_map")
+        if (speech.get("reason") == "stt_alass_no_safe_map" and isinstance(guard, Mapping)
+                and guard.get("reason") == "strong_embedded_timeline_after_unsafe_stt"):
+            return False
+    return True
+
+
 def quality_from_result(
     result: Mapping[str, Any],
     *,
@@ -67,12 +125,13 @@ def quality_from_result(
         activity = 12.0
 
     repair = result.get("reference_piecewise_repair")
-    holdout = None
-    if isinstance(repair, Mapping):
-        raw = repair.get("holdout_p95_seconds")
-        holdout = _number(raw, default=float("nan")) if raw is not None else None
-        if holdout is not None and not math.isfinite(holdout):
-            holdout = None
+    holdouts = []
+    for payload in (result, repair):
+        if isinstance(payload, Mapping) and payload.get("holdout_p95_seconds") is not None:
+            value = _number(payload["holdout_p95_seconds"], default=float("nan"))
+            if math.isfinite(value):
+                holdouts.append(value)
+    holdout = max(holdouts) if holdouts else None
     score = max(0.0, min(100.0, identity + timing + structure + activity))
     if not accepted:
         score = min(score, 39.0)
@@ -85,6 +144,10 @@ def quality_from_result(
         confidence = AlignmentConfidence.B
     else:
         confidence = AlignmentConfidence.C
+    flags: list[str] = []
+    if accepted and (unresolved_early_edit(result) or unverified_timeline_edit(result)):
+        flags.append("unresolved_early_edit")
+        confidence = AlignmentConfidence.C
     return SubtitleQuality(
         score=round(score, 3),
         confidence=confidence,
@@ -95,4 +158,5 @@ def quality_from_result(
         structure_score=round(structure, 3),
         activity_score=round(activity, 3),
         holdout_p95_seconds=holdout,
+        flags=flags,
     )

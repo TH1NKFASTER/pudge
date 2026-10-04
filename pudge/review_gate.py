@@ -25,6 +25,20 @@ class EpisodeReviewIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class ContentReviewIdentity:
+    kind: str
+    content_id: str
+    revision: str
+    part: int
+
+    @property
+    def logical_id(self) -> str:
+        import hashlib
+        return hashlib.sha256(json.dumps([self.kind, self.content_id, self.revision, self.part],
+                                        separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewGateProgress:
     required: int
     confirmed_card_keys: tuple[str, ...]
@@ -145,6 +159,12 @@ class ReviewGateStore:
             "unknown_card_keys": unknown,
             "granted": bool(data.get("granted")),
         }
+
+    def clear_unearned_grant(self, account_key: str, identity: ContentReviewIdentity) -> None:
+        """Recheck content previously allowed by an empty due-word snapshot."""
+        before = self.snapshot(account_key, identity)
+        if before["granted"] and not before["confirmed_card_keys"] and not before["unknown_card_keys"]:
+            self._state.set_state(_state_key(account_key, identity, self._prefix), "")
 
     def grant(
         self,

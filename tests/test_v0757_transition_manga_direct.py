@@ -31,7 +31,8 @@ def test_audiobook_pause_uses_explicit_mpv_property(tmp_path: Path, monkeypatch)
 def test_live_player_resume_keeps_player_but_forced_reader_start_restarts() -> None:
     html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
 
-    marker = "if(!forceReaderStart&&state.alignment?.ready&&state.player_running&&state.audiobook_id){"
+    # Pause/resume of a live player no longer requires alignment (plan §6).
+    marker = "if(!forceReaderStart&&state.player_running&&state.audiobook_id){"
     assert marker in html
     assert "const forceReaderStart=wanted&&Number(ui.lnPairedStartFromReaderGeneration||0)===generation;" in html
     assert "if(appliedDesired!==wanted){" in html

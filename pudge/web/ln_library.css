@@ -1,0 +1,32 @@
+/* L1: equal-height LN library tiles + side panel with volumes. */
+.ln-grid{align-items:stretch}
+.ln-grid>.ln-card{height:100%;box-sizing:border-box}
+.ln-group-tile{cursor:pointer;position:relative}
+.ln-group-tile:hover{border-color:#607c9f;box-shadow:inset 0 0 0 1px rgba(133,171,216,.28);background:rgba(31,50,73,.82)}
+.ln-group-tile:focus-visible{outline:2px solid var(--accent);outline-offset:-3px}
+/* Rings are drawn inside the card: the grid clips overflow, so an outer ring
+   lost its left/top edges on tiles in the first row/column. */
+.ln-group-tile.series-selected,.ln-group-tile.franchise-selected{border-color:var(--accent);box-shadow:inset 0 0 0 2px rgba(111,140,255,.55);background:rgba(65,87,145,.22)}
+.ln-group-tile.series-partial,.ln-group-tile.franchise-partial{border-color:rgba(111,140,255,.62)}
+.ln-group-tile .ln-card-title{-webkit-line-clamp:2}
+.ln-group-badge{padding:1px 7px;border-radius:999px;background:rgba(111,140,255,.18);color:#c9d5ff;white-space:nowrap}
+.ln-group-tile[data-ln-group-open="franchise"] .ln-group-badge{background:rgba(96,134,255,.10);border:1px dashed rgba(96,134,255,.45)}
+.ln-group-stats{min-width:0;overflow:hidden;max-height:44px}
+.ln-group-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:auto;padding-top:6px}
+.ln-group-cover-col{display:flex;flex-direction:column;gap:8px;width:76px;min-width:0}
+.ln-group-cover-col>.ln-card-cover{width:76px;height:108px;flex:0 0 auto}
+.ln-group-continue{box-sizing:border-box;width:76px;height:24px;min-height:0;margin:0;padding:0 2px;border-radius:6px;font-size:11px;line-height:22px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}
+.ln-group-continue.is-empty{visibility:hidden}
+.ln-group-open-hint{font-size:11px;color:var(--muted,#93a7c0);white-space:nowrap}
+.ln-volume-panel{position:fixed;z-index:110;top:0;right:0;bottom:0;width:min(620px,94vw);display:flex;flex-direction:column;background:var(--panel,#0e1a29);border-left:1px solid var(--line,#334862);box-shadow:-18px 0 40px rgba(0,0,0,.35)}
+.ln-volume-panel[hidden]{display:none}
+.ln-volume-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line,#334862)}
+.ln-volume-head strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
+.ln-volume-head-actions{display:flex;gap:8px;flex:0 0 auto}
+.ln-volume-head [data-ln-volume-close]{min-width:32px;font-size:18px;line-height:1}
+.ln-volume-body{flex:1 1 auto;overflow-y:auto;padding:14px 16px;display:grid;gap:16px;align-content:start}
+.ln-volume-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(260px,100%),1fr));gap:10px;align-items:stretch}
+.ln-volume-section h4{margin:0 0 8px;font-size:13px;color:var(--muted,#93a7c0);font-weight:600}
+@media(max-width:760px){.ln-volume-panel{width:100vw}}
+/* Under the series title: the volume count is absolutely placed top-right. */
+.ln-series-title-block>.ln-series-continue,.ln-series-title-block>.manga-series-continue{justify-self:start;display:inline-flex;align-items:center;margin:4px 0 2px;white-space:nowrap;max-width:100%;width:auto;height:26px;padding:0 10px;font-size:12px;line-height:24px;overflow:visible}

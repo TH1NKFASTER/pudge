@@ -427,7 +427,7 @@ class Aria2Client:
             "--summary-interval=0",
         ]
         try:
-            subprocess.Popen(
+            self._managed_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -962,25 +962,38 @@ class Aria2Client:
         return state == "active"
 
 
-    def torrent_status(self, torrent_hash: str) -> dict[str, Any]:
+    def torrent_status(self, torrent_hash: str) -> dict[str, Any] | None:
         """Return the small progress surface used by the common release racer."""
         self._require_observable()
         gid = self._resolve_gid(torrent_hash)
-        item = self._rpc_raw(
-            "aria2.tellStatus",
-            [
-                gid,
+        try:
+            item = self._rpc_raw(
+                "aria2.tellStatus",
                 [
-                    "status",
-                    "totalLength",
-                    "completedLength",
-                    "downloadSpeed",
-                    "connections",
-                    "numSeeders",
-                    "seeder",
+                    gid,
+                    [
+                        "status",
+                        "totalLength",
+                        "completedLength",
+                        "downloadSpeed",
+                        "connections",
+                        "numSeeders",
+                        "seeder",
+                    ],
                 ],
-            ],
-        ) or {}
+            ) or {}
+        except Aria2Error as exc:
+            # Only a tellStatus rejection for this exact GID proves absence.
+            # Transport failures and failures while resolving the GID remain
+            # errors, so cleanup cannot discard ownership on an unknown result.
+            missing = {
+                f"aria2 rpc: gid #{gid}# is not found",
+                f"aria2 rpc: gid {gid} is not found",
+                f"aria2 rpc: invalid gid {gid}",
+            }
+            if str(exc).strip().casefold() in {message.casefold() for message in missing}:
+                return None
+            raise
         total = max(0, int(item.get("totalLength") or 0))
         downloaded = max(0, int(item.get("completedLength") or 0))
         progress = downloaded / total if total > 0 else 0.0
@@ -1364,12 +1377,17 @@ class Aria2Client:
             for row in rows
             if int(row.get("priority") or 0) > 0
         }
+        previous_selected = selected.copy()
         if int(priority) > 0:
             selected.update(wanted)
         else:
             selected.difference_update(wanted)
         if not selected:
             raise Aria2Error("aria2 selective download must keep at least one file selected")
+        # A resumed torrent may already be complete/stopped. aria2 rejects
+        # changeOption for those GIDs, even when the selection is identical.
+        if selected == previous_selected:
+            return
         value = ",".join(str(index + 1) for index in sorted(selected))
         gid = self._resolve_gid(torrent_hash)
         self._rpc_raw("aria2.changeOption", [gid, {"select-file": value}])

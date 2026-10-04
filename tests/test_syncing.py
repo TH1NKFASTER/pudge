@@ -789,6 +789,99 @@ def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monk
     assert result["timing_reference_validation"]["accepted"] is True
 
 
+def test_extreme_embedded_map_is_replaced_by_reliable_japanese_speech(
+    tmp_path: Path, monkeypatch
+):
+    from pudge.syncing import optimize_subtitle
+
+    video = tmp_path / "episode.mkv"
+    subtitle = tmp_path / "japanese.srt"
+    timing_reference = tmp_path / "english.srt"
+    alass_output = tmp_path / "alass.srt"
+    speech_output = tmp_path / "speech.srt"
+    payload = "1\n00:00:01,000 --> 00:00:02,000\ntext\n"
+    for path in (video, subtitle, timing_reference, alass_output, speech_output):
+        path.write_text(payload, encoding="utf-8")
+
+    monkeypatch.setattr(
+        "pudge.syncing.extract_embedded_timing_reference",
+        lambda *args, **kwargs: (
+            timing_reference,
+            {"reason": "applied", "language": "eng", "title": "CR"},
+        ),
+    )
+
+    def fake_alass(reference, *args, **kwargs):
+        return alass_output, {
+            "reason": "applied",
+            "sync_was_successful": True,
+            "engine": "alass",
+            "alass_blocks": 5,
+            "alass_distinct_shifts": 5,
+            "alass_shift_spread_seconds": 42.0,
+        }
+
+    class AcceptingLLM:
+        def compare_subtitle_semantics(self, *_args, **_kwargs):
+            return {
+                "accepted": True,
+                "reason": "same episode",
+                "similarity": 0.9,
+                "matched_samples": 6,
+                "total_samples": 6,
+            }
+
+    monkeypatch.setattr("pudge.syncing.synchronize_with_alass", fake_alass)
+    monkeypatch.setattr(
+        "pudge.syncing._subtitle_shift_summary",
+        lambda *_args, **_kwargs: {
+            "offset_seconds": -3.0,
+            "framerate_scale_factor": 1.0,
+            "alass_shift_spread_seconds": 42.0,
+            "alass_constant_shift": False,
+        },
+    )
+    monkeypatch.setattr(
+        "pudge.syncing.compare_timing_activity",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "start": 0.9,
+            "middle": 0.9,
+            "end": 0.9,
+            "weighted": 0.9,
+        },
+    )
+    monkeypatch.setattr(
+        "pudge.syncing._try_japanese_stt_fallback",
+        lambda *_args, **_kwargs: (
+            speech_output,
+            {
+                "reason": "applied",
+                "sync_was_successful": True,
+                "engine": "japanese-stt+text-clock",
+                "reference_alignment_reliable": True,
+                "output": str(speech_output),
+            },
+        ),
+    )
+
+    output, result = optimize_subtitle(
+        video,
+        subtitle,
+        tmp_path / "cache",
+        SyncConfig(engine="auto", compare_engines=True),
+        llm=AcceptingLLM(),
+        validate_embedded_reference_with_llm=True,
+    )
+
+    assert output == speech_output
+    assert result["selection_reason"] == "extreme_map_japanese_speech_verification"
+    assert result["engine"] == "japanese-stt+text-clock"
+    assert result["embedded_reference_extreme_map"]["gate"]["reason"] == (
+        "extreme_map_requires_speech_verification"
+    )
+
+
 def test_timing_activity_detects_cold_open_improvement(tmp_path: Path):
     from pudge.syncing import compare_timing_activity, _embedded_reference_is_better
 
@@ -1724,7 +1817,8 @@ def test_exact_jimaku_timing_consensus_accepts_three_strong_independent_files(tm
     items = []
     for index, activity in enumerate((0.93, 0.91, 0.89, 0.84), start=1):
         path = tmp_path / f"source-{index}.srt"
-        path.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語\n", encoding="utf-8")
+        # Independently authored files: different text (identical copies are one voice).
+        path.write_text(f"1\n00:00:01,000 --> 00:00:02,000\n日本語{index}\n", encoding="utf-8")
         candidate = SubtitleCandidate(
             path,
             "jimaku",

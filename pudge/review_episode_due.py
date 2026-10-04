@@ -236,13 +236,20 @@ def build_episode_due_review_cards(
             f"{stat.st_size}:{stat.st_mtime_ns}"
         ).encode("utf-8")
     ).hexdigest()
+    return _build_cue_due_review_cards(service, cue_rows, digest, conversion)
+
+
+def build_text_due_review_cards(service: Any, text: str, revision: str) -> dict[str, Any]:
+    rows = [(float(i), float(i + 1), line.strip()) for i, line in enumerate(text.splitlines()) if line.strip()]
+    return _build_cue_due_review_cards(service, rows, revision, {})
+
+
+def _build_cue_due_review_cards(service: Any, cue_rows: list, digest: str, conversion: dict) -> dict[str, Any]:
     parsed = service.jiten_preparse("\n".join(row[2] for row in cue_rows), digest=digest)
     token_rows = parsed.get("tokens") if isinstance(parsed, dict) else None
     vocabulary = parsed.get("vocabulary") if isinstance(parsed, dict) else None
-    if not isinstance(token_rows, list):
-        token_rows = []
-    if not isinstance(vocabulary, list):
-        vocabulary = []
+    if not isinstance(token_rows, list) or len(token_rows) != len(cue_rows) or not isinstance(vocabulary, list):
+        raise ValueError("Jiten did not return a complete content parse; retry review preparation")
 
     context: dict[tuple[int, int], dict[str, Any]] = {}
     order: list[tuple[int, int]] = []
@@ -285,8 +292,16 @@ def build_episode_due_review_cards(
                 continue
             pair = _pair(state)
             if pair is not None:
+                if state.get("stale") or state.get("knowledgeStatus") == "stale_live_state_cache":
+                    raise ValueError("Jiten word states are stale; retry review preparation")
                 live_by_pair[pair] = state
 
+    missing = set(order) - set(live_by_pair)
+    if missing:
+        raise ValueError("Jiten did not return a state for every content word; retry review preparation")
+    unknown_words = [dict(vocab_by_pair.get(pair, {}), wordId=pair[0], readingIndex=pair[1])
+                     for pair in order if str(live_by_pair[pair].get("normalizedState") or "").casefold() in {"new", "unknown"}
+                     or "new" in (live_by_pair[pair].get("states") or [])]
     due_pairs = [pair for pair in order if _is_due(live_by_pair.get(pair, {}))]
     media_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
     if due_pairs and hasattr(service, "jiten_card_media"):
@@ -336,6 +351,7 @@ def build_episode_due_review_cards(
 
     return {
         "cards": cards,
+        "unknown_words": unknown_words,
         "episode_pairs": len(order),
         "due_pairs": len(due_pairs),
         "conversion": conversion,

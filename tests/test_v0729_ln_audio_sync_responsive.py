@@ -51,10 +51,12 @@ def test_seek_resets_stale_word_progress() -> None:
 def test_anchor_changes_are_smoothed_without_slowing_explicit_seek() -> None:
     source = HTML.read_text(encoding="utf-8")
 
-    assert "function lnPairedSmoothOffset(" in source
-    assert "maxAdvance=Math.max(.16,Math.min(.65" in source
-    assert "clamp_forward" in source
-    assert "seekJump||!speechActive" in source
+    # Plan §7 replaced the LN-only forward clamp (lnPairedSmoothOffset,
+    # .16–.65 chars/frame) by the shared canonical offset; explicit seeks
+    # still reset word state.  Behaviour: ln_entry_contract no_forward_clamp.
+    assert "function lnPairedSmoothOffset(" not in source
+    assert "clamp_forward" not in source
+    assert "if(seekJump){lnPairedResetWordProgress(reader);" in source
     assert "function lnPairedTransportClockReconcile(" in source
     assert "function lnPairedTransportClockNow(" in source
     assert "path[path.length-1]?.time" in source

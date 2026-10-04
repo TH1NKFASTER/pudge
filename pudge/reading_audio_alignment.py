@@ -3385,6 +3385,185 @@ def align_light_novel_to_transcript(
     }
 
 
+_MIN_SPOKEN_CHAR_SECONDS = 0.08
+_MAX_CHAR_FLOOR_BORROW_SECONDS = 0.5
+
+
+def _enforce_min_char_duration(
+    anchors: list[dict[str, Any]],
+    speech_regions: Iterable[dict[str, Any]],
+    min_char: float = _MIN_SPOKEN_CHAR_SECONDS,
+    max_borrow: float = _MAX_CHAR_FLOOR_BORROW_SECONDS,
+    max_walk: int = 6,
+) -> tuple[list[dict[str, Any]], int]:
+    """Give every spoken character a minimum share of audio time.
+
+    Sparse STT anchors produce a slow linear bridge followed by a burst
+    (おばあちゃん: 7 chars/1.6 s then ゃ,ん at 40 ms each) or an onset hold
+    followed by a sprint (言ってやりました: 260 ms on 言, then 3 chars in 80 ms).
+    Borrow time from the *earlier* speech-active neighbour so the burst gets at
+    least ``min_char`` per character.  Pause holds (VAD silence) are barriers and
+    are never shortened; the fast segment's right anchor never moves.
+    """
+
+    if len(anchors) < 3:
+        return anchors, 0
+    regions = [
+        (float(row.get("start") or 0.0), float(row.get("end") or 0.0))
+        for row in speech_regions
+        if isinstance(row, dict)
+    ]
+    regions.sort()
+    starts = [row[0] for row in regions]
+
+    def speech_cover(start: float, end: float) -> float:
+        if end <= start or not regions:
+            return 0.0 if regions else end - start
+        total = 0.0
+        index = max(0, bisect.bisect_right(starts, start) - 1)
+        while index < len(regions) and regions[index][0] < end:
+            total += max(0.0, min(end, regions[index][1]) - max(start, regions[index][0]))
+            index += 1
+        return total
+
+    rows = [dict(row) for row in anchors]
+    times = [float(row["time"]) for row in rows]
+    offsets = [float(row["offset"]) for row in rows]
+    changed = 0
+    for i in range(1, len(rows)):
+        chars = offsets[i] - offsets[i - 1]
+        if chars < 0.5 or bool(rows[i].get("wall_clock_from_previous")):
+            continue
+        need = min_char * chars - (times[i] - times[i - 1])
+        if need <= 1e-4:
+            continue
+        borrowed = 0.0
+        # Walk left; the points between donor and the fast segment shift
+        # earlier together, so only the donor segment shrinks.
+        for donor in range(i - 1, max(0, i - 1 - max_walk), -1):
+            if need <= 1e-4 or borrowed >= max_borrow:
+                break
+            left, right = donor - 1, donor
+            if left < 0 or bool(rows[right].get("wall_clock_from_previous")):
+                break
+            span = times[right] - times[left]
+            if span <= 0 or speech_cover(times[left], times[right]) < 0.8 * span:
+                break  # pause hold or silence: barrier
+            donor_chars = max(0.0, offsets[right] - offsets[left])
+            slack = span - max(min_char * donor_chars, 0.02)
+            take = min(need, slack, max_borrow - borrowed)
+            if take <= 1e-4:
+                continue
+            for k in range(right, i):
+                times[k] = round(times[k] - take, 3)
+            need -= take
+            borrowed += take
+            changed += 1
+    if not changed:
+        return anchors, 0
+    for row, value in zip(rows, times):
+        row["time"] = value
+    return rows, changed
+
+
+def _relocate_misplaced_pause_holds(
+    anchors: list[dict[str, Any]],
+    speech_regions: Iterable[dict[str, Any]],
+    min_char: float = _MIN_SPOKEN_CHAR_SECONDS,
+    min_gap: float = 0.25,
+    min_gain: float = 1.5,
+) -> tuple[list[dict[str, Any]], int]:
+    """Move a punctuation hold to the real sentence pause when STT put it early.
+
+    Coarse STT can stamp a sentence start (桐生 after 。) inside the previous
+    clause, so pause injection binds 。 to a short intra-word VAD dip.  The
+    clause before the hold then sprints (返してあげました: 8 chars in 180 ms),
+    the next sentence starts ~2.5 s early, and the real 1.5 s pause freezes the
+    highlight mid-sentence.  When the segment feeding a hold is physically too
+    fast and the segment after it contains a clearly longer silence that leaves
+    both sides >= ``min_char`` per char, move the hold triple into that silence.
+    The outer anchors never move.
+    """
+
+    if len(anchors) < 5:
+        return anchors, 0
+    regions = sorted(
+        (float(row.get("start") or 0.0), float(row.get("end") or 0.0))
+        for row in speech_regions
+        if isinstance(row, dict)
+    )
+    if len(regions) < 2:
+        return anchors, 0
+    starts = [row[0] for row in regions]
+    gaps = [
+        (left[1], right[0])
+        for left, right in zip(regions, regions[1:])
+        if right[0] - left[1] >= min_gap
+    ]
+    gap_starts = [row[0] for row in gaps]
+
+    def speech_cover(start: float, end: float) -> float:
+        if end <= start:
+            return 0.0
+        total = 0.0
+        index = max(0, bisect.bisect_right(starts, start) - 1)
+        while index < len(regions) and regions[index][0] < end:
+            total += max(0.0, min(end, regions[index][1]) - max(start, regions[index][0]))
+            index += 1
+        return total
+
+    rows = [dict(row) for row in anchors]
+    times = [float(row["time"]) for row in rows]
+    offsets = [float(row["offset"]) for row in rows]
+    moved = 0
+    j = 1
+    while j + 3 < len(rows):
+        hold = offsets[j]
+        is_hold = (
+            abs(offsets[j + 1] - hold) < 1e-6
+            and abs(hold - round(hold)) > 1e-6
+            and abs(offsets[j + 2] - (hold + 0.001)) < 1e-4
+            and times[j + 2] - times[j + 1] <= 0.0025
+        )
+        if not is_hold or any(
+            bool(rows[k].get("wall_clock_from_previous")) for k in range(j, j + 4)
+        ):
+            j += 1
+            continue
+        left_chars = hold - offsets[j - 1]
+        right_chars = offsets[j + 3] - offsets[j + 2]
+        if left_chars < 0.5 or times[j] - times[j - 1] >= min_char * left_chars:
+            j += 1
+            continue
+        hold_len = times[j + 2] - times[j]
+        best = None
+        index = bisect.bisect_left(gap_starts, times[j + 2])
+        while index < len(gaps) and gaps[index][1] < times[j + 3]:
+            gap_start, gap_end = gaps[index]
+            index += 1
+            if gap_end - gap_start < max(min_gap, min_gain * hold_len):
+                continue
+            if speech_cover(times[j - 1], gap_start) < min_char * left_chars:
+                continue
+            if speech_cover(gap_end, times[j + 3]) < min_char * max(0.0, right_chars):
+                continue
+            if best is None or gap_end - gap_start > best[1] - best[0]:
+                best = (gap_start, gap_end)
+        if best is not None:
+            times[j] = round(best[0], 3)
+            times[j + 1] = round(max(best[0], best[1] - 0.001), 3)
+            times[j + 2] = round(best[1], 3)
+            moved += 1
+            j += 3
+            continue
+        j += 1
+    if not moved:
+        return anchors, 0
+    for row, value in zip(rows, times):
+        row["time"] = value
+    return rows, moved
+
+
 def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the live clock, enriching old cached alignments in memory.
 
@@ -3555,6 +3734,10 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
     chapter["_runtime_reading_bridge_debug"] = runtime_reading_bridge_debug
 
     anchors = _prune_unreachable_leading_anchors(anchors, max_rate=16.0)
+    anchors, pause_relocation_count = _relocate_misplaced_pause_holds(anchors, speech_regions)
+    chapter["_runtime_pause_relocation_count"] = pause_relocation_count
+    anchors, char_floor_count = _enforce_min_char_duration(anchors, speech_regions)
+    chapter["_runtime_char_floor_count"] = char_floor_count
     chapter["_runtime_enriched_anchors"] = anchors
     chapter["_runtime_punctuation_pause_count"] = runtime_pause_count
     return anchors

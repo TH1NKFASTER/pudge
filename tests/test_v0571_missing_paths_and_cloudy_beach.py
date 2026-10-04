@@ -89,7 +89,7 @@ def test_foreground_poll_restarts_auto_search_only_after_missing_path_cleanup(
         lambda: calls.append("auto") or 1,
     )
 
-    result = api.poll_downloads_and_subtitles()
+    result = api._poll_downloads_and_subtitles_sync()
 
     assert calls == ["sync", "auto", "sync"]
     assert result["stats"]["auto"] == 1

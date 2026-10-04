@@ -6,7 +6,7 @@ new episodes, prepare subtitles, play video through mpv, track progress, and
 pair audiobooks with Light Novels without turning the setup into a collection
 of separate scripts.
 
-Current version: **0.7.29**.
+Current version: **0.7.30**.
 
 ## What Pudge can do
 
@@ -23,9 +23,7 @@ Pudge keeps its library and progress on your Mac. Optional online services are
 used only for the features you enable. Exported backups do not contain API
 tokens.
 
-For everyday instructions, see the [user guide](docs/USER_GUIDE.md). For a
-plain-language description of matching, readiness, subtitle repair, and paired
-reading, see [algorithms and state model](docs/ALGORITHMS.md).
+Use Settings to configure study providers, playback and optional reading reviews.
 
 ## Requirements
 
@@ -50,7 +48,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip pudge-macos-v0.7.29.zip
+unzip 0.7.30.zip
 cd pudge
 ./install.sh
 ```
@@ -121,8 +119,12 @@ make test-batches
 make lint
 ```
 
+Release installs run a short offline preflight before replacing the app. To
+run the complete developer suite during installation, set
+`PUDGE_INSTALL_FULL_TESTS=1`; its separate test environment may need downloads.
+
 Add `.[manga]` when working on OCR. More details are in
-[DEVELOPMENT.md](DEVELOPMENT.md).
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Troubleshooting
 
@@ -133,8 +135,7 @@ Add `.[manga]` when working on OCR. More details are in
 - Backups keep the library, settings, and Pudge-managed prepared subtitle files. Restoring a backup keeps the credentials already installed on that Mac.
 
 Report security issues through [SECURITY.md](SECURITY.md). Contribution and
-release instructions are in [CONTRIBUTING.md](CONTRIBUTING.md) and
-[RELEASING.md](RELEASING.md).
+release instructions are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

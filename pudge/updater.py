@@ -45,8 +45,10 @@ def _safe_json(path: Path) -> dict[str, Any]:
 class AppUpdater:
     """Safe updater for stable release installs and clean development checkouts."""
 
-    def __init__(self, *, logger: Any = None) -> None:
+    def __init__(self, *, logger: Any = None, before_install: Any = None, request_quit: Any = None) -> None:
         self.logger = logger
+        self.before_install = before_install
+        self.request_quit = request_quit
         self.marker_path = DATA_DIR / "install-source.json"
         self.update_root = DATA_DIR / "updates"
         self.log_path = LOG_DIR / f"{APP_SLUG}-update.log"
@@ -378,13 +380,17 @@ class AppUpdater:
             if _version_key(version) <= _version_key(__version__):
                 self._set_state("current", "Pudge is already current", latest_version=version)
                 return
-            archive_name = f"{APP_SLUG}-macos-v{version}.zip"
+            archive_name = f"{version}.zip"
             asset = self._asset(release, archive_name)
+            if not asset:
+                archive_name = f"{APP_SLUG}-macos-v{version}.zip"
+                asset = self._asset(release, archive_name)
             if not asset:
                 raise UpdateError(f"GitHub Release does not contain {archive_name}")
             expected = self._expected_digest(release, asset, archive_name)
             self._log("APP release update v%s started", version)
             self.update_root.mkdir(parents=True, exist_ok=True)
+            self._prune_update_sources()
             temporary = Path(tempfile.mkdtemp(prefix=f"v{version}-", dir=self.update_root))
             archive = temporary / archive_name
             self._set_state("downloading", f"Downloading Pudge {version}", latest_version=version)
@@ -401,6 +407,17 @@ class AppUpdater:
             if temporary is not None:
                 shutil.rmtree(temporary, ignore_errors=True)
 
+    def _prune_update_sources(self) -> None:
+        deadline = time.time() - 7 * 86400
+        for path in self.update_root.glob("v*-*"):
+            if path.is_symlink() or not re.fullmatch(r"v\d+\.\d+\.\d+-.+", path.name):
+                continue
+            try:
+                if path.is_dir() and path.stat().st_mtime < deadline:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+
     def _launch_script(self, project: Path, prefix: list[str]) -> None:
         project = project.resolve()
         script = project.parent / "run-pudge-update.zsh"
@@ -416,6 +433,21 @@ class AppUpdater:
             f"exec >> {shlex.quote(str(self.log_path))} 2>&1",
             "unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE",
         ]
+        # Only a downloaded release belongs to the updater. A development
+        # checkout and rollback data must never be removed by this exit trap.
+        update_root = self.update_root.resolve()
+        if project.is_relative_to(update_root):
+            relative = project.relative_to(update_root)
+            if relative.parts and re.fullmatch(r"v\d+\.\d+\.\d+-.+", relative.parts[0]):
+                downloaded = update_root / relative.parts[0]
+                commands.extend([
+                    "cleanup_update_source() {",
+                    "  local result=$?",
+                    f"  /bin/rm -rf {shlex.quote(str(downloaded))}",
+                    "  return $result",
+                    "}",
+                    "trap cleanup_update_source EXIT",
+                ])
         if prefix_line:
             commands.append(prefix_line)
         commands.extend(
@@ -424,13 +456,14 @@ class AppUpdater:
                 f"rm -rf {shlex.quote(str(rollback_path))}",
                 f"if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/ditto {shlex.quote(str(app_path))} {shlex.quote(str(rollback_path))}; fi",
                 f"echo 'Updater: stopping source Pudge PID {source_pid}'",
-                f"/bin/kill -9 {source_pid} >/dev/null 2>&1 || true",
-                "for attempt in {1..50}; do",
+                "# Wait for the native quit path to finish cleanup and exit.",
+                "for attempt in {1..300}; do",
                 f"  if ! /bin/kill -0 {source_pid} >/dev/null 2>&1; then break; fi",
                 "  /bin/sleep 0.1",
                 "done",
                 f"if /bin/kill -0 {source_pid} >/dev/null 2>&1; then",
-                f"  echo 'Updater error: source Pudge PID {source_pid} is still running after SIGKILL.' >&2",
+                f"  echo 'Updater error: source Pudge PID {source_pid} has not exited after graceful cleanup; refusing to replace the running app.' >&2",
+                f"  if [[ -d {shlex.quote(str(app_path))} ]]; then /usr/bin/open -n {shlex.quote(str(app_path))}; fi",
                 "  exit 1",
                 "fi",
                 "if ! /bin/zsh ./install.sh --update; then",
@@ -445,6 +478,8 @@ class AppUpdater:
         )
         script.write_text("\n".join(commands) + "\n", encoding="utf-8")
         os.chmod(script, 0o700)
+        if callable(self.before_install):
+            self.before_install()
         subprocess.Popen(
             ["/bin/zsh", str(script)],
             stdin=subprocess.DEVNULL,
@@ -454,3 +489,5 @@ class AppUpdater:
         )
         self._log("APP update installer launched from %s", project)
         self._set_state("restarting", "Installer started; Pudge will reopen automatically")
+        if callable(self.request_quit):
+            self.request_quit()

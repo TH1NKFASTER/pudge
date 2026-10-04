@@ -10,7 +10,9 @@
     '.library-cover-shell img',
     '.planned-suggestion-grid img',
     '.list-cover img',
-    '.airing-cover-shell img'
+    '.airing-cover-shell img',
+    '.sidebar-audio-cover img',
+    '.sidebar-due-image img'
   ].join(',');
   const MOUSE_OPEN_DISTANCE = 148;
   const PINCH_OPEN_SCALE = 1.36;

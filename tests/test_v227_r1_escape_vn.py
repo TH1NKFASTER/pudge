@@ -227,7 +227,9 @@ def test_visual_novel_frontend_has_no_anilist_identity_surface() -> None:
     assert "pudge-media-identity-changed" not in source
 
     # Capture/OCR/Jiten reading functionality remains present.
-    assert "visual_novel_windows" in source
+    assert "visual_novel_start(0,gameTitle,'',true)" in source
+    assert "Choose game window" in source
+    assert "visual_novel_windows" not in source
     assert "visual_novel_start" in source
     assert "visual_novel_parse" in source
     assert "PudgeReadingTools" in source

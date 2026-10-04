@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings, strategies as st
 
 from pudge.filename import normalize_title, parse_anime_filename
 from pudge.mobile_sync import MobileSyncService
+from pudge.release_parser import EXTRA_TYPES, SPECIAL_TYPES
 from pudge.subtitle_formats import parse_srt, write_srt
+
+_EXTRA_LABEL_WORDS = {word for label in EXTRA_TYPES | SPECIAL_TYPES for word in label.split()}
 
 
 @given(st.text(max_size=180))
@@ -21,14 +26,23 @@ def test_filename_normalization_is_idempotent(value: str) -> None:
         alphabet=list("abcdefghijklmnopqrstuvwxyz     -_."),
         min_size=1,
         max_size=80,
-    ),
+    ).filter(lambda title: not (_EXTRA_LABEL_WORDS & set(re.findall(r"[a-z]+", title)))),
     season=st.integers(min_value=1, max_value=99),
     episode=st.integers(min_value=1, max_value=999),
 )
 def test_filename_parser_preserves_explicit_season_episode(title: str, season: int, episode: int) -> None:
+    # OP/ED labels deliberately suppress regular-episode identity, even
+    # when a filename also contains SxxExxx. Generate ordinary titles here.
     identity = parse_anime_filename(f"{title} S{season:02d}E{episode:03d}.mkv")
     assert identity.season == season
     assert identity.episode == episode
+
+
+@pytest.mark.parametrize("label", ["OP", "ED"])
+def test_explicit_season_episode_does_not_override_extra_label(label: str) -> None:
+    identity = parse_anime_filename(f"{label} S01E001.mkv")
+    assert identity.season == 1
+    assert identity.episode is None
 
 
 @settings(max_examples=40)

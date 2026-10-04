@@ -114,16 +114,12 @@ def test_reconstructed_nonzero_title_prefix_gets_precision_pass() -> None:
 
 def test_paired_scroll_hotpath_is_logarithmic_and_throttled() -> None:
     html = INDEX.read_text(encoding="utf-8")
-    weight = html.split("function lnPairedWeightMap()", 1)[1].split("function lnPairedSpeechRatio", 1)[0]
-    assert "nodes=domIndex.words||[]" in weight
-    assert "querySelectorAll('[data-ln-audio-start][data-ln-audio-end].ln-word')" not in weight
-    assert "function lnPairedLastSegmentAt(rows,value,key)" in weight
-    weighted = weight.split("function lnPairedWeightedPosition", 1)[1].split("function lnPairedSourcePosition", 1)[0]
-    source = weight.split("function lnPairedSourcePosition", 1)[1]
-    assert "lnPairedLastSegmentAt" in weighted
-    assert "for(const segment of map.segments)" not in weighted
-    assert "lnPairedLastSegmentAt" in source
-    assert "for(const segment of map.segments)" not in source
+    # Plan §7 removed the DOM mora weight map from the timing path entirely,
+    # so the per-frame cost no longer depends on DOM word count at all.
+    assert "function lnPairedWeightMap()" not in html
+    assert "function lnPairedWeightedPosition(" not in html
+    render = html.split("function renderLnPairedPosition", 1)[1].split("function startLnPairedInterpolation", 1)[0]
+    assert "lnPairedFindRange(domIndex.wordRanges,offset,false)" in render
 
     interpolation = html.split("function startLnPairedInterpolation", 1)[1].split("async function applyLnPairedPosition", 1)[0]
     assert "minPaintMs=manualScrolling?250:33" in interpolation

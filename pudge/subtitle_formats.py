@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import html
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
@@ -570,8 +572,31 @@ def write_srt(
         blocks.append(
             f"{index}\n{_seconds_to_timestamp(start)} --> {_seconds_to_timestamp(end)}\n{payload}"
         )
-    path.write_text("\n\n".join(blocks) + ("\n" if blocks else ""), encoding="utf-8")
+    payload_text = "\n\n".join(blocks) + ("\n" if blocks else "")
+    # Write atomically: callers treat an existing output as a ready cache, so
+    # an interrupted write must never leave a truncated file at *path*.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload_text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return path
+
+
+def _cached_srt_ready(path: Path) -> bool:
+    """A cached SRT is reusable only when it still parses to real cues."""
+    try:
+        if not path.is_file() or path.stat().st_size <= 0:
+            return False
+        return bool(parse_srt(path))
+    except (OSError, ValueError):
+        return False
 
 
 def clean_srt_for_playback(
@@ -602,8 +627,9 @@ def clean_srt_for_playback(
     output = output_dir / f"v16-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
-    if output.exists() and output.stat().st_size > 0:
+    if _cached_srt_ready(output):
         return output, {"reason": "cached", "cleaned": True, "output": str(output)}
+    output.unlink(missing_ok=True)
 
     cues = parse_srt(subtitle)
     if not cues:
@@ -687,29 +713,51 @@ def subtitle_has_genuine_overlaps(
     return False
 
 
-def _manual_ass_to_srt(source: Path, output: Path) -> bool:
+def _ass_geometry_cues(
+    source: Path,
+) -> tuple[list[tuple[float, float, str]], dict[str, int]]:
+    """Assemble positioned caption fragments before text/language cleanup.
+
+    Ruby is only discarded when a smaller kana fragment sits above a matching
+    kanji-containing base in the same interval. Small standalone dialogue and
+    unpositioned events are retained. Moving/drawing events are not assembled.
+    """
     text = source.read_text(encoding="utf-8-sig", errors="replace")
     fields: list[str] = []
-    cues: list[tuple[float, float, str]] = []
-    in_events = False
+    style_fields: list[str] = []
+    styles: dict[str, dict[str, str]] = {}
+    events: list[dict[str, object]] = []
+    section = ""
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if line.startswith("[") and line.endswith("]"):
-            in_events = line.casefold() == "[events]"
-            continue
-        if not in_events:
+            section = line.casefold()
             continue
         if line.casefold().startswith("format:"):
-            fields = [part.strip().casefold() for part in line.split(":", 1)[1].split(",")]
+            names = [
+                part.strip().casefold() for part in line.split(":", 1)[1].split(",")
+            ]
+            if section == "[events]":
+                fields = names
+            elif section in {"[v4+ styles]", "[v4 styles]"}:
+                style_fields = names
             continue
-        if not line.casefold().startswith("dialogue:") or not fields:
+        if line.casefold().startswith("style:") and style_fields:
+            parts = line.split(":", 1)[1].lstrip().split(",", len(style_fields) - 1)
+            row = dict(zip(style_fields, parts))
+            styles[row.get("name", "")] = row
+            continue
+        if (
+            section != "[events]"
+            or not line.casefold().startswith("dialogue:")
+            or not fields
+        ):
             continue
         parts = line.split(":", 1)[1].lstrip().split(",", len(fields) - 1)
         if len(parts) != len(fields):
             continue
         row = dict(zip(fields, parts))
         raw_text = row.get("text", "")
-        # ASS vector drawings are not dialogue and become garbage in SRT.
         if re.search(r"\\p[1-9]", raw_text, re.IGNORECASE):
             continue
         try:
@@ -717,9 +765,156 @@ def _manual_ass_to_srt(source: Path, output: Path) -> bool:
             end = _timestamp_to_seconds(row.get("end", ""))
         except ValueError:
             continue
-        payload = plain_subtitle_text(raw_text)
-        if payload and end > start:
-            cues.append((start, end, payload))
+        # Speaker-label removal must wait until fragments have been joined.
+        payload = (
+            html.unescape(_ASS_OVERRIDE_RE.sub("", raw_text))
+            .replace(r"\N", "\n")
+            .replace(r"\n", "\n")
+            .replace(r"\h", " ")
+            .strip()
+        )
+        if not payload or end <= start:
+            continue
+        style = styles.get(row.get("style", ""), {})
+
+        def number(name: str, default: float, style: dict[str, str] = style) -> float:
+            try:
+                return float(style.get(name, default))
+            except (ValueError, TypeError):
+                return default
+
+        def override(tag: str, default: float, raw_text: str = raw_text) -> float:
+            matches = re.findall(r"\\" + tag + r"(-?\d+(?:\.\d+)?)", raw_text)
+            return float(matches[-1]) if matches else default
+
+        positions = re.findall(
+            r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", raw_text
+        )
+        position = (
+            positions[0]
+            if len(positions) == 1 and "\n" not in payload and r"\move" not in raw_text
+            else None
+        )
+        font = override("fs", number("fontsize", 40.0))
+        height = font * override("fscy", number("scaley", 100.0)) / 100.0
+        # Inline scale changes often narrow only the closing punctuation.
+        # Its final override is not the width of the entire base sentence.
+        horizontal_scales = [
+            float(v) for v in re.findall(r"\\fscx(-?\d+(?:\.\d+)?)", raw_text)
+        ]
+        scale_x = (
+            max(horizontal_scales) if horizontal_scales else number("scalex", 100.0)
+        )
+        width = (
+            font
+            * scale_x
+            / 100.0
+            * sum(1.0 if ord(ch) >= 0x2E80 else 0.55 for ch in payload)
+        )
+        alignment = int(override("an", number("alignment", 2)))
+        x, y = (float(position[0]), float(position[1])) if position else (0.0, 0.0)
+        if alignment % 3 == 2:
+            x -= width / 2
+        elif alignment % 3 == 0:
+            x -= width
+        events.append(
+            {
+                "start": start,
+                "end": end,
+                "text": payload,
+                "positioned": bool(position),
+                "x": x,
+                "y": y,
+                "height": height,
+                "width": width,
+            }
+        )
+    groups: dict[tuple[float, float], list[dict[str, object]]] = {}
+    for event in events:
+        groups.setdefault((float(event["start"]), float(event["end"])), []).append(
+            event
+        )
+    cues: list[tuple[float, float, str]] = []
+    ruby_removed = assembled = 0
+    for (start, end), group in groups.items():
+        # Outline/blur layers render the same caption at the same position.
+        # Deduplicate before joining fragments, while retaining repeated words
+        # at different positions (for example two speakers saying "はい").
+        seen_positions: set[tuple[str, float, float]] = set()
+        positioned = []
+        for event in group:
+            if not event["positioned"]:
+                continue
+            position_key = (str(event["text"]), float(event["x"]), float(event["y"]))
+            if position_key not in seen_positions:
+                seen_positions.add(position_key)
+                positioned.append(event)
+        ruby: set[int] = set()
+        for index, reading in enumerate(positioned):
+            if not re.fullmatch(r"[ぁ-ゖァ-ヺーゝゞヽヾ・\s]+", str(reading["text"])):
+                continue
+            for base in positioned:
+                if not re.search(r"[一-龯々0-9０-９]", str(base["text"])):
+                    continue
+                h = float(base["height"])
+                dy = float(base["y"]) - float(reading["y"])
+                overlap = min(
+                    float(reading["x"]) + float(reading["width"]),
+                    float(base["x"]) + float(base["width"]),
+                ) - max(float(reading["x"]), float(base["x"]))
+                if (
+                    h > 0
+                    and float(reading["height"]) <= 0.70 * h
+                    and 0.45 * h <= dy <= 1.75 * h
+                    and overlap > 0
+                ):
+                    ruby.add(index)
+                    break
+        ruby_removed += len(ruby)
+        rows: list[list[dict[str, object]]] = []
+        for index, event in sorted(
+            enumerate(positioned),
+            key=lambda pair: (float(pair[1]["y"]), float(pair[1]["x"])),
+        ):
+            if index in ruby:
+                continue
+            if rows and abs(float(event["y"]) - float(rows[-1][0]["y"])) <= max(
+                3.0, 0.12 * float(rows[-1][0]["height"])
+            ):
+                rows[-1].append(event)
+            else:
+                rows.append([event])
+        if len(positioned) >= 2:
+            lines = [
+                "".join(
+                    str(event["text"])
+                    for event in sorted(row, key=lambda event: float(event["x"]))
+                )
+                for row in rows
+            ]
+            payload = plain_subtitle_text("\n".join(lines))
+            if payload:
+                cues.append((start, end, payload))
+            assembled += max(0, len(positioned) - len(ruby) - 1)
+        else:
+            for event in positioned:
+                payload = plain_subtitle_text(str(event["text"]))
+                if payload:
+                    cues.append((start, end, payload))
+        for event in group:
+            if not event["positioned"]:
+                payload = plain_subtitle_text(str(event["text"]))
+                if payload:
+                    cues.append((start, end, payload))
+    return cues, {
+        "positioned_events": sum(bool(event["positioned"]) for event in events),
+        "ruby_removed": ruby_removed,
+        "fragments_joined": assembled,
+    }
+
+
+def _manual_ass_to_srt(source: Path, output: Path) -> bool:
+    cues, _geometry = _ass_geometry_cues(source)
     if not cues:
         return False
     cues, _bilingual_profile = _filter_parallel_chinese_cues(cues)
@@ -747,15 +942,26 @@ def convert_to_plain_srt(
 
     stat = subtitle.stat()
     digest = hashlib.sha1(
-        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v7".encode()
+        f"{subtitle.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:plain-srt-v9-geometry-layers".encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "converted"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / f"v15-{digest}.srt"
+    output = output_dir / f"v19-{digest}.srt"
     if force:
         output.unlink(missing_ok=True)
-    if output.exists() and output.stat().st_size > 0:
+    if _cached_srt_ready(output):
         return output, {"reason": "cached", "converted": True, "output": str(output)}
+    output.unlink(missing_ok=True)
+
+    # FFmpeg's plain-text encoder drops layout before our language filter can
+    # distinguish ruby/base fragments. Positioned captions use the ASS parser.
+    geometry_cues, geometry = _ass_geometry_cues(subtitle)
+    if geometry["positioned_events"] >= 2:
+        geometry_cues, bilingual_profile = _filter_parallel_chinese_cues(geometry_cues)
+        geometry_cues, parallel_merged = _merge_parallel_cues(geometry_cues)
+        if geometry_cues:
+            write_srt(geometry_cues, output, preserve_overlaps=True)
+            return output, {"reason": "converted", "converted": True, "method": "ass-geometry", "output": str(output), "geometry": geometry, "parallel_merged": parallel_merged, "bilingual_cjk": bool(bilingual_profile.get("suspected_bilingual_cjk")), "bilingual_removed": int(bilingual_profile.get("removed_han_only_cues") or 0), "bilingual_profile": bilingual_profile}
 
     filename_language = subtitle_filename_language_profile(subtitle.name)
     explicit_mixed_cjk = (
@@ -770,7 +976,9 @@ def convert_to_plain_srt(
         else (shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path)
     )
     ffmpeg_error = ""
+    ffmpeg_output = output.with_name(f".{output.stem}.ffmpeg.srt")
     if resolved:
+        ffmpeg_output.unlink(missing_ok=True)
         command = [
             resolved,
             "-y",
@@ -778,7 +986,7 @@ def convert_to_plain_srt(
             "error",
             "-i",
             str(subtitle),
-            str(output),
+            str(ffmpeg_output),
         ]
         try:
             completed = subprocess.run(
@@ -789,9 +997,10 @@ def convert_to_plain_srt(
                 timeout=60,
                 check=False,
             )
-            if completed.returncode == 0 and output.exists() and output.stat().st_size > 0:
+            if completed.returncode == 0 and ffmpeg_output.exists() and ffmpeg_output.stat().st_size > 0:
                 # Rewrite through our parser to strip any style tags retained by ffmpeg.
-                cues = parse_srt(output)
+                cues = parse_srt(ffmpeg_output)
+                ffmpeg_output.unlink(missing_ok=True)
                 if cues:
                     cues, bilingual_profile = _filter_parallel_chinese_cues(cues)
                     if not cues:
@@ -816,6 +1025,8 @@ def convert_to_plain_srt(
             ffmpeg_error = completed.stdout[-1000:]
         except (OSError, subprocess.TimeoutExpired) as exc:
             ffmpeg_error = str(exc)
+        finally:
+            ffmpeg_output.unlink(missing_ok=True)
 
     output.unlink(missing_ok=True)
     try:

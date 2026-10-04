@@ -186,8 +186,13 @@ def test_web_api_only_compresses_manga_page_for_word_missing_from_all_decks() ->
 
 def test_reader_blocks_new_unassigned_review_until_a_jiten_deck_is_selected() -> None:
     source = (WEB / "reading_tools.js").read_text(encoding="utf-8")
-    assert "memberships && memberships.length === 0 && !deck" in source
-    assert "Choose a Jiten deck for this new word" in source
+    # Plan §5: the guard reads memberships after awaiting a pending live refresh.
+    # A deck is required only for a NEW word outside every deck (Jiten reviews
+    # are shared across decks); blocked grades are grey with a hover reason.
+    assert "memberships?.length === 0 && normalizeState(card) === 'new'" in source
+    assert "New word: choose a deck to add it to" in source
+    assert "studyReviewBlockReason({...current, pendingReview:false}, deck)" in source
+    assert "aria-disabled" in source and "is-unavailable" in source
 
 
 def test_card_media_upload_uses_jiten_api_key_auth(

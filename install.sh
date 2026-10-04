@@ -1,4 +1,8 @@
 #!/bin/zsh
+# Accept explicit bash/sh invocations before evaluating zsh-only expansions.
+if [ -z "${ZSH_VERSION:-}" ]; then
+  exec /bin/zsh "$0" "$@"
+fi
 set -euo pipefail
 
 PROJECT_DIR="${0:A:h}"
@@ -63,10 +67,21 @@ for formula in mpv ffmpeg alass sevenzip aria2 python@3.12 python-tk@3.12; do
   fi
 done
 
+# End-user installs use a bounded offline check. Developers can explicitly
+# request the full source suite; CI and release builds already run it.
+if [[ "${PUDGE_INSTALL_FULL_TESTS:-0}" == "1" ]]; then
+  if ! command -v node >/dev/null 2>&1; then
+    brew install node
+  fi
+  python3.12 "$PROJECT_DIR/pudge/install_checks.py" --full-suite
+else
+  python3.12 "$PROJECT_DIR/pudge/install_checks.py"
+fi
+
 # Product renames are migrations, not fresh installs. Move the old default
 # config/data/cache/library locations before reading config so a branding
 # change never creates an empty second installation.
-python3.12 "$PROJECT_DIR/scripts/migrations/legacy_anime_mpv.py" paths \
+python3.12 "$PROJECT_DIR/pudge/legacy_install.py" paths \
   --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
   --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}"
 
@@ -98,6 +113,66 @@ if (( UPDATE_MODE )) && [[ -x "$VENV_DIR/bin/python" ]]; then
   FAST_UPDATE=1
   echo "Fast update: preserving the existing runtime environment."
 fi
+
+if [[ -x "$VENV_DIR/bin/python" ]]; then
+# Request the same AppKit termination path as Cmd+Q; abort if cleanup cannot finish.
+# Never clear the crash marker or replace a bundle while its owner is still alive.
+"$VENV_DIR/bin/python" - "$APP_BUNDLE_ID" "${LEGACY_BUNDLE_IDS[@]}" <<'PUDGE_GRACEFUL_QUIT'
+import sys, time
+from AppKit import NSRunningApplication
+apps = []
+for bundle_id in dict.fromkeys(value for value in sys.argv[1:] if value):
+    apps.extend(NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id))
+for app in apps:
+    app.terminate()
+deadline = time.monotonic() + 30
+while any(not app.isTerminated() for app in apps):
+    if time.monotonic() >= deadline:
+        raise SystemExit("Pudge is still shutting down. Quit it with Cmd+Q and rerun the installer.")
+    time.sleep(0.1)
+PUDGE_GRACEFUL_QUIT
+
+fi
+
+# A source/CLI window may not have the native bundle identifier. Keep its
+# session marker intact and refuse replacement until that window quits too.
+python3.12 - "$DATA_DIR/app-session.json" <<'PUDGE_SESSION_GUARD'
+import json, os, subprocess, sys, time
+from pathlib import Path
+try:
+    marker = json.loads(Path(sys.argv[1]).read_text())
+    pid = int(marker.get("pid") or 0)
+except (OSError, ValueError, TypeError, AttributeError):
+    pid = 0
+if pid > 0:
+    active = False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # A reused PID belonging to another user is not our session. If its
+        # identity cannot be checked, keep the conservative active-session guard.
+        active = True
+    else:
+        active = True
+    if active:
+        try:
+            started_at = float(marker.get("started_at") or 0)
+            if started_at > 0:
+                result = subprocess.run(
+                    ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                    capture_output=True, text=True, timeout=3, check=False,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    process_start = time.mktime(time.strptime(result.stdout.strip(), "%a %b %d %H:%M:%S %Y"))
+                    active = process_start <= started_at + 2
+        except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
+            pass
+    if active:
+        raise SystemExit("A Pudge session is still active. Quit its window with Cmd+Q before installing.")
+PUDGE_SESSION_GUARD
 
 UPDATE_PACKAGE_BACKUP="$DATA_DIR/update-package-backup"
 UPDATE_SITE_PACKAGES=""
@@ -276,6 +351,20 @@ with zipfile.ZipFile(wheel) as archive:
             raise SystemExit(f"Installer error: stale runtime file after wheel install: {installed}")
 PYWHEELVERIFY
 
+# Record this installation in the imported runtime, after wheel verification.
+"$VENV_DIR/bin/python" -I - <<'PYBUILDSTAMP'
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+import pudge
+path = Path(pudge.__file__).resolve().parent / "build-info.json"
+if path.is_file():
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["installed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print("Installed build:", payload["id"], payload["installed_at"])
+PYBUILDSTAMP
+
 if (( MANGA_OCR_WAS_INSTALLED && ! FAST_UPDATE )); then
   echo "Restoring MangaOCR..."
   "$VENV_DIR/bin/python" -m pip install --upgrade "manga-ocr>=0.1.14,<1"
@@ -323,7 +412,7 @@ fi
 
 # Rewrite only old *default* branded paths/category values. Custom user paths
 # are left intact. This runs after the physical folder migration above.
-python3.12 "$PROJECT_DIR/scripts/migrations/legacy_anime_mpv.py" config \
+python3.12 "$PROJECT_DIR/pudge/legacy_install.py" config \
   --app-name "$APP_NAME" --app-slug "$APP_SLUG" \
   --legacy-names "${APP_LEGACY_NAMES:-}" --legacy-slugs "${APP_LEGACY_SLUGS:-}" \
   --config "$CONFIG_PATH"
@@ -402,6 +491,7 @@ sevenzip_bin = json.dumps(os.environ["SEVENZIP_BIN"])
 aria2_bin = json.dumps(os.environ["ARIA2_BIN"])
 
 template = r"""#import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <UserNotifications/UserNotifications.h>
 #include <Python.h>
 #include <stdlib.h>
@@ -492,6 +582,7 @@ int main(int argc, char *argv[]) {
         if (argc < 4) {
             return 2;
         }
+        [NSApplication.sharedApplication setActivationPolicy:NSApplicationActivationPolicyProhibited];
         return send_notification(argv[2], argv[3]);
     }
 
@@ -582,6 +673,7 @@ PYTHON_EMBED_LDFLAGS="$($PYTHON_CONFIG --embed --ldflags)"
   -fobjc-arc \
   -fblocks \
   ${=PYTHON_EMBED_CFLAGS} \
+  -framework AppKit \
   -framework Foundation \
   -framework UserNotifications \
   "$LAUNCHER_SOURCE" \
@@ -655,18 +747,6 @@ if [[ -f "$ICON_SOURCE" ]]; then
   fi
 fi
 
-# Replacement is complete before the working app is touched.
-# The installer is an intentional shutdown, not a crash. Remove the runtime
-# session marker before terminating an existing app so the replacement does
-# not enter Safe Mode on its first launch.
-rm -f "$DATA_DIR/app-session.json"
-pkill -f "pudge.cli --app" >/dev/null 2>&1 || true
-pkill -f "pudge.app_entry" >/dev/null 2>&1 || true
-for app_name in "$APP_NAME" "${LEGACY_NAMES[@]}"; do
-  [[ -z "$app_name" ]] && continue
-  pkill -f "$APP_DIR/$app_name.app/Contents/MacOS/$app_name" >/dev/null 2>&1 || true
-done
-sleep 1
 
 for legacy_name in "${LEGACY_NAMES[@]}"; do
   [[ -z "$legacy_name" || "$legacy_name" == "$APP_NAME" ]] && continue
@@ -771,16 +851,11 @@ PYINSTALLSOURCE
 
 "$LSREGISTER" -f "$APP_PATH" >/dev/null 2>&1 || true
 
-# Keep old Dock pins functional after a visible rename. The compatibility app
-# links are hidden in Finder, while LaunchServices/Dock resolve them to the new
-# bundle and read its new CFBundleDisplayName.
-for legacy_name in "${LEGACY_NAMES[@]}"; do
-  [[ -z "$legacy_name" || "$legacy_name" == "$APP_NAME" ]] && continue
-  legacy_app="$APP_DIR/$legacy_name.app"
-  rm -rf "$legacy_app"
-  ln -s "$APP_PATH" "$legacy_app"
-  chflags hidden "$legacy_app" >/dev/null 2>&1 || true
-done
+# Update old Dock pins to the canonical bundle, then retire only compatibility
+# symlinks that point there. Hidden .app links can become extra search entries.
+"$VENV_DIR/bin/python" "$PROJECT_DIR/pudge/mac_app_aliases.py" \
+  "$APP_PATH" "$APP_BUNDLE_ID" "${LEGACY_NAMES[@]}" || \
+  echo "Installed successfully; old Dock aliases could not be refreshed." >&2
 killall Dock >/dev/null 2>&1 || true
 
 if [[ ! -d "/Applications/qbittorrent.app" && ! -d "/Applications/qBittorrent.app" ]] && ! brew list --cask qbittorrent >/dev/null 2>&1; then

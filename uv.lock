@@ -18,6 +18,12 @@ required-markers = [
 ]
 
 [[package]]
+name = "anitopy"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/8b/3da3f8ba73b8e4e5325a9ecbd6780f4dc9f41c98cc1c6a897800c4f85979/anitopy-2.1.1.tar.gz", hash = "sha256:515b97cd78917ee406313f4eb53bdc75e8a573e6ad5252ffd355c96a06988e26", size = 20890, upload-time = "2022-07-24T10:24:27.23Z" }
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -791,9 +797,10 @@ sdist = { url = "https://files.pythonhosted.org/packages/f2/cf/77d3e19b7fabd0389
 
 [[package]]
 name = "pudge"
-version = "0.7.29"
+version = "0.7.30"
 source = { editable = "." }
 dependencies = [
+    { name = "anitopy" },
     { name = "charset-normalizer" },
     { name = "httpx" },
     { name = "pillow" },
@@ -828,6 +835,7 @@ sync = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anitopy", specifier = ">=2.1.1,<3" },
     { name = "charset-normalizer", specifier = ">=3.3,<4" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=7,<8" },
     { name = "ffsubsync", marker = "extra == 'sync'", specifier = ">=0.4.31,<0.5" },
