@@ -9,7 +9,10 @@ import pytest
 
 from pudge.updater import AppUpdater
 
+requires_zsh = pytest.mark.skipif(not Path("/bin/zsh").exists(), reason="the generated macOS updater runs under /bin/zsh")
 
+
+@requires_zsh
 @pytest.mark.parametrize('installer_status', [0, 73])
 def test_downloaded_update_source_is_removed_after_installer_exit(tmp_path, monkeypatch, installer_status):
     updater = AppUpdater()

@@ -8,10 +8,14 @@ from types import SimpleNamespace
 import pytest
 from pudge.updater import AppUpdater
 
+requires_zsh = pytest.mark.skipif(not Path("/bin/zsh").exists(), reason="the generated macOS updater runs under /bin/zsh")
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def run_update_scenario(tmp_path, monkeypatch, *, source_exits):
+    if not Path("/bin/zsh").exists():
+        pytest.skip("the generated macOS updater runs under /bin/zsh")
     # Real generated shell, real owned/unrelated processes, harmless installer.
     popen = subprocess.Popen
     owned = popen([sys.executable, "-c", "import time;time.sleep(60)"])
@@ -52,10 +56,12 @@ def run_update_scenario(tmp_path, monkeypatch, *, source_exits):
             process.wait(timeout=3)
 
 
+@requires_zsh
 def test_generated_installer_runs_after_owned_exit_and_preserves_unrelated(tmp_path,monkeypatch):
     run_update_scenario(tmp_path,monkeypatch,source_exits=True)
 
 
+@requires_zsh
 def test_generated_installer_refuses_live_source_without_killing_it(tmp_path,monkeypatch):
     run_update_scenario(tmp_path,monkeypatch,source_exits=False)
 

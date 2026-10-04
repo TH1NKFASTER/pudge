@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -41,5 +43,7 @@ def test_updater_uses_fast_installer_with_sanitized_environment(tmp_path,monkeyp
     assert '"if ! /bin/zsh ./install.sh --update; then"' in updater
     assert '"unset TCL_LIBRARY TK_LIBRARY TCLLIBPATH PYTHONHOME PYTHONPATH PYTHONEXECUTABLE"' in updater
 
+    if not Path("/bin/zsh").exists():
+        pytest.skip("the generated macOS updater runs under /bin/zsh")
     from test_v16_updater_script import run_update_scenario
     run_update_scenario(tmp_path,monkeypatch,source_exits=True)
