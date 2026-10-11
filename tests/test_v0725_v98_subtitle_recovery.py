@@ -51,9 +51,7 @@ def test_subtitle_invalidation_clears_stale_candidate_fingerprint(tmp_path: Path
     assert row.subtitle_path is None
 
 
-def test_play_uses_history_subtitle_on_same_recovery_launch(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_play_uses_history_subtitle_on_same_recovery_launch(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     video = (manager.config.library.root_dir / "episode.mkv").resolve()
     subtitle = (tmp_path / "prepared.srt").resolve()

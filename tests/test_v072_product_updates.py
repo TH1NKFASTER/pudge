@@ -1,15 +1,33 @@
+"""The in-app updater (release and development channels), Jiten stats for Planning, the
+AniList character glossary and manga cover links (behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from source_policy import source
+from t71g01_support import (
+    MacSim,
+    Recorder,
+    launch_update,
+    load_workflow,
+    release_history,
+    run_step,
+    source_history,
+    workflow_step,
+)
 
 from pudge.config import AppConfig
 from pudge.light_novels import LightNovelService
 from pudge.updater import AppUpdater, UpdateError, _version_key
+from pudge.web_app import WebAppApi
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -159,22 +177,28 @@ def test_release_archive_rejects_path_traversal(tmp_path: Path) -> None:
         AppUpdater._extract_archive(archive, tmp_path / "extract", "0.7.2")
 
 
-def test_update_installer_script_keeps_a_rollback_bundle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_update_script_keeps_a_rollback_copy_of_the_app_while_the_installer_runs(
+    tmp_path: Path, monkeypatch
 ) -> None:
+    sim = MacSim(tmp_path / "mac")
+    (sim.app / "Contents/MacOS").mkdir(parents=True)
+    (sim.app / "Contents/MacOS/pudge").write_text("working app\n", encoding="utf-8")
     project = tmp_path / "checkout"
     project.mkdir()
-    (project / "install.sh").write_text("#!/bin/zsh\n", encoding="utf-8")
-    updater = AppUpdater()
-    updater.update_root = tmp_path / "updates"
-    updater.log_path = tmp_path / "update.log"
-    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: object())
-    updater._launch_script(project, [])
-    script = (tmp_path / "run-pudge-update.zsh").read_text(encoding="utf-8")
-    assert ".app.before-update" in script
-    assert "/usr/bin/ditto" in script
-    assert "if ! /bin/zsh ./install.sh --update; then" in script
-    assert "/bin/mv" in script
+    rollback = sim.base / "updates/rollback/pudge.app.before-update"
+    # The installer sees a complete copy of the app it is about to replace.
+    (project / "install.sh").write_text(
+        "line=\"installer$(printf '\\t')$(cat '" + str(rollback) + "/Contents/MacOS/pudge')\"\n"
+        'printf \'%s\\n\' "$line" >> "$MACSIM_LOG"\n',
+        encoding="utf-8",
+    )
+    result = sim.run(launch_update(sim, project, monkeypatch), cwd=sim.base)
+    assert result.returncode == 0, (sim.base / "update.log").read_text(encoding="utf-8")
+    assert result.calls("ditto") == [[str(sim.app), str(rollback)]]
+    assert result.calls("installer") == [["working app"]]
+    # A successful update drops the copy and reopens the app; the checkout stays.
+    assert not rollback.exists() and project.is_dir()
+    assert result.calls("open") == [["-n", str(sim.app)]]
 
 
 def test_jiten_finished_media_uses_exact_anilist_link_and_private_coverage(
@@ -203,9 +227,7 @@ def test_jiten_finished_media_uses_exact_anilist_link_and_private_coverage(
                 {
                     "deckId": 42,
                     "originalTitle": "葬送のフリーレン",
-                    "links": [
-                        {"linkType": 4, "url": "https://anilist.co/anime/154587"}
-                    ],
+                    "links": [{"linkType": 4, "url": "https://anilist.co/anime/154587"}],
                 }
             ]
         }
@@ -250,7 +272,7 @@ def test_anilist_character_glossary_includes_unambiguous_short_names(
                                     "full": "Kazuto Kirigaya",
                                     "native": "桐ヶ谷 和人",
                                     "alternative": ["キリト"],
-                                }
+                                },
                             }
                         }
                     ]
@@ -258,9 +280,7 @@ def test_anilist_character_glossary_includes_unambiguous_short_names(
             }
         },
     )
-    glossary = {
-        item["source"]: item["preferred"] for item in service.character_glossary(11757)
-    }
+    glossary = {item["source"]: item["preferred"] for item in service.character_glossary(11757)}
     assert glossary["桐ヶ谷 和人"] == "Kazuto Kirigaya"
     assert glossary["桐ヶ谷"] == "Kirigaya"
     assert glossary["和人"] == "Kazuto"
@@ -269,18 +289,187 @@ def test_anilist_character_glossary_includes_unambiguous_short_names(
     assert all(item.get("character_id") == 1234 for item in rows)
 
 
-def test_update_jiten_and_manga_cover_frontend_contracts() -> None:
-    root = Path(__file__).parents[1]
-    html = (root / "pudge/web/index.html").read_text(encoding="utf-8")
-    manga = (root / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    app = (root / "pudge/web_app.py").read_text(encoding="utf-8")
-    installer = (root / "install.sh").read_text(encoding="utf-8")
-    release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
-    assert 'id="checkAppUpdate"' in html
-    assert "app_update_install" in html and "app_update_progress" in app
-    assert "planning_jiten_stats" in html and "planning_jiten_stats" in app
-    assert 'data-manga-v2-action="anilist"' in manga
-    assert "install-source.json" in installer
-    assert "source_revision" in installer
-    assert '"development"' in installer and '"release"' in installer
-    assert ".sha256" in release
+def test_settings_check_and_install_an_update_and_follow_its_progress(page) -> None:
+    result = page.run(
+        r"""
+        setPage('settings'); await __tick(200);
+        await __click('[data-settings-category="advanced"]'); await __tick(10);
+        const view = () => ({status: __text('#appUpdateState'), install: __visible('#installAppUpdate'), check: $('checkAppUpdate').disabled});
+        const out = {start: view()};
+        await __click('#checkAppUpdate'); await __tick(10); out.checked = view();
+        await __click('#installAppUpdate'); await __tick(10); out.installing = view();
+        await __tick(760); out.later = view();
+        await __tick(760); out.restarting = view();
+        await __tick(3000); out.polls = __apiCalls.filter(c => c.name === 'app_update_progress').length;
+        out.texts = {available: t('update.available', {version: '9.9.9'}), downloading: t('update.downloading'),
+                     installing: t('update.installing'), restarting: t('update.restarting')};
+        return out;
+        """,
+        before=r"""
+        window.PROGRESS = [{state: 'downloading', running: true}, {state: 'installing', running: true}, {state: 'restarting', running: false}];
+        __api.app_update_status = async () => ({state: 'idle', available: true, latest_version: '9.9.9', channel: 'release'});
+        __api.app_update_install = async () => ({state: 'preparing', running: true});
+        __api.app_update_progress = async () => window.PROGRESS.shift();
+        """,
+    )
+    out, texts = result.value, result.value["texts"]
+    assert out["start"] == {"status": "", "install": False, "check": False}
+    assert out["checked"] == {"status": texts["available"], "install": True, "check": False}
+    assert result.calls_of("app_update_status") == [[True]] and result.calls_of("app_update_install") == [[]]
+    # While it runs the window polls progress (and the buttons are locked) until Pudge restarts.
+    assert out["installing"] == {"status": texts["downloading"], "install": False, "check": True}
+    assert (out["later"]["status"], out["restarting"]["status"]) == (texts["installing"], texts["restarting"])
+    assert out["polls"] == 3
+    # The window's update calls are the updater's answers.
+    api = WebAppApi.__new__(WebAppApi)
+    api.app_updater = SimpleNamespace(
+        state=lambda: {"state": "downloading"},
+        start=lambda: {"state": "preparing"},
+        check=lambda force: {"forced": force},
+    )
+    assert (api.app_update_progress(), api.app_update_install(), api.app_update_status(True)) == (
+        {"state": "downloading"},
+        {"state": "preparing"},
+        {"forced": True},
+    )
+
+
+def test_finished_planning_titles_show_jiten_stats_when_they_come_into_view(
+    page, tmp_path: Path, monkeypatch
+) -> None:
+    anime = {
+        "media_id": 154587,
+        "title": "Frieren",
+        "titles": ["Sousou no Frieren"],
+        "synonyms": ["葬送のフリーレン"],
+        "format": "TV",
+        "media_status": "FINISHED",
+        "media_kind": "anime",
+        "site_url": "https://anilist.co/anime/154587",
+    }
+    stats = {
+        "available": True,
+        "difficulty": 3,
+        "speech_duration_ms": 7_200_000,
+        "word_count": 50000,
+        "unique_word_count": 7100,
+        "coverage_available": True,
+        "known_coverage": 87.25,
+        "url": "https://jiten.moe/decks/media/42/detail",
+    }
+    result = page.run(
+        r"""
+        setPage('planned'); await __tick(200);
+        const before = __apiCalls.filter(c => c.name === 'planning_jiten_stats').length;
+        for (const o of __observers.intersection.filter(o => !o.disconnected && o.targets.some(n => n.matches('[data-planned-jiten]'))))
+          o.__fire(o.targets.filter(n => n.matches('[data-planned-jiten]')).map(target => ({target})));
+        await __tick(50);
+        return {before, chips: [...document.querySelectorAll('.planned-jiten .planned-jiten-chip')].map(n => n.textContent),
+                expected: [t('uiA.jiten.difficulty', {level: t('uiA.jiten.level3')}), t('uiA.jiten.speech', {duration: jitenDuration(7200000)}),
+                           t('uiA.jiten.known', {percent: '87.3'})],
+                link: document.querySelector('.planned-jiten [data-action="url"]')?.dataset.url};
+        """,
+        state={"planned": [anime]},
+        api={"planning_jiten_stats": stats},
+    )
+    out = result.value
+    assert out["before"] == 0  # nothing is fetched for cards out of view
+    assert result.calls_of("planning_jiten_stats") == [
+        [154587, "anime", "TV", ["Frieren", "Sousou no Frieren", "葬送のフリーレン"]]
+    ]
+    assert out["chips"] == out["expected"] and out["link"] == stats["url"]
+    # The backend call the card makes exists and answers from the Light Novel service.
+    api = WebAppApi.__new__(WebAppApi)
+    seen: list[tuple] = []
+    api.light_novels = SimpleNamespace(
+        jiten_media_stats=lambda *args, **kwargs: seen.append(args) or {"available": False}
+    )
+    assert api.planning_jiten_stats(154587, "anime", "TV", ["Frieren"]) == {"available": False}
+    assert seen and seen[0][:2] == (154587, "anime")
+
+
+def test_manga_cover_opens_its_anilist_page(page) -> None:
+    result = page.run(
+        r"""
+        setPage('manga'); await __tick(300);
+        await __click('[data-cover-placeholder="21"][data-manga-v2-action="anilist"]'); await __tick(20);
+        return document.querySelectorAll('[data-cover-placeholder="22"][data-manga-v2-action]').length;
+        """,
+        api={
+            "manga_state": {
+                "books": [
+                    {
+                        "id": 21,
+                        "title": "Linked",
+                        "series_title": "Linked",
+                        "page_count": 4,
+                        "anilist_id": 30013,
+                    },
+                    {"id": 22, "title": "Unlinked", "series_title": "Unlinked", "page_count": 4},
+                ],
+                "ocr_available": False,
+            }
+        },
+    )
+    assert result.calls_of("open_url") == [["https://anilist.co/manga/30013"]]
+    assert result.value == 0  # a volume without AniList has no link on its cover
+
+
+def test_installs_record_their_channel_for_the_updater() -> None:
+    # The updater offers GitHub releases to release installs and fast-forwards to clean
+    # development checkouts; install.sh tells it which one this is.
+    release = release_history().steps["update"].records["install-source.json"]
+    assert json.loads(release) == {"channel": "release", "source_path": "", "source_revision": ""}
+    history = source_history()
+    checkout = history.projects["checkout"]
+    head = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    development = json.loads(history.steps["install"].records["install-source.json"])
+    assert development == {"channel": "development", "source_path": str(checkout), "source_revision": head}
+
+
+def test_release_publishes_the_archive_with_its_checksum(tmp_path: Path) -> None:
+    # policy: the workflow file is configuration for GitHub; its steps are run here.
+    workflow = load_workflow(source(".github/workflows/release.yml"))
+    locate = workflow_step(workflow, "build-release", "Locate archive")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    # A stray X.Y.Z.zip (the 0.7.30 layout) is not what gets published.
+    for name in ("9.8.7.zip", "pudge-macos-v9.8.7.zip"):
+        (dist / name).write_bytes(b"zip")
+        (dist / f"{name}.sha256").write_text("00  " + name + "\n")
+    found = run_step(locate, tmp_path, tools=tmp_path, env={"GITHUB_OUTPUT": str(tmp_path / "outputs")})
+    assert found.returncode == 0, found.stderr
+    assert dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines()) == {
+        "path": "dist/pudge-macos-v9.8.7.zip",
+        "checksum": "dist/pudge-macos-v9.8.7.zip.sha256",
+    }
+    # Without the checksum the release stops (the updater verifies downloads with it).
+    (dist / "pudge-macos-v9.8.7.zip.sha256").unlink()
+    assert (
+        run_step(locate, tmp_path, tools=tmp_path, env={"GITHUB_OUTPUT": str(tmp_path / "again")}).returncode
+        != 0
+    )
+    # The published release carries the archive and its checksum, nothing else.
+    calls = Recorder(tmp_path / "gh")
+    calls.tool("gh", '[ "$2" != view ] || [ -n "$EXISTS" ]\n')
+    publish = workflow_step(workflow, "build-release", "Publish GitHub Release")
+    values = {
+        "github.token": "token",
+        "steps.archive.outputs.path": "dist/pudge-macos-v9.8.7.zip",
+        "steps.archive.outputs.checksum": "dist/pudge-macos-v9.8.7.zip.sha256",
+        "github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name": "v9.8.7",
+    }
+    created = run_step(publish, tmp_path, tools=calls.bin, expressions=values, env=calls.env)
+    assert created.returncode == 0, created.stderr
+    [view, create] = calls.calls("gh")
+    assert view == ["release", "view", "v9.8.7"]
+    assert create[:6] == [
+        "release",
+        "create",
+        "v9.8.7",
+        "dist/pudge-macos-v9.8.7.zip",
+        "dist/pudge-macos-v9.8.7.zip.sha256",
+        "--title",
+    ]

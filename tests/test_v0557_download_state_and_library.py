@@ -1,15 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from css_support import css_rules
 
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode, NyaaRelease
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -83,7 +82,8 @@ def test_partial_qbittorrent_file_is_hidden_from_library_and_ready_sections(tmp_
     state = api.get_state()
 
     assert state["library"] == []
-    assert state["downloaded"] == []
+    anime_by_id = {anime.media_id: anime for anime in api.manager.db.anime_list()}
+    assert api._downloaded_payloads(anime_by_id) == []
     assert state["home"]["completed_ready"] == []
 
 
@@ -92,9 +92,7 @@ def test_scan_library_removes_stale_partial_episode_row(tmp_path: Path) -> None:
     item = partial_download(tmp_path)
     video = Path(item.content_path)
     api.manager.db.upsert_download(item)
-    api.manager.db.upsert_episode(
-        LibraryEpisode(None, "Anime", None, video, state="ready")
-    )
+    api.manager.db.upsert_episode(LibraryEpisode(None, "Anime", None, video, state="ready"))
     api.manager.db.queue_subtitle_job(video, None, None)
 
     api.manager.scan_library()
@@ -166,15 +164,64 @@ def test_existing_old_torrent_for_same_anime_blocks_second_batch(tmp_path: Path,
     assert manager.db.download_by_hash("oldhash").media_id == 119321
 
 
-def test_download_card_keeps_normal_height_and_hides_button_while_active() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    library = (HTML.parent / "library.js").read_text(encoding="utf-8")
-
-    assert ".download-available-card .cover-action { display:block; width:100%;" in html
-    assert ".download-available-card .airing-meta { height:68px; min-height:68px; }" in html
-    assert "const download=a.download||null" in html
-    assert "t('label.downloading'" in html
-    assert "compactDownloadStatus(download)" in html
-    assert "t('label.preparingDownload')" in html
-    assert "result?.already_downloading" in html
-    assert "const ep=e.episode==null?t('label.movie')" in library
+def test_download_card_keeps_normal_height_and_hides_button_while_active(tmp_path: Path, page) -> None:
+    api = make_api(tmp_path)
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=42, title="Backlog anime", status="CURRENT", episodes=12, media_status="FINISHED"
+        )
+    )
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=43, title="Other backlog", status="CURRENT", episodes=12, media_status="FINISHED"
+        )
+    )
+    api.manager.db.upsert_download(partial_download(tmp_path))
+    state = json.loads(json.dumps(api.get_state(), default=str))
+    state["settings"]["torrents_enabled"] = True
+    release = {
+        "title": "[Group] Other backlog (BD 1080p)",
+        "seeders": 9,
+        "downloads": 1,
+        "size_text": "9 GiB",
+        "group": "Group",
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            const card = id => document.querySelector(`[data-home-section="section.availableDownload"] [data-media-id="${id}"]`);
+            const look = id => ({button: card(id).querySelector('button.download-card-button')?.innerText ?? null,
+                                 state: card(id).querySelector('.download-card-state')?.innerText ?? null});
+            const download = ui.state.home.download_available.find(a => a.media_id === 42).download;
+            const out = {stale: look(42), staleExpected: compactDownloadStatus(download), idle: look(43),
+                         downloadAnime: t('action.downloadAnime')};
+            // Torrent traffic is fresh: the card says how far the download is.
+            ui.torrentTraffic = {enabled: true, stale: false, updated_at: Date.now() / 1000, transition: 'on'};
+            renderCurrent();
+            out.running = look(42);
+            out.runningExpected = t('label.downloading', {progress: 35});
+            // Downloading the other one: the backend says it is already being downloaded.
+            await __click('[data-home-section="section.availableDownload"] [data-media-id="43"] button.download-card-button');
+            await __tick(10);
+            await __click('#modalBody [data-action="download-release"]');
+            await __tick(10);
+            out.toast = __toasts().at(-1);
+            out.already = t('toast.alreadyDownloading');
+            return out;
+            """,
+            lang=lang,
+            state=state,
+            api={"search_releases": [release], "add_release": {"already_downloading": True}},
+        )
+        out = result.value
+        assert out["idle"] == {"button": out["downloadAnime"], "state": None}
+        assert out["stale"] == {"button": None, "state": out["staleExpected"]}
+        assert out["running"] == {"button": None, "state": out["runningExpected"]}
+        assert result.calls_of("add_release") == [[43, None, True, release]]
+        assert out["toast"] == out["already"]
+    # The state label replaces the button without changing the card's height.
+    rules = css_rules("index.html")
+    assert rules.get(".download-available-card .airing-meta", "height") == "68px"
+    assert rules.get(".download-available-card .airing-meta", "min-height") == "68px"
+    assert rules.get(".download-available-card .cover-action", "display") == "block"
+    assert rules.get(".download-available-card .cover-action", "width") == "100%"

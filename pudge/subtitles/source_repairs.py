@@ -25,9 +25,7 @@ _BLEACH_E45_OPENING_TEXT = (
 )
 
 
-def _matches_bleach_e45(
-    *, media_id: int | None, episode: int | None, candidate_name: str
-) -> bool:
+def _matches_bleach_e45(*, media_id: int | None, episode: int | None, candidate_name: str) -> bool:
     return (
         media_id == _BLEACH_E45_MEDIA_ID
         and episode == _BLEACH_E45_EPISODE
@@ -74,9 +72,7 @@ def apply_known_source_repair(
 
     if subtitle.suffix.casefold() != ".srt" or not subtitle.is_file():
         return subtitle, {"applied": False, "reason": "unsupported_or_missing"}
-    if not _matches_bleach_e45(
-        media_id=media_id, episode=episode, candidate_name=candidate_name
-    ):
+    if not _matches_bleach_e45(media_id=media_id, episode=episode, candidate_name=candidate_name):
         return subtitle, {"applied": False, "reason": "no_matching_rule"}
     if timing_reference is None or not timing_reference.is_file():
         return subtitle, {"applied": False, "reason": "timing_reference_missing"}
@@ -94,8 +90,7 @@ def apply_known_source_repair(
         return subtitle, {"applied": False, "reason": "reference_signature_mismatch"}
 
     repaired_opening = [
-        (float(ref[0]), float(ref[1]), text)
-        for ref, text in zip(reference_opening, _BLEACH_E45_OPENING_TEXT)
+        (float(ref[0]), float(ref[1]), text) for ref, text in zip(reference_opening, _BLEACH_E45_OPENING_TEXT)
     ]
     cutoff = 60.0
     retained = [cue for cue in source_cues if cue[0] >= cutoff]

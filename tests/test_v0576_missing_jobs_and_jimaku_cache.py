@@ -35,9 +35,7 @@ def stub_regular_maintenance(monkeypatch, manager: AnimeManager) -> None:
     monkeypatch.setattr(manager, "enforce_disk_limit", lambda: 0)
 
 
-def test_manual_refresh_recreates_missing_job_from_waiting_library_row(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_manual_refresh_recreates_missing_job_from_waiting_library_row(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
     stub_regular_maintenance(monkeypatch, manager)
     video = manager.config.library.root_dir / "Mushoku Tensei III - 06.mkv"
@@ -71,9 +69,7 @@ def test_manual_refresh_recreates_missing_job_from_waiting_library_row(
     assert job["episode"] == 6
 
 
-def test_manual_refresh_recovers_processing_job_before_lease_expires(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_manual_refresh_recovers_processing_job_before_lease_expires(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
     stub_regular_maintenance(monkeypatch, manager)
     video = manager.config.library.root_dir / "Mushoku Tensei III - 06.mkv"

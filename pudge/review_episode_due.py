@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Any
 from .media import TEXT_CODECS, find_embedded_japanese_subtitles, probe_media
 from .models import EmbeddedSubtitle
 from .subtitle_formats import convert_to_plain_srt, parse_srt
-
+from .i18n import err
 
 
 def resolve_episode_review_subtitle(
@@ -35,7 +37,7 @@ def resolve_episode_review_subtitle(
 
     video = Path(video_path).expanduser()
     if not video.is_file():
-        raise FileNotFoundError(f"Episode video is unavailable: {video}")
+        raise FileNotFoundError(err("review.episodeVideoMissing", video=video))
 
     selected: EmbeddedSubtitle | None = None
     # The library's stored mpv sid is already the track Pudge selected for
@@ -46,7 +48,8 @@ def resolve_episode_review_subtitle(
         try:
             info = probe_media(video, str(ffprobe_path or "ffprobe"))
             streams = [
-                row for row in (info.get("streams") or [])
+                row
+                for row in (info.get("streams") or [])
                 if isinstance(row, dict) and row.get("codec_type") == "subtitle"
             ]
             sid = int(embedded_subtitle_id)
@@ -63,7 +66,13 @@ def resolve_episode_review_subtitle(
                         title=str(tags.get("title") or ""),
                         score=1000.0,
                     )
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - fall back to a full subtitle scan
+            logging.getLogger(__name__).info(
+                "FALLBACK step=review_gate.episode_due.stored_sid video=%r sid=%s error=%r",
+                str(video),
+                embedded_subtitle_id,
+                exc,
+            )
             selected = None
 
     if selected is None:
@@ -76,12 +85,8 @@ def resolve_episode_review_subtitle(
         ]
         if not candidates:
             if embedded_subtitle_id is not None:
-                raise ValueError(
-                    "The episode has embedded subtitles, but no Japanese text subtitle track can be extracted for review."
-                )
-            raise FileNotFoundError(
-                "This episode has no prepared external or embedded Japanese text subtitles, so Pudge cannot determine its due words."
-            )
+                raise ValueError(err("review.embeddedNoText"))
+            raise FileNotFoundError(err("review.noPreparedSubtitles"))
         selected = next(
             (item for item in candidates if item.subtitle_id == embedded_subtitle_id),
             candidates[0],
@@ -106,9 +111,7 @@ def resolve_episode_review_subtitle(
             "codec": selected.codec,
         }
 
-    handle = tempfile.NamedTemporaryFile(
-        prefix=f".{digest}.", suffix=".srt", dir=output_dir, delete=False
-    )
+    handle = tempfile.NamedTemporaryFile(prefix=f".{digest}.", suffix=".srt", dir=output_dir, delete=False)
     temporary = Path(handle.name)
     handle.close()
     try:
@@ -135,12 +138,13 @@ def resolve_episode_review_subtitle(
         if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 0:
             detail = str(completed.stderr or completed.stdout or "").strip()[-800:]
             raise ValueError(
-                "Could not extract the embedded Japanese text subtitles"
-                + (f": {detail}" if detail else "")
+                err("review.embeddedExtractFailed", error=detail)
+                if detail
+                else err("review.embeddedExtractFailedPlain")
             )
         temporary.replace(output)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ValueError(f"Could not extract the embedded Japanese text subtitles: {exc}") from exc
+        raise ValueError(err("review.embeddedExtractFailed", error=exc)) from exc
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -152,6 +156,7 @@ def resolve_episode_review_subtitle(
         "subtitle_id": selected.subtitle_id,
         "codec": selected.codec,
     }
+
 
 def _pair(item: dict[str, Any]) -> tuple[int, int] | None:
     try:
@@ -188,6 +193,37 @@ def _definitions(item: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+_KANJI_RUN = re.compile(r"([\u3400-\u9fff々〆]+)")
+
+
+def _hiragana(text: str) -> str:
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in text)
+
+
+def _bracket_ruby(spelling: str, reading: str) -> str:
+    """Jiten bracket ruby (選[えら]ぶ, 取[と]り扱[あつか]う) of a spelling and its kana reading.
+
+    Each kanji run gets its part of the reading; when spelling and reading cannot be
+    aligned, the plain spelling (kanji without furigana) is returned.
+    """
+    if not spelling or not reading or not _KANJI_RUN.search(spelling):
+        return spelling or reading
+    parts = [part for part in _KANJI_RUN.split(spelling) if part]
+    pattern = "".join("(.+?)" if _KANJI_RUN.fullmatch(part) else re.escape(_hiragana(part)) for part in parts)
+    match = re.fullmatch(pattern, _hiragana(reading))
+    if not match:
+        return spelling
+    out, group = [], 0
+    for part in parts:
+        if _KANJI_RUN.fullmatch(part):
+            group += 1
+            low, high = match.span(group)
+            out.append(f"{part}[{reading[low:high]}]")
+        else:
+            out.append(part)
+    return "".join(out)
+
+
 def _media_image_url(media: dict[str, Any] | None) -> str:
     if not isinstance(media, dict):
         return ""
@@ -208,48 +244,75 @@ def build_episode_due_review_cards(
     word is currently due. The first subtitle cue containing a card becomes its
     local context sentence. No new Jiten cards are created.
     """
+    cue_rows, digest, conversion = _episode_cue_rows(subtitle_path, cache_dir)
+    if not cue_rows:
+        return {"cards": [], "episode_pairs": 0, "due_pairs": 0, "conversion": conversion}
+    return _build_cue_due_review_cards(service, cue_rows, digest, conversion)
+
+
+def _episode_cue_rows(subtitle_path: Path, cache_dir: Path) -> tuple[list, str, dict[str, Any]]:
+    """Non-empty subtitle lines (start, end, text) and the parse-cache digest of the file."""
     subtitle = Path(subtitle_path).expanduser()
     if not subtitle.is_file():
-        raise FileNotFoundError(f"Subtitle file is unavailable: {subtitle}")
+        raise FileNotFoundError(err("review.subtitleMissing", subtitle=subtitle))
 
     plain_path, conversion = convert_to_plain_srt(
         subtitle,
         Path(cache_dir).expanduser() / "review_gate",
     )
     if plain_path.suffix.casefold() != ".srt":
-        raise ValueError(
-            "Episode subtitles could not be converted to plain SRT for Jiten parsing"
-        )
+        raise ValueError(err("review.srtConversionFailed"))
     cues = parse_srt(plain_path)
     cue_rows = [
         (float(start), float(end), " ".join(str(text or "").split()).strip())
         for start, end, text in cues
         if " ".join(str(text or "").split()).strip()
     ]
-    if not cue_rows:
-        return {"cards": [], "episode_pairs": 0, "due_pairs": 0, "conversion": conversion}
-
     stat = plain_path.stat()
     digest = hashlib.sha256(
-        (
-            f"review-gate-episode-v1:{plain_path.resolve()}:"
-            f"{stat.st_size}:{stat.st_mtime_ns}"
-        ).encode("utf-8")
+        (f"review-gate-episode-v1:{plain_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}").encode("utf-8")
     ).hexdigest()
-    return _build_cue_due_review_cards(service, cue_rows, digest, conversion)
+    return cue_rows, digest, conversion
+
+
+def episode_cue_words(service: Any, subtitle_path: Path, cache_dir: Path) -> list[list[Any]]:
+    """Statistics: each subtitle line as [start, end, [[wordId, readingIndex], ...]].
+
+    Shares the review gate's parse of the same file (one Jiten parse per episode,
+    background priority)."""
+    cue_rows, digest, _conversion = _episode_cue_rows(subtitle_path, cache_dir)
+    if not cue_rows:
+        return []
+    parsed = service.jiten_preparse("\n".join(row[2] for row in cue_rows), digest=digest, interactive=False)
+    token_rows = parsed.get("tokens") if isinstance(parsed, dict) else None
+    if not isinstance(token_rows, list) or len(token_rows) != len(cue_rows):
+        raise ValueError(err("review.jitenParseIncomplete"))
+    result: list[list[Any]] = []
+    for (start, end, _text), tokens in zip(cue_rows, token_rows):
+        pairs = [p for p in (_pair(t) for t in tokens or [] if isinstance(t, dict)) if p is not None]
+        result.append([round(start, 3), round(end, 3), [list(pair) for pair in pairs]])
+    return result
 
 
 def build_text_due_review_cards(service: Any, text: str, revision: str) -> dict[str, Any]:
-    rows = [(float(i), float(i + 1), line.strip()) for i, line in enumerate(text.splitlines()) if line.strip()]
+    rows = [
+        (float(i), float(i + 1), line.strip()) for i, line in enumerate(text.splitlines()) if line.strip()
+    ]
     return _build_cue_due_review_cards(service, rows, revision, {})
 
 
-def _build_cue_due_review_cards(service: Any, cue_rows: list, digest: str, conversion: dict) -> dict[str, Any]:
+def _build_cue_due_review_cards(
+    service: Any, cue_rows: list, digest: str, conversion: dict
+) -> dict[str, Any]:
     parsed = service.jiten_preparse("\n".join(row[2] for row in cue_rows), digest=digest)
     token_rows = parsed.get("tokens") if isinstance(parsed, dict) else None
     vocabulary = parsed.get("vocabulary") if isinstance(parsed, dict) else None
-    if not isinstance(token_rows, list) or len(token_rows) != len(cue_rows) or not isinstance(vocabulary, list):
-        raise ValueError("Jiten did not return a complete content parse; retry review preparation")
+    if (
+        not isinstance(token_rows, list)
+        or len(token_rows) != len(cue_rows)
+        or not isinstance(vocabulary, list)
+    ):
+        raise ValueError(err("review.jitenParseIncomplete"))
 
     context: dict[tuple[int, int], dict[str, Any]] = {}
     order: list[tuple[int, int]] = []
@@ -293,15 +356,19 @@ def _build_cue_due_review_cards(service: Any, cue_rows: list, digest: str, conve
             pair = _pair(state)
             if pair is not None:
                 if state.get("stale") or state.get("knowledgeStatus") == "stale_live_state_cache":
-                    raise ValueError("Jiten word states are stale; retry review preparation")
+                    raise ValueError(err("review.jitenStatesStale"))
                 live_by_pair[pair] = state
 
     missing = set(order) - set(live_by_pair)
     if missing:
-        raise ValueError("Jiten did not return a state for every content word; retry review preparation")
-    unknown_words = [dict(vocab_by_pair.get(pair, {}), wordId=pair[0], readingIndex=pair[1])
-                     for pair in order if str(live_by_pair[pair].get("normalizedState") or "").casefold() in {"new", "unknown"}
-                     or "new" in (live_by_pair[pair].get("states") or [])]
+        raise ValueError(err("review.jitenStatesIncomplete"))
+    unknown_words = [
+        dict(vocab_by_pair.get(pair, {}), wordId=pair[0], readingIndex=pair[1])
+        for pair in order
+        if str(live_by_pair[pair].get("normalizedState") or "").casefold()
+        in {"new", "not_in_deck", "unknown"}
+        or "new" in (live_by_pair[pair].get("states") or [])
+    ]
     due_pairs = [pair for pair in order if _is_due(live_by_pair.get(pair, {}))]
     media_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
     if due_pairs and hasattr(service, "jiten_card_media"):
@@ -326,12 +393,18 @@ def _build_cue_due_review_cards(service: Any, cue_rows: list, digest: str, conve
             "wordText": word_text,
             "wordTextPlain": word_text,
             "reading": reading,
-            "readings": ([{
-                "text": reading,
-                "rubyText": reading,
-                "readingIndex": reading_index,
-                "formType": 0,
-            }] if reading else []),
+            "readings": (
+                [
+                    {
+                        "text": reading,
+                        "rubyText": _bracket_ruby(spelling, reading) if spelling else reading,
+                        "readingIndex": reading_index,
+                        "formType": 0,
+                    }
+                ]
+                if reading
+                else []
+            ),
             "definitions": _definitions(item),
             "partsOfSpeech": list(item.get("partsOfSpeech") or []),
             "pitchAccents": list(item.get("pitchAccents") or []),

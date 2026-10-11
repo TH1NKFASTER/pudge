@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
 from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime
+from test_v0614_preloaded_watch_order_render import OPEN, watch_order_backend
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -52,12 +54,8 @@ def graph_payload(root_id: int) -> dict:
 
 def test_full_graph_is_shared_between_all_component_entries(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=10, title="Season 1", status="CURRENT", episodes=12)
-    )
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=20, title="Season 2", status="PLANNING", episodes=12)
-    )
+    manager.db.upsert_anime(LibraryAnime(media_id=10, title="Season 1", status="CURRENT", episodes=12))
+    manager.db.upsert_anime(LibraryAnime(media_id=20, title="Season 2", status="PLANNING", episodes=12))
     calls: list[int] = []
 
     class FakeClient:
@@ -176,10 +174,37 @@ def test_startup_anilist_sync_uses_compact_list_and_preserves_relations(
     assert stored.relations[0]["media_id"] == 10
 
 
-def test_watch_order_modal_has_component_refresh_button() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "refresh_relation_graph" in html
-    assert 'data-action="refresh-watch-order"' in html
-    assert "action.refreshWatchOrder" in html
+def test_watch_order_modal_has_component_refresh_button(tmp_path: Path, monkeypatch, page) -> None:
+    backend = watch_order_backend(tmp_path, monkeypatch)
+    for lang in ("en", "ru"):
+        result = page.run(
+            OPEN
+            + """
+            await __tick(100);
+            const button = () => body.querySelector('[data-action="refresh-watch-order"]');
+            const out = {before: {label: button().innerText, enabled: !button().disabled, nodes: nodes()},
+                         labels: [t('action.refreshWatchOrder'), t('action.refreshing')]};
+            await __click('[data-action="refresh-watch-order"]');
+            out.during = {label: button().innerText, enabled: !button().disabled};
+            answer();
+            await __tick(20);
+            out.after = {label: button().innerText, enabled: !button().disabled, nodes: nodes()};
+            return out;
+            """,
+            lang=lang,
+            state=backend["state"],
+            api={"get_relation_graph_cache": backend["cache"]},
+            before="__api.refresh_relation_graph = () => new Promise(resolve => { window.answer = () => resolve(GRAPH); });".replace(
+                "GRAPH", json.dumps(backend["refreshed"])
+            ),
+        )
+        out = result.value
+        refresh, refreshing = out["labels"]
+        assert out["before"] == {"label": refresh, "enabled": True, "nodes": ["Season 1", "Season 2"]}
+        assert out["during"] == {"label": refreshing, "enabled": False}
+        assert out["after"] == {
+            "label": refresh,
+            "enabled": True,
+            "nodes": ["Season 1", "Season 2", "Season 3"],
+        }
+        assert result.calls_of("refresh_relation_graph") == [[20]]  # the whole component, from this entry

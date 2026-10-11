@@ -32,10 +32,7 @@ def merge_activity_regions(
             merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
-    return [
-        {"start": round(start, 3), "end": round(end, 3)}
-        for start, end in merged
-    ]
+    return [{"start": round(start, 3), "end": round(end, 3)} for start, end in merged]
 
 
 def gate_activity_regions(
@@ -218,6 +215,7 @@ def analyze_audio_activity(
     timed_out = threading.Event()
     watchdog: threading.Timer | None = None
     if timeout is not None and float(timeout) > 0:
+
         def kill_on_timeout() -> None:
             timed_out.set()
             try:
@@ -258,7 +256,11 @@ def analyze_audio_activity(
                 rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
                 energies.append((20.0 * np.log10(rms + 1e-9)).astype(np.float32))
                 spectrum = np.abs(np.fft.rfft(frames * window, axis=1)).astype(np.float32)
-                prior = np.vstack((previous_spectrum, spectrum[:-1])) if previous_spectrum is not None else np.vstack((spectrum[:1], spectrum[:-1]))
+                prior = (
+                    np.vstack((previous_spectrum, spectrum[:-1]))
+                    if previous_spectrum is not None
+                    else np.vstack((spectrum[:1], spectrum[:-1]))
+                )
                 positive_change = np.maximum(0.0, spectrum - prior)
                 flux = positive_change.sum(axis=1) / (spectrum.sum(axis=1) + 1e-6)
                 fluxes.append(flux.astype(np.float32))

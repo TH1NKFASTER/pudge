@@ -81,15 +81,12 @@ def _manager(tmp_path: Path) -> AnimeManager:
 
 
 def test_volume_marker_is_not_treated_as_episode_number() -> None:
-    assert release_episode(
-        "[FFF] Assassination Classroom - Vol.04 [BD][1080p-FLAC]"
-    ) is None
+    assert release_episode("[FFF] Assassination Classroom - Vol.04 [BD][1080p-FLAC]") is None
 
 
 def test_s00_special_is_removed_before_episode_ranking() -> None:
     special = _release(
-        "[hchcsen] Assassination Classroom S00E02 Episode 0 Meeting Time "
-        "[BD 1080p x265 2xOPUS]"
+        "[hchcsen] Assassination Classroom S00E02 Episode 0 Meeting Time [BD 1080p x265 2xOPUS]"
     )
 
     class FakeClient:
@@ -119,8 +116,7 @@ def test_s00_special_is_removed_before_episode_ranking() -> None:
     [
         (
             1,
-            "[SubsPlease] Ansatsu Kyoushitsu Movie - Minna no Jikan "
-            "(1080p) [2C7F205D]",
+            "[SubsPlease] Ansatsu Kyoushitsu Movie - Minna no Jikan (1080p) [2C7F205D]",
             2.0,
         ),
         (
@@ -130,20 +126,17 @@ def test_s00_special_is_removed_before_episode_ranking() -> None:
         ),
         (
             2,
-            "[hchcsen] Assassination Classroom S00E02 Episode 0 Meeting Time "
-            "[BD 1080p x265 2xOPUS]",
+            "[hchcsen] Assassination Classroom S00E02 Episode 0 Meeting Time [BD 1080p x265 2xOPUS]",
             2.0,
         ),
         (
             2,
-            "[SubsPlease] Ansatsu Kyoushitsu Movie - Minna no Jikan "
-            "(720p) [2F06A4F7]",
+            "[SubsPlease] Ansatsu Kyoushitsu Movie - Minna no Jikan (720p) [2F06A4F7]",
             1.2,
         ),
         (
             3,
-            "Assassination.Classroom.365.Days.2016.1080p.BluRay."
-            "10-Bit.Dual-Audio.TrueHD.x265-iAHD",
+            "Assassination.Classroom.365.Days.2016.1080p.BluRay.10-Bit.Dual-Audio.TrueHD.x265-iAHD",
             5.0,
         ),
     ],
@@ -174,12 +167,8 @@ def test_bad_ansatsu_candidates_cannot_be_selected_as_episode(
 
 
 def test_single_episode_size_has_no_unbounded_large_file_bonus() -> None:
-    normal_score, normal_reasons = _episode_size_quality_score(
-        int(1.2 * 1024**3), ANSATSU
-    )
-    huge_score, huge_reasons = _episode_size_quality_score(
-        int(12 * 1024**3), ANSATSU
-    )
+    normal_score, normal_reasons = _episode_size_quality_score(int(1.2 * 1024**3), ANSATSU)
+    huge_score, huge_reasons = _episode_size_quality_score(int(12 * 1024**3), ANSATSU)
 
     assert normal_score == 5.0
     assert huge_score == normal_score

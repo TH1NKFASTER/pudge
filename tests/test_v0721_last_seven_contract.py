@@ -1,5 +1,8 @@
+"""Release items of v0.7.21 (behaviour; audit 71Б rewrite of the window checks)."""
+
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pudge.config import AppConfig, load_config, write_config
@@ -7,11 +10,7 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, NyaaRelease
 import pudge.reading_audio_alignment as ralign
 from pudge.reading_audio_alignment import align_light_novel_to_transcript
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
-VN_JS = ROOT / "pudge" / "web" / "visual_novels.js"
-MANGA_JS = ROOT / "pudge" / "web" / "manga_reader_v2.js"
+from tests.i18n_support import en, ru
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -79,7 +78,9 @@ def test_alignment_interpolates_missing_middle_chapter(monkeypatch) -> None:
 def test_search_order_is_subsplease_then_nyaa_then_shana(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     media_id = 42
-    manager.db.upsert_anime(LibraryAnime(media_id=media_id, title="Example Show", status="CURRENT", progress=0, episodes=12))
+    manager.db.upsert_anime(
+        LibraryAnime(media_id=media_id, title="Example Show", status="CURRENT", progress=0, episodes=12)
+    )
     calls: list[str] = []
 
     def rss(*_args, **_kwargs):
@@ -120,28 +121,6 @@ def test_manager_requires_toggle_even_when_backend_is_configured(tmp_path: Path)
     assert manager.downloads_enabled() is False
     manager.config.nyaa.torrents_enabled = True
     assert manager.downloads_enabled() is True
-
-
-def test_settings_remove_legacy_toggles_and_custom_name_actions() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    vn = VN_JS.read_text(encoding="utf-8")
-    manga = MANGA_JS.read_text(encoding="utf-8")
-    assert "s_subsplease_rss" not in html
-    assert "s_subsplease_preferred" not in html
-    assert "s_nyaa_auto" not in html
-    assert "s_codecs" not in html
-    assert "s_sources" not in html
-    assert 'data-ln-context-action="name-cues"' not in html
-    assert "vnNames" not in vn
-    assert 'data-manga-context-action="names"' not in manga
-
-
-def test_ui_exposes_torrent_toggle_and_warning_copy() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    assert 'id="torrentToggleButton"' in html
-    assert 'id="torrentToggleButton"' in html
-    assert 'data-action="torrent-toggle"' not in html
-    assert 'Torrents are off by default' in html
 
 
 def test_feed_history_persists_release_rows(tmp_path: Path) -> None:
@@ -200,11 +179,168 @@ def test_first_run_config_keeps_torrent_traffic_off(tmp_path: Path) -> None:
     assert loaded.nyaa.torrents_enabled is False
 
 
-def test_ln_and_manga_share_header_import_button_without_duplicate_manga_heading() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    manga = MANGA_JS.read_text(encoding="utf-8")
-    assert '<button id="pageImportButton" class="primary" hidden>Import</button>' in html
-    assert '<button id="lnImport" hidden>Import</button>' in html
-    assert 'id="mangaImportV2" hidden' in manga
-    assert "<h2>${ru() ? 'Манга' : 'Manga'}</h2>" not in manga
-    assert "if(ui.page==='lightnovels')$('lnImport')?.click();else if(ui.page==='manga')$('mangaImportV2')?.click();" in html
+# --- Window -------------------------------------------------------------------------------
+
+# Old settings controls (SubsPlease RSS / preferred, automatic Nyaa, codec and source lists)
+# and the custom character-name actions of LN, VN and manga were removed in v0.7.21.
+LEGACY_CONTROLS = ["s_subsplease_rss", "s_subsplease_preferred", "s_nyaa_auto", "s_codecs", "s_sources"]
+LIBRARY = {
+    "light_novel_state": {
+        "version": 1,
+        "settings": {},
+        "books": [
+            {
+                "id": 1,
+                "title": "Spice 1",
+                "series_title": "Spice",
+                "series_key": "spice",
+                "volume": 1,
+                "anilist_id": 31,
+            },
+            {
+                "id": 2,
+                "title": "Spice 2",
+                "series_title": "Spice",
+                "series_key": "spice",
+                "volume": 2,
+                "anilist_id": 31,
+            },
+            {"id": 9, "title": "Solo", "volume": 1, "anilist_id": 5},
+        ],
+    },
+    "manga_state": {
+        "books": [
+            {
+                "id": 11,
+                "title": "Food v1",
+                "series_title": "Food",
+                "series_key": "food",
+                "volume": 1,
+                "page_count": 10,
+                "anilist_id": 86082,
+            },
+            {
+                "id": 12,
+                "title": "Food v2",
+                "series_title": "Food",
+                "series_key": "food",
+                "volume": 2,
+                "page_count": 10,
+                "anilist_id": 86082,
+            },
+            {
+                "id": 20,
+                "title": "Solo v1",
+                "series_title": "Solo",
+                "series_key": "solo",
+                "volume": 1,
+                "page_count": 10,
+                "anilist_id": 7,
+            },
+        ],
+        "ocr_available": True,
+    },
+    "visual_novel_state": {"windows": [], "transcript": []},
+}
+
+
+def test_removed_settings_and_character_name_actions_are_gone_everywhere(page) -> None:
+    result = page.run(
+        r"""
+        const menu = async selector => {
+          await __fire(selector, 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent'); await __tick(10);
+          const items = [...document.querySelectorAll('#contextMenu button')].filter(b => b.checkVisibility())
+            .map(b => [b.dataset.lnContextAction || b.dataset.mangaContextAction, b.innerText]);
+          await __key('Escape'); return items;
+        };
+        const out = {};
+        setPage('settings'); await __tick(50);
+        const tabs = [...document.querySelectorAll('.settings-categories [data-settings-category]')];
+        const shown = new Set();
+        for (const tab of tabs) {
+          tab.click(); await __tick(5);
+          for (const control of document.querySelectorAll('#settingsContent [id^="s_"]')) if (control.checkVisibility()) shown.add(control.id);
+        }
+        out.settings = {legacy: LEGACY.filter(id => document.getElementById(id) || shown.has(id)), tabs: tabs.length, shown: shown.size};
+        setPage('lightnovels'); await __tick(100);
+        out.ln = [...await menu('#lightNovelsContent [data-ln-book="9"]'), ...await menu('#lightNovelsContent [data-ln-series-key="spice"] .ln-series-head')];
+        setPage('manga'); await __tick(100);
+        out.manga = [...await menu('#mangaContent [data-manga-book="20"]'), ...await menu('#mangaContent [data-manga-series-key="food"] .ln-series-head')];
+        setPage('visualnovels'); await __tick(100);
+        out.vn = [...document.querySelectorAll('#visualNovelsContent button')].map(b => [b.id, b.innerText]);
+        out.names = t('ui.characterNames');
+        return out;
+        """.replace("LEGACY", json.dumps(LEGACY_CONTROLS)),
+        api=LIBRARY,
+    )
+    out = result.value
+    assert out["settings"]["legacy"] == [] and out["settings"]["tabs"] == 5 and out["settings"]["shown"] > 50
+    names = out["names"]
+    for where in ("ln", "manga"):
+        actions = [action for action, _label in out[where]]
+        assert actions and not {"names", "name-cues"} & set(actions), where
+        assert names not in [label for _action, label in out[where]], where
+    assert out["vn"] and names not in [label for _id, label in out["vn"]]
+    assert "vnNames" not in [button_id for button_id, _label in out["vn"]]
+
+
+def test_torrent_switch_is_the_only_toggle_and_its_hover_says_torrents_are_off_by_default(page) -> None:
+    assert en("ui.torrentsAreOffByDefault").startswith("Torrents are off by default")
+    assert en("ui.torrentsAreOffByDefault2") == "Torrents are off by default"
+    assert ru("ui.torrentsAreOffByDefault2") == "Торренты выключены по умолчанию"
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const button = () => document.getElementById('torrentToggleButton');
+            const off = {visible: __visible('#torrentToggleButton'), title: button().title};
+            window.fetch = async (url, init) => new Response(JSON.stringify({ok: true, enabled: true, desired_enabled: true, transition: 'on'}), {status: 200});
+            await __click('#torrentToggleButton'); await __tick(10);
+            const on = {title: button().title};
+            const toggles = [];
+            for (const name of ['current', 'planned', 'lightnovels', 'manga', 'audiobooks', 'settings']) {
+              setPage(name); await __tick(30);
+              toggles.push(document.querySelectorAll('[data-action="torrent-toggle"]').length);
+            }
+            return {off, on, toggles, switches: document.querySelectorAll('#torrentToggleButton').length,
+                    texts: {off: PudgeI18n.t('ui.torrentsAreOffByDefault2'), on: PudgeI18n.t('ui.clickToTurnTorrentTraffic')}};
+            """,
+            lang=lang,
+        )
+        out = result.value
+        assert out["off"] == {"visible": True, "title": out["texts"]["off"]}
+        assert out["on"] == {"title": out["texts"]["on"]}
+        # One switch in the sidebar; no page renders a second (old Downloads page) toggle.
+        assert out["switches"] == 1 and out["toggles"] == [0] * 6
+
+
+def test_light_novels_and_manga_share_the_header_import_button(page) -> None:
+    assert en("uiB.import") == "Import"
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const out = {label: t('uiB.import')};
+            for (const name of ['lightnovels', 'manga']) {
+              setPage(name); await __tick(100);
+              const content = document.getElementById(name === 'lightnovels' ? 'lightNovelsContent' : 'mangaContent');
+              out[name] = {header: __visible('#pageImportButton'), text: __text('#pageImportButton'),
+                           ownButtons: [...content.querySelectorAll('button')].filter(b => b.checkVisibility() && b.innerText === out.label).length,
+                           headings: [...document.querySelectorAll(`#${name} h1, #${name} h2`)].filter(h => h.checkVisibility()).map(h => h.innerText)};
+              await __click('#pageImportButton'); await __tick(50);
+            }
+            return out;
+            """,
+            lang=lang,
+            api={
+                **LIBRARY,
+                "choose_light_novel_file": {"cancelled": True},
+                "choose_manga_folder": {"cancelled": True},
+            },
+        )
+        out = result.value
+        for name in ("lightnovels", "manga"):
+            # The page header's Import button; no second Import button or "Manga" heading in the page.
+            assert out[name] == {"header": True, "text": out["label"], "ownButtons": 0, "headings": []}, name
+        assert [call["name"] for call in result.calls if call["name"].startswith("choose_")] == [
+            "choose_light_novel_file",
+            "choose_manga_folder",
+        ]

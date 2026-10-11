@@ -1,15 +1,24 @@
-from __future__ import annotations
+"""Listen together v1.76: the real opening of a chapter is never skipped, a spoken chapter
+title is a zero-width plateau, scrolling stays cheap (behaviour; audit 71Б rewrite).
 
-from pathlib import Path
+Covered elsewhere: following the audio finds the spoken word in a per-chapter index and
+probes layout at most every 250 ms, test_v175_ln_audio_opening_scroll_torrent_feedback.py::
+test_following_the_audio_reuses_its_word_index_and_reads_layout_rarely; while the user
+scrolls the highlight is frozen (no frames, no furigana preview) and catches up afterwards,
+test_v178_ln_audio_state_clock_torrent.py::test_manual_scroll_freezes_the_highlight_and_catches_up_after;
+a previous word's reading lingers even where it overlaps the next one,
+test_v131_furigana_search_images_stt.py::test_previous_reading_lingers_briefly_even_where_it_overlaps_the_next.
+Dropped: the removed DOM mora-weight helpers and the alignment cache revision string (no
+behaviour of their own)."""
+
+from __future__ import annotations
 
 import pytest
 
 from pudge.audiobooks import AudiobookService
 from pudge.reading_audio_alignment import _recover_leading_prefix_clock
-
-ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "pudge" / "web" / "index.html"
-AUDIOBOOKS = ROOT / "pudge" / "audiobooks.py"
+from t71g18_support import NO_LN_GATE, ln_book
+from t71g22_support import USER_SCROLL
 
 
 def test_unpunctuated_real_opening_prefix_is_never_silently_skipped() -> None:
@@ -96,7 +105,9 @@ def test_character_level_spoken_chapter_title_plateau_is_zero_width() -> None:
     assert debug.get("marker_false_advance_chars") == pytest.approx(11.0, abs=0.5)
     assert story_start == pytest.approx(6856.199, abs=0.08)
     assert all(float(row["offset"]) == 0.0 for row in repaired if float(row["time"]) < story_start - 0.01)
-    assert any(abs(float(row["time"]) - 6865.06) < 0.05 and 34 <= float(row["offset"]) <= 36 for row in repaired)
+    assert any(
+        abs(float(row["time"]) - 6865.06) < 0.05 and 34 <= float(row["offset"]) <= 36 for row in repaired
+    )
 
 
 def test_reconstructed_nonzero_title_prefix_gets_precision_pass() -> None:
@@ -112,38 +123,38 @@ def test_reconstructed_nonzero_title_prefix_gets_precision_pass() -> None:
     assert AudiobookService._alignment_chapter_needs_precision(row) is True
 
 
-def test_paired_scroll_hotpath_is_logarithmic_and_throttled() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    # Plan §7 removed the DOM mora weight map from the timing path entirely,
-    # so the per-frame cost no longer depends on DOM word count at all.
-    assert "function lnPairedWeightMap()" not in html
-    assert "function lnPairedWeightedPosition(" not in html
-    render = html.split("function renderLnPairedPosition", 1)[1].split("function startLnPairedInterpolation", 1)[0]
-    assert "lnPairedFindRange(domIndex.wordRanges,offset,false)" in render
-
-    interpolation = html.split("function startLnPairedInterpolation", 1)[1].split("async function applyLnPairedPosition", 1)[0]
-    assert "minPaintMs=manualScrolling?250:33" in interpolation
-    assert "previewOffset=manualScrolling?NaN" in interpolation
-
-    render = html.split("function renderLnPairedPosition", 1)[1].split("function startLnPairedInterpolation", 1)[0]
-    assert "if(manualScrolling&&options.scrollCatchup!==true)" in render
-    assert "if(!manualScrolling)" in render
-    assert "lnPairedFuriganaPaintOverlaps" not in render
-    assert "perf_revision:'ln-paired-v178'" in html
-
-
-def test_scroll_does_not_recreate_bookmark_and_settle_timers_per_event() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    bookmark = html.split("function scheduleLnAutoBookmark()", 1)[1].split("function restoreLnReaderOffset", 1)[0]
-    assert "ui.lnAutoBookmarkDueAt=performance.now()+20000" in bookmark
-    assert "if(ui.lnAutoBookmarkTimer)return" in bookmark
-    assert "cancelLnAutoBookmark();" not in bookmark
-
-    handler = html.split("$('lnReaderScroll').addEventListener('scroll',()=>{", 1)[1].split("},{passive:true});", 1)[0]
-    assert "if(!lnReaderScrollSettleTimer)" in handler
-    assert "clearTimeout(lnReaderScrollSettleTimer)" not in handler
-
-
-def test_alignment_revision_bumped_to_v17() -> None:
-    source = AUDIOBOOKS.read_text(encoding="utf-8")
-    assert 'reading-audio-v3-leading-prefix-v22' in source
+def test_scrolling_keeps_its_timers_and_bookmarks_20_s_after_the_last_scroll(page) -> None:
+    # WebKit sends a scroll event per frame. The reader keeps one "scrolling" timer and one
+    # auto-bookmark timer for the whole gesture (it used to clear and re-create both on
+    # every event); "scrolling" ends ~150 ms after the last event and the position is
+    # bookmarked once, 20 s after it.
+    result = page.run(
+        USER_SCROLL
+        + r"""
+        await __settle(openLightNovel(6)); await __tick(1000);
+        const bookmarks = () => __apiCalls.filter(c => c.name === 'light_novel_bookmark').map(c => c.args);
+        wheel(); scroller.dispatchEvent(new Event('scroll'));
+        let timers = 0;
+        const set = window.setTimeout, clear = window.clearTimeout;
+        window.setTimeout = (...args) => { timers++; return set(...args); };
+        window.clearTimeout = (...args) => { timers++; return clear(...args); };
+        for (let k = 0; k < 50; k++) { scroller.scrollTop += 30; scroller.dispatchEvent(new Event('scroll')); }
+        window.setTimeout = set; window.clearTimeout = clear;
+        const out = {timers, during: scrolling()};
+        await __tick(130); out.at130 = scrolling();
+        await __tick(40); out.at170 = scrolling();
+        await __tick(19700); out.before20s = bookmarks();
+        await __tick(200); out.after20s = bookmarks();
+        await __tick(30000); out.later = bookmarks();
+        return out;
+        """,
+        before=ln_book(paragraphs=["猫が好きです。", "犬も好きです。"])
+        + "__api.light_novel_bookmark = async (id, chapter, offset) => ({current_chapter: chapter, current_offset: offset});",
+        state=NO_LN_GATE,
+    )
+    out = result.value
+    assert out["timers"] == 0
+    assert (out["during"], out["at130"], out["at170"]) == (True, True, False)
+    assert out["before20s"] == []
+    assert [args[0:2] + args[3:] for args in out["after20s"]] == [[6, 0, "auto"]]
+    assert out["later"] == out["after20s"]

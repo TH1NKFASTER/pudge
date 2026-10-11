@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import inspect
+import sqlite3
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,9 +10,6 @@ from pudge.config import AppConfig, write_config
 from pudge.database import Database
 from pudge.review_gate import ReviewGateStore
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -26,16 +23,28 @@ def make_api(tmp_path: Path) -> WebAppApi:
     return WebAppApi(cfg.config_path)
 
 
-def test_wal_is_persistent_database_configuration_not_per_connection(tmp_path: Path) -> None:
-    db = Database(tmp_path / "library.sqlite3")
-    with db.connect() as conn:
-        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).casefold() == "wal"
+def test_wal_is_persistent_database_configuration_not_per_connection(tmp_path: Path, monkeypatch) -> None:
+    # WAL persists in the database file. Reissuing journal_mode on every tiny state
+    # lookup was visible in the R10 macOS stack sample as repeated schema parsing.
+    statements: list[str] = []
+    real_connect = sqlite3.connect
 
-    # WAL persists in the database file. Reissuing journal_mode on every tiny
-    # state lookup was visible in the R10 macOS stack sample as repeated schema
-    # parsing and made connection-heavy UI state assembly unnecessarily costly.
-    assert "journal_mode" not in inspect.getsource(Database.connect)
-    assert "PRAGMA journal_mode=WAL" in inspect.getsource(Database.__init__)
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced_connect)
+    db = Database(tmp_path / "library.sqlite3")
+    assert [s for s in statements if "journal_mode" in s] == ["PRAGMA journal_mode=WAL"]
+    statements.clear()
+    for _ in range(3):
+        with db.connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+    assert len([s for s in statements if s == "SELECT 1"]) == 3
+    assert not [s for s in statements if "journal_mode" in s]
+    with Database(tmp_path / "library.sqlite3", initialize=False).connect() as conn:
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).casefold() == "wal"
 
 
 def _make_foreground_poll_idle(api: WebAppApi, monkeypatch) -> None:
@@ -163,18 +172,63 @@ def test_review_prefetch_backs_off_when_provider_yields_no_new_cards(tmp_path: P
     assert service.calls == calls_after_no_progress
 
 
-def test_ln_reader_close_releases_heavy_chapter_state() -> None:
-    source = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    start = source.index("if(target.id==='lnReaderClose')")
-    branch = source[start : start + 1400]
+# A book with seven chapters; light_novel_chapter answers at once, or holds its answers
+# while window.__hold is set (window.__release() answers them).
+LN_BOOK = """
+window.__chapterFetches = []; window.__held = []; window.__hold = false;
+window.__release = () => { window.__held.splice(0).forEach(answer => answer()); };
+__api.light_novel_open = async id => ({id, title: 'Novel', current_chapter: 0, current_offset: 0,
+  chapters: [0, 1, 2, 3, 4, 5, 6].map(i => ({chapter_index: i, title: 'Chapter ' + i}))});
+__api.light_novel_chapter = (id, index) => {
+  window.__chapterFetches.push(index);
+  const payload = {book_id: id, chapter_index: index, paragraphs: ['Chapter ' + index + ' text'], tokens: [[]]};
+  return window.__hold ? new Promise(resolve => window.__held.push(() => resolve(payload))) : Promise.resolve(payload);
+};
+"""
+# Opening a book and changing chapters wait for animation frames: tick until done.
+SETTLE = """
+const settle = async promise => {
+  let done = false;
+  promise.then(() => { done = true; }, () => { done = true; });
+  for (let k = 0; k < 100 && !done; k++) await __tick(10);
+};
+"""
 
-    assert "ui.lnChapterCacheGeneration++" in branch
-    assert "ui.lnChapterPayloadCache.clear()" in branch
-    assert "ui.lnTokenMap.clear()" in branch
-    assert "ui.lnChapter=null" in branch
-    assert "$('lnReader').replaceChildren()" in branch
-    assert "while(ui.lnChapterPayloadCache.size>3)" in source
-    assert "generation===Number(ui.lnChapterCacheGeneration||0)?cacheLnChapter" in source
+
+def test_ln_reader_keeps_three_chapters_and_close_releases_them(page) -> None:
+    result = page.run(
+        SETTLE
+        + """
+        await __tick(100);
+        await settle(openLightNovel(5));
+        for (const index of [1, 2, 3, 4]) await settle(loadLightNovelChapter(index));
+        const reading = window.__chapterFetches.splice(0);
+        await settle(loadLightNovelChapter(0));                  // dropped from the cache: asked again (and 1)
+        await settle(loadLightNovelChapter(5));                  // one of the last three: kept (6 prefetched)
+        const back = {fetches: window.__chapterFetches.splice(0), text: __text('#lnReader')};
+        window.__hold = true;
+        void loadLightNovelChapter(2);                           // still loading when the reader closes
+        await __tick(10);
+        await __click('#lnReaderClose');
+        await __tick(100);
+        // What the closed reader still holds (the chapters' text, tokens and DOM are heavy).
+        const held = () => ({reader: document.getElementById('lnReader').children.length, chapter: ui.lnChapter,
+                             cached: ui.lnChapterPayloadCache.size, tokens: ui.lnTokenMap.size});
+        const closed = {open: __visible('#lnReaderShell'), ...held()};
+        window.__release();                                      // the late answer arrives
+        await __tick(100);
+        return {reading, back, closed, late: held()};
+        """,
+        state={"settings": {"review_gate_ln_enabled": False}},
+        before=LN_BOOK,
+        api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},
+    )
+    out = result.value
+    assert out["reading"] == [0, 1, 2, 3, 4, 5]  # each chapter once, the next one prefetched
+    assert out["back"] == {"fetches": [0, 1, 6], "text": "Chapter 5 text"}
+    released = {"reader": 0, "chapter": None, "cached": 0, "tokens": 0}
+    assert out["closed"] == {"open": False, **released}
+    assert out["late"] == released
 
 
 def test_snapshot_and_cold_fast_state_reuse_one_sqlite_connection(tmp_path: Path, monkeypatch) -> None:
@@ -203,7 +257,6 @@ def test_snapshot_and_cold_fast_state_reuse_one_sqlite_connection(tmp_path: Path
     api._ui_state_cache.invalidate()
     api.get_state_fast()
     assert opened == 1
-
 
 
 def test_app_session_tracks_interactive_window_state(tmp_path: Path, monkeypatch) -> None:
@@ -270,6 +323,7 @@ def test_scheduled_agent_can_work_when_live_window_is_inactive(monkeypatch, tmp_
     class _Timed:
         def __enter__(self):
             return None
+
         def __exit__(self, *_args):
             return False
 
@@ -279,19 +333,38 @@ def test_scheduled_agent_can_work_when_live_window_is_inactive(monkeypatch, tmp_
     assert calls == ["run_once"]
 
 
-def test_window_activity_is_published_to_backend_only_on_state_changes() -> None:
-    source = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    start = source.index("function setWindowActivity(active)")
-    branch = source[start : start + 1100]
-
-    assert "if(changed&&window.pywebview?.api?.set_window_activity)" in branch
-    assert "set_window_activity(next)" in branch
+def test_window_activity_is_published_to_backend_only_on_state_changes(page) -> None:
+    # The scheduled agent works while the window is inactive (see above); the window
+    # tells the backend only when its activity changes.
+    result = page.run(
+        """
+        const activity = () => __apiCalls.filter(call => call.name === 'set_window_activity').map(call => call.args[0]);
+        const start = activity();
+        for (const event of ['blur', 'blur', 'focus', 'focus', 'blur']) window.dispatchEvent(new Event(event));
+        document.hidden = true; document.visibilityState = 'hidden';
+        document.dispatchEvent(new Event('visibilitychange'));     // already inactive
+        await __flush();
+        return {start, all: activity()};
+        """,
+        api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},
+    )
+    assert result.value["start"] == []  # the window opens active
+    assert result.value["all"] == [False, True, False]
+    # Opened behind other windows (e.g. at login): the backend learns it at once.
+    hidden = page.run(
+        "return __apiCalls.filter(call => call.name === 'set_window_activity').map(call => call.args[0]);",
+        before="document.hidden = true; document.visibilityState = 'hidden';",
+        api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},
+    )
+    assert hidden.value == [False]
 
 
 def test_webapp_window_activity_updates_session_marker(tmp_path: Path, monkeypatch) -> None:
     api = object.__new__(WebAppApi)
     calls: list[bool] = []
-    monkeypatch.setattr("pudge.web_app.set_app_window_active", lambda active: calls.append(bool(active)) or True)
+    monkeypatch.setattr(
+        "pudge.web_app.set_app_window_active", lambda active: calls.append(bool(active)) or True
+    )
 
     assert api.set_window_activity(False) == {"ok": True, "active": False, "updated": True}
     assert api.set_window_activity(True) == {"ok": True, "active": True, "updated": True}

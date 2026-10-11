@@ -8,6 +8,7 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.notifications import maybe_handle_notification_helper, send_native_notification
 from pudge.web_app import WebAppApi
+from source_policy import source
 
 
 def test_notification_uses_installed_app_bundle_helper(monkeypatch, tmp_path: Path) -> None:
@@ -61,9 +62,7 @@ def test_hidden_notification_mode_calls_native_framework(monkeypatch) -> None:
         lambda subtitle, message: calls.append((subtitle, message)) or True,
     )
 
-    assert maybe_handle_notification_helper(
-        ["--pudge-native-notification", "Episode ready", "Example"]
-    ) == 0
+    assert maybe_handle_notification_helper(["--pudge-native-notification", "Episode ready", "Example"]) == 0
     assert calls == [("Episode ready", "Example")]
     assert maybe_handle_notification_helper([]) is None
 
@@ -115,18 +114,34 @@ def test_test_notification_api_requests_permission_and_sends(tmp_path: Path, mon
 
 
 def test_installer_routes_helper_mode_through_app_bundle() -> None:
-    install = Path("install.sh").read_text(encoding="utf-8")
-    assert 'strcmp(argv[1], "--pudge-native-notification")' in install
-    assert "return send_notification(argv[2], argv[3]);" in install
+    # policy: the app launcher is Objective-C that install.sh generates and compiles with
+    # clang against the macOS frameworks; nothing of it can run on the test machine.
+    # Notifications come from the app bundle (its icon and permission), and the helper
+    # mode must not start Python.
+    install = source("install.sh")
+    helper = install.index('strcmp(argv[1], "--pudge-native-notification")')
+    assert "return send_notification(argv[2], argv[3]);" in install[helper : helper + 400]
+    assert helper < install.index("Py_InitializeFromConfig(&config)")
     assert "UNUserNotificationCenter" in install
-    assert "Py_InitializeFromConfig(&config)" in install
-    assert (
-        install.index('strcmp(argv[1], "--pudge-native-notification")')
-        < install.index("Py_InitializeFromConfig(&config)")
+    assert "-framework UserNotifications" in install
+
+
+def test_settings_have_no_notification_test_button(page) -> None:
+    # The test button was removed; notifications are checked when permissions are requested.
+    result = page.run(
+        """
+        setPage('settings');
+        const labels = [];
+        for (const tab of [...document.querySelectorAll('#settingsContent .settings-categories [data-settings-category]')]) {
+          await __click(`#settingsContent .settings-categories [data-settings-category=${tab.dataset.settingsCategory}]`);
+          labels.push(...[...document.querySelectorAll('#settingsContent button')].filter(b => b.checkVisibility()).map(b => b.innerText.trim()));
+        }
+        return {labels, test: PudgeI18n.t('notify.test'), byId: Boolean(document.getElementById('testNotification'))};
+        """,
+        lang="ru",
+        api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},
     )
-
-
-def test_settings_does_not_contain_notification_test_button() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert 'id="testNotification"' not in html
-    assert "pywebview.api.test_notification()" not in html
+    out = result.value
+    assert len(out["labels"]) > 20  # the settings were drawn
+    assert out["test"] not in out["labels"] and out["byId"] is False
+    assert not result.called("test_notification")

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import logging
-import time
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
-from pudge.companion_streaming import CompanionStreamingService
+import pytest
+
+from desktop_isolation import patch_webapp_popen
 from pudge.config import AppConfig, load_config
 from pudge.database import Database
+from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
 
 
 def test_reset_progress_clears_partial_ready_episode(tmp_path: Path) -> None:
@@ -22,9 +23,7 @@ def test_reset_progress_clears_partial_ready_episode(tmp_path: Path) -> None:
     video.write_bytes(b"video")
     subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語\n", encoding="utf-8")
     db.upsert_anime(LibraryAnime(media_id=128547, title="Odd Taxi", status="CURRENT", progress=4))
-    db.upsert_episode(
-        LibraryEpisode(128547, "Odd Taxi", 1, video, subtitle_path=subtitle, state="ready")
-    )
+    db.upsert_episode(LibraryEpisode(128547, "Odd Taxi", 1, video, subtitle_path=subtitle, state="ready"))
     db.record_playback(video, 130.0, 1430.0, active_seconds=80.0)
 
     changed = db.reset_anime_progress(128547)
@@ -48,9 +47,7 @@ def test_runtime_subtitle_recovers_selected_history_and_repairs_db(tmp_path: Pat
     video.write_bytes(b"video")
     good.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語です\n", encoding="utf-8")
     db.upsert_anime(LibraryAnime(media_id=128547, title="Odd Taxi", status="CURRENT"))
-    db.upsert_episode(
-        LibraryEpisode(128547, "Odd Taxi", 1, video, subtitle_path=missing, state="ready")
-    )
+    db.upsert_episode(LibraryEpisode(128547, "Odd Taxi", 1, video, subtitle_path=missing, state="ready"))
     db.record_subtitle_history(
         video_path=video,
         media_id=128547,
@@ -81,7 +78,6 @@ def test_runtime_subtitle_recovers_selected_history_and_repairs_db(tmp_path: Pat
     repaired = db.episode_by_path(video)
     assert repaired is not None
     assert repaired.subtitle_path == good.resolve()
-
 
 
 def test_runtime_resolver_preserves_explicit_bitmap_sid_only_when_allowed(
@@ -166,43 +162,6 @@ def test_runtime_resolver_trusts_stored_sid_for_explicit_bitmap_playback_when_pr
     assert selected.embedded_stream_index is None
     assert selected.is_text is False
 
-def test_companion_can_prepare_srt_after_hls_was_already_cached(tmp_path: Path) -> None:
-    db = Database(tmp_path / "library.sqlite3")
-    video = tmp_path / "episode.mkv"
-    subtitle = tmp_path / "episode.srt"
-    video.write_bytes(b"video")
-    subtitle.write_text(
-        "1\n00:00:01,000 --> 00:00:02,250\n日本語です\n",
-        encoding="utf-8",
-    )
-    service = CompanionStreamingService(
-        db,
-        cache_dir=tmp_path / "cache",
-        ffmpeg="/definitely/missing-ffmpeg",
-        ffprobe="/definitely/missing-ffprobe",
-    )
-    out = tmp_path / "hls"
-    result = service._prepare_subtitles(
-        {
-            "entity_id": "episode",
-            "media_id": 1,
-            "episode": 1,
-            "video_path": video,
-            "subtitle_path": str(subtitle),
-            "embedded_subtitle_id": None,
-            "subtitle_origin": "jimaku",
-        },
-        out,
-    )
-    assert result["ready"] is True
-    vtt = (out / "subtitles.vtt").read_text(encoding="utf-8")
-    assert vtt.startswith("WEBVTT")
-    assert "00:00:01.000 --> 00:00:02.250" in vtt
-    assert service._ffmpeg_optional_path() == "/definitely/missing-ffmpeg"
-    source = (ROOT / "pudge" / "companion_streaming.py").read_text(encoding="utf-8")
-    prepare = source[source.index("    def prepare("):source.index("    def media_path(")]
-    assert prepare.index("_prepare_subtitles") < prepare.index("_ensure_job")
-
 
 def test_permission_preflight_skips_folder_touch_after_first_run(monkeypatch, tmp_path: Path) -> None:
     api = WebAppApi.__new__(WebAppApi)
@@ -233,23 +192,73 @@ def test_legacy_implicit_downloads_is_not_recreated_as_subtitle_folder(tmp_path:
     assert loaded.paths.subtitle_dirs == []
 
 
-def test_desktop_play_uses_runtime_subtitle_recovery_and_imports_do_not_default_downloads() -> None:
-    source = (ROOT / "pudge" / "web_app.py").read_text(encoding="utf-8")
-    play = source[source.index("    def play("):source.index("    def play_status(")]
-    assert "resolve_episode_subtitle(" in play
-    assert "repair_episode_subtitle(" in play
-    assert "RESULT step=play.subtitle_recover" in play
+def test_play_recovers_a_lost_subtitle_from_history_and_repairs_the_library(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    # The Ready row points at a subtitle the cache cleanup removed; the prepared file is still
+    # recorded in the history. Play starts mpv with it (not without subtitles) and fixes the row.
+    manager = AnimeManager(_play_config(tmp_path), log=lambda _message: None)
+    video = (tmp_path / "Odd Taxi - 01.mkv").resolve()
+    good = (tmp_path / "prepared.srt").resolve()
+    video.write_bytes(b"video")
+    good.write_text("1\n00:00:01,000 --> 00:00:02,000\n日本語です\n", encoding="utf-8")
+    manager.db.upsert_episode(
+        LibraryEpisode(128547, "Odd Taxi", 1, video, subtitle_path=tmp_path / "missing.srt", state="ready")
+    )
+    manager.db.record_subtitle_history(
+        video_path=video,
+        media_id=128547,
+        episode=1,
+        source="jimaku",
+        candidate_name="Odd.Taxi.S01E01.ja.srt",
+        candidate_path=good,
+        score=113.0,
+        status="selected",
+        details={"final_path": str(good)},
+    )
+    api = WebAppApi.__new__(WebAppApi)
+    api.config, api.manager, api.logger = manager.config, manager, logging.getLogger("v0118-play")
+    api._play_processes, api._play_started_at, api._play_exit_codes, api._play_registry = {}, {}, {}, {}
+    api._play_registry_path = manager.config.paths.cache_dir / "active-playbacks.json"
+    api._play_lock = threading.Lock()
+    launched: list[list[str]] = []
+    patch_webapp_popen(
+        monkeypatch,
+        lambda command, **_kwargs: launched.append(command) or SimpleNamespace(pid=4242, poll=lambda: None),
+    )
 
-    ln = source[source.index("    def choose_light_novel_file("):source.index("    def ", source.index("    def choose_light_novel_file(") + 8)]
-    manga = source[source.index("    def choose_manga_file("):source.index("    def ", source.index("    def choose_manga_file(") + 8)]
-    assert "directory=str(Path.home())" in ln
-    assert "directory=str(Path.home())" in manga
+    with caplog.at_level(logging.INFO, logger="v0118-play"):
+        api.play(str(video))
+
+    [command] = launched
+    assert command[command.index("--sub") + 1] == str(good)
+    assert manager.db.episode_by_path(video).subtitle_path == good
+    assert any(
+        message.startswith("RESULT step=play.subtitle_recover video=Odd Taxi - 01.mkv source=jimaku")
+        for message in caplog.messages
+    )
 
 
-def test_fast_update_preserves_native_app_identity() -> None:
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert "PRESERVE_NATIVE_APP=0" in installer
-    assert "NATIVE_SHELL_REV=2" in installer
-    assert "PUDGE_FORCE_NATIVE_REBUILD" in installer
-    assert "preserving native app identity and existing macOS folder grants" in installer
-    assert "EXISTING_APP_VERSION" not in installer
+def _play_config(tmp_path: Path) -> AppConfig:
+    cfg = AppConfig()
+    cfg.config_path = tmp_path / "config.toml"
+    cfg.library.database_path = tmp_path / "library.sqlite3"
+    cfg.library.root_dir = tmp_path / "library"
+    cfg.library.root_dir.mkdir(parents=True, exist_ok=True)
+    cfg.paths.cache_dir = tmp_path / "cache"
+    return cfg
+
+
+def test_import_file_dialogs_open_in_the_home_folder_not_downloads(monkeypatch) -> None:
+    # Opening Downloads triggers macOS's Downloads-folder permission prompt.
+    pytest.importorskip("webview")
+    api = WebAppApi.__new__(WebAppApi)
+    dialogs: list[dict] = []
+    api.window = SimpleNamespace(create_file_dialog=lambda *_args, **options: dialogs.append(options))
+    assert api.choose_light_novel_file() == {"cancelled": True}
+    assert api.choose_manga_file() == {"cancelled": True}
+    assert [options["directory"] for options in dialogs] == [str(Path.home())] * 2
+
+
+# Fast updates keep the native app (and its folder grants): test_install_script.py
+# (test_fast_update_keeps_the_native_app_..., test_native_app_is_rebuilt_when_forced_...).

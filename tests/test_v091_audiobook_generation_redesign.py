@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 import pudge.web_app as web_app_module
 from pudge.config import AppConfig, write_config
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en, has_text, ru
 
 
 def _api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebAppApi:
@@ -28,7 +29,7 @@ def test_provider_settings_are_migrated_and_managed_irodori_hides_api_details(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id": book_id})
     api.light_novels.save_settings({"irodori_tts_enabled": True, "irodori_tts_caption": "calm"})
     settings = api.light_novels.settings_payload()
     assert settings["audiobook_generation_provider"] == "irodori"
@@ -110,7 +111,7 @@ def test_generation_progress_uses_characters_chunks_long_chapters_and_survives_c
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id": book_id})
     api.light_novels.save_settings({"audiobook_generation_provider": "irodori"})
     text = "猫が好きです。" * 1000
     book_id = 77
@@ -160,7 +161,7 @@ def test_422_error_body_is_preserved_and_managed_caption_has_compat_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id": book_id})
     runtime = {
         "provider": "irodori",
         "base_url": "http://127.0.0.1:8088",
@@ -189,7 +190,7 @@ def test_422_error_body_is_preserved_and_managed_caption_has_compat_retry(
 
     class RejectClient:
         def post(self, _url, *, headers, json):
-            return _Response(status=422, text='input must be at most 4096 characters')
+            return _Response(status=422, text="input must be at most 4096 characters")
 
     with pytest.raises(RuntimeError, match="4096 characters"):
         api._post_audiobook_speech(RejectClient(), {**runtime, "caption": ""}, "本文", 2)
@@ -199,7 +200,7 @@ def test_failed_generation_state_remains_visible_until_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id": book_id})
     job_id = api.job_center.start("audiobook_generation", "test", total=100)
     api.job_center.update(job_id, current=40, total=100)
     api.job_center.fail(job_id, RuntimeError("HTTP 422 — bad request"))
@@ -217,7 +218,7 @@ def test_install_status_only_marks_update_when_remote_revision_differs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id":book_id})
+    monkeypatch.setattr(api.light_novels, "book", lambda book_id: {"id": book_id})
     repo = api._irodori_repo_dir()
     (repo / ".git").mkdir(parents=True)
     python = api._irodori_managed_python()
@@ -245,19 +246,128 @@ def test_install_status_only_marks_update_when_remote_revision_differs(
     assert different["update_available"] is True
 
 
-def test_v91_ui_is_provider_neutral_and_patches_progress_in_place() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="s_ln_audiobook_provider"' in html
-    assert "Audiobook generation" in html
-    assert 'id="audiobookIrodoriFields"' in html
-    assert 'id="audiobookExternalFields"' in html
-    assert "Generate audiobook (Irodori)" not in html
-    assert "Optional audiobook generation" not in html
-    assert "Irodori is installed" not in html
-    assert "patchLnAudiobookProgress(next)" in html
-    signature = html.split("function lnStateRenderSignature", 1)[1].split("async function loadLightNovels", 1)[0]
-    assert "irodori_tts" not in signature
-    assert "slot.hidden=!(active||failed||resumable)" in html
-    assert "update_available" in html
-    assert "!!status.running||!status.installed||!!status.update_available" in html
-    assert "Loading settings…" in html
+GENERATION_SETTINGS = r"""
+setPage('settings', true); await __tick(300);
+await __click('button[data-settings-category="advanced"]');
+const block = document.getElementById('s_ln_audiobook_provider').closest('.setting-block');
+const install = () => __visible('#installIrodoriTts') ? [__text('#installIrodoriTts'), document.getElementById('installIrodoriTts').disabled] : null;
+const view = () => ({irodori: __visible('#audiobookIrodoriFields'), external: __visible('#audiobookExternalFields'), install: install()});
+"""
+
+
+def test_audiobook_generation_settings_are_provider_neutral(page) -> None:
+    assert (en("ui.audiobookGeneration"), ru("ui.audiobookGeneration")) == (
+        "Audiobook generation",
+        "Создание аудиокниг",
+    )
+    for text in ("Generate audiobook (Irodori)", "Optional audiobook generation", "Irodori is installed"):
+        assert not has_text(text)
+    result = page.run(
+        GENERATION_SETTINGS
+        + r"""
+        const out = {heading: block.querySelector('h3').innerText, shown: block.checkVisibility(),
+                     options: [...block.querySelectorAll('#s_ln_audiobook_provider option')].map(o => o.value), start: view()};
+        for (const provider of ['external', 'off', 'irodori']) { await __input('#s_ln_audiobook_provider', provider); await __tick(50); out[provider] = view(); }
+        out.texts = {heading: t('ui.audiobookGeneration'), install: t('ui.installIrodori')};
+        out.page = document.getElementById('settingsContent').innerText;
+        return out;
+        """,
+        state={"settings": {"light_novels": {"audiobook_generation_provider": "irodori"}}},
+        api={"irodori_install_status": {"installed": False, "running": False}},
+    )
+    out = result.value
+    assert out["heading"] == out["texts"]["heading"] and out["shown"] is True
+    assert out["options"] == ["off", "irodori", "external"]
+    # Only the chosen provider's fields are shown; Irodori offers its installer while it is missing.
+    assert (
+        out["start"]
+        == out["irodori"]
+        == {"irodori": True, "external": False, "install": [out["texts"]["install"], False]}
+    )
+    assert out["external"] == {"irodori": False, "external": True, "install": None}
+    assert out["off"] == {"irodori": False, "external": False, "install": None}
+    for text in ("Generate audiobook (Irodori)", "Optional audiobook generation", "Irodori is installed"):
+        assert text not in out["page"]
+
+
+def test_irodori_button_installs_when_missing_and_updates_when_installed(page) -> None:
+    # An installed Irodori always offers Update (it says itself when main has nothing new).
+    cases = {
+        "missing": ({"installed": False, "running": False}, "ui.installIrodori", False),
+        "update": (
+            {"installed": True, "running": False, "update_available": True},
+            "ui.updateIrodori",
+            False,
+        ),
+        "current": (
+            {"installed": True, "running": False, "update_available": False},
+            "ui.updateIrodori",
+            False,
+        ),
+        "running": ({"installed": False, "running": True}, "ui.installing", True),
+    }
+    for name, (status, label, disabled) in cases.items():
+        result = page.run(
+            GENERATION_SETTINGS
+            + f"return {{install: install(), label: {json.dumps(label)} && t({json.dumps(label)})}};",
+            state={"settings": {"light_novels": {"audiobook_generation_provider": "irodori"}}},
+            api={"irodori_install_status": status},
+        )
+        out = result.value
+        assert out["install"] == (None if label is None else [out["label"], disabled]), name
+
+
+def test_settings_page_says_loading_before_the_state_arrives(page) -> None:
+    # Before the first state the language is not known yet: the page speaks English.
+    result = page.run(
+        r"""
+        await __click('.nav button[data-page="settings"]'); await __tick(50);
+        const loading = __text('#settingsContent');
+        window.releaseState(); await __tick(500);
+        return {loading, loaded: Boolean(document.getElementById('s_language'))};
+        """,
+        # The backend is slow to answer the first state request.
+        before="""
+        const state = __api.get_state_fast;
+        let release; const answered = new Promise(resolve => { release = resolve; });
+        window.releaseState = release;
+        __api.get_state_fast = async (...args) => { await answered; return state(...args); };
+        __api.get_state = __api.get_state_fast;
+        """,
+    )
+    assert result.value == {"loading": en("uiB.settings.loading"), "loaded": True}
+    assert en("uiB.settings.loading") == "Loading settings…"
+
+
+# The LN library while book 6 generates its audiobook: window.nextLn is what the next poll returns.
+LN_GENERATION = """
+const book = tts => ({id: 6, title: 'Novel', volume: 1, character_count: 1000, irodori_tts: tts});
+window.lnState = tts => ({version: 1, settings: {audiobook_generation_provider: 'irodori'}, irodori_tts_active: !!tts.active, books: [book(tts)]});
+window.nextLn = window.lnState({active: true, state: 'running', current: 10, total: 100});
+__api.light_novel_state = async () => window.nextLn;
+"""
+
+
+def test_generation_progress_is_patched_in_place_without_redrawing_the_library(page) -> None:
+    result = page.run(
+        r"""
+        setPage('lightnovels', true); await __tick(300);
+        const card = () => document.querySelector('[data-ln-book="6"]');
+        const slot = () => card().querySelector('[data-ln-tts-status]');
+        const view = () => ({shown: slot().checkVisibility(), percent: slot().querySelector('[data-ln-tts-percent]').innerText,
+                             failed: slot().classList.contains('danger'), same: card() === first});
+        const first = card();
+        const out = {start: view()};
+        window.nextLn = lnState({active: true, state: 'running', current: 40, total: 100}); await __tick(1000);
+        out.progress = view();
+        window.nextLn = lnState({active: false, state: 'failed', current: 55, total: 100, error: 'HTTP 422'}); await __tick(1000);
+        out.failed = view();
+        return out;
+        """,
+        before=LN_GENERATION,
+    )
+    out = result.value
+    assert out["start"] == {"shown": True, "percent": "10%", "failed": False, "same": True}
+    assert out["progress"] == {"shown": True, "percent": "40%", "failed": False, "same": True}
+    # A failed job stays visible (until retried) — and the card is still not redrawn.
+    assert out["failed"] == {"shown": True, "percent": "55%", "failed": True, "same": True}

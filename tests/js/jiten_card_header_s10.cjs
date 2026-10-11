@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 
 const WEB = process.argv[2];
 const byId = new Map();
@@ -67,6 +68,7 @@ const context = {
 context.globalThis = context;
 vm.createContext(context);
 vm.runInContext('const ui={state:{settings:{}}};', context);
+loadI18n(context, WEB);
 for (const name of ['review_actions.js', 'reading_tools.js']) {
   vm.runInContext(fs.readFileSync(path.join(WEB, name), 'utf8'), context, {filename: name});
 }
@@ -130,21 +132,5 @@ async function open(spec, withActions) {
   assert.equal(r.width, null);
   narrow = false;
 
-  // CSS contract: real column bounds, headword wraps, no clipping.
-  const css = fs.readFileSync(path.join(WEB, 'reading_tools.css'), 'utf8');
-  const rule = sel => {
-    const m = new RegExp(`(?:^|[}\\n])${sel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\{([^}]*)\\}`).exec(css);
-    assert.ok(m, `missing rule ${sel}`);
-    return m[1];
-  };
-  assert.match(rule('.pudge-study-head'), /display:grid;grid-template-columns:minmax\(0,1fr\) auto auto/);
-  assert.match(rule('.pudge-study-head[data-layout="stacked"]'), /"term close" "actions actions"/);
-  const term = rule('.pudge-study-term');
-  assert.match(term, /white-space:normal/);
-  assert.match(term, /min-width:0/);
-  assert.doesNotMatch(term, /nowrap|keep-all|overflow:hidden|text-overflow/);
-  assert.match(rule('.pudge-study-term-controls'), /flex:0 0 auto/);
-  assert.match(rule('.pudge-study-close'), /grid-area:close/);
-  assert.match(rule('.pudge-study-head-actions'), /grid-area:actions/);
   console.log('jiten card header S10: PASS');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -74,6 +74,16 @@
     state.label.textContent = selectedLabel(select);
     state.button.disabled = Boolean(select.disabled);
     state.button.setAttribute('aria-disabled', String(Boolean(select.disabled)));
+    // Why a setting is unavailable (data-disabled-reason, set by Settings) is shown on hover
+    // of the visible control; a disabled button gets no pointer events, the shell does.
+    const reason = select.disabled ? String(select.dataset.disabledReason || '') : '';
+    if (reason) {
+      state.shell.dataset.tooltip = reason;
+      state.shell.title = reason;
+    } else if (state.shell.dataset.tooltip) {
+      delete state.shell.dataset.tooltip;
+      state.shell.removeAttribute('title');
+    }
     if (state.menu.classList.contains('open')) {
       // Rebuild only when the option list changed. Replacing the option buttons
       // under the pointer (e.g. a poll re-setting .value every few hundred ms)
@@ -257,7 +267,7 @@
 
   const start = () => {
     scan(document);
-    observer.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['disabled', 'selected', 'label', 'hidden']});
+    observer.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['disabled', 'selected', 'label', 'hidden', 'data-disabled-reason']});
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once: true});
   else start();

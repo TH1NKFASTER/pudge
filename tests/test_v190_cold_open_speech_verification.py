@@ -1,8 +1,8 @@
+"""Cold-open speech verification, the reader clock at player start-up, and speech pauses in
+the reading clock (behaviour; audit 71Б rewrite: the reader clock runs in the page harness)."""
+
 from __future__ import annotations
 
-import json
-import re
-import subprocess
 from pathlib import Path
 
 from pudge.reading_audio_alignment import _inject_punctuation_pause_anchors
@@ -13,53 +13,6 @@ from pudge.subtitles.timeline_alignment import (
     _early_edit_audio_verification_risk,
 )
 from pudge.syncing import _restore_embedded_opening_clock_scaffold
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge/web/index.html"
-
-
-def _function(source: str, name: str) -> str:
-    match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", source)
-    assert match, name
-    opening = source.find("){", match.end())
-    assert opening >= 0
-    opening += 1
-    depth = 0
-    quote: str | None = None
-    escaped = False
-    index = opening
-    while index < len(source):
-        char = source[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"', "`"}:
-            quote = char
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return source[match.start() : index + 1]
-        index += 1
-    raise AssertionError(name)
-
-
-def _run_node(script: str) -> dict[str, object]:
-    completed = subprocess.run(
-        ["node", "-e", script],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(completed.stdout)
 
 
 def _row(center: float, offset: float) -> _WindowMatch:
@@ -208,45 +161,26 @@ def test_ambiguous_single_window_uses_local_japanese_speech_residual(tmp_path: P
     assert abs(cues[len(pre)][0] - post[0]) < 0.01
 
 
-def test_syncing_has_no_episode_specific_hyakkano_timing_override() -> None:
-    source = (ROOT / "pudge/syncing.py").read_text(encoding="utf-8")
-    assert "_HYAKKANO_S03E09_PREOPENING_OFFSET" not in source
-    assert "_apply_verified_candidate_timing_override" not in source
-    assert "verified-user-timing-v1" not in source
-
-
-def test_new_player_startup_does_not_leave_browser_clock_700ms_ahead() -> None:
-    source = HTML.read_text(encoding="utf-8")
-    functions = "\n".join(
-        _function(source, name)
-        for name in (
-            "lnPairedTransportClockDesired",
-            "lnPairedTransportClockNow",
-            "lnPairedTransportClockSetDesired",
-            "lnPairedTransportClockReconcile",
-            "lnPairedTransportClockReset",
-        )
+def test_new_player_startup_does_not_leave_the_reader_clock_700ms_ahead(page) -> None:
+    # A freshly spawned mpv reports "playing" before its media clock moves. The reader's clock
+    # used to run on during that stall and stayed ~0.7 s ahead of the voice for the chapter.
+    result = page.run(
+        r"""
+        const state = position => ({position, speed: 1, playing: true});
+        const clock = position => lnPairedTransportClockNow(state(position));
+        lnPairedTransportClockReset(state(33.646));
+        const out = {};
+        await __tick(148); lnPairedTransportClockReconcile(state(33.646), {settled: true}); out.stalled = clock(33.646);
+        await __tick(379); lnPairedTransportClockReconcile(state(33.646), {settled: true}); out.stillStalled = clock(33.646);
+        await __tick(255); lnPairedTransportClockReconcile(state(33.71679), {settled: true}); out.started = clock(33.71679);
+        await __tick(1000); out.running = clock(33.71679);
+        return out;
+        """
     )
-    script = f"""
-let now=0;
-global.performance={{now:()=>now}};
-global.ui={{lnPairedTransportDesired:null,lnPairedState:null}};
-{functions}
-const state={{position:33.646,speed:1,playing:true}};
-lnPairedTransportClockReset(state);
-now=148;
-const first=lnPairedTransportClockReconcile({{...state,position:33.646}},{{settled:true}});
-now=527;
-const second=lnPairedTransportClockReconcile({{...state,position:33.646}},{{settled:true}});
-now=782;
-const started=lnPairedTransportClockReconcile({{...state,position:33.71679}},{{settled:true}});
-console.log(JSON.stringify({{first,second,started}}));
-"""
-    result = _run_node(script)
-    assert result["first"]["startupWaiting"] is True
-    assert result["second"]["startupWaiting"] is True
-    assert result["started"]["startupRebase"] is True
-    assert abs(float(result["started"]["lead"])) < 0.01
+    out = result.value
+    assert abs(out["stalled"] - 33.646) < 0.01 and abs(out["stillStalled"] - 33.646) < 0.01
+    assert abs(out["started"] - 33.71679) < 0.01
+    assert abs(out["running"] - 34.71679) < 0.02
 
 
 def test_long_vad_gap_moves_impossible_next_word_onset_to_resume() -> None:
@@ -261,9 +195,7 @@ def test_long_vad_gap_moves_impossible_next_word_onset_to_resume() -> None:
         {"start": 14086.700, "end": 14087.140},
         {"start": 14087.580, "end": 14088.075},
     ]
-    refined, count = _inject_punctuation_pause_anchors(
-        anchors, boundaries, speech_regions
-    )
+    refined, count = _inject_punctuation_pause_anchors(anchors, boundaries, speech_regions)
     assert count == 1
     assert {"offset": 132.999, "time": 14085.96} in refined
     assert {"offset": 132.999, "time": 14086.699} in refined

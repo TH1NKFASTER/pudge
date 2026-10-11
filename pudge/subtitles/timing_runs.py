@@ -1,4 +1,5 @@
 """Describe the delivered cue clock (including local repairs)."""
+
 from itertools import pairwise
 
 from ..subtitle_formats import convert_to_plain_srt, parse_srt
@@ -15,10 +16,16 @@ def final_timing_runs(raw, output):
         if before[2] != after[2]:
             return []
         offset = round(after[0] - before[0], 3)
-        if not runs or abs(offset - runs[-1]["offset_seconds"]) > .020:
-            runs.append({"first_cue": index + 1, "last_cue": index + 1,
-                         "source_start": before[0], "source_end": before[1],
-                         "offset_seconds": offset})
+        if not runs or abs(offset - runs[-1]["offset_seconds"]) > 0.020:
+            runs.append(
+                {
+                    "first_cue": index + 1,
+                    "last_cue": index + 1,
+                    "source_start": before[0],
+                    "source_end": before[1],
+                    "offset_seconds": offset,
+                }
+            )
         else:
             runs[-1].update(last_cue=index + 1, source_end=before[1])
     for left, right in pairwise(runs):

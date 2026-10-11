@@ -1,4 +1,5 @@
 """Scheduled-agent traffic starts must obey GUI's cross-process Torrent Off."""
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +27,7 @@ class _Client:
 
     def add_release(self, release, *, paused):
         self.calls.append((release, paused))
-        return 'hash'
+        return "hash"
 
 
 def _manager(config_path: Path, *, locally_enabled: bool):
@@ -40,41 +41,41 @@ def _manager(config_path: Path, *, locally_enabled: bool):
 
 
 def test_old_agent_config_cannot_start_after_gui_off(tmp_path):
-    path = tmp_path / 'config.toml'
+    path = tmp_path / "config.toml"
     gate = TorrentAdmission(path)
     manager = _manager(path, locally_enabled=True)  # stale agent config
     client = _Client()
     with gate.locked():
         gate.publish(False)
     assert manager.downloads_enabled() is False
-    with pytest.raises(ManagerError, match='off'):
-        manager._torrent_network_start(client, 'start', 'old-task')
-    with pytest.raises(ManagerError, match='off'):
-        manager._torrent_network_start(client, 'add_release', 'new-task', paused=False)
+    with pytest.raises(ManagerError, match="off"):
+        manager._torrent_network_start(client, "start", "old-task")
+    with pytest.raises(ManagerError, match="off"):
+        manager._torrent_network_start(client, "add_release", "new-task", paused=False)
     assert client.calls == []
     with gate.locked():
         gate.publish(True)
     assert manager.downloads_enabled() is True
-    manager._torrent_network_start(client, 'start', 'new-task')
-    assert client.calls == ['new-task']
+    manager._torrent_network_start(client, "start", "new-task")
+    assert client.calls == ["new-task"]
 
 
 def test_unreadable_intent_fails_closed(tmp_path):
-    path = tmp_path / 'config.toml'
+    path = tmp_path / "config.toml"
     gate = TorrentAdmission(path)
     with gate.locked():
         gate.publish(True)
-    gate._state_path.write_text('not json')
+    gate._state_path.write_text("not json")
     assert gate.enabled(fallback=True) is False
     assert _manager(path, locally_enabled=True).downloads_enabled() is False
 
 
 def test_cross_process_start_waits_for_off_and_rechecks(tmp_path):
-    path = tmp_path / 'config.toml'
+    path = tmp_path / "config.toml"
     gate = TorrentAdmission(path)
-    started = tmp_path / 'started'
-    blocked = tmp_path / 'blocked'
-    code = '''
+    started = tmp_path / "started"
+    blocked = tmp_path / "blocked"
+    code = """
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,16 +90,16 @@ try:
     manager._torrent_network_start(Client(), 'start', 'delayed-task')
 except ManagerError:
     blocked.write_text('blocked')
-'''
+"""
     with gate.locked():
         gate.publish(True)
         child = subprocess.Popen(
-            [sys.executable, '-c', code, str(path), str(started), str(blocked)],
+            [sys.executable, "-c", code, str(path), str(started), str(blocked)],
             cwd=Path(__file__).resolve().parents[1],
         )
         try:
             time.sleep(0.25)
-            assert child.poll() is None, 'start must wait for the cross-process lock'
+            assert child.poll() is None, "start must wait for the cross-process lock"
             assert not started.exists()
             gate.publish(False)
         finally:
@@ -110,14 +111,14 @@ except ManagerError:
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
-    assert blocked.read_text() == 'blocked'
+    assert blocked.read_text() == "blocked"
     assert not started.exists()
 
 
 def test_gui_off_waits_for_other_manager_before_quiescing(tmp_path, monkeypatch):
     from pudge import web_app
 
-    path = tmp_path / 'config.toml'
+    path = tmp_path / "config.toml"
     gate = TorrentAdmission(path)
     with gate.locked():
         gate.publish(True)
@@ -131,22 +132,25 @@ def test_gui_off_waits_for_other_manager_before_quiescing(tmp_path, monkeypatch)
 
     api = WebAppApi.__new__(WebAppApi)
     api.config = SimpleNamespace(
-        config_path=path, nyaa=SimpleNamespace(torrents_enabled=True),
+        config_path=path,
+        nyaa=SimpleNamespace(torrents_enabled=True),
     )
-    api.manager = SimpleNamespace(config=api.config, download_intents=SimpleNamespace(waiting_count=lambda: 0))
-    api.logger = logging.getLogger('test-cross-process-off')
+    api.manager = SimpleNamespace(
+        config=api.config, download_intents=SimpleNamespace(waiting_count=lambda: 0)
+    )
+    api.logger = logging.getLogger("test-cross-process-off")
     api._torrent_session_enabled = True
     api._torrent_session_authoritative = True
     api._downloads_configured = lambda: False
-    api._quiesce_torrent_backends = lambda *, reason: (quiesced.set() or {})
+    api._quiesce_torrent_backends = lambda *, reason: quiesced.set() or {}
     api._bump_ui_state_version = lambda: None
-    monkeypatch.setattr(web_app, 'write_torrents_enabled', lambda *_args: None)
-    monkeypatch.setattr(web_app, 'write_config', lambda *_args: None)
+    monkeypatch.setattr(web_app, "write_torrents_enabled", lambda *_args: None)
+    monkeypatch.setattr(web_app, "write_config", lambda *_args: None)
     errors = []
 
     def run_start():
         try:
-            manager._torrent_network_start(SlowClient(), 'start', 'abc')
+            manager._torrent_network_start(SlowClient(), "start", "abc")
         except Exception as exc:
             errors.append(exc)
 
@@ -170,5 +174,6 @@ def test_gui_off_waits_for_other_manager_before_quiescing(tmp_path, monkeypatch)
             two.join(timeout=5)
     assert not one.is_alive() and not two.is_alive()
     assert not errors
+    assert api._wait_torrent_off_quiet(5)  # Off's background half
     assert quiesced.is_set()
     assert gate.enabled(fallback=True) is False

@@ -100,9 +100,7 @@ def compact_relations_from_graph(
             seen.add(key)
             payload = dict(nodes[neighbour_id])
             payload["relation_type"] = relation_type
-            payload["relations"] = (
-                build(neighbour_id, current_id, remaining - 1) if remaining > 1 else []
-            )
+            payload["relations"] = build(neighbour_id, current_id, remaining - 1) if remaining > 1 else []
             result.append(payload)
         return result
 

@@ -8,7 +8,6 @@
   const API = () => g.window?.pywebview?.api || g.pywebview?.api;
   // eslint-disable-next-line no-undef
   const uiRef = () => (typeof ui !== 'undefined' ? ui : g.ui);
-  const ru = () => (uiRef()?.lang || document.documentElement.lang) === 'ru';
   const available = () => Boolean(g.PudgeReadingTools?.llmAvailable?.());
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
 
@@ -50,7 +49,7 @@
 
   function modelName() {
     const settings = uiRef()?.state?.settings || {};
-    return String(settings.llm_model || '').trim() || (ru() ? 'Помощник' : 'Assistant');
+    return String(settings.llm_model || '').trim() || (PudgeI18n.t('assistant.assistant'));
   }
 
   // Minimal, safe Markdown: everything is escaped first.
@@ -66,7 +65,7 @@
         const code = (match ? chunk.slice(match[0].length) : chunk).replace(/\n$/, '');
         blocks.push(
           `<div class="pa-code"><div class="pa-code-head"><span>${esc(lang || 'code')}</span>` +
-          `<button type="button" class="pa-code-copy" data-pa-copy-code>${ru() ? 'Копировать' : 'Copy'}</button></div>` +
+          `<button type="button" class="pa-code-copy" data-pa-copy-code>${PudgeI18n.t('ui.copy')}</button></div>` +
           `<pre><code${lang ? ` data-lang="${esc(lang)}"` : ''}>${g.PudgeAssistantSyntax?.highlight?.(code, lang) ?? esc(code)}</code></pre></div>`,
         );
         return;
@@ -94,9 +93,9 @@
 
   function grammarSummary(result) {
     const points = Array.isArray(result?.points) ? result.points : [];
-    if (!points.length) return result?.translation ? `Translation: ${result.translation}. No notable grammar points.` : 'No notable grammar points.';
+    if (!points.length) return result?.translation ? PudgeI18n.t('assistant.translationNoGrammarPoints', {translation: result.translation}) : PudgeI18n.t('reading.noNotableGrammarPoints');
     return [
-      result?.translation ? `Translation: ${result.translation}` : '',
+      result?.translation ? PudgeI18n.t('assistant.translationLine', {translation: result.translation}) : '',
       ...points.map(point => `- ${point.pattern}${point.meaning_in_context ? ` — ${point.meaning_in_context}` : ''}`),
     ].filter(Boolean).join('\n');
   }
@@ -111,7 +110,7 @@
     root.hidden = true;
     root.innerHTML = `
       <header class="pa-head">
-        <button type="button" class="pa-avatar" data-pa-reset-geometry aria-label="Reset assistant position">✦</button>
+        <button type="button" class="pa-avatar" data-pa-reset-geometry aria-label="${PudgeI18n.t('assistant.resetAssistantSizeAndPosition')}">✦</button>
         <div class="pa-window-controls">
           <button type="button" class="pa-window-button pa-window-close" data-pa-close><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3 9 9M9 3 3 9"/></svg></button>
           <button type="button" class="pa-window-button pa-window-collapse" data-pa-collapse><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8"/></svg></button>
@@ -128,7 +127,7 @@
       const resize = document.createElement('div');
       resize.className = `pa-resize-handle pa-resize-${edge}`;
       resize.dataset.paResize = edge;
-      resize.setAttribute('aria-label', ru() ? 'Изменить размер' : 'Resize assistant');
+      resize.setAttribute('aria-label', PudgeI18n.t('assistant.resizeAssistant'));
       root.appendChild(resize);
     }
     document.body.appendChild(root);
@@ -278,14 +277,14 @@
     root.querySelector('[data-pa-title]').textContent = modelName();
     root.querySelector('[data-pa-title]').title = modelName();
     const set = (sel, title, text) => { const node = root.querySelector(sel); if (!node) return; node.title = title; node.setAttribute('aria-label', title); if (text !== undefined) node.textContent = text; };
-    set('[data-pa-new]', ru() ? 'Очистить чат' : 'Clear chat');
-    set('[data-pa-reset-geometry]', ru() ? 'Вернуть размер и положение помощника' : 'Reset assistant size and position');
-    set('[data-pa-collapse]', ru() ? 'Свернуть' : 'Collapse');
-    set('[data-pa-close]', ru() ? 'Закрыть' : 'Close');
-    set('[data-pa-send]', ru() ? 'Отправить' : 'Send');
+    set('[data-pa-new]', PudgeI18n.t('assistant.clearChat'));
+    set('[data-pa-reset-geometry]', PudgeI18n.t('assistant.resetAssistantSizeAndPosition'));
+    set('[data-pa-collapse]', PudgeI18n.t('ui.collapse'));
+    set('[data-pa-close]', PudgeI18n.t('action.close'));
+    set('[data-pa-send]', PudgeI18n.t('assistant.send'));
     const input = root.querySelector('[data-pa-input]');
-    if (input) input.placeholder = ru() ? 'Спросите о предложении…' : 'Ask about this sentence…';
-    if (tab) { tab.textContent = ru() ? '✦ Помощник' : '✦ Assistant'; tab.title = ru() ? 'Развернуть помощника' : 'Expand assistant'; }
+    if (input) input.placeholder = PudgeI18n.t('assistant.askAboutThisSentence');
+    if (tab) { tab.textContent = PudgeI18n.t('assistant.assistant2'); tab.title = PudgeI18n.t('assistant.expandAssistant'); }
   }
 
   function messageHtml(message, index) {
@@ -293,7 +292,7 @@
     const divider = index > 0 && message.role === 'user' && message.topic !== thread.messages[index - 1]?.topic
       ? '<div class="pa-divider" aria-hidden="true"></div>' : '';
     const copy = message.role === 'assistant' && !message.error && message.content
-      ? `<button type="button" class="pa-copy" data-pa-copy title="${ru() ? 'Копировать ответ' : 'Copy answer'}" aria-label="${ru() ? 'Копировать ответ' : 'Copy answer'}">⧉</button>` : '';
+      ? `<button type="button" class="pa-copy" data-pa-copy title="${PudgeI18n.t('assistant.copyAnswer')}" aria-label="${PudgeI18n.t('assistant.copyAnswer')}">⧉</button>` : '';
     return `${divider}<div class="pa-msg pa-${message.role}${message.error ? ' pa-error' : ''}" data-pa-index="${index}"><div class="pa-bubble">${body}</div>${copy}</div>`;
   }
 
@@ -362,7 +361,7 @@
     const messages = thread?.messages || [];
     list.innerHTML = messages.length
       ? messages.map((message, index) => messageHtml(message, index)).join('') + (pending ? '<div class="pa-msg pa-assistant"><div class="pa-bubble pa-typing"><span></span><span></span><span></span></div></div>' : '')
-      : `<div class="pa-empty">${ru() ? 'Выделите предложение и нажмите «Разобрать грамматику», затем задавайте вопросы здесь.' : 'Select a sentence and press “Explain grammar”, then ask questions here.'}</div>`;
+      : `<div class="pa-empty">${PudgeI18n.t('assistant.selectASentenceAndPress')}</div>`;
     const send = root.querySelector('[data-pa-send]');
     if (send) send.disabled = pending;
     if (scroll) list.scrollTop = list.scrollHeight;
@@ -426,7 +425,7 @@
     const id = ++generation;
     const topic = Number(thread?.topic || 0) + 1;
     thread = {topic, sentence, context: String(context || ''), grammar: null, messages: thread?.messages || []};
-    push({role: 'user', content: `${ru() ? 'Разбери грамматику' : 'Explain the grammar of'}: «${sentence}»`});
+    push({role: 'user', content: `${PudgeI18n.t('assistant.explainTheGrammarOf')}: «${sentence}»`});
     pending = true;
     show();
     let reply;
@@ -439,7 +438,7 @@
       reply = {role: 'assistant', html, content: failed ? '' : grammarSummary(result), error: failed};
     } catch (error) {
       if (id !== generation) return true;
-      reply = {role: 'assistant', content: String(error?.message || error), error: true};
+      reply = {role: 'assistant', content: PudgeI18n.message(String(error?.message || error)), error: true};
     }
     pending = false;
     push(reply);
@@ -468,13 +467,13 @@
         reply = {role: 'assistant', content: String(result.reply || '')};
       } else {
         const why = result?.reason === 'llm_disabled'
-          ? (ru() ? 'Включите LLM в настройках.' : 'Enable the LLM in Settings.')
-          : (ru() ? 'Не удалось получить ответ.' : 'Could not get an answer.');
+          ? (PudgeI18n.t('assistant.enableTheLlmInSettings'))
+          : (PudgeI18n.t('assistant.couldNotGetAnAnswer'));
         reply = {role: 'assistant', content: `${why}${result?.detail ? `\n\n\`${result.detail}\`` : ''}`, error: true};
       }
     } catch (error) {
       if (id !== generation) return true;
-      reply = {role: 'assistant', content: String(error?.message || error), error: true};
+      reply = {role: 'assistant', content: PudgeI18n.message(String(error?.message || error)), error: true};
     }
     pending = false;
     push(reply);
@@ -578,7 +577,7 @@
     }
     if (button) {
       const previous = button.textContent;
-      button.textContent = ok ? (ru() ? 'Скопировано' : 'Copied') : (ru() ? 'Не вышло' : 'Failed');
+      button.textContent = ok ? (PudgeI18n.t('assistant.copied')) : (PudgeI18n.t('assistant.failed'));
       button.classList?.add('pa-copied');
       setTimeout(() => { button.textContent = previous; button.classList?.remove('pa-copied'); }, 1200);
     }

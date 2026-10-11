@@ -24,6 +24,15 @@ class ReleaseError(RuntimeError):
     pass
 
 
+def release_tag(version: str) -> str:
+    # Releases are tagged vX.Y.Z (as up to v0.7.29); 0.7.30 alone was tagged without the v.
+    return "v" + version
+
+
+def release_message(version: str) -> str:
+    return f"Pudge v{version}"
+
+
 def run(
     *args: str,
     capture: bool = False,
@@ -116,9 +125,7 @@ def ensure_safe_release_start(version: str) -> None:
     # and only release-metadata files are dirty.  Unrelated work is never staged.
     if unexpected or current_version() != version:
         detail = ", ".join(sorted(unexpected or dirty))
-        raise ReleaseError(
-            "working tree must be clean before a version bump; unrelated changes: " + detail
-        )
+        raise ReleaseError("working tree must be clean before a version bump; unrelated changes: " + detail)
     print("Resuming release with reviewed metadata changes: " + ", ".join(sorted(dirty)))
 
 
@@ -127,8 +134,7 @@ def ensure_clean_after_stage() -> None:
     untracked = git_output("ls-files", "--others", "--exclude-standard")
     if unstaged or untracked:
         raise ReleaseError(
-            "working tree contains files outside the explicitly staged release metadata; "
-            "release aborted"
+            "working tree contains files outside the explicitly staged release metadata; release aborted"
         )
 
 
@@ -149,9 +155,7 @@ def ensure_release_version(version: str, python: str) -> None:
         raise ReleaseError(f"version bump did not produce {version}")
     unexpected = changed_paths().difference(RELEASE_FILES)
     if unexpected:
-        raise ReleaseError(
-            "version bump changed unexpected paths: " + ", ".join(sorted(unexpected))
-        )
+        raise ReleaseError("version bump changed unexpected paths: " + ", ".join(sorted(unexpected)))
 
 
 def validate(python: str) -> None:
@@ -167,16 +171,18 @@ def commit_if_needed(version: str) -> str:
     git("diff", "--cached", "--check")
     ensure_clean_after_stage()
 
+    message = release_message(version)
     staged = git("diff", "--cached", "--quiet", check=False).returncode != 0
-    if staged:
+    local = int(git_output("rev-list", "--count", "origin/main..HEAD"))
+    resumed = not staged and local == 1 and git_output("log", "-1", "--pretty=%s") == message
+    if not resumed:
+        if not staged and local == 0:
+            raise ReleaseError("nothing to release: no local commits and nothing staged")
+        # GitHub gets one commit per release: every local commit since origin/main (and the
+        # staged version bump) becomes the single release commit on top of origin/main.
+        git("reset", "--soft", "origin/main")
         run("git", "--no-pager", "diff", "--cached", "--stat")
-        git("commit", "-m", f"Pudge {version}")
-    else:
-        message = git_output("log", "-1", "--pretty=%s")
-        if message != f"Pudge {version}":
-            raise ReleaseError(
-                "nothing is staged and HEAD is not the requested release commit"
-            )
+        git("commit", "-m", message)
 
     head = git_output("rev-parse", "HEAD")
     if current_version() != version:
@@ -185,36 +191,30 @@ def commit_if_needed(version: str) -> str:
 
 
 def publish(version: str, head: str) -> None:
-    tag = version
+    tag = release_tag(version)
 
     git("push", "origin", "main")
 
     existing_local = local_tag_sha(tag)
     if existing_local and existing_local != head:
-        raise ReleaseError(
-            f"local {tag} already points to {existing_local[:12]}, not HEAD {head[:12]}"
-        )
+        raise ReleaseError(f"local {tag} already points to {existing_local[:12]}, not HEAD {head[:12]}")
     if not existing_local:
         git("tag", tag)
 
     existing_remote = remote_tag_sha(tag)
     if existing_remote and existing_remote != head:
-        raise ReleaseError(
-            f"remote {tag} already points to {existing_remote[:12]}, not HEAD {head[:12]}"
-        )
+        raise ReleaseError(f"remote {tag} already points to {existing_remote[:12]}, not HEAD {head[:12]}")
     if not existing_remote:
         git("push", "origin", tag)
 
     print()
-    print(f"Released Pudge {version}")
+    print(f"Released {release_message(version)}")
     print(f"commit: {head}")
     print(f"tag:    {tag}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Validate, commit, push and tag a Pudge release."
-    )
+    parser = argparse.ArgumentParser(description="Validate, commit, push and tag a Pudge release.")
     parser.add_argument("version", help="Release version, e.g. 0.7.21")
     parser.add_argument(
         "--python",
@@ -239,7 +239,7 @@ def main() -> int:
     if branch != "main":
         raise ReleaseError(f"release must run from main, current branch is {branch!r}")
 
-    tag = version
+    tag = release_tag(version)
     print(f"Pudge release {tag}")
     print(f"checkout: {ROOT}")
 

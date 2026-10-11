@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pudge import i18n
 from pudge.config import SyncConfig
 from pudge.models import SubtitleCandidate
 from pudge.syncing import optimize_candidates, subtitle_quality_accepted
@@ -76,9 +77,7 @@ def test_exact_numbered_episode_strong_clock_skips_noisy_llm_and_audio(
     )
     monkeypatch.setattr(
         "pudge.syncing.prepare_speech_reference",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("audio fallback must not run")
-        ),
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("audio fallback must not run")),
     )
 
     selected, output, result = optimize_candidates(
@@ -193,4 +192,5 @@ def test_quality_gate_accepts_mushoku_exact_episode_shape() -> None:
     )
 
     assert accepted is True
-    assert "точная серия" in reason
+    assert "exact AniList/Jimaku episode" in reason
+    assert "точная серия" in i18n.message(reason, "ru")

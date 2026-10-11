@@ -1,13 +1,19 @@
-from __future__ import annotations
+"""Listen together v1.75: the first sentence of a chapter is not skipped, a spoken chapter
+title does not advance the text, following the audio stays cheap (behaviour; audit 71Б rewrite).
 
-from pathlib import Path
+Covered elsewhere: blurred pictures stay blurred and visible while scrolling,
+test_v141_ln_blur_scroll_open_alignment_perf.py::
+test_blurred_illustration_is_the_eager_image_itself_clipped_by_its_frame; the
+torrent switch turns green only after the backend confirmed it, is disabled meanwhile and gives
+up after 3 s, test_v195_torrent_authoritative_state.py and test_v197_torrent_http_bridge.py."""
+
+from __future__ import annotations
 
 import pytest
 
 from pudge.reading_audio_alignment import _recover_leading_prefix_clock
-
-ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "pudge" / "web" / "index.html"
+from t71g19_support import LN_PAIRED, OPEN
+from t71g22_support import COSTS, USER_SCROLL
 
 
 def _first_chapter_story() -> str:
@@ -96,43 +102,37 @@ def test_short_title_burst_plateau_becomes_zero_width_until_real_prose() -> None
 
     assert debug.get("skipped_ln_prefix") is not True
     assert debug.get("marker_false_advance_chars") == pytest.approx(11.0, abs=0.2)
-    assert debug.get("inferred_marker_plateau") is True or debug.get("marker_source") == "acoustic+prefix-rebase"
+    assert (
+        debug.get("inferred_marker_plateau") is True or debug.get("marker_source") == "acoustic+prefix-rebase"
+    )
     assert story_start == pytest.approx(6856.20, abs=0.08)
     assert all(float(row["offset"]) == 0.0 for row in repaired if float(row["time"]) < story_start - 0.01)
     # The later semantic chain is retained, so the repair naturally converges.
-    assert any(abs(float(row["time"]) - 6865.06) < 0.05 and 34 <= float(row["offset"]) <= 36 for row in repaired)
+    assert any(
+        abs(float(row["time"]) - 6865.06) < 0.05 and 34 <= float(row["offset"]) <= 36 for row in repaired
+    )
 
 
-def test_paired_audiobook_scroll_uses_cached_dom_index_and_avoids_layout_reads_during_manual_scroll() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    assert "function lnPairedDomIndex()" in html
-    assert "function lnPairedFindRange(rows,value,inclusiveEnd=false)" in html
-    fn = html.split("function renderLnPairedPosition", 1)[1].split("function startLnPairedInterpolation", 1)[0]
-    assert "lnPairedFindRange(domIndex.wordRanges" in fn
-    assert "reader.querySelectorAll('[data-ln-audio-start][data-ln-audio-end].ln-word')" not in fn
-    assert "reader.querySelectorAll('.ln-paired-furigana-preview" not in fn
-    manual_at = fn.index("manualHold=lnPairedManualNavigationActive(state)")
-    rect_at = fn.index("viewport=scroll.getBoundingClientRect()")
-    assert manual_at < rect_at
-    assert "render_ms:" in fn
-    assert "manual_scroll:" in fn
-
-
-def test_blurred_images_remain_visible_during_scroll() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    rule = ".ln-reader-scroll.ln-reader-scrolling .ln-reader.blur-images .ln-inline-image:not(.revealed) img{filter:none!important;visibility:hidden!important}"
-    assert rule not in html
-    assert ".ln-reader.blur-images .ln-inline-image:not(.revealed) img{filter:blur(44px);cursor:pointer}" in html
-
-
-def test_torrent_toggle_waits_for_backend_ack_before_turning_green() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    handler = html.split("async function torrentToggleHttpCapture(){", 1)[1].split("document.addEventListener('click',event=>{", 1)[0]
-    backend = handler.index("torrentHttpJson('/api/torrents/enabled'")
-    confirmed = handler.index("ui.state.settings.torrents_enabled=Boolean(result.enabled)")
-    assert backend < confirmed
-    assert "ui.state.settings.torrents_enabled=desired" not in handler[:backend]
-    assert "Torrent toggle HTTP timeout" in handler
-    assert "button.disabled=true" in handler
-    assert "button.disabled=false" in handler
-    assert "torrentToggleCaptureInFlight" in handler
+def test_following_the_audio_reuses_its_word_index_and_reads_layout_rarely(page) -> None:
+    # Following the narration paints ~30 frames a second. It finds the spoken word in an
+    # index built once per chapter (searching the chapter's DOM each frame was slow in long
+    # chapters) and checks whether the word is still in view at most every 250 ms (that
+    # check forces a WebKit layout); right after the user scrolled it does not check at all.
+    result = page.run(
+        OPEN
+        + USER_SCROLL
+        + COSTS
+        + r"""
+        await __tick(500);
+        const playing = await measure(1000);
+        wheel();
+        const afterWheel = await measure(1500);
+        await __tick(600);
+        return {playing, afterWheel, following: await measure(1000)};
+        """,
+        before=LN_PAIRED,
+    )
+    out = result.value
+    assert out["playing"]["chapterQueries"] == 0 and 2 <= out["playing"]["viewport"] <= 4
+    assert out["afterWheel"] == {"viewport": 0, "chapterQueries": 0}
+    assert out["following"]["chapterQueries"] == 0 and 2 <= out["following"]["viewport"] <= 4

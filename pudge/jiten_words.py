@@ -178,13 +178,20 @@ class JitenWordRepository:
                     previous, previous_updated = hit or ({}, 0)
                     current = normalize_card(card)
                     merged = {**previous, **{k: v for k, v in current.items() if v not in (None, "", [])}}
-                    merged["all_readings"] = [v for v in dict.fromkeys(
-                        [merged.get("primary_reading", "")]
-                        + current.get("all_readings", [])
-                        + previous.get("all_readings", [])
-                    ) if v]
-                    updated = (previous_updated if previous.get("dictionary_complete")
-                               and not card.get("dictionary_complete") else now)
+                    merged["all_readings"] = [
+                        v
+                        for v in dict.fromkeys(
+                            [merged.get("primary_reading", "")]
+                            + current.get("all_readings", [])
+                            + previous.get("all_readings", [])
+                        )
+                        if v
+                    ]
+                    updated = (
+                        previous_updated
+                        if previous.get("dictionary_complete") and not card.get("dictionary_complete")
+                        else now
+                    )
                     staged[key] = (merged, updated)
                     conn.execute(
                         "INSERT OR REPLACE INTO jiten_word_cache VALUES(?,?,?,?,?)",

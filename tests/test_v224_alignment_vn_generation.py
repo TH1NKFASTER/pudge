@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -15,8 +14,6 @@ from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.light_novels import LightNovelService
 from pudge.visual_novels import VisualNovelService
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _paired_audio(tmp_path: Path) -> tuple[AudiobookService, int, int]:
@@ -110,7 +107,8 @@ def test_alignment_reprocess_generation_blocks_late_old_publish(monkeypatch, tmp
             "marker": "new" if call == 2 else "old",
         }
 
-    monkeypatch.setattr(audiobooks_module, "align_light_novel_to_transcript", fake_align)
+    # The alignment itself runs in a child process; the test replaces that step.
+    monkeypatch.setattr(audio, "_align_reading_audio", fake_align)
 
     audio.prepare_alignment(ln_id)
     assert first_started.wait(1.0)
@@ -122,7 +120,9 @@ def test_alignment_reprocess_generation_blocks_late_old_publish(monkeypatch, tmp
     assert json.loads(output.read_text(encoding="utf-8"))["marker"] == "new"
 
     release_first.set()
-    _wait_until(lambda: not any(name.startswith("reading-audio-align-") for name in audio.active_worker_names()))
+    _wait_until(
+        lambda: not any(name.startswith("reading-audio-align-") for name in audio.active_worker_names())
+    )
     assert json.loads(output.read_text(encoding="utf-8"))["marker"] == "new"
     status = audio.alignment_status(ln_id)
     assert status["ready"] is True
@@ -161,46 +161,50 @@ def test_alignment_relink_cancels_old_generation(tmp_path: Path) -> None:
     assert int(link["book"]["id"]) == second_id
 
 
-def test_vn_render_ignores_out_of_order_parse_response() -> None:
-    source = (ROOT / "pudge/web/visual_novels.js").read_text(encoding="utf-8")
-    export_marker = "  window.PudgeVisualNovels={"
-    assert export_marker in source
-    source = source.replace(
-        export_marker,
-        "  window.__vnTest={renderCurrent,setState:(g,line,key)=>{pollGeneration=g;lastLineId=line;lastCurrentKey=key;}};\n"
-        + export_marker,
-        1,
-    )
-    script = f"""
-const vm=require('vm');
-const source={json.dumps(source)};
-const root={{textContent:'',innerHTML:'',dataset:{{}}}};
-let resolves=[];
-global.window={{ui:{{lang:'en'}},PudgeReadingTools:{{study:{{renderParsedText:(payload)=>payload.value}}}},addEventListener(){{}}}};
-global.document={{documentElement:{{lang:'en'}},getElementById:(id)=>id==='vnCurrent'?root:null,addEventListener(){{}}}};
-global.pywebview={{api:{{visual_novel_parse:(text)=>new Promise(resolve=>resolves.push({{text,resolve}}))}}}};
-vm.runInThisContext(source);
-window.__vnTest.setState(1,0,'1:1:OLD');
-const oldPromise=window.__vnTest.renderCurrent('OLD','current:1:1:OLD',1);
-window.__vnTest.setState(1,0,'1:2:NEW');
-const newPromise=window.__vnTest.renderCurrent('NEW','current:1:2:NEW',1);
-resolves.find(row=>row.text==='NEW').resolve({{value:'NEW_PARSED'}});
-setImmediate(()=>{{
-  resolves.find(row=>row.text==='OLD').resolve({{value:'OLD_PARSED'}});
-  Promise.all([oldPromise,newPromise]).then(()=>process.stdout.write(JSON.stringify({{html:root.innerHTML,text:root.textContent}})));
-}});
+# The VN page in the window: the backend reports the line on screen (current_text), and the
+# window asks visual_novel_parse for its words. Parse answers wait until the test releases
+# them (window.__answer(text)); window.__line = [id, text] is what the capture shows.
+VN_SLOW_PARSE = r"""
+window.__line = [1, '猫が好き'];
+__api.visual_novel_state = async () => ({running: true, status: 'running', capture_count: 1, ocr_count: 1, generation: 1,
+  current_text_id: window.__line[0], current_text: window.__line[1], transcript: []});
+const pending = new Map();
+__api.visual_novel_parse = text => new Promise(resolve => pending.set(text, resolve));
+window.__answer = text => pending.get(text)({paragraphs: [text], tokens: [[{start: 0, end: 1, wordId: 1, readingIndex: 0}]],
+  vocabulary: [{wordId: 1, readingIndex: 0, spelling: text[0], reading: 'x', meaningsChunks: [['word']], cardState: ['new']}]});
 """
-    payload = json.loads(subprocess.check_output(["node", "-e", script], text=True))
-    assert payload["html"] == "NEW_PARSED"
+VN_CURRENT = r"""
+const current = () => ({text: __text('#vnCurrent'), words: [...document.querySelectorAll('#vnCurrent [data-pudge-study-token]')].map(w => w.textContent)});
+const parses = () => __apiCalls.filter(call => call.name === 'visual_novel_parse').map(call => call.args[0]);
+"""
 
 
-def test_vn_poll_does_not_await_slow_parse() -> None:
-    source = (ROOT / "pudge/web/visual_novels.js").read_text(encoding="utf-8")
-    update = source.split("  async function update", 1)[1].split("  async function start", 1)[0]
-    assert "await renderCurrent" not in update
-    assert "void renderCurrent" in update
-    assert "requestId!==renderRequestId" in source
-    assert "String(lineId)===currentKey" in source
+def test_vn_keeps_polling_while_a_line_is_parsed_and_shows_only_the_newest_line(page) -> None:
+    # A slow parse used to hold up the capture poll (the next line appeared only after it),
+    # and a late answer for an older line replaced the newer line's words.
+    result = page.run(
+        VN_CURRENT
+        + r"""
+        setPage('visualnovels', true); await __tick(50);
+        const out = {first: current(), parses1: parses()};
+        window.__line = [2, '犬も好き'];
+        await __tick(600);                                 // the poll goes on while 猫が好き is parsed
+        out.second = current(); out.parses2 = parses();
+        window.__answer('犬も好き'); await __tick(10);
+        out.newParsed = current();
+        window.__answer('猫が好き'); await __tick(10);     // the late answer of the older line
+        out.afterLate = current();
+        return out;
+        """,
+        before=VN_SLOW_PARSE,
+    )
+    out = result.value
+    assert out["first"] == {"text": "猫が好き", "words": []}  # plain text until parsed
+    assert out["parses1"] == ["猫が好き"]
+    assert out["second"] == {"text": "犬も好き", "words": []}
+    assert out["parses2"] == ["猫が好き", "犬も好き"]
+    assert out["newParsed"] == {"text": "犬も好き", "words": ["犬"]}
+    assert out["afterLate"] == out["newParsed"]
 
 
 def test_vn_dialogue_roi_beats_non_dialogue_full_frame(monkeypatch) -> None:

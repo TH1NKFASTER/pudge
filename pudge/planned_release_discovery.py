@@ -3,6 +3,7 @@
 This subsystem never starts a download or writes to AniList. Only future entries
 observed while still upcoming are armed; pre-existing released entries are not.
 """
+
 from __future__ import annotations
 
 import fcntl
@@ -18,6 +19,7 @@ _PREFIX = "planned_release_discovery:v1:"
 _DELAYS = (15, 30, 60, 120, 240, 480, 720)
 _WEEK_SECONDS = 7 * 24 * 60 * 60
 _RELIABLE_AIRING_SOURCES = {"next_episode_1", "weekly_backfill"}
+_RECENT_PREMIERE_SECONDS = 24 * 60 * 60
 _SEARCH_REVISION = 5  # G32h: keep split-stage identity alias in related-title plausibility
 
 
@@ -63,6 +65,29 @@ def _first_airing_at(anime: LibraryAnime) -> float | None:
     return _first_airing_candidate(anime)[0]
 
 
+def discovery_work_due(db: Any, *, now: float | None = None) -> bool:
+    """Cheap check for the scheduled agent: does a Planning entry need the tick?
+
+    True when an entry was never seen and has a known premiere (it may need
+    arming) or an armed entry's next search is due. Ignored, found and undated
+    entries do not wake the agent.
+    """
+    current = time.time() if now is None else float(now)
+    for anime in db.anime_list(("PLANNING",)):
+        state = _decode(db.get_state(f"{_PREFIX}{int(anime.media_id)}", ""))
+        if not state:
+            if _first_airing_at(anime) is not None:
+                return True
+            continue
+        if state.get("phase") == "armed":
+            try:
+                if float(state.get("next_check", 0)) <= current:
+                    return True
+            except (TypeError, ValueError):
+                return True
+    return False
+
+
 def _decode(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(raw)
@@ -98,16 +123,19 @@ class PlannedReleaseDiscovery:
         result: list[dict[str, Any]] = []
         for anime in self.db.anime_list(("PLANNING",)):
             state = self._state(anime.media_id)
-            if state.get("phase") != "found" or self.db.get_state(
-                f"{_PREFIX}dismissed:{anime.media_id}", ""
-            ) == "1":
+            if (
+                state.get("phase") != "found"
+                or self.db.get_state(f"{_PREFIX}dismissed:{anime.media_id}", "") == "1"
+            ):
                 continue
-            result.append({
-                "media_id": anime.media_id,
-                "title": anime.title,
-                "cover": str(anime.cover_url or ""),
-                "found_at": state.get("found_at"),
-            })
+            result.append(
+                {
+                    "media_id": anime.media_id,
+                    "title": anime.title,
+                    "cover": str(anime.cover_url or ""),
+                    "found_at": state.get("found_at"),
+                }
+            )
         return sorted(result, key=lambda row: (float(row["found_at"] or 0), row["media_id"]))
 
     def tick(self, *, now: float | None = None, max_searches: int = 2) -> dict[str, int]:
@@ -141,15 +169,21 @@ class PlannedReleaseDiscovery:
                             # Missing dates are not proof of an old release. Wait
                             # for an authoritative future first-airing timestamp.
                             continue
-                        if first_airing <= current:
+                        if first_airing <= current - _RECENT_PREMIERE_SECONDS:
                             # Grandfather existing released entries. A later
                             # metadata refresh must never arm them retroactively.
+                            # An entry added on premiere day (e.g. after the
+                            # noon-UTC date-only guess) is still searched.
                             self._save(anime.media_id, {"phase": "ignored"})
                             continue
-                        state = {"phase": "armed", "airing_at": first_airing,
-                                 "airing_source": airing_source,
-                                 "next_check": first_airing + 15 * 60, "attempts": 0,
-                                 "search_revision": _SEARCH_REVISION}
+                        state = {
+                            "phase": "armed",
+                            "airing_at": first_airing,
+                            "airing_source": airing_source,
+                            "next_check": first_airing + 15 * 60,
+                            "attempts": 0,
+                            "search_revision": _SEARCH_REVISION,
+                        }
                         self._save(anime.media_id, state)
                         armed += 1
                     if state.get("phase") != "armed" or first_airing is None:
@@ -157,10 +191,7 @@ class PlannedReleaseDiscovery:
                     # Exact/recovered metadata supersedes a date-only guess. This
                     # also migrates G27 states created during AniList's Ep1 -> Ep2
                     # transition (the JoJo SBR 2nd/3rd STAGE failure mode).
-                    if (
-                        first_airing != state.get("airing_at")
-                        or state.get("airing_source") != airing_source
-                    ):
+                    if first_airing != state.get("airing_at") or state.get("airing_source") != airing_source:
                         old_airing = state.get("airing_at")
                         state["airing_at"] = first_airing
                         state["airing_source"] = airing_source
@@ -205,11 +236,15 @@ class PlannedReleaseDiscovery:
                         if callable(resolver):
                             try:
                                 aliases, _titles = resolver(anime, episode)
-                            except Exception:
+                            except Exception as exc:  # noqa: BLE001 - aliases are optional
+                                self.manager.logger.warning(
+                                    "FALLBACK step=planning.release_discovery.aliases media_id=%s error=%r",
+                                    anime.media_id,
+                                    exc,
+                                )
                                 aliases = ()
                             search_aliases = [
-                                int(value) for value in aliases
-                                if int(value) > 0 and int(value) != episode
+                                int(value) for value in aliases if int(value) > 0 and int(value) != episode
                             ]
                             if search_aliases and state.get("search_aliases") != search_aliases:
                                 previous_aliases = state.get("search_aliases")
@@ -229,19 +264,23 @@ class PlannedReleaseDiscovery:
                     searched += 1
                     try:
                         releases = self.manager.search_releases(
-                            anime.media_id, episode=episode,
-                            batch=anime.format == "MOVIE", automatic=True,
+                            anime.media_id,
+                            episode=episode,
+                            batch=anime.format == "MOVIE",
+                            automatic=True,
                             allow_anilist_network=False,
                         )
                         acceptable = [
-                            release for release in releases
+                            release
+                            for release in releases
                             if self.manager._release_is_allowed_for_auto(release)
                             and (episode is None or self.manager._release_has_safe_episode_identity(release))
                         ]
                     except Exception as exc:
                         self.manager.logger.warning(
                             "RETRY step=planning.release_discovery media_id=%s error=%r",
-                            anime.media_id, exc,
+                            anime.media_id,
+                            exc,
                         )
                         acceptable = []
                     latest = self.db.get_anime(anime.media_id)

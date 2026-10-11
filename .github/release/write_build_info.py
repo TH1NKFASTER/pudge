@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Fingerprint the package that is about to be built into a release wheel."""
+
 from __future__ import annotations
 
 import argparse
@@ -15,21 +16,30 @@ def main() -> int:
     parser.add_argument("package", type=Path)
     parser.add_argument("version")
     parser.add_argument("--revision")
-    parser.add_argument("--release", action="store_true",
-                        help="public release: the build id is just the version (no git revision)")
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help="public release: the build id is just the version (no git revision)",
+    )
     args = parser.parse_args()
     revision = args.revision
     if not revision and not args.release:
         result = subprocess.run(
-            ["git", "rev-parse", "--short=12", "HEAD"], cwd=args.package.parent,
-            capture_output=True, text=True, check=False, timeout=5,
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=args.package.parent,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
         )
         revision = result.stdout.strip() if result.returncode == 0 else "source"
     files = {
         path.relative_to(args.package).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(args.package.rglob("*"))
-        if path.is_file() and path.name != "build-info.json"
-        and "__pycache__" not in path.parts and path.suffix not in {".pyc", ".pyo"}
+        if path.is_file()
+        and path.name != "build-info.json"
+        and "__pycache__" not in path.parts
+        and path.suffix not in {".pyc", ".pyo"}
         # Finder metadata (.DS_Store) and other dotfiles never ship in the wheel.
         and not any(part.startswith(".") for part in path.relative_to(args.package).parts)
     }

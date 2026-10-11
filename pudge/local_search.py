@@ -118,7 +118,8 @@ def _extract_best_from_zip(
     try:
         with zipfile.ZipFile(archive) as zf:
             names = [
-                name for name in zf.namelist()
+                name
+                for name in zf.namelist()
                 if not name.endswith("/") and Path(name).suffix.casefold() in SUBTITLE_EXTENSIONS
             ]
             ranked: list[tuple[float, str, int | None]] = []
@@ -139,7 +140,11 @@ def _extract_best_from_zip(
                 if not output.exists():
                     with zf.open(name) as src, output.open("wb") as dst:
                         dst.write(src.read())
-                verified = is_japanese_subtitle(output) if output.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS else has_japanese_marker(name)
+                verified = (
+                    is_japanese_subtitle(output)
+                    if output.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
+                    else has_japanese_marker(name)
+                )
                 score, episode = _candidate_score(
                     output, identity, video, verified, display_name=name, prefer_srt=prefer_srt
                 )

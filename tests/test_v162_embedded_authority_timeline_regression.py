@@ -3,7 +3,9 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from pudge import i18n
 from pudge.config import AppConfig
+from pudge.i18n import err
 from pudge.manager import AnimeManager
 from pudge.syncing import subtitle_quality_accepted
 
@@ -33,8 +35,24 @@ def _insert_episode(manager: AnimeManager, video: Path, subtitle: Path) -> None:
                 relations_json,updated_at
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (177699, "Ghost", "[]", "[]", "", "", "CURRENT", 0, 10, "TV",
-             2026, "2026-07-07", "", "RELEASING", "[]", now),
+            (
+                177699,
+                "Ghost",
+                "[]",
+                "[]",
+                "",
+                "",
+                "CURRENT",
+                0,
+                10,
+                "TV",
+                2026,
+                "2026-07-07",
+                "",
+                "RELEASING",
+                "[]",
+                now,
+            ),
         )
         conn.execute(
             """
@@ -137,7 +155,10 @@ def test_reference_timeline_that_is_strictly_worse_is_rejected() -> None:
     }
     accepted, reason = subtitle_quality_accepted(result)
     assert accepted is False
-    assert "timeline-remap" in reason
+    # Audit 68Б: reasons are English (error.*); the window shows them in Russian.
+    assert reason == err("sync.timelineRemapWorse")
+    assert "timeline remap worsened the original timing" in reason
+    assert "timeline-remap" in i18n.message(reason, "ru")
     assert result["timeline_validation_regression"]["reason"] == "timeline_remap_strictly_worse"
 
 
@@ -162,4 +183,5 @@ def test_reference_timeline_tradeoff_is_not_rejected_as_global_regression() -> N
     }
     accepted, reason = subtitle_quality_accepted(result)
     assert accepted is True
-    assert "надёжная" in reason
+    assert reason == "reliable embedded timing track"
+    assert "надёжная" in i18n.message(reason, "ru")

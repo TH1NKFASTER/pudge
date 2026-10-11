@@ -6,9 +6,7 @@ from types import SimpleNamespace
 from pudge.mpv_study import SubtitleStudyApi
 
 
-def test_translation_prewarm_starts_at_resume_and_uses_exact_history(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_translation_prewarm_starts_at_resume_and_uses_exact_history(tmp_path: Path, monkeypatch) -> None:
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
         "1\n00:00:01,000 --> 00:00:02,000\n最初\n\n"
@@ -22,8 +20,9 @@ def test_translation_prewarm_starts_at_resume_and_uses_exact_history(
         config = SimpleNamespace(llm=SimpleNamespace(enabled=True))
 
         def translate_selection(
-            self, text: str, context: str, *, media_id: int | None
+            self, text: str, context: str, *, media_id: int | None, google_fallback: bool = True
         ) -> dict[str, object]:
+            assert google_fallback is False  # the prewarm never sends subtitles to Google
             calls.append((text, context, media_id))
             return {"translation": text, "provider": "local_llm", "cached": False}
 
@@ -43,13 +42,9 @@ def test_translation_prewarm_starts_at_resume_and_uses_exact_history(
 
 def test_translation_prewarm_is_disabled_without_local_llm(tmp_path: Path) -> None:
     subtitle = tmp_path / "episode.srt"
-    subtitle.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\n字幕\n", encoding="utf-8"
-    )
+    subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\n字幕\n", encoding="utf-8")
     api = SubtitleStudyApi.__new__(SubtitleStudyApi)
-    api.service = SimpleNamespace(
-        config=SimpleNamespace(llm=SimpleNamespace(enabled=False))
-    )
+    api.service = SimpleNamespace(config=SimpleNamespace(llm=SimpleNamespace(enabled=False)))
     api.media_id = None
 
     assert api.prewarm_file(subtitle)["reason"] == "local_llm_disabled"

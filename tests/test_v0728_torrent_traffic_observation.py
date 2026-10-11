@@ -13,11 +13,16 @@ from pudge.torrent_observation import normalize_torrent_state
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ("pausedDL", "paused"), ("stoppedDL", "paused"),
-        ("queuedDL", "queued"), ("stalledDL", "stalled"),
-        ("pausedUP", "paused"), ("stalledUP", "stalled"),
-        ("checkingDL", "checking"), ("forcedDL", "downloading"),
-        ("uploading", "seeding"), ("unknownFutureState", "unknown"),
+        ("pausedDL", "paused"),
+        ("stoppedDL", "paused"),
+        ("queuedDL", "queued"),
+        ("stalledDL", "stalled"),
+        ("pausedUP", "paused"),
+        ("stalledUP", "seeding"),
+        ("checkingDL", "checking"),
+        ("forcedDL", "downloading"),
+        ("uploading", "seeding"),
+        ("unknownFutureState", "unknown"),
     ],
 )
 def test_normalization(raw, expected):
@@ -52,8 +57,7 @@ class Client:
     def torrents(self, *, category):
         if self.error:
             raise self.error
-        return [SimpleNamespace(state=state, raw={"dlspeed": 0, "upspeed": 0})
-                for state in self.states]
+        return [SimpleNamespace(state=state, raw={"dlspeed": 0, "upspeed": 0}) for state in self.states]
 
     def close(self):
         self.closed = True

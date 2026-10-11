@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 
 from .branding import APP_BUNDLE_ID
+from .i18n import err
 
 
 SECRET_MASK = "••••••••"
+# Service and account names are written unquoted into a `security -i` command line.
+_KEYCHAIN_NAME = re.compile(r"[A-Za-z0-9._@-]+")
 
 
 @dataclass(slots=True)
@@ -37,24 +42,31 @@ class SecretStore:
     def set(self, account: str, value: str) -> bool:
         if not self.available or not value:
             return False
+        if not (_KEYCHAIN_NAME.fullmatch(self.service) and _KEYCHAIN_NAME.fullmatch(account)):
+            return False
+        if self.get(account) == value:
+            return True
+        # The secret goes to `security` on stdin (interactive mode, as hex data):
+        # a command-line argument is readable by every process through `ps`.
+        command = f"add-generic-password -U -s {self.service} -a {account} -X {value.encode('utf-8').hex()}\n"
         completed = subprocess.run(
-            [
-                "security",
-                "add-generic-password",
-                "-U",
-                "-s",
-                self.service,
-                "-a",
-                account,
-                "-w",
-                value,
-            ],
+            ["security", "-i"],
+            input=command,
+            text=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
             check=False,
         )
-        return completed.returncode == 0
+        # Interactive mode may not report a failed command in its exit status, and a
+        # value `find-generic-password -w` would print differently (as hex) must stay
+        # in the config file rather than come back wrong: read it back.
+        if completed.returncode == 0 and self.get(account) == value:
+            return True
+        logging.getLogger("pudge.secrets").warning(
+            "FALLBACK step=keychain.write account=%s returncode=%s", account, completed.returncode
+        )
+        return False
 
     def delete(self, account: str) -> None:
         if self.available:
@@ -67,7 +79,7 @@ class SecretStore:
             )
             # security uses 44 for an absent item; clearing it is already done.
             if completed.returncode not in {0, 44}:
-                raise RuntimeError(f"Could not delete Keychain credential: {account}")
+                raise RuntimeError(err("setup.keychainDeleteFailed", account=account))
 
     def resolve(
         self,

@@ -8,9 +8,6 @@ from pudge.database import Database
 from pudge.web_app import WebAppApi
 
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
 def make_api(tmp_path: Path) -> WebAppApi:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -82,16 +79,50 @@ def test_hidden_poll_uses_longer_inbox_and_tag_cadence(tmp_path: Path, monkeypat
     assert calls == []
 
 
-def test_frontend_uses_authoritative_subtitle_retry_hint() -> None:
-    source = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
+POLLS = (
+    "const polls = () => __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles').map(c => c.at);"
+)
+# A subtitle check that the window's (cached) Home snapshot still shows as due.
+STALE_JOB = {"video": "/v/1.mkv", "state": "pending", "priority": 260, "next_check": 0, "attempts": 1}
 
-    assert "subtitlePollHint:null" in source
-    assert "effectiveSubtitleDueCount()" in source
-    assert "effectivePrioritySubtitleDueCount()" in source
-    assert "r?.subtitle_poll_hint" in source
-    assert "receivedAt:Date.now()" in source
-    assert "Math.min(hidden?120000:60000" in source
-    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in source
+
+def test_window_follows_the_backends_retry_hint_over_its_cached_snapshot(page) -> None:
+    # After a retry the backend keeps the Home snapshot unchanged on purpose; the window used to
+    # believe the stale "due now" and asked every second. The backend's hint says the next
+    # retry is in an hour: the window asks once a minute (once every 2 minutes behind).
+    hint = "({subtitle_poll_hint: {active_count: 1, due_count: 0, priority_due_count: 0, next_check: Date.now() / 1000 + 3600}})"
+    result = page.run(
+        POLLS + "await __tick(130000); return {polls: polls(), status: __text('#status')};",
+        state={"subtitle_jobs": [STALE_JOB]},
+        before=f"__api.poll_downloads_and_subtitles = async () => {hint};",
+        api={"startup_maintenance": {"running": False}},
+    )
+    assert result.value == {"polls": [1000, 61000, 121000], "status": ""}
+
+
+def test_backends_hint_of_due_checks_keeps_the_window_checking(page) -> None:
+    # The snapshot has no jobs yet, the backend says a manual check is due: the window shows
+    # that subtitles are being checked and asks every second until the hint says otherwise.
+    for lang in ("en", "ru"):
+        result = page.run(
+            POLLS
+            + r"""
+            await __tick(3500);
+            const due = {polls: polls(), status: __text('#status')};
+            window.DUE = 0; await __tick(40000);
+            return {due, later: polls().slice(due.polls.length), status: __text('#status'), checking: t('status.subtitleCheckingBackground')};
+            """,
+            lang=lang,
+            before="""window.DUE = 1;
+            __api.poll_downloads_and_subtitles = async () => ({subtitle_poll_hint: {active_count: window.DUE, due_count: window.DUE,
+              priority_due_count: window.DUE, next_check: Date.now() / 1000}});""",
+            api={"startup_maintenance": {"running": False}},
+        )
+        out = result.value
+        assert out["due"] == {"polls": [1000, 2000, 3000], "status": out["checking"]}
+        assert (
+            out["later"] == [4000, 19000] and out["status"] == ""
+        )  # nothing left: two quiet checks, then it stops
 
 
 def test_scheduled_agent_rechecks_window_before_heavy_run(monkeypatch, tmp_path: Path) -> None:

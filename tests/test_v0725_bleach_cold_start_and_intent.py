@@ -65,9 +65,7 @@ def test_bleach_sized_old_cold_start_result_is_requeued_once(tmp_path: Path) -> 
                     {
                         "source_time": 808.066,
                         "jump_seconds": 5.0,
-                        "refinement": {
-                            "method": "fixed_offset_crossover_across_silence"
-                        },
+                        "refinement": {"method": "fixed_offset_crossover_across_silence"},
                     }
                 ],
             }

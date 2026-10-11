@@ -6,9 +6,6 @@ from pudge.config import AppConfig, write_config
 from pudge.web_app import WebAppApi
 
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
 def make_api(tmp_path: Path) -> WebAppApi:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
@@ -96,9 +93,23 @@ def test_active_download_keeps_15_second_qbt_network_cadence(tmp_path: Path, mon
     assert calls == ["sync"]
 
 
-def test_hidden_ui_drops_to_background_poll_cadence() -> None:
-    source = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-
-    assert "if(hidden)return 60000;" in source
-    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in source
-    assert "if(r?.state){acceptUiState(r.state)" in source
+def test_window_draws_the_state_a_background_check_sends_back(page) -> None:
+    # The check answers with the whole state only when its version changed: an episode that
+    # became ready meanwhile is drawn at once (not on the next full reload). The cadence in front, behind and with due
+    # subtitles is in test_v0560_inactive_window_energy.py and test_v203_refresh_foreground_queue.py.
+    result = page.run(
+        r"""
+        setPage('current'); await __tick(1500);
+        return __text('#currentContent');
+        """,
+        before=r"""
+        const fresh = {media_id: 9, title: 'Fresh Show', next_episode: 1, site_url: 'https://anilist.co/anime/9',
+                       local: {state: 'ready', episode: 1, video_path: '/v/fresh-01.mkv'}};
+        __api.poll_downloads_and_subtitles = async () => ({state: {...(await __api.get_state()), ui_state_version: '2', current: [fresh],
+          library: [{media_id: 9, title: 'Fresh Show', episodes: [{episode: 1, state: 'ready', video_path: '/v/fresh-01.mkv'}]}],
+          home: {new_ready: [fresh]}}});
+        """,
+        api={"startup_maintenance": {"running": False}},
+    )
+    assert "Fresh Show" in result.value
+    assert result.calls_of("poll_downloads_and_subtitles")[0][:2] == ["1", False]

@@ -133,13 +133,13 @@ def test_embedded_timing_reference_is_published_atomically(monkeypatch, tmp_path
                 ]
             }
             import json
+
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
         temp_output = Path(command[-1])
         assert temp_output.name.startswith(".")
         assert temp_output.suffix == ".srt"
         temp_output.write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
-            "2\n00:00:03,000 --> 00:00:04,000\nWorld\n",
+            "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:03,000 --> 00:00:04,000\nWorld\n",
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(command, 0, stdout="")
@@ -164,13 +164,18 @@ def test_embedded_timing_reference_removes_exact_duplicate_cues(monkeypatch, tmp
     def fake_run(command, **kwargs):
         if command[0] == "ffprobe":
             import json
-            payload = {"streams": [{
-                "index": 4,
-                "codec_type": "subtitle",
-                "codec_name": "ass",
-                "tags": {"language": "eng", "title": "Full Dialogue"},
-                "disposition": {"default": 1},
-            }]}
+
+            payload = {
+                "streams": [
+                    {
+                        "index": 4,
+                        "codec_type": "subtitle",
+                        "codec_name": "ass",
+                        "tags": {"language": "eng", "title": "Full Dialogue"},
+                        "disposition": {"default": 1},
+                    }
+                ]
+            }
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
         Path(command[-1]).write_text(
             "1\n00:00:00,326 --> 00:00:03,146\nBank of Tatehama\n\n"
@@ -220,39 +225,43 @@ def test_invalid_cached_timing_reference_is_rebuilt(monkeypatch, tmp_path):
     monkeypatch.setattr(syncing, "_resolve_command", lambda command: command)
 
     import hashlib
+
     stat = video.stat()
     digest = hashlib.sha1(
         (
-            f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-            "stream=4:timing-reference-v2-exact-dedupe"
+            f"{video.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:stream=4:timing-reference-v2-exact-dedupe"
         ).encode()
     ).hexdigest()[:20]
-    cached = tmp_path / "cache" / "timing-reference" / f"{digest}.srt"
-    cached.parent.mkdir(parents=True)
-    cached.write_text("partial garbage", encoding="utf-8")
+    cached_output = tmp_path / "cache" / "timing-reference" / f"{digest}.srt"
+    cached_output.parent.mkdir(parents=True)
+    cached_output.write_text("partial garbage", encoding="utf-8")
 
     calls = []
+
     def fake_run(command, **kwargs):
         calls.append(command)
         if command[0] == "ffprobe":
             import json
-            payload = {"streams": [{
-                "index": 4,
-                "codec_type": "subtitle",
-                "codec_name": "subrip",
-                "tags": {"language": "eng", "title": "Full Dialogue"},
-                "disposition": {"default": 1},
-            }]}
+
+            payload = {
+                "streams": [
+                    {
+                        "index": 4,
+                        "codec_type": "subtitle",
+                        "codec_name": "subrip",
+                        "tags": {"language": "eng", "title": "Full Dialogue"},
+                        "disposition": {"default": 1},
+                    }
+                ]
+            }
             return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
-        Path(command[-1]).write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\nRebuilt\n", encoding="utf-8"
-        )
+        Path(command[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nRebuilt\n", encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout="")
 
     monkeypatch.setattr(syncing.subprocess, "run", fake_run)
     output, result = syncing.extract_embedded_timing_reference(video, tmp_path / "cache")
 
-    assert output == cached
+    assert output == cached_output
     assert result["reason"] == "applied"
-    assert "Rebuilt" in cached.read_text(encoding="utf-8")
+    assert "Rebuilt" in cached_output.read_text(encoding="utf-8")
     assert len(calls) == 2

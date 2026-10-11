@@ -1,3 +1,10 @@
+"""Cold-open subtitle clock without per-episode offsets, repair of broken or stale
+downloads, the reading-weighted clock bridge (behaviour).
+
+The light-novel card of v1.93 (unparsed words open the shared study card with Play from
+here / Read up to here and no Jiten lookups) is tested in
+test_v184_ln_unparsed_mora_overlay.py (audit 71Б)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -164,18 +171,32 @@ def test_corrupt_orphan_clears_completed_intent_before_reselection(tmp_path: Pat
     class DB:
         def downloads(self):
             return [item]
-        def delete_subtitle_job(self, _path): pass
-        def delete_episode_record(self, _path): pass
-        def delete_torrent_records(self, _hash): pass
+
+        def delete_subtitle_job(self, _path):
+            pass
+
+        def delete_episode_record(self, _path):
+            pass
+
+        def delete_torrent_records(self, _hash):
+            pass
 
     class Intent:
-        def __init__(self): self.events = []
-        def clear(self, media_id, episode, batch): self.events.append(("clear", media_id, episode, batch))
-        def update(self, *args, **kwargs): self.events.append(("update", args, kwargs))
+        def __init__(self):
+            self.events = []
+
+        def clear(self, media_id, episode, batch):
+            self.events.append(("clear", media_id, episode, batch))
+
+        def update(self, *args, **kwargs):
+            self.events.append(("update", args, kwargs))
 
     class Client:
-        def delete(self, *_args, **_kwargs): pass
-        def close(self): pass
+        def delete(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
 
     manager = object.__new__(AnimeManager)
     manager.db = DB()
@@ -184,10 +205,12 @@ def test_corrupt_orphan_clears_completed_intent_before_reselection(tmp_path: Pat
     manager.qbt_client = lambda: Client()
     manager.downloads_enabled = lambda: True
     calls = []
+
     def search(media_id, *, episode, batch, automatic=False, **_kwargs):
         assert manager.download_intents.events[0] == ("clear", 187260, 9, False)
         calls.append((media_id, episode, batch, automatic))
         return SimpleNamespace(title="replacement")
+
     manager.search_and_add_best = search
 
     assert manager._repair_unreadable_orphaned_download(
@@ -216,25 +239,51 @@ def test_corrupt_orphan_becomes_waiting_when_torrent_traffic_is_off(tmp_path: Pa
         release_episode=9,
         raw={"backend": "aria2", "orphaned_metadata": True},
     )
+
     class DB:
-        def downloads(self): return [item]
-        def delete_subtitle_job(self, _path): pass
-        def delete_episode_record(self, _path): pass
-        def delete_torrent_records(self, _hash): pass
+        def downloads(self):
+            return [item]
+
+        def delete_subtitle_job(self, _path):
+            pass
+
+        def delete_episode_record(self, _path):
+            pass
+
+        def delete_torrent_records(self, _hash):
+            pass
+
     class Intent:
-        def __init__(self): self.events=[]
-        def clear(self,*args): self.events.append(("clear",args))
-        def update(self,*args,**kwargs): self.events.append(("update",args,kwargs))
+        def __init__(self):
+            self.events = []
+
+        def clear(self, *args):
+            self.events.append(("clear", args))
+
+        def update(self, *args, **kwargs):
+            self.events.append(("update", args, kwargs))
+
     class Client:
-        def delete(self,*_args,**_kwargs): pass
-        def close(self): pass
-    manager=object.__new__(AnimeManager)
-    manager.db=DB(); manager.download_intents=Intent()
-    manager.logger=SimpleNamespace(info=lambda *a,**k:None, warning=lambda *a,**k:None)
-    manager.qbt_client=lambda: Client(); manager.downloads_enabled=lambda: False
-    manager.search_and_add_best=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("must not add while off"))
+        def delete(self, *_args, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    manager = object.__new__(AnimeManager)
+    manager.db = DB()
+    manager.download_intents = Intent()
+    manager.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    manager.qbt_client = lambda: Client()
+    manager.downloads_enabled = lambda: False
+    manager.search_and_add_best = lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("must not add while off")
+    )
     assert manager._repair_unreadable_orphaned_download(
-        video, media_id=187260, episode=9, attempts=3,
+        video,
+        media_id=187260,
+        episode=9,
+        attempts=3,
         probe_error="Invalid data found when processing input",
     )
     assert manager.download_intents.events[0][0] == "clear"
@@ -258,20 +307,36 @@ def test_watched_deleted_zero_byte_aria2_shell_is_removed_from_downloads(tmp_pat
         raw={"backend": "aria2", "total_size": 0, "downloaded": 0},
     )
     anime = LibraryAnime(media_id=177699, title="Ghost", progress=9, episodes=10, format="TV")
+
     class DB:
-        def __init__(self): self.deleted=[]
-        def get_anime(self, media_id): return anime if media_id == 177699 else None
-        def delete_torrent_records(self, torrent_hash): self.deleted.append(torrent_hash)
+        def __init__(self):
+            self.deleted = []
+
+        def get_anime(self, media_id):
+            return anime if media_id == 177699 else None
+
+        def delete_torrent_records(self, torrent_hash):
+            self.deleted.append(torrent_hash)
+
     class Intent:
-        def __init__(self): self.cleared=[]
-        def clear(self,*args): self.cleared.append(args)
+        def __init__(self):
+            self.cleared = []
+
+        def clear(self, *args):
+            self.cleared.append(args)
+
     class Client:
-        def __init__(self): self.deleted=[]
-        def delete(self, torrent_hash, *, delete_files=True): self.deleted.append((torrent_hash, delete_files))
-    manager=object.__new__(AnimeManager)
-    manager.db=DB(); manager.download_intents=Intent()
-    manager.logger=SimpleNamespace(info=lambda *a,**k:None, warning=lambda *a,**k:None)
-    client=Client()
+        def __init__(self):
+            self.deleted = []
+
+        def delete(self, torrent_hash, *, delete_files=True):
+            self.deleted.append((torrent_hash, delete_files))
+
+    manager = object.__new__(AnimeManager)
+    manager.db = DB()
+    manager.download_intents = Intent()
+    manager.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    client = Client()
     assert manager._discard_watched_empty_aria2_shells(client, [item]) == []
     assert client.deleted == [("ghost", False)]
     assert manager.db.deleted == ["ghost"]
@@ -292,12 +357,21 @@ def test_unwatched_zero_byte_shell_is_preserved(tmp_path: Path) -> None:
         release_episode=9,
         raw={"backend": "aria2", "total_size": 0, "downloaded": 0},
     )
+
     class DB:
-        def get_anime(self, _mid): return LibraryAnime(media_id=1,title="A",progress=8,episodes=12,format="TV")
-        def delete_torrent_records(self, _hash): raise AssertionError("must keep")
-    manager=object.__new__(AnimeManager); manager.db=DB(); manager.download_intents=SimpleNamespace(clear=lambda *a:None)
-    manager.logger=SimpleNamespace(info=lambda *a,**k:None, warning=lambda *a,**k:None)
-    assert manager._discard_watched_empty_aria2_shells(SimpleNamespace(delete=lambda *a,**k:None), [item]) == [item]
+        def get_anime(self, _mid):
+            return LibraryAnime(media_id=1, title="A", progress=8, episodes=12, format="TV")
+
+        def delete_torrent_records(self, _hash):
+            raise AssertionError("must keep")
+
+    manager = object.__new__(AnimeManager)
+    manager.db = DB()
+    manager.download_intents = SimpleNamespace(clear=lambda *a: None)
+    manager.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    assert manager._discard_watched_empty_aria2_shells(
+        SimpleNamespace(delete=lambda *a, **k: None), [item]
+    ) == [item]
 
 
 def test_post_precision_bridge_uses_reading_mora_instead_of_raw_characters() -> None:
@@ -326,22 +400,7 @@ def test_post_precision_bridge_uses_reading_mora_instead_of_raw_characters() -> 
     at_148 = next(float(row["time"]) for row in bridged if abs(float(row["offset"]) - 148.0) < 1e-6)
     raw_linear = 14089.015 + (14090.360 - 14089.015) * ((148 - 142) / (154.999 - 142))
     assert at_148 > raw_linear + 0.10
-    assert all(float(b["time"]) >= float(a["time"]) for a,b in zip(bridged, bridged[1:]))
-
-
-def test_fallback_ln_word_uses_shared_study_card_singleton_contract() -> None:
-    index = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    tools = Path("pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    shared = "if(globalThis.PudgeReadingTools?.study?.open)"
-    fallback = "if(token.fallback){const pop=$('lnStudyPop')"
-    assert index.index(shared) < index.index(fallback)
-    assert "const fallbackOnly = Boolean(token.fallback);" in tools
-    assert "if (fallbackOnly) return;" in tools
-    # Same header gives Play/Read actions, green listen tone and the normal close.
-    assert 'data-pudge-study-action-tone="${String(action.tone || \'\') === \'listen\'' in tools
-    assert "data-pudge-study-close" in tools
-    # No deck/Jiten API request is made for fallback-only cards.
-    assert tools.index("if (fallbackOnly) return;") < tools.index("const decks = await apiDecks")
+    assert all(float(b["time"]) >= float(a["time"]) for a, b in zip(bridged, bridged[1:]))
 
 
 def test_existing_stale_complete_intent_without_file_is_restarted() -> None:
@@ -356,43 +415,87 @@ def test_existing_stale_complete_intent_without_file_is_restarted() -> None:
         next_airing_episode=10,
         next_airing_at=9999999999,
     )
+
     class DB:
-        def anime_list(self, statuses=None): return [anime]
-        def has_episode(self, media_id, episode): return False
+        def anime_list(self, statuses=None):
+            return [anime]
+
+        def has_episode(self, media_id, episode):
+            return False
+
     class Intent:
-        def __init__(self): self.payload={"state":"complete","backend":"aria2"}; self.events=[]
-        def get(self,*_args): return dict(self.payload) if self.payload else None
-        def clear(self,*args): self.events.append(("clear",args)); self.payload=None
-        def update(self,*args,**kwargs): self.events.append(("update",args,kwargs))
-    manager=object.__new__(AnimeManager)
-    manager.db=DB(); manager.download_intents=Intent()
-    manager.downloads_enabled=lambda: True
-    manager.logger=SimpleNamespace(info=lambda *a,**k:None, warning=lambda *a,**k:None)
-    calls=[]
-    manager.search_and_add_best=lambda media_id, **kwargs: (calls.append((media_id,kwargs)) or SimpleNamespace(title="fresh"))
+        def __init__(self):
+            self.payload = {"state": "complete", "backend": "aria2"}
+            self.events = []
+
+        def get(self, *_args):
+            return dict(self.payload) if self.payload else None
+
+        def clear(self, *args):
+            self.events.append(("clear", args))
+            self.payload = None
+
+        def update(self, *args, **kwargs):
+            self.events.append(("update", args, kwargs))
+
+    manager = object.__new__(AnimeManager)
+    manager.db = DB()
+    manager.download_intents = Intent()
+    manager.downloads_enabled = lambda: True
+    manager.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    calls = []
+    manager.search_and_add_best = lambda media_id, **kwargs: (
+        calls.append((media_id, kwargs)) or SimpleNamespace(title="fresh")
+    )
     assert manager._repair_stale_completed_current_download_intents([]) == 1
     assert manager.download_intents.events[0][0] == "clear"
-    assert calls == [(187260, {"episode":9,"batch":False,"automatic":True})]
+    assert calls == [(187260, {"episode": 9, "batch": False, "automatic": True})]
 
 
 def test_stale_complete_intent_with_active_torrent_is_not_restarted() -> None:
     anime = LibraryAnime(
-        media_id=1,title="Current",progress=8,episodes=12,format="TV",status="CURRENT",
-        media_status="RELEASING",next_airing_episode=10,next_airing_at=9999999999,
+        media_id=1,
+        title="Current",
+        progress=8,
+        episodes=12,
+        format="TV",
+        status="CURRENT",
+        media_status="RELEASING",
+        next_airing_episode=10,
+        next_airing_at=9999999999,
     )
-    active=DownloadItem(
-        torrent_hash="active",name="e09.mkv",state="downloading",progress=.2,
-        save_path="/tmp",content_path="/tmp/e09.mkv",media_id=1,episode=9,media_episode=9,
-        release_episode=9,raw={"backend":"aria2","total_size":100,"downloaded":20},
+    active = DownloadItem(
+        torrent_hash="active",
+        name="e09.mkv",
+        state="downloading",
+        progress=0.2,
+        save_path="/tmp",
+        content_path="/tmp/e09.mkv",
+        media_id=1,
+        episode=9,
+        media_episode=9,
+        release_episode=9,
+        raw={"backend": "aria2", "total_size": 100, "downloaded": 20},
     )
+
     class DB:
-        def anime_list(self,statuses=None): return [anime]
-        def has_episode(self,*_args): return False
+        def anime_list(self, statuses=None):
+            return [anime]
+
+        def has_episode(self, *_args):
+            return False
+
     class Intent:
-        def get(self,*_args): return {"state":"complete","backend":"aria2"}
-        def clear(self,*_args): raise AssertionError("active download must win")
-    manager=object.__new__(AnimeManager); manager.db=DB(); manager.download_intents=Intent()
-    manager.downloads_enabled=lambda: True
-    manager.logger=SimpleNamespace(info=lambda *a,**k:None, warning=lambda *a,**k:None)
-    manager.search_and_add_best=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("no restart"))
+        def get(self, *_args):
+            return {"state": "complete", "backend": "aria2"}
+
+        def clear(self, *_args):
+            raise AssertionError("active download must win")
+
+    manager = object.__new__(AnimeManager)
+    manager.db = DB()
+    manager.download_intents = Intent()
+    manager.downloads_enabled = lambda: True
+    manager.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
+    manager.search_and_add_best = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no restart"))
     assert manager._repair_stale_completed_current_download_intents([active]) == 0

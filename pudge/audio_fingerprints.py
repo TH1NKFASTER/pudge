@@ -81,7 +81,9 @@ def fingerprint_samples(samples: Any, *, start_seconds: float = 0.0) -> AudioFin
     frame_count = 0 if pcm.size < FRAME_SIZE else 1 + (pcm.size - FRAME_SIZE) // HOP_SIZE
     if frame_count < 3:
         return AudioFingerprint(
-            np.zeros(0, dtype=np.uint32), np.zeros(0, dtype=bool), float(start_seconds),
+            np.zeros(0, dtype=np.uint32),
+            np.zeros(0, dtype=bool),
+            float(start_seconds),
             pcm.size / SAMPLE_RATE,
         )
     window = np.hanning(FRAME_SIZE).astype(np.float32)
@@ -120,12 +122,28 @@ def decode_region(
     import numpy as np
 
     command = [
-        str(ffmpeg), "-nostdin", "-v", "error",
-        "-ss", f"{max(0.0, float(start_seconds)):.3f}",
-        "-t", f"{max(0.1, float(duration_seconds)):.3f}",
-        "-i", str(video),
-        "-map", f"0:{int(stream_index)}" if stream_index is not None else "0:a:0",
-        "-vn", "-sn", "-dn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "pipe:1",
+        str(ffmpeg),
+        "-nostdin",
+        "-v",
+        "error",
+        "-ss",
+        f"{max(0.0, float(start_seconds)):.3f}",
+        "-t",
+        f"{max(0.1, float(duration_seconds)):.3f}",
+        "-i",
+        str(video),
+        "-map",
+        f"0:{int(stream_index)}" if stream_index is not None else "0:a:0",
+        "-vn",
+        "-sn",
+        "-dn",
+        "-ac",
+        "1",
+        "-ar",
+        str(SAMPLE_RATE),
+        "-f",
+        "s16le",
+        "pipe:1",
     ]
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -191,7 +209,7 @@ def candidate_offsets(a: AudioFingerprint, b: AudioFingerprint, *, limit: int = 
     corr = np.fft.irfft(np.conj(fa) * fb, n=n, axis=0).sum(axis=1)
     # corr[k] = sum_i a[i]·b[i+k] for k>=0; negative k wraps to the end.
     lags = np.concatenate([np.arange(0, b.size), np.arange(-(a.size - 1), 0)])
-    values = np.concatenate([corr[: b.size], corr[n - (a.size - 1):]])
+    values = np.concatenate([corr[: b.size], corr[n - (a.size - 1) :]])
     order = np.argsort(values)[::-1]
     picked: list[int] = []
     for position in order:
@@ -236,13 +254,13 @@ def matching_runs(
     if last_a - first_a < 8:
         return []
     codes_a = a.codes[first_a:last_a]
-    codes_b = b.codes[first_a + offset:last_a + offset]
+    codes_b = b.codes[first_a + offset : last_a + offset]
     xor = np.bitwise_xor(codes_a, codes_b)
     distance = np.zeros(xor.shape[0], dtype=np.float64)
     for shift in range(32):
         distance += ((xor >> np.uint32(shift)) & np.uint32(1)).astype(np.float64)
     ber = distance / 32.0
-    valid = ~(a.silent[first_a:last_a] | b.silent[first_a + offset:last_a + offset])
+    valid = ~(a.silent[first_a:last_a] | b.silent[first_a + offset : last_a + offset])
     width = max(3, int(round(window_seconds / HOP_SECONDS)))
     kernel = np.ones(width)
     sums = np.convolve(np.where(valid, ber, 0.0), kernel, mode="same")
@@ -303,8 +321,10 @@ def best_shared_run(
         for run in matching_runs(a, b, offset, max_bit_error=max_bit_error, min_seconds=min_seconds):
             if not (min_seconds <= run.duration <= max_seconds):
                 continue
-            if best is None or run.duration > best.duration or (
-                abs(run.duration - best.duration) < 0.5 and run.bit_error_rate < best.bit_error_rate
+            if (
+                best is None
+                or run.duration > best.duration
+                or (abs(run.duration - best.duration) < 0.5 and run.bit_error_rate < best.bit_error_rate)
             ):
                 best = run
     return best
@@ -322,7 +342,9 @@ def save_fingerprint(path: Path, fp: AudioFingerprint, *, meta: dict[str, Any]) 
     os.close(fd)
     try:
         np.savez_compressed(
-            tmp, codes=fp.codes, silent=fp.silent,
+            tmp,
+            codes=fp.codes,
+            silent=fp.silent,
             header=np.array([fp.start_seconds, fp.duration_seconds], dtype=np.float64),
             meta=np.array(json.dumps({**meta, "engine": ENGINE_VERSION}, sort_keys=True)),
         )
@@ -347,8 +369,10 @@ def load_fingerprint(path: Path) -> tuple[AudioFingerprint, dict[str, Any]] | No
             header = data["header"]
             return (
                 AudioFingerprint(
-                    data["codes"].astype(np.uint32), data["silent"].astype(bool),
-                    float(header[0]), float(header[1]),
+                    data["codes"].astype(np.uint32),
+                    data["silent"].astype(bool),
+                    float(header[0]),
+                    float(header[1]),
                 ),
                 meta,
             )

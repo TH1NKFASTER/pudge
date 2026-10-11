@@ -1,28 +1,13 @@
-from __future__ import annotations
+"""Listen together: the backend sends an anchor window reaching past the next poll, and
+the reader's highlight runs along it (behaviour; audit 71Б rewrite). How the shared clock
+maps a window to offsets: tests/test_v0744_ln_linear_mora_clock.py."""
 
-import re
-import subprocess
-from pathlib import Path
+from __future__ import annotations
 
 import pytest
 
 from pudge.reading_audio_alignment import light_novel_position_for_audio
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge/web/index.html"
-
-
-def _shared_offsets(state: dict, times: list[float]) -> list[float]:
-    """Evaluate the shared PudgePairedAudioClock (LN and sidebar use the same math)."""
-    import json
-    script = (
-        "const vm=require('vm'),fs=require('fs');const c={performance:{now:()=>0}};c.globalThis=c;vm.createContext(c);"
-        f"vm.runInContext(fs.readFileSync({json.dumps(str(ROOT / 'pudge/web/paired_audio_clock.js'))},'utf8'),c);"
-        f"const s={json.dumps(state)};console.log(JSON.stringify({json.dumps(times)}.map(t=>c.PudgePairedAudioClock.offsetAtTime(s,t))));"
-    )
-    out = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout
-    return json.loads(out)
+from t71g21_support import READER, paired
 
 
 def _alignment() -> dict[str, object]:
@@ -63,48 +48,42 @@ def test_backend_returns_future_anchor_path_beyond_poll_interval() -> None:
     assert len(path) >= 6
 
 
-def test_frontend_uses_piecewise_anchor_path() -> None:
-    source = HTML.read_text(encoding="utf-8")
+def test_reader_runs_along_the_window_until_its_last_anchor(page) -> None:
+    # One poll answer carries several anchors (slow, fast, slow); no newer answer comes
+    # (the backend stalls). The highlight follows every stretch of the window and stops at
+    # its last anchor instead of guessing beyond it.
+    result = page.run(
+        READER
+        + r"""
+        AUDIO.path = [{time: 100, offset: 0}, {time: 101, offset: 1}, {time: 101.2, offset: 3}, {time: 102, offset: 3.5}];
+        await openReader();
+        AUDIO.hold = true;
+        const samples = [];
+        for (const t of [100.6, 101.5, 101.9, 103, 104]) { await untilAudio(t); samples.push({word: current(), offset: shown()}); }
+        return samples;
+        """,
+        **paired(playing=True),
+    )
+    assert [sample["word"] for sample in result.value] == [0, 1, 1, 1, 1]
+    assert [sample["offset"] for sample in result.value] == pytest.approx(
+        [0.6, 3.19, 3.44, 3.5, 3.5], abs=0.05
+    )
 
-    assert "function lnPairedAnchorPath(anchor)" in source
-    # The anchor path is parsed by the shared clock module (plan §7).
-    assert "PudgePairedAudioClock?.pathFor?.({anchor_window:anchor||{}})" in source
-    assert "function lnPairedOffsetAtTime(state,time)" in source
-    state = {"anchor_window": {"path": [{"time": 0, "offset": 0}, {"time": 1, "offset": 10}, {"time": 3, "offset": 12}]}}
-    assert _shared_offsets(state, [0.5, 1, 2, 3]) == pytest.approx([5, 10, 11, 12])
-    assert "path[path.length-1]?.time" in source
 
-
-def test_forward_clamp_remains_only_as_a_safety_net() -> None:
-    source = HTML.read_text(encoding="utf-8")
-
-    # Plan §7 removed the LN-only forward clamp from the timing path.
-    assert "function lnPairedSmoothOffset(" not in source
-    assert "clamp_forward" not in source
-    assert "function lnPairedAnchorPath(anchor)" in source
-
-
-def test_inline_javascript_parses() -> None:
-    source = HTML.read_text(encoding="utf-8")
-    scripts = [
-        match.group(2)
-        for match in re.finditer(
-            r"<script([^>]*)>(.*?)</script>",
-            source,
-            flags=re.I | re.S,
-        )
-        if not re.search(r"\bsrc\s*=", match.group(1), flags=re.I)
+def test_highlight_is_not_held_back_behind_the_clock(page) -> None:
+    # Forward steps of the clock show up in full on the next paint (there used to be an
+    # LN-only forward clamp that let the highlight trail the audio).
+    result = page.run(
+        READER
+        + r"""
+        await openReader();
+        return [paintAt(0.5, 100.5), paintAt(1.5, 100.53), paintAt(3.3, 100.56), paintAt(5.6, 100.59)];
+        """,
+        **paired(playing=False),
+    )
+    assert result.value == [
+        {"word": 0, "offset": pytest.approx(0.5)},
+        {"word": 0, "offset": pytest.approx(1.5)},
+        {"word": 1, "offset": pytest.approx(3.3)},
+        {"word": 2, "offset": pytest.approx(5.6)},
     ]
-    assert scripts
-
-    for index, script in enumerate(scripts):
-        path = ROOT / f".pudge-v0745-anchor-path-inline-{index}.js"
-        path.write_text(script, encoding="utf-8")
-        try:
-            subprocess.run(
-                ["node", "--check", str(path)],
-                cwd=ROOT,
-                check=True,
-            )
-        finally:
-            path.unlink(missing_ok=True)

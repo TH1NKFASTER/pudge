@@ -29,9 +29,7 @@ def test_interactive_requeue_preserves_active_processing_lease(tmp_path: Path) -
             (future, str(video)),
         )
 
-    affected = manager.db.force_requeue_unresolved_subtitle_jobs(
-        priority=200, recover_processing=False
-    )
+    affected = manager.db.force_requeue_unresolved_subtitle_jobs(priority=200, recover_processing=False)
     assert affected == 1
     row = manager.db.subtitle_jobs()[0]
     assert row["state"] == "processing"
@@ -68,10 +66,39 @@ def test_priority_job_count_tracks_manual_refresh_until_attempt(tmp_path: Path) 
     assert manager.db.priority_subtitle_job_count(min_priority=200) == 0
 
 
-def test_ui_keeps_background_subtitle_status_without_locking_refresh() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "function prioritySubtitleJobs()" in html
-    assert "status.subtitleCheckingBackground" in html
-    assert "toast.refreshedSubtitlesQueued" in html
-    assert "ui.startupRunning||ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
-    assert "foreground.subtitle_manual_refresh" not in html  # backend concern only
+# Refresh queued a manual subtitle check (priority 200, due now) that the backend keeps working on.
+REFRESH = r"""
+const job = () => ({video: 'Show - 03.mkv', video_path: '/v/Show - 03.mkv', state: 'pending', priority: 200,
+                    next_check: Date.now() / 1000, attempts: 0});
+__api.refresh_local = async () => ({state: {...(await __api.get_state()), subtitle_jobs: [job()]}, stats: {subtitle_check_queued: 1}});
+__api.poll_downloads_and_subtitles = async () => ({state: {...(await __api.get_state()), subtitle_jobs: [job()]}});
+const button = () => ({disabled: $('refreshAll').disabled, label: $('refreshAll').innerText.trim()});
+await __click('#refreshAll');
+await __tick(50);
+const out = {toast: __toasts().at(-1), status: __text('#status'), button: button(),
+             texts: {queued: t('toast.refreshedSubtitlesQueued'), checking: t('status.subtitleCheckingBackground'),
+                     refresh: t('action.refresh'), already: t('toast.alreadyRefreshing')}};
+await __tick(1000);                       // the foreground worker checks the queued job
+out.polls = __apiCalls.filter(call => call.name === 'poll_downloads_and_subtitles').length;
+out.later = {status: __text('#status'), button: button()};
+await __click('#refreshAll');             // a second Refresh is not refused
+await __tick(50);
+out.refreshes = __apiCalls.filter(call => call.name === 'refresh_local').length;
+out.toasts = __toasts();
+return out;
+"""
+
+
+def test_ui_keeps_background_subtitle_status_without_locking_refresh(page) -> None:
+    for lang in ("en", "ru"):
+        out = page.run(REFRESH, lang=lang).value
+        texts = out["texts"]
+        assert out["toast"] == texts["queued"]
+        assert out["status"] == texts["checking"]
+        assert out["button"] == {"disabled": False, "label": texts["refresh"]}
+        assert out["polls"] >= 1
+        assert out["later"] == {
+            "status": texts["checking"],
+            "button": {"disabled": False, "label": texts["refresh"]},
+        }
+        assert out["refreshes"] == 2 and texts["already"] not in out["toasts"]

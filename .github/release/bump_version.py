@@ -57,7 +57,7 @@ def main() -> int:
     readme = ROOT / "README.md"
     text = readme.read_text(encoding="utf-8")
     text = re.sub(r"Current version: \*\*[^*]+\*\*", f"Current version: **{args.version}**", text, count=1)
-    text = re.sub(r"(?:pudge-macos-v)?\d+\.\d+\.\d+\.zip", f"{args.version}.zip", text, count=1)
+    text = re.sub(r"(?:pudge-macos-v)?\d+\.\d+\.\d+\.zip", f"pudge-macos-v{args.version}.zip", text, count=1)
     readme.write_text(text, encoding="utf-8")
     ensure_changelog_entry(args.version)
 

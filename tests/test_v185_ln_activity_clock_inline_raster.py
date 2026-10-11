@@ -1,6 +1,11 @@
-from __future__ import annotations
+"""Listen together: the clock holds through pauses inside speech (VAD), in the backend
+and in the reader's highlight (behaviour; audit 71Б rewrite).
 
-from pathlib import Path
+A small step back of the clock is ignored (clock_rebase_backward):
+test_v0723_ln_audio_weighted_highlight.py. The word card of unparsed text:
+test_v184_ln_unparsed_mora_overlay.py."""
+
+from __future__ import annotations
 
 import pytest
 
@@ -8,9 +13,7 @@ from pudge.reading_audio_alignment import (
     audio_position_for_light_novel_offset,
     light_novel_position_for_audio,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from t71g19_support import LN_PAIRED, OPEN
 
 
 def _trace_shape_alignment() -> dict[str, object]:
@@ -76,30 +79,37 @@ def test_seek_inverse_uses_same_activity_clock() -> None:
     assert 14087.58 <= position <= 14090.36
 
 
-def test_frontend_activity_clock_uses_vad_for_every_lookahead_segment() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    fn = html.split("function lnPairedOffsetAtTime", 1)[1].split(
-        "function lnPairedResetWordProgress", 1
-    )[0]
-    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
-    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
-    assert "shared.offsetAtTime(state||{},Number(time))" in fn
-    clock = (ROOT / "pudge" / "web" / "paired_audio_clock.js").read_text(encoding="utf-8")
-    assert "activityDuration(anchor.activity, left.time, time) / duration" in clock
-
-    render = html.split("function renderLnPairedPosition", 1)[1].split(
-        "function cancelLnPairedInterpolation", 1
-    )[0]
-    assert "clock_rebase_backward" in render
+# The reader with light novel 9 read together with audiobook 31 (tests/t71g19_support.py).
+# One poll answer carries an anchor window of four segments with speech activity; then mpv
+# stops answering, so everything after the first segment is look-ahead.
+#   10 s -> 0 · 12 s -> 1.5 · 14 s -> 4 · 16 s -> 6 · 18 s -> 8;  speech 10-11.5, 12-15, 16-18
+ACTIVITY_WINDOW = r"""
+Object.assign(AUDIO, {activity: [{start: 10, end: 11.5}, {start: 12, end: 15}, {start: 16, end: 18}], activityClock: true,
+  path: [{time: 10, offset: 0}, {time: 12, offset: 1.5}, {time: 14, offset: 4}, {time: 16, offset: 6}, {time: 18, offset: 8}]});
+"""
 
 
-def test_fallback_popup_has_actions_without_jiten_explanation() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    popup = html.split("async function showLnPopup", 1)[1].split(
-        "async function showLnNyaa", 1
-    )[0]
-    assert "if(token.fallback)" in popup
-    assert "No Jiten entry" not in popup
-    assert "Нет записи Jiten" not in popup
-    assert "data-ln-bookmark-here" in popup
-    assert 'id="lnPlayFromWord"' in popup
+def test_reader_highlight_follows_speech_activity_in_every_lookahead_segment(page) -> None:
+    result = page.run(
+        ACTIVITY_WINDOW
+        + OPEN
+        + r"""
+        const shown = () => { const w = wordNodes().find(n => n.classList.contains('ln-paired-word-current')); if (!w) return null;
+          const s = Number(w.dataset.lnAudioStart), e = Number(w.dataset.lnAudioEnd);
+          return s + (e - s) * parseFloat(w.style.getPropertyValue('--ln-paired-word-progress') || '0') / 100; };
+        await __tick(100); AUDIO.hold = true;
+        const samples = [];
+        for (const time of [11.2, 11.8, 14.6, 15.6]) { while (audioAt() < time) await __tick(10); samples.push(shown()); }
+        return {samples, polls: trace('poll').length};
+        """,
+        before=LN_PAIRED,
+    )
+    samples = result.value["samples"]
+    assert result.value["polls"] == 1
+    # Text moves only while there is speech: 1.5 characters in 1.5 s of speech, not over
+    # the whole 2 s segment (1.2 at 11.2 s; linear would be 0.9), held in the pause...
+    assert samples[0] == pytest.approx(1.2, abs=0.15)
+    assert samples[1] == 1.5
+    # ... and the same in a later segment of the window (5.2 at 14.6 s; linear: 4.6).
+    assert samples[2] == pytest.approx(5.2, abs=0.2)
+    assert samples[3] == 6

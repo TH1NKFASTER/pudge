@@ -1,62 +1,129 @@
+"""Light novel library: which volume a series continues with, and redrawing only when
+something changed (behaviour, page harness; audit 71Б rewrite).
+
+Covered elsewhere: the series scroller opening on the first unfinished volume
+(test_v0727_drop_selection_series_jiten.py::test_series_scroll_opens_on_the_current_volume_and_shows_two_rows),
+the background state poll redrawing only on visible changes
+(test_v0732_literature_drop_and_diagnostics.py::test_embedded_covers_redraw_only_when_they_change_without_copying_them),
+a Finder drop adding a volume to a series without reloading the library
+(test_v0732...::test_dropped_volume_is_injected_without_reloading_the_library) and the backend
+drop bridge (prevent default + stop propagation, run_js fire-and-forget:
+test_v0732...::test_finder_drop_is_handled_by_pudge_not_by_webkit)."""
+
 from __future__ import annotations
 
-from pathlib import Path
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
-WEB_APP = ROOT / "pudge" / "web_app.py"
+import json
+from typing import Any
 
 
-def _function(source: str, name: str) -> str:
-    start = source.index(f"function {name}(")
-    next_function = source.find("\nfunction ", start + 1)
-    return source[start:] if next_function < 0 else source[start:next_function]
+def _volume(book_id: int, series: str, volume: int, **extra: Any) -> dict[str, Any]:
+    return {
+        "id": book_id,
+        "title": f"{series} {volume}",
+        "series_key": series.lower(),
+        "series_title": series,
+        "volume": volume,
+        "character_count": 1000,
+        **extra,
+    }
 
 
-def test_ln_series_focus_prefers_first_unfinished_volume() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    function = _function(html, "currentSeriesBook")
-    assert "!Boolean(book?.finished)" in function
-    assert "return group.find(unfinished)||group[group.length-1];" in function
-    assert "reading_progress" not in function
+LIBRARY = {
+    "light_novel_state": {
+        "version": 1,
+        "settings": {},
+        "books": [
+            # Volume 3 has progress left over from an accidental open; volume 2 is next in order.
+            _volume(1, "Wolf", 1, finished=True, reading_progress=1),
+            _volume(2, "Wolf", 2, reading_progress=0),
+            _volume(3, "Wolf", 3, reading_progress=0.6),
+            _volume(4, "Saga", 1, finished=True),
+            _volume(5, "Saga", 2, finished=True),
+            _volume(6, "Saga", 3, finished=True),
+        ],
+    }
+}
 
 
-def test_ln_tab_reuses_existing_dom_when_state_is_unchanged() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    load = html[html.index("async function loadLightNovels"):html.index("\nfunction scheduleLnStatePoll", html.index("async function loadLightNovels"))]
-    assert "lnStateRenderSignature" in load
-    assert "ui.lnRenderSignature===signature" in load
-    cached_branch = load[load.index("if(ui.lnState&&!force&&rendered"):load.index("if(ui.lnState&&!force){")]
-    assert "renderLightNovels" not in cached_branch
+def test_series_continues_with_the_first_unfinished_volume(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('lightnovels'); await __tick(100);
+            const series = key => document.querySelector(`#lightNovelsContent [data-ln-series-key="${key}"]`);
+            const out = {
+              wolf: __text('[data-ln-series-key="wolf"] .ln-series-continue'), expected: PudgeI18n.t('ln.continueVolume', {volume: 2}),
+              sagaContinue: Boolean(series('saga').querySelector('.ln-series-continue')),
+              sagaFocus: series('saga').querySelector('.ln-series-books').dataset.seriesCurrentBook,
+            };
+            await __click('[data-ln-series-key="wolf"] .ln-series-continue');
+            await __tick(100);
+            return out;
+            """,
+            lang=lang,
+            api=LIBRARY,
+        )
+        out = result.value
+        assert out["wolf"] == out["expected"]
+        assert result.calls_of("light_novel_open") == [[2]]
+        # A finished series offers no "continue" and keeps its last volume in view.
+        assert out["sagaContinue"] is False and out["sagaFocus"] == "6"
 
 
-def test_ln_background_poll_only_rerenders_when_visible_state_changes() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    poll = _function(html, "scheduleLnStatePoll")
-    assert "beforeSignature=lnStateRenderSignature(ui.lnState)" in poll
-    assert "nextSignature=lnStateRenderSignature(next)" in poll
-    assert "if(nextSignature!==beforeSignature)" in poll
-    assert poll.count("renderLightNovels()") == 1
+def test_returning_to_the_light_novels_tab_redraws_only_after_a_change(page) -> None:
+    result = page.run(
+        """
+        setPage('lightnovels'); await __tick(100);
+        const grid = () => document.querySelector('#lightNovelsContent .ln-grid');
+        const card = () => document.querySelector('#lightNovelsContent [data-ln-book="2"]');
+        const first = {grid: grid(), card: card()};
+        const since = __apiCalls.length;
+        setPage('current'); await __tick(100); setPage('lightnovels'); await __tick(100);
+        const same = grid() === first.grid && card() === first.card;
+        // The library state changed while another page was shown (e.g. a volume added from Planning).
+        setPage('current'); await __tick(100);
+        ui.lnState = {...ui.lnState, books: [...ui.lnState.books, {id: 7, title: 'Moon 1', series_key: 'moon', series_title: 'Moon', volume: 1}]};
+        setPage('lightnovels'); await __tick(100);
+        return {same, redrawn: grid() !== first.grid, moon: Boolean(document.querySelector('#lightNovelsContent [data-ln-book="7"]')),
+                reads: __apiCalls.slice(since).filter(call => call.name === 'light_novel_state').length};
+        """,
+        api=LIBRARY,
+    )
+    assert result.value == {"same": True, "redrawn": True, "moon": True, "reads": 0}
 
 
-def test_dropped_ln_is_injected_without_full_library_reload() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    focus = html[html.index("async function focusDroppedImport"):html.index("\nfunction enableFinderDrop", html.index("async function focusDroppedImport"))]
-    assert "const canInject=Boolean(focus.book" in focus
-    assert "ui.skipActivatedPageLoadOnce=true" in focus
-    assert "setPage(page);" in focus
-    assert "injectLnBook(focus.book)" in focus
-    assert "setTimeout(()=>void loadLightNovels(true)" not in focus
-    inject = _function(html, "injectLnBook")
-    # L1: series render as one tile (ln_library.js); legacy group markup is the fallback.
-    assert "lnLibraryEntryHtml(group)" in inject
-    assert "replaceWith(fresh)" in inject
-    assert "renderLightNovels();return;" in inject
-
-
-def test_drop_bridge_does_not_duplicate_default_event_handling_and_dispatch_is_fire_and_forget() -> None:
-    web_app = WEB_APP.read_text(encoding="utf-8")
-    assert "drop_handler = DOMEventHandler(dropped, True, True)" in web_app
-    assert 'runner = getattr(window, "run_js", None)' in web_app
-    assert "if callable(runner):" in web_app
-    assert "runner(script)" in web_app
+def test_dropped_second_volume_turns_the_card_into_a_series_without_reloading(page) -> None:
+    # Moon had one volume (a plain card); a Finder drop adds volume 2. Only Moon's entry is
+    # redrawn (now a two-volume series), and no full library reload follows later either.
+    dropped = {
+        "ok": True,
+        "focus": {"page": "lightnovels", "kind": "light_novel", "id": 8, "book": _volume(8, "Moon", 2)},
+    }
+    result = page.run(
+        """
+        setPage('current', true); await __tick(50);
+        const box = () => document.querySelector('#lightNovelsContent');
+        const wolf = () => box().querySelector('[data-ln-series-key="wolf"]');
+        const before = wolf();
+        const since = __apiCalls.length;
+        window.dispatchEvent(new CustomEvent('pudge-files-imported', {detail: DROPPED}));
+        await __tick(6000);
+        const moon = box().querySelector('[data-ln-series-key="moon"]');
+        return {page: ui.page, wolfKept: Boolean(before) && wolf() === before,
+                moon: moon && [...moon.querySelectorAll('[data-ln-book]')].map(node => node.dataset.lnBook),
+                count: moon && moon.querySelector('.ln-series-count')?.innerText, expected: tn('uiB.ln.volumeCount', 2),
+                reads: __apiCalls.slice(since).filter(call => call.name === 'light_novel_state').length};
+        """.replace("DROPPED", json.dumps(dropped)),
+        api={
+            "light_novel_state": {
+                "version": 1,
+                "settings": {},
+                "books": [*LIBRARY["light_novel_state"]["books"], _volume(7, "Moon", 1)],
+            }
+        },
+    )
+    out = result.value
+    assert out["page"] == "lightnovels"
+    assert out["moon"] == ["7", "8"] and out["count"] == out["expected"]
+    assert out["wolfKept"] is True
+    assert out["reads"] == 0

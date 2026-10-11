@@ -16,24 +16,35 @@ COMMON_PAREN_RE = re.compile(
     re.IGNORECASE,
 )
 SEASON_EP_RE = re.compile(r"(?i)(?:^|[\s._-])S(?P<season>\d{1,2})E(?P<episode>\d{1,4})(?:v\d+)?(?:$|[\s._-])")
-BRACKET_EP_RE = re.compile(
-    r"(?i)(?<!\d)\[(?:E|EP)?\s*0*(?P<episode>\d{1,3})(?:v\d+)?\](?!\d)"
-)
+BRACKET_EP_RE = re.compile(r"(?i)(?<!\d)\[(?:E|EP)?\s*0*(?P<episode>\d{1,3})(?:v\d+)?\](?!\d)")
 EPISODE_LABEL_RE = re.compile(
     r"(?i)(?:^|[\s._-])(?:EP?|Episode)\s*0*(?P<episode>\d{1,4})(?:v\d+)?(?:$|[\s._-])"
 )
 DASH_EP_RE = re.compile(r"(?i)\s[-–—]\s*0*(?P<episode>\d{1,4})(?:v\d+)?(?=\s|$)")
 TRAILING_EP_RE = re.compile(r"(?i)(?:^|\s)0*(?P<episode>\d{1,3})(?:v\d+)?$")
-ARCHIVE_BDSUP_EP_RE = re.compile(
-    r"(?i)(?:^|\s)0*(?P<episode>\d{1,3})(?:v\d+)?\s+(?:BD\s*SUP|BDSUP)$"
-)
+ARCHIVE_BDSUP_EP_RE = re.compile(r"(?i)(?:^|\s)0*(?P<episode>\d{1,3})(?:v\d+)?\s+(?:BD\s*SUP|BDSUP)$")
 SEASON_LABEL_RE = re.compile(r"(?i)(?:season|saison)\s*(?P<season>\d{1,2})")
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
 
 KNOWN_MEDIA_SUFFIXES = {
-    ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts",
-    ".srt", ".ass", ".ssa", ".vtt", ".sup", ".sub", ".idx",
-    ".zip", ".7z", ".rar",
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".ts",
+    ".m2ts",
+    ".srt",
+    ".ass",
+    ".ssa",
+    ".vtt",
+    ".sup",
+    ".sub",
+    ".idx",
+    ".zip",
+    ".7z",
+    ".rar",
 }
 
 
@@ -45,24 +56,83 @@ def _strip_known_suffixes(name: str) -> str:
 
 
 NOISE_TOKENS = {
-    "1080p", "720p", "2160p", "480p", "web", "webdl", "webrip", "bdrip", "bluray", "bd",
-    "hevc", "avc", "x264", "x265", "h264", "h265", "aac", "flac", "opus", "multi", "multisub",
-    "dual", "audio", "cr", "nf", "netflix", "amazon", "amzn", "atx", "batch", "complete",
+    "1080p",
+    "720p",
+    "2160p",
+    "480p",
+    "web",
+    "webdl",
+    "webrip",
+    "bdrip",
+    "bluray",
+    "bd",
+    "hevc",
+    "avc",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "aac",
+    "flac",
+    "opus",
+    "multi",
+    "multisub",
+    "dual",
+    "audio",
+    "cr",
+    "nf",
+    "netflix",
+    "amazon",
+    "amzn",
+    "atx",
+    "batch",
+    "complete",
 }
 
 RELEASE_TAGS = {
-    "webdl", "webrip", "bluray", "bdrip", "bd", "cr", "netflix", "nf", "amazon", "amzn",
-    "atx", "unext", "bglobal", "hdtv", "1080p", "720p", "2160p",
+    "webdl",
+    "webrip",
+    "bluray",
+    "bdrip",
+    "bd",
+    "cr",
+    "netflix",
+    "nf",
+    "amazon",
+    "amzn",
+    "atx",
+    "unext",
+    "bglobal",
+    "hdtv",
+    "1080p",
+    "720p",
+    "2160p",
 }
 
 
 LATIN_SEARCH_FOLD = str.maketrans(
     {
-        "Æ": "AE", "æ": "ae", "Œ": "OE", "œ": "oe",
-        "Ø": "O", "ø": "o", "Ł": "L", "ł": "l",
-        "Đ": "D", "đ": "d", "Ð": "D", "ð": "d",
-        "Þ": "Th", "þ": "th", "ß": "ss", "ẞ": "SS",
-        "Ħ": "H", "ħ": "h", "ı": "i", "Ŋ": "N", "ŋ": "n",
+        "Æ": "AE",
+        "æ": "ae",
+        "Œ": "OE",
+        "œ": "oe",
+        "Ø": "O",
+        "ø": "o",
+        "Ł": "L",
+        "ł": "l",
+        "Đ": "D",
+        "đ": "d",
+        "Ð": "D",
+        "ð": "d",
+        "Þ": "Th",
+        "þ": "th",
+        "ß": "ss",
+        "ẞ": "SS",
+        "Ħ": "H",
+        "ħ": "h",
+        "ı": "i",
+        "Ŋ": "N",
+        "ŋ": "n",
     }
 )
 
@@ -200,8 +270,12 @@ def release_tokens(name: str) -> set[str]:
     normalized = normalize_title(name).replace(" ", "")
     tokens: set[str] = set()
     aliases = {
-        "web-dl": "webdl", "web dl": "webdl", "blu-ray": "bluray", "blu ray": "bluray",
-        "u-next": "unext", "b-global": "bglobal",
+        "web-dl": "webdl",
+        "web dl": "webdl",
+        "blu-ray": "bluray",
+        "blu ray": "bluray",
+        "u-next": "unext",
+        "b-global": "bglobal",
     }
     lowered = unicodedata.normalize("NFKC", name).casefold()
     for source, target in aliases.items():

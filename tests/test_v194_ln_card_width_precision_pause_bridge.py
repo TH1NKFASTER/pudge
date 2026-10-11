@@ -1,8 +1,12 @@
+"""Listen together: the clock bridge after a precise chapter start, and the width of the
+word card (behaviour; audit 71Б rewrite; the reader runs in node, tests/page_harness.py)."""
+
 from __future__ import annotations
 
-from pathlib import Path
-
+from css_support import css_rules
 from pudge import reading_audio_alignment as raa
+from t71g19_support import LN_PAIRED, OPEN
+from t71g21_support import computed_style
 
 
 def _chapter() -> dict:
@@ -89,27 +93,74 @@ def test_normal_rate_bridge_keeps_original_coarse_anchor(monkeypatch) -> None:
     assert {"offset": 30, "time": 16.5} in refined
 
 
-def test_study_card_starts_at_old_width_and_can_expand_to_long_term_limit() -> None:
-    css = Path("pudge/web/reading_tools.css").read_text(encoding="utf-8")
-    js = Path("pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    assert (
-        ".pudge-study-card{width:min(var(--pudge-study-width,440px),calc(100vw - 24px));"
-        "max-width:min(620px,calc(100vw - 24px))"
-    ) in css
-    # Plan §10: the headword wraps inside its bounded column instead of
-    # overflowing under the ↗/★/action controls; width stays 440..620.
-    assert (
-        ".pudge-study-term{min-width:0;flex:0 1 auto;padding-top:0;font-size:25px;"
-        "font-weight:700;line-height:1.15;white-space:normal;"
-        "overflow-wrap:anywhere;word-break:normal}"
-    ) in css
-    assert "function sizeStudyCard(el)" in js
-    assert "const STUDY_CARD_MIN_WIDTH = 440;" in js
-    assert "const STUDY_CARD_MAX_WIDTH = 620;" in js
-    assert "Math.max(STUDY_CARD_MIN_WIDTH, Math.min(STUDY_CARD_MAX_WIDTH, required))" in js
-    assert "sizeStudyCard(pop);" in js
-    # Small windows remain usable instead of overflowing off-screen.
-    assert (
-        "@media(max-width:520px){.pudge-study-card{width:calc(100vw - 16px);"
-        "padding:12px}.pudge-study-head{gap:8px}.pudge-study-term{white-space:normal;"
-    ) in css
+# The natural (one-line) widths of the card header's parts, which the window measures
+# (dom_lite has no layout): NATURAL[class] = px. Start of a run body.
+NATURAL_WIDTHS = r"""
+window.NATURAL = {};
+Object.defineProperty(Element.prototype, '__scrollWidth', {configurable: true,
+  get() { for (const [name, width] of Object.entries(NATURAL)) if (this.classList?.contains(name)) return width; return undefined; },
+  set(value) { Object.defineProperty(this, '__scrollWidth', {value, writable: true, configurable: true}); }});
+"""
+
+CARD = r"""
+const card = () => document.getElementById('pudgeStudyCard');
+const openCard = async natural => {
+  PudgeReadingTools.study.close(); await __tick(50);
+  window.NATURAL = natural;
+  await __click('#lnReader [data-ln-token="0:0"]'); await __tick(200);
+  const term = card().querySelector('.pudge-study-term');
+  return {open: card().classList.contains('open'), layout: card().querySelector('.pudge-study-head').dataset.layout,
+          width: __css(card(), 'width'), max: __css(card(), 'max-width'),
+          term: Object.fromEntries(['white-space', 'overflow-wrap', 'word-break', 'min-width'].map(p => [p, __css(term, p)]))};
+};
+"""
+
+
+def test_word_card_keeps_its_width_and_grows_up_to_620px_for_long_headers(page) -> None:
+    # The card of a word read together with an audiobook has Play from here / Read up to
+    # here in its header. It stays 440 px wide (the old card) unless the headword,
+    # actions and close need more; it grows to at most 620 px, and when they do not fit
+    # in one row the actions move to their own row and the headword wraps.
+    wide = page.run(
+        computed_style("width", "max-width", "white-space", "overflow-wrap", "word-break", "min-width")
+        + NATURAL_WIDTHS
+        + "AUDIO.playing = false;"
+        + OPEN
+        + CARD
+        + r"""
+        return [await openCard({'pudge-study-term-wrap': 60, 'pudge-study-head-actions': 220, 'pudge-study-close': 30}),
+                await openCard({'pudge-study-term-wrap': 200, 'pudge-study-head-actions': 300, 'pudge-study-close': 30}),
+                await openCard({'pudge-study-term-wrap': 700, 'pudge-study-head-actions': 300, 'pudge-study-close': 30})];
+        """,
+        before=LN_PAIRED,
+    )
+    short, longer, longest = wide.value
+    viewport_cap = "calc(100vw - 24px)"
+    assert short["open"] and short["layout"] == "inline" and short["width"] == f"min(440px,{viewport_cap})"
+    assert longer["layout"] == "inline" and longer["width"] == f"min(530px,{viewport_cap})"
+    assert longest["layout"] == "stacked" and longest["width"] == f"min(620px,{viewport_cap})"
+    assert {row["max"] for row in wide.value} == {f"min(620px,{viewport_cap})"}
+    assert longest["term"] == {
+        "white-space": "normal",
+        "overflow-wrap": "anywhere",
+        "word-break": "normal",
+        "min-width": "0",
+    }
+
+    # A narrow window: actions on their own row, the card as wide as the window allows.
+    narrow = page.run(
+        NATURAL_WIDTHS
+        + "AUDIO.playing = false;"
+        + OPEN
+        + r"""
+        await __click('#lnReader [data-ln-token="0:0"]'); await __tick(200);
+        const card = document.getElementById('pudgeStudyCard');
+        return {layout: card.querySelector('.pudge-study-head').dataset.layout, width: card.style.getPropertyValue('--pudge-study-width')};
+        """,
+        before=LN_PAIRED,
+        media={"(max-width:520px)": True},
+    )
+    assert narrow.value == {"layout": "stacked", "width": ""}
+    small = css_rules("reading_tools.css")
+    assert small.get(".pudge-study-card", "width", media="(max-width:520px)") == "calc(100vw - 16px)"
+    assert small.get(".pudge-study-term", "white-space", media="(max-width:520px)") == "normal"

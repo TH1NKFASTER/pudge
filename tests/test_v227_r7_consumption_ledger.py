@@ -41,8 +41,10 @@ def test_r7_schema_migrates_from_v8_with_backup(tmp_path: Path) -> None:
         ):
             conn.execute(f"DROP TABLE IF EXISTS {table}")
         conn.execute("PRAGMA user_version=8")
-        conn.execute("INSERT INTO state(key,value,updated_at) VALUES('r7-probe','kept',1) "
-                     "ON CONFLICT(key) DO UPDATE SET value='kept'")
+        conn.execute(
+            "INSERT INTO state(key,value,updated_at) VALUES('r7-probe','kept',1) "
+            "ON CONFLICT(key) DO UPDATE SET value='kept'"
+        )
 
     migrated = Database(path)
     backup = path.with_name(f"{path.name}.pre-v{LATEST_SCHEMA_VERSION}.backup")
@@ -96,7 +98,9 @@ def test_event_retry_is_idempotent_and_conflicting_retry_is_rejected(tmp_path: P
 
 def test_event_chunks_are_bounded(tmp_path: Path) -> None:
     ledger = ConsumptionLedger(Database(tmp_path / "db.sqlite3"))
-    media = ledger.ensure_media(kind="anime_episode", title="Episode", aliases=[("external", "anilist:1:episode:1")])
+    media = ledger.ensure_media(
+        kind="anime_episode", title="Episode", aliases=[("external", "anilist:1:episode:1")]
+    )
     session = ledger.start_session(kind="anime", media_uuid=media.media_uuid)
     with pytest.raises(ConsumptionLedgerError, match="bounded"):
         ledger.append_interval(
@@ -242,21 +246,25 @@ def test_manga_content_identity_survives_path_rename_and_reimport(tmp_path: Path
     first_path.write_bytes(payload)
     second_path.write_bytes(payload)
     with db.connect() as conn:
-        first_id = int(conn.execute(
-            "INSERT INTO manga_books(path,title,page_count,position,read_pages,reading_direction,source_fingerprint,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (str(first_path), "Volume", 10, 0, 0, "rtl", "path-sensitive-1", 1.0, 1.0),
-        ).lastrowid)
+        first_id = int(
+            conn.execute(
+                "INSERT INTO manga_books(path,title,page_count,position,read_pages,reading_direction,source_fingerprint,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (str(first_path), "Volume", 10, 0, 0, "rtl", "path-sensitive-1", 1.0, 1.0),
+            ).lastrowid
+        )
     ledger = ConsumptionLedger(db)
     first = ledger.manga_media(first_id)
     assert first is not None
     with db.connect() as conn:
         conn.execute("DELETE FROM manga_books WHERE id=?", (first_id,))
-        second_id = int(conn.execute(
-            "INSERT INTO manga_books(path,title,page_count,position,read_pages,reading_direction,source_fingerprint,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (str(second_path), "Volume renamed", 10, 0, 0, "rtl", "path-sensitive-2", 2.0, 2.0),
-        ).lastrowid)
+        second_id = int(
+            conn.execute(
+                "INSERT INTO manga_books(path,title,page_count,position,read_pages,reading_direction,source_fingerprint,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (str(second_path), "Volume renamed", 10, 0, 0, "rtl", "path-sensitive-2", 2.0, 2.0),
+            ).lastrowid
+        )
     second = ledger.manga_media(second_id)
     assert second is not None
     assert second.media_uuid == first.media_uuid
@@ -269,6 +277,7 @@ def test_web_vn_start_uses_saved_game_identity_not_window_id(tmp_path: Path) -> 
     class FakeVN:
         def __init__(self) -> None:
             self.generation = 0
+
         def start(self, window_id: int, title: str = "") -> dict[str, object]:
             self.generation += 1
             return {
@@ -277,8 +286,10 @@ def test_web_vn_start_uses_saved_game_identity_not_window_id(tmp_path: Path) -> 
                 "window_title": title,
                 "generation": self.generation,
             }
+
         def stop(self) -> dict[str, object]:
             return {"running": False, "generation": self.generation}
+
         def state(self) -> dict[str, object]:
             return {"running": False, "generation": self.generation}
 

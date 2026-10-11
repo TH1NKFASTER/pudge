@@ -32,9 +32,7 @@ def _jimaku_item(name: str) -> JimakuFile:
     )
 
 
-def test_v37_single_member_sup_cache_bootstraps_without_7zip(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_v37_single_member_sup_cache_bootstraps_without_7zip(tmp_path: Path, monkeypatch) -> None:
     archive = tmp_path / "Demon.Slayer.Infinity.Castle.sup.7z"
     archive.write_bytes(b"already downloaded archive")
     display_name = archive.stem
@@ -63,9 +61,7 @@ def test_v37_single_member_sup_cache_bootstraps_without_7zip(
     assert payload["members"][0]["output_name"] == extracted.name
 
 
-def test_7z_manifest_reuses_nested_member_without_second_extraction(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_7z_manifest_reuses_nested_member_without_second_extraction(tmp_path: Path, monkeypatch) -> None:
     archive = tmp_path / "movie.7z"
     archive.write_bytes(b"fake archive")
     payload = tmp_path / "payload.sup"
@@ -74,10 +70,10 @@ def test_7z_manifest_reuses_nested_member_without_second_extraction(
     marker = tmp_path / "runs.txt"
     tool.write_text(
         "#!/bin/sh\n"
-        "echo run >> \"$FAKE_7Z_MARKER\"\n"
-        "for arg in \"$@\"; do case \"$arg\" in -o*) out=${arg#-o} ;; esac; done\n"
-        "mkdir -p \"$out/nested\"\n"
-        "cp \"$FAKE_7Z_PAYLOAD\" \"$out/nested/Infinity Castle Japanese.sup\"\n",
+        'echo run >> "$FAKE_7Z_MARKER"\n'
+        'for arg in "$@"; do case "$arg" in -o*) out=${arg#-o} ;; esac; done\n'
+        'mkdir -p "$out/nested"\n'
+        'cp "$FAKE_7Z_PAYLOAD" "$out/nested/Infinity Castle Japanese.sup"\n',
         encoding="utf-8",
     )
     tool.chmod(0o755)
@@ -187,9 +183,7 @@ def test_prepared_bitmap_retry_ocr_writes_final_cache_and_next_run_hits_it(
 
 def test_7zip_is_reported_as_archive_worker() -> None:
     assert (
-        EnergyDiagnosticsMonitor._process_role(
-            "/opt/homebrew/opt/sevenzip/bin/7zz x -y /tmp/subs.sup.7z"
-        )
+        EnergyDiagnosticsMonitor._process_role("/opt/homebrew/opt/sevenzip/bin/7zz x -y /tmp/subs.sup.7z")
         == "archive-worker"
     )
 

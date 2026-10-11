@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+import source_policy
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -17,7 +19,8 @@ def test_index_inline_javascript_parses_with_node() -> None:
     if node is None:
         pytest.skip("node is not installed")
 
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
+    # policy: a syntax check of the inline scripts (a lint, with a clearer message than a page error).
+    html = source_policy.source("pudge/web/index.html")
 
     output = ["\n" if char == "\n" else " " for char in html]
     for match in re.finditer(

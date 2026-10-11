@@ -15,7 +15,14 @@ from pudge.providers import anime_mappings as am
 LOG = logging.getLogger("test")
 
 FRIBB = [
-    {"type": "TV", "anidb_id": 9001, "anilist_id": 5001, "tvdb_id": 777, "season": {"tvdb": 1}, "episode_offset": {"tvdb": 12}},
+    {
+        "type": "TV",
+        "anidb_id": 9001,
+        "anilist_id": 5001,
+        "tvdb_id": 777,
+        "season": {"tvdb": 1},
+        "episode_offset": {"tvdb": 12},
+    },
     {"type": "TV", "anidb_id": 9003, "anilist_id": 5003, "tvdb_id": 778, "season": {"tvdb": 1}},
     {"type": "MOVIE", "anidb_id": 9004, "anilist_id": 5004},
     {"type": "TV", "anidb_id": 9005, "anilist_id": 5005, "tvdb_id": 779, "season": {"tvdb": 1}},
@@ -39,14 +46,26 @@ def cfg(tmp_path):
     config.paths.cache_dir = tmp_path / "cache"
     config.anilist.enabled = False
     bodies = {am.FRIBB_URL: json.dumps(FRIBB).encode(), am.ANIME_LISTS_URL: LISTS.encode()}
-    mappings = am.AnimeMappings(config.paths.cache_dir, fetch=lambda url, h: (200, bodies[url], {}), min_rows={"fribb": 1, "anime_lists": 1})
+    mappings = am.AnimeMappings(
+        config.paths.cache_dir,
+        fetch=lambda url, h: (200, bodies[url], {}),
+        min_rows={"fribb": 1, "anime_lists": 1},
+    )
     assert mappings.refresh_if_due()["status"] == "rebuilt"
     ext._rules_cache.clear()
     return config
 
 
 def _anime(media_id, episodes, fmt="TV"):
-    return SimpleNamespace(media_id=media_id, id=media_id, episodes=episodes, format=fmt, title=f"A{media_id}", titles=[], synonyms=[])
+    return SimpleNamespace(
+        media_id=media_id,
+        id=media_id,
+        episodes=episodes,
+        format=fmt,
+        title=f"A{media_id}",
+        titles=[],
+        synonyms=[],
+    )
 
 
 def test_rules_roundtrip_range_pair_and_default(cfg):
@@ -94,10 +113,16 @@ def test_conflict_with_relation_chain_is_uncertain_not_guessed(cfg):
     for folder in ("anilist-episode-offset", "anilist-release-numbering"):
         path = cfg.paths.cache_dir / folder / "5001.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"offset": 10, "chain": [5000, 5001], "resolver_version": 2, "updated_at": time.time()}))
+        path.write_text(
+            json.dumps(
+                {"offset": 10, "chain": [5000, 5001], "resolver_version": 2, "updated_at": time.time()}
+            )
+        )
     result = en.resolve_episode_numbering(part2, 3, cfg, LOG, allow_network=False)
     assert result.status == "conflict" and result.aliases == ()
-    assert en.media_episode_from_release(part2, 15, cfg, LOG) is None, "no automatic progress on an ambiguous episode"
+    assert en.media_episode_from_release(part2, 15, cfg, LOG) is None, (
+        "no automatic progress on an ambiguous episode"
+    )
 
 
 def test_without_index_behaviour_is_unchanged(tmp_path):
@@ -113,5 +138,7 @@ def test_without_index_behaviour_is_unchanged(tmp_path):
 def test_cli_jimaku_aliases_use_piecewise_rules(cfg, monkeypatch):
     from pudge import cli
 
-    monkeypatch.setattr(cli, "_cached_relation_graph_episode_offset", lambda *_a: pytest.fail("graph offset must not be used"))
+    monkeypatch.setattr(
+        cli, "_cached_relation_graph_episode_offset", lambda *_a: pytest.fail("graph offset must not be used")
+    )
     assert cli._jimaku_episode_aliases(_anime(5001, 12), 4, cfg, LOG) == (16,)

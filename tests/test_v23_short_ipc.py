@@ -1,4 +1,5 @@
 """Regressions for macOS mpv IPC under deeply nested test isolation."""
+
 import os
 import tempfile
 

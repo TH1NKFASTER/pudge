@@ -12,7 +12,7 @@ from pudge.subtitles.timeline_alignment import (
 )
 
 
-def _match(center: float, offset: float, *, score: float = 3.0, coverage: float = .9) -> _WindowMatch:
+def _match(center: float, offset: float, *, score: float = 3.0, coverage: float = 0.9) -> _WindowMatch:
     return _WindowMatch(
         center=center,
         offset=offset,
@@ -21,11 +21,11 @@ def _match(center: float, offset: float, *, score: float = 3.0, coverage: float 
         source_count=11,
         reference_count=11,
         onset_coverage=coverage,
-        onset_f1=.9,
-        activity_f1=.9,
-        mean_error=.25,
-        rank_delta=.01,
-        gap_fingerprint=.8,
+        onset_f1=0.9,
+        activity_f1=0.9,
+        mean_error=0.25,
+        rank_delta=0.01,
+        gap_fingerprint=0.8,
         edge_hint_distance=None,
     )
 
@@ -56,10 +56,7 @@ def test_slime24_style_huge_two_window_alias_is_removed_without_matching_gap() -
         _match(541.0, -5.0),
         _match(577.0, -4.5),
     ]
-    cues = [
-        (300.0 + index * 4.0, 302.0 + index * 4.0, str(index))
-        for index in range(75)
-    ]
+    cues = [(300.0 + index * 4.0, 302.0 + index * 4.0, str(index)) for index in range(75)]
     filtered, diagnostics = _suppress_nonmonotonic_transient_path_excursion(cues, path)
     assert diagnostics["applied"] is True
     assert diagnostics["removed_window_count"] == 2
@@ -69,8 +66,8 @@ def test_slime24_style_huge_two_window_alias_is_removed_without_matching_gap() -
 
 def test_slime24_style_opening_edge_disagreement_requires_audio_without_gap() -> None:
     path = [
-        _match(37.6, -5.0, score=2.58, coverage=.75),
-        _match(109.6, -5.0, score=2.62, coverage=.80),
+        _match(37.6, -5.0, score=2.58, coverage=0.75),
+        _match(109.6, -5.0, score=2.62, coverage=0.80),
         _match(145.6, -5.0),
         _match(217.6, -5.0),
     ]

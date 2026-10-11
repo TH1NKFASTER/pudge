@@ -180,6 +180,7 @@ WHEEL_BUILD_DIR=""
 SOURCE_BUILD_BACKUP=""
 SOURCE_BUILD_ISOLATED=0
 APP_SWAP_BACKUP=""
+LOCKED_REQUIREMENTS=""
 restore_source_build() {
   (( SOURCE_BUILD_ISOLATED )) || return 0
   rm -rf "$PROJECT_DIR/build"
@@ -210,39 +211,11 @@ cleanup_install() {
   fi
   restore_source_build
   [[ -n "${WHEEL_BUILD_DIR:-}" ]] && rm -rf "$WHEEL_BUILD_DIR"
+  [[ -n "${LOCKED_REQUIREMENTS:-}" ]] && rm -f "$LOCKED_REQUIREMENTS"
   rm -rf "$UPDATE_PACKAGE_BACKUP"
   return "$exit_code"
 }
 trap cleanup_install EXIT
-
-# Preserve the optional MangaOCR capability across updates. The installer
-# recreates the runtime venv, so remember whether OCR was available before
-# deleting it. A surviving model-ready marker also counts: in that case the
-# Python package must be restored even if the old venv itself is damaged.
-MANGA_OCR_WAS_INSTALLED=0
-if [[ -x "$VENV_DIR/bin/python" ]]; then
-  if CONFIG_PATH="$CONFIG_PATH" "$VENV_DIR/bin/python" - <<'PYMANGAOLD'
-import importlib.util
-import os
-from pathlib import Path
-
-installed = importlib.util.find_spec("manga_ocr") is not None
-model_ready = False
-try:
-    from pudge.config import load_config
-    config = load_config(Path(os.environ["CONFIG_PATH"]).expanduser())
-    marker = Path(config.paths.cache_dir) / "manga-ocr" / "model-ready.json"
-    model_ready = marker.exists()
-except Exception:
-    pass
-
-raise SystemExit(0 if installed or model_ready else 1)
-PYMANGAOLD
-  then
-    MANGA_OCR_WAS_INSTALLED=1
-    echo "MangaOCR detected; it will be preserved across this update."
-  fi
-fi
 
 if (( FAST_UPDATE )); then
   UPDATE_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITE'
@@ -287,7 +260,7 @@ if (( BUILD_CURRENT_TREE )); then
   fi
   SOURCE_BUILD_ISOLATED=1
 
-  "$VENV_DIR/bin/python" -m pip install --upgrade "setuptools>=75" wheel
+  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "setuptools>=75" wheel
   # A source checkout carries no (or a stale) build-info.json: fingerprint the
   # tree being installed so Settings shows this build instead of "(modified)".
   if [[ -f "$PROJECT_DIR/.github/release/write_build_info.py" ]]; then
@@ -298,8 +271,9 @@ if (( BUILD_CURRENT_TREE )); then
     SOURCE_VERSION="$("$VENV_DIR/bin/python" -I -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$PROJECT_DIR/pyproject.toml")"
     "$VENV_DIR/bin/python" -I "$PROJECT_DIR/.github/release/write_build_info.py" "$PROJECT_DIR/pudge" "$SOURCE_VERSION" --revision "$SOURCE_REVISION"
   fi
+  echo "Building the Pudge package..."
   "$VENV_DIR/bin/python" -m pip wheel "$PROJECT_DIR" \
-    --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR"
+    --no-deps --no-build-isolation -w "$WHEEL_BUILD_DIR" --quiet
   restore_source_build
   WHEEL_CANDIDATES=("$WHEEL_BUILD_DIR"/pudge-*.whl(N))
 else
@@ -316,10 +290,30 @@ WHEEL_PATH="${WHEEL_CANDIDATES[1]}"
 # subtitle synchronization stack. Then replace the package directory explicitly
 # before installing the exact wheel. A same-version pip reinstall can otherwise
 # leave stale package files behind in a long-lived update venv.
+# pip and uv stay quiet (no per-package lines or hash lists); errors and warnings still show.
+echo "Installing locked Python dependencies (the first install downloads a few GB)..."
 if [[ -f "$PROJECT_DIR/release-requirements.txt" && ! -d "$PROJECT_DIR/.git" ]]; then
-  "$VENV_DIR/bin/python" -m pip install --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
+  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade --require-hashes -r "$PROJECT_DIR/release-requirements.txt"
+elif [[ -f "$PROJECT_DIR/uv.lock" ]]; then
+  # A development checkout or a patched tree: the same locked, hash-checked versions a
+  # release installs, exported from uv.lock (as build_release.sh does), never resolved anew.
+  if ! command -v uv >/dev/null 2>&1; then
+    if ! brew list --versions uv >/dev/null 2>&1; then
+      echo "Installing uv..."
+      brew install uv
+    fi
+  fi
+  UV_BIN="$(command -v uv 2>/dev/null || true)"
+  [[ -n "$UV_BIN" ]] || UV_BIN="$(brew --prefix uv)/bin/uv"
+  LOCKED_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/${APP_SLUG}-requirements.XXXXXX")"
+  "$UV_BIN" export --project "$PROJECT_DIR" --python "$VENV_DIR/bin/python" --locked --extra sync \
+    --no-dev --no-emit-project --format requirements.txt --output-file "$LOCKED_REQUIREMENTS" \
+    --quiet >/dev/null
+  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade --require-hashes -r "$LOCKED_REQUIREMENTS"
+  rm -f "$LOCKED_REQUIREMENTS"
+  LOCKED_REQUIREMENTS=""
 else
-  "$VENV_DIR/bin/python" -m pip install --upgrade "${WHEEL_PATH}[sync]"
+  "$VENV_DIR/bin/python" -m pip install --quiet --upgrade "${WHEEL_PATH}[sync]"
 fi
 INSTALL_SITE_PACKAGES="$("$VENV_DIR/bin/python" - <<'PYSITEINSTALL'
 import sysconfig
@@ -374,17 +368,6 @@ if path.is_file():
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("Installed build:", payload["id"], payload["installed_at"])
 PYBUILDSTAMP
-
-if (( MANGA_OCR_WAS_INSTALLED && ! FAST_UPDATE )); then
-  echo "Restoring MangaOCR..."
-  "$VENV_DIR/bin/python" -m pip install --upgrade "manga-ocr>=0.1.14,<1"
-  "$VENV_DIR/bin/python" - <<'PYMANGANEW'
-import importlib.util
-
-if importlib.util.find_spec("manga_ocr") is None:
-    raise SystemExit("Installer error: MangaOCR was present before update but could not be restored.")
-PYMANGANEW
-fi
 
 # Fail before touching the app bundle if the packaged Python modules are absent
 # or the installed code does not match the bundled wheel. Derive the expected

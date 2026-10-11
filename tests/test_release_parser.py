@@ -53,7 +53,9 @@ def test_bare_numbers_are_not_explicit_episodes():
 def test_filename_and_release_parsers_agree_and_are_safe():
     assert parse_anime_filename("[Grp] Show - 12.5 [720p].mkv").episode is None  # was 12
     assert release_episode("[Grp] Show - 12.5 [720p].mkv") is None
-    assert parse_anime_filename("[Erai-raws] Kuroko no Basket 2nd Season - 01 ~ 25 [1080p]").episode is None  # was 1
+    assert (
+        parse_anime_filename("[Erai-raws] Kuroko no Basket 2nd Season - 01 ~ 25 [1080p]").episode is None
+    )  # was 1
     assert release_episode("[Erai-raws] Kuroko no Basket 2nd Season - 01 ~ 25 [1080p]") is None
     assert release_episode_range("[Erai-raws] Kuroko no Basket 2nd Season - 01 ~ 25 [1080p]") == (1, 25)
     assert release_episode("[Grp] Show [03] [1080p].mkv") == 3  # was None

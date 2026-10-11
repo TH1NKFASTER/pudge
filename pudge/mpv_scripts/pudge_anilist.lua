@@ -12,13 +12,52 @@ local title = os.getenv('PUDGE_ANILIST_TITLE') or 'anime'
 local auto_update = (os.getenv('PUDGE_ANILIST_AUTO_UPDATE') or '0') == '1'
 local shortcut_mark_watched = os.getenv('PUDGE_SHORTCUT_MARK_WATCHED') or 'Ctrl+a'
 local shortcut_translate_subtitle = os.getenv('PUDGE_SHORTCUT_TRANSLATE_SUBTITLE') or 'Ctrl+t'
-local ui_language = (os.getenv('PUDGE_UI_LANGUAGE') or 'en'):lower()
 local app_name = os.getenv('PUDGE_APP_NAME') or 'pudge'
 local subtitle_path = os.getenv('PUDGE_SUBTITLE_PATH') or ''
+-- Two episodes in one file (audit 17А): episode one counts where episode two
+-- starts ("half" until subtitles have found that point).
+local part_boundary_setting = os.getenv('PUDGE_ANILIST_PART_BOUNDARY') or ''
+local part_one_done = false
+local part_last_position = nil
 
-local function tr(english, russian)
-    if ui_language == 'ru' then return russian end
-    return english
+-- Interface texts come from the window's string catalog: cli.py passes the
+-- path of pudge/web/locales.<lang>.js in PUDGE_LOCALE_FILE. The file is strict
+-- JSON wrapped in one JavaScript line (between the first '= {' and the last
+-- '};'). Without it every text falls back to English.
+local function load_locale()
+    local path = os.getenv('PUDGE_LOCALE_FILE') or ''
+    if path == '' then return {} end
+    local handle = io.open(path, 'r')
+    if not handle then return {} end
+    local content = handle:read('*a') or ''
+    handle:close()
+    local start = content:find('= {', 1, true)
+    local finish, position = nil, 1
+    while true do
+        local found = content:find('};', position, true)
+        if not found then break end
+        finish, position = found, found + 1
+    end
+    if not start or not finish or finish <= start then return {} end
+    local data = utils.parse_json(content:sub(start + 2, finish))
+    if type(data) ~= 'table' then return {} end
+    return data
+end
+
+local locale = load_locale()
+
+-- tr_key('osd.someKey', 'English fallback', {name = value}) with {name} fields.
+local function tr_key(key, fallback, params)
+    local text = locale[key]
+    if type(text) ~= 'string' or text == '' then text = fallback end
+    if params then
+        text = (text:gsub('{([%w_]+)}', function(name)
+            local value = params[name]
+            if value == nil then return nil end
+            return tostring(value)
+        end))
+    end
+    return text
 end
 
 local playback_enabled = (os.getenv('PUDGE_PLAYBACK_ENABLED') or '0') == '1'
@@ -27,6 +66,12 @@ local playback_interval = tonumber(os.getenv('PUDGE_PLAYBACK_INTERVAL') or '30')
 playback_interval = math.max(10, playback_interval)
 
 local triggered = false
+-- The automatic update reached a definite answer for this file (counted, or
+-- not needed). `reached` remembers that the watched point was passed, so an
+-- episode still uncounted when the file ends (the update was running, was
+-- deferred, or the ending was skipped straight to the end) is counted then.
+local counted = false
+local reached = false
 local paused = false
 local timer = nil
 local busy = false
@@ -63,6 +108,17 @@ local translation_timer = nil
 local translation_request = 0
 local translation_prewarm_timer = nil
 local translation_prewarm_started = false
+-- On-demand translations of this episode found in the cache / translated now; the
+-- prewarm process reads them (user-data) for its one summary log line.
+local translation_hits = 0
+local translation_misses = 0
+
+local function reset_translation_counts()
+    translation_hits = 0
+    translation_misses = 0
+    mp.set_property_native('user-data/pudge/translation-hits', 0)
+    mp.set_property_native('user-data/pudge/translation-misses', 0)
+end
 
 local function translation_context()
     local parts = {}
@@ -260,22 +316,27 @@ end
 local function translate_visible_subtitle()
     local text = mp.get_property('sub-text', '') or ''
     if not text:match('%S') then
-        mp.osd_message(tr(
-            'No text subtitle is visible',
-            'Сейчас нет текстовых субтитров для перевода'
-        ), 3)
+        mp.osd_message(tr_key('osd.noTextSubtitleVisible', 'No text subtitle is visible'), 3)
         return
     end
     mp.set_property_bool('pause', true)
     translation_request = translation_request + 1
     local request_id = translation_request
-    show_translation(tr('Translating…', 'Перевожу…'), 30)
+    show_translation(tr_key('reading.translating', 'Translating…'), 30)
     local args = {
         python, '-m', 'pudge.cli',
         '--subtitle-translate',
         '--subtitle-study-text', text,
         '--subtitle-study-context', translation_context(),
     }
+    if subtitle_path ~= '' then
+        -- A line of the prepared subtitle file: Python builds the same text and
+        -- context as the prewarm from the file, so the prepared translation is used.
+        table.insert(args, '--subtitle-study-file')
+        table.insert(args, subtitle_path)
+        table.insert(args, '--subtitle-study-time')
+        table.insert(args, string.format('%.3f', mp.get_property_number('time-pos', 0) or 0))
+    end
     if media_id ~= '' then
         table.insert(args, '--subtitle-study-media-id')
         table.insert(args, media_id)
@@ -283,6 +344,11 @@ local function translate_visible_subtitle()
     if config_path ~= '' then
         table.insert(args, '--config')
         table.insert(args, config_path)
+    end
+    local english = mp.get_property('secondary-sub-text', '') or ''
+    if subtitle_path ~= '' and english:match('%S') then
+        -- One argument: an English line may start with "-" (dialogue dash).
+        table.insert(args, '--subtitle-study-secondary=' .. english)
     end
     mp.command_native_async({
         name = 'subprocess',
@@ -303,12 +369,12 @@ local function translate_visible_subtitle()
             end
         end
         if payload and payload.translation and payload.translation ~= '' then
+            if payload.cached then translation_hits = translation_hits + 1 else translation_misses = translation_misses + 1 end
+            mp.set_property_native('user-data/pudge/translation-hits', translation_hits)
+            mp.set_property_native('user-data/pudge/translation-misses', translation_misses)
             show_translation(payload.translation, 18)
         else
-            show_translation(tr(
-                'Could not translate this subtitle',
-                'Не удалось перевести этот субтитр'
-            ), 5)
+            show_translation(tr_key('osd.couldNotTranslateSubtitle', 'Could not translate this subtitle'), 5)
             if result and result.stderr and result.stderr ~= '' then
                 mp.msg.error(result.stderr)
             end
@@ -318,18 +384,18 @@ end
 
 local function explain_current_subtitle()
     if (os.getenv('PUDGE_LLM_CONFIGURED') or '0') ~= '1' then
-        mp.osd_message(tr('Configure the LLM in Settings', 'Настройте LLM'), 4)
+        mp.osd_message(tr_key('osd.configureLlm', 'Configure the LLM in Settings'), 4)
         return
     end
     local text = study_current_subtitle ~= '' and study_current_subtitle or (mp.get_property('sub-text', '') or '')
-    if not text:match('%S') then mp.osd_message(tr('No current subtitle line', 'Нет текущего субтитра'), 3); return end
+    if not text:match('%S') then mp.osd_message(tr_key('osd.noCurrentSubtitleLine', 'No current subtitle line'), 3); return end
     local payload = utils.format_json({text=text, context=translation_context(), video=playback_video,
                                       position=mp.get_property_number('time-pos', 0) or 0})
     mp.set_property_bool('pause', true)
     mp.command_native_async({name='subprocess', args={python, '-m', 'pudge.mpv_assistant_request', payload},
         capture_stdout=true, capture_stderr=true, playback_only=false}, function(success, result)
         if not success or not result or result.status ~= 0 then
-            mp.osd_message(tr('Could not open subtitle assistant', 'Не удалось открыть помощника'), 4)
+            mp.osd_message(tr_key('osd.couldNotOpenAssistant', 'Could not open subtitle assistant'), 4)
         end
     end)
 end
@@ -365,7 +431,9 @@ local function start_translation_prewarm()
         args = args,
         capture_stdout = true,
         capture_stderr = true,
-        playback_only = true,
+        -- Not killed at the end of the file: the process sees another file / a
+        -- closed player itself and logs its summary first.
+        playback_only = false,
     }, function(success, result)
         if success and result and result.status == 0 then
             mp.msg.info(app_name .. ' subtitle translation cache prewarm finished')
@@ -402,18 +470,12 @@ end
 
 local function run_helper(action, extra, callback)
     if busy then
-        mp.osd_message(tr(
-            'AniList: an update is already running',
-            'AniList: обновление уже выполняется'
-        ), 3)
+        mp.osd_message(tr_key('osd.anilistUpdateRunning', 'AniList: an update is already running'), 3)
         mp.msg.info('AniList manual update ignored: helper is busy')
         return false
     end
     if tracking_file == '' then
-        mp.osd_message(tr(
-            'AniList: tracking is unavailable for this file',
-            'AniList: трекер недоступен для этого файла'
-        ), 5)
+        mp.osd_message(tr_key('osd.anilistTrackingUnavailable', 'AniList: tracking is unavailable for this file'), 5)
         mp.msg.warn('AniList manual update unavailable: tracking file is empty')
         return false
     end
@@ -437,13 +499,10 @@ end
 
 local function export_episode_debug()
     if playback_video == '' then
-        mp.osd_message(tr(
-            'Debug export is unavailable for this file',
-            'Экспорт логов недоступен для этого файла'
-        ), 4)
+        mp.osd_message(tr_key('osd.debugExportUnavailable', 'Debug export is unavailable for this file'), 4)
         return
     end
-    mp.osd_message(tr('Exporting episode logs…', 'Собираю логи серии…'), 2)
+    mp.osd_message(tr_key('osd.exportingEpisodeLogs', 'Exporting episode logs…'), 2)
     local args = {
         python, '-m', 'pudge.cli',
         '--export-episode-debug',
@@ -461,13 +520,8 @@ local function export_episode_debug()
         playback_only = false,
     }, function(success, result)
         local ok = success and result and result.status == 0
-        mp.osd_message(ok and tr(
-            'Episode logs exported; Finder opened',
-            'Логи серии сохранены; Finder открыт'
-        ) or tr(
-            'Could not export episode logs',
-            'Не удалось собрать логи серии'
-        ), 5)
+        mp.osd_message(ok and tr_key('osd.episodeLogsExported', 'Episode logs exported; Finder opened')
+            or tr_key('osd.couldNotExportEpisodeLogs', 'Could not export episode logs'), 5)
         if not ok and result and result.stderr and result.stderr ~= '' then
             mp.msg.error(result.stderr)
         end
@@ -563,16 +617,62 @@ local function save_playback(force)
     end)
 end
 
+local function part_boundary()
+    if part_boundary_setting == '' then return nil end
+    local value = tonumber(part_boundary_setting)
+    if value and value > 0 then return value end
+    local duration = mp.get_property_number('duration')
+    if part_boundary_setting == 'half' and duration and duration > 0 then return duration / 2 end
+    return nil
+end
+
+local function update_part_one(manual)
+    local started = run_helper('update', manual and {'--part', '1', '--manual'} or {'--part', '1'}, function(success, result)
+        local stdout = result and result.stdout or ''
+        if stdout:find('ANILIST_DEFERRED:1', 1, true) ~= nil then
+            -- Not watched enough of episode one: shown once, not retried.
+            osd_from_result(result, nil)
+            return
+        end
+        local ok = success and result and result.status == 0
+        osd_from_result(result, ok and tr_key('osd.anilistUpdated', 'AniList updated')
+            or tr_key('osd.couldNotUpdateAnilist', 'Could not update AniList'))
+    end)
+    if started then part_one_done = true end
+    return started
+end
+
+local function check_part_boundary()
+    local boundary = part_boundary()
+    if not boundary or part_one_done then return false end
+    local position = mp.get_property_number('time-pos')
+    local previous = part_last_position
+    part_last_position = position
+    -- Only a crossing during playback counts (also over a skipped ending);
+    -- resuming inside episode two does not count episode one.
+    if not position or not previous or previous >= boundary or position < boundary then return false end
+    if position - boundary > 600 then return false end
+    save_playback(true)
+    return update_part_one(false)
+end
+
 local function update_anilist(manual)
+    if manual then
+        local boundary = part_boundary()
+        local position = mp.get_property_number('time-pos')
+        if boundary and position and position < boundary then
+            mp.osd_message(tr_key('osd.anilistCountingEpisodeOne', 'AniList: counting episode one…'), 2)
+            save_playback(true)
+            update_part_one(true)
+            return
+        end
+    end
     if triggered and not manual then return end
     if manual then
         -- Give immediate feedback even before the Python helper starts. This
         -- makes a missing tracker or a subprocess failure visible instead of
         -- making Ctrl+A appear to do nothing.
-        mp.osd_message(tr(
-            'AniList: counting this entry…',
-            'AniList: засчитываю серию…'
-        ), 2)
+        mp.osd_message(tr_key('osd.anilistCountingEntry', 'AniList: counting this entry…'), 2)
         save_playback(true)
     else
         if mp.get_time() < deferred_until then return end
@@ -589,13 +689,9 @@ local function update_anilist(manual)
             return
         end
         local ok = success and result and result.status == 0
-        osd_from_result(result, ok and tr(
-            'AniList updated',
-            'AniList обновлён'
-        ) or tr(
-            'Could not update AniList',
-            'Не удалось обновить AniList'
-        ))
+        if ok and not deferred then counted = true end
+        osd_from_result(result, ok and tr_key('osd.anilistUpdated', 'AniList updated')
+            or tr_key('osd.couldNotUpdateAnilist', 'Could not update AniList'))
         if not ok and result and result.stderr and result.stderr ~= '' then
             mp.msg.error(result.stderr)
         end
@@ -603,10 +699,28 @@ local function update_anilist(manual)
     if not started and not manual then triggered = false end
 end
 
+-- The file ends (end of file, quit or next file) after the watched point but
+-- the episode is not counted yet: count it in a detached helper, which mpv
+-- does not kill when it exits. The helper still requires real watch time.
+local function count_on_close(at_eof)
+    if not auto_update or tracking_file == '' or counted then return end
+    if not reached and not at_eof then return end
+    counted = true
+    local args = helper_args('update')
+    mp.command_native_async({
+        name = 'subprocess',
+        args = args,
+        detach = true,
+        playback_only = false,
+    }, function() end)
+    mp.msg.info('AniList: counting the episode on close')
+end
+
 local function check_progress()
     accumulate_active_time()
     if not auto_update or triggered then return end
     if tracking_file == '' or paused or busy then return end
+    if check_part_boundary() then return end
     local percent = mp.get_property_number('percent-pos')
     local position = mp.get_property_number('time-pos')
     local duration = mp.get_property_number('duration')
@@ -614,6 +728,7 @@ local function check_progress()
     if not position or not duration or duration <= 0 then return end
     local remaining_seconds = math.max(0, duration - position)
     if remaining_seconds <= max_remaining_minutes * 60 then
+        reached = true
         update_anilist(false)
     end
 end
@@ -629,6 +744,10 @@ end
 mp.register_event('file-loaded', function()
     clear_translation(true)
     triggered = false
+    counted = false
+    reached = false
+    part_one_done = false
+    part_last_position = nil
     paused = mp.get_property_bool('pause', false)
     active_since_save = 0.0
     last_active_clock = mp.get_time()
@@ -641,6 +760,7 @@ mp.register_event('file-loaded', function()
     study_current_subtitle = ''
     study_subtitle_history = {}
     translation_prewarm_started = false
+    reset_translation_counts()
     if translation_prewarm_timer then
         translation_prewarm_timer:kill()
         translation_prewarm_timer = nil
@@ -657,9 +777,9 @@ mp.register_event('file-loaded', function()
         end)
     end
     if subtitle_path ~= '' then
-        -- Low-priority Python work starts after mpv has settled. It walks from
-        -- the resume position, writes only the normal translation cache and is
-        -- killed automatically with playback.
+        -- Low-priority Python work starts after mpv has settled. It keeps the next
+        -- few cues after the playback position translated (only while playing),
+        -- writes only the normal translation cache and stops with the episode.
         translation_prewarm_timer = mp.add_timeout(2.0, function()
             translation_prewarm_timer = nil
             start_translation_prewarm()
@@ -672,10 +792,7 @@ mp.register_event('file-loaded', function()
             if paused then timer:stop() else timer:resume() end
         else
             if timer then timer:stop() end
-            mp.osd_message(tr(
-                'AniList: manual mode — Ctrl+A to count',
-                'AniList: ручной режим — Ctrl+A засчитать'
-            ), 3)
+            mp.osd_message(tr_key('osd.anilistManualMode', 'AniList: manual mode — Ctrl+A to count'), 3)
         end
         mp.msg.info(string.format(
             'AniList tracker loaded: media_id=%s auto=%s threshold=%.1f%% max_remaining=%.1fmin',
@@ -702,7 +819,7 @@ mp.register_event('file-loaded', function()
     end
 end)
 
-mp.register_event('end-file', function()
+mp.register_event('end-file', function(event)
     clear_translation(true)
     if translation_prewarm_timer then
         translation_prewarm_timer:kill()
@@ -710,6 +827,7 @@ mp.register_event('end-file', function()
     end
     cancel_subtitle_refresh_timers()
     save_playback(true)
+    count_on_close(type(event) == 'table' and event.reason == 'eof')
     if active_timer then active_timer:stop() end
     if playback_timer then playback_timer:stop() end
 end)

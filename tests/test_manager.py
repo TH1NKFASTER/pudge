@@ -34,8 +34,6 @@ RSS = """<?xml version="1.0"?>
 </rss>"""
 
 
-
-
 def test_nyaa_rss_accepts_compatible_mirror_namespace() -> None:
     mirror_rss = RSS.replace(
         'xmlns:nyaa="https://nyaa.si/xmlns/nyaa"',
@@ -115,7 +113,7 @@ def test_default_nyaa_client_continues_after_empty_mirror_response() -> None:
 
     assert len(releases) == 1
     assert releases[0].info_hash == "abcdef0123456789"
-    assert [url.split('/?', 1)[0] for url in requested] == [
+    assert [url.split("/?", 1)[0] for url in requested] == [
         "https://nyaa.si",
         "https://nyaa.net",
         "https://cn.nyaa.net",
@@ -146,6 +144,7 @@ def test_custom_nyaa_base_url_does_not_silently_add_public_mirrors() -> None:
     client = NyaaClient("https://nyaa.invalid", proxy_mode="direct")
     assert client.search_base_urls == ["https://nyaa.invalid"]
     client.close()
+
 
 def test_nyaa_rss_and_scoring() -> None:
     releases = parse_rss(RSS)
@@ -222,9 +221,7 @@ def test_qbittorrent_52_adds_with_form_and_json_response(tmp_path: Path) -> None
         if request.url.path.endswith("/info"):
             return httpx.Response(200, json=[])
         if request.url.path.endswith("/add"):
-            assert request.headers.get("content-type", "").startswith(
-                "application/x-www-form-urlencoded"
-            )
+            assert request.headers.get("content-type", "").startswith("application/x-www-form-urlencoded")
             assert b"urls=magnet%3A%3Fxt%3Durn%3Abtih%3Aabcdef" in body
             assert b"stopped=false" in body
             assert b"contentLayout=Original" in body
@@ -433,9 +430,7 @@ def test_nyaa_search_can_request_descending_seeder_order() -> None:
         client.close()
 
     assert len(releases) == 1
-    assert requested == [
-        "https://nyaa.invalid/?page=rss&q=Erai+NF+720&c=1_0&f=0&s=seeders&o=desc"
-    ]
+    assert requested == ["https://nyaa.invalid/?page=rss&q=Erai+NF+720&c=1_0&f=0&s=seeders&o=desc"]
 
 
 def test_library_scan_marks_embedded_japanese_subtitles_ready(tmp_path: Path, monkeypatch) -> None:
@@ -1072,7 +1067,7 @@ def test_downloaded_episode_upgrade_requires_large_score_gain(tmp_path: Path, mo
     monkeypatch.setattr(
         manager,
         "add_release",
-        lambda _media_id, release, **_kwargs: added.append(release.info_hash),
+        lambda _media_id, release, **_kwargs: added.append(release.info_hash) or True,
     )
 
     assert manager.auto_upgrade_downloaded() == 1
@@ -1093,9 +1088,7 @@ def test_downloaded_episode_upgrade_skips_small_gain(tmp_path: Path, monkeypatch
     assert not manager.db.has_pending_upgrade(700, 5)
 
 
-def test_upgrade_replaces_old_file_even_while_new_subtitles_are_pending(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_upgrade_replaces_old_file_only_once_new_subtitles_are_ready(tmp_path: Path, monkeypatch) -> None:
     from pudge.manager_models import DownloadItem, LibraryEpisode
 
     manager = _upgrade_manager(tmp_path)
@@ -1145,15 +1138,26 @@ def test_upgrade_replaces_old_file_even_while_new_subtitles_are_pending(
 
     monkeypatch.setattr(manager, "qbt_client", lambda: FakeQbt())
 
+    # Subtitles still pending: the old Ready copy stays.
+    assert manager.finalize_ready_upgrades() == 0
+    assert manager.reconcile_duplicate_versions() == 0
+    assert deleted == []
+    assert (tmp_path / "Upgrade Show - 05.mkv").is_file()
+
+    subtitle = tmp_path / "Upgrade Show - 05 new.ja.srt"
+    subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8")
+    ready = manager.db.episode_for_torrent(700, 5, "newhash")
+    ready.state = "ready"
+    ready.subtitle_path = subtitle
+    manager.db.upsert_episode(ready)
+
     assert manager.finalize_ready_upgrades() == 1
     assert deleted == ["oldhash"]
     assert manager.db.episode_for_torrent(700, 5, "oldhash") is None
     assert manager.db.episode_for_torrent(700, 5, "newhash") is not None
 
 
-def test_reconcile_orphaned_scored_duplicate_versions(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_reconcile_orphaned_scored_duplicate_versions(tmp_path: Path, monkeypatch) -> None:
     from pudge.manager_models import DownloadItem, LibraryEpisode
 
     manager = _upgrade_manager(tmp_path)
@@ -1225,8 +1229,9 @@ def test_regular_maintenance_searches_missing_before_upgrades(tmp_path: Path, mo
     assert order == ["subtitles", "missing", "upgrade"]
 
 
-
-def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_path: Path, monkeypatch) -> None:
+def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
     from pudge.config import AppConfig
     from pudge.manager import AnimeManager
 
@@ -1252,6 +1257,7 @@ def test_startup_maintenance_runs_subtitle_jobs_even_with_background_agent(tmp_p
     # releases are discovered immediately; queued subtitle jobs are handled by
     # the foreground worker/agent afterwards.
     assert order == ["downloads", "scan", "missing", "upgrade"]
+
 
 def test_nyaa_search_uses_ascii_folded_title_variant() -> None:
     from pudge.manager_models import LibraryAnime
@@ -1305,7 +1311,6 @@ def test_subtitle_jobs_are_claimed_once(tmp_path: Path) -> None:
 
 
 def test_process_subtitle_job_passes_cached_anilist_identity(tmp_path: Path, monkeypatch) -> None:
-    import subprocess
 
     from pudge.config import AppConfig
     from pudge.manager import AnimeManager
@@ -1437,11 +1442,7 @@ def test_manager_generation_four_from_two_requeues_only_direct_alass_outputs(tmp
     assert synced_item is not None and synced_item.subtitle_path is not None
 
 
-
-def test_failed_subtitle_validation_clears_stale_prepared_path(
-    tmp_path: Path, monkeypatch
-) -> None:
-    import subprocess
+def test_failed_subtitle_validation_clears_stale_prepared_path(tmp_path: Path, monkeypatch) -> None:
 
     from pudge.config import AppConfig
     from pudge.manager import AnimeManager
@@ -1483,8 +1484,7 @@ def test_failed_subtitle_validation_clears_stale_prepared_path(
 
         def communicate(self):
             return (
-                "Субтитры отклонены проверкой качества\n"
-                "PREPARE_STATUS=waiting_subtitles\n",
+                "Субтитры отклонены проверкой качества\nPREPARE_STATUS=waiting_subtitles\n",
                 "",
             )
 
@@ -1702,14 +1702,50 @@ def test_cleanup_verifies_anilist_before_deleting(monkeypatch, tmp_path: Path) -
     assert restored is not None and restored.state == "ready"
 
 
-def test_background_prepare_marker_is_set_on_manager_child_source() -> None:
-    # Regression guard: manager-spawned --prepare-only workers must identify
-    # themselves so a manual --prepare-only can claim foreground priority.
-    from inspect import getsource
+def test_background_prepare_worker_identifies_itself_to_the_child(tmp_path: Path, monkeypatch) -> None:
+    # Manager-spawned --prepare-only workers say they are background work
+    # (PUDGE_BACKGROUND_PREPARE=1) so a manual --prepare-only can claim foreground priority.
+    from pudge.config import AppConfig
     from pudge.manager import AnimeManager
 
-    source = getsource(AnimeManager.process_subtitle_jobs)
-    assert 'env["PUDGE_BACKGROUND_PREPARE"] = "1"' in source
+    cfg = AppConfig()
+    cfg.config_path = tmp_path / "config.toml"
+    cfg.library.database_path = tmp_path / "library.sqlite3"
+    cfg.paths.cache_dir = tmp_path / "cache"
+    cfg.library.root_dir = tmp_path / "library"
+    manager = AnimeManager(cfg, log=lambda _message: None)
+    video = tmp_path / "Show - 05.mkv"
+    prepared = tmp_path / "prepared.srt"
+    video.write_bytes(b"video")
+    prepared.write_text("subtitle", encoding="utf-8")
+    manager.db.upsert_anime(LibraryAnime(media_id=7, title="Show", episodes=12, format="TV"))
+    manager.db.upsert_episode(
+        LibraryEpisode(
+            media_id=7, title="Show", episode=5, video_path=video.resolve(), state="waiting_subtitles"
+        )
+    )
+    manager.db.queue_subtitle_job(video.resolve(), 7, 5)
+    monkeypatch.delenv("PUDGE_BACKGROUND_PREPARE", raising=False)
+    children: list[dict[str, str]] = []
+
+    class FakeProcess:
+        def __init__(self, command, **kwargs):
+            if "--media-id" in command:
+                children.append(dict(kwargs.get("env") or {}))
+            self.returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self):
+            return f"PREPARED_SUBTITLE={prepared}\nPREPARE_STATUS=ready\n", ""
+
+    monkeypatch.setattr("pudge.manager.subprocess.Popen", FakeProcess)
+
+    assert manager.process_subtitle_jobs(limit=1) == 1
+    [env] = children
+    assert env["PUDGE_BACKGROUND_PREPARE"] == "1"
+    assert env["PUDGE_CONFIG"] == str(cfg.config_path)
 
 
 def test_same_directory_named_subtitle_for_another_show_is_not_a_candidate(tmp_path: Path) -> None:
@@ -1859,7 +1895,6 @@ def test_ready_notification_can_be_disabled_without_later_duplicate(tmp_path: Pa
     assert calls == []
 
 
-
 def test_startup_maintenance_runs_one_subtitle_job_when_agent_disabled(tmp_path: Path, monkeypatch) -> None:
     from pudge.config import AppConfig
     from pudge.manager import AnimeManager
@@ -1907,7 +1942,9 @@ def test_library_scan_reuses_known_no_subtitle_result(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr(
         "pudge.library.japanese_subtitle_details",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("known result must not be probed again")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("known result must not be probed again")
+        ),
     )
 
     items = scan_library(root, db, ffprobe="ffprobe", ffmpeg="ffmpeg")

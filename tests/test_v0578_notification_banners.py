@@ -74,12 +74,9 @@ def test_permission_is_requested_when_regular_app_opens(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(
         "pudge.web_app.request_notification_permission",
-        lambda timeout=12.0: calls.append(timeout)
-        or {"supported": True, "granted": True, "error": ""},
+        lambda timeout=12.0: calls.append(timeout) or {"supported": True, "granted": True, "error": ""},
     )
-    api = SimpleNamespace(
-        logger=SimpleNamespace(info=lambda message, *args: logs.append((message, args)))
-    )
+    api = SimpleNamespace(logger=SimpleNamespace(info=lambda message, *args: logs.append((message, args))))
 
     _request_notification_permission_after_launch(api)
 
@@ -88,7 +85,5 @@ def test_permission_is_requested_when_regular_app_opens(monkeypatch, tmp_path: P
     assert "notification.permission_startup" in logs[0][0]
 
 
-def test_installer_keeps_usernotifications_framework_and_new_version() -> None:
-    install = Path("install.sh").read_text(encoding="utf-8")
-    assert "-framework UserNotifications" in install
-    assert "UNUserNotificationCenter" in install
+# The installer links the launcher with UserNotifications: the policy check in
+# test_v0577_native_notifications.py (test_installer_routes_helper_mode_through_app_bundle).

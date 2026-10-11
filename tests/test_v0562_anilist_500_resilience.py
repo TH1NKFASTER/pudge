@@ -5,10 +5,13 @@ from pathlib import Path
 
 import httpx
 
+from pudge import i18n
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
 from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
+from test_v0553_planning_relation_chain import MENU
+from test_v0552_planning_relations import planning_relations_state
 
 
 def _client(handler) -> AniListClient:
@@ -108,7 +111,8 @@ def test_library_falls_back_after_extended_query_500() -> None:
     assert full_calls == 2
     assert items[0].title == "Fallback Anime"
     assert client.last_library_used_fallback is True
-    assert "упрощённый" in client.last_library_warning
+    assert "used a simplified query" in client.last_library_warning
+    assert "упрощённый" in i18n.message(client.last_library_warning, "ru")
 
 
 def test_status_mutation_500_is_verified_by_readback() -> None:
@@ -197,7 +201,35 @@ def test_planning_mutation_stays_successful_when_refresh_fails(tmp_path: Path, m
     assert result["state"]["planned"][0]["media_id"] == 55
 
 
-def test_ui_explains_saved_mutation_with_delayed_refresh() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
-    assert "toast.anilistRefreshPending" in html
-    assert "r.refresh_pending?t('toast.anilistRefreshPending')" in html
+def test_ui_explains_saved_mutation_with_delayed_refresh(tmp_path: Path, page) -> None:
+    # AniList saved the change but the refresh after it failed (HTTP 500): the toast says
+    # so instead of claiming everything is up to date.
+    state = planning_relations_state(tmp_path)
+    code = (
+        MENU
+        + """
+    await menuFor(111);
+    await __click('#contextMenu [data-context-action="add-planning"]');
+    await __tick(10);
+    const afterAdd = __toasts().at(-1);
+    await menuFor(110);
+    await __click('#contextMenu [data-context-action="remove-planning"]');
+    await __tick(10);
+    const asked = __text('#pudgeConfirmMessage') === t('confirm.removePlanning');
+    await __click('#pudgeConfirmBackdrop [data-pudge-confirm=ok]');
+    await __tick(10);
+    return {asked, toasts: [afterAdd, __toasts().at(-1)], pending: t('toast.anilistRefreshPending'), added: t('toast.addedPlanning'),
+            removed: t('toast.removedPlanning')};
+    """
+    )
+    for lang in ("en", "ru"):
+        for pending in (True, False):
+            answer = {"ok": True, "state": state, "refresh_pending": pending}
+            result = page.run(
+                code, lang=lang, state=state, api={"add_to_planning": answer, "remove_from_planning": answer}
+            )
+            out = result.value
+            assert out["asked"] is True
+            expected = [out["pending"], out["pending"]] if pending else [out["added"], out["removed"]]
+            assert out["toasts"] == expected, (lang, pending)
+        assert result.calls_of("remove_from_planning") == [[110]]

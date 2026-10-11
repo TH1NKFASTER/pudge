@@ -72,9 +72,10 @@ def deduplicate_candidates(
             passthrough.append(candidate)
             continue
         current = selected.get(fingerprint)
-        if current is None or (
-            int(candidate.path.suffix.casefold() == ".srt"), candidate.score
-        ) > (int(current.path.suffix.casefold() == ".srt"), current.score):
+        if current is None or (int(candidate.path.suffix.casefold() == ".srt"), candidate.score) > (
+            int(current.path.suffix.casefold() == ".srt"),
+            current.score,
+        ):
             selected[fingerprint] = candidate
 
     result = sorted(

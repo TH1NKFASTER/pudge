@@ -50,17 +50,12 @@ def test_spoken_chapter_marker_is_locator_not_text_anchor() -> None:
     assert debug["chapter_marker"] is True
     assert debug["marker_start"] == pytest.approx(6852.68, abs=0.05)
     assert story_start is not None and story_start >= 6856.0
-    assert all(
-        float(row["offset"]) == 0.0
-        for row in repaired
-        if float(row["time"]) < story_start - 0.01
-    )
+    assert all(float(row["offset"]) == 0.0 for row in repaired if float(row["time"]) < story_start - 0.01)
 
 
 def test_every_chapter_semantically_verifies_prose_after_spoken_marker() -> None:
     first = (
-        "小高い丘が延々と続く。岩ばかりが目立ち草も木も少ない。"
-        "旅人は丘の間を縫う細い道を静かに進んでいた。"
+        "小高い丘が延々と続く。岩ばかりが目立ち草も木も少ない。旅人は丘の間を縫う細い道を静かに進んでいた。"
     ) * 10
     second = _chapter_two_text()
 
@@ -74,10 +69,7 @@ def test_every_chapter_semantically_verifies_prose_after_spoken_marker() -> None
         {"start": 60.2, "end": 64.0, "text": second[58:95]},
         {"start": 64.2, "end": 70.0, "text": second[95:150]},
     ]
-    speech = [
-        {"start": row["start"], "end": row["end"]}
-        for row in segments
-    ]
+    speech = [{"start": row["start"], "end": row["end"]} for row in segments]
     alignment = align_light_novel_to_transcript(
         [
             {"chapter_index": 0, "title": "第一幕", "text": first},
@@ -163,8 +155,4 @@ def test_first_chapter_credits_then_spoken_marker_then_prose_waits_for_prose() -
     )
     assert debug["chapter_marker"] is True
     assert story_start is not None and story_start >= 40.7
-    assert all(
-        float(row["offset"]) == 0.0
-        for row in repaired
-        if float(row["time"]) < story_start - 0.01
-    )
+    assert all(float(row["offset"]) == 0.0 for row in repaired if float(row["time"]) < story_start - 0.01)

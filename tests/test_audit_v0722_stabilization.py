@@ -265,13 +265,46 @@ def test_safe_mode_blocks_foreground_download_and_subtitle_poll() -> None:
     assert result["stats"] == {}
 
 
-def test_safe_mode_frontend_never_shows_monitoring_banner() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
+# The library changes after 20 s (the version check sees it): a download has started.
+# Every text the startup/monitoring banner showed is recorded in window.__banner.
+SAFE_MODE_WINDOW = r"""
+window.__banner = [];
+document.addEventListener('DOMContentLoaded', () => new MutationObserver(() => {
+  if (document.getElementById('startupBanner').classList.contains('show'))
+    window.__banner.push(document.getElementById('startupBannerText').textContent);
+}).observe(document.getElementById('startupBanner'), {attributes: true}));
+const base = __api.get_state;
+window.__versions = {ready: '1', ui: '1'};
+__api.ui_state_versions = async () => window.__versions;
+__api.get_state = __api.get_state_fast = async () => ({...(await base()), ui_state_version: window.__versions.ui,
+  downloads: window.__versions.ui === '2' ? [{name: 'Show 03', torrent_hash: 'abc', state: 'downloading', progress: 0.5}] : []});
+__api.refresh_local = async () => ({state: await __api.get_state(), stats: {}});
+"""
 
-    assert "function safeModeActive()" in html
-    assert "visible=!!show&&!safeModeActive()" in html
-    assert "if(safeModeActive()){showStartupBanner(false);setStatus(t('status.ready'));return;}" in html
-    assert "if(safeModeActive()||ui.foregroundPolling||ui.foregroundPollTimer)return" in html
+
+def test_safe_mode_window_never_monitors_or_shows_the_monitoring_banner(page) -> None:
+    code = r"""
+    await __tick(20000);
+    window.__versions = {ready: '1', ui: '2'};
+    await __tick(30000);
+    await __click('#refreshAll');                // Refresh while the download is running
+    await __tick(70000);
+    return {banner: window.__banner, safeBanner: __visible('#safeModeBanner') ? __text('#safeModeBanner span') : null,
+            safeText: t('ui.pudgeIsRunningInSafe'), monitoring: t('status.monitoring')};
+    """
+    safe = page.run(code, state={"safe_mode": {"active": True}}, before=SAFE_MODE_WINDOW)
+    assert safe.value["banner"] == []
+    assert safe.value["safeBanner"] == safe.value["safeText"]
+    assert safe.calls_of("refresh_local") == [[]]
+    for name in ("poll_downloads_and_subtitles", "startup_sync_anilist", "startup_maintenance"):
+        assert not safe.called(name), name
+    # The same window outside safe mode starts up, watches the download and says so.
+    normal = page.run(code, state={"safe_mode": {"active": False}}, before=SAFE_MODE_WINDOW)
+    assert normal.value["monitoring"] in normal.value["banner"] and normal.value["safeBanner"] is None
+    assert normal.called("startup_maintenance")
+    assert [call.get("at") for call in normal.calls if call["name"] == "poll_downloads_and_subtitles"][
+        -1
+    ] > 20000
 
 
 def test_ui_snapshot_cache_returns_only_matching_version() -> None:

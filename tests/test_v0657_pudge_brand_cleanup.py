@@ -11,8 +11,6 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.legacy_install import migrate_paths, rewrite_config
 
-ROOT = Path(__file__).parents[1]
-
 
 def test_product_is_now_pudge_with_legacy_migration_metadata() -> None:
     assert APP_NAME == "pudge"
@@ -21,14 +19,8 @@ def test_product_is_now_pudge_with_legacy_migration_metadata() -> None:
     assert "Anime MPV" in LEGACY_APP_NAMES
     assert "anime-mpv" in LEGACY_APP_SLUGS
 
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert 'pudge/legacy_install.py" paths' in installer
-    assert 'pudge/legacy_install.py" config' in installer
-    assert 'killall Dock' in installer
-    assert 'pudge/mac_app_aliases.py' in installer
-    assert 'ln -s "$APP_PATH" "$legacy_app"' not in installer
-    assert 'APP_PATH="$APP_DIR/$APP_NAME.app"' in installer
-
+    # What install.sh does with this metadata (migrating folders, retiring the old app and
+    # Dock pins) runs in test_install_script.py::test_install_migrates_and_retires_the_old_brand.
 
 
 def test_brand_path_migration_moves_old_defaults_and_rewrites_config(tmp_path: Path) -> None:
@@ -82,7 +74,10 @@ def test_brand_path_migration_moves_old_defaults_and_rewrites_config(tmp_path: P
     assert str(home / ".local" / "share" / "pudge") in text
     assert 'category = "pudge"' in text
 
-def test_managed_library_detaches_false_match_even_with_stale_torrent_hash(monkeypatch, tmp_path: Path) -> None:
+
+def test_managed_library_detaches_false_match_even_with_stale_torrent_hash(
+    monkeypatch, tmp_path: Path
+) -> None:
     root = tmp_path / "Library"
     root.mkdir()
     video = root / "catmahjong.mp4"
@@ -191,8 +186,7 @@ def test_brand_config_does_not_rewrite_similar_custom_path(tmp_path: Path) -> No
     config = tmp_path / "config.toml"
     custom = home / "Movies" / "Anime MPV custom"
     config.write_text(
-        f'[library]\nroot_dir = "{custom}"\n'
-        '[qbittorrent]\ncategory = "anime-mpv-custom"\n',
+        f'[library]\nroot_dir = "{custom}"\n[qbittorrent]\ncategory = "anime-mpv-custom"\n',
         encoding="utf-8",
     )
     report = rewrite_config(

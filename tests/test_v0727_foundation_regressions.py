@@ -94,9 +94,7 @@ def test_manga_artifact_v1_is_read_without_destroying_legacy_data(tmp_path: Path
                         "name": "001.png",
                         "width": 100,
                         "height": 100,
-                        "regions": [
-                            {"text": "猫", "x": 0.1, "y": 0.2, "width": 0.2, "height": 0.3}
-                        ],
+                        "regions": [{"text": "猫", "x": 0.1, "y": 0.2, "width": 0.2, "height": 0.3}],
                     }
                 ],
             },

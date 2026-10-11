@@ -4,9 +4,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -19,6 +19,7 @@ from pudge.manager_models import LibraryAnime
 from pudge.providers.jimaku import JimakuClient
 from pudge.providers.nyaa import _quality_score
 from pudge.syncing import parse_srt, repair_with_embedded_reference_piecewise, write_srt
+from tests.i18n_support import has_text
 
 
 def test_preferred_resolution_gets_ten_extra_points():
@@ -133,6 +134,7 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
         start = 119.972 + index * 30.0
         refs.append((start, start + 3.0, f"eng {index}"))
     write_srt(cues, candidate, preserve_order=True)
+
     # Keep the intentional overlapping SFX cues: write_srt protects normal
     # playback files by trimming overlaps, while embedded references may contain
     # them exactly like Crunchyroll's ASS track does.
@@ -142,11 +144,13 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
         minutes, millis = divmod(millis, 60_000)
         seconds, millis = divmod(millis, 1000)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
     reference.write_text(
         "\n\n".join(
             f"{index}\n{stamp(start)} --> {stamp(end)}\n{text}"
             for index, (start, end, text) in enumerate(refs, start=1)
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -186,16 +190,111 @@ def test_cold_open_duplicate_sfx_anchors_unique_dialogue(monkeypatch, tmp_path: 
     assert anchor["duplicate_reference_cues"] == 2
 
 
-def test_web_ui_accumulated_v0637_changes_present():
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "Configure only the features you use" not in html
-    assert 'id="s_watched_folders"' in html
-    assert 'id="s_subtitle_folders"' in html
-    assert "queue_next_count" not in html
-    assert "queue_franchise_available" in html
-    assert "data-context-action=\"queue-next\"" not in html
-    assert "const diagnose=!planned" in html
-    assert "full-relation-alternatives" in html
-    assert "alternativeTypes=new Set(['ALTERNATIVE','SUMMARY','COMPILATION'])" in html
-    assert "'#a93c4a','#c64e42'" in html
-    assert "'#439eb0','#6f8cff'" in html
+# Window changes of v0.6.37 (behaviour, page harness). Multiple watched/subtitle folders in
+# Settings: test_subtitle_folder_permissions_v0605.py; "Queue next" gone, the franchise queue
+# kept: test_v0720_second_six_contract.py; the Alternative shelf for ALTERNATIVE movies:
+# test_v0656_settings_brand_library.py.
+def _menu(page_name: str) -> str:
+    """Right-click Show (media 7) on a page; the context-menu actions."""
+    content = "plannedContent" if page_name == "planned" else "currentContent"
+    return f"""
+    setPage('{page_name}', true); await __tick(20);
+    await __fire('#{content} [data-media-id="7"]', 'contextmenu', {{bubbles: true, cancelable: true, clientX: 10, clientY: 10}}, 'MouseEvent');
+    return [...document.querySelectorAll('#contextMenu button')].map(b => b.dataset.contextAction);
+    """
+
+
+SHOW = {
+    "media_id": 7,
+    "title": "Show",
+    "episodes": 12,
+    "next_episode": 3,
+    "progress": 2,
+    "site_url": "https://anilist.co/anime/7",
+    "media_status": "RELEASING",
+    "local": None,
+}
+
+
+def test_settings_have_no_long_integration_hint(page) -> None:
+    text = page.run(
+        "setPage('settings', true); await __tick(20); return $('settingsContent').textContent;"
+    ).value
+    assert "Configure only the features you use" not in text
+    assert not has_text("Configure only the features you use")
+
+
+def test_planning_cards_never_ask_why_not_ready(page) -> None:
+    planned = {**SHOW, "list_status": "PLANNING"}
+    in_planning = page.run(_menu("planned"), state={"planned": [planned]}).value
+    assert "open" in in_planning and "diagnose" not in in_planning
+    waiting = page.run(_menu("current"), state={"current": [SHOW], "home": {"waiting": [SHOW]}}).value
+    assert "diagnose" in waiting
+
+
+def test_franchise_queue_is_offered_only_when_the_backend_has_one(page) -> None:
+    menus = {}
+    for available, status in ((True, "RELEASING"), (False, "RELEASING"), (True, "NOT_YET_RELEASED")):
+        show = {**SHOW, "queue_franchise_available": available, "media_status": status}
+        menus[(available, status)] = page.run(
+            _menu("current"), state={"current": [show], "home": {"waiting": [show]}}
+        ).value
+    assert "queue-franchise" in menus[(True, "RELEASING")]
+    assert "queue-franchise" not in menus[(False, "RELEASING")]
+    assert "queue-franchise" not in menus[(True, "NOT_YET_RELEASED")]
+
+
+def test_recap_and_compilation_movies_go_to_the_alternative_shelf(page) -> None:
+    def node(media_id: int, title: str, kind: str, year: int) -> dict:
+        return {"media_id": media_id, "title": title, "format": kind, "season_year": year}
+
+    graph = {
+        "root_id": 1,
+        "nodes": [
+            node(1, "Show", "TV", 2019),
+            node(2, "Show: Recap", "MOVIE", 2020),
+            node(3, "Show: Compilation", "MOVIE", 2021),
+            node(4, "Show 2", "TV", 2022),
+            node(5, "Show: The Movie", "MOVIE", 2023),
+        ],
+        "edges": [
+            {"source": 1, "target": 2, "relation_type": "SUMMARY"},
+            {"source": 3, "target": 1, "relation_type": "COMPILATION"},
+            {"source": 1, "target": 4, "relation_type": "SEQUEL"},
+            {"source": 4, "target": 5, "relation_type": "SEQUEL"},
+        ],
+    }
+    result = page.run(
+        r"""
+        const host = document.createElement('div'); document.body.appendChild(host);
+        host.innerHTML = fullRelationGraphDiagram(window.graph);
+        return {shelf: [...host.querySelectorAll('.full-relation-alternatives .full-relation-alt')].map(b => b.title),
+                label: __text('.full-relation-alternatives-label'), expected: relationTypeLabel('ALTERNATIVE'),
+                nodes: [...host.querySelectorAll('.full-relation-node [data-title]')].map(n => n.dataset.title)};
+        """,
+        before=f"window.graph = {json.dumps(graph)};",
+    )
+    out = result.value
+    # Recap/compilation movies of a season sit on its small Alternative shelf; a sequel movie
+    # stays a full node.
+    assert out["shelf"] == ["Show: Recap", "Show: Compilation"] and out["label"] == out["expected"]
+    assert out["nodes"] == ["Show", "Show 2", "Show: The Movie"]
+
+
+def test_score_wheel_runs_from_red_for_low_to_blue_for_high_scores(page) -> None:
+    result = page.run(
+        r"""
+        showScoreModal({media_id: 7, title: 'Show'});
+        const background = $('scoreWheel').style.background;
+        return {background, labels: [...document.querySelectorAll('#scoreWheel .score-wheel-label')].map(l => l.textContent)};
+        """
+    )
+    colors = re.findall(r"#([0-9a-f]{6})", result.value["background"])
+    assert result.value["labels"] == [str(score) for score in range(1, 11)] and len(colors) == 10
+    rgb = [tuple(int(color[i : i + 2], 16) for i in (0, 2, 4)) for color in colors]
+    low, high = rgb[0], rgb[-1]
+    assert low[0] > low[1] and low[0] > low[2]  # 1 is red
+    assert high[2] > high[0] and high[2] > high[1]  # 10 is blue (high scores used to be red)
+    assert all(red > blue for red, _green, blue in rgb[:4]) and all(
+        blue > red for red, _green, blue in rgb[-2:]
+    )

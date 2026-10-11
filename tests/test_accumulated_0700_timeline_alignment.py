@@ -20,10 +20,7 @@ def _dialogue_rows(start: float, count: int, *, spacing: float = 4.0):
 
 def test_timeline_alignment_constant_offset(tmp_path: Path) -> None:
     source = _dialogue_rows(20.0, 80)
-    reference = [
-        (start + 7.5, end + 7.5, text)
-        for start, end, text in source
-    ]
+    reference = [(start + 7.5, end + 7.5, text) for start, end, text in source]
     source_path = _write(tmp_path / "source.srt", source)
     reference_path = _write(tmp_path / "reference.srt", reference)
 
@@ -121,9 +118,7 @@ def test_timeline_alignment_uses_raw_cue_onsets_when_activity_merges(tmp_path: P
         shifted_end = end + 8.25
         reference.append((shifted_start, shifted_end, text))
         if index % 9 == 0:
-            reference.append(
-                (shifted_start + 1.0, shifted_start + 1.55, text + " split")
-            )
+            reference.append((shifted_start + 1.0, shifted_start + 1.55, text + " split"))
 
     source_path = _write(tmp_path / "dense-jp.srt", source)
     reference_path = _write(tmp_path / "dense-en.srt", reference)

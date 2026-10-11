@@ -77,6 +77,9 @@ class NyaaRelease:
     numbering_scheme: str = ""
     numbering_rule: str = ""
     numbering_revision: int = 0
+    # False when the source does not report seeders (read-only RSS mirrors):
+    # unknown is neither zero nor a known swarm.
+    seeders_known: bool = True
 
     @property
     def magnet(self) -> str:
@@ -106,6 +109,10 @@ class LibraryEpisode:
     playback_updated_at: float | None = None
     playback_active_seconds: float = 0.0
     subtitle_origin: str = ""
+    # Two episodes in one file ("Show - 01-02"): the last episode it holds and,
+    # once subtitles are prepared, where the second episode starts (seconds).
+    media_episode_end: int | None = None
+    part_boundary: float | None = None
 
     def __post_init__(self) -> None:
         # ``episode`` remains the backwards-compatible season-local alias.
@@ -116,6 +123,16 @@ class LibraryEpisode:
         self.episode = self.media_episode
         if self.release_episode is None:
             self.release_episode = self.media_episode
+        if self.media_episode_end is not None and (
+            self.media_episode is None or int(self.media_episode_end) <= int(self.media_episode)
+        ):
+            self.media_episode_end = None
+
+    @property
+    def last_episode(self) -> int | None:
+        """The highest episode this file holds (the same as ``media_episode`` for one episode)."""
+        return self.media_episode_end if self.media_episode_end is not None else self.media_episode
+
 
 @dataclass(slots=True)
 class DownloadItem:
@@ -133,6 +150,7 @@ class DownloadItem:
     added_on: int = 0
     completed_on: int = 0
     raw: dict[str, Any] = field(default_factory=dict)
+    media_episode_end: int | None = None
 
     def __post_init__(self) -> None:
         if self.media_episode is None:

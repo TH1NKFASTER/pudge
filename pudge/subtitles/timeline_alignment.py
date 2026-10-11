@@ -6,6 +6,7 @@ import math
 import re
 import statistics
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,9 +52,7 @@ class _WindowMatch:
             "cumulative_rank_delta": round(self.rank_delta, 5),
             "gap_fingerprint": round(self.gap_fingerprint, 5),
             "edge_hint_distance_seconds": (
-                round(self.edge_hint_distance, 3)
-                if self.edge_hint_distance is not None
-                else None
+                round(self.edge_hint_distance, 3) if self.edge_hint_distance is not None else None
             ),
         }
 
@@ -80,16 +79,9 @@ def _early_edit_audio_verification_risk(
     early = [item for item in path if float(item.center) <= 360.0 and item.matched >= 3]
     smoothed_offsets = _smooth_offsets(early) if early else []
 
-    offset_span = (
-        max(smoothed_offsets) - min(smoothed_offsets)
-        if len(smoothed_offsets) >= 2
-        else 0.0
-    )
+    offset_span = max(smoothed_offsets) - min(smoothed_offsets) if len(smoothed_offsets) >= 2 else 0.0
     max_jump = max(
-        (
-            abs(right - left)
-            for left, right in zip(smoothed_offsets, smoothed_offsets[1:])
-        ),
+        (abs(right - left) for left, right in zip(smoothed_offsets, smoothed_offsets[1:])),
         default=0.0,
     )
     if len(smoothed_offsets) >= 3 and offset_span >= 4.0 and max_jump >= 3.0:
@@ -130,11 +122,7 @@ def _early_edit_audio_verification_risk(
             cold_boundary = float(cold_start.get("boundary_source_time") or 0.0)
         except (TypeError, ValueError):
             cold_delta = cold_gap = cold_boundary = 0.0
-    if (
-        cold_gap >= 45.0
-        and 0.0 < cold_boundary <= 240.0
-        and cold_delta >= 1.5
-    ):
+    if cold_gap >= 45.0 and 0.0 < cold_boundary <= 240.0 and cold_delta >= 1.5:
         reasons.append("opening_gap_clock_ambiguity")
 
     # An opening can contain continuous music/sign cues and therefore have no
@@ -142,10 +130,7 @@ def _early_edit_audio_verification_risk(
     # risky enough to verify against Japanese speech instead of trusting a
     # subtitle-only fit.
     strong_early = any(
-        item.center <= 120.0
-        and item.matched >= 4
-        and item.score >= 2.40
-        and item.onset_coverage >= 0.65
+        item.center <= 120.0 and item.matched >= 4 and item.score >= 2.40 and item.onset_coverage >= 0.65
         for item in early
     )
     if 4.0 <= cold_delta <= 15.0 and strong_early:
@@ -165,8 +150,7 @@ def _early_edit_audio_verification_risk(
     # Text anchors resolve only the path alias inside an opening gap. Other
     # evidence of an early edit must still go through Japanese speech checking.
     if resolved_by and (
-        resolved_by != "shared_opening_text_anchors"
-        or set(reasons) <= {"early_path_clock_change"}
+        resolved_by != "shared_opening_text_anchors" or set(reasons) <= {"early_path_clock_change"}
     ):
         payload.update(
             {
@@ -263,6 +247,18 @@ def _match_onsets(
     return matched, mean_error, gap_fingerprint
 
 
+def _bins_in_range(bins: set[int], first: int, last: int) -> Iterable[int]:
+    """Members of ``bins`` in [first, last).
+
+    A scoring window covers ~150 grid bins while an episode has thousands, and
+    the window scorer runs >10k times per alignment, so probe the window's bins
+    instead of scanning the whole episode (same set either way).
+    """
+    if last - first < len(bins):
+        return (index for index in range(first, last) if index in bins)
+    return (index for index in bins if first <= index < last)
+
+
 def _activity_f1(
     source_bins: set[int],
     reference_bins: set[int],
@@ -275,12 +271,8 @@ def _activity_f1(
     first = int(math.floor(window_start / step))
     last = int(math.ceil(window_end / step))
     shift = int(round(offset / step))
-    source_window = {index + shift for index in source_bins if first <= index < last}
-    ref_first = first + shift
-    ref_last = last + shift
-    reference_window = {
-        index for index in reference_bins if ref_first <= index < ref_last
-    }
+    source_window = {index + shift for index in _bins_in_range(source_bins, first, last)}
+    reference_window = set(_bins_in_range(reference_bins, first + shift, last + shift))
     if not source_window or not reference_window:
         return 0.0
     overlap = len(source_window & reference_window)
@@ -310,11 +302,7 @@ def _score_window(
     )
     minimum = max(1, min(len(source), len(reference)))
     onset_coverage = matched / minimum
-    onset_f1 = (
-        (2.0 * matched) / (len(source) + len(reference))
-        if source and reference
-        else 0.0
-    )
+    onset_f1 = (2.0 * matched) / (len(source) + len(reference)) if source and reference else 0.0
     activity_f1 = _activity_f1(
         source_bins,
         reference_bins,
@@ -323,9 +311,7 @@ def _score_window(
         offset=offset,
     )
     count_ratio = (
-        min(len(source), len(reference)) / max(len(source), len(reference))
-        if source and reference
-        else 0.0
+        min(len(source), len(reference)) / max(len(source), len(reference)) if source and reference else 0.0
     )
     # Periodic dialogue rhythms can create several equally good local
     # offsets (for example every 4 seconds). Use cumulative cue position as a
@@ -333,14 +319,8 @@ def _score_window(
     # roughly the same fraction of the JP cue sequence to the EN cue sequence.
     # This remains tolerant of different segmentation because it compares
     # normalized ranks rather than cue indexes one-to-one.
-    source_rank = (
-        bisect.bisect_right(source_onsets, center)
-        / max(1, len(source_onsets))
-    )
-    reference_rank = (
-        bisect.bisect_right(reference_onsets, center + offset)
-        / max(1, len(reference_onsets))
-    )
+    source_rank = bisect.bisect_right(source_onsets, center) / max(1, len(source_onsets))
+    reference_rank = bisect.bisect_right(reference_onsets, center + offset) / max(1, len(reference_onsets))
     rank_delta = abs(source_rank - reference_rank)
 
     edge_hint_distance: float | None = None
@@ -384,11 +364,7 @@ def _score_window(
                 locality_weight = max(0.0, 1.0 - distance_from_end / edge_zone)
             if local_hint is not None and locality_weight > 0.0:
                 edge_hint_distance = abs(offset - local_hint)
-                edge_hint_bonus = (
-                    0.24
-                    * locality_weight
-                    * math.exp(-edge_hint_distance / 5.0)
-                )
+                edge_hint_bonus = 0.24 * locality_weight * math.exp(-edge_hint_distance / 5.0)
 
     score = (
         1.35 * onset_coverage
@@ -498,12 +474,7 @@ def _best_path(
     scores: list[list[float]] = []
     previous: list[list[int]] = []
     first_candidates = usable[0][1]
-    scores.append(
-        [
-            item.score - 0.0015 * abs(item.offset)
-            for item in first_candidates
-        ]
-    )
+    scores.append([item.score - 0.0015 * abs(item.offset) for item in first_candidates])
     previous.append([-1] * len(first_candidates))
 
     for index in range(1, len(usable)):
@@ -513,8 +484,7 @@ def _best_path(
         row_prev: list[int] = []
         for candidate in candidates:
             options = [
-                scores[index - 1][prev_index]
-                - _transition_penalty(prev_item.offset, candidate.offset)
+                scores[index - 1][prev_index] - _transition_penalty(prev_item.offset, candidate.offset)
                 for prev_index, prev_item in enumerate(prev_candidates)
             ]
             best_prev = max(range(len(options)), key=options.__getitem__)
@@ -589,9 +559,9 @@ def _suppress_weak_opening_path_excursion(
     for run_length in (2, 1):
         for start_index in range(3, len(path) - run_length - 5):
             end_index = start_index + run_length
-            left_rows = path[max(0, start_index - 4):start_index]
+            left_rows = path[max(0, start_index - 4) : start_index]
             middle_rows = path[start_index:end_index]
-            right_rows = path[end_index:min(len(path), end_index + 8)]
+            right_rows = path[end_index : min(len(path), end_index + 8)]
             if len(left_rows) < 3 or len(right_rows) < 6:
                 continue
 
@@ -634,10 +604,7 @@ def _suppress_weak_opening_path_excursion(
             left_center = float(left_rows[-1].center)
             right_center = float(right_rows[0].center)
             matching_gap = next(
-                (
-                    row for row in long_gaps
-                    if left_center - 18.0 <= row[3] <= right_center + 18.0
-                ),
+                (row for row in long_gaps if left_center - 18.0 <= row[3] <= right_center + 18.0),
                 None,
             )
             if matching_gap is None:
@@ -685,9 +652,9 @@ def _suppress_nonmonotonic_transient_path_excursion(
     for run_length in (2, 1):
         for start_index in range(3, len(path) - run_length - 2):
             end_index = start_index + run_length
-            left_rows = path[start_index - 3:start_index]
+            left_rows = path[start_index - 3 : start_index]
             middle_rows = path[start_index:end_index]
-            right_rows = path[end_index:end_index + 3]
+            right_rows = path[end_index : end_index + 3]
             left_values = [float(row.offset) for row in left_rows]
             middle_values = [float(row.offset) for row in middle_rows]
             right_values = [float(row.offset) for row in right_rows]
@@ -787,7 +754,7 @@ def _segments(path: list[_WindowMatch]) -> list[dict[str, object]]:
             if abs(left_med - right_med) <= 1.50:
                 groups[index - 1].extend(groups[index])
                 groups[index - 1].extend(groups[index + 1])
-                del groups[index:index + 2]
+                del groups[index : index + 2]
                 changed = True
                 break
 
@@ -886,7 +853,6 @@ def _refine_boundary(
     return min(candidates, key=cost)
 
 
-
 def _fixed_offset_boundary_refinement(
     source_onsets: list[float],
     reference_onsets: list[float],
@@ -960,13 +926,14 @@ def _fixed_offset_boundary_refinement(
             continue
         after = [
             other
-            for other in valid_rows[index:index + 4]
+            for other in valid_rows[index : index + 4]
             if float(other["center"]) - float(row["center"]) <= 10.0
         ]
         if sum(float(other["delta"]) >= threshold for other in after) < 3:
             continue
         before = [
-            other for other in valid_rows[:index]
+            other
+            for other in valid_rows[:index]
             if 0.0 < float(row["center"]) - float(other["center"]) <= 18.0
         ]
         left_evidence = [other for other in before if float(other["delta"]) <= -threshold]
@@ -1003,9 +970,7 @@ def _fixed_offset_boundary_refinement(
             continue
         boundary = (previous + current) / 2.0
         confidence = (previous_right - previous_left) + (current_left - current_right)
-        flip_candidates.append(
-            (confidence, boundary, previous, current, previous_left + current_right)
-        )
+        flip_candidates.append((confidence, boundary, previous, current, previous_left + current_right))
     if flip_candidates:
         _confidence, boundary, previous, current, combined_error = max(
             flip_candidates,
@@ -1024,14 +989,11 @@ def _fixed_offset_boundary_refinement(
     for index, row in enumerate(valid_rows):
         if float(row["delta"]) < threshold:
             continue
-        after = valid_rows[index:index + 4]
+        after = valid_rows[index : index + 4]
         if sum(float(other["delta"]) >= threshold for other in after) < 3:
             continue
         previous_left = next(
-            (
-                other for other in reversed(valid_rows[:index])
-                if float(other["delta"]) <= -threshold
-            ),
+            (other for other in reversed(valid_rows[:index]) if float(other["delta"]) <= -threshold),
             None,
         )
         if previous_left is None:
@@ -1068,7 +1030,6 @@ def _fixed_offset_boundary_refinement(
     }
 
 
-
 def _suppress_ambiguous_sparse_edge_transition(
     source_cues: list[tuple[float, float, str]],
     source_onsets: list[float],
@@ -1098,11 +1059,7 @@ def _suppress_ambiguous_sparse_edge_transition(
         return segments, boundaries, diagnostics
 
     last_boundary = boundary_payload[-1]
-    refinement = (
-        last_boundary.get("refinement")
-        if isinstance(last_boundary.get("refinement"), dict)
-        else {}
-    )
+    refinement = last_boundary.get("refinement") if isinstance(last_boundary.get("refinement"), dict) else {}
     if str(refinement.get("method") or "") != "fixed_offset_crossover_across_silence":
         diagnostics["reason"] = "last_boundary_not_gap_fallback"
         return segments, boundaries, diagnostics
@@ -1133,10 +1090,7 @@ def _suppress_ambiguous_sparse_edge_transition(
         diagnostics["reason"] = "right_edge_not_weak"
         return segments, boundaries, diagnostics
 
-    current_offsets = [
-        _offset_for_time(onset, segments, boundaries)
-        for onset in source_onsets
-    ]
+    current_offsets = [_offset_for_time(onset, segments, boundaries) for onset in source_onsets]
     current_metrics = _global_onset_metrics(
         source_onsets,
         reference_onsets,
@@ -1152,8 +1106,7 @@ def _suppress_ambiguous_sparse_edge_transition(
     trimmed_segments = [dict(segment) for segment in segments[:-1]]
     trimmed_boundaries = list(boundaries[:-1])
     trimmed_offsets = [
-        _offset_for_time(onset, trimmed_segments, trimmed_boundaries)
-        for onset in source_onsets
+        _offset_for_time(onset, trimmed_segments, trimmed_boundaries) for onset in source_onsets
     ]
     trimmed_metrics = _global_onset_metrics(
         source_onsets,
@@ -1202,11 +1155,7 @@ def _suppress_ambiguous_sparse_edge_transition(
         }
     )
 
-    preserves_alignment = bool(
-        matched_retention >= 0.97
-        and f1_loss <= 0.02
-        and activity_loss <= 0.03
-    )
+    preserves_alignment = bool(matched_retention >= 0.97 and f1_loss <= 0.02 and activity_loss <= 0.03)
     improves_error = bool(mean_gain >= 0.02 or p95_gain >= 0.05)
     if not preserves_alignment or not improves_error:
         diagnostics["reason"] = "edge_clock_has_unique_evidence"
@@ -1259,15 +1208,9 @@ def _suppress_weak_singleton_tail_transition(
     jump = abs(right_offset - left_offset)
     tail_duration = max(0.0, source_end - boundary)
     boundary_ratio = boundary / max(source_end, 0.001)
-    reference_end = (
-        max(float(end) for _start, end, _text in reference_cues)
-        if reference_cues else None
-    )
+    reference_end = max(float(end) for _start, end, _text in reference_cues) if reference_cues else None
     mapped_tail_end = source_end + right_offset
-    reference_overshoot = (
-        mapped_tail_end - reference_end
-        if reference_end is not None else None
-    )
+    reference_overshoot = mapped_tail_end - reference_end if reference_end is not None else None
     diagnostics.update(
         {
             "jump_seconds": round(jump, 3),
@@ -1306,10 +1249,15 @@ def _suppress_weak_singleton_tail_transition(
         # threshold for an ordinary or supported ending edit.
         kept_end_error = source_end + left_offset - reference_end if reference_end else None
         eligible = (
-            reference_cues and 2.5 <= jump < 8.0 and left_support >= 8
-            and boundary_ratio >= 0.90 and 60.0 <= tail_duration <= 120.0
-            and reference_overshoot is not None and reference_overshoot >= 2.0
-            and kept_end_error is not None and -3.0 <= kept_end_error <= 1.0
+            reference_cues
+            and 2.5 <= jump < 8.0
+            and left_support >= 8
+            and boundary_ratio >= 0.90
+            and 60.0 <= tail_duration <= 120.0
+            and reference_overshoot is not None
+            and reference_overshoot >= 2.0
+            and kept_end_error is not None
+            and -3.0 <= kept_end_error <= 1.0
         )
         if eligible:
             source_onsets = sorted(start for start, _end, _text in source_cues)
@@ -1319,21 +1267,28 @@ def _suppress_weak_singleton_tail_transition(
 
             def score(offset: float, length: float) -> _WindowMatch:
                 return _score_window(
-                    center=source_end - length / 2.0, offset=offset,
-                    source_onsets=source_onsets, reference_onsets=reference_onsets,
-                    source_bins=source_bins, reference_bins=reference_bins,
+                    center=source_end - length / 2.0,
+                    offset=offset,
+                    source_onsets=source_onsets,
+                    reference_onsets=reference_onsets,
+                    source_bins=source_bins,
+                    reference_bins=reference_bins,
                     window_seconds=length,
                 )
 
             kept, shifted = score(left_offset, 60.0), score(right_offset, 60.0)
             whole_kept, whole_shifted = score(left_offset, tail_duration), score(right_offset, tail_duration)
             diagnostics["local_tail_comparison"] = {
-                "kept": kept.as_dict(), "shifted": shifted.as_dict(),
-                "whole_kept": whole_kept.as_dict(), "whole_shifted": whole_shifted.as_dict(),
+                "kept": kept.as_dict(),
+                "shifted": shifted.as_dict(),
+                "whole_kept": whole_kept.as_dict(),
+                "whole_shifted": whole_shifted.as_dict(),
                 "kept_end_error_seconds": round(kept_end_error, 3),
             }
             if (
-                kept.matched >= 4 and kept.onset_coverage >= 0.60 and kept.mean_error <= 0.60
+                kept.matched >= 4
+                and kept.onset_coverage >= 0.60
+                and kept.mean_error <= 0.60
                 and kept.score - shifted.score >= 0.40
                 and kept.activity_f1 - shifted.activity_f1 >= 0.08
                 and whole_shifted.mean_error - whole_kept.mean_error >= 0.15
@@ -1373,7 +1328,6 @@ def _suppress_weak_singleton_tail_transition(
         }
     )
     return [dict(segment) for segment in segments[:-1]], list(boundaries[:-1]), diagnostics
-
 
 
 def _suppress_weak_post_opening_tail_transition(
@@ -1466,6 +1420,7 @@ def _suppress_weak_post_opening_tail_transition(
     diagnostics.update({"applied": True, "reason": "weak_post_opening_tail_clock"})
     return [dict(segment) for segment in segments[:-1]], list(boundaries[:-1]), diagnostics
 
+
 def _boundary_payload_from_mapping(
     segments: list[dict[str, object]],
     boundaries: list[float],
@@ -1522,7 +1477,7 @@ def _insert_override_segment(
     part_boundaries: list[float] = []
 
     before = start > seg_start + 0.05
-    after = (math.isinf(seg_end) or end < seg_end - 0.05)
+    after = math.isinf(seg_end) or end < seg_end - 0.05
 
     if before:
         left = dict(base)
@@ -1548,7 +1503,7 @@ def _insert_override_segment(
         right["first_center"] = end
         parts.append(right)
 
-    new_segments = segments[:index] + parts + segments[index + 1:]
+    new_segments = segments[:index] + parts + segments[index + 1 :]
     # Rebuild boundaries from interval endpoints to avoid index arithmetic.
     interval_bounds: list[float] = []
     for i in range(len(new_segments) - 1):
@@ -1556,10 +1511,7 @@ def _insert_override_segment(
             interval_bounds.append(boundaries[i])
         elif i == index and before:
             interval_bounds.append(start)
-        elif (
-            (before and i == index + 1)
-            or (not before and i == index)
-        ) and after:
+        elif ((before and i == index + 1) or (not before and i == index)) and after:
             interval_bounds.append(end)
         else:
             old_i = i - (len(parts) - 1)
@@ -1591,11 +1543,7 @@ def _insert_cross_boundary_override(
         return segments, boundaries, False
 
     left_start = 0.0 if boundary_index == 0 else boundaries[boundary_index - 1]
-    right_end = (
-        boundaries[boundary_index + 1]
-        if boundary_index + 1 < len(boundaries)
-        else float("inf")
-    )
+    right_end = boundaries[boundary_index + 1] if boundary_index + 1 < len(boundaries) else float("inf")
     if start < left_start - 1e-6 or end > right_end + 1e-6:
         return segments, boundaries, False
 
@@ -1628,13 +1576,13 @@ def _insert_cross_boundary_override(
         right["first_center"] = end
         parts.append(right)
 
-    new_segments = segments[:boundary_index] + parts + segments[boundary_index + 2:]
+    new_segments = segments[:boundary_index] + parts + segments[boundary_index + 2 :]
     new_boundaries = list(boundaries[:boundary_index])
     if has_left:
         new_boundaries.append(start)
     if has_right:
         new_boundaries.append(end)
-    new_boundaries.extend(boundaries[boundary_index + 1:])
+    new_boundaries.extend(boundaries[boundary_index + 1 :])
 
     if len(new_boundaries) != len(new_segments) - 1:
         return segments, boundaries, False
@@ -1714,7 +1662,7 @@ def _local_transition_refinement(
                 if direction < 0:
                     value = max(baseline_offset, right_offset)
                     target_end = min(baseline_offset, right_offset) + direction * 3.0
-                while (value <= target_end + 1e-9 if direction > 0 else value >= target_end - 1e-9):
+                while value <= target_end + 1e-9 if direction > 0 else value >= target_end - 1e-9:
                     current = _score_window(
                         center=first_onset,
                         offset=value,
@@ -1726,10 +1674,7 @@ def _local_transition_refinement(
                     )
                     if (
                         current.matched > best.matched
-                        or (
-                            current.matched == best.matched
-                            and current.mean_error + 1e-9 < best.mean_error
-                        )
+                        or (current.matched == best.matched and current.mean_error + 1e-9 < best.mean_error)
                         or (
                             current.matched == best.matched
                             and abs(current.mean_error - best.mean_error) <= 1e-9
@@ -1751,10 +1696,7 @@ def _local_transition_refinement(
                         if direction > 0
                         else min(next_base_offset, bridge_offset)
                     )
-                    safe_drop = (
-                        next_onset + next_expected_offset
-                        >= first_onset + float(best.offset) + 0.25
-                    )
+                    safe_drop = next_onset + next_expected_offset >= first_onset + float(best.offset) + 0.25
                 if (
                     abs(best.offset - baseline_offset) >= 1.50
                     and safe_drop
@@ -1784,11 +1726,7 @@ def _local_transition_refinement(
         # it, so compare against the piecewise base clock on both sides.
         candidate_offset = right_offset + direction
         rows: list[dict[str, object]] = []
-        previous_boundary = (
-            original_boundaries[boundary_index - 1]
-            if boundary_index > 0
-            else 0.0
-        )
+        previous_boundary = original_boundaries[boundary_index - 1] if boundary_index > 0 else 0.0
         bridge_scan_start = max(previous_boundary + 2.0, boundary - 28.0, 0.0)
         center = float(math.floor(bridge_scan_start))
         while center <= scan_end + 1e-9:
@@ -1815,19 +1753,13 @@ def _local_transition_refinement(
             strong = bool(
                 candidate.matched >= 2
                 and candidate.onset_coverage >= 0.66
-                and (
-                    delta >= 0.05
-                    or candidate.mean_error + 0.20 < base.mean_error
-                )
+                and (delta >= 0.05 or candidate.mean_error + 0.20 < base.mean_error)
             )
             # Near-equal rows are allowed to bridge two strong regions.  They
             # do not count as support, but they prevent sparse segmentation
             # differences from splitting a real transient in two.
             neutral = bool(
-                not strong
-                and candidate.matched >= 1
-                and candidate.onset_coverage >= 0.50
-                and delta >= -0.15
+                not strong and candidate.matched >= 1 and candidate.onset_coverage >= 0.50 and delta >= -0.15
             )
             rows.append(
                 {
@@ -1868,17 +1800,18 @@ def _local_transition_refinement(
                 continue
             group_start = float(rows[start_i]["center"])
             group_end = float(rows[end_i]["center"])
-            distance = 0.0 if group_start <= boundary <= group_end else min(
-                abs(group_start - boundary),
-                abs(group_end - boundary),
+            distance = (
+                0.0
+                if group_start <= boundary <= group_end
+                else min(
+                    abs(group_start - boundary),
+                    abs(group_end - boundary),
+                )
             )
             if (
                 best_run is None
                 or distance < best_distance - 1e-9
-                or (
-                    abs(distance - best_distance) <= 1e-9
-                    and len(group) > best_run[2]
-                )
+                or (abs(distance - best_distance) <= 1e-9 and len(group) > best_run[2])
                 or (
                     abs(distance - best_distance) <= 1e-9
                     and len(group) == best_run[2]
@@ -1897,9 +1830,7 @@ def _local_transition_refinement(
             if start_i <= end_i:
                 transient_start = max(bridge_scan_start, float(rows[start_i]["center"]) - 1.0)
                 transient_end = min(scan_end, float(rows[end_i]["center"]) + 1.0)
-                strong_rows = [
-                    row for row in rows[start_i:end_i + 1] if bool(row["strong"])
-                ]
+                strong_rows = [row for row in rows[start_i : end_i + 1] if bool(row["strong"])]
                 kwargs = dict(
                     start=transient_start,
                     end=transient_end,
@@ -1939,8 +1870,13 @@ def _local_transition_refinement(
             kwargs = {
                 key: reacquire_candidate[key]
                 for key in (
-                    "start", "end", "offset", "kind", "support",
-                    "mean_score", "mean_coverage",
+                    "start",
+                    "end",
+                    "offset",
+                    "kind",
+                    "support",
+                    "mean_score",
+                    "mean_coverage",
                 )
             }
             segments, boundaries, applied = _insert_override_segment(
@@ -1951,7 +1887,8 @@ def _local_transition_refinement(
             if not applied:
                 crossing_index = next(
                     (
-                        i for i, value in enumerate(boundaries)
+                        i
+                        for i, value in enumerate(boundaries)
                         if float(kwargs["start"]) < value < float(kwargs["end"])
                     ),
                     None,
@@ -1971,14 +1908,15 @@ def _local_transition_refinement(
                     "offset_seconds": round(float(kwargs["offset"]), 3),
                     "baseline_offset_seconds": round(float(reacquire_candidate["baseline_offset"]), 3),
                     "mean_error_seconds": round(float(reacquire_candidate["mean_error"]), 4),
-                    "baseline_mean_error_seconds": round(float(reacquire_candidate["baseline_mean_error"]), 4),
+                    "baseline_mean_error_seconds": round(
+                        float(reacquire_candidate["baseline_mean_error"]), 4
+                    ),
                 }
 
         if len(row_diag) > 3:
             diagnostics.append(row_diag)
 
     return segments, boundaries, diagnostics
-
 
 
 def _shared_opening_text_anchors(
@@ -1995,6 +1933,7 @@ def _shared_opening_text_anchors(
     identities provide an independent clock check. Restrict this to short
     uppercase Latin cues; do not attempt fuzzy cross-language text matching.
     """
+
     def unique(cues: list[tuple[float, float, str]]) -> dict[str, float]:
         grouped: dict[str, list[float]] = {}
         for start, _end, text in cues:
@@ -2012,25 +1951,31 @@ def _shared_opening_text_anchors(
         if key not in reference or not first_post <= start <= first_post + 90.0:
             continue
         reference_start = reference[key]
-        rows.append({
-            "key": key, "source_start_seconds": start,
-            "reference_start_seconds": reference_start,
-            "candidate_error_seconds": round(abs(start + candidate_offset - reference_start), 3),
-            "current_error_seconds": round(abs(start + current_offset - reference_start), 3),
-        })
+        rows.append(
+            {
+                "key": key,
+                "source_start_seconds": start,
+                "reference_start_seconds": reference_start,
+                "candidate_error_seconds": round(abs(start + candidate_offset - reference_start), 3),
+                "current_error_seconds": round(abs(start + current_offset - reference_start), 3),
+            }
+        )
     supported = bool(
         len(rows) >= 2
         and float(rows[-1]["source_start_seconds"]) - float(rows[0]["source_start_seconds"]) >= 20.0
         and all(float(row["candidate_error_seconds"]) <= 0.75 for row in rows)
         and all(float(row["current_error_seconds"]) >= 3.0 for row in rows)
-        and all(float(a["reference_start_seconds"]) < float(b["reference_start_seconds"])
-                for a, b in zip(rows, rows[1:]))
+        and all(
+            float(a["reference_start_seconds"]) < float(b["reference_start_seconds"])
+            for a, b in zip(rows, rows[1:])
+        )
     )
     return {"supported": supported, "anchors": rows}
 
 
 def _shared_opening_anchors_resolve_path(
-    path: list[_WindowMatch], diagnostics: dict[str, object],
+    path: list[_WindowMatch],
+    diagnostics: dict[str, object],
 ) -> bool:
     if not diagnostics.get("applied") or not diagnostics.get("shared_text_anchors", {}).get("supported"):
         return False
@@ -2043,7 +1988,8 @@ def _shared_opening_anchors_resolve_path(
     return all(
         gap_start <= item.center <= gap_end
         or abs(item.offset - (before if item.center < gap_start else after)) <= 1.5
-        for item in path if item.center <= 360.0 and item.matched >= 3
+        for item in path
+        if item.center <= 360.0 and item.matched >= 3
     )
 
 
@@ -2139,8 +2085,14 @@ def _post_opening_gap_reacquire(
 
     text_evidence = {
         index: _shared_opening_text_anchors(
-            source_cues, reference_cues or [], first_post, current_offset, offset,
-        ) if int(segments[index].get("support") or 0) >= 8 else {"supported": False, "anchors": []}
+            source_cues,
+            reference_cues or [],
+            first_post,
+            current_offset,
+            offset,
+        )
+        if int(segments[index].get("support") or 0) >= 8
+        else {"supported": False, "anchors": []}
         for index, offset, _metrics in candidates
     }
     candidate_index, candidate_offset, candidate_metrics = max(
@@ -2192,7 +2144,7 @@ def _post_opening_gap_reacquire(
     winner["first_center"] = gap_boundary
     winner["kind"] = "post_opening_reacquire"
 
-    new_segments = segments[:start_index] + [left, winner] + segments[candidate_index + 1:]
+    new_segments = segments[:start_index] + [left, winner] + segments[candidate_index + 1 :]
     new_boundaries = boundaries[:start_index] + [gap_boundary] + boundaries[candidate_index:]
     if len(new_boundaries) != len(new_segments) - 1:
         diagnostics["reason"] = "rebuild_mismatch"
@@ -2205,6 +2157,7 @@ def _post_opening_gap_reacquire(
         else "dominant_clock_reacquired_after_opening_gap"
     )
     return new_segments, new_boundaries, diagnostics
+
 
 def _suppress_weak_opening_bridge_excursion(
     source_cues: list[tuple[float, float, str]],
@@ -2362,11 +2315,7 @@ def _suppress_weak_opening_bridge_excursion(
             + [new_left, new_right]
             + [dict(segment) for segment in segments[index + 2 :]]
         )
-        new_boundaries = (
-            list(boundaries[: index - 1])
-            + [transition_boundary]
-            + list(boundaries[index + 1 :])
-        )
+        new_boundaries = list(boundaries[: index - 1]) + [transition_boundary] + list(boundaries[index + 1 :])
         diagnostics.update(
             {
                 "applied": True,
@@ -2457,9 +2406,7 @@ def _wide_decreasing_gap_candidate(
         mapped = [starts[i] + offsets[i] for i in range(len(starts))]
         if not all(mapped[i] + 0.25 >= mapped[i - 1] for i in range(1, len(mapped))):
             continue
-        reassigned = sum(
-            1 for i in range(len(offsets)) if abs(offsets[i] - base_offsets[i]) > 1e-9
-        )
+        reassigned = sum(1 for i in range(len(offsets)) if abs(offsets[i] - base_offsets[i]) > 1e-9)
         matched = (
             int(_global_onset_metrics(starts, reference_onsets, offsets=offsets)["matched"])
             if reference_onsets
@@ -2475,7 +2422,8 @@ def _wide_decreasing_gap_candidate(
             "reference_matched": matched,
         }
         if best is None or (matched, -reassigned) > (
-            int(best["reference_matched"]), -int(best["reassigned_cues"])
+            int(best["reference_matched"]),
+            -int(best["reassigned_cues"]),
         ):
             best = candidate
     return best
@@ -2504,14 +2452,8 @@ def _stabilize_decreasing_boundaries(
     max_iterations = min(256, len(source_cues) * 2)
     for _ in range(max_iterations):
         mids = [(float(start) + float(end)) / 2.0 for start, end, _text in source_cues]
-        offsets = [
-            _offset_for_time(midpoint, adjusted_segments, adjusted_boundaries)
-            for midpoint in mids
-        ]
-        mapped_starts = [
-            float(source_cues[index][0]) + offsets[index]
-            for index in range(len(source_cues))
-        ]
+        offsets = [_offset_for_time(midpoint, adjusted_segments, adjusted_boundaries) for midpoint in mids]
+        mapped_starts = [float(source_cues[index][0]) + offsets[index] for index in range(len(source_cues))]
 
         bad_index = next(
             (
@@ -2580,9 +2522,7 @@ def _stabilize_decreasing_boundaries(
         # behaviour seen on Youjo Senki II S02E12 (-37s -> -47s).
         jump_seconds = left_offset - right_offset
         previous_boundary = (
-            float(adjusted_boundaries[boundary_index - 1])
-            if boundary_index > 0
-            else float("-inf")
+            float(adjusted_boundaries[boundary_index - 1]) if boundary_index > 0 else float("-inf")
         )
         if jump_seconds >= 4.0 and bad_index >= 2:
             minimum_gap = max(6.0, min(12.0, jump_seconds * 0.70))
@@ -2592,20 +2532,14 @@ def _stabilize_decreasing_boundaries(
             gap_seconds = gap_end - gap_start
             gap_midpoint = (gap_start + gap_end) / 2.0
             near_boundary = 0.0 <= old_boundary - gap_end <= max(18.0, jump_seconds * 2.0)
-            if (
-                gap_seconds >= minimum_gap
-                and near_boundary
-                and gap_midpoint > previous_boundary + 0.001
-            ):
+            if gap_seconds >= minimum_gap and near_boundary and gap_midpoint > previous_boundary + 0.001:
                 trial_boundaries = list(adjusted_boundaries)
                 trial_boundaries[boundary_index] = gap_midpoint
                 trial_offsets = [
-                    _offset_for_time(midpoint, adjusted_segments, trial_boundaries)
-                    for midpoint in mids
+                    _offset_for_time(midpoint, adjusted_segments, trial_boundaries) for midpoint in mids
                 ]
                 trial_mapped = [
-                    float(source_cues[index][0]) + trial_offsets[index]
-                    for index in range(len(source_cues))
+                    float(source_cues[index][0]) + trial_offsets[index] for index in range(len(source_cues))
                 ]
                 if all(
                     trial_mapped[index] + 0.25 >= trial_mapped[index - 1]
@@ -2897,8 +2831,7 @@ def _cold_start_refinement(
 
     def mean_error(offset: float) -> float:
         return statistics.fmean(
-            min(3.0, _nearest_distance(reference_onsets, onset + offset))
-            for onset in early_onsets
+            min(3.0, _nearest_distance(reference_onsets, onset + offset)) for onset in early_onsets
         )
 
     base_error = mean_error(base_offset)
@@ -2962,7 +2895,9 @@ def _global_onset_metrics(
 ) -> dict[str, object]:
     if not source_onsets or not reference_onsets:
         return {
-            "matched": 0, "coverage": 0.0, "f1": 0.0,
+            "matched": 0,
+            "coverage": 0.0,
+            "f1": 0.0,
             "source_count": len(source_onsets),
             "reference_count": len(reference_onsets),
         }
@@ -2995,9 +2930,7 @@ def _global_onset_metrics(
         "reference_count": len(reference_onsets),
         "mean_error_seconds": statistics.fmean(errors) if errors else None,
         "p95_error_seconds": (
-            sorted(errors)[min(len(errors) - 1, int(math.ceil(0.95 * len(errors))) - 1)]
-            if errors
-            else None
+            sorted(errors)[min(len(errors) - 1, int(math.ceil(0.95 * len(errors))) - 1)] if errors else None
         ),
     }
 
@@ -3098,7 +3031,10 @@ def _refine_opening_preclock_from_holdout(
     if max(residuals) - min(residuals) > 0.50:
         diagnostics["reason"] = "holdout_residuals_disagree"
         return segments, diagnostics
-    if any(value == 0.0 or math.copysign(1.0, value) != math.copysign(1.0, median_residual) for value in residuals):
+    if any(
+        value == 0.0 or math.copysign(1.0, value) != math.copysign(1.0, median_residual)
+        for value in residuals
+    ):
         diagnostics["reason"] = "holdout_residual_sign_disagrees"
         return segments, diagnostics
 
@@ -3188,23 +3124,13 @@ def _holdout_validation(
             }
         )
     residuals = sorted(abs(float(row["residual_seconds"])) for row in rows)
-    p90 = (
-        residuals[min(len(residuals) - 1, int(math.ceil(0.90 * len(residuals))) - 1)]
-        if residuals
-        else None
-    )
+    p90 = residuals[min(len(residuals) - 1, int(math.ceil(0.90 * len(residuals))) - 1)] if residuals else None
     return {
         "windows": rows,
         "count": len(rows),
-        "median_abs_residual_seconds": (
-            statistics.median(residuals) if residuals else None
-        ),
+        "median_abs_residual_seconds": (statistics.median(residuals) if residuals else None),
         "p90_abs_residual_seconds": p90,
-        "mean_coverage": (
-            statistics.fmean(float(row["coverage"]) for row in rows)
-            if rows
-            else None
-        ),
+        "mean_coverage": (statistics.fmean(float(row["coverage"]) for row in rows) if rows else None),
     }
 
 
@@ -3230,20 +3156,16 @@ def _suppress_false_tail_jump_from_duration_anchors(
     old_offset = float(previous["offset_seconds"])
     proposed_offset = float(last["offset_seconds"])
     boundary = float(boundaries[-1])
-    if (abs(proposed_offset - old_offset) < 15.0
-            or int(previous.get("support") or 0) < 3
-            or boundary < 0):
+    if abs(proposed_offset - old_offset) < 15.0 or int(previous.get("support") or 0) < 3 or boundary < 0:
         return segments, boundaries, diagnostics
     disputed = [
-        (float(start), float(end)) for start, end, _ in source_cues
+        (float(start), float(end))
+        for start, end, _ in source_cues
         if boundary <= start < boundary + 120.0 and end - start >= 0.5
     ]
     if len(disputed) < 10:
         return segments, boundaries, diagnostics
-    observed = sorted(
-        (float(start), float(end)) for start, end, _ in reference_cues
-        if end - start >= 0.5
-    )
+    observed = sorted((float(start), float(end)) for start, end, _ in reference_cues if end - start >= 0.5)
     onsets = [start for start, _ in observed]
 
     def duration_anchor_count(offset: float) -> int:
@@ -3252,21 +3174,25 @@ def _suppress_false_tail_jump_from_duration_anchors(
             shifted = source_start + offset
             left = bisect.bisect_left(onsets, shifted - 0.25)
             right = bisect.bisect_right(onsets, shifted + 0.25)
-            if any(abs((ref_end - ref_start) - (source_end - source_start)) <= 0.65
-                   for ref_start, ref_end in observed[left:right]):
+            if any(
+                abs((ref_end - ref_start) - (source_end - source_start)) <= 0.65
+                for ref_start, ref_end in observed[left:right]
+            ):
                 matched += 1
         return matched
 
     old_count = duration_anchor_count(old_offset)
     new_count = duration_anchor_count(proposed_offset)
-    diagnostics.update({
-        "boundary_source_time": round(boundary, 3),
-        "old_offset_seconds": round(old_offset, 3),
-        "proposed_offset_seconds": round(proposed_offset, 3),
-        "source_cues_checked": len(disputed),
-        "old_clock_duration_anchors": old_count,
-        "proposed_clock_duration_anchors": new_count,
-    })
+    diagnostics.update(
+        {
+            "boundary_source_time": round(boundary, 3),
+            "old_offset_seconds": round(old_offset, 3),
+            "proposed_offset_seconds": round(proposed_offset, 3),
+            "source_cues_checked": len(disputed),
+            "old_clock_duration_anchors": old_count,
+            "proposed_clock_duration_anchors": new_count,
+        }
+    )
     old_ratio = old_count / len(disputed) if disputed else 0.0
     diagnostics["old_clock_duration_anchor_ratio"] = round(old_ratio, 4)
     # Absolute edge agreement is the primary evidence here. A subtitle tail can
@@ -3275,8 +3201,7 @@ def _suppress_false_tail_jump_from_duration_anchors(
     # to anchor the old clock was too strict (Sayonara Lara E04: 11/51 old-clock
     # anchors, 0 at the proposed +82 s clock). Twenty percent plus at least eight
     # independent duration matches and a large superiority margin remains narrow.
-    if (old_count < 8 or old_ratio < 0.20
-            or old_count - new_count < 6 or new_count > max(2, old_count // 4)):
+    if old_count < 8 or old_ratio < 0.20 or old_count - new_count < 6 or new_count > max(2, old_count // 4):
         return segments, boundaries, diagnostics
     diagnostics["applied"] = True
     diagnostics["reason"] = "old_clock_confirmed_by_independent_duration_anchors"
@@ -3331,15 +3256,9 @@ def align_subtitle_timelines(
     source_activity = _merge_activity(source_cues)
     reference_activity = _merge_activity(reference_cues)
 
-    source_onsets = sorted(
-        float(start)
-        for start, end, _text in source_cues
-        if float(end) > float(start)
-    )
+    source_onsets = sorted(float(start) for start, end, _text in source_cues if float(end) > float(start))
     reference_onsets = sorted(
-        float(start)
-        for start, end, _text in reference_cues
-        if float(end) > float(start)
+        float(start) for start, end, _text in reference_cues if float(end) > float(start)
     )
     source_bins = _activity_bins(source_activity)
     reference_bins = _activity_bins(reference_activity)
@@ -3357,10 +3276,7 @@ def align_subtitle_timelines(
         centers.append(center)
         center += _WINDOW_STRIDE_SECONDS
     if len(centers) < 4:
-        centers = [
-            first + (last - first) * fraction
-            for fraction in (0.15, 0.35, 0.55, 0.75, 0.9)
-        ]
+        centers = [first + (last - first) * fraction for fraction in (0.15, 0.35, 0.55, 0.75, 0.9)]
 
     all_windows = [
         (
@@ -3377,10 +3293,7 @@ def align_subtitle_timelines(
         )
         for center in centers
     ]
-    fit_windows = [
-        row for index, row in enumerate(all_windows)
-        if index % 3 != 1
-    ]
+    fit_windows = [row for index, row in enumerate(all_windows) if index % 3 != 1]
     path = _best_path(fit_windows)
     path, weak_opening_path_guard = _suppress_weak_opening_path_excursion(
         source_cues,
@@ -3469,19 +3382,15 @@ def align_subtitle_timelines(
         source_bins,
         reference_bins,
     )
-    segments, boundaries, opening_path_boundary_anchor = (
-        _anchor_opening_path_gap_boundary(
-            segments,
-            boundaries,
-            weak_opening_path_guard,
-        )
+    segments, boundaries, opening_path_boundary_anchor = _anchor_opening_path_gap_boundary(
+        segments,
+        boundaries,
+        weak_opening_path_guard,
     )
     if opening_path_boundary_anchor.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
     boundary_refinements = [
-        row.get("refinement")
-        for row in boundary_payload
-        if row.get("refinement") is not None
+        row.get("refinement") for row in boundary_payload if row.get("refinement") is not None
     ]
     segments, boundaries, transition_refinements = _local_transition_refinement(
         source_cues,
@@ -3515,13 +3424,11 @@ def align_subtitle_timelines(
     )
     if opening_gap_reacquire.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
-    segments, boundaries, weak_opening_bridge_guard = (
-        _suppress_weak_opening_bridge_excursion(
-            source_cues,
-            segments,
-            boundaries,
-            edge_hints,
-        )
+    segments, boundaries, weak_opening_bridge_guard = _suppress_weak_opening_bridge_excursion(
+        source_cues,
+        segments,
+        boundaries,
+        edge_hints,
     )
     if weak_opening_bridge_guard.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
@@ -3578,18 +3485,16 @@ def align_subtitle_timelines(
     if opening_preclock_refinement.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
 
-    segments, boundaries, false_tail_jump_guard = (
-        _suppress_false_tail_jump_from_duration_anchors(
-            source_cues, reference_cues, segments, boundaries,
-        )
+    segments, boundaries, false_tail_jump_guard = _suppress_false_tail_jump_from_duration_anchors(
+        source_cues,
+        reference_cues,
+        segments,
+        boundaries,
     )
     if false_tail_jump_guard.get("applied"):
         boundary_payload = _boundary_payload_from_mapping(segments, boundaries)
 
-    mapped_offsets = [
-        _offset_for_time(onset, segments, boundaries)
-        for onset in source_onsets
-    ]
+    mapped_offsets = [_offset_for_time(onset, segments, boundaries) for onset in source_onsets]
     before_metrics = _global_onset_metrics(source_onsets, reference_onsets)
     after_metrics = _global_onset_metrics(
         source_onsets,
@@ -3628,11 +3533,7 @@ def align_subtitle_timelines(
         and (after_f1 - before_f1 >= 0.06 or after_f1 >= 0.64)
         and (
             holdout_count < 2
-            or (
-                holdout_p90 is not None
-                and float(holdout_p90) <= 1.50
-                and holdout_coverage >= 0.42
-            )
+            or (holdout_p90 is not None and float(holdout_p90) <= 1.50 and holdout_coverage >= 0.42)
         )
     )
 
@@ -3642,15 +3543,12 @@ def align_subtitle_timelines(
     # identical. Accept only with several independent strong confirmations.
     source_count = max(1, int(after_metrics.get("source_count") or 0))
     reference_count = max(1, int(after_metrics.get("reference_count") or 0))
-    onset_count_ratio = max(source_count, reference_count) / min(
-        source_count, reference_count
-    )
+    onset_count_ratio = max(source_count, reference_count) / min(source_count, reference_count)
     after_mean_error = after_metrics.get("mean_error_seconds")
     after_p95_error = after_metrics.get("p95_error_seconds")
     segment_support_total = sum(max(0, int(segment["support"])) for segment in segments)
-    dominant_support_ratio = (
-        max(max(0, int(segment["support"])) for segment in segments)
-        / max(1, segment_support_total)
+    dominant_support_ratio = max(max(0, int(segment["support"])) for segment in segments) / max(
+        1, segment_support_total
     )
     layered_reference_acceptance = bool(
         onset_count_ratio >= 3.0
@@ -3734,7 +3632,7 @@ def align_subtitle_timelines(
                 timeline_boundaries=boundary_payload,
                 timeline_monotonic_refinements=monotonic_refinements,
                 timeline_weak_opening_path_guard=weak_opening_path_guard,
-        timeline_weak_opening_bridge_guard=weak_opening_bridge_guard,
+                timeline_weak_opening_bridge_guard=weak_opening_bridge_guard,
             )
         repaired.append((new_start, new_end, text))
         previous_start = new_start
@@ -3742,8 +3640,7 @@ def align_subtitle_timelines(
     source_stat = source.stat()
     reference_stat = reference.stat()
     signature = ",".join(
-        f"{float(segment['offset_seconds']):.3f}:{int(segment['support'])}"
-        for segment in segments
+        f"{float(segment['offset_seconds']):.3f}:{int(segment['support'])}" for segment in segments
     )
     signature += "|" + ",".join(f"{value:.3f}" for value in boundaries)
     digest = hashlib.sha1(

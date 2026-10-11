@@ -3,7 +3,7 @@
 .pudge-debug-head{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid #25364d;background:#0f1a29}
 .pudge-debug-head h2{margin:0;font-size:20px}.pudge-debug-head .spacer{flex:1}
 .pudge-debug-tabs{display:flex;gap:6px;padding:10px 18px;border-bottom:1px solid #25364d;overflow-x:auto}
-.pudge-debug-tabs button.active{background:#6f8cff;border-color:#6f8cff;color:#fff}
+.pudge-debug-tabs button.active{background:#4a68e0;border-color:#4a68e0;color:#fff}
 .pudge-debug-body{flex:1;overflow:auto;padding:18px 22px 40px}
 .pudge-debug-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
 .pudge-debug-card{border:1px solid #25364d;border-radius:10px;background:#111d2d;padding:13px;min-width:0}

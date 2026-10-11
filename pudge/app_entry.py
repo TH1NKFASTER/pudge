@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .branding import APP_BUNDLE_ID, APP_NAME
+from .branding import APP_BUNDLE_ID, APP_NAME, CONFIG_DIR
 from .notifications import maybe_handle_notification_helper
 
 
@@ -53,7 +53,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = Path(
         os.environ.get(
             "PUDGE_CONFIG",
-            str(Path.home() / ".config" / "pudge" / "config.toml"),
+            # Same default as the CLI and workers (PUDGE_HOME and branding aware).
+            str(CONFIG_DIR / "config.toml"),
         )
     ).expanduser()
     return int(launch_app(config) or 0)

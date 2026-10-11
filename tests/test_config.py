@@ -39,7 +39,14 @@ def test_config_round_trip(tmp_path: Path):
             embedded_reference_min_similarity=0.7,
         ),
         matching=MatchingConfig(prefer_srt=True, evaluate_all_jimaku=True, max_jimaku_candidates=12),
-        sync=SyncConfig(engine="auto", compare_engines=True, vad="auditok", fix_framerate=False, gss=True, alass_split_penalty=9.0),
+        sync=SyncConfig(
+            engine="auto",
+            compare_engines=True,
+            vad="auditok",
+            fix_framerate=False,
+            gss=True,
+            alass_split_penalty=9.0,
+        ),
         config_path=path,
     )
 

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pudge.config import AppConfig, write_config
-from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryEpisode, NyaaRelease
 from pudge.models import AniListAnime, JimakuFile, VideoIdentity
@@ -11,6 +11,7 @@ from pudge.providers.anilist import AniListClient
 from pudge.providers.jimaku import JimakuClient, materialize_jimaku_files
 from pudge.providers.nyaa import score_release
 from pudge.manager_models import LibraryAnime
+from tests.i18n_support import en, ru
 
 
 def _anime(media_id: int, title: str, episodes: int) -> AniListAnime:
@@ -71,7 +72,7 @@ def test_jimaku_accepts_absolute_episode_alias_and_normalizes_candidate(tmp_path
         alternative_episodes=(17,),
     )
     assert found == [item]
-    assert files_client.calls[:2] == [5, 17]
+    assert files_client.calls[:3] == [None, 5, 17]
 
     rank_client = object.__new__(JimakuClient)
     ranked = JimakuClient.rank_files(
@@ -115,9 +116,7 @@ def test_continue_watching_records_position_and_rewinds_in_web_payload(tmp_path:
     write_config(cfg, cfg.config_path)
     api = WebAppApi(cfg.config_path)
     api.manager.db.upsert_anime(LibraryAnime(media_id=7, title="Anime", status="CURRENT"))
-    api.manager.db.upsert_episode(
-        LibraryEpisode(7, "Anime", 3, video, state="ready")
-    )
+    api.manager.db.upsert_episode(LibraryEpisode(7, "Anime", 3, video, state="ready"))
     api.manager.db.record_playback(video, 125, 1400)
 
     item = api.get_state()["home"]["continue_watching"][0]
@@ -177,7 +176,7 @@ def test_video_quality_policy_blocks_explicit_bad_releases() -> None:
     assert "english-dub-only" in scored.reasons
 
 
-def test_continue_watching_marks_movie_for_web_label(tmp_path: Path) -> None:
+def _movie_resumed_at_ten_minutes(tmp_path: Path):
     from pudge.web_app import WebAppApi
 
     cfg = AppConfig()
@@ -194,17 +193,34 @@ def test_continue_watching_marks_movie_for_web_label(tmp_path: Path) -> None:
     api.manager.db.upsert_anime(
         LibraryAnime(media_id=8, title="Movie", status="CURRENT", format="MOVIE", episodes=1)
     )
-    api.manager.db.upsert_episode(
-        LibraryEpisode(8, "Movie", None, video, state="ready")
-    )
+    api.manager.db.upsert_episode(LibraryEpisode(8, "Movie", None, video, state="ready"))
     api.manager.db.record_playback(video, 600, 7200)
+    return api
 
+
+def test_continue_watching_marks_movie_for_web_label(tmp_path: Path) -> None:
+    api = _movie_resumed_at_ten_minutes(tmp_path)
     item = api.get_state()["home"]["continue_watching"][0]
     assert item["episode"] is None
     assert item["is_movie"] is True
 
 
-def test_continue_watching_movie_uses_movie_label() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
-    assert "'label.continueMovie':'Movie • resume at {time}'" in html
-    assert "a.is_movie?t('label.continueMovie'" in html
+def test_continue_watching_movie_uses_movie_label(tmp_path: Path, page) -> None:
+    assert en("label.continueMovie", time="1:00") == "Movie • resume at 1:00"
+    assert ru("label.continueMovie", time="1:00") == "Фильм • продолжить с 1:00"
+    state = json.loads(json.dumps(_movie_resumed_at_ten_minutes(tmp_path).get_state(), default=str))
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const card = document.querySelector('#currentContent [data-home-section="section.continueWatching"] [data-media-id="8"]');
+            const resume = ui.state.home.continue_watching[0].resume_start;
+            return {text: card.innerText, resume, expected: t('label.continueMovie', {time: formatClock(resume)}),
+                    episode: t('label.continueEpisode', {episode: '?', time: formatClock(resume)})};
+            """,
+            lang=lang,
+            state={"home": state["home"], "current": state["current"]},
+        )
+        out = result.value
+        # "Movie • resume at …" (a little before the stop), not "Episode ? • …".
+        assert 0 < out["resume"] < 600
+        assert out["expected"] in out["text"] and out["episode"] not in out["text"]

@@ -61,48 +61,71 @@ class Window:
 def cocoa(monkeypatch):
     # Execute the actual installed pywebview AppDelegate and the two delegate
     # assignments in BrowserView.__init__, without requiring an AppKit display.
-    path = Path(webview.__file__).parent / 'platforms/cocoa.py'
+    path = Path(webview.__file__).parent / "platforms/cocoa.py"
     source = ast.parse(path.read_text())
-    view_class = next(row for row in source.body if isinstance(row, ast.ClassDef) and row.name == 'BrowserView')
-    app_class = next(row for row in view_class.body if isinstance(row, ast.ClassDef) and row.name == 'AppDelegate')
-    constructor = next(row for row in view_class.body if isinstance(row, ast.FunctionDef) and row.name == '__init__')
-    start = next(index for index, row in enumerate(constructor.body)
-                 if isinstance(row, ast.If) and ast.unparse(row.test) == 'BrowserView._shared_app_delegate is None')
-    assignments = ast.Module(body=constructor.body[start:start + 2], type_ignores=[])
+    view_class = next(
+        row for row in source.body if isinstance(row, ast.ClassDef) and row.name == "BrowserView"
+    )
+    app_class = next(
+        row for row in view_class.body if isinstance(row, ast.ClassDef) and row.name == "AppDelegate"
+    )
+    constructor = next(
+        row for row in view_class.body if isinstance(row, ast.FunctionDef) and row.name == "__init__"
+    )
+    start = next(
+        index
+        for index, row in enumerate(constructor.body)
+        if isinstance(row, ast.If) and ast.unparse(row.test) == "BrowserView._shared_app_delegate is None"
+    )
+    assignments = ast.Module(body=constructor.body[start : start + 2], type_ignores=[])
     app = Application()
     browser = SimpleNamespace(app=app, instances={}, _shared_app_delegate=None)
-    foundation = SimpleNamespace(NSObject=NSObject, YES=True, NO=False, NSDefaultRunLoopMode='default')
-    appkit = SimpleNamespace(NSObject=NSObject, NSTerminateLater=2, NSModalPanelRunLoopMode='modal', NSApplication=SimpleNamespace(sharedApplication=lambda: app))
-    context = {'BrowserView': browser, 'AppKit': appkit, 'Foundation': foundation}
-    exec(compile(ast.Module(body=[app_class], type_ignores=[]), str(path), 'exec'), context)
-    browser.AppDelegate = context['AppDelegate']
-    create_delegate = lambda: exec(compile(assignments, str(path), 'exec'), context)
+    foundation = SimpleNamespace(NSObject=NSObject, YES=True, NO=False, NSDefaultRunLoopMode="default")
+    appkit = SimpleNamespace(
+        NSObject=NSObject,
+        NSTerminateLater=2,
+        NSModalPanelRunLoopMode="modal",
+        NSApplication=SimpleNamespace(sharedApplication=lambda: app),
+    )
+    context = {"BrowserView": browser, "AppKit": appkit, "Foundation": foundation}
+    exec(compile(ast.Module(body=[app_class], type_ignores=[]), str(path), "exec"), context)
+    browser.AppDelegate = context["AppDelegate"]
+    create_delegate = lambda: exec(compile(assignments, str(path), "exec"), context)
     create_delegate()
     original = app.delegate()
-    monkeypatch.setitem(sys.modules, 'AppKit', appkit)
-    monkeypatch.setitem(sys.modules, 'Foundation', foundation)
-    monkeypatch.setitem(sys.modules, 'webview.platforms.cocoa', SimpleNamespace(BrowserView=browser))
-    monkeypatch.setattr(web_app.sys, 'platform', 'darwin')
+    monkeypatch.setitem(sys.modules, "AppKit", appkit)
+    monkeypatch.setitem(sys.modules, "Foundation", foundation)
+    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", SimpleNamespace(BrowserView=browser))
+    monkeypatch.setattr(web_app.sys, "platform", "darwin")
     messages = []
-    logger = SimpleNamespace(info=lambda *args: messages.append(args),
-                             warning=lambda *args: messages.append(args),
-                             exception=lambda *args: pytest.fail(str(args)))
+    logger = SimpleNamespace(
+        info=lambda *args: messages.append(args),
+        warning=lambda *args: messages.append(args),
+        exception=lambda *args: pytest.fail(str(args)),
+    )
     api = SimpleNamespace(logger=logger, close=lambda: None)
     main = Window()
     quiet = []
     lifecycle = web_app._MacWindowLifecycle(main, logger, quiet.append)
     browser.should_close = lambda window: lifecycle.handle_closing() if window is main else True
-    browser.instances['master'] = SimpleNamespace(pywebview_window=main)
-    return SimpleNamespace(app=app, browser=browser, original=original, api=api,
-                           main=main, lifecycle=lifecycle, quiet=quiet,
-                           create_delegate=create_delegate)
+    browser.instances["master"] = SimpleNamespace(pywebview_window=main)
+    return SimpleNamespace(
+        app=app,
+        browser=browser,
+        original=original,
+        api=api,
+        main=main,
+        lifecycle=lifecycle,
+        quiet=quiet,
+        create_delegate=create_delegate,
+    )
 
 
 def test_child_windows_preserve_real_quit_delegate_and_allow_quit(cocoa):
     c = cocoa
     assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle)
     proxy = c.app.delegate()
-    for uid in ('audiobook-first', 'audiobook-reopened'):
+    for uid in ("audiobook-first", "audiobook-reopened"):
         c.create_delegate()  # Real pywebview child-window delegate assignment.
         c.browser.instances[uid] = SimpleNamespace(pywebview_window=Window())
         assert c.app.delegate() is proxy
@@ -111,10 +134,10 @@ def test_child_windows_preserve_real_quit_delegate_and_allow_quit(cocoa):
     assert c.app.replied.wait(2)
     assert c.lifecycle.quit_requested is True
     assert c.main.hide_calls == 0
-    assert c.quiet == ['macos_quit']
+    assert c.quiet == ["macos_quit"]
 
 
-@pytest.mark.parametrize('has_visible_windows', [False, True])
+@pytest.mark.parametrize("has_visible_windows", [False, True])
 def test_dock_reopen_restores_main_after_companion_creation(cocoa, has_visible_windows):
     c = cocoa
     assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle)
@@ -131,12 +154,13 @@ def test_dock_reopen_restores_main_after_companion_creation(cocoa, has_visible_w
 def test_minimized_main_window_is_restored_before_show(cocoa):
     calls = []
     c = cocoa
-    c.main.native = SimpleNamespace(isMiniaturized=lambda: True,
-                                    deminiaturize_=lambda sender: calls.append('restore'))
-    c.main.show = lambda: calls.append('show')
+    c.main.native = SimpleNamespace(
+        isMiniaturized=lambda: True, deminiaturize_=lambda sender: calls.append("restore")
+    )
+    c.main.show = lambda: calls.append("show")
     assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle)
     c.app.delegate().applicationShouldHandleReopen_hasVisibleWindows_(c.app, True)
-    assert calls == ['restore', 'show']
+    assert calls == ["restore", "show"]
 
 
 def test_delegate_install_is_idempotent_and_keeps_original_backend(cocoa):
@@ -153,7 +177,7 @@ def test_delegate_install_is_idempotent_and_keeps_original_backend(cocoa):
     assert c.app.replied.wait(2)
     assert proxy.applicationShouldTerminate_(c.app) == 2
     assert c.app.replied.wait(2)
-    assert c.quiet == ['macos_quit']
+    assert c.quiet == ["macos_quit"]
 
 
 def test_reopen_during_quit_does_not_show_main_again(cocoa):
@@ -167,10 +191,15 @@ def test_reopen_during_quit_does_not_show_main_again(cocoa):
 def test_restore_from_worker_queues_native_operations_on_main_thread(cocoa, monkeypatch):
     c = cocoa
     queued, native_threads = [], []
-    c.main.native = SimpleNamespace(isMiniaturized=lambda: True,
-        deminiaturize_=lambda sender: native_threads.append(threading.current_thread()))
-    monkeypatch.setitem(sys.modules, 'PyObjCTools', SimpleNamespace(
-        AppHelper=SimpleNamespace(callAfter=lambda callback: queued.append(callback))))
+    c.main.native = SimpleNamespace(
+        isMiniaturized=lambda: True,
+        deminiaturize_=lambda sender: native_threads.append(threading.current_thread()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "PyObjCTools",
+        SimpleNamespace(AppHelper=SimpleNamespace(callAfter=lambda callback: queued.append(callback))),
+    )
     worker = threading.Thread(target=c.lifecycle.reopen)
     worker.start()
     worker.join(timeout=2)
@@ -183,6 +212,6 @@ def test_restore_from_worker_queues_native_operations_on_main_thread(cocoa, monk
 
 def test_other_platforms_do_not_replace_delegate(cocoa, monkeypatch):
     c = cocoa
-    monkeypatch.setattr(web_app.sys, 'platform', 'linux')
+    monkeypatch.setattr(web_app.sys, "platform", "linux")
     assert web_app._install_macos_app_delegate_proxy(c.api, c.lifecycle) is False
     assert c.app.delegate() is c.original

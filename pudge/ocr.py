@@ -44,8 +44,6 @@ class OCRCue:
     text: str
 
 
-
-
 @dataclass(frozen=True, slots=True)
 class _VisionTextRow:
     y: float
@@ -64,7 +62,9 @@ class _VisionTextRow:
 
 
 def _kana_ratio(value: str) -> float:
-    meaningful = [ch for ch in value if ch.isalnum() or "\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff"]
+    meaningful = [
+        ch for ch in value if ch.isalnum() or "\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff"
+    ]
     if not meaningful:
         return 0.0
     kana = sum(1 for ch in meaningful if "\u3040" <= ch <= "\u30ff")
@@ -456,11 +456,54 @@ def _srt_timestamp(seconds: float) -> str:
 def _write_srt(cues: Iterable[OCRCue], destination: Path) -> None:
     blocks = []
     for index, cue in enumerate(cues, start=1):
-        blocks.append(
-            f"{index}\n{_srt_timestamp(cue.start)} --> {_srt_timestamp(cue.end)}\n{cue.text}\n"
-        )
+        blocks.append(f"{index}\n{_srt_timestamp(cue.start)} --> {_srt_timestamp(cue.end)}\n{cue.text}\n")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("\n".join(blocks), encoding="utf-8")
+
+
+# Extracting one PGS track reads the whole video. A stalled network volume must
+# not hold the heavy-work slot forever: 2x the running time, at least 15 min.
+PGS_EXTRACT_MIN_TIMEOUT_SECONDS = 15 * 60.0
+PGS_EXTRACT_TIMEOUT_PER_MEDIA_SECOND = 2.0
+PGS_EXTRACT_UNKNOWN_DURATION_TIMEOUT_SECONDS = 4 * 3600.0
+_DURATION_PROBE_TIMEOUT_SECONDS = 60.0
+
+
+def _media_duration_seconds(video: Path, ffprobe_path: str) -> float | None:
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_DURATION_PROBE_TIMEOUT_SECONDS,
+        )
+        duration = float(completed.stdout.strip().splitlines()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+    return duration if duration > 0 else None
+
+
+def pgs_extract_timeout_seconds(duration_seconds: float | None) -> float:
+    if not duration_seconds or duration_seconds <= 0:
+        return PGS_EXTRACT_UNKNOWN_DURATION_TIMEOUT_SECONDS
+    return max(
+        PGS_EXTRACT_MIN_TIMEOUT_SECONDS, float(duration_seconds) * PGS_EXTRACT_TIMEOUT_PER_MEDIA_SECOND
+    )
+
+
+def _default_ffprobe(ffmpeg_path: str) -> str:
+    sibling = Path(ffmpeg_path).with_name("ffprobe")
+    return str(sibling) if sibling.parent != Path(".") and sibling.is_file() else "ffprobe"
 
 
 def extract_embedded_pgs(
@@ -469,6 +512,7 @@ def extract_embedded_pgs(
     destination: Path,
     *,
     ffmpeg_path: str,
+    timeout_seconds: float | None = None,
 ) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
@@ -485,7 +529,17 @@ def extract_embedded_pgs(
         str(destination),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True)
+        subprocess.run(command, check=True, capture_output=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        destination.unlink(missing_ok=True)
+        logger.warning(
+            "FAIL step=subtitle.ocr_extract video=%s reason=timeout timeout_s=%.0f",
+            video.name,
+            float(timeout_seconds or 0),
+        )
+        raise OCRConversionError(
+            f"Extracting embedded bitmap subtitles timed out after {int(timeout_seconds or 0)} s"
+        ) from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         stderr = getattr(exc, "stderr", b"")
         if isinstance(stderr, bytes):
@@ -533,6 +587,7 @@ def image_subtitle_to_srt(
     embedded_stream_index: int | None = None,
     embedded_codec: str | None = None,
     ffmpeg_path: str = "ffmpeg",
+    ffprobe_path: str | None = None,
     force: bool = False,
 ) -> tuple[Path | None, dict[str, object]]:
     """Convert Japanese PGS/SUP subtitles to SRT with Apple Vision OCR.
@@ -553,7 +608,11 @@ def image_subtitle_to_srt(
     digest = hashlib.sha256(f"ocr-ruby-v2:{source_identity}".encode("utf-8")).hexdigest()
     output = cache_dir / "ocr" / f"{digest}.srt"
     if output.is_file() and output.stat().st_size > 0 and not force:
-        return output, {"reason": "cached", "cue_count": output.read_text(encoding="utf-8", errors="ignore").count(" --> "), "quality": {"status": "accepted", "accepted": True, "warnings": []}}
+        return output, {
+            "reason": "cached",
+            "cue_count": output.read_text(encoding="utf-8", errors="ignore").count(" --> "),
+            "quality": {"status": "accepted", "accepted": True, "warnings": []},
+        }
 
     if subtitle_path is not None:
         source = subtitle_path.resolve()
@@ -571,13 +630,24 @@ def image_subtitle_to_srt(
                 "codec": normalized_codec,
             }
         source = cache_dir / "ocr" / f"{digest}.sup"
-        extract_embedded_pgs(
-            video,
-            int(embedded_stream_index),
-            source,
-            ffmpeg_path=ffmpeg_path,
-        )
+        # The extracted track is never reused (extraction always runs again):
+        # delete it whatever the OCR outcome.
+        try:
+            duration = _media_duration_seconds(video, ffprobe_path or _default_ffprobe(ffmpeg_path))
+            extract_embedded_pgs(
+                video,
+                int(embedded_stream_index),
+                source,
+                ffmpeg_path=ffmpeg_path,
+                timeout_seconds=pgs_extract_timeout_seconds(duration),
+            )
+            return _ocr_bitmap_source(video, source, output)
+        finally:
+            source.unlink(missing_ok=True)
+    return _ocr_bitmap_source(video, source, output)
 
+
+def _ocr_bitmap_source(video: Path, source: Path, output: Path) -> tuple[Path | None, dict[str, object]]:
     cues: list[OCRCue] = []
     recognized = 0
     display_count = 0

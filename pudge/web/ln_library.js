@@ -10,7 +10,6 @@
   // index.html declares `const ui` (global lexical scope, not window.ui).
   // eslint-disable-next-line no-undef
   const uiRef = () => (typeof ui !== 'undefined' ? ui : g.ui);
-  const ru = () => (uiRef()?.lang || document.documentElement.lang) === 'ru';
   const esc = value => (typeof g.escapeHtml === 'function' ? g.escapeHtml(value) : String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])));
   const byVolume = (a, b) => Number(a.volume || 1) - Number(b.volume || 1) || Number(a.id) - Number(b.id);
   let panelState = null; // {kind:'series'|'franchise', key, returnFocusKey}
@@ -24,9 +23,13 @@
 
   function coverHtml(book) {
     const preview = ` data-pudge-cover-kind="light_novel" data-pudge-cover-id="${Number(book?.id || 0)}"`;
-    return book?.cover_url
-      ? `<img class="ln-card-cover" src="${esc(book.cover_url)}" alt="" loading="lazy" decoding="async"${preview}>`
-      : '<div class="ln-card-cover cover-placeholder">Cover</div>';
+    const sources = typeof g.pudgeCoverSources === 'function'
+      ? g.pudgeCoverSources(book?.cover_url, book?.remote_cover_url)
+      : [book?.cover_url].filter(Boolean);
+    const fallbacks = typeof g.pudgeCoverFallbackAttr === 'function' ? g.pudgeCoverFallbackAttr(sources) : '';
+    return sources.length
+      ? `<img class="ln-card-cover" src="${esc(sources[0])}"${fallbacks} alt="" loading="lazy" decoding="async" onerror="window.pudgeLnCoverFailed&&window.pudgeLnCoverFailed(this)"${preview}>`
+      : `<div class="ln-card-cover cover-placeholder">${PudgeI18n.t('label.cover')}</div>`;
   }
 
   // Shared tile shell: identical slot structure for series and franchise.
@@ -34,14 +37,14 @@
     const percent = percentOf(current);
     const volume = Number(current?.volume || 1);
     const position = finishedAll
-      ? (ru() ? 'Прочитано' : 'Finished')
-      : `${ru() ? 'Том' : 'Volume'} ${volume} · ${percent}%`;
+      ? (PudgeI18n.t('ui.finished'))
+      : `${PudgeI18n.t('ui.volume', {volume})} · ${percent}%`;
     // Continue sits in the cover column: same width as the cover, fixed gap
     // below it; finished tiles keep an empty slot so every tile lines up.
-    const contLabel = `${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${volume}`;
+    const contLabel = PudgeI18n.t('ln.continueVolume', {volume});
     const cont = finishedAll || !current
       ? '<span class="ln-group-continue is-empty" aria-hidden="true"></span>'
-      : `<button type="button" class="ln-group-continue" data-ln-action="read" data-id="${Number(current.id)}" title="${esc(contLabel)}" aria-label="${esc(contLabel)}">${ru() ? 'Продолжить' : 'Continue'}</button>`;
+      : `<button type="button" class="ln-group-continue" data-ln-action="read" data-id="${Number(current.id)}" title="${esc(contLabel)}" aria-label="${esc(contLabel)}">${PudgeI18n.t('ui.continue')}</button>`;
     const label = `${title}. ${badge}. ${position}`;
     return `<article class="ln-card ln-entry ln-group-tile" ${attrs} data-ln-group-open="${kind}" data-ln-group-key="${esc(key)}" tabindex="0" role="button" aria-haspopup="dialog" aria-label="${esc(label)}">`
       + `<div class="ln-group-cover-col">${coverHtml(current)}${cont}</div>`
@@ -49,7 +52,7 @@
       + `<div class="ln-card-meta"><span>${esc(position)}</span><span class="ln-group-badge">${esc(badge)}</span></div>`
       + `<div class="ln-card-progress"><span style="width:${finishedAll ? 100 : percent}%"></span></div>`
       + (stats ? `<div class="ln-group-stats">${stats}</div>` : '')
-      + `<div class="ln-group-actions"><span class="ln-group-open-hint">${ru() ? 'Все тома' : 'All volumes'} · ${total}</span></div>`
+      + `<div class="ln-group-actions"><span class="ln-group-open-hint">${PudgeI18n.t('ln.allVolumes')} · ${total}</span></div>`
       + '</div></article>';
   }
 
@@ -73,7 +76,7 @@
     const key = g.lnSeriesKey(books[0]);
     const current = g.currentSeriesBook(books);
     const cont = current && !current.finished
-      ? `<button type="button" class="ln-group-continue ln-series-continue" data-ln-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(current.volume || 1)}</button>`
+      ? `<button type="button" class="ln-group-continue ln-series-continue" data-ln-action="read" data-id="${Number(current.id)}">${PudgeI18n.t('ln.continueVolume', {volume: Number(current.volume || 1)})}</button>`
       : '';
     const html = String(g.lnSeriesGroupHtml(books))
       .replace(/^(\s*<section\b[^>]*class="ln-series-group")/, `$1 data-ln-group-open="series" data-ln-group-key="${esc(key)}"`);
@@ -94,11 +97,11 @@
       kind: 'series',
       key,
       attrs: `data-ln-series-key="${esc(key)}" data-ln-series-ids="${ids}"`,
-      title: first.series_title || first.title || 'Light Novel',
+      title: first.series_title || first.title || PudgeI18n.t('ui.lightNovel2'),
       current,
       total: books.length,
       finishedAll,
-      badge: `${ru() ? 'Серия' : 'Series'} · ${books.length} ${ru() ? 'т.' : 'vol.'}`,
+      badge: PudgeI18n.tn('ln.seriesBadge', books.length),
       stats: seriesStats(first),
     });
   }
@@ -121,11 +124,11 @@
       kind: 'franchise',
       key: String(shelf.key || ''),
       attrs: `data-ln-franchise-ids="${ids}" data-library-shelf-key="${esc(shelf.key || '')}"`,
-      title: shelf.title || series[0]?.title || 'Light Novel',
+      title: shelf.title || series[0]?.title || PudgeI18n.t('ui.lightNovel2'),
       current,
       total: books.length,
       finishedAll: books.length > 0 && books.every(book => Boolean(book.finished)),
-      badge: `${ru() ? 'Франшиза' : 'Franchise'} · ${series.length} ${ru() ? 'сер.' : 'series'}`,
+      badge: PudgeI18n.tn('ln.franchiseBadge', series.length),
       stats: seriesStats(books.find(book => book.anilist_id || book.jiten_deck_id) || books[0]),
     });
   }
@@ -141,7 +144,7 @@
     if (!builder) return null;
     return builder(books, {
       seriesKey: g.lnSeriesKey,
-      seriesTitle: book => String(book?.series_title || book?.title || 'Light Novel'),
+      seriesTitle: book => String(book?.series_title || book?.title || PudgeI18n.t('ui.lightNovel2')),
       bookOrder: byVolume,
     });
   }
@@ -162,16 +165,17 @@
   }
 
   // Panel covers load eagerly (a lazy image in a just-shown fixed panel
-  // flashes empty first) and stay referenced, so WebKit keeps them decoded.
-  const warmCovers = new Map();
+  // flashes empty first). The small library copies are fetched ahead once but
+  // not kept decoded: holding 400 decoded covers cost 50-200 MB.
+  const warmedCovers = new Set();
   const WARM_LIMIT = 400;
   function warm(url) {
-    if (!url || warmCovers.has(url) || typeof Image !== 'function') return;
+    if (!url || warmedCovers.has(url) || typeof Image !== 'function') return;
     const img = new Image();
     img.decoding = 'async';
     img.src = url;
-    warmCovers.set(url, img);
-    if (warmCovers.size > WARM_LIMIT) warmCovers.delete(warmCovers.keys().next().value);
+    warmedCovers.add(url);
+    if (warmedCovers.size > WARM_LIMIT) warmedCovers.delete(warmedCovers.values().next().value);
   }
   function eager(html) { return String(html).replace(/ loading="lazy"/g, ' loading="eager"'); }
 
@@ -200,7 +204,7 @@
       const group = g.lnSeriesForKey(state.key);
       if (!group) return null;
       const first = [...group].sort(byVolume)[0];
-      return {title: first.series_title || first.title || 'Light Novel', body: volumesHtml(group), current: g.currentSeriesBook([...group].sort(byVolume))};
+      return {title: first.series_title || first.title || PudgeI18n.t('ui.lightNovel2'), body: volumesHtml(group), current: g.currentSeriesBook([...group].sort(byVolume))};
     }
     const shelf = (shelvesFor(books) || []).find(row => String(row.key || '') === state.key);
     if (!shelf) return null;
@@ -217,9 +221,9 @@
     if (!content) { close(); return; }
     const current = content.current;
     const cont = typeof content.continueHtml === 'string' ? content.continueHtml : current && !current.finished
-      ? `<button type="button" class="primary" data-ln-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(current.volume || 1)}</button>`
+      ? `<button type="button" class="primary" data-ln-action="read" data-id="${Number(current.id)}">${PudgeI18n.t('ln.continueVolume', {volume: Number(current.volume || 1)})}</button>`
       : '';
-    const html = `<div class="ln-volume-head"><strong>${esc(content.title)}</strong><div class="ln-volume-head-actions">${cont}<button type="button" data-ln-volume-close aria-label="${ru() ? 'Закрыть' : 'Close'}">×</button></div></div><div class="ln-volume-body">${content.body}</div>`;
+    const html = `<div class="ln-volume-head"><strong>${esc(content.title)}</strong><div class="ln-volume-head-actions">${cont}<button type="button" data-ln-volume-close aria-label="${PudgeI18n.t('action.close')}">×</button></div></div><div class="ln-volume-body">${content.body}</div>`;
     if (html === panelHtml) { panel.hidden = false; if (panelState.kind !== 'custom') g.applyLnSelection?.(); return; }
     panel.setAttribute('aria-label', content.title);
     panel.innerHTML = html;

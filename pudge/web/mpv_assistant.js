@@ -3,7 +3,12 @@
   let request='';
   async function refresh(){
     const data=await pywebview.api.mpv_assistant_snapshot();
-    window.ui.state.settings=data.settings||{};window.ui.lang=data.settings?.language||'en';document.documentElement.lang=window.ui.lang;
+    // The interface language comes from the main window's settings (mpv_assistant_snapshot).
+    const language=String(data.settings?.language||'en').toLowerCase().startsWith('ru')?'ru':'en';
+    const changed=window.ui.lang!==language;
+    window.ui.state.settings=data.settings||{};window.ui.lang=language;document.documentElement.lang=language;
+    document.title=PudgeI18n.t('mpvAssistant.title');
+    if(changed&&document.getElementById('pudgeAssistant'))window.PudgeAssistant?.refreshAvailability?.();
     const snapshot=data.snapshot||{};
     if(!snapshot.request_id||request===snapshot.request_id)return;
     request=snapshot.request_id;

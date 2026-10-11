@@ -24,9 +24,17 @@ def make_volume(tmp_path: Path, *, archive_name: str = "my-book.cbz") -> tuple[M
 
 
 def sidecar(path: Path, *, pages: tuple[str, ...] = ("02.png", "01.png"), width: int = 100) -> None:
-    data = {"pages": [{"img_path": name, "img_width": width, "img_height": 200,
-                       "blocks": [{"box": [10, 20, 40, 80], "vertical": True,
-                                   "lines": [f"page-{name}"]}]} for name in pages]}
+    data = {
+        "pages": [
+            {
+                "img_path": name,
+                "img_width": width,
+                "img_height": 200,
+                "blocks": [{"box": [10, 20, 40, 80], "vertical": True, "lines": [f"page-{name}"]}],
+            }
+            for name in pages
+        ]
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
 
@@ -103,8 +111,14 @@ def test_nearby_does_not_replace_existing_native_ocr(tmp_path: Path) -> None:
     service, book_id, archive = make_volume(tmp_path)
     sidecar(archive.with_suffix(".mokuro"))
     fingerprint, generation, _ = service._ocr_context(book_id)
-    service._commit_ocr_page_updates(book_id, source_fingerprint=fingerprint, generation=generation,
-        updates=[(0, [{"text": "Native", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "ready", "", False)])
+    service._commit_ocr_page_updates(
+        book_id,
+        source_fingerprint=fingerprint,
+        generation=generation,
+        updates=[
+            (0, [{"text": "Native", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "ready", "", False)
+        ],
+    )
     result = service.import_nearby_mokuro(book_id)
     assert result["imported_pages"] == 1 and result["skipped_pages"] == 1
     assert service.text_regions(book_id, 0, cached_only=True)["regions"][0]["text"] == "Native"
@@ -115,10 +129,24 @@ def test_mokuro_repairs_retryable_partial_page_without_touching_ready_page(tmp_p
     sidecar(archive.with_suffix(".mokuro"))
     fingerprint, generation, _ = service._ocr_context(book_id)
     service._commit_ocr_page_updates(
-        book_id, source_fingerprint=fingerprint, generation=generation,
+        book_id,
+        source_fingerprint=fingerprint,
+        generation=generation,
         updates=[
-            (0, [{"text": "Unreliable", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "partial", "worker_error", True),
-            (1, [{"text": "Verified native", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "ready", "", False),
+            (
+                0,
+                [{"text": "Unreliable", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}],
+                "partial",
+                "worker_error",
+                True,
+            ),
+            (
+                1,
+                [{"text": "Verified native", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}],
+                "ready",
+                "",
+                False,
+            ),
         ],
     )
     result = service.import_nearby_mokuro(book_id)
@@ -133,9 +161,13 @@ def test_mokuro_repairs_legacy_empty_cache_but_preserves_legacy_text(tmp_path: P
     sidecar(archive.with_suffix(".mokuro"))
     fingerprint, generation, _ = service._ocr_context(book_id)
     service._commit_ocr_page_updates(
-        book_id, source_fingerprint=fingerprint, generation=generation,
-        updates=[(0, [], "empty_verified", "", False),
-                 (1, [{"text": "Old text", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "ready", "", False)],
+        book_id,
+        source_fingerprint=fingerprint,
+        generation=generation,
+        updates=[
+            (0, [], "empty_verified", "", False),
+            (1, [{"text": "Old text", "x": 0.1, "y": 0.1, "width": 0.1, "height": 0.1}], "ready", "", False),
+        ],
     )
     # Simulate pre-status empty cache and pre-status nonempty cache.
     with service.db.connect() as conn:
@@ -146,14 +178,20 @@ def test_mokuro_repairs_legacy_empty_cache_but_preserves_legacy_text(tmp_path: P
     assert service.text_regions(book_id, 1, cached_only=True)["regions"][0]["text"] == "Old text"
 
 
-def test_reader_shows_explicit_nearby_button_and_manual_fallback() -> None:
-    root = Path(__file__).resolve().parents[1]
-    js = (root / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    api = (root / "pudge/web_app.py").read_text(encoding="utf-8")
-    assert 'data-manga-v2-action="import-nearby-mokuro" hidden' in js
-    assert "API().manga_nearby_mokuro(Number(bookId))" in js
-    assert "API().import_nearby_mokuro(bookId)" in js
-    assert "API().choose_manga_mokuro(bookId)" in js
-    assert "currentBook === nearbyBook" in js
-    assert "def manga_nearby_mokuro(" in api
-    assert "def import_nearby_mokuro(" in api
+def test_window_api_reports_and_imports_a_nearby_sidecar_but_not_during_ocr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.test_web_app import make_api
+
+    api = make_api(tmp_path / "app")
+    volume = tmp_path / "volume"
+    volume.mkdir()
+    _service, _book_id, archive = make_volume(volume)
+    book_id = int(api.manga.import_file(archive)["id"])
+    sidecar(archive.with_suffix(".mokuro"))
+    assert api.manga_nearby_mokuro(book_id) == {"available": True, "filename": "my-book.mokuro"}
+    monkeypatch.setattr(api, "manga_ocr_book_status", lambda _book: {"running": True})
+    with pytest.raises(RuntimeError):
+        api.import_nearby_mokuro(book_id)
+    monkeypatch.undo()
+    assert api.import_nearby_mokuro(book_id)["imported_pages"] == 2

@@ -12,13 +12,12 @@ def build_alignment_report(
     source_chapters: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
     sources = [dict(row) for row in source_chapters if isinstance(row, dict)]
-    source_by_index = {
-        int(row.get("chapter_index") or 0): row
-        for row in sources
-    }
+    source_by_index = {int(row.get("chapter_index") or 0): row for row in sources}
     aligned = [dict(row) for row in alignment.get("chapters") or [] if isinstance(row, dict)]
     aligned_indexes = {int(row.get("chapter_index") or 0) for row in aligned}
-    total_characters = sum(max(0, int(row.get("normalized_length") or len(str(row.get("text") or "")))) for row in sources)
+    total_characters = sum(
+        max(0, int(row.get("normalized_length") or len(str(row.get("text") or "")))) for row in sources
+    )
     matched_characters = sum(max(0, int(row.get("normalized_length") or 0)) for row in aligned)
     warnings: list[dict[str, Any]] = []
     chapters: list[dict[str, Any]] = []
@@ -75,33 +74,53 @@ def build_alignment_report(
         }
         chapters.append(chapter_report)
         if confidence < 0.55:
-            warnings.append({"kind": "low_confidence", "chapter_index": chapter_index, "value": round(confidence, 4)})
+            warnings.append(
+                {"kind": "low_confidence", "chapter_index": chapter_index, "value": round(confidence, 4)}
+            )
         if density < 3.0:
-            warnings.append({"kind": "sparse_anchors", "chapter_index": chapter_index, "value": round(density, 2)})
+            warnings.append(
+                {"kind": "sparse_anchors", "chapter_index": chapter_index, "value": round(density, 2)}
+            )
         if long_gaps:
-            warnings.append({"kind": "long_interpolation", "chapter_index": chapter_index, "count": len(long_gaps)})
+            warnings.append(
+                {"kind": "long_interpolation", "chapter_index": chapter_index, "count": len(long_gaps)}
+            )
         if instantaneous_jumps:
-            warnings.append({"kind": "instantaneous_jump", "chapter_index": chapter_index, "count": len(instantaneous_jumps)})
+            warnings.append(
+                {
+                    "kind": "instantaneous_jump",
+                    "chapter_index": chapter_index,
+                    "count": len(instantaneous_jumps),
+                }
+            )
         if implausible_rates:
-            warnings.append({"kind": "implausible_rate", "chapter_index": chapter_index, "count": len(implausible_rates)})
+            warnings.append(
+                {"kind": "implausible_rate", "chapter_index": chapter_index, "count": len(implausible_rates)}
+            )
         leading = row.get("leading_prefix_debug")
         if isinstance(leading, dict) and leading.get("attempted") and not leading.get("recovered"):
-            warnings.append({
-                "kind": "leading_prefix_unverified",
-                "chapter_index": chapter_index,
-                "reason": str(leading.get("reason") or "unknown"),
-            })
+            warnings.append(
+                {
+                    "kind": "leading_prefix_unverified",
+                    "chapter_index": chapter_index,
+                    "reason": str(leading.get("reason") or "unknown"),
+                }
+            )
         elif isinstance(leading, dict) and leading.get("recovered") and leading.get("degraded"):
-            warnings.append({
-                "kind": "leading_prefix_safe_fallback",
-                "chapter_index": chapter_index,
-                "mode": str((leading.get("fallback") or {}).get("mode") or "unknown"),
-            })
+            warnings.append(
+                {
+                    "kind": "leading_prefix_safe_fallback",
+                    "chapter_index": chapter_index,
+                    "mode": str((leading.get("fallback") or {}).get("mode") or "unknown"),
+                }
+            )
         elif isinstance(leading, dict) and leading.get("recovered") and not leading.get("bridge_found", True):
-            warnings.append({
-                "kind": "leading_prefix_coarse_bridge",
-                "chapter_index": chapter_index,
-            })
+            warnings.append(
+                {
+                    "kind": "leading_prefix_coarse_bridge",
+                    "chapter_index": chapter_index,
+                }
+            )
 
     for chapter_index, row in sorted(source_by_index.items()):
         if chapter_index not in aligned_indexes:
@@ -115,8 +134,18 @@ def build_alignment_report(
 
     coverage = matched_characters / max(1, total_characters)
     confidence = float(alignment.get("confidence") or 0.0)
-    critical_warning_kinds = {"unmatched_chapter", "instantaneous_jump", "implausible_rate", "leading_prefix_unverified", "leading_prefix_safe_fallback"}
-    if coverage >= 0.90 and confidence >= 0.85 and not any(row["kind"] in critical_warning_kinds for row in warnings):
+    critical_warning_kinds = {
+        "unmatched_chapter",
+        "instantaneous_jump",
+        "implausible_rate",
+        "leading_prefix_unverified",
+        "leading_prefix_safe_fallback",
+    }
+    if (
+        coverage >= 0.90
+        and confidence >= 0.85
+        and not any(row["kind"] in critical_warning_kinds for row in warnings)
+    ):
         grade = "good"
     elif coverage >= 0.65 and confidence >= 0.60:
         grade = "review"

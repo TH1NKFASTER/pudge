@@ -23,8 +23,7 @@ def _bleach_transient_excursion(tmp_path: Path) -> tuple[Path, Path]:
     # for a bounded middle/ending region and then returns to the exact baseline.
     shifts = [-10.0] * 3 + [76.0] * 17 + [-10.0] * 3
     aligned_cues = [
-        (start + shift, end + shift, text)
-        for (start, end, text), shift in zip(source_cues, shifts)
+        (start + shift, end + shift, text) for (start, end, text), shift in zip(source_cues, shifts)
     ]
     write_srt(source_cues, source)
     write_srt(aligned_cues, aligned)
@@ -65,10 +64,7 @@ def test_small_unsupported_clock_wiggle_keeps_previous_tolerance(tmp_path: Path)
     shifts = [0.0, 0.0, 5.0, 5.0, 5.0, 5.0]
     write_srt(cues, source)
     write_srt(
-        [
-            (start + shift, end + shift, text)
-            for (start, end, text), shift in zip(cues, shifts)
-        ],
+        [(start + shift, end + shift, text) for (start, end, text), shift in zip(cues, shifts)],
         aligned,
     )
 

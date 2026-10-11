@@ -135,12 +135,13 @@ def test_unchanged_candidates_keep_existing_valid_prepared_selection(
     class FakeProcess:
         def __init__(self, _command, **_kwargs):
             self.returncode = 4
+
         def poll(self):
             return self.returncode
+
         def communicate(self):
             return (
-                "SUBTITLE_CANDIDATE_FINGERPRINT=same\n"
-                "PREPARE_STATUS=waiting_unchanged_candidates\n",
+                "SUBTITLE_CANDIDATE_FINGERPRINT=same\nPREPARE_STATUS=waiting_unchanged_candidates\n",
                 "",
             )
 
@@ -157,10 +158,7 @@ def test_reading_hints_are_not_truncated_at_64_tokens() -> None:
     paragraph = "あ" * 80
     parsed = {
         "paragraphs": [paragraph],
-        "tokens": [[
-            {"start": index, "end": index + 1, "reading": "あ"}
-            for index in range(80)
-        ]],
+        "tokens": [[{"start": index, "end": index + 1, "reading": "あ"} for index in range(80)]],
         "vocabulary": [],
     }
     hints = _reading_hints_from_cached_parse(parsed, source_limit=320)
@@ -175,7 +173,9 @@ def test_audiobook_series_title_strips_matching_linked_or_roman_volume() -> None
 
 def test_audiobook_book_uses_linked_ln_volume_for_group_identity(tmp_path: Path) -> None:
     db = Database(tmp_path / "db.sqlite3")
-    service = AudiobookService(db, ffprobe="ffprobe", ffmpeg="ffmpeg", mpv="mpv", cache_dir=tmp_path / "cache")
+    service = AudiobookService(
+        db, ffprobe="ffprobe", ffmpeg="ffmpeg", mpv="mpv", cache_dir=tmp_path / "cache"
+    )
     now = time.time()
     with db.connect() as conn:
         conn.execute(
@@ -191,7 +191,16 @@ def test_audiobook_book_uses_linked_ln_volume_for_group_identity(tmp_path: Path)
         path=source,
         title="狼と香辛料II",
         duration=10.0,
-        files=[{"index": 0, "path": str(source), "title": source.stem, "duration": 10.0, "start": 0.0, "end": 10.0}],
+        files=[
+            {
+                "index": 0,
+                "path": str(source),
+                "title": source.stem,
+                "duration": 10.0,
+                "start": 0.0,
+                "end": 10.0,
+            }
+        ],
         chapters=[{"index": 0, "title": "Chapter 1", "start": 0.0, "end": 10.0}],
     )
     with db.connect() as conn:

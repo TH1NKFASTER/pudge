@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate that a staged source release is self-contained for documented tooling."""
+
 from __future__ import annotations
 
 import re

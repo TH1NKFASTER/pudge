@@ -79,7 +79,10 @@ def test_old_final_pipeline_manifest_can_prove_ocr_origin_without_raw_ocr_cache(
     cleaned.write_text("1\n00:00:01,000 --> 00:00:02,000\nJP\n", encoding="utf-8")
     manifest = cfg.paths.cache_dir / "final-pipeline" / "old.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps({"schema": "final-pipeline-v2", "source": "ocr", "subtitle": str(cleaned)}), encoding="utf-8")
+    manifest.write_text(
+        json.dumps({"schema": "final-pipeline-v2", "source": "ocr", "subtitle": str(cleaned)}),
+        encoding="utf-8",
+    )
     manager.db.upsert_episode(LibraryEpisode(None, "Movie", 1, video, subtitle_path=cleaned, state="ready"))
 
     row = manager.db.episode_by_path(video)

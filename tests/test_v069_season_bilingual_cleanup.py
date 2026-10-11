@@ -95,14 +95,10 @@ def test_parallel_japanese_chinese_srt_removes_translation_track(tmp_path: Path)
     for number in range(24):
         japanese = "これは日本語の台詞です"
         chinese = "这是中文翻译台词"
-        blocks.append(
-            f"{index}\n{_ts(clock)} --> {_ts(clock + 1.2)}\n{japanese}"
-        )
+        blocks.append(f"{index}\n{_ts(clock)} --> {_ts(clock + 1.2)}\n{japanese}")
         index += 1
         clock += 1.3
-        blocks.append(
-            f"{index}\n{_ts(clock)} --> {_ts(clock + 0.3)}\n{chinese}"
-        )
+        blocks.append(f"{index}\n{_ts(clock)} --> {_ts(clock + 0.3)}\n{chinese}")
         index += 1
         clock += 0.4
     # Ambiguous kanji-only Japanese dialogue should survive the bilingual filter.

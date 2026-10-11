@@ -49,13 +49,7 @@ def download_complete(download: Any) -> bool:
     except (TypeError, ValueError):
         total = downloaded = 0
     verifying = bool(raw.get("verifying"))
-    return bool(
-        not verifying
-        and (
-            progress >= 0.999
-            or (total > 0 and downloaded >= total)
-        )
-    )
+    return bool(not verifying and (progress >= 0.999 or (total > 0 and downloaded >= total)))
 
 
 def _download_progress(download: Any) -> tuple[int, int | None]:
@@ -68,21 +62,13 @@ def _download_progress(download: Any) -> tuple[int, int | None]:
         speed = max(
             0,
             int(
-                raw.get("download_speed")
-                or raw.get("dlspeed")
-                or _value(download, "download_speed", 0)
-                or 0
+                raw.get("download_speed") or raw.get("dlspeed") or _value(download, "download_speed", 0) or 0
             ),
         )
         total = max(0, int(raw.get("total_size") or raw.get("totalLength") or 0))
         downloaded = max(
             0,
-            int(
-                raw.get("downloaded")
-                or raw.get("completedLength")
-                or round(total * progress)
-                or 0
-            ),
+            int(raw.get("downloaded") or raw.get("completedLength") or round(total * progress) or 0),
         )
     except (TypeError, ValueError):
         speed = total = downloaded = 0
@@ -164,9 +150,7 @@ def derive_episode_presentation(
         state = str(_value(download, "state", "") or "").casefold()
         raw = _raw(download)
         error = bool(
-            state in {"error", "missingfiles", "unknown"}
-            or raw.get("error_code")
-            or raw.get("error_message")
+            state in {"error", "missingfiles", "unknown"} or raw.get("error_code") or raw.get("error_message")
         )
         if error:
             status = "download_error"

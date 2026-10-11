@@ -23,15 +23,18 @@ def _ts(value: float) -> str:
 
 
 def test_filename_language_profile_distinguishes_clean_and_mixed_japanese() -> None:
-    assert subtitle_filename_language_profile(
-        "さよならララ.S01E01.人魚姫ララ.WEBRip.ABEMA.ja[cc].srt"
-    )["purity"] == "japanese_only"
-    assert subtitle_filename_language_profile(
-        "[KitaujiSub] Sayonara Lara [01][JPN].ass"
-    )["purity"] == "japanese_only"
-    assert subtitle_filename_language_profile(
-        "[Studio] Sayonara Lara [01][CHS, JPN].ass"
-    )["purity"] == "mixed_japanese_chinese"
+    assert (
+        subtitle_filename_language_profile("さよならララ.S01E01.人魚姫ララ.WEBRip.ABEMA.ja[cc].srt")["purity"]
+        == "japanese_only"
+    )
+    assert (
+        subtitle_filename_language_profile("[KitaujiSub] Sayonara Lara [01][JPN].ass")["purity"]
+        == "japanese_only"
+    )
+    assert (
+        subtitle_filename_language_profile("[Studio] Sayonara Lara [01][CHS, JPN].ass")["purity"]
+        == "mixed_japanese_chinese"
+    )
 
 
 def test_jimaku_filename_ranking_penalizes_mixed_track() -> None:
@@ -68,20 +71,16 @@ def test_cleaner_removes_normal_duration_parallel_chinese_track(tmp_path: Path) 
         start = 1.0 + number * 1.5
         end = start + 1.2
         index = number * 2 + 1
-        blocks.append(
-            f"{index}\n{_ts(start)} --> {_ts(end)}\nこれは日本語の台詞です"
-        )
-        blocks.append(
-            f"{index + 1}\n{_ts(start)} --> {_ts(end)}\n这是中文翻译台词"
-        )
-    source = tmp_path / "parallel.srt"
-    source.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        blocks.append(f"{index}\n{_ts(start)} --> {_ts(end)}\nこれは日本語の台詞です")
+        blocks.append(f"{index + 1}\n{_ts(start)} --> {_ts(end)}\n这是中文翻译台词")
+    subtitle = tmp_path / "parallel.srt"
+    subtitle.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
 
-    cleaned, result = clean_srt_for_playback(source, tmp_path / "cache")
+    cleaned_output, result = clean_srt_for_playback(subtitle, tmp_path / "cache")
 
     assert result["bilingual_cjk"] is True
     assert result["bilingual_removed"] == 24
-    payload = cleaned.read_text(encoding="utf-8")
+    payload = cleaned_output.read_text(encoding="utf-8")
     assert "这是中文翻译台词" not in payload
     assert payload.count("これは日本語の台詞です") == 24
 
@@ -97,26 +96,22 @@ def test_manual_ass_conversion_filters_parallel_chinese_before_merging(tmp_path:
     for number in range(24):
         start = number * 1.5
         end = start + 1.2
-        events.append(
-            f"Dialogue: 0,0:00:{start:05.2f},0:00:{end:05.2f},Default,,0,0,0,,これは日本語です"
-        )
-        events.append(
-            f"Dialogue: 0,0:00:{start:05.2f},0:00:{end:05.2f},Default,,0,0,0,,这是中文翻译"
-        )
-    source = tmp_path / "episode.[CHS, JPN].ass"
-    source.write_text("\n".join(events) + "\n", encoding="utf-8")
+        events.append(f"Dialogue: 0,0:00:{start:05.2f},0:00:{end:05.2f},Default,,0,0,0,,これは日本語です")
+        events.append(f"Dialogue: 0,0:00:{start:05.2f},0:00:{end:05.2f},Default,,0,0,0,,这是中文翻译")
+    subtitle = tmp_path / "episode.[CHS, JPN].ass"
+    subtitle.write_text("\n".join(events) + "\n", encoding="utf-8")
 
-    converted, result = convert_to_plain_srt(
-        source,
+    converted_output, result = convert_to_plain_srt(
+        subtitle,
         tmp_path / "cache",
         ffmpeg_path="/definitely/missing/ffmpeg",
     )
 
     assert result["converted"] is True
-    payload = converted.read_text(encoding="utf-8")
+    payload = converted_output.read_text(encoding="utf-8")
     assert "这是中文翻译" not in payload
     assert "これは日本語です" in payload
-    assert len(parse_srt(converted)) == 24
+    assert len(parse_srt(converted_output)) == 24
 
 
 def test_clean_srt_beats_better_activity_mixed_ass_when_clock_is_acceptable(tmp_path: Path) -> None:
@@ -126,7 +121,9 @@ def test_clean_srt_beats_better_activity_mixed_ass_when_clock_is_acceptable(tmp_
         purity: str,
         activity: float,
         score: float,
-    ) -> tuple[tuple[float, ...], SubtitleCandidate, Path, dict[str, object], dict[str, object], dict[str, object]]:
+    ) -> tuple[
+        tuple[float, ...], SubtitleCandidate, Path, dict[str, object], dict[str, object], dict[str, object]
+    ]:
         candidate = SubtitleCandidate(
             path=tmp_path / f"candidate{suffix}",
             source="jimaku",

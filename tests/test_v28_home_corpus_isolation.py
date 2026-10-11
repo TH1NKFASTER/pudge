@@ -30,9 +30,15 @@ def episode(api, folder: Path, *, media_id=1, state="waiting_subtitles", number=
 
 def download(api, folder: Path, *, media_id=1, torrent_hash="isolated", added_on=1):
     item = DownloadItem(
-        torrent_hash=torrent_hash, name="Synthetic batch", state="active", progress=0.3,
-        save_path=str(folder), content_path=str(folder / "Synthetic batch"),
-        media_id=media_id, is_batch=True, added_on=added_on,
+        torrent_hash=torrent_hash,
+        name="Synthetic batch",
+        state="active",
+        progress=0.3,
+        save_path=str(folder),
+        content_path=str(folder / "Synthetic batch"),
+        media_id=media_id,
+        is_batch=True,
+        added_on=added_on,
     )
     api.manager.db.upsert_download(item)
     return item
@@ -44,26 +50,43 @@ def cards(home):
             yield from card.get("items", [card]) if card.get("kind") == "watch_sequence" else [card]
 
 
-@pytest.mark.parametrize("state", ["local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync", "ready"])
+@pytest.mark.parametrize(
+    "state", ["local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync", "ready"]
+)
 @pytest.mark.parametrize("status", ["", "PLANNING"])
 def test_isolated_stale_rows_never_surface_on_home(isolated_library, state, status):
     api, corpus, _marker = isolated_library
-    api.manager.db.upsert_anime(LibraryAnime(1, "Synthetic corpus anime", status=status, episodes=12, media_status="FINISHED"))
+    api.manager.db.upsert_anime(
+        LibraryAnime(1, "Synthetic corpus anime", status=status, episodes=12, media_status="FINISHED")
+    )
     item = episode(api, corpus / "downloads", state=state)
     api.manager.db.queue_subtitle_job(item.video_path, 1, 1)
     if state == "waiting_text_subtitles":
-        api.manager.db.mark_subtitle_job_needs_action(item.video_path, "Synthetic bitmap subs", "enable_subtitle_ocr")
-    before = (api.manager.db.episodes(), api.manager.db.downloads(), [dict(row) for row in api.manager.db.subtitle_jobs()])
+        api.manager.db.mark_subtitle_job_needs_action(
+            item.video_path, "Synthetic bitmap subs", "enable_subtitle_ocr"
+        )
+    before = (
+        api.manager.db.episodes(),
+        api.manager.db.downloads(),
+        [dict(row) for row in api.manager.db.subtitle_jobs()],
+    )
 
     for _ in range(3):
         result = api.get_state()
         assert list(cards(result["home"])) == []
-        assert result["downloaded"] == []
+        assert "downloaded" not in result
+        assert (
+            api._downloaded_payloads({anime.media_id: anime for anime in api.manager.db.anime_list()}) == []
+        )
         # Explicit low-level library and worker views remain available.
         assert result["library"][0]["episodes"][0]["video_path"] == str(item.video_path)
         assert result["subtitle_jobs"][0]["video_path"] == str(item.video_path)
 
-    assert before == (api.manager.db.episodes(), api.manager.db.downloads(), [dict(row) for row in api.manager.db.subtitle_jobs()])
+    assert before == (
+        api.manager.db.episodes(),
+        api.manager.db.downloads(),
+        [dict(row) for row in api.manager.db.subtitle_jobs()],
+    )
     assert item.video_path.read_bytes() == b"synthetic video"
 
 
@@ -80,14 +103,23 @@ def test_ordinary_copy_of_same_episode_wins_over_isolated_row(isolated_library, 
 
     assert result["current"][0]["local"]["video_path"] == str(visible.video_path)
     assert result["home"][section][0]["local"]["video_path"] == str(visible.video_path)
-    assert all((card.get("local") or {}).get("video_path") != str(hidden.video_path) for card in cards(result["home"]))
-    assert [row["video_path"] for row in api._ready_queue_items([1])] == ([str(visible.video_path)] if state == "ready" else [])
+    assert all(
+        (card.get("local") or {}).get("video_path") != str(hidden.video_path)
+        for card in cards(result["home"])
+    )
+    assert [row["video_path"] for row in api._ready_queue_items([1])] == (
+        [str(visible.video_path)] if state == "ready" else []
+    )
 
 
 def test_isolated_download_cannot_reinsert_planning_card(isolated_library):
     api, corpus, _marker = isolated_library
     for media_id in (1, 2):
-        api.manager.db.upsert_anime(LibraryAnime(media_id, f"Synthetic {media_id}", status="PLANNING", episodes=12, media_status="FINISHED"))
+        api.manager.db.upsert_anime(
+            LibraryAnime(
+                media_id, f"Synthetic {media_id}", status="PLANNING", episodes=12, media_status="FINISHED"
+            )
+        )
     hidden = download(api, corpus / "downloads")
     ordinary = download(api, api.config.library.root_dir, media_id=2, torrent_hash="ordinary")
 
@@ -101,7 +133,9 @@ def test_isolated_download_cannot_reinsert_planning_card(isolated_library):
 
 def test_newer_isolated_download_does_not_shadow_ordinary_download(isolated_library):
     api, corpus, _marker = isolated_library
-    api.manager.db.upsert_anime(LibraryAnime(1, "Synthetic shared anime", status="PLANNING", episodes=12, media_status="FINISHED"))
+    api.manager.db.upsert_anime(
+        LibraryAnime(1, "Synthetic shared anime", status="PLANNING", episodes=12, media_status="FINISHED")
+    )
     download(api, api.config.library.root_dir, torrent_hash="ordinary", added_on=1)
     download(api, corpus / "downloads", added_on=2)
 
@@ -117,16 +151,25 @@ def test_exclusion_uses_marker_and_is_reversible(isolated_library):
     hidden = episode(api, corpus / "downloads")
     ordinary = episode(api, corpus.parent / "benchmark-in-name-only", media_id=2)
 
-    assert [card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]] == [str(ordinary.video_path)]
+    assert [card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]] == [
+        str(ordinary.video_path)
+    ]
     marker.unlink()
-    assert {card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]} == {str(hidden.video_path), str(ordinary.video_path)}
+    assert {card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]} == {
+        str(hidden.video_path),
+        str(ordinary.video_path),
+    }
     marker.write_text("Synthetic isolated test corpus\n")
-    assert [card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]] == [str(ordinary.video_path)]
+    assert [card["local"]["video_path"] for card in api.get_state()["home"]["waiting"]] == [
+        str(ordinary.video_path)
+    ]
 
 
 def test_content_path_is_checked_when_save_path_is_outside_corpus(isolated_library):
     api, corpus, _marker = isolated_library
-    api.manager.db.upsert_anime(LibraryAnime(1, "Synthetic anime", status="PLANNING", episodes=12, media_status="FINISHED"))
+    api.manager.db.upsert_anime(
+        LibraryAnime(1, "Synthetic anime", status="PLANNING", episodes=12, media_status="FINISHED")
+    )
     item = download(api, corpus / "downloads")
     item.save_path = str(corpus.parent)
     api.manager.db.upsert_download(item)
@@ -139,7 +182,9 @@ def test_symlink_to_corpus_does_not_leak_into_waiting(isolated_library):
     hidden = episode(api, corpus / "downloads")
     linked = corpus.parent / "shortcut.mkv"
     linked.symlink_to(hidden.video_path)
-    api.manager.db.upsert_episode(LibraryEpisode(2, "Synthetic shortcut", 1, linked, state="waiting_subtitles"))
+    api.manager.db.upsert_episode(
+        LibraryEpisode(2, "Synthetic shortcut", 1, linked, state="waiting_subtitles")
+    )
 
     assert api.get_state()["home"]["waiting"] == []
 
@@ -148,8 +193,14 @@ def test_isolated_resume_history_and_dropped_are_hidden(isolated_library):
     api, corpus, _marker = isolated_library
     api.config.agent.delete_after_watched_hours = 24
     for media_id, status in ((1, ""), (2, "COMPLETED"), (3, "DROPPED")):
-        api.manager.db.upsert_anime(LibraryAnime(media_id, f"Synthetic {media_id}", status=status, episodes=1, media_status="FINISHED"))
-        item = episode(api, corpus / "downloads", media_id=media_id, state="watched" if media_id == 2 else "ready")
+        api.manager.db.upsert_anime(
+            LibraryAnime(
+                media_id, f"Synthetic {media_id}", status=status, episodes=1, media_status="FINISHED"
+            )
+        )
+        item = episode(
+            api, corpus / "downloads", media_id=media_id, state="watched" if media_id == 2 else "ready"
+        )
         if media_id == 1:
             api.manager.db.record_playback(item.video_path, 120, 1200)
         if media_id == 2:

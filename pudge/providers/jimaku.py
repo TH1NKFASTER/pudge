@@ -21,6 +21,13 @@ from ..language import IMAGE_SUBTITLE_EXTENSIONS, TEXT_SUBTITLE_EXTENSIONS, is_j
 from ..logging_utils import configure_logging, timed_step
 from ..branding import APP_SLUG
 from ..models import JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
+from ..i18n import err, t
+from ..jimaku_trial import (
+    clear_jimaku_key_rejection,
+    jimaku_key_fingerprint,
+    jimaku_rejects_key,
+    record_jimaku_key_rejection,
+)
 from ..subtitle_formats import (
     format_preference_bonus,
     subtitle_bilingual_cjk_profile,
@@ -66,7 +73,6 @@ def find_7zip() -> str | None:
     return None
 
 
-
 _SEASON_TOKEN_RE = re.compile(r"(?i)(?:^|[\s._-])s(?:eason\s*)?0*(?P<season>\d{1,2})(?=$|[\s._-])")
 _ORDINAL_SEASON_RE = re.compile(r"(?i)\b(?P<season>\d{1,2})(?:st|nd|rd|th)\s+season\b")
 _ROMAN_SEASONS = {"ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9}
@@ -91,7 +97,7 @@ def explicit_season_hint(name: str, identity_title: str = "") -> int | None:
     parsed_title = normalize_title(parsed.title)
     if not base or not parsed_title.startswith(base + " "):
         return None
-    suffix = parsed_title[len(base):].strip()
+    suffix = parsed_title[len(base) :].strip()
     if suffix in _ROMAN_SEASONS:
         return _ROMAN_SEASONS[suffix]
     if suffix.isdigit():
@@ -137,6 +143,12 @@ class JimakuError(RuntimeError):
     pass
 
 
+class JimakuKeyRejected(JimakuError):
+    """Jimaku refused the API key (invalid, revoked or an ended shared key)."""
+
+    def __init__(self, message: str, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
 
 
 def _parse_timestamp(value: str) -> int | None:
@@ -168,11 +180,11 @@ class JimakuClient:
         cache_ttl_seconds: float = 2 * 60,
     ) -> None:
         if not api_key:
-            raise JimakuError("Не задан JIMAKU_API_KEY")
+            raise JimakuError(err("jimaku.apiKeyMissing"))
         self.base_url = base_url.rstrip("/")
         self.cache_dir = cache_dir
         self.cache_ttl_seconds = max(0.0, float(cache_ttl_seconds))
-        self._api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+        self._api_key_hash = jimaku_key_fingerprint(api_key)
         self.logger = configure_logging()
         self.client = httpx.Client(
             timeout=httpx.Timeout(15.0, connect=6.0),
@@ -244,9 +256,7 @@ class JimakuClient:
                     # balances serialize several concurrent processes into
                     # distinct future slots: 3s, 6s, 9s, ... instead of a thundering herd.
                     tokens -= 1.0
-                    temporary = marker.with_name(
-                        f"{marker.name}.{os.getpid()}.tmp"
-                    )
+                    temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
                     temporary.write_text(
                         json.dumps(
                             {
@@ -312,7 +322,7 @@ class JimakuClient:
     @staticmethod
     def _rate_limit_message(seconds: float) -> str:
         minutes = max(1, int((max(0.0, seconds) + 59) // 60))
-        return f"Jimaku rate limited (429); retry in {minutes} min"
+        return err("jimaku.rateLimited", minutes=minutes)
 
     def _set_rate_limit(self, seconds: float) -> float:
         seconds = max(30.0, float(seconds))
@@ -329,6 +339,17 @@ class JimakuClient:
             except OSError:
                 pass
         return seconds
+
+    def _key_rejected(self, path: str, status_code: int) -> None:
+        self.logger.warning(
+            "FAIL step=jimaku.http path=%s reason=key_rejected status=%s key=%s",
+            path,
+            status_code,
+            self._api_key_hash,
+        )
+        if self.cache_dir is not None:
+            record_jimaku_key_rejection(self.cache_dir, self._api_key_hash, status_code)
+        raise JimakuKeyRejected(err("jimaku.keyRejected", status=status_code), status_code)
 
     def _get_json(self, path: str, params: dict[str, object] | None = None):
         safe_params = dict(params or {})
@@ -371,7 +392,9 @@ class JimakuClient:
                 count = len(stale_payload) if isinstance(stale_payload, list) else 1
                 self.logger.warning(
                     "FALLBACK step=jimaku.http path=%s cache=stale count=%s reason=rate_limited remaining_s=%.0f",
-                    path, count, rate_limit_remaining,
+                    path,
+                    count,
+                    rate_limit_remaining,
                 )
                 return stale_payload
             raise JimakuError(self._rate_limit_message(rate_limit_remaining))
@@ -398,14 +421,22 @@ class JimakuClient:
                             count = len(stale_payload) if isinstance(stale_payload, list) else 1
                             self.logger.warning(
                                 "FALLBACK step=jimaku.http path=%s cache=stale count=%s reason=429 cooldown_s=%.0f",
-                                path, count, cooldown,
+                                path,
+                                count,
+                                cooldown,
                             )
                             return stale_payload
                         raise JimakuError(self._rate_limit_message(cooldown))
+                    if status_code in {401, 403} and jimaku_rejects_key(
+                        status_code, response.headers.get("content-type", "")
+                    ):
+                        self._key_rejected(path, status_code)
                     response.raise_for_status()
                     payload = response.json()
                 count = len(payload) if isinstance(payload, list) else 1
                 self.logger.info("RESULT step=jimaku.http path=%s count=%s cache=miss", path, count)
+                if self.cache_dir is not None:
+                    clear_jimaku_key_rejection(self.cache_dir, self._api_key_hash)
                 empty_dynamic_result = payload == [] and (
                     path == "/api/entries/search" or path.endswith("/files")
                 )
@@ -439,16 +470,16 @@ class JimakuClient:
                         attempt + 1,
                         exc,
                     )
-                    time.sleep(0.25 * (2 ** attempt))
+                    time.sleep(0.25 * (2**attempt))
                     continue
                 break
             except httpx.HTTPError as exc:
                 # HTTP status errors are deterministic enough that retrying them
                 # immediately only creates extra load. DNS/connect failures are
                 # handled by the retry branch above.
-                raise JimakuError(f"Ошибка Jimaku API: {exc}") from exc
+                raise JimakuError(err("jimaku.api", error=exc)) from exc
             except ValueError as exc:
-                raise JimakuError(f"Ошибка Jimaku API: {exc}") from exc
+                raise JimakuError(err("jimaku.api", error=exc)) from exc
 
         if stale_payload is not None and last_network_error is not None:
             count = len(stale_payload) if isinstance(stale_payload, list) else 1
@@ -460,8 +491,8 @@ class JimakuClient:
             )
             return stale_payload
         if last_network_error is not None:
-            raise JimakuError(f"Ошибка Jimaku API: {last_network_error}") from last_network_error
-        raise JimakuError("Ошибка Jimaku API: неизвестная сетевая ошибка")
+            raise JimakuError(err("jimaku.api", error=last_network_error)) from last_network_error
+        raise JimakuError(err("jimaku.unknownNetwork"))
 
     def search_entries(self, *, anilist_id: int | None = None, query: str | None = None) -> list[JimakuEntry]:
         params: dict[str, object] = {"anime": "true"}
@@ -503,68 +534,140 @@ class JimakuClient:
         episode: int | None,
         alternative_episodes: tuple[int, ...] = (),
     ) -> list[JimakuFile]:
-        """Return episode-filtered files, with a local-filter fallback.
+        # Called unbound with lightweight test doubles too: resolve helpers on the class.
+        files = JimakuClient._files_for_episode_unchecked(self, entry_id, episode, alternative_episodes)
+        if episode is None or not files:
+            return files
+        collision = JimakuClient._absolute_numbering_collision(
+            self, entry_id, int(episode), alternative_episodes
+        )
+        if collision is None:
+            return files
+        kept: list[JimakuFile] = []
+        for item in files:
+            if parse_anime_filename(item.name).episode == int(episode):
+                getattr(self, "logger", configure_logging()).info(
+                    "REJECT step=jimaku.files entry_id=%s episode=%s reason=absolute_numbering_collision "
+                    "offset=%s means_episode=%s name=%r",
+                    entry_id,
+                    episode,
+                    collision,
+                    int(episode) - collision,
+                    item.name,
+                )
+                continue
+            kept.append(item)
+        return kept
 
-        Jimaku's server-side episode index can occasionally miss files whose names
-        still contain an unambiguous episode number, especially source-specific
-        releases such as ``AT-X 1440x1080``. It can also return only one source for
-        an episode even though the entry contains several independent variants.
-        A single badly timed source must not prevent the remaining sources from
-        being evaluated, so sparse server results are supplemented from the full
-        entry and filtered locally.
+    def _absolute_numbering_collision(
+        self,
+        entry_id: int,
+        episode: int,
+        alternative_episodes: tuple[int, ...],
+    ) -> int | None:
+        """Return the season offset when this entry numbers episodes absolutely.
+
+        A sequel entry such as "2nd Season" may label its files 13, 14, ...
+        (continuing the prequel). Then the file "13" is the sequel's first
+        episode, not the requested season-local episode 13. The entry is
+        absolute only when it has no file numbered within the prequel range
+        and several distinct numbers above it; a lone "13" stays ambiguous.
+        """
+        absolute = [int(value) for value in alternative_episodes if int(value) > episode]
+        if not absolute:
+            return None
+        offset = min(absolute) - episode
+        if offset <= 0 or episode <= offset:
+            return None
+        numbers = {
+            number
+            for item in self.files(entry_id, None)
+            if (number := parse_anime_filename(item.name).episode) is not None
+        }
+        if not numbers or min(numbers) <= offset:
+            return None
+        if len({number for number in numbers if number > offset}) < 2:
+            return None
+        return offset
+
+    def _files_for_episode_unchecked(
+        self,
+        entry_id: int,
+        episode: int | None,
+        alternative_episodes: tuple[int, ...] = (),
+    ) -> list[JimakuFile]:
+        """Return episode files: the entry's full list first, the server filter only when sparse.
+
+        One full-list request (cached for 2 minutes) answers most episodes: every
+        file whose name carries the episode, or a range covering it. Jimaku's
+        server-side episode index can know a file whose name hides the episode,
+        so with fewer than three such files the per-episode filter is asked as
+        well and both are merged (server results first, as before).
         """
         aliases = {int(value) for value in alternative_episodes if int(value) > 0}
         if episode is not None:
             aliases.add(int(episode))
-        filtered = self.files(entry_id, episode)
-        for alias in sorted(aliases):
-            if episode is not None and alias == episode:
-                continue
-            for item in self.files(entry_id, alias):
-                if all(existing.url != item.url for existing in filtered):
-                    filtered.append(item)
+        unfiltered = self.files(entry_id, None)
         if episode is None:
             getattr(self, "logger", configure_logging()).info(
                 "RESULT step=jimaku.files entry_id=%s episode=none filtered=%s fallback=false",
-                entry_id, len(filtered),
+                entry_id,
+                len(unfiltered),
             )
-            return filtered
+            return unfiltered
 
-        exact_filtered = [
-            item for item in filtered
-            if parse_anime_filename(item.name).episode in aliases
-        ]
-        # Three independent files are normally enough diversity. With fewer than
-        # that, inspect the whole entry because Jimaku's episode index is known to
-        # omit otherwise valid Netflix/Amazon/BD variants on some entries.
-        if len(exact_filtered) >= 3:
-            getattr(self, "logger", configure_logging()).info(
-                "RESULT step=jimaku.files entry_id=%s episode=%s filtered=%s exact=%s fallback=false",
-                entry_id, episode, len(filtered), len(exact_filtered),
-            )
-            return filtered
-
-        unfiltered = self.files(entry_id, None)
-        merged: dict[str, JimakuFile] = {item.url: item for item in filtered}
+        local: dict[str, JimakuFile] = {}
+        unknown: dict[str, JimakuFile] = {}
+        exact = 0
         for item in unfiltered:
             parsed_episode = parse_anime_filename(item.name).episode
             episode_range = explicit_episode_range(item.name)
             if parsed_episode in aliases:
-                merged.setdefault(item.url, item)
+                local.setdefault(item.url, item)
+                exact += 1
             elif episode_range is not None:
                 start, end = episode_range
                 if any(start <= alias <= end for alias in aliases):
-                    merged.setdefault(item.url, item)
+                    local.setdefault(item.url, item)
             elif parsed_episode is None:
-                merged.setdefault(item.url, item)
+                unknown.setdefault(item.url, item)
+        # Three independent files are normally enough diversity.
+        if exact >= 3:
+            result = list(local.values())
+            getattr(self, "logger", configure_logging()).info(
+                "RESULT step=jimaku.files entry_id=%s episode=%s unfiltered=%s exact=%s server_filter=false",
+                entry_id,
+                episode,
+                len(unfiltered),
+                exact,
+            )
+            return result
+
+        filtered = list(self.files(entry_id, int(episode)))
+        for alias in sorted(aliases):
+            if alias == int(episode):
+                continue
+            for item in self.files(entry_id, alias):
+                if all(existing.url != item.url for existing in filtered):
+                    filtered.append(item)
+        merged: dict[str, JimakuFile] = {item.url: item for item in filtered}
+        for item in [*local.values(), *unknown.values()]:
+            merged.setdefault(item.url, item)
         result = list(merged.values())
         getattr(self, "logger", configure_logging()).info(
-            "RESULT step=jimaku.files entry_id=%s episode=%s filtered=%s exact=%s unfiltered=%s merged=%s fallback=true",
-            entry_id, episode, len(filtered), len(exact_filtered), len(unfiltered), len(result),
+            "RESULT step=jimaku.files entry_id=%s episode=%s filtered=%s exact=%s unfiltered=%s merged=%s server_filter=true",
+            entry_id,
+            episode,
+            len(filtered),
+            exact,
+            len(unfiltered),
+            len(result),
         )
         return result
 
-    def rank_entries(self, entries: list[JimakuEntry], identity: VideoIdentity, anilist_id: int | None) -> list[JimakuEntry]:
+    def rank_entries(
+        self, entries: list[JimakuEntry], identity: VideoIdentity, anilist_id: int | None
+    ) -> list[JimakuEntry]:
         def score(entry: JimakuEntry) -> float:
             if anilist_id and entry.anilist_id == anilist_id:
                 return 1000.0
@@ -658,16 +761,18 @@ class JimakuClient:
             score += language_purity_bonus
             if japanese_marker:
                 score += 10
-            item.details.update({
-                "release_token_overlap": sorted(overlap),
-                "overlap_bonus": overlap_bonus,
-                "format_bonus": format_bonus,
-                "japanese_marker": japanese_marker,
-                "chinese_marker": bool(language_profile.get("chinese_marker")),
-                "language_purity": language_purity,
-                "language_purity_priority": int(language_profile.get("priority") or 0),
-                "language_purity_bonus": language_purity_bonus,
-            })
+            item.details.update(
+                {
+                    "release_token_overlap": sorted(overlap),
+                    "overlap_bonus": overlap_bonus,
+                    "format_bonus": format_bonus,
+                    "japanese_marker": japanese_marker,
+                    "chinese_marker": bool(language_profile.get("chinese_marker")),
+                    "language_purity": language_purity,
+                    "language_purity_priority": int(language_profile.get("priority") or 0),
+                    "language_purity_bonus": language_purity_bonus,
+                }
+            )
             lowered = item.name.casefold()
             if any(token in lowered for token in ("signs", "songs", "karaoke", "forced")):
                 score -= 35
@@ -713,15 +818,26 @@ class JimakuClient:
         target_dir = cache_dir / "jimaku" / digest
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / _safe_name(Path(item.name).name)
-        if target.exists() and target.stat().st_size > 0:
+        expected = int(getattr(item, "size", 0) or 0)
+        if (
+            target.exists()
+            and target.stat().st_size > 0
+            and (expected <= 0 or target.stat().st_size >= expected)
+        ):
             return target
         try:
             response = self.client.get(item.url)
             response.raise_for_status()
-            target.write_bytes(response.content)
+            data = response.content
+            if expected > 0 and len(data) < expected:
+                raise OSError(f"incomplete download: {len(data)} of {expected} bytes")
+            # Atomic: an interrupted write never becomes a cached subtitle.
+            temporary = target.with_name(target.name + ".part")
+            temporary.write_bytes(data)
+            os.replace(temporary, target)
             return target
         except (httpx.HTTPError, OSError) as exc:
-            raise JimakuError(f"Не удалось скачать {item.name}: {exc}") from exc
+            raise JimakuError(err("jimaku.downloadFailed", name=item.name, error=exc)) from exc
 
 
 def _archive_member_score(
@@ -774,7 +890,10 @@ def _extract_archive_all(
         with zipfile.ZipFile(path) as zf:
             names = [name for name in zf.namelist() if Path(name).suffix.casefold() in SUBTITLE_EXTENSIONS]
             ranked = sorted(
-                ((_archive_member_score(name, identity, video, prefer_srt, allowed_episodes), name) for name in names),
+                (
+                    (_archive_member_score(name, identity, video, prefer_srt, allowed_episodes), name)
+                    for name in names
+                ),
                 reverse=True,
             )
             for score, name in ranked:
@@ -798,7 +917,6 @@ def _extract_archive_all(
     return extracted
 
 
-
 def _copy_extracted_subtitles(
     root: Path,
     identity: VideoIdentity,
@@ -816,11 +934,7 @@ def _copy_extracted_subtitles(
             continue
         display_name = str(source.relative_to(root))
         parsed = parse_anime_filename(display_name)
-        if (
-            identity.episode is not None
-            and parsed.episode is not None
-            and parsed.episode not in aliases
-        ):
+        if identity.episode is not None and parsed.episode is not None and parsed.episode not in aliases:
             continue
         score = _archive_member_score(display_name, identity, video, prefer_srt, allowed_episodes)
         digest = hashlib.sha1(display_name.encode("utf-8", errors="ignore")).hexdigest()[:8]
@@ -910,20 +1024,18 @@ def _cached_archive_result_rows(
         except OSError:
             return None
         parsed = parse_anime_filename(display_name)
-        if (
-            identity.episode is not None
-            and parsed.episode is not None
-            and parsed.episode not in aliases
-        ):
+        if identity.episode is not None and parsed.episode is not None and parsed.episode not in aliases:
             continue
         suffix = output.suffix.casefold()
         if suffix not in IMAGE_SUBTITLE_EXTENSIONS and not is_japanese_subtitle(output):
             continue
-        results.append((
-            output,
-            display_name,
-            _archive_member_score(display_name, identity, video, prefer_srt, allowed_episodes),
-        ))
+        results.append(
+            (
+                output,
+                display_name,
+                _archive_member_score(display_name, identity, video, prefer_srt, allowed_episodes),
+            )
+        )
     return sorted(results, key=lambda item: item[2], reverse=True)
 
 
@@ -953,18 +1065,14 @@ def _extract_7z_all(
     prefer_srt: bool,
     allowed_episodes: tuple[int, ...] = (),
 ) -> list[tuple[Path, str, float]]:
-    cached = _cached_archive_result_rows(
-        path, identity, video, output_dir, prefer_srt, allowed_episodes
-    )
+    cached = _cached_archive_result_rows(path, identity, video, output_dir, prefer_srt, allowed_episodes)
     if cached is not None:
-        configure_logging().info(
-            "CACHE step=jimaku.archive_extract path=%s members=%s", path, len(cached)
-        )
+        configure_logging().info("CACHE step=jimaku.archive_extract path=%s members=%s", path, len(cached))
         return cached
 
     tool = find_7zip()
     if tool is None:
-        print("Jimaku: найден архив .7z/.rar, но 7-Zip не установлен")
+        print(t("error.jimaku.sevenZipMissing"))
         return []
     try:
         with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-archive-") as temp_dir:
@@ -978,7 +1086,7 @@ def _extract_7z_all(
                 check=False,
             )
             if completed.returncode != 0:
-                print(f"Jimaku: не удалось распаковать {path.name}: {completed.stdout[-500:]}")
+                print(t("error.jimaku.extractFailedDetail", file=path.name, error=completed.stdout[-500:]))
                 return []
             results = _copy_extracted_subtitles(
                 root, identity, video, output_dir, prefer_srt, allowed_episodes
@@ -995,7 +1103,7 @@ def _extract_7z_all(
             )
             return results
     except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Jimaku: не удалось распаковать {path.name}: {exc}")
+        print(t("error.jimaku.extractFailedDetail", file=path.name, error=exc))
         return []
 
 
@@ -1016,9 +1124,7 @@ def materialize_jimaku_files(
             downloaded, identity, video, downloaded.parent, prefer_srt, allowed_episodes
         )
     elif archive_suffix in {".7z", ".rar"}:
-        paths = _extract_7z_all(
-            downloaded, identity, video, downloaded.parent, prefer_srt, allowed_episodes
-        )
+        paths = _extract_7z_all(downloaded, identity, video, downloaded.parent, prefer_srt, allowed_episodes)
     else:
         paths = [(downloaded, item.name, 0.0)]
 
@@ -1032,17 +1138,13 @@ def materialize_jimaku_files(
         aliases = {int(value) for value in allowed_episodes if int(value) > 0}
         source_episode = parsed_episode
         normalized_episode = (
-            identity.episode
-            if identity.episode is not None and parsed_episode in aliases
-            else parsed_episode
+            identity.episode if identity.episode is not None and parsed_episode in aliases else parsed_episode
         )
         filename_language = subtitle_filename_language_profile(display_name)
         language_purity = str(filename_language.get("purity") or "unknown")
         bilingual_profile = subtitle_bilingual_cjk_profile(path)
         filename_bilingual = language_purity == "mixed_japanese_chinese"
-        bilingual_detected = bool(
-            filename_bilingual or bilingual_profile.get("suspected_bilingual_cjk")
-        )
+        bilingual_detected = bool(filename_bilingual or bilingual_profile.get("suspected_bilingual_cjk"))
         bilingual_penalty = -85.0 if bilingual_detected else 0.0
         candidates.append(
             SubtitleCandidate(

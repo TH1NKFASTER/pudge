@@ -26,20 +26,26 @@ def make_manager(tmp_path: Path) -> AnimeManager:
 
 def test_brand_rename_recovers_prepared_subtitle_from_history(tmp_path: Path) -> None:
     manager = make_manager(tmp_path)
-    anime = LibraryAnime(media_id=100723, title="Boku no Hero Academia THE MOVIE: Futari no Hero", format="MOVIE")
+    anime = LibraryAnime(
+        media_id=100723, title="Boku no Hero Academia THE MOVIE: Futari no Hero", format="MOVIE"
+    )
     manager.db.upsert_anime(anime)
 
     video = manager.config.library.root_dir / "Boku.no.Hero.Academia.Two.Heroes.1080p.mkv"
     video.write_bytes(b"video")
     manager.db.upsert_episode(
-        LibraryEpisode(media_id=100723, title=anime.title, episode=None, video_path=video, state="waiting_subtitles")
+        LibraryEpisode(
+            media_id=100723, title=anime.title, episode=None, video_path=video, state="waiting_subtitles"
+        )
     )
     manager.db.queue_subtitle_job(video, 100723, None)
 
     current_subtitle = manager.config.paths.cache_dir / "playback-srt" / "two-heroes.srt"
     current_subtitle.parent.mkdir(parents=True, exist_ok=True)
     current_subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8")
-    legacy_subtitle = manager.config.paths.cache_dir.parent / "anime-mpv" / "playback-srt" / current_subtitle.name
+    legacy_subtitle = (
+        manager.config.paths.cache_dir.parent / "anime-mpv" / "playback-srt" / current_subtitle.name
+    )
     legacy_video = tmp_path / "Movies" / "Anime MPV" / video.name
 
     manager.db.record_subtitle_history(
@@ -122,7 +128,9 @@ def test_web_refresh_uses_interactive_maintenance(tmp_path: Path) -> None:
     api = WebAppApi.__new__(WebAppApi)
     api.manager = Manager()
     api.logger = logging.getLogger("test-v0659-web-refresh")
-    api.config = SimpleNamespace(qbittorrent=SimpleNamespace(enabled=False), aria2=SimpleNamespace(enabled=False))
+    api.config = SimpleNamespace(
+        qbittorrent=SimpleNamespace(enabled=False), aria2=SimpleNamespace(enabled=False)
+    )
     api._startup_maintenance_thread = None
     api._local_refresh_lock = threading.Lock()
     api.get_state = lambda: {"home": {}}
@@ -136,7 +144,7 @@ def _write_srt(path: Path, end_seconds: int) -> None:
     minutes, seconds = divmod(end_seconds, 60)
     path.write_text(
         "1\n00:00:01,000 --> 00:00:02,000\nstart\n\n"
-        f"2\n00:{minutes:02d}:{max(0, seconds-1):02d},000 --> 00:{minutes:02d}:{seconds:02d},000\nend\n",
+        f"2\n00:{minutes:02d}:{max(0, seconds - 1):02d},000 --> 00:{minutes:02d}:{seconds:02d},000\nend\n",
         encoding="utf-8",
     )
 

@@ -1,3 +1,6 @@
+"""Batch cleanup keeps batch rows without download metadata, the manga page list's styling,
+torrent traffic counts from real jobs (behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,6 +8,8 @@ from pathlib import Path
 from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
+
+from css_support import css_rules
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -63,19 +68,16 @@ def test_cleanup_never_drops_remaining_batch_rows_when_download_metadata_is_miss
     assert all(path.exists() for path in paths)
 
 
-def test_manga_page_picker_is_scrollable_dropdown_under_page_number() -> None:
-    root = Path(__file__).parents[1]
-    js = (root / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
-    css = (root / "pudge" / "web" / "manga_reader_v2.css").read_text(encoding="utf-8")
-
-    assert 'class="manga-v2-page-picker-shell"' in js
-    assert 'aria-haspopup="listbox"' in js
-    assert 'data-manga-v2-page-option' in js
-    assert 'mangaV2PageInput' not in js
-    assert '.manga-v2-page-picker-shell{position:relative' in css
-    assert 'top:calc(100% + 5px)' in css
-    assert 'max-height:min(340px,52vh)' in css
-    assert 'overflow-y:auto' in css
+# The page list itself (open, jump, Escape) is tested in test_v211_manga_reader_tech_debt.py.
+def test_page_list_is_a_scrollable_dropdown_under_the_page_number() -> None:
+    rules = css_rules("manga_reader_v2.css")
+    assert rules.get(".manga-v2-page-picker-shell", "position") == "relative"
+    picker = rules.declarations(".manga-v2-page-picker")
+    assert (picker["position"], picker["top"]) == ("absolute", "calc(100% + 5px)")
+    assert (picker["max-height"], picker["overflow-y"]) == ("min(340px,52vh)", "auto")
+    # The list is display:grid, so the hidden attribute needs its own rule to hide it in WebKit.
+    assert picker["display"] == "grid"
+    assert rules.get(".manga-v2-page-picker[hidden]", "display") == "none"
 
 
 def test_torrent_toggle_waiting_count_uses_real_backend_jobs_not_stale_intents() -> None:
@@ -117,14 +119,3 @@ def test_torrent_toggle_waiting_count_uses_real_backend_jobs_not_stale_intents()
     assert on["active"] == 0
     assert on["download_speed"] == 0
     assert on["upload_speed"] == 0
-
-
-def test_torrent_toggle_frontend_trusts_fresh_live_waiting_count() -> None:
-    root = Path(__file__).parents[1]
-    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    toggle = html.split("function refreshTorrentToggle(){", 1)[1].split(
-        "function scheduleTorrentTrafficPoll", 1
-    )[0]
-
-    assert "const waiting=liveFresh?Math.max(0,Number(live.waiting||0)):fallbackWaiting;" in toggle
-    assert "Math.max(fallbackWaiting,Number(live.waiting||0))" not in toggle

@@ -139,9 +139,7 @@ def test_scan_removes_existing_false_match_inside_active_watched_folder(monkeypa
     )
 
     manager = AnimeManager(config, log=lambda _message: None)
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=66, title="Azumanga Daiou THE ANIMATION", progress=0)
-    )
+    manager.db.upsert_anime(LibraryAnime(media_id=66, title="Azumanga Daiou THE ANIMATION", progress=0))
     manager.db.upsert_episode(
         LibraryEpisode(
             media_id=66,

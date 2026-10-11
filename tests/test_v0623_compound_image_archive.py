@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from pudge.models import JimakuFile, VideoIdentity
@@ -19,11 +18,11 @@ def _fake_7zz(tmp_path: Path, payload: Path) -> Path:
     tool = tmp_path / "7zz-outside-path"
     tool.write_text(
         "#!/bin/sh\n"
-        "for arg in \"$@\"; do\n"
-        "  case \"$arg\" in -o*) out=${arg#-o} ;; esac\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in -o*) out=${arg#-o} ;; esac\n'
         "done\n"
-        "mkdir -p \"$out\"\n"
-        f"cp {str(payload)!r} \"$out/Infinity Castle Japanese.sup\"\n",
+        'mkdir -p "$out"\n'
+        f'cp {str(payload)!r} "$out/Infinity Castle Japanese.sup"\n',
         encoding="utf-8",
     )
     tool.chmod(0o755)
@@ -40,9 +39,7 @@ def test_find_7zip_uses_app_injected_absolute_path(tmp_path: Path, monkeypatch) 
     assert find_7zip() == str(tool)
 
 
-def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(tmp_path: Path, monkeypatch) -> None:
     archive = tmp_path / "Demon.Slayer.Infinity.Castle.sup.7z"
     archive.write_bytes(b"fake archive")
     payload = tmp_path / "payload.sup"
@@ -54,8 +51,7 @@ def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(
     item = JimakuFile(
         url="https://example.test/movie.sup.7z",
         name=(
-            "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025."
-            "1080p.BDRip.AAC5.1.10bits.x265-Rapta.sup.7z"
+            "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025.1080p.BDRip.AAC5.1.10bits.x265-Rapta.sup.7z"
         ),
         size=1,
         last_modified="",
@@ -77,9 +73,5 @@ def test_sup_7z_is_extracted_when_finder_app_path_lacks_homebrew(
     assert candidates[0].verified_japanese is True
 
 
-def test_installer_injects_sevenzip_into_app_and_agent() -> None:
-    installer = Path("install.sh").read_text(encoding="utf-8")
-    assert 'SEVENZIP_BIN="$(brew --prefix sevenzip)/bin/7zz"' in installer
-    assert "PUDGE_7ZIP" in installer
-    assert 'setenv("PUDGE_7ZIP", __SEVENZIP_BIN__, 1);' in installer
-    assert '<key>PUDGE_7ZIP</key><string>$SEVENZIP_BIN</string>' in installer
+# install.sh hands the app and the agent the 7-Zip path (PUDGE_7ZIP): test_install_script.py
+# (test_agent_gets_the_tool_paths_..., test_launcher_runs_pudge_in_its_own_process_...).

@@ -4,7 +4,9 @@
 // returns focus to its tile, and follows library updates.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 
 const byId = new Map();
 let focused = null;
@@ -64,6 +66,7 @@ vm.createContext(ctx);
 ctx.__state = state;
 vm.runInContext("const ui = {lang: 'ru', lnState: __state};", ctx);
 assert.equal(ctx.ui, undefined);
+loadI18n(ctx, path.dirname(process.argv[2]));
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, {filename: 'ln_library.js'});
 const L = ctx.PudgeLnLibrary;
 
@@ -74,7 +77,8 @@ assert.equal(L.seriesTileHtml([book(1, 1, {series_key: 'solo'})]), '<article cla
 const series = n => Array.from({length: n}, (_, i) => book(100 + i, i + 1, {finished: i < 3}));
 const small = L.seriesTileHtml(series(4));
 const big = L.seriesTileHtml(series(20));
-const shape = html => html.replace(/data-ln-series-ids="[^"]*"/, 'IDS').replace(/\d+/g, '#');
+// Russian plural endings follow the count (4 тома / 20 томов); the slots must not.
+const shape = html => html.replace(/data-ln-series-ids="[^"]*"/, 'IDS').replace(/\d+/g, '#').replace(/# том(?:а|ов)?/g, '# том');
 assert.equal(shape(small), shape(big), 'tile slots do not depend on volume count');
 assert.equal((big.match(/<article/g) || []).length, 1);
 assert.equal((big.match(/ln-card-cover/g) || []).length, 1);
@@ -83,7 +87,8 @@ assert.match(big, /data-ln-group-open="series" data-ln-group-key="academy"/);
 assert.match(big, /data-ln-series-ids="100,101,/);
 assert.match(big, /<div class="ln-group-cover-col"><img class="ln-card-cover"|<div class="ln-group-cover-col"><div class="ln-card-cover/, 'Continue lives in the cover column');
 assert.match(big, /<button type="button" class="ln-group-continue" data-ln-action="read" data-id="103" title="Продолжить · том 4"[^>]*>Продолжить<\/button><\/div>/);
-assert.match(big, /Серия · 20 т\./);
+assert.match(big, /Серия · 20 томов/);
+assert.match(small, /Серия · 4 тома/);
 assert.match(big, /tabindex="0" role="button" aria-haspopup="dialog"/);
 
 // 3. Finished series: explicit state, no invented next volume.
@@ -100,7 +105,7 @@ const fr = L.franchiseTileHtml({key: 'tower', title: 'Хроники башни'
 ]});
 assert.match(fr, /data-ln-group-open="franchise" data-ln-group-key="tower"/);
 assert.match(fr, /data-ln-franchise-ids="201,202,203"/);
-assert.match(fr, /Франшиза · 2 сер\./);
+assert.match(fr, /Франшиза · 2 серии/);
 assert.match(fr, /data-id="203"/);
 
 // 5. Panel: all volumes, continue, Escape closes and restores focus.

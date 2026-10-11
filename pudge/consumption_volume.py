@@ -148,7 +148,10 @@ def _manga_visits(segments: list[dict[str, Any]]) -> dict[tuple[str, str], list[
         dwell = 0.0
         last_start: float | None = None
         for start, seconds, page in rows:
-            split = bool(current_page and (page != current_page or (last_start is not None and start - last_start > 30.0)))
+            split = bool(
+                current_page
+                and (page != current_page or (last_start is not None and start - last_start > 30.0))
+            )
             if split:
                 if dwell >= MANGA_DWELL_SECONDS:
                     result[key].append(current_page)
@@ -162,59 +165,61 @@ def _manga_visits(segments: list[dict[str, Any]]) -> dict[tuple[str, str], list[
     return result
 
 
-def aggregate_volume(
-    database: Database,
-    segments: list[dict[str, Any]],
+def _collect(
+    rows: list[dict[str, Any]],
+    target: dict[tuple[str, str, str, str], list[tuple[float, float]]],
+    denominators: dict[tuple[str, str], float],
+    metadata: dict[str, dict[str, Any]],
     *,
-    prior_segments: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Compute native material consumption without deriving it from progress deltas."""
-    prior_segments = prior_segments or []
-    metadata = _media_metadata(database)
+    metadata_denominators: bool = True,
+) -> None:
+    def keep(key: tuple[str, str], value: float | None) -> None:
+        if value is not None and value > 0:
+            denominators[key] = max(denominators.get(key, 0.0), value)
 
-    numeric: dict[tuple[str, str, str, str], list[tuple[float, float]]] = defaultdict(list)
-    prior_numeric: dict[tuple[str, str, str, str], list[tuple[float, float]]] = defaultdict(list)
-    denominators: dict[tuple[str, str], float] = {}
-
-    def collect(rows: list[dict[str, Any]], target: dict[tuple[str, str, str, str], list[tuple[float, float]]]) -> None:
-        for segment in rows:
-            kind = _kind(segment.get("kind"))
-            if kind not in {"anime", "audiobook", "light_novel"}:
+    for segment in rows:
+        kind = _kind(segment.get("kind"))
+        if kind not in {"anime", "audiobook", "light_novel"}:
+            continue
+        payload = segment.get("payload") or {}
+        for media in segment.get("media") or []:
+            media_uuid = str(media.get("media_uuid") or "")
+            if not media_uuid:
                 continue
-            payload = segment.get("payload") or {}
-            for media in segment.get("media") or []:
-                media_uuid = str(media.get("media_uuid") or "")
-                if not media_uuid:
+            revision = str(
+                media.get("source_revision") or metadata.get(media_uuid, {}).get("source_revision") or ""
+            )
+            if kind in {"anime", "audiobook"}:
+                interval = _position_range(segment, media)
+                if interval is None:
                     continue
-                revision = str(media.get("source_revision") or metadata.get(media_uuid, {}).get("source_revision") or "")
-                if kind in {"anime", "audiobook"}:
-                    interval = _position_range(segment, media)
-                    if interval is None:
-                        continue
-                    target[(media_uuid, revision, kind, "timeline")].append(interval)
-                    if kind == "anime":
-                        duration = _finite_float(payload.get("duration_seconds"))
-                    else:
-                        duration = _finite_float(metadata.get(media_uuid, {}).get("metadata", {}).get("duration_seconds"))
-                    if duration is not None and duration > 0:
-                        denominators[(media_uuid, kind)] = max(denominators.get((media_uuid, kind), 0.0), duration)
-                else:
-                    interval = _ln_range(media)
-                    if interval is None:
-                        continue
-                    chapter, start, end = interval
-                    target[(media_uuid, revision, kind, chapter)].append((start, end))
-                    total = _finite_float(metadata.get(media_uuid, {}).get("metadata", {}).get("character_count"))
-                    if total is not None and total > 0:
-                        denominators[(media_uuid, kind)] = max(denominators.get((media_uuid, kind), 0.0), total)
+                target[(media_uuid, revision, kind, "timeline")].append(interval)
+                if kind == "anime":
+                    keep((media_uuid, kind), _finite_float(payload.get("duration_seconds")))
+                elif metadata_denominators:
+                    keep((media_uuid, kind), _metadata_denominator(metadata, media_uuid, kind))
+            else:
+                interval = _ln_range(media)
+                if interval is None:
+                    continue
+                chapter, start, end = interval
+                target[(media_uuid, revision, kind, chapter)].append((start, end))
+                if metadata_denominators:
+                    keep((media_uuid, kind), _metadata_denominator(metadata, media_uuid, kind))
 
-    collect(segments, numeric)
-    collect(prior_segments, prior_numeric)
-    selected_manga = _manga_visits(segments)
-    prior_manga = _manga_visits(prior_segments)
 
+def _metadata_denominator(metadata: dict[str, dict[str, Any]], media_uuid: str, kind: str) -> float | None:
+    values = metadata.get(media_uuid, {}).get("metadata", {})
+    if kind == "audiobook":
+        return _finite_float(values.get("duration_seconds"))
+    if kind == "light_novel":
+        return _finite_float(values.get("character_count"))
+    return None
+
+
+def _manga_page_counts(rows: list[dict[str, Any]], denominators: dict[tuple[str, str], float]) -> None:
     # Manga denominator is supplied by the reader independently of OCR.
-    for segment in segments + prior_segments:
+    for segment in rows:
         if _kind(segment.get("kind")) != "manga":
             continue
         page_count = _finite_float((segment.get("payload") or {}).get("page_count"))
@@ -223,7 +228,105 @@ def aggregate_volume(
         for media in segment.get("media") or []:
             media_uuid = str(media.get("media_uuid") or "")
             if media_uuid:
-                denominators[(media_uuid, "manga")] = max(denominators.get((media_uuid, "manga"), 0.0), page_count)
+                denominators[(media_uuid, "manga")] = max(
+                    denominators.get((media_uuid, "manga"), 0.0), page_count
+                )
+
+
+def prior_volume_state(database: Database, segments: list[dict[str, Any]]) -> dict[str, Any]:
+    """What history before a report period contributes to its volume, in compact form.
+
+    Merged position intervals, distinct manga pages and denominators that come from
+    the events themselves. Everything here combines by union/max, so states for
+    consecutive spans of history can be merged (and stored per closed day).
+    """
+    numeric: dict[tuple[str, str, str, str], list[tuple[float, float]]] = defaultdict(list)
+    denominators: dict[tuple[str, str], float] = {}
+    _collect(segments, numeric, denominators, _media_metadata(database), metadata_denominators=False)
+    _manga_page_counts(segments, denominators)
+    return {
+        "numeric": {key: _merged(rows) for key, rows in numeric.items()},
+        "manga": {key: sorted(set(pages)) for key, pages in _manga_visits(segments).items()},
+        "denominators": denominators,
+    }
+
+
+def merge_prior_volume_states(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    numeric = {key: list(rows) for key, rows in first.get("numeric", {}).items()}
+    for key, rows in second.get("numeric", {}).items():
+        numeric[key] = _merged([*numeric.get(key, []), *rows])
+    manga = {key: list(pages) for key, pages in first.get("manga", {}).items()}
+    for key, pages in second.get("manga", {}).items():
+        manga[key] = sorted(set(manga.get(key, [])) | set(pages))
+    denominators = dict(first.get("denominators", {}))
+    for key, value in second.get("denominators", {}).items():
+        denominators[key] = max(denominators.get(key, 0.0), float(value))
+    return {"numeric": numeric, "manga": manga, "denominators": denominators}
+
+
+_SEPARATOR = "\x1f"
+
+
+def dump_prior_volume_state(state: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "numeric": {
+                _SEPARATOR.join(key): [[a, b] for a, b in rows] for key, rows in state["numeric"].items()
+            },
+            "manga": {_SEPARATOR.join(key): list(pages) for key, pages in state["manga"].items()},
+            "denominators": {_SEPARATOR.join(key): value for key, value in state["denominators"].items()},
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def load_prior_volume_state(text: str) -> dict[str, Any]:
+    raw = json.loads(text)
+    return {
+        "numeric": {
+            tuple(key.split(_SEPARATOR)): [(float(a), float(b)) for a, b in rows]
+            for key, rows in raw["numeric"].items()
+        },
+        "manga": {
+            tuple(key.split(_SEPARATOR)): [str(page) for page in pages] for key, pages in raw["manga"].items()
+        },
+        "denominators": {
+            tuple(key.split(_SEPARATOR)): float(value) for key, value in raw["denominators"].items()
+        },
+    }
+
+
+def aggregate_volume(
+    database: Database,
+    segments: list[dict[str, Any]],
+    *,
+    prior_segments: list[dict[str, Any]] | None = None,
+    prior_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compute native material consumption without deriving it from progress deltas.
+
+    History before the period comes as raw ``prior_segments`` or as a precomputed
+    ``prior_state`` (see prior_volume_state); both give the same result.
+    """
+    metadata = _media_metadata(database)
+    if prior_state is None:
+        prior_state = prior_volume_state(database, prior_segments or [])
+
+    numeric: dict[tuple[str, str, str, str], list[tuple[float, float]]] = defaultdict(list)
+    prior_numeric: dict[tuple[str, str, str, str], list[tuple[float, float]]] = prior_state["numeric"]
+    denominators: dict[tuple[str, str], float] = {}
+
+    _collect(segments, numeric, denominators, metadata)
+    for key, value in prior_state["denominators"].items():
+        denominators[key] = max(denominators.get(key, 0.0), float(value))
+    for media_uuid, _revision, kind, _part in prior_numeric:
+        value = _metadata_denominator(metadata, media_uuid, kind)
+        if value is not None and value > 0:
+            denominators[(media_uuid, kind)] = max(denominators.get((media_uuid, kind), 0.0), value)
+    selected_manga = _manga_visits(segments)
+    prior_manga = prior_state["manga"]
+    _manga_page_counts(segments, denominators)
 
     by_media: dict[str, dict[str, Any]] = {}
 
@@ -297,10 +400,17 @@ def aggregate_volume(
             media_uuid = str(media.get("media_uuid") or "")
             if media_uuid and media_uuid not in by_media:
                 by_media[media_uuid] = {
-                    "media_uuid": media_uuid, "kind": "visual_novel", "unit": "unknown",
-                    "exact": False, "consumed": None, "unique_in_scope": None,
-                    "first_in_scope": None, "repeat_in_scope": None,
-                    "lifetime_unique": None, "total_available": None, "coverage": None,
+                    "media_uuid": media_uuid,
+                    "kind": "visual_novel",
+                    "unit": "unknown",
+                    "exact": False,
+                    "consumed": None,
+                    "unique_in_scope": None,
+                    "first_in_scope": None,
+                    "repeat_in_scope": None,
+                    "lifetime_unique": None,
+                    "total_available": None,
+                    "coverage": None,
                 }
 
     by_kind: dict[str, dict[str, Any]] = {}
@@ -308,7 +418,9 @@ def aggregate_volume(
         kind = str(row["kind"])
         if kind not in by_kind:
             by_kind[kind] = {
-                "kind": kind, "unit": row["unit"], "exact": bool(row["exact"]),
+                "kind": kind,
+                "unit": row["unit"],
+                "exact": bool(row["exact"]),
                 "consumed": 0.0 if row["consumed"] is not None else None,
                 "first_in_scope": 0.0 if row["first_in_scope"] is not None else None,
                 "repeat_in_scope": 0.0 if row["repeat_in_scope"] is not None else None,

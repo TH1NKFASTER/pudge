@@ -19,12 +19,14 @@ class ProcessIdentity:
 
 
 def process_snapshot() -> dict[int, ProcessIdentity]:
-    if sys.platform == 'linux':
+    if sys.platform == "linux":
         return _linux_process_snapshot()
     # lstart works on macOS and Linux. Never collect arguments or credentials.
     process = subprocess.Popen(
-        ['ps', '-axo', 'pid=,ppid=,lstart=,stat='],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        ["ps", "-axo", "pid=,ppid=,lstart=,stat="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
         env={**os.environ, "LC_ALL": "C"},
     )
     try:
@@ -34,7 +36,7 @@ def process_snapshot() -> dict[int, ProcessIdentity]:
         process.communicate()
         raise
     if process.returncode:
-        raise OSError('Cannot inspect owned process tree')
+        raise OSError("Cannot inspect owned process tree")
     result = {}
     for line in output.splitlines():
         fields = line.split()
@@ -45,38 +47,51 @@ def process_snapshot() -> dict[int, ProcessIdentity]:
         except ValueError:
             continue
         if pid > 1 and pid != process.pid:
-            result[pid] = ProcessIdentity(pid, parent, ' '.join(fields[2:7]), fields[7])
+            result[pid] = ProcessIdentity(pid, parent, " ".join(fields[2:7]), fields[7])
     return result
 
 
-def _linux_process_snapshot(proc: Path = Path('/proc')) -> dict[int, ProcessIdentity]:
+def _linux_process_snapshot(proc: Path = Path("/proc")) -> dict[int, ProcessIdentity]:
     # A container's /proc can expose outer PIDs while os.kill uses inner PIDs.
     # Only translate processes in our own PID namespace; unrelated namespaces
     # can have the same inner PID. Start ticks also protect against PID reuse.
-    namespace = os.readlink(proc / 'self/ns/pid')
+    namespace = os.readlink(proc / "self/ns/pid")
     rows: dict[int, tuple[int, int, str, str]] = {}
     for entry in proc.iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            if os.readlink(entry / 'ns/pid') != namespace:
+            if os.readlink(entry / "ns/pid") != namespace:
                 continue
-            status = dict(line.split(':', 1) for line in (entry / 'status').read_text().splitlines()
-                          if ':' in line)
-            local_pid = int(status.get('NSpid', entry.name).split()[-1])
-            outer_parent = int(status['PPid'])
+            status = dict(
+                line.split(":", 1) for line in (entry / "status").read_text().splitlines() if ":" in line
+            )
+            local_pid = int(status.get("NSpid", entry.name).split()[-1])
+            outer_parent = int(status["PPid"])
             # comm can contain spaces and parentheses. Fields after the last
             # ')' start with state (field 3); starttime is field 22.
-            fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             rows[int(entry.name)] = (local_pid, outer_parent, fields[19], fields[0])
         except (OSError, ValueError, KeyError, IndexError):
             continue  # Exited or inaccessible; never guess a process identity.
     if os.getpid() not in {row[0] for row in rows.values()}:
-        raise OSError('Cannot inspect own PID namespace')
+        raise OSError("Cannot inspect own PID namespace")
     return {
-        pid: ProcessIdentity(pid, rows[parent][0] if parent in rows else 0, 'ticks:' + started, state)
-        for pid, parent, started, state in rows.values() if pid > 1
+        pid: ProcessIdentity(pid, rows[parent][0] if parent in rows else 0, "ticks:" + started, state)
+        for pid, parent, started, state in rows.values()
+        if pid > 1
     }
+
+
+def _multiprocessing_tracker_pid() -> int | None:
+    """multiprocessing's resource tracker of this process, if one runs.
+
+    It exits by itself, after unlinking what is left, once this process is gone. Killing
+    it first makes multiprocessing relaunch it, warn that resources might leak and lose
+    track of the semaphores registered with it."""
+    tracker = sys.modules.get("multiprocessing.resource_tracker")
+    pid = getattr(getattr(tracker, "_resource_tracker", None), "_pid", None)
+    return pid if isinstance(pid, int) and pid > 1 else None
 
 
 class OwnedProcessTree:
@@ -92,26 +107,33 @@ class OwnedProcessTree:
 
     def capture(self) -> None:
         snapshot = process_snapshot()
+        tracker = _multiprocessing_tracker_pid() if self.root == os.getpid() else None
+        if tracker is not None and tracker in snapshot and snapshot[tracker].parent == self.root:
+            self._excluded[tracker] = snapshot[tracker]
         root = snapshot.get(self.root)
         if self._root_started is None and root is not None:
             self._root_started = root.started
         parents = {self.root} if root is not None and root.started == self._root_started else set()
-        parents.update(pid for pid, row in self.owned.items()
-                       if pid in snapshot and snapshot[pid].started == row.started)
-        excluded = {pid for pid, row in self._excluded.items()
-                    if pid in snapshot and snapshot[pid].started == row.started}
+        parents.update(
+            pid for pid, row in self.owned.items() if pid in snapshot and snapshot[pid].started == row.started
+        )
+        excluded = {
+            pid
+            for pid, row in self._excluded.items()
+            if pid in snapshot and snapshot[pid].started == row.started
+        }
         parents.update(excluded)
         while True:
-            children = {pid for pid, row in snapshot.items()
-                        if row.parent in parents and pid not in parents}
+            children = {pid for pid, row in snapshot.items() if row.parent in parents and pid not in parents}
             if not children:
                 break
             parents.update(children)
         for pid in parents - {self.root}:
             self.owned[pid] = snapshot[pid]
         while True:
-            children = {pid for pid, row in snapshot.items()
-                        if row.parent in excluded and pid not in excluded}
+            children = {
+                pid for pid, row in snapshot.items() if row.parent in excluded and pid not in excluded
+            }
             if not children:
                 break
             excluded.update(children)
@@ -125,8 +147,9 @@ class OwnedProcessTree:
             self.capture()
             excluded = {int(pid) for pid in roots if int(pid) in self.owned}
             while True:
-                children = {pid for pid, row in self.owned.items()
-                            if row.parent in excluded and pid not in excluded}
+                children = {
+                    pid for pid, row in self.owned.items() if row.parent in excluded and pid not in excluded
+                }
                 if not children:
                     break
                 excluded.update(children)
@@ -135,9 +158,13 @@ class OwnedProcessTree:
 
     def _alive(self) -> dict[int, ProcessIdentity]:
         current = process_snapshot()
-        return {pid: row for pid, row in list(self.owned.items())
-                if pid in current and current[pid].started == row.started
-                and not current[pid].state.startswith('Z')}
+        return {
+            pid: row
+            for pid, row in list(self.owned.items())
+            if pid in current
+            and current[pid].started == row.started
+            and not current[pid].state.startswith("Z")
+        }
 
     def _signal(self, sig: signal.Signals) -> None:
         # Recheck process identity to avoid signaling a reused PID. No global
@@ -148,17 +175,17 @@ class OwnedProcessTree:
             except ProcessLookupError:
                 pass
 
-    def stop(self, *, grace: float = .6) -> list[int]:
+    def stop(self, *, grace: float = 0.6) -> list[int]:
         with self._lock:
             self.capture()
             self._signal(signal.SIGTERM)
             deadline = time.monotonic() + max(0, grace)
             while self._alive() and time.monotonic() < deadline:
-                time.sleep(.025)
+                time.sleep(0.025)
             # Include workers created during cancellation, before their parent dies.
             self.capture()
             self._signal(signal.SIGKILL)
-            deadline = time.monotonic() + .6
+            deadline = time.monotonic() + 0.6
             while self._alive() and time.monotonic() < deadline:
-                time.sleep(.025)
+                time.sleep(0.025)
             return sorted(self._alive())

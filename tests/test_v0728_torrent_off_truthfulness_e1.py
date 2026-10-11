@@ -1,8 +1,8 @@
 """A desired global Off is not a zero-speed backend measurement."""
+
 from __future__ import annotations
 
 import logging
-import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,9 +43,9 @@ def test_off_does_not_publish_unobserved_zero_and_never_polls_clients() -> None:
     assert result["observed_state"] == "unknown"
     assert result["stale"] is True
     assert result["observed_at"] is None
-    assert all(result[field] is None for field in (
-        "download_speed", "upload_speed", "active", "waiting", "paused"
-    ))
+    assert all(
+        result[field] is None for field in ("download_speed", "upload_speed", "active", "waiting", "paused")
+    )
 
 
 def test_on_poll_finishing_after_off_cannot_publish_old_active_rate() -> None:
@@ -56,9 +56,7 @@ def test_on_poll_finishing_after_off_cannot_publish_old_active_rate() -> None:
         def torrents(self, *, category):
             entered.set()
             assert release.wait(timeout=5)
-            return [SimpleNamespace(
-                state="downloading", raw={"dlspeed": 1_000_000, "upspeed": 0}
-            )]
+            return [SimpleNamespace(state="downloading", raw={"dlspeed": 1_000_000, "upspeed": 0})]
 
         def close(self):
             pass
@@ -122,7 +120,8 @@ def test_toggle_ack_separates_intents_from_unobserved_backend_queue(tmp_path: Pa
     api.manager.download_intents = SimpleNamespace(waiting_count=lambda: 7)
     api.manager.torrent_backend_name = lambda: "aria2"
     api._quiesce_torrent_backends = lambda *, reason: {
-        "aria2_stopped": False, "qbittorrent_paused": 0,
+        "aria2_stopped": False,
+        "qbittorrent_paused": 0,
     }
     monkeypatch.setattr(web_app, "write_config", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(web_app, "write_torrents_enabled", lambda *_args, **_kwargs: None)
@@ -130,39 +129,42 @@ def test_toggle_ack_separates_intents_from_unobserved_backend_queue(tmp_path: Pa
     assert result["enabled"] is False
     assert result["waiting"] is None
     assert result["pending_intents"] == 7
-    assert result["transition"] == "unconfirmed"
+    # Acknowledged at once; the backends are being stopped in the background.
+    assert result["transition"] == "stopping"
+    assert api._wait_torrent_off_quiet(5)
+    assert api.torrent_traffic_status()["transition"] != "stopping"  # then observed
 
 
-def test_browser_discards_pre_toggle_poll_after_off() -> None:
-    html = (Path(__file__).resolve().parents[1] / "pudge/web/index.html").read_text()
-    poll = html.split("async function pollTorrentTraffic(){", 1)[1].split(
-        "\nfunction renderSafely", 1
-    )[0]
-    script = r"""
-const assert=require('node:assert/strict');
-const ui={state:{settings:{torrents_enabled:true}},torrentTraffic:null,
-  torrentTrafficPolling:false,torrentTrafficRevision:0,torrentToggleDesired:null};
-let deliver, renders=0;
-const torrentHttpJson=()=>new Promise(resolve=>{deliver=resolve;});
-const scheduleTorrentTrafficPoll=()=>{};
-const refreshTorrentToggle=()=>{renders++;};
-const document={hidden:false};
-ui.windowActive=true;
-async function pollTorrentTraffic(){""" + poll + "\n" + r"""
-(async()=>{
-  const pending=pollTorrentTraffic();
-  assert.equal(typeof deliver,'function');
-  ui.torrentTrafficRevision++;
-  ui.torrentToggleDesired=false;
-  ui.state.settings.torrents_enabled=false;
-  deliver({enabled:true,download_speed:100000,observed_at:123});
-  await pending;
-  assert.equal(ui.state.settings.torrents_enabled,false);
-  assert.equal(ui.torrentTraffic,null);
-  assert.equal(renders,0);
-})().catch(e=>{console.error(e);process.exitCode=1;});
+# Status polls and the switch's POST wait until the test answers them.
+HELD = """
+window.__polls = []; window.__posts = [];
+window.fetch = (url, init) => new Promise(resolve => {
+  const answer = body => resolve(new Response(JSON.stringify(body)));
+  (String(url).endsWith('/api/torrents/enabled') ? window.__posts : window.__polls).push(answer);
+});
 """
-    result = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=10, check=False
+ON = "{ok: true, enabled: true, download_speed: 100000, upload_speed: 0, updated_at: Date.now() / 1000}"
+
+
+def test_browser_discards_pre_toggle_poll_after_off(page) -> None:
+    # A status poll that left before the user switched torrents off answers "on, 100 KB/s"
+    # afterwards: the window stays off and shows no speed.
+    result = page.run(
+        """
+        await __tick(300);
+        const polling = window.__polls.length;
+        await __click('#torrentToggleButton'); await __tick(10);
+        window.__posts.shift()({ok: true, enabled: false, transition: 'off_requested'}); await __tick(10);
+        const off = __text('#torrentToggleButton');
+        window.__polls.shift()(ON); await __tick(10);
+        return {polling, off, after: __text('#torrentToggleButton'), enabled: ui.state.settings.torrents_enabled,
+                offLabel: t('ui.torrentsOff2')};
+        """.replace("ON", ON),
+        state={"settings": {"torrents_enabled": True}},
+        before=HELD,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.value
+    assert out["polling"] == 1
+    assert out["off"].startswith(out["offLabel"])
+    assert out["after"] == out["off"] and "↓" not in out["after"]
+    assert out["enabled"] is False

@@ -89,20 +89,36 @@ def rules_from_mapping(mapping: ExternalMapping) -> tuple[EpisodeMappingRule, ..
                 continue  # one source episode split over several target episodes: not a 1:1 rule
             rules.append(
                 EpisodeMappingRule(
-                    **base, target_season=int(rule.target_season), kind="pair",
-                    episode_type=episode_type, source_episode=int(source), target_episode=int(targets[0]),
+                    **base,
+                    target_season=int(rule.target_season),
+                    kind="pair",
+                    episode_type=episode_type,
+                    source_episode=int(source),
+                    target_episode=int(targets[0]),
                 )
             )
-        if rule.start is not None and rule.end is not None and rule.offset is not None and rule.start <= rule.end:
+        if (
+            rule.start is not None
+            and rule.end is not None
+            and rule.offset is not None
+            and rule.start <= rule.end
+        ):
             rules.append(
                 EpisodeMappingRule(
-                    **base, target_season=int(rule.target_season), kind="range", episode_type=episode_type,
-                    start=int(rule.start), end=int(rule.end), offset=int(rule.offset),
+                    **base,
+                    target_season=int(rule.target_season),
+                    kind="range",
+                    episode_type=episode_type,
+                    start=int(rule.start),
+                    end=int(rule.end),
+                    offset=int(rule.offset),
                 )
             )
     rules.append(
         EpisodeMappingRule(
-            **base, target_season=int(mapping.tvdb_season), kind="offset",
+            **base,
+            target_season=int(mapping.tvdb_season),
+            kind="offset",
             offset=int(mapping.tvdb_episode_offset or 0),
         )
     )
@@ -160,12 +176,12 @@ def from_target(
     """(tvdb season, episode) → regular AniList episode, only when exactly one maps there."""
     if not rules or int(season) == 0:
         return None  # season 0 is specials: never a regular episode
-    limit = int(total_episodes) if total_episodes else max(
-        [rule.end or 0 for rule in rules] + [rule.source_episode or 0 for rule in rules] + [0]
-    ) + 400
+    limit = (
+        int(total_episodes)
+        if total_episodes
+        else max([rule.end or 0 for rule in rules] + [rule.source_episode or 0 for rule in rules] + [0]) + 400
+    )
     candidates = {
-        local
-        for local in range(1, limit + 1)
-        if to_target(rules, local) == (int(season), int(episode))
+        local for local in range(1, limit + 1) if to_target(rules, local) == (int(season), int(episode))
     }
     return candidates.pop() if len(candidates) == 1 else None

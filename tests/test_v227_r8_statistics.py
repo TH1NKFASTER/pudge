@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from pudge.consumption import ConsumptionConflictError, ConsumptionLedger
 from pudge.consumption_statistics import ConsumptionStatistics
 from pudge.database import Database, LATEST_SCHEMA_VERSION
+from tests.i18n_support import en, has_text
 
 
 def _link(media_uuid: str) -> list[dict[str, object]]:
@@ -47,12 +49,18 @@ def test_r8_schema_is_additive_and_has_statistics_tables(tmp_path: Path) -> None
         assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == LATEST_SCHEMA_VERSION
         assert LATEST_SCHEMA_VERSION >= 10
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        assert {"consumption_corrections", "consumption_manual_entries", "consumption_daily_rollups"} <= tables
+        assert {
+            "consumption_corrections",
+            "consumption_manual_entries",
+            "consumption_daily_rollups",
+        } <= tables
         columns = {row[1] for row in conn.execute("PRAGMA table_info(consumption_devices)")}
         assert "device_name" in columns
 
 
-def test_event_timezone_is_taken_from_computer_automatically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_event_timezone_is_taken_from_computer_automatically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if not hasattr(time, "tzset"):
         pytest.skip("tzset unavailable")
     old = os.environ.get("TZ")
@@ -62,9 +70,13 @@ def test_event_timezone_is_taken_from_computer_automatically(tmp_path: Path, mon
         db = Database(tmp_path / "db.sqlite3")
         ledger = ConsumptionLedger(db)
         media = ledger.ensure_media(kind="manga", title="Volume", aliases=[("stable", "v1")])
-        session = _event(ledger, media_uuid=media.media_uuid, kind="manga", start=1_700_000_000, end=1_700_000_010)
+        session = _event(
+            ledger, media_uuid=media.media_uuid, kind="manga", start=1_700_000_000, end=1_700_000_010
+        )
         with db.connect() as conn:
-            row = conn.execute("SELECT timezone_iana,utc_offset FROM consumption_events WHERE session_id=?", (session,)).fetchone()
+            row = conn.execute(
+                "SELECT timezone_iana,utc_offset FROM consumption_events WHERE session_id=?", (session,)
+            ).fetchone()
         assert row["timezone_iana"] == "Asia/Almaty"
         expected_offset = int(datetime.fromtimestamp(1_700_000_010).astimezone().utcoffset().total_seconds())
         assert int(row["utc_offset"]) == expected_offset
@@ -85,11 +97,19 @@ def test_ln_audio_overlap_counts_physical_time_once(tmp_path: Path) -> None:
     audio = ledger.ensure_media(kind="audiobook", title="Audio", aliases=[("stable", "audio")])
     group = "ln-audio:test"
     _event(
-        ledger, media_uuid=ln.media_uuid, kind="light_novel", start=base, end=base + 30,
+        ledger,
+        media_uuid=ln.media_uuid,
+        kind="light_novel",
+        start=base,
+        end=base + 30,
         activity_group_id=group,
     )
     _event(
-        ledger, media_uuid=audio.media_uuid, kind="audiobook", start=base + 10, end=base + 40,
+        ledger,
+        media_uuid=audio.media_uuid,
+        kind="audiobook",
+        start=base + 10,
+        end=base + 40,
         activity_group_id=group,
     )
 
@@ -103,7 +123,6 @@ def test_ln_audio_overlap_counts_physical_time_once(tmp_path: Path) -> None:
     assert result["works"][0]["kind"] == "light_novel+audiobook"
     assert result["works"][0]["seconds"] == pytest.approx(40.0)
     assert set(result["works"][0]["media_uuids"]) == {ln.media_uuid, audio.media_uuid}
-
 
 
 def test_unrelated_ln_and_audio_overlap_is_simultaneous(tmp_path: Path) -> None:
@@ -133,11 +152,19 @@ def test_ln_format_filter_keeps_linked_audio_half(tmp_path: Path) -> None:
     audio = ledger.ensure_media(kind="audiobook", title="Audio", aliases=[("stable", "audio-f")])
     group = "ln-audio:filter"
     _event(
-        ledger, media_uuid=ln.media_uuid, kind="light_novel", start=base, end=base + 30,
+        ledger,
+        media_uuid=ln.media_uuid,
+        kind="light_novel",
+        start=base,
+        end=base + 30,
         activity_group_id=group,
     )
     _event(
-        ledger, media_uuid=audio.media_uuid, kind="audiobook", start=base + 10, end=base + 40,
+        ledger,
+        media_uuid=audio.media_uuid,
+        kind="audiobook",
+        start=base + 10,
+        end=base + 40,
         activity_group_id=group,
     )
 
@@ -154,13 +181,22 @@ def test_session_correction_is_revisioned_and_rebuilds_totals(tmp_path: Path) ->
     session = _event(ledger, media_uuid=media.media_uuid, kind="manga", start=100, end=110)
     assert stats.query({"period": "all"}, now=200)["summary"]["total_seconds"] == pytest.approx(10)
 
-    first = stats.correction(target_type="session", target_id=session, expected_revision=0, excluded=True, reason="idle")
+    first = stats.correction(
+        target_type="session", target_id=session, expected_revision=0, excluded=True, reason="idle"
+    )
     assert first["revision"] == 1
     assert stats.query({"period": "all"}, now=200)["summary"]["total_seconds"] == pytest.approx(0)
     with pytest.raises(ConsumptionConflictError):
         stats.correction(target_type="session", target_id=session, expected_revision=0, excluded=False)
 
-    stats.correction(target_type="session", target_id=session, expected_revision=1, excluded=False, start_utc=120, end_utc=125)
+    stats.correction(
+        target_type="session",
+        target_id=session,
+        expected_revision=1,
+        excluded=False,
+        start_utc=120,
+        end_utc=125,
+    )
     result = stats.query({"period": "all"}, now=200)
     assert result["summary"]["total_seconds"] == pytest.approx(5)
     assert result["journal"][0]["correction_revision"] == 2
@@ -176,7 +212,9 @@ def test_manual_duration_without_timestamp_is_not_drawn_as_fake_time(tmp_path: P
     assert result["journal"][0]["measurement_method"] == "manual_duration_only"
 
 
-def test_local_midnight_split_uses_current_computer_timezone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_midnight_split_uses_current_computer_timezone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if not hasattr(time, "tzset"):
         pytest.skip("tzset unavailable")
     old = os.environ.get("TZ")
@@ -221,7 +259,6 @@ def test_csv_export_uses_same_filtered_scope(tmp_path: Path) -> None:
     assert rows[0]["title"] == "Manga"
 
 
-
 def test_daily_rollup_rebuild_persists_real_event_count(tmp_path: Path) -> None:
     db = Database(tmp_path / "db.sqlite3")
     ledger = ConsumptionLedger(db)
@@ -250,10 +287,20 @@ def test_csv_export_is_not_truncated_at_ui_page_limit(tmp_path: Path) -> None:
     with db.connect() as conn:
         rows = []
         for index in range(1005):
-            rows.append((
-                f"manual-{index}", media.media_uuid, "manga", "Bulk", now + index, 1.0,
-                "", "manual", now + index, now + index,
-            ))
+            rows.append(
+                (
+                    f"manual-{index}",
+                    media.media_uuid,
+                    "manga",
+                    "Bulk",
+                    now + index,
+                    1.0,
+                    "",
+                    "manual",
+                    now + index,
+                    now + index,
+                )
+            )
         conn.executemany(
             """
             INSERT INTO consumption_manual_entries(
@@ -268,16 +315,55 @@ def test_csv_export_is_not_truncated_at_ui_page_limit(tmp_path: Path) -> None:
     with Path(exported["path"]).open(encoding="utf-8-sig", newline="") as handle:
         assert len(list(csv.DictReader(handle))) == 1005
 
-def test_statistics_ui_has_no_report_timezone_selector() -> None:
-    root = Path(__file__).parents[1]
-    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    js = (root / "pudge" / "web" / "statistics.js").read_text(encoding="utf-8")
-    assert 'data-page="statistics"' in html
-    assert 'id="statistics"' in html
-    assert "consumption_statistics_query" in js
-    assert "statsTimezone" not in js
-    assert "report timezone" not in js.casefold()
-    assert "follows this computer automatically" in js
+
+# The page harness clock: 2026-10-01 12:00 UTC.
+PAGE_NOW = datetime(2026, 10, 1, 12, tzinfo=timezone.utc).timestamp()
+
+
+def _statistics_payload(tmp_path: Path, scope: dict[str, object]) -> dict[str, object]:
+    """What consumption_statistics_query answers: two minutes of manga yesterday."""
+    db = Database(tmp_path / "stats.sqlite3")
+    ledger = ConsumptionLedger(db)
+    media = ledger.ensure_media(kind="manga", title="Volume", aliases=[("stable", "page-v1")])
+    session = None
+    for start in range(int(PAGE_NOW) - 86_400, int(PAGE_NOW) - 86_400 + 120, 30):  # events are at most 30 s
+        session = _event(
+            ledger, media_uuid=media.media_uuid, kind="manga", start=start, end=start + 30, session_id=session
+        )
+    payload = ConsumptionStatistics(db).query(scope, now=PAGE_NOW)
+    return json.loads(json.dumps(payload, default=str))
+
+
+def test_statistics_page_follows_the_computer_time_zone_without_a_selector(page, tmp_path: Path) -> None:
+    # Reports use this computer's zone automatically; the old "report timezone" selector is gone.
+    assert not has_text("report timezone") and not has_text("Report timezone")
+    assert "follows this computer automatically" in en("stats.timezoneNote", zone="UTC")
+    payload = _statistics_payload(tmp_path, {"period": "30d"})
+    zone = payload["timezone"]["label"]
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            await __click('.nav button[data-page="statistics"]'); await __tick(50);
+            return {visible: __visible('#statistics'), text: __text('#statisticsContent'),
+                    controls: [...document.querySelectorAll('#statisticsContent select, #statisticsContent input')].map(el => el.id),
+                    note: PudgeI18n.t('stats.timezoneNote', {zone: ZONE}), total: __text('#statsBody .stats-card strong'),
+                    twoMinutes: PudgeI18n.t('stats.durationMinutesSeconds', {minutes: 2, seconds: 0})};
+            """.replace("ZONE", json.dumps(zone)),
+            lang=lang,
+            api={"consumption_statistics_query": payload},
+        )
+        out = result.value
+        assert out["visible"] is True
+        [[scope, limit, offset]] = result.calls_of("consumption_statistics_query")
+        assert (scope["period"], scope["kind"], limit, offset) == ("30d", "all", 200, 0)
+        assert out["note"] in out["text"] and zone in out["note"]
+        assert out["controls"] == [
+            "statsKind",
+            "statsMedia",
+            "statsStartDate",
+            "statsEndDate",
+        ]  # no zone choice
+        assert out["total"] == out["twoMinutes"]
 
 
 def test_reader_observation_caps_one_frontend_heartbeat_to_fifteen_seconds() -> None:
@@ -299,7 +385,9 @@ def test_reader_observation_caps_one_frontend_heartbeat_to_fifteen_seconds() -> 
     assert calls[0]["active_seconds"] == pytest.approx(15.0)
 
 
-def test_runtime_recorder_counts_contiguous_audio_but_drops_sleep_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_recorder_counts_contiguous_audio_but_drops_sleep_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from pudge import web_app
 
     class CancelAfterTwoPolls:

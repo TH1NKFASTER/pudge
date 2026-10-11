@@ -84,9 +84,7 @@ def test_sparse_cold_open_requires_stable_post_opening_dialogue(tmp_path: Path) 
     broken_reference = _write(
         tmp_path / "broken-reference.srt",
         [
-            (start + 5.0, end + 5.0, text)
-            if start >= 100.0
-            else (start, end, text)
+            (start + 5.0, end + 5.0, text) if start >= 100.0 else (start, end, text)
             for start, end, text in parse_srt(reference)
         ],
     )

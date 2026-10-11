@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 from pudge import web_app
 from pudge.presentation_state import derive_episode_presentation
+from test_v197_torrent_http_bridge import SWITCH
+from tests.i18n_support import en, ru
 
 
 def _download(*, state: str = "active", progress: float = 0.12, backend: str = "aria2"):
@@ -111,7 +113,6 @@ def test_enable_followup_resumes_existing_job_before_discovery() -> None:
     assert events.count("resume:deadbeef") == 1
 
 
-
 def test_download_payload_does_not_pause_just_because_backend_is_unconfigured() -> None:
     api = web_app.WebAppApi.__new__(web_app.WebAppApi)
     api.config = SimpleNamespace(
@@ -137,22 +138,49 @@ def test_download_payload_without_config_keeps_observed_backend_state() -> None:
     assert payload["state"] == "active"
     assert payload["effective_state"] == "active"
 
-def test_frontend_exposes_paused_job_state_and_count() -> None:
-    home = (web_app.Path(web_app.__file__).parent / "web" / "home_status.js").read_text(
-        encoding="utf-8"
-    )
-    index = (web_app.Path(web_app.__file__).parent / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
 
-    assert "download?.effective_state||download?.state" in home
-    assert "p.status==='paused_download'" in home
-    # The shared classifier localizes the paused label and appends progress.
-    helper = (web_app.Path(web_app.__file__).parent / "web" / "torrent_status_ui.js").read_text(
-        encoding="utf-8"
-    )
-    assert "torrentUiLabel(kind,ui.lang)" in home
-    assert "paused:'Paused'" in helper
-    assert "compactDownloadStatus(download)" in index
-    assert "live.paused" in index
-    assert "fallbackPaused" in index
+# A download at 12% that the backend reports paused because torrent traffic is off.
+PAUSED_DOWNLOAD = {
+    "hash": "deadbeef",
+    "name": "Example 01",
+    "media_id": 123,
+    "episode": 1,
+    "state": "active",
+    "effective_state": "paused",
+    "progress": 0.12,
+}
+PAUSED_ANIME = {
+    "media_id": 123,
+    "title": "Example",
+    "episodes": 12,
+    "next_episode": 1,
+    "download": PAUSED_DOWNLOAD,
+    "presentation": {"status": "paused_download", "episode": 1},
+}
+
+
+def test_paused_download_shows_paused_and_progress_on_home(page) -> None:
+    assert [en("ui.paused"), ru("ui.paused")] == ["Paused", "Пауза"]
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            await __tick(1000);                                   // the switch reports torrents off (confirmed)
+            setPage('current', true); renderCurrent();
+            const card = () => __text('#currentContent [data-media-id="123"] .airing-state');
+            const first = card();
+            await __tick(7000);                                   // live status refreshes keep it
+            return {first, later: card(), paused: t('ui.paused'), label: torrentUiLabel('paused', ui.lang),
+                    // A card without a presentation (only the download row) while torrents are off.
+                    bare: compactDownloadStatus({state: 'active', progress: 0.12})};
+            """,
+            lang=lang,
+            before=SWITCH,
+            state={
+                "current": [PAUSED_ANIME],
+                "home": {"waiting": [PAUSED_ANIME]},
+                "downloads": [PAUSED_DOWNLOAD],
+            },
+        )
+        out = result.value
+        assert out["label"] == out["paused"] == (en if lang == "en" else ru)("ui.paused")
+        assert out["first"] == out["later"] == out["bare"] == f"{out['paused']} · 12%"

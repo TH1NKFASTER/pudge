@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
 import re
+import threading
+from collections import OrderedDict
 import statistics
 import unicodedata
 from collections.abc import Iterable
@@ -10,6 +13,7 @@ from typing import Any
 
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
+from .i18n import err
 
 
 _IGNORED_CATEGORIES = {"Pc", "Pd", "Pe", "Pf", "Pi", "Po", "Ps", "Zl", "Zp", "Zs"}
@@ -36,6 +40,7 @@ def chapter_audio_text(value: str) -> str:
         lines.append(line)
     return "\n".join(lines)
 
+
 def normalize_reading_text(value: str) -> str:
     """Normalize LN/STT text while preserving every spoken letter and digit."""
 
@@ -43,8 +48,7 @@ def normalize_reading_text(value: str) -> str:
     return "".join(
         character
         for character in normalized
-        if not character.isspace()
-        and unicodedata.category(character) not in _IGNORED_CATEGORIES
+        if not character.isspace() and unicodedata.category(character) not in _IGNORED_CATEGORIES
     )
 
 
@@ -70,10 +74,7 @@ def _punctuation_boundaries(value: str) -> list[dict[str, int]]:
         if character.isspace() or unicodedata.category(character) in _IGNORED_CATEGORIES:
             continue
         offset += 1
-    return [
-        {"offset": boundary, "strength": strength}
-        for boundary, strength in sorted(strengths.items())
-    ]
+    return [{"offset": boundary, "strength": strength} for boundary, strength in sorted(strengths.items())]
 
 
 def _median(values: list[float]) -> float:
@@ -278,10 +279,7 @@ def _inject_punctuation_pause_anchors(
                 and row_offset <= float(pause_offset) + 1e-6
                 and (
                     abs(row_time - gap_start) <= 1e-6
-                    or (
-                        gap_end - gap_start >= 0.25
-                        and gap_start - 0.08 <= row_time < gap_start
-                    )
+                    or (gap_end - gap_start >= 0.25 and gap_start - 0.08 <= row_time < gap_start)
                 )
             ):
                 # Precision STT occasionally stamps the *next* word a few
@@ -302,9 +300,7 @@ def _inject_punctuation_pause_anchors(
         raw_offset = float(row["offset"])
         rounded_offset = round(raw_offset)
         offset: float | int = (
-            int(rounded_offset)
-            if abs(raw_offset - rounded_offset) < 1e-6
-            else round(raw_offset, 4)
+            int(rounded_offset) if abs(raw_offset - rounded_offset) < 1e-6 else round(raw_offset, 4)
         )
         if (
             output
@@ -318,7 +314,6 @@ def _inject_punctuation_pause_anchors(
     return output, len(pause_windows)
 
 
-
 def _segment_text(segment: dict[str, Any]) -> str:
     text = str(segment.get("text") or "")
     if text.strip():
@@ -326,9 +321,7 @@ def _segment_text(segment: dict[str, Any]) -> str:
     words = segment.get("words")
     if isinstance(words, list):
         return "".join(
-            str(row.get("word") or row.get("text") or "")
-            for row in words
-            if isinstance(row, dict)
+            str(row.get("word") or row.get("text") or "") for row in words if isinstance(row, dict)
         )
     return ""
 
@@ -414,7 +407,9 @@ def _find_spoken_chapter_marker(
         distance = abs(start - float(reference_time))
         # Prefer a marker slightly before the first dense prose anchor.
         after_penalty = 4.0 if start > float(reference_time) + 3.0 else 0.0
-        candidates.append((distance + after_penalty, -best, {"start": start, "end": end, "score": best, "text": surface}))
+        candidates.append(
+            (distance + after_penalty, -best, {"start": start, "end": end, "score": best, "text": surface})
+        )
     if not candidates:
         return None
     return min(candidates, key=lambda row: (row[0], row[1]))[2]
@@ -498,7 +493,6 @@ def _clock_offset_at(
         return max(left_offset, right_offset)
     ratio = (float(position) - left_time) / (right_time - left_time)
     return left_offset + (right_offset - left_offset) * max(0.0, min(1.0, ratio))
-
 
 
 def _infer_acoustic_chapter_marker(
@@ -622,9 +616,7 @@ def _infer_acoustic_chapter_marker(
     median_bias = float(statistics.median(float(row["bias"]) for row in evidence))
     inliers = [row for row in evidence if abs(float(row["bias"]) - median_bias) <= 6.0]
     strong_single = (
-        len(inliers) == 1
-        and int(inliers[0]["length"]) >= 12
-        and float(inliers[0]["score"]) >= 93.0
+        len(inliers) == 1 and int(inliers[0]["length"]) >= 12 and float(inliers[0]["score"]) >= 93.0
     )
     if len(inliers) < 2 and not strong_single:
         return None
@@ -644,7 +636,6 @@ def _infer_acoustic_chapter_marker(
         "evidence_count": len(inliers),
         "false_advance_chars": round(float(shape["false_advance"]), 3),
     }
-
 
 
 def _chapter_title_plateau_story_start(
@@ -761,9 +752,7 @@ def _recover_leading_prefix_clock(
         reference_time=first_time,
     )
     normalized_title = normalize_reading_text(chapter_title)
-    title_requires_prefix_verification = (
-        normalized_title.startswith("第") and normalized_title.endswith("幕")
-    )
+    title_requires_prefix_verification = normalized_title.startswith("第") and normalized_title.endswith("幕")
     acoustic_marker = None
     if marker is None and title_requires_prefix_verification:
         acoustic_marker = _infer_acoustic_chapter_marker(
@@ -902,16 +891,8 @@ def _recover_leading_prefix_clock(
         else {"chapter_marker": False}
     )
 
-    chain_span = (
-        int(best_chain[-1]["offset_end"]) - int(best_chain[0]["offset_start"])
-        if best_chain
-        else 0
-    )
-    chain_duration = (
-        float(best_chain[-1]["end"]) - float(best_chain[0]["start"])
-        if best_chain
-        else 0.0
-    )
+    chain_span = int(best_chain[-1]["offset_end"]) - int(best_chain[0]["offset_start"]) if best_chain else 0
+    chain_duration = float(best_chain[-1]["end"]) - float(best_chain[0]["start"]) if best_chain else 0.0
     chain_strong_single = bool(
         best_chain
         and len(best_chain) == 1
@@ -919,12 +900,8 @@ def _recover_leading_prefix_clock(
         and float(best_chain[0].get("score") or 0.0) >= 92.0
         and chain_duration >= 0.08
     )
-    needs_local_prefix = (
-        not best_chain
-        or (
-            not chain_strong_single
-            and (len(best_chain) < 2 or chain_span < 24 or chain_duration < 1.0)
-        )
+    needs_local_prefix = not best_chain or (
+        not chain_strong_single and (len(best_chain) < 2 or chain_span < 24 or chain_duration < 1.0)
     )
     if needs_local_prefix:
         local_clock, local_start, local_debug = _local_fuzzy_prefix_clock(
@@ -959,9 +936,7 @@ def _recover_leading_prefix_clock(
                     continue
                 if time <= float(last["time"]) + 0.02:
                     continue
-                rate = (offset - float(last["offset"])) / max(
-                    0.02, time - float(last["time"])
-                )
+                rate = (offset - float(last["offset"])) / max(0.02, time - float(last["time"]))
                 if rate <= 10.0:
                     bridge_index = index
                     break
@@ -973,19 +948,23 @@ def _recover_leading_prefix_clock(
                     if float(row.get("offset") or 0.0) < float(recovered[-1]["offset"]) - 1e-6:
                         continue
                     recovered.append(dict(row))
-            return recovered, local_start, {
-                "attempted": True,
-                "recovered": True,
-                "degraded": False,
-                "reason": "local_fuzzy_prefix",
-                "candidate_count": len(candidates),
-                "chain_count": len(best_chain),
-                "story_start": round(float(local_start), 3),
-                "bridge_found": bridge_index is not None,
-                **local_debug,
-                **({"structural_bridge": structural_debug} if structural_debug else {}),
-                **marker_debug,
-            }
+            return (
+                recovered,
+                local_start,
+                {
+                    "attempted": True,
+                    "recovered": True,
+                    "degraded": False,
+                    "reason": "local_fuzzy_prefix",
+                    "candidate_count": len(candidates),
+                    "chain_count": len(best_chain),
+                    "story_start": round(float(local_start), 3),
+                    "bridge_found": bridge_index is not None,
+                    **local_debug,
+                    **({"structural_bridge": structural_debug} if structural_debug else {}),
+                    **marker_debug,
+                },
+            )
 
         reading_clock, reading_start, reading_debug = _local_reading_hint_clock(
             reading_hints or [],
@@ -1031,38 +1010,44 @@ def _recover_leading_prefix_clock(
                     if float(row.get("offset") or 0.0) < float(recovered[-1]["offset"]) - 1e-6:
                         continue
                     recovered.append(dict(row))
-            return recovered, reading_start, {
-                "attempted": True,
-                "recovered": True,
-                "degraded": False,
-                "reason": "phonetic_reading_prefix",
-                "candidate_count": len(candidates),
-                "chain_count": len(best_chain),
-                "story_start": round(float(reading_start), 3),
-                "bridge_found": bridge_index is not None,
-                **reading_debug,
-                **({"structural_bridge": structural_debug} if structural_debug else {}),
-                **marker_debug,
-            }
+            return (
+                recovered,
+                reading_start,
+                {
+                    "attempted": True,
+                    "recovered": True,
+                    "degraded": False,
+                    "reason": "phonetic_reading_prefix",
+                    "candidate_count": len(candidates),
+                    "chain_count": len(best_chain),
+                    "story_start": round(float(reading_start), 3),
+                    "bridge_found": bridge_index is not None,
+                    **reading_debug,
+                    **({"structural_bridge": structural_debug} if structural_debug else {}),
+                    **marker_debug,
+                },
+            )
 
         structural_clock, structural_debug = _structural_leading_bias_rebase(clock)
         if structural_debug is not None:
-            structural_start = float(
-                (structural_debug.get("hazard") or {}).get("left_time") or first_time
+            structural_start = float((structural_debug.get("hazard") or {}).get("left_time") or first_time)
+            return (
+                structural_clock,
+                structural_start,
+                {
+                    "attempted": True,
+                    "recovered": True,
+                    "degraded": True,
+                    "reason": "structural_bias_rebase",
+                    "candidate_count": len(candidates),
+                    "chain_count": len(best_chain),
+                    "story_start": round(structural_start, 3),
+                    "bridge_found": True,
+                    "fallback": structural_debug,
+                    "clock_rebase_chars": float(structural_debug["clock_rebase_chars"]),
+                    **marker_debug,
+                },
             )
-            return structural_clock, structural_start, {
-                "attempted": True,
-                "recovered": True,
-                "degraded": True,
-                "reason": "structural_bias_rebase",
-                "candidate_count": len(candidates),
-                "chain_count": len(best_chain),
-                "story_start": round(structural_start, 3),
-                "bridge_found": True,
-                "fallback": structural_debug,
-                "clock_rebase_chars": float(structural_debug["clock_rebase_chars"]),
-                **marker_debug,
-            }
 
     if not best_chain:
         marker_clock, marker_story_floor = (
@@ -1070,15 +1055,21 @@ def _recover_leading_prefix_clock(
             if marker is not None
             else (clock, None)
         )
-        return marker_clock, marker_story_floor, {
-            "attempted": True,
-            "recovered": marker_story_floor is not None and marker_clock is not clock,
-            "degraded": marker_story_floor is not None and marker_clock is not clock,
-            "reason": "marker_hold_fallback" if marker_story_floor is not None and marker_clock is not clock else "no_prefix_seed",
-            "candidate_count": len(candidates),
-            "first_offset": first_offset,
-            **marker_debug,
-        }
+        return (
+            marker_clock,
+            marker_story_floor,
+            {
+                "attempted": True,
+                "recovered": marker_story_floor is not None and marker_clock is not clock,
+                "degraded": marker_story_floor is not None and marker_clock is not clock,
+                "reason": "marker_hold_fallback"
+                if marker_story_floor is not None and marker_clock is not clock
+                else "no_prefix_seed",
+                "candidate_count": len(candidates),
+                "first_offset": first_offset,
+                **marker_debug,
+            },
+        )
 
     span = int(best_chain[-1]["offset_end"]) - int(best_chain[0]["offset_start"])
     duration = float(best_chain[-1]["end"]) - float(best_chain[0]["start"])
@@ -1094,16 +1085,22 @@ def _recover_leading_prefix_clock(
             if marker is not None
             else (clock, None)
         )
-        return marker_clock, marker_story_floor, {
-            "attempted": True,
-            "recovered": marker_story_floor is not None and marker_clock is not clock,
-            "degraded": marker_story_floor is not None and marker_clock is not clock,
-            "reason": "marker_hold_fallback" if marker_story_floor is not None and marker_clock is not clock else "prefix_evidence_too_sparse",
-            "candidate_count": len(candidates),
-            "chain_count": len(best_chain),
-            "span": span,
-            **marker_debug,
-        }
+        return (
+            marker_clock,
+            marker_story_floor,
+            {
+                "attempted": True,
+                "recovered": marker_story_floor is not None and marker_clock is not clock,
+                "degraded": marker_story_floor is not None and marker_clock is not clock,
+                "reason": "marker_hold_fallback"
+                if marker_story_floor is not None and marker_clock is not clock
+                else "prefix_evidence_too_sparse",
+                "candidate_count": len(candidates),
+                "chain_count": len(best_chain),
+                "span": span,
+                **marker_debug,
+            },
+        )
 
     first = best_chain[0]
     first_verified_offset = int(first["offset_start"])
@@ -1112,9 +1109,7 @@ def _recover_leading_prefix_clock(
         for row in _punctuation_boundaries(chapter_text)
         if int(row.get("strength") or 0) >= 3
     ]
-    prose_prefix_boundary = any(
-        4 <= boundary <= first_verified_offset + 1 for boundary in strong_boundaries
-    )
+    prose_prefix_boundary = any(4 <= boundary <= first_verified_offset + 1 for boundary in strong_boundaries)
     plateau_story_start, plateau_debug = _chapter_title_plateau_story_start(
         clock,
         chapter_title=chapter_title,
@@ -1127,28 +1122,27 @@ def _recover_leading_prefix_clock(
     # escape hatch, but never use it for the multi-segment real chapter-start
     # chains that produced the v175 0->10/11 runaway.  Those must reconstruct
     # their missing prose prefix or use the spoken-title plateau below.
-    if (
-        marker is None
-        and plateau_story_start is None
-        and strong_single
-        and 18 <= first_verified_offset <= 64
-    ):
+    if marker is None and plateau_story_start is None and strong_single and 18 <= first_verified_offset <= 64:
         verified_start = float(first["start"])
-        return clock, verified_start, {
-            "attempted": True,
-            "recovered": True,
-            "candidate_count": len(candidates),
-            "chain_count": len(best_chain),
-            "span": span,
-            "story_start": round(verified_start, 3),
-            "verified_through_offset": int(first["offset_end"]),
-            "bridge_found": True,
-            "original_first_offset": first_offset,
-            "original_first_time": round(first_time, 3),
-            "skipped_ln_prefix": True,
-            "skipped_prefix_reason": "single_strong_nonspoken_prefix",
-            **marker_debug,
-        }
+        return (
+            clock,
+            verified_start,
+            {
+                "attempted": True,
+                "recovered": True,
+                "candidate_count": len(candidates),
+                "chain_count": len(best_chain),
+                "span": span,
+                "story_start": round(verified_start, 3),
+                "verified_through_offset": int(first["offset_end"]),
+                "bridge_found": True,
+                "original_first_offset": first_offset,
+                "original_first_time": round(first_time, 3),
+                "skipped_ln_prefix": True,
+                "skipped_prefix_reason": "single_strong_nonspoken_prefix",
+                **marker_debug,
+            },
+        )
 
     # Since image placeholders are zero-width in the audiobook coordinate
     # system, a non-zero unmatched prefix from a multi-segment opening chain is
@@ -1164,9 +1158,7 @@ def _recover_leading_prefix_clock(
     elif plateau_story_start is not None:
         recovered_start = float(plateau_story_start)
 
-    recovered: list[dict[str, float | int]] = [
-        {"offset": 0, "time": round(recovered_start, 3)}
-    ]
+    recovered: list[dict[str, float | int]] = [{"offset": 0, "time": round(recovered_start, 3)}]
     for row in best_chain:
         recovered.extend(
             [
@@ -1217,27 +1209,30 @@ def _recover_leading_prefix_clock(
                 continue
             recovered.append(dict(row))
 
-    return recovered, recovered_start, {
-        "attempted": True,
-        "recovered": True,
-        "candidate_count": len(candidates),
-        "chain_count": len(best_chain),
-        "span": span,
-        "story_start": round(recovered_start, 3),
-        "verified_through_offset": int(last["offset"]),
-        "bridge_found": bridge_index is not None,
-        "original_first_offset": first_offset,
-        "original_first_time": round(first_time, 3),
-        "unsafe_early_jump": unsafe_early_jump,
-        "verified_rate": round(verified_rate, 3),
-        "max_bridge_rate": round(max_bridge_rate, 3),
-        "reconstructed_prose_prefix": bool(
-            marker is None and first_verified_offset > 0
-        ),
-        "prose_prefix_has_strong_boundary": bool(prose_prefix_boundary),
-        **(plateau_debug or {}),
-        **marker_debug,
-    }
+    return (
+        recovered,
+        recovered_start,
+        {
+            "attempted": True,
+            "recovered": True,
+            "candidate_count": len(candidates),
+            "chain_count": len(best_chain),
+            "span": span,
+            "story_start": round(recovered_start, 3),
+            "verified_through_offset": int(last["offset"]),
+            "bridge_found": bridge_index is not None,
+            "original_first_offset": first_offset,
+            "original_first_time": round(first_time, 3),
+            "unsafe_early_jump": unsafe_early_jump,
+            "verified_rate": round(verified_rate, 3),
+            "max_bridge_rate": round(max_bridge_rate, 3),
+            "reconstructed_prose_prefix": bool(marker is None and first_verified_offset > 0),
+            "prose_prefix_has_strong_boundary": bool(prose_prefix_boundary),
+            **(plateau_debug or {}),
+            **marker_debug,
+        },
+    )
+
 
 def _safe_degraded_leading_bridge(
     anchors: list[dict[str, Any]],
@@ -1297,8 +1292,7 @@ def _safe_degraded_leading_bridge(
             "rejoin_offset": float(salvaged[1]["offset"]),
             "rejoin_time": float(salvaged[1]["time"]),
             "rejoin_rate": round(
-                float(salvaged[1]["offset"])
-                / max(0.02, float(salvaged[1]["time"]) - start_time),
+                float(salvaged[1]["offset"]) / max(0.02, float(salvaged[1]["time"]) - start_time),
                 3,
             ),
             "max_rate": round(limit, 3),
@@ -1392,11 +1386,7 @@ def _prune_rejoining_local_rate_outliers(
     if max_offset_exclusive is not None:
         cutoff = max(0.0, float(max_offset_exclusive))
         split_index = next(
-            (
-                index
-                for index, row in enumerate(rows)
-                if float(row.get("offset") or 0.0) >= cutoff - 1e-6
-            ),
+            (index for index, row in enumerate(rows) if float(row.get("offset") or 0.0) >= cutoff - 1e-6),
             len(rows),
         )
         tail = rows[split_index:]
@@ -1472,15 +1462,16 @@ def _prune_rejoining_local_rate_outliers(
         for skipped in rows[index:rejoin_index]:
             skipped_offset = float(skipped.get("offset") or previous_offset)
             skipped_time = float(skipped.get("time") or previous_time)
-            dropped.append({
-                "offset": round(skipped_offset, 4),
-                "time": round(skipped_time, 3),
-                "rate": round(
-                    (skipped_offset - previous_offset)
-                    / max(0.02, skipped_time - previous_time),
-                    3,
-                ),
-            })
+            dropped.append(
+                {
+                    "offset": round(skipped_offset, 4),
+                    "time": round(skipped_time, 3),
+                    "rate": round(
+                        (skipped_offset - previous_offset) / max(0.02, skipped_time - previous_time),
+                        3,
+                    ),
+                }
+            )
         # The rejoin intentionally borrows wall-clock silence to slow a
         # transient fast prefix edge.  Mark that segment so the runtime
         # activity clock does not immediately compress the borrowed pause away
@@ -1596,7 +1587,8 @@ def _structural_leading_bias_rebase(
     if _unsafe_leading_anchor_jump(rebased) is not None:
         return rows, None
     progressed = [
-        row for row in rebased
+        row
+        for row in rebased
         if float(row.get("time") or 0.0) > cut_time + 0.1
         and float(row.get("offset") or 0.0) >= left_offset + 24.0
     ]
@@ -1671,9 +1663,7 @@ def _local_fuzzy_prefix_clock(
 
     equal_runs: list[tuple[int, int, int]] = []
     matched = 0
-    for tag, src_start, src_end, dest_start, dest_end in Levenshtein.opcodes(
-        prefix, transcript
-    ).as_list():
+    for tag, src_start, src_end, dest_start, dest_end in Levenshtein.opcodes(prefix, transcript).as_list():
         if tag != "equal":
             continue
         length = min(src_end - src_start, dest_end - dest_start)
@@ -1726,9 +1716,7 @@ def _local_fuzzy_prefix_clock(
         float(reference_time),
         float(first["time"]) - first_offset / local_rate,
     )
-    output: list[dict[str, float | int]] = [
-        {"offset": 0, "time": round(story_start, 3)}
-    ]
+    output: list[dict[str, float | int]] = [{"offset": 0, "time": round(story_start, 3)}]
     for row in dense:
         if float(row["time"]) <= story_start + 0.0005:
             continue
@@ -1737,16 +1725,19 @@ def _local_fuzzy_prefix_clock(
         output.append(dict(row))
     if len(output) < 8 or float(output[-1]["offset"]) < 24.0:
         return [], None, None
-    return output, story_start, {
-        "mode": "local_fuzzy_prefix",
-        "matched_characters": int(matched),
-        "coverage": round(float(coverage), 4),
-        "first_matched_offset": int(earliest),
-        "verified_through_offset": int(float(output[-1]["offset"])),
-        "local_rate": round(local_rate, 3),
-        "segment_count": len(selected),
-    }
-
+    return (
+        output,
+        story_start,
+        {
+            "mode": "local_fuzzy_prefix",
+            "matched_characters": int(matched),
+            "coverage": round(float(coverage), 4),
+            "first_matched_offset": int(earliest),
+            "verified_through_offset": int(float(output[-1]["offset"])),
+            "local_rate": round(local_rate, 3),
+            "segment_count": len(selected),
+        },
+    )
 
 
 def _hiragana_fold(value: str) -> str:
@@ -1770,7 +1761,8 @@ def _local_reading_hint_clock(
     """Align chapter-start Jiten readings against a local STT word window."""
 
     hints = [
-        dict(row) for row in reading_hints
+        dict(row)
+        for row in reading_hints
         if isinstance(row, dict)
         and int(row.get("offset_start") or 0) < 160
         and int(row.get("offset_end") or 0) > int(row.get("offset_start") or 0)
@@ -1834,12 +1826,14 @@ def _local_reading_hint_clock(
             combined_surface += normalize_reading_text(str(next_row.get("surface") or ""))
             end_offset = int(next_row.get("offset_end") or end_offset)
             if len(combined_reading) >= 7:
-                phrase_hints.append({
-                    "offset_start": int(row.get("offset_start") or 0),
-                    "offset_end": end_offset,
-                    "reading_phrase": combined_reading,
-                    "surface_phrase": combined_surface,
-                })
+                phrase_hints.append(
+                    {
+                        "offset_start": int(row.get("offset_start") or 0),
+                        "offset_end": end_offset,
+                        "reading_phrase": combined_reading,
+                        "surface_phrase": combined_surface,
+                    }
+                )
     if not phrase_hints:
         return [], None, None
 
@@ -1864,8 +1858,10 @@ def _local_reading_hint_clock(
                 if len(combined) < 3:
                     continue
                 reading_score = 100.0 if reading in combined else float(fuzz.ratio(reading, combined))
-                surface_score = 100.0 if surface and surface in combined else (
-                    float(fuzz.ratio(surface, combined)) if surface else 0.0
+                surface_score = (
+                    100.0
+                    if surface and surface in combined
+                    else (float(fuzz.ratio(surface, combined)) if surface else 0.0)
                 )
                 score = max(reading_score, surface_score)
                 threshold = 92.0 if len(reading) < 6 else (84.0 if len(reading) < 10 else 78.0)
@@ -1905,7 +1901,10 @@ def _local_reading_hint_clock(
                 continue
         if chain and int(row["offset_start"]) == int(chain[-1]["offset_start"]):
             previous = chain[-1]
-            if (int(row["offset_end"]), float(row["score"])) > (int(previous["offset_end"]), float(previous["score"])):
+            if (int(row["offset_end"]), float(row["score"])) > (
+                int(previous["offset_end"]),
+                float(previous["score"]),
+            ):
                 chain[-1] = row
             continue
         chain.append(row)
@@ -1943,25 +1942,29 @@ def _local_reading_hint_clock(
             return [], None, None
     elif len(output) < 3 or float(output[-1]["offset"]) < 8.0:
         return [], None, None
-    return output, story_start, {
-        "mode": "phonetic_reading_prefix",
-        "hint_count": len(hints),
-        "candidate_count": len(candidates),
-        "chain_count": len(chain),
-        "verified_through_offset": int(float(output[-1]["offset"])),
-        "first_hint_offset": first_offset,
-        "first_hint_score": round(float(first["score"]), 2),
-        "evidence": [
-            {
-                "offset_start": int(row["offset_start"]),
-                "offset_end": int(row["offset_end"]),
-                "start": round(float(row["start"]), 3),
-                "end": round(float(row["end"]), 3),
-                "score": round(float(row["score"]), 2),
-            }
-            for row in chain[:4]
-        ],
-    }
+    return (
+        output,
+        story_start,
+        {
+            "mode": "phonetic_reading_prefix",
+            "hint_count": len(hints),
+            "candidate_count": len(candidates),
+            "chain_count": len(chain),
+            "verified_through_offset": int(float(output[-1]["offset"])),
+            "first_hint_offset": first_offset,
+            "first_hint_score": round(float(first["score"]), 2),
+            "evidence": [
+                {
+                    "offset_start": int(row["offset_start"]),
+                    "offset_end": int(row["offset_end"]),
+                    "start": round(float(row["start"]), 3),
+                    "end": round(float(row["end"]), 3),
+                    "score": round(float(row["score"]), 2),
+                }
+                for row in chain[:4]
+            ],
+        },
+    )
 
 
 def _precision_reading_word_clock(
@@ -2101,7 +2104,9 @@ def _precision_reading_word_clock(
                 surface_score = (
                     100.0
                     if surface and (surface == combined_surface or surface in combined_surface)
-                    else (float(fuzz.ratio(surface, combined_surface)) if surface and combined_surface else 0.0)
+                    else (
+                        float(fuzz.ratio(surface, combined_surface)) if surface and combined_surface else 0.0
+                    )
                 )
                 score = max(reading_score, surface_score)
                 target_len = max(len(reading), len(surface))
@@ -2282,17 +2287,14 @@ def _runtime_precision_reading_prefix(
         if abs(offset) <= 1e-6 and time_value <= float(prose_start) + 0.0005:
             continue
         candidate = {
-            "offset": int(round(offset))
-            if abs(offset - round(offset)) < 1e-6
-            else round(offset, 4),
+            "offset": int(round(offset)) if abs(offset - round(offset)) < 1e-6 else round(offset, 4),
             "time": round(time_value, 3),
         }
         if refined:
             if float(candidate["time"]) <= float(refined[-1]["time"]) + 0.0005:
-                if (
-                    abs(float(candidate["offset"]) - float(refined[-1]["offset"])) <= 1e-6
-                    and float(candidate["time"]) > float(refined[-1]["time"])
-                ):
+                if abs(float(candidate["offset"]) - float(refined[-1]["offset"])) <= 1e-6 and float(
+                    candidate["time"]
+                ) > float(refined[-1]["time"]):
                     refined[-1] = candidate
                 continue
             if float(candidate["offset"]) < float(refined[-1]["offset"]) - 1e-6:
@@ -2326,9 +2328,7 @@ def _runtime_precision_reading_prefix(
             continue
         if time_value <= float(last["time"]) + 0.02:
             continue
-        rate = (offset - float(last["offset"])) / max(
-            0.02, time_value - float(last["time"])
-        )
+        rate = (offset - float(last["offset"])) / max(0.02, time_value - float(last["time"]))
         if rate <= 16.0:
             bridge_index = index
 
@@ -2349,9 +2349,7 @@ def _runtime_precision_reading_prefix(
                     pass
                 else:
                     whole_offset = round(bridge_offset)
-                    encoded_pre_boundary = abs(
-                        bridge_offset - (float(whole_offset) - 0.001)
-                    ) <= 0.01
+                    encoded_pre_boundary = abs(bridge_offset - (float(whole_offset) - 0.001)) <= 0.01
                     same_hold_offset = abs(hold_offset - bridge_offset) <= 0.01
                     resumes_at_boundary = abs(resume_offset - float(whole_offset)) <= 0.01
                     meaningful_pause = 0.25 <= hold_time - bridge_time <= 1.5
@@ -2385,9 +2383,7 @@ def _runtime_precision_reading_prefix(
         except (TypeError, ValueError):
             continue
         offset_value: float | int = (
-            int(round(raw_offset))
-            if abs(raw_offset - round(raw_offset)) < 1e-6
-            else round(raw_offset, 4)
+            int(round(raw_offset)) if abs(raw_offset - round(raw_offset)) < 1e-6 else round(raw_offset, 4)
         )
         if output:
             if time_value <= float(output[-1]["time"]) + 0.0005:
@@ -2410,7 +2406,6 @@ def _runtime_precision_reading_prefix(
         "wall_clock_pause_bridge": wall_clock_bridge,
     }
     return output, len(refined), debug
-
 
 
 def _reading_mora_units(value: str) -> float:
@@ -2560,17 +2555,22 @@ def _runtime_reading_weighted_bridge(
         *inserted,
         *[dict(row) for row in anchors[left_index + 1 :]],
     ]
-    return merged, len(inserted), {
-        "mode": "reading_weighted_post_precision_bridge",
-        "left_offset": round(left_offset, 3),
-        "right_offset": round(right_offset, 3),
-        "left_time": round(left_time, 3),
-        "right_time": round(right_time, 3),
-        "hint_count": len(non_overlapping),
-        "coverage": round(covered / max(1.0, span), 4),
-        "anchor_count": len(inserted),
-        "wall_clock_bridge": wall_clock_bridge,
-    }
+    return (
+        merged,
+        len(inserted),
+        {
+            "mode": "reading_weighted_post_precision_bridge",
+            "left_offset": round(left_offset, 3),
+            "right_offset": round(right_offset, 3),
+            "left_time": round(left_time, 3),
+            "right_time": round(right_time, 3),
+            "hint_count": len(non_overlapping),
+            "coverage": round(covered / max(1.0, span), 4),
+            "anchor_count": len(inserted),
+            "wall_clock_bridge": wall_clock_bridge,
+        },
+    )
+
 
 def _anchor_chain(
     novel: str,
@@ -2627,10 +2627,7 @@ def _anchor_chain(
     # result and gives seeking/highlighting a substantially denser clock.
     compact: list[tuple[int, int]] = []
     for novel_index, transcript_index_ in chain:
-        if compact and (
-            novel_index <= compact[-1][0]
-            or transcript_index_ <= compact[-1][1]
-        ):
+        if compact and (novel_index <= compact[-1][0] or transcript_index_ <= compact[-1][1]):
             continue
         if compact and novel_index - compact[-1][0] < 2:
             continue
@@ -2673,6 +2670,68 @@ def _best_dense_anchor_chain(novel: str, transcript: str) -> tuple[int, list[tup
     return best_size, best
 
 
+# The chain depends only on the two texts. One alignment job computes it again
+# for the chapter-start refinement pass, so keep the last couple of results.
+_ANCHOR_CHAIN_CACHE: OrderedDict[
+    tuple[str, str], tuple[int, tuple[tuple[int, int], ...], str, float | None]
+] = OrderedDict()
+_ANCHOR_CHAIN_CACHE_SIZE = 2
+_ANCHOR_CHAIN_LOCK = threading.Lock()
+
+
+def _global_anchor_chain(novel: str, transcript: str) -> tuple[int, list[tuple[int, int]], str, float | None]:
+    """Exact n-gram clock, else the fuzzy fallback: (size, anchors, method, similarity)."""
+    key = (
+        hashlib.sha256(novel.encode("utf-8")).hexdigest(),
+        hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
+    )
+    with _ANCHOR_CHAIN_LOCK:
+        cached = _ANCHOR_CHAIN_CACHE.get(key)
+        if cached is not None:
+            _ANCHOR_CHAIN_CACHE.move_to_end(key)
+            return cached[0], list(cached[1]), cached[2], cached[3]
+    anchor_size, anchors = _best_dense_anchor_chain(novel, transcript)
+    method = "exact-ngram"
+    similarity: float | None = None
+    if len(anchors) < 8:
+        anchor_size, anchors, similarity = _fuzzy_global_anchor_chain(novel, transcript)
+        method = "fuzzy-global"
+    with _ANCHOR_CHAIN_LOCK:
+        _ANCHOR_CHAIN_CACHE[key] = (int(anchor_size), tuple(anchors), method, similarity)
+        _ANCHOR_CHAIN_CACHE.move_to_end(key)
+        while len(_ANCHOR_CHAIN_CACHE) > _ANCHOR_CHAIN_CACHE_SIZE:
+            _ANCHOR_CHAIN_CACHE.popitem(last=False)
+    return anchor_size, list(anchors), method, similarity
+
+
+def anchor_cache_rows() -> list[list[Any]]:
+    """The memoized anchor chains as JSON rows (an alignment process hands them on)."""
+    with _ANCHOR_CHAIN_LOCK:
+        return [
+            [novel, transcript, size, [list(pair) for pair in anchors], method, similarity]
+            for (novel, transcript), (size, anchors, method, similarity) in _ANCHOR_CHAIN_CACHE.items()
+        ]
+
+
+def load_anchor_cache_rows(rows: Iterable[Any]) -> None:
+    for row in rows or []:
+        try:
+            novel, transcript, size, anchors, method, similarity = row
+            value = (
+                int(size),
+                tuple((int(pair[0]), int(pair[1])) for pair in anchors),
+                str(method),
+                None if similarity is None else float(similarity),
+            )
+        except (TypeError, ValueError, IndexError):
+            continue
+        with _ANCHOR_CHAIN_LOCK:
+            _ANCHOR_CHAIN_CACHE[(str(novel), str(transcript))] = value
+            _ANCHOR_CHAIN_CACHE.move_to_end((str(novel), str(transcript)))
+            while len(_ANCHOR_CHAIN_CACHE) > _ANCHOR_CHAIN_CACHE_SIZE:
+                _ANCHOR_CHAIN_CACHE.popitem(last=False)
+
+
 def _fuzzy_global_anchor_chain(
     novel: str,
     transcript: str,
@@ -2696,11 +2755,7 @@ def _fuzzy_global_anchor_chain(
     if length_ratio < 0.40:
         return 0, [], 0.0
 
-    similarity = float(
-        Levenshtein.normalized_similarity(
-            novel, transcript, score_cutoff=minimum_similarity
-        )
-    )
+    similarity = float(Levenshtein.normalized_similarity(novel, transcript, score_cutoff=minimum_similarity))
     if similarity < minimum_similarity:
         return 0, [], similarity
 
@@ -2709,9 +2764,7 @@ def _fuzzy_global_anchor_chain(
     anchor_size = 3
     anchors: list[tuple[int, int]] = []
     matched_characters = 0
-    for tag, src_start, src_end, dest_start, dest_end in Levenshtein.opcodes(
-        novel, transcript
-    ).as_list():
+    for tag, src_start, src_end, dest_start, dest_end in Levenshtein.opcodes(novel, transcript).as_list():
         if tag != "equal":
             continue
         length = min(src_end - src_start, dest_end - dest_start)
@@ -2745,9 +2798,7 @@ def _clip_activity_regions(
         except (TypeError, ValueError):
             continue
         if region_end - region_start >= 0.015:
-            clipped.append(
-                {"start": round(region_start, 3), "end": round(region_end, 3)}
-            )
+            clipped.append({"start": round(region_start, 3), "end": round(region_end, 3)})
     return clipped
 
 
@@ -2801,7 +2852,6 @@ def _time_for_activity_ratio(
     return float(clipped[-1]["end"])
 
 
-
 def _chapter_uses_activity_clock(chapter: dict[str, Any]) -> bool:
     """Use VAD-weighted interpolation only on modern enriched LN clocks.
 
@@ -2817,6 +2867,7 @@ def _chapter_uses_activity_clock(chapter: dict[str, Any]) -> bool:
         or bool(chapter.get("activity_clock"))
     )
 
+
 def _anchor_segment_uses_activity_clock(
     chapter: dict[str, Any],
     right_anchor: dict[str, Any],
@@ -2830,9 +2881,9 @@ def _anchor_segment_uses_activity_clock(
     """
 
     return bool(
-        _chapter_uses_activity_clock(chapter)
-        and not bool(right_anchor.get("wall_clock_from_previous"))
+        _chapter_uses_activity_clock(chapter) and not bool(right_anchor.get("wall_clock_from_previous"))
     )
+
 
 def _acoustic_chapter_start(
     estimated_start: float,
@@ -3034,16 +3085,11 @@ def align_light_novel_to_transcript(
         )
     novel = "".join(novel_parts)
     if len(transcript) < 40 or len(novel) < 40:
-        raise ValueError("STT produced too little Japanese text for alignment")
+        raise ValueError(err("audiobook.sttTooLittleText"))
 
-    anchor_size, anchors = _best_dense_anchor_chain(novel, transcript)
-    alignment_method = "exact-ngram"
-    fuzzy_similarity = None
+    anchor_size, anchors, alignment_method, fuzzy_similarity = _global_anchor_chain(novel, transcript)
     if len(anchors) < 8:
-        anchor_size, anchors, fuzzy_similarity = _fuzzy_global_anchor_chain(novel, transcript)
-        alignment_method = "fuzzy-global"
-    if len(anchors) < 8:
-        raise ValueError("Not enough matching STT/LN anchors")
+        raise ValueError(err("audiobook.notEnoughAnchors"))
 
     aligned: list[dict[str, Any]] = []
     for chapter in chapter_ranges:
@@ -3149,14 +3195,12 @@ def align_light_novel_to_transcript(
                 "anchors": clock,
                 "leading_prefix_start": leading_start,
                 "leading_prefix_debug": leading_debug,
-                "punctuation_boundaries": list(
-                    chapter.get("punctuation_boundaries") or []
-                ),
+                "punctuation_boundaries": list(chapter.get("punctuation_boundaries") or []),
                 "confidence": round(min(1.0, span / max(1, chapter["length"])), 4),
             }
         )
     if not aligned:
-        raise ValueError("STT text did not match any readable LN chapter")
+        raise ValueError(err("audiobook.sttNoChapterMatch"))
 
     aligned_by_index = {int(row["chapter_index"]): row for row in aligned}
     ordered_ranges = sorted(chapter_ranges, key=lambda row: int(row["chapter_index"]))
@@ -3177,7 +3221,11 @@ def align_light_novel_to_transcript(
             gap_duration = right_start - left_end
             if gap_duration < 0.25:
                 continue
-            between = [row for row in ordered_ranges if left_candidates[-1] < int(row["chapter_index"]) < right_candidates[0]]
+            between = [
+                row
+                for row in ordered_ranges
+                if left_candidates[-1] < int(row["chapter_index"]) < right_candidates[0]
+            ]
             total_chars = sum(int(row["length"]) for row in between) or 1
             elapsed = 0.0
             for row in between:
@@ -3272,9 +3320,7 @@ def align_light_novel_to_transcript(
             merged_anchors = _prune_unreachable_leading_anchors(
                 merged_anchors,
                 max_rate=float(leading_debug.get("max_bridge_rate") or 10.0),
-                verified_through_offset=float(
-                    leading_debug.get("verified_through_offset") or 0.0
-                ),
+                verified_through_offset=float(leading_debug.get("verified_through_offset") or 0.0),
             )
         if chapter is aligned[0]:
             hazard = _unsafe_leading_anchor_jump(merged_anchors)
@@ -3314,8 +3360,7 @@ def align_light_novel_to_transcript(
         leading_debug = chapter.get("leading_prefix_debug")
         fallback = (
             leading_debug.get("fallback")
-            if isinstance(leading_debug, dict)
-            and isinstance(leading_debug.get("fallback"), dict)
+            if isinstance(leading_debug, dict) and isinstance(leading_debug.get("fallback"), dict)
             else {}
         )
         fallback_mode = str(fallback.get("mode") or "")
@@ -3342,9 +3387,7 @@ def align_light_novel_to_transcript(
         leading_debug = chapter.get("leading_prefix_debug")
         if isinstance(leading_debug, dict) and leading_debug.get("recovered"):
             max_bridge_rate = float(leading_debug.get("max_bridge_rate") or 0.0)
-            verified_through_offset = float(
-                leading_debug.get("verified_through_offset") or 0.0
-            )
+            verified_through_offset = float(leading_debug.get("verified_through_offset") or 0.0)
             if max_bridge_rate > 0.0 and verified_through_offset > 0.0:
                 chapter["anchors"], local_rate_debug = _prune_rejoining_local_rate_outliers(
                     list(chapter["anchors"]),
@@ -3358,7 +3401,13 @@ def align_light_novel_to_transcript(
                 }
 
         chapter["punctuation_pause_count"] = pause_count
-        for key in ("first_anchor_time", "last_anchor_time", "estimated_start", "estimated_end", "leading_prefix_start"):
+        for key in (
+            "first_anchor_time",
+            "last_anchor_time",
+            "estimated_start",
+            "estimated_end",
+            "leading_prefix_start",
+        ):
             chapter.pop(key, None)
 
     return {
@@ -3369,9 +3418,7 @@ def align_light_novel_to_transcript(
         "novel_characters": len(novel),
         "anchor_count": sum(len(row.get("anchors") or []) for row in aligned),
         "matched_anchor_count": len(anchors),
-        "punctuation_pause_count": sum(
-            int(row.get("punctuation_pause_count") or 0) for row in aligned
-        ),
+        "punctuation_pause_count": sum(int(row.get("punctuation_pause_count") or 0) for row in aligned),
         "anchor_size": anchor_size,
         "alignment_method": alignment_method,
         "fuzzy_similarity": round(float(fuzzy_similarity), 4) if fuzzy_similarity is not None else None,
@@ -3495,11 +3542,7 @@ def _relocate_misplaced_pause_holds(
     if len(regions) < 2:
         return anchors, 0
     starts = [row[0] for row in regions]
-    gaps = [
-        (left[1], right[0])
-        for left, right in zip(regions, regions[1:])
-        if right[0] - left[1] >= min_gap
-    ]
+    gaps = [(left[1], right[0]) for left, right in zip(regions, regions[1:]) if right[0] - left[1] >= min_gap]
     gap_starts = [row[0] for row in gaps]
 
     def speech_cover(start: float, end: float) -> float:
@@ -3525,9 +3568,7 @@ def _relocate_misplaced_pause_holds(
             and abs(offsets[j + 2] - (hold + 0.001)) < 1e-4
             and times[j + 2] - times[j + 1] <= 0.0025
         )
-        if not is_hold or any(
-            bool(rows[k].get("wall_clock_from_previous")) for k in range(j, j + 4)
-        ):
+        if not is_hold or any(bool(rows[k].get("wall_clock_from_previous")) for k in range(j, j + 4)):
             j += 1
             continue
         left_chars = hold - offsets[j - 1]
@@ -3581,9 +3622,7 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
     if isinstance(leading_debug, dict) and bool(leading_debug.get("chapter_marker")):
         anchors = _raw_anchors_with_leading_hold(chapter)
     else:
-        anchors = [
-            dict(row) for row in chapter.get("anchors") or [] if isinstance(row, dict)
-        ]
+        anchors = [dict(row) for row in chapter.get("anchors") or [] if isinstance(row, dict)]
 
     boundaries = chapter.get("_runtime_punctuation_boundaries")
     stored_pause_count = int(chapter.get("punctuation_pause_count") or 0)
@@ -3604,8 +3643,8 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
                     recovered_prefix_end_time = row_time
                     break
 
-    anchors, runtime_reading_anchor_count, runtime_reading_debug = (
-        _runtime_precision_reading_prefix(chapter, anchors)
+    anchors, runtime_reading_anchor_count, runtime_reading_debug = _runtime_precision_reading_prefix(
+        chapter, anchors
     )
     chapter["_runtime_reading_hint_anchor_count"] = runtime_reading_anchor_count
     chapter["_runtime_reading_hint_debug"] = runtime_reading_debug
@@ -3616,9 +3655,7 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
     # word onset can overwrite an existing pause hold (real S&W v2 ch3: まず).
     if runtime_reading_anchor_count > 0 and isinstance(runtime_reading_debug, dict):
         try:
-            verified_offset = float(
-                runtime_reading_debug.get("verified_through_offset") or 0.0
-            )
+            verified_offset = float(runtime_reading_debug.get("verified_through_offset") or 0.0)
         except (TypeError, ValueError):
             verified_offset = 0.0
         if verified_offset > 0.0:
@@ -3676,10 +3713,7 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
                                 len(anchors) - 1,
                             ),
                         )
-                        prefix = [
-                            dict(row)
-                            for row in anchors[story_index : prefix_end_index + 1]
-                        ]
+                        prefix = [dict(row) for row in anchors[story_index : prefix_end_index + 1]]
                         enriched_prefix, prefix_pause_count = _inject_punctuation_pause_anchors(
                             prefix,
                             boundaries,
@@ -3725,10 +3759,8 @@ def _runtime_anchors_for_chapter(chapter: dict[str, Any]) -> list[dict[str, Any]
                 speech_regions,
             )
 
-    anchors, runtime_reading_bridge_count, runtime_reading_bridge_debug = (
-        _runtime_reading_weighted_bridge(
-            chapter, anchors, runtime_reading_debug
-        )
+    anchors, runtime_reading_bridge_count, runtime_reading_bridge_debug = _runtime_reading_weighted_bridge(
+        chapter, anchors, runtime_reading_debug
     )
     chapter["_runtime_reading_bridge_anchor_count"] = runtime_reading_bridge_count
     chapter["_runtime_reading_bridge_debug"] = runtime_reading_bridge_debug
@@ -3818,6 +3850,7 @@ def audio_position_for_light_novel_offset(
             return left_time + max(0.0, min(1.0, ratio)) * (right_time - left_time)
     return float(anchors[-1].get("time") or chapter.get("end") or 0.0)
 
+
 def _runtime_audio_position_index(alignment: dict[str, Any]) -> dict[str, Any]:
     """Build the immutable live-playback lookup once per loaded alignment.
 
@@ -3877,19 +3910,13 @@ def _runtime_audio_position_index(alignment: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def light_novel_position_for_audio(
-    alignment: dict[str, Any], position: float
-) -> dict[str, Any] | None:
+def light_novel_position_for_audio(alignment: dict[str, Any], position: float) -> dict[str, Any] | None:
     index = _runtime_audio_position_index(alignment)
     chapter_rows = list(index.get("chapters") or [])
     if not chapter_rows:
         return None
     value = float(position)
-    matching = [
-        item
-        for item in chapter_rows
-        if float(item["start"]) <= value < float(item["end"])
-    ]
+    matching = [item for item in chapter_rows if float(item["start"]) <= value < float(item["end"])]
     if matching:
         # At an acoustic boundary the ranges may overlap by a few hundred ms.
         # Once the later chapter has started, never bounce back to the previous
@@ -3916,8 +3943,7 @@ def light_novel_position_for_audio(
     leading_debug = chapter.get("leading_prefix_debug")
     fallback = (
         leading_debug.get("fallback")
-        if isinstance(leading_debug, dict)
-        and isinstance(leading_debug.get("fallback"), dict)
+        if isinstance(leading_debug, dict) and isinstance(leading_debug.get("fallback"), dict)
         else {}
     )
     fallback_mode = str(fallback.get("mode") or "")
@@ -4023,17 +4049,11 @@ def light_novel_position_for_audio(
         anchor_window["runtime_reading_hint_anchor_count"] = runtime_reading_count
         runtime_reading_debug = chapter.get("_runtime_reading_hint_debug")
         if isinstance(runtime_reading_debug, dict):
-            anchor_window["runtime_reading_hint_mode"] = str(
-                runtime_reading_debug.get("mode") or ""
-            )
+            anchor_window["runtime_reading_hint_mode"] = str(runtime_reading_debug.get("mode") or "")
             anchor_window["runtime_reading_verified_through_offset"] = int(
                 runtime_reading_debug.get("verified_through_offset") or 0
             )
-    activity_right_time = (
-        float(anchor_path[-1]["time"])
-        if anchor_path
-        else float(right_anchor["time"])
-    )
+    activity_right_time = float(anchor_path[-1]["time"]) if anchor_path else float(right_anchor["time"])
     window_activity = _clip_activity_regions(
         speech_regions,
         float(left_anchor["time"]),

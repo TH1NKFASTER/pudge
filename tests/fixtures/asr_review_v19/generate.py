@@ -4,6 +4,7 @@ The snapshot contains no original caption text or original-to-glyph mapping.
 Its timing, word confidence, ASS overrides and glyph layout retain the
 historical regression cases. Run directly, or pass --output to another folder.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,15 +23,19 @@ def glyphs(slots: list[int | str]) -> str:
 def render(record: dict) -> str:
     kind = record["format"]
     if kind == "srt":
-        return "\n\n".join(
-            "\n".join([*cue["prefix"], glyphs(cue["glyphs"])])
-            for cue in record["cues"]
-        ) + "\n"
+        return (
+            "\n\n".join("\n".join([*cue["prefix"], glyphs(cue["glyphs"])]) for cue in record["cues"]) + "\n"
+        )
     if kind == "ass":
-        return "\n".join(
-            [*record["header"], *(event["prefix"] + glyphs(event["glyphs"])
-                                  for event in record["events"])]
-        ) + "\n"
+        return (
+            "\n".join(
+                [
+                    *record["header"],
+                    *(event["prefix"] + glyphs(event["glyphs"]) for event in record["events"]),
+                ]
+            )
+            + "\n"
+        )
     if kind == "json":
         payload = copy.deepcopy(record["payload"])
         for segment in payload["segments"]:

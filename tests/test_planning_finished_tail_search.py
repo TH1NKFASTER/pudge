@@ -27,19 +27,45 @@ def _run(tmp_path: Path, monkeypatch, *, end_days_ago: int, local: range) -> lis
     manager = _manager(tmp_path)
     end = (datetime.date.today() - datetime.timedelta(days=end_days_ago)).isoformat()
     manager.db.upsert_anime(
-        LibraryAnime(media_id=177637, title="Sayonara Lara", status="PLANNING", media_status="FINISHED", progress=0, episodes=12, end_date=end)
+        LibraryAnime(
+            media_id=177637,
+            title="Sayonara Lara",
+            status="PLANNING",
+            media_status="FINISHED",
+            progress=0,
+            episodes=12,
+            end_date=end,
+        )
     )
     for episode in local:
         video = tmp_path / f"Lara - {episode:02d}.mkv"
         video.write_bytes(b"v")
-        manager.db.upsert_episode(LibraryEpisode(media_id=177637, title="Sayonara Lara", episode=episode, video_path=video, state="ready"))
+        manager.db.upsert_episode(
+            LibraryEpisode(
+                media_id=177637, title="Sayonara Lara", episode=episode, video_path=video, state="ready"
+            )
+        )
     release = NyaaRelease(
-        title="[Group] Sayonara Lara - 12 [1080p]", link="", torrent_url="https://example.invalid/12.torrent",
-        info_hash="c" * 40, size_text="1 GiB", size_bytes=1024**3, seeders=10, leechers=0, downloads=1,
-        trusted=True, remake=False, score=100.0, group="Group",
+        title="[Group] Sayonara Lara - 12 [1080p]",
+        link="",
+        torrent_url="https://example.invalid/12.torrent",
+        info_hash="c" * 40,
+        size_text="1 GiB",
+        size_bytes=1024**3,
+        seeders=10,
+        leechers=0,
+        downloads=1,
+        trusted=True,
+        remake=False,
+        score=100.0,
+        group="Group",
     )
     searched: list[int] = []
-    monkeypatch.setattr(manager, "search_releases", lambda _m, *, episode, batch, automatic=False: searched.append(episode) or [release])
+    monkeypatch.setattr(
+        manager,
+        "search_releases",
+        lambda _m, *, episode, batch, automatic=False: searched.append(episode) or [release],
+    )
     monkeypatch.setattr(manager, "_release_is_allowed_for_auto", lambda _item: True)
     monkeypatch.setattr(manager, "add_release", lambda *a, **k: release)
     manager.auto_search_current()

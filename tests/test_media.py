@@ -25,9 +25,7 @@ def test_embedded_bitmap_does_not_hide_text_candidate(monkeypatch) -> None:
         },
     )
 
-    candidates = media.find_embedded_japanese_subtitles(
-        Path("movie.mkv"), "ffprobe", "ffmpeg"
-    )
+    candidates = media.find_embedded_japanese_subtitles(Path("movie.mkv"), "ffprobe", "ffmpeg")
 
     assert len(candidates) == 2
     assert candidates[0].codec == "ass"
@@ -50,8 +48,6 @@ def test_text_only_ignores_japanese_pgs(monkeypatch) -> None:
         },
     )
 
-    result = media.find_embedded_japanese_subtitle(
-        Path("movie.mkv"), "ffprobe", "ffmpeg", text_only=True
-    )
+    result = media.find_embedded_japanese_subtitle(Path("movie.mkv"), "ffprobe", "ffmpeg", text_only=True)
 
     assert result is None

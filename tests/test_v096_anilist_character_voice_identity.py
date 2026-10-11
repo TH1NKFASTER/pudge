@@ -50,17 +50,13 @@ def _insert_book(
 
 def _annotation(api: WebAppApi, book_id: int, text: str, caption: str) -> dict:
     series_key = api.light_novels.book(book_id)["series_key"]
-    dialogue_id = next(
-        int(row["id"]) for row in api._audiobook_voice_units(text) if row["dialogue"]
-    )
+    dialogue_id = next(int(row["id"]) for row in api._audiobook_voice_units(text) if row["dialogue"])
     return {
         "schema": 1,
         "kind": "pudge-speaker-annotations",
         "series_key": series_key,
         "profiles": {},
-        "character_profiles": {
-            "999": {"name": "Ayanokouji Kiyotaka", "caption": caption}
-        },
+        "character_profiles": {"999": {"name": "Ayanokouji Kiyotaka", "caption": caption}},
         "books": [
             {
                 "book_id": book_id,
@@ -103,11 +99,17 @@ def test_same_anilist_character_keeps_voice_across_different_ln_series(
     monkeypatch.setattr(api.light_novels, "character_glossary", lambda _media_id: glossary)
 
     first = tmp_path / "first.json"
-    first.write_text(json.dumps(_annotation(api, y1, y1_text, "最初に決めた低く静かな声"), ensure_ascii=False), encoding="utf-8")
+    first.write_text(
+        json.dumps(_annotation(api, y1, y1_text, "最初に決めた低く静かな声"), ensure_ascii=False),
+        encoding="utf-8",
+    )
     api.import_light_novel_speaker_markup(y1, str(first))
 
     second = tmp_path / "second.json"
-    second.write_text(json.dumps(_annotation(api, y2, y2_text, "二年目で勝手に変えた声"), ensure_ascii=False), encoding="utf-8")
+    second.write_text(
+        json.dumps(_annotation(api, y2, y2_text, "二年目で勝手に変えた声"), ensure_ascii=False),
+        encoding="utf-8",
+    )
     api.import_light_novel_speaker_markup(y2, str(second))
 
     global_profiles = api._read_audiobook_character_profiles(api._audiobook_character_profiles_path())
@@ -181,9 +183,7 @@ def test_export_includes_anilist_character_ids_and_global_profiles(
     api = _api(tmp_path, monkeypatch)
     text = "地の文。「台詞だ」続き。"
     book_id = _insert_book(api, tmp_path, title="Export Series Vol. 1", media_id=444, text=text)
-    glossary = [
-        {"source": "綾小路清隆", "preferred": "Ayanokouji Kiyotaka", "character_id": 999}
-    ]
+    glossary = [{"source": "綾小路清隆", "preferred": "Ayanokouji Kiyotaka", "character_id": 999}]
     monkeypatch.setattr(api.light_novels, "character_glossary", lambda _media_id: glossary)
     api._write_audiobook_character_profiles(
         api._audiobook_character_profiles_path(),

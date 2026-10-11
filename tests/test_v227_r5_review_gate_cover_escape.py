@@ -3,21 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 import threading
-import json
-import subprocess
 
 import pytest
 
 from pudge.config import AppConfig, load_config, write_config
 from pudge.database import Database
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from pudge.review_gate import EpisodeReviewIdentity, ReviewGateStore
+from pudge.review_gate import ReviewGateStore
 from pudge.review_providers import JitenReviewProvider, ReviewOutcomeUnknown, ReviewProviderError
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "pudge" / "web"
+from css_support import css_rules
 
 
 class FakeStudyService:
@@ -78,16 +73,16 @@ class FakeStudyService:
         cards = [card for card in self.cards if card["pudgeCardKey"] not in excluded]
         return {"cards": cards[: max(1, required)], "session_id": "s1"}
 
-    def strict_review_submit(
-        self, word_id: int, reading_index: int, grade: str, *, attempt_id: str
-    ):
+    def strict_review_submit(self, word_id: int, reading_index: int, grade: str, *, attempt_id: str):
         self.submit_calls.append((word_id, reading_index, grade, attempt_id))
         if int(word_id) in self.unknown_words:
             raise ReviewOutcomeUnknown("jiten", attempt_id, "lost response")
         return {"ok": True, "outcome": "confirmed", "attempt_id": attempt_id}
 
 
-def _api(tmp_path: Path, *, count: int = 2, service: FakeStudyService | None = None) -> tuple[WebAppApi, Path, FakeStudyService]:
+def _api(
+    tmp_path: Path, *, count: int = 2, service: FakeStudyService | None = None
+) -> tuple[WebAppApi, Path, FakeStudyService]:
     cfg = AppConfig()
     cfg.library.database_path = tmp_path / "pudge.sqlite3"
     cfg.ui.review_gate_enabled = True
@@ -247,75 +242,139 @@ def test_review_gate_config_roundtrip(tmp_path: Path) -> None:
     assert loaded.ui.review_gate_count == 7
 
 
+def test_escape_closes_the_word_card_first_then_the_modal_then_fullscreen(page) -> None:
+    result = page.run(
+        """
+        await __tick(100);
+        void showLnAudiobookNyaa({id: 5});                       // a modal is open...
+        await __tick(20);
+        const box = document.createElement('div');               // ...and a Jiten word card above it
+        box.innerHTML = PudgeReadingTools.study.renderParsedText({paragraphs: ['猫'], tokens: [[{wordId: 1, readingIndex: 0, start: 0, end: 1}]],
+          vocabulary: [{wordId: 1, readingIndex: 0, spelling: '猫', states: ['young']}]}, {backend: 'jiten'});
+        document.body.appendChild(box);
+        await __click('[data-pudge-study-token]'); await __tick(20);
+        const surfaces = () => ({card: PudgeReadingTools.study.isOpen(), modal: __visible('#modalBackdrop'),
+                                 fullscreen: __apiCalls.filter(c => c.name === 'exit_fullscreen').length});
+        const out = {start: surfaces()};
+        const first = await __key('Escape'); await __tick(20);
+        out.first = {...surfaces(), prevented: first.defaultPrevented};
+        await __key('Escape'); await __tick(20);
+        out.second = surfaces();
+        await __key('Escape'); await __tick(20);
+        out.third = surfaces();
+        return out;
+        """,
+        state={"settings": {"escape_exits_fullscreen": True}},
+    )
+    out = result.value
+    assert out["start"] == {"card": True, "modal": True, "fullscreen": 0}
+    # One Escape closes one surface, the word card first.
+    assert out["first"] == {"card": False, "modal": True, "fullscreen": 0, "prevented": True}
+    assert out["second"] == {"card": False, "modal": False, "fullscreen": 0}
+    assert out["third"] == {"card": False, "modal": False, "fullscreen": 1}
 
-def test_jiten_card_escape_behavior_closes_card_before_modal_or_fullscreen() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    dispatcher = "function isEscapeKey" + html.split("function isEscapeKey", 1)[1].split(
-        "// pudge-r1-escape-dispatch-end", 1
-    )[0]
-    script = f"""
-const vm=require('vm');
-const dispatcher={dispatcher!r};
-const state={{study:true,modal:true,fullscreen:0,closes:[]}};
-const windowTarget=new EventTarget();global.window=windowTarget;
-global.ui={{page:'lightnovels',lnSelection:new Set(),lnStudyTriggerCapturing:false,shortcutCaptureTarget:null,onboardingForced:false,state:{{settings:{{escape_exits_fullscreen:true}}}}}};
-global.$=id=>({{hidden:id==='globalSearchOverlay',classList:{{contains:name=>id==='modalBackdrop'&&name==='open'?state.modal:false,remove(){{}}}},click(){{state.closes.push(id+':click')}}}});
-global.finishLnStudyTriggerCapture=()=>{{}};global.stopShortcutCapture=()=>{{}};global.closeLnFind=()=>{{}};
-global.closeGlobalSearch=()=>{{}};global.closeOnboarding=()=>{{}};global.skipOnboarding=async()=>{{}};
-global.closeModal=()=>{{state.modal=false;state.closes.push('modal')}};global.hideContextMenu=()=>{{}};
-global.closeLnChapterPicker=()=>{{}};global.hideLnStudyStateMenu=()=>{{}};global.hideLnTranslation=()=>{{}};
-global.clearLnSelection=()=>{{}};global.pywebview={{api:{{exit_fullscreen:async()=>{{state.fullscreen+=1}}}}}};
-window.PudgeSelect={{closeIfOpen:()=>false}};window.PudgeConfirm={{closeIfOpen:()=>false}};window.PudgeCoverPreview={{closeIfOpen:()=>false}};
-window.PudgeReadingTools={{study:{{closeIfOpen:()=>{{if(!state.study)return false;state.study=false;state.closes.push('study');return true;}}}},closeIfOpen:()=>false}};
-window.PudgeReviewGate={{handleEscape:()=>false}};window.PudgeDebug={{close:()=>{{}}}};window.PudgeMangaReaderV2={{selectedBookIds:()=>[],closeEscapeSurface:()=>false}};window.PudgeAudiobookSelection={{selectedBookIds:()=>[]}};
-vm.runInThisContext(dispatcher);
-const event=new Event('keydown',{{cancelable:true}});Object.defineProperties(event,{{key:{{value:'Escape'}},code:{{value:'Escape'}},repeat:{{value:false}},isComposing:{{value:false}}}});
-window.dispatchEvent(event);
-setImmediate(()=>process.stdout.write(JSON.stringify({{study:state.study,modal:state.modal,fullscreen:state.fullscreen,closes:state.closes,prevented:event.defaultPrevented}})));
-"""
-    result = json.loads(subprocess.check_output(["node", "-e", script], text=True))
-    assert result == {
-        "study": False,
-        "modal": True,
-        "fullscreen": 0,
-        "closes": ["study"],
-        "prevented": True,
+
+def test_main_anime_covers_keep_placeholder_until_real_image_loads(page) -> None:
+    show = {
+        "media_id": 7,
+        "title": "Show",
+        "cover": "https://img/cover.jpg",
+        "next_episode": 3,
+        "site_url": "https://anilist.co/anime/7",
     }
+    result = page.run(
+        """
+        await __tick(100);
+        const img = document.querySelector('.cover-shell img[data-pudge-cover-image]');
+        // The page's inline onload/onerror handlers, run as WebKit runs them.
+        const fire = type => new Function('event', img.getAttribute('on' + type)).call(img, new Event(type));
+        const look = () => ({placeholder: __visible('.cover-shell [data-pudge-cover-placeholder]'), ready: img.dataset.pudgeCoverReady ?? null});
+        const out = {loading: look()};
+        fire('load');                                            // "loaded" but nothing decoded
+        out.empty = look();
+        img.__naturalWidth = 230; img.__naturalHeight = 345;
+        fire('load');
+        out.loaded = look();
+        fire('error');
+        out.failed = look();
+        return out;
+        """,
+        state={"home": {"waiting": [show]}},
+    )
+    out = result.value
+    assert out["loading"] == {"placeholder": True, "ready": None}
+    assert out["empty"] == {"placeholder": True, "ready": None}
+    assert out["loaded"] == {"placeholder": False, "ready": "1"}
+    assert out["failed"] == {"placeholder": True, "ready": None}
+    # Until it is ready the image is transparent over the placeholder (no broken-image frame).
+    rules = css_rules("index.html")
+    assert rules.get(".cover-shell img[data-pudge-cover-image]", "opacity") == "0"
+    assert rules.get('.cover-shell img[data-pudge-cover-image][data-pudge-cover-ready="1"]', "opacity") == "1"
 
 
-def test_main_anime_covers_keep_placeholder_until_real_image_loads() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert "pudge-cover-load-placeholder" in html
-    assert "data-pudge-cover-placeholder" in html
-    assert "data-pudge-cover-image" in html
-    assert "onload=\"window.pudgeCoverImageState(this,true)\"" in html
-    assert "onerror=\"window.pudgeCoverImageState(this,false)\"" in html
-    assert "img[data-pudge-cover-image] { position:relative; z-index:1; opacity:0; }" in html
-    assert "img[data-pudge-cover-image][data-pudge-cover-ready=\"1\"] { opacity:1; }" in html
-    assert "if(placeholder)placeholder.hidden=true" in html
-    assert "if(placeholder)placeholder.hidden=false" in html
+# Manga covers decode by file name: ok-* decodes, broken-* fails, zero-* decodes to nothing,
+# slow-* waits for window.__decoded(name), hang-* never settles the first time.
+MANGA_COVERS = r"""
+const MakeImage = window.Image;
+const attempts = new Map();
+window.__waiting = new Map();
+window.__decoded = name => { window.__waiting.get(name)?.(); };
+window.Image = function Image() {
+  const img = MakeImage();
+  img.decode = () => {
+    const src = String(img.src), name = src.split('/').pop();
+    attempts.set(name, (attempts.get(name) || 0) + 1);
+    const size = () => { img.__naturalWidth = 200; img.__naturalHeight = 300; };
+    if (src.includes('ok-') || (src.includes('hang-') && attempts.get(name) > 1)) { size(); return Promise.resolve(); }
+    if (src.includes('broken-')) return Promise.reject(new Error('decode failed'));
+    if (src.includes('zero-')) return Promise.resolve();
+    if (src.includes('hang-')) return new Promise(() => {});
+    return new Promise(resolve => window.__waiting.set(name, () => { size(); resolve(); }));
+  };
+  return img;
+};
+window.__books = ['ok', 'broken', 'slow', 'zero', 'hang'].map((kind, i) => ({id: i + 1, title: `Vol ${i + 1}`, series_title: `Series ${i + 1}`,
+  volume: 1, page_count: 10, read_pages: 0, cover_url: `covers/${kind}-${i + 1}.jpg`}));
+__api.manga_state = async () => ({books: window.__books, ocr_available: false});
+"""
 
 
-def test_jiten_card_escape_precedes_generic_modal_escape() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    reading = (WEB / "reading_tools.js").read_text(encoding="utf-8")
-    study_escape = "if(window.PudgeReadingTools?.study?.closeIfOpen?.())return;"
-    modal_escape = "if($('modalBackdrop').classList.contains('open')){closeModal();return;}"
-    assert study_escape in html
-    assert html.index(study_escape) < html.index(modal_escape)
-    assert "closeIfOpen()" in reading
-    assert "document.getElementById('pudgeStudyCard')?.classList.contains('open')" in reading
-
-
-def test_manga_cover_placeholder_waits_for_successful_decode() -> None:
-    source = (WEB / "manga_reader_v2.js").read_text(encoding="utf-8")
-    decode = source.index("const ready = await decodeCover(url);")
-    reveal = source.index("img.hidden = false;", decode)
-    hide_placeholder = source.index("placeholder.hidden = true;", reveal)
-    assert decode < reveal < hide_placeholder
-    assert "coverLoadInflight" in source
-    assert "COVER_DECODE_TIMEOUT_MS = 8000" in source
-    assert "Promise.race([load, timeout])" in source
-    # The shared cover painter checks that its render (grid or volumes panel) is still current.
-    assert "if (!ready || !stillCurrent()) return;" in source
-    assert "paintLibraryCovers(root, books, () => renderSignature === libraryRenderSignature);" in source
+def test_manga_cover_placeholder_waits_for_successful_decode(page) -> None:
+    result = page.run(
+        """
+        const cover = id => ({image: __visible(`img[data-cover-book="${id}"]`), src: document.querySelector(`img[data-cover-book="${id}"]`)?.getAttribute('src') ?? null,
+          placeholder: __visible(`[data-cover-placeholder="${id}"]`)});
+        const redraw = async (id, changes) => {
+          window.__books = window.__books.map(b => b.id === id ? {...b, ...changes} : b);
+          await __settle(PudgeMangaReaderV2.renderLibrary(true)); await __tick(50);
+        };
+        setPage('manga');
+        await __tick(100);
+        const out = {first: [1, 2, 3, 4, 5].map(cover)};
+        // Volume 3 gets a new cover while its old one is still decoding: the late old one is not shown.
+        await redraw(3, {title: 'Vol 3 (new)', cover_url: 'covers/ok-new-3.jpg'});
+        out.redrawn = cover(3);
+        window.__decoded('slow-3.jpg'); await __tick(50);
+        out.lateOld = cover(3);
+        // A load that hangs is given up after a while, so the next redraw loads the cover again.
+        await __tick(9000);
+        out.hung = cover(5);
+        await redraw(5, {title: 'Vol 5 (new)'});
+        out.retried = cover(5);
+        return out;
+        """,
+        before=MANGA_COVERS,
+    )
+    out = result.value
+    hidden = {"image": False, "src": None, "placeholder": True}
+    assert out["first"] == [
+        {"image": True, "src": "covers/ok-1.jpg", "placeholder": False},
+        hidden,
+        hidden,
+        hidden,
+        hidden,
+    ]
+    assert out["redrawn"] == {"image": True, "src": "covers/ok-new-3.jpg", "placeholder": False}
+    assert out["lateOld"] == out["redrawn"]
+    assert out["hung"] == hidden
+    assert out["retried"] == {"image": True, "src": "covers/hang-5.jpg", "placeholder": False}

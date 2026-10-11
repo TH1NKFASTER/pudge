@@ -1,42 +1,78 @@
+"""The sidebar torrent switch has one owner of its clicks, ahead of every other click handler;
+its status endpoint answers the backend's current state every time (behaviour; audit 71Б)."""
+
 from __future__ import annotations
 
-from pathlib import Path
+import json
+import threading
+import urllib.request
+from types import SimpleNamespace
+
+from pudge import web_app
+from test_v197_torrent_http_bridge import SWITCH
 
 
-ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "pudge" / "web" / "index.html"
-WEB_APP = ROOT / "pudge" / "web_app.py"
+def test_torrent_button_has_one_early_capture_owner(page) -> None:
+    # One click is one request, even when a handler added later swallows clicks (optional UI
+    # handlers used to shadow the switch); that handler never sees the switch's click.
+    result = page.run(
+        r"""
+        await __tick(1000);
+        const swallowed = [];
+        document.addEventListener('click', event => { swallowed.push(event.target.id); event.stopImmediatePropagation(); }, true);
+        await __click('#torrentToggleButton'); await __tick(10);
+        return {posts: __fetches.filter(f => f.method === 'POST').map(f => f.body), on: __switchState().on, swallowed};
+        """,
+        before=SWITCH,
+    )
+    assert result.value == {"posts": ['{"enabled":true}'], "on": True, "swallowed": []}
+    assert not result.called("set_torrents_enabled")
 
 
-def test_torrent_button_has_one_early_capture_owner() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    button = html.split('id="torrentToggleButton"', 1)[1].split('</button>', 1)[0]
-    # The capture listener is the proven working owner. The old inline fallback
-    # could never run after stopImmediatePropagation and was only debug residue.
-    assert 'onclick=' not in button
-
-    ui_pos = html.index("const ui={")
-    capture_pos = html.index("async function torrentToggleHttpCapture(){")
-    ordinary_handlers = html.index("document.addEventListener('contextmenu'")
-    assert ui_pos < capture_pos < ordinary_handlers
-
-    handler = html.split("async function torrentToggleHttpCapture(){", 1)[1].split(
-        "document.addEventListener('click',event=>{", 1
-    )[0]
-    assert "torrentHttpJson('/api/torrents/enabled'" in handler
-    assert "Torrent toggle HTTP timeout" in handler
-    assert "torrentToggleCaptureInFlight" in handler
-    assert "ui.state.settings.torrents_enabled=Boolean(result.enabled)" in handler
-
-    capture = html.split("document.addEventListener('click',event=>{", 1)[1].split("},true);", 1)[0]
-    assert "#torrentToggleButton" in capture
-    assert "event.stopImmediatePropagation()" in capture
-    assert "torrentToggleGeneration" not in html
+def test_menu_item_switches_torrents_once(page) -> None:
+    # The sidebar context menu's item goes through the same switch: one request.
+    result = page.run(
+        r"""
+        await __tick(1000);
+        await __fire('#torrentToggleButton', 'contextmenu', {clientX: 10, clientY: 10}, 'MouseEvent');
+        const item = __text('#contextMenu [data-sidebar-context-action="torrent-toggle"]');
+        await __click('#contextMenu [data-sidebar-context-action="torrent-toggle"]'); await __tick(10);
+        return {item, label: PudgeI18n.t('ui.enableTorrentTraffic'),
+                posts: __fetches.filter(f => f.method === 'POST').map(f => f.body), on: __switchState().on};
+        """,
+        before=SWITCH,
+    )
+    out = result.value
+    assert out["item"] == out["label"]
+    assert (out["posts"], out["on"]) == (['{"enabled":true}'], True)
 
 
-def test_torrent_http_status_is_plain_authoritative_endpoint() -> None:
-    source = WEB_APP.read_text(encoding="utf-8")
-    section = source.split('if path == "/api/torrents/status":', 1)[1].split('super().do_GET()', 1)[0]
-    assert "torrent_traffic_status()" in section
-    assert "_torrent_http_status_seen" not in section
-    assert "torrent.http_status_first" not in section
+class _Logger:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, message, *args, **kwargs):
+        self.lines.append(str(message) % args)
+
+    warning = error = debug = info
+
+
+def test_torrent_http_status_is_plain_authoritative_endpoint(tmp_path) -> None:
+    states = iter([{"enabled": False, "stale": False}, {"enabled": True, "stale": False}])
+    api = SimpleNamespace(logger=_Logger(), torrent_traffic_status=lambda: next(states))
+    server = web_app.http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), web_app._asset_handler_for_api(api, tmp_path)
+    )
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/api/torrents/status"
+    try:
+        answers = []
+        for _ in range(2):
+            with urllib.request.urlopen(url, timeout=2) as response:
+                answers.append(json.loads(response.read()))
+    finally:
+        server.shutdown()
+        server.server_close()
+    # Every request asks the backend; the first one is not special.
+    assert answers == [{"enabled": False, "stale": False}, {"enabled": True, "stale": False}]
+    assert api.logger.lines == []

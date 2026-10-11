@@ -29,17 +29,32 @@ class DB:
 
 
 def release():
-    return NyaaRelease("episode 1", "https://example.org/1", "https://example.org/1.torrent", "a"*40,
-                       "1GB", 10**9, 50, 1, 10, True, False, score=100)
+    return NyaaRelease(
+        "episode 1",
+        "https://example.org/1",
+        "https://example.org/1.torrent",
+        "a" * 40,
+        "1GB",
+        10**9,
+        50,
+        1,
+        10,
+        True,
+        False,
+        score=100,
+    )
 
 
 def service(tmp_path, *anime):
     db = DB(anime)
-    manager = SimpleNamespace(db=db, config=SimpleNamespace(paths=SimpleNamespace(cache_dir=tmp_path), nyaa=SimpleNamespace(enabled=True)),
-                              search_releases=Mock(return_value=[]),
-                              _release_is_allowed_for_auto=Mock(return_value=True),
-                              _release_has_safe_episode_identity=Mock(return_value=True),
-                              logger=Mock())
+    manager = SimpleNamespace(
+        db=db,
+        config=SimpleNamespace(paths=SimpleNamespace(cache_dir=tmp_path), nyaa=SimpleNamespace(enabled=True)),
+        search_releases=Mock(return_value=[]),
+        _release_is_allowed_for_auto=Mock(return_value=True),
+        _release_has_safe_episode_identity=Mock(return_value=True),
+        logger=Mock(),
+    )
     return PlannedReleaseDiscovery(manager), manager
 
 
@@ -57,59 +72,65 @@ def test_arms_future_and_waits_15_minutes_then_backoff(tmp_path):
     anime = LibraryAnime(2, "upcoming", status="PLANNING", start_date="2030-01-01")
     svc, mgr = service(tmp_path, anime)
     airing = 1893499200  # 2030-01-01 12:00 UTC
-    assert svc.tick(now=airing-3600) == {"armed": 1, "searched": 0, "found": 0}
-    assert svc.tick(now=airing+899)["searched"] == 0
-    assert svc.tick(now=airing+900)["searched"] == 1
-    assert mgr.search_releases.call_args.kwargs == {"episode": 1, "batch": False, "automatic": True,
-                                                   "allow_anilist_network": False}
-    assert svc.tick(now=airing+901)["searched"] == 0
-    state=json.loads(mgr.db.get_state(svc._key(2)))
+    assert svc.tick(now=airing - 3600) == {"armed": 1, "searched": 0, "found": 0}
+    assert svc.tick(now=airing + 899)["searched"] == 0
+    assert svc.tick(now=airing + 900)["searched"] == 1
+    assert mgr.search_releases.call_args.kwargs == {
+        "episode": 1,
+        "batch": False,
+        "automatic": True,
+        "allow_anilist_network": False,
+    }
+    assert svc.tick(now=airing + 901)["searched"] == 0
+    state = json.loads(mgr.db.get_state(svc._key(2)))
     assert state["next_check"] == airing + 1800
     for _ in range(10):
         svc.tick(now=state["next_check"])
-        state=json.loads(mgr.db.get_state(svc._key(2)))
+        state = json.loads(mgr.db.get_state(svc._key(2)))
     assert state["next_check"] - (airing + 900) <= 10 * 86400
     assert state["next_check"] - airing > 3600
     assert svc.tick(now=airing + 8 * 86400)["searched"] == 1
-    state=json.loads(mgr.db.get_state(svc._key(2)))
+    state = json.loads(mgr.db.get_state(svc._key(2)))
     assert state["next_check"] == airing + 9 * 86400
 
 
 def test_found_is_persistent_and_no_download(tmp_path):
     anime = LibraryAnime(3, "new", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000)
-    svc, mgr=service(tmp_path, anime)
+    svc, mgr = service(tmp_path, anime)
     svc.tick(now=2_099_999_000)
-    mgr.search_releases.return_value=[release()]
+    mgr.search_releases.return_value = [release()]
     assert svc.tick(now=2_100_001_000)["found"] == 1
     assert [a["title"] for a in PlannedReleaseDiscovery(mgr).offers()] == ["new"]
     svc.tick(now=2_100_100_000)
     assert mgr.search_releases.call_count == 1
-    mgr.db.anime[3]=replace(anime,status="CURRENT")
+    mgr.db.anime[3] = replace(anime, status="CURRENT")
     assert svc.offers() == []
 
 
 def test_multiple_offers_and_inflight_watch_transition(tmp_path):
-    a=LibraryAnime(4,"A",status="PLANNING",next_airing_episode=1,next_airing_at=2_100_000_000)
-    b=replace(a,media_id=5,title="B")
-    svc,mgr=service(tmp_path,a,b)
+    a = LibraryAnime(4, "A", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000)
+    b = replace(a, media_id=5, title="B")
+    svc, mgr = service(tmp_path, a, b)
     svc.tick(now=2_099_999_000)
-    mgr.search_releases.return_value=[release()]
+    mgr.search_releases.return_value = [release()]
     assert svc.tick(now=2_100_001_000)["found"] == 2
-    assert [row["media_id"] for row in svc.offers()] == [4,5]
-    mgr.db.anime[4]=replace(a,status="CURRENT")
+    assert [row["media_id"] for row in svc.offers()] == [4, 5]
+    mgr.db.anime[4] = replace(a, status="CURRENT")
     assert [row["media_id"] for row in svc.offers()] == [5]
 
 
 def test_no_false_success_if_watch_changed_during_search(tmp_path):
-    anime=LibraryAnime(6,"A",status="PLANNING",next_airing_episode=1,next_airing_at=2_100_000_000)
-    svc,mgr=service(tmp_path,anime)
+    anime = LibraryAnime(6, "A", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000)
+    svc, mgr = service(tmp_path, anime)
     svc.tick(now=2_099_999_000)
-    def change(*args,**kwargs):
-        mgr.db.anime[6]=replace(anime,status="CURRENT")
+
+    def change(*args, **kwargs):
+        mgr.db.anime[6] = replace(anime, status="CURRENT")
         return [release()]
-    mgr.search_releases.side_effect=change
+
+    mgr.search_releases.side_effect = change
     assert svc.tick(now=2_100_001_000)["found"] == 0
-    assert svc.offers()==[]
+    assert svc.offers() == []
 
 
 def test_missing_date_waits_for_future_metadata(tmp_path):
@@ -121,7 +142,9 @@ def test_missing_date_waits_for_future_metadata(tmp_path):
 
 
 def test_release_candidate_requires_safe_episode_identity(tmp_path):
-    anime = LibraryAnime(8, "ambiguous", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000)
+    anime = LibraryAnime(
+        8, "ambiguous", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000
+    )
     svc, mgr = service(tmp_path, anime)
     svc.tick(now=2_099_999_000)
     mgr.search_releases.return_value = [release()]
@@ -145,13 +168,11 @@ def test_dismiss_is_durable_even_if_returned_to_planning(tmp_path):
 
 
 def test_next_airing_metadata_advances_without_losing_first_airing(tmp_path):
-    anime = LibraryAnime(10, "series", status="PLANNING", next_airing_episode=1,
-                         next_airing_at=2_100_000_000)
+    anime = LibraryAnime(10, "series", status="PLANNING", next_airing_episode=1, next_airing_at=2_100_000_000)
     svc, mgr = service(tmp_path, anime)
     svc.tick(now=2_099_999_000)
-    mgr.db.anime[10] = replace(anime, next_airing_episode=2,
-                               next_airing_at=2_100_604_800, start_date=None)
-    mgr.search_releases.return_value=[release()]
+    mgr.db.anime[10] = replace(anime, next_airing_episode=2, next_airing_at=2_100_604_800, start_date=None)
+    mgr.search_releases.return_value = [release()]
     assert svc.tick(now=2_100_001_000)["found"] == 1
     assert len(svc.offers()) == 1
 

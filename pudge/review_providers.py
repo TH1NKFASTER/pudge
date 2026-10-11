@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from .branding import APP_SLUG
+from .i18n import err
 
 JITEN_API_BASE = "https://api.jiten.moe/api"
 JPDB_API_BASE = "https://jpdb.io/api/v1"
@@ -119,9 +120,7 @@ JPDB_CAPABILITIES = ProviderCapabilities(
     reconciliation="unsupported: /review returns {} and no attempt echo",
     mutation_retry="single-send; timeout/network/5xx => outcome_unknown",
     strict_gate_supported=False,
-    strict_gate_reason=(
-        "public API has no due-queue enumeration, no review history and no idempotency key"
-    ),
+    strict_gate_reason=("public API has no due-queue enumeration, no review history and no idempotency key"),
     grade_modes=(("native", JPDB_GRADES_NATIVE), ("binary", JPDB_GRADES_BINARY)),
     undo="unsupported: no undo endpoint in the public API",
     native_parse="POST /parse (vid/sid/rid, card_state, due_at; utf16/utf32 positions)",
@@ -161,14 +160,14 @@ def _json_or_error(response: httpx.Response, provider: str) -> Any:
     try:
         return response.json() if response.content else {}
     except ValueError as exc:
-        raise ReviewProviderError(f"{provider} returned invalid JSON") from exc
+        raise ReviewProviderError(err("review.invalidJson", provider=provider)) from exc
 
 
 class JitenReviewProvider:
     def __init__(self, token: str) -> None:
         self.token = str(token or "")
         if not self.token:
-            raise ReviewProviderError("Jiten API token is not configured")
+            raise ReviewProviderError(err("ln.jitenTokenMissing"))
 
     @property
     def account_key(self) -> str:
@@ -210,11 +209,11 @@ class JitenReviewProvider:
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
-                f"Jiten HTTP {response.status_code}{': ' + detail if detail else ''}"
+                err("ln.jitenHttp", status=response.status_code, detail=": " + detail if detail else "")
             )
         payload = _json_or_error(response, "Jiten")
         if not isinstance(payload, dict):
-            raise ReviewProviderError("Jiten study-batch returned an invalid response")
+            raise ReviewProviderError(err("review.jitenBatchInvalid"))
         cards = [
             card
             for card in (payload.get("cards") or [])
@@ -319,8 +318,7 @@ class JitenReviewProvider:
         if pending:
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pudge-jiten-review") as pool:
                 futures = {
-                    pool.submit(self.lookup_state, word_id, reading_index):
-                    (position, card, key)
+                    pool.submit(self.lookup_state, word_id, reading_index): (position, card, key)
                     for position, card, word_id, reading_index, key in pending
                 }
                 for future in as_completed(futures):
@@ -360,11 +358,11 @@ class JitenReviewProvider:
     def validate_strict_review_candidate(self, word_id: int, reading_index: int) -> dict[str, Any]:
         state = self.lookup_state(int(word_id), int(reading_index))
         if not state.get("exists"):
-            raise ReviewProviderError("Jiten card no longer exists; refusing to create a new card")
+            raise ReviewProviderError(err("review.jitenCardMissing"))
         if not state.get("previously_reviewed"):
-            raise ReviewProviderError("Jiten card has no previous review history; new cards are forbidden by the gate")
+            raise ReviewProviderError(err("review.jitenCardNoHistory"))
         if int(state.get("state") if state.get("state") is not None else -1) in {0, 4, 5, 6}:
-            raise ReviewProviderError("Jiten card is not currently reviewable; refusing strict gate review")
+            raise ReviewProviderError(err("review.jitenCardNotDue"))
         return state
 
     def lookup_state(self, word_id: int, reading_index: int) -> dict[str, Any]:
@@ -376,11 +374,11 @@ class JitenReviewProvider:
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
-                f"Jiten HTTP {response.status_code}{': ' + detail if detail else ''}"
+                err("ln.jitenHttp", status=response.status_code, detail=": " + detail if detail else "")
             )
         payload = _json_or_error(response, "Jiten")
         if not isinstance(payload, dict):
-            raise ReviewProviderError("Jiten review-history returned an invalid response")
+            raise ReviewProviderError(err("review.jitenHistoryInvalid"))
         reviews = payload.get("reviews") or []
         card = payload.get("card") if isinstance(payload.get("card"), dict) else None
         return {
@@ -407,10 +405,10 @@ class JitenReviewProvider:
     ) -> dict[str, Any]:
         attempt = str(attempt_id or "").strip()
         if not attempt or len(attempt) > 64:
-            raise ReviewProviderError("Jiten review requires a stable attempt_id of at most 64 characters")
+            raise ReviewProviderError(err("review.jitenAttemptId"))
         rating = {"again": 1, "hard": 2, "good": 3, "easy": 4}.get(str(grade).casefold())
         if rating is None:
-            raise ReviewProviderError("Unsupported Jiten review grade")
+            raise ReviewProviderError(err("review.jitenGrade"))
         body: dict[str, Any] = {
             "wordId": int(word_id),
             "readingIndex": int(reading_index),
@@ -429,15 +427,17 @@ class JitenReviewProvider:
                 timeout=30,
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise ReviewOutcomeUnknown("jiten", attempt, f"Jiten review outcome is unknown: {exc}") from exc
+            raise ReviewOutcomeUnknown(
+                "jiten", attempt, err("review.jitenOutcomeUnknown", error=exc)
+            ) from exc
         if response.status_code == 408 or response.status_code >= 500:
             raise ReviewOutcomeUnknown(
-                "jiten", attempt, f"Jiten review outcome is unknown after HTTP {response.status_code}"
+                "jiten", attempt, err("review.jitenOutcomeUnknownHttp", status=response.status_code)
             )
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
-                f"Jiten HTTP {response.status_code}{': ' + detail if detail else ''}"
+                err("ln.jitenHttp", status=response.status_code, detail=": " + detail if detail else "")
             )
         try:
             result = _json_or_error(response, "Jiten")
@@ -463,11 +463,15 @@ class JitenReviewProvider:
                 timeout=30,
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise ReviewProviderError(f"Jiten undo failed: {exc}") from exc
+            raise ReviewProviderError(err("review.jitenUndoFailed", error=exc)) from exc
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
-                f"Jiten undo HTTP {response.status_code}{': ' + detail if detail else ''}"
+                err(
+                    "review.jitenUndoHttp",
+                    status=response.status_code,
+                    detail=": " + detail if detail else "",
+                )
             )
         payload = _json_or_error(response, "Jiten")
         return {
@@ -494,7 +498,7 @@ class JpdbReviewProvider:
     def __init__(self, token: str) -> None:
         self.token = str(token or "")
         if not self.token:
-            raise ReviewProviderError("JPDB API token is not configured")
+            raise ReviewProviderError(err("ln.jpdbTokenMissing"))
 
     @property
     def account_key(self) -> str:
@@ -522,18 +526,14 @@ class JpdbReviewProvider:
     ) -> dict[str, Any]:
         attempt = str(attempt_id or "").strip()
         if not attempt:
-            raise ReviewProviderError("JPDB review requires a local attempt_id")
+            raise ReviewProviderError(err("review.jpdbAttemptId"))
         requested = str(grade).casefold()
         # Native jpdb grades pass through verbatim. The legacy Jiten-style
         # names are kept only for the existing 4-button UI until the shared
         # review action set (S2) sends native jpdb grades itself.
-        mapped = (
-            requested
-            if requested in JPDB_GRADES
-            else {"again": "fail", "good": "okay"}.get(requested)
-        )
+        mapped = requested if requested in JPDB_GRADES else {"again": "fail", "good": "okay"}.get(requested)
         if mapped is None:
-            raise ReviewProviderError("Unsupported JPDB review grade")
+            raise ReviewProviderError(err("review.jpdbGrade"))
         try:
             response = httpx.post(
                 f"{JPDB_API_BASE}/review",
@@ -542,15 +542,15 @@ class JpdbReviewProvider:
                 timeout=30,
             )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            raise ReviewOutcomeUnknown("jpdb", attempt, f"JPDB review outcome is unknown: {exc}") from exc
+            raise ReviewOutcomeUnknown("jpdb", attempt, err("review.jpdbOutcomeUnknown", error=exc)) from exc
         if response.status_code == 408 or response.status_code >= 500:
             raise ReviewOutcomeUnknown(
-                "jpdb", attempt, f"JPDB review outcome is unknown after HTTP {response.status_code}"
+                "jpdb", attempt, err("review.jpdbOutcomeUnknownHttp", status=response.status_code)
             )
         if response.status_code >= 400:
             detail = _error_detail(response)
             raise ReviewProviderError(
-                f"JPDB HTTP {response.status_code}{': ' + detail if detail else ''}"
+                err("review.jpdbHttp", status=response.status_code, detail=": " + detail if detail else "")
             )
         try:
             result = _json_or_error(response, "JPDB")

@@ -49,6 +49,8 @@ def test_weak_timeline_does_not_override_stt_even_with_large_conflict():
         {"reason_detail": "speech_clock_disagrees_with_post_plateau"},
     )
     assert accepted is False
+
+
 from pathlib import Path
 
 from pudge.config import AppConfig

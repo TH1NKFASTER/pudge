@@ -4,12 +4,14 @@ import json
 import time
 from pathlib import Path
 
+from pudge import i18n
 from pudge.config import LLMConfig
 from pudge.llm import (
     OllamaClient,
     SEMANTIC_CACHE_REJECTED_TTL_SECONDS,
 )
 from pudge.syncing import subtitle_quality_accepted
+from tests.i18n_support import en
 
 
 def test_exact_linked_movie_ignores_noisy_semantic_samples_when_timing_is_strong() -> None:
@@ -42,7 +44,8 @@ def test_exact_linked_movie_ignores_noisy_semantic_samples_when_timing_is_strong
     )
 
     assert accepted is True
-    assert "точный фильм" in reason
+    assert reason == en("error.sync.exactMovie")
+    assert "точный фильм" in i18n.message(reason, "ru")
 
 
 def test_exact_linked_movie_override_rejects_bitmap_subtitle() -> None:
@@ -78,13 +81,11 @@ def test_rejected_semantic_cache_expires_quickly(tmp_path: Path, monkeypatch) ->
     japanese = tmp_path / "ja.srt"
     english = tmp_path / "en.srt"
     japanese.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n\n"
-        "2\n00:00:05,000 --> 00:00:06,000\n元気ですか\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n\n2\n00:00:05,000 --> 00:00:06,000\n元気ですか\n",
         encoding="utf-8",
     )
     english.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
-        "2\n00:00:05,000 --> 00:00:06,000\nHow are you?\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:05,000 --> 00:00:06,000\nHow are you?\n",
         encoding="utf-8",
     )
     client = OllamaClient(

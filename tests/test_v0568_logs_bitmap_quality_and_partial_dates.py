@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pudge import i18n
 from pudge.config import AppConfig, write_config
 from pudge.database import Database
 from pudge.manager import AnimeManager
@@ -50,7 +51,9 @@ def test_exact_single_special_ignores_semantic_cut_mismatch_when_timing_is_stron
     )
 
     assert accepted is True
-    assert "одноэпизодный SPECIAL" in reason
+    # Audit 68Б: reasons are English (error.*); the window shows them in Russian.
+    assert "single-episode Jimaku SPECIAL" in reason
+    assert "одноэпизодный SPECIAL" in i18n.message(reason, "ru")
 
 
 def test_exact_single_special_override_never_accepts_bitmap_subtitle() -> None:

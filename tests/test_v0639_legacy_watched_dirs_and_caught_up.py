@@ -102,7 +102,42 @@ def test_scan_preserves_ready_external_row_when_watch_folder_removed(tmp_path: P
     assert manager.db.episode_by_path(external) is not None
 
 
-def test_caught_up_never_uses_readiness_diagnosis() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "function mediaInHomeSection(section,mediaId)" in html
-    assert "if(mediaInHomeSection('caught_up',anime.media_id))return false;" in html
+# A finished title with nothing local: anywhere else its menu offers "Why not ready?".
+CAUGHT_UP = {
+    "media_id": 7,
+    "title": "Show",
+    "episodes": 12,
+    "progress": 12,
+    "next_episode": None,
+    "site_url": "https://anilist.co/anime/7",
+    "local": None,
+}
+MENU = """
+setPage('current', true);
+const actions = () => [...document.querySelectorAll('#contextMenu button')].map(b => b.dataset.contextAction);
+const out = {};
+if (document.querySelector('.caught-up-section [data-media-id="7"]')) {
+  await __fire('.caught-up-section [data-media-id="7"]', 'contextmenu', {bubbles: true, cancelable: true}, 'MouseEvent');
+  out.card = actions();
+  hideContextMenu();
+}
+showAnimeMenu(7, false, 10, 10);       // the same title opened from another node / duplicate payload
+out.elsewhere = actions();
+return out;
+"""
+
+
+def test_caught_up_never_uses_readiness_diagnosis(page) -> None:
+    # Caught-up cards are informational: their menu never offers readiness diagnostics or
+    # debugging, wherever the menu is opened from (the title also sits in Current with local=None).
+    caught_up = page.run(MENU, state={"current": [CAUGHT_UP], "home": {"caught_up": [CAUGHT_UP]}}).value
+    assert "open" in caught_up["card"]
+    for actions in (caught_up["card"], caught_up["elsewhere"]):
+        assert "diagnose" not in actions and "debug" not in actions
+    # Inside a caught-up watch sequence too.
+    sequence = {"kind": "watch_sequence", "media_id": 900, "title": "Show franchise", "items": [CAUGHT_UP]}
+    nested = page.run(MENU, state={"current": [CAUGHT_UP], "home": {"caught_up": [sequence]}}).value
+    assert "open" in nested["elsewhere"] and "diagnose" not in nested["elsewhere"]
+    # The same title waiting for its episode is diagnosable.
+    waiting = page.run(MENU, state={"current": [CAUGHT_UP], "home": {"waiting": [CAUGHT_UP]}}).value
+    assert "diagnose" in waiting["elsewhere"] and "debug" in waiting["elsewhere"]

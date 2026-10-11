@@ -3,7 +3,7 @@
 .pudge-assistant[hidden]{display:none}
 .pa-head{display:flex;min-height:42px;box-sizing:border-box;cursor:move;touch-action:none;user-select:none;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border-bottom:1px solid #22344b;background:#0e1b2c}
 .pa-title{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px}
-.pa-avatar{display:inline-grid;place-items:center;padding:0;border:0;cursor:pointer;width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#6f8cff,#8b5cf6);color:#fff;font-size:13px}
+.pa-avatar{display:inline-grid;place-items:center;padding:0;border:0;cursor:pointer;width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,var(--accent,#4a68e0),#7c3aed);color:#fff;font-size:13px}
 .pa-head-actions{display:flex;gap:4px}
 .pa-icon{min-width:30px;height:30px;padding:0 6px;border:1px solid transparent;border-radius:8px;background:transparent;color:#aebed3;font-size:16px;line-height:1;cursor:pointer}
 .pa-icon:hover{background:#18283d;border-color:#2b4059;color:#fff}
@@ -28,7 +28,7 @@
 .pa-typing span:nth-child(2){animation-delay:.15s}.pa-typing span:nth-child(3){animation-delay:.3s}
 @keyframes pa-dot{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
 .pa-composer{display:flex;align-items:flex-end;gap:8px;margin:10px;padding:6px 6px 6px 12px;border:1px solid #334862;border-radius:18px;background:#101e30}
-.pa-composer:focus-within{border-color:#6f8cff}
+.pa-composer:focus-within{border-color:var(--accent,#4a68e0)}
 .pa-composer textarea{flex:1 1 auto;min-width:0;min-height:38px;max-height:160px;resize:none;border:0;outline:0;background:transparent;color:#e6edf6;font:inherit;font-size:14px;line-height:1.45;padding:8px 0}
 .pa-send{flex:0 0 auto;display:grid;place-items:center;width:34px;height:34px;margin:2px 0;padding:0;border:0;border-radius:50%;background:#e6edf6;color:#0b1624;font-size:17px;font-weight:800;line-height:1;cursor:pointer}
 .pa-send svg{display:block;width:16px;height:16px}

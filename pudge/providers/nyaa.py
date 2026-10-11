@@ -20,11 +20,12 @@ from urllib.parse import parse_qs, quote_plus, urlparse
 import httpx
 
 from ..filename import fold_search_title, normalize_title, title_similarity
-from ..release_parser import parse_release_name
+from ..release_parser import double_episode_span, parse_release_name
 from ..episode_numbering import EpisodeNumbering, is_split_stage, match_release_episode
 from .seadex import SeaDexRecommendation, bonus_for
 from ..branding import APP_SLUG
 from ..manager_models import LibraryAnime, NyaaRelease
+from ..i18n import err
 from .base import CircuitBreaker
 
 
@@ -33,24 +34,26 @@ NYAA_RSS_MIRROR_BASES = ("https://nyaa.net", "https://cn.nyaa.net")
 MIRROR_BACKOFF_SECONDS = 300.0
 _MIRROR_BACKOFF: dict[str, float] = {}
 GROUP_RE = re.compile(r"^\s*\[([^\]]+)\]")
-SUFFIX_GROUP_RE = re.compile(
-    r"-(?P<group>[A-Za-z][A-Za-z0-9._-]{1,31})(?:\s+\([^)]*\))?\s*$"
-)
+SUFFIX_GROUP_RE = re.compile(r"-(?P<group>[A-Za-z][A-Za-z0-9._-]{1,31})(?:\s+\([^)]*\))?\s*$")
 FRESH_TRUSTED_ZERO_SEEDER_MAX_HOURS = 24.0
+# Manual searches: a few RSS queries in parallel, one overall deadline, and the
+# same query answered from memory for 5 minutes (automatic searches keep their
+# sequential, budgeted path and always read fresh results).
+MANUAL_SEARCH_WORKERS = 3
+MANUAL_SEARCH_DEADLINE_SECONDS = 30.0
+MANUAL_QUERY_CACHE_SECONDS = 300.0
+_MANUAL_QUERY_CACHE: dict[tuple[str, ...], tuple[float, list[NyaaRelease]]] = {}
+_MANUAL_QUERY_CACHE_LOCK = threading.Lock()
 EPISODE_PATTERNS = (
     re.compile(r"(?i)\bS\d{1,2}E(?P<ep>\d{1,4})\b"),
     re.compile(r"(?i)\bE(?:P(?:ISODE)?)?[ ._-]?(?P<ep>\d{1,4})\b"),
     re.compile(r"(?:^|[\s._-])-(?:[\s._-])*(?P<ep>\d{1,4})(?:v\d+)?(?:[\s._-]|$)"),
     re.compile(r"(?:^|[\s._-])(?P<ep>\d{2,4})(?:v\d+)?(?:[\s._-]|$)"),
 )
-BATCH_RE = re.compile(
-    r"(?i)\b(batch|complete|全集|全話|season\s*pack|\d{1,3}\s*[-~]\s*\d{1,3})\b"
-)
+BATCH_RE = re.compile(r"(?i)\b(batch|complete|全集|全話|season\s*pack|\d{1,3}\s*[-~]\s*\d{1,3})\b")
 VOLUME_MARKER_RE = re.compile(r"(?i)\bvol(?:ume)?[ ._-]*0*\d{1,3}\b")
 EPISODE_RANGE_PATTERNS = (
-    re.compile(
-        r"(?i)\bS\d{1,2}E(?P<start>\d{1,3})\s*[-~]\s*(?:S\d{1,2}E)?(?P<end>\d{1,3})\b"
-    ),
+    re.compile(r"(?i)\bS\d{1,2}E(?P<start>\d{1,3})\s*[-~]\s*(?:S\d{1,2}E)?(?P<end>\d{1,3})\b"),
     re.compile(
         r"(?i)\bE(?:P(?:ISODES?)?)?[ ._-]*0*(?P<start>\d{1,3})\s*[-~]\s*"
         r"(?:E(?:P(?:ISODES?)?)?[ ._-]*)?0*(?P<end>\d{1,3})\b"
@@ -62,9 +65,7 @@ EPISODE_RANGE_PATTERNS = (
 )
 RESOLUTION_RE = re.compile(r"(?i)\b(2160p|1440p|1080p|720p|480p)\b")
 SEASON_PATTERNS = (
-    re.compile(
-        r"(?i)\bS(?:eason)?(?:[ ._]*|-(?!\s))0*(?P<season>\d{1,2})(?:\b|(?=E\d))"
-    ),
+    re.compile(r"(?i)\bS(?:eason)?(?:[ ._]*|-(?!\s))0*(?P<season>\d{1,2})(?:\b|(?=E\d))"),
     re.compile(r"(?i)\b0*(?P<season>\d{1,2})(?:st|nd|rd|th)[ ._-]+Season\b"),
     re.compile(r"(?i)\bSeason(?:[ ._]*|-(?!\s))0*(?P<season>\d{1,2})\b"),
     re.compile(r"第\s*0*(?P<season>\d{1,2})\s*期"),
@@ -72,9 +73,7 @@ SEASON_PATTERNS = (
 SEASON_RANGE_PATTERNS = (
     # Compact forms where the first ``S`` makes the range unambiguous.
     # ``S01-04`` / ``S01~04``.
-    re.compile(
-        r"(?i)\bS0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"
-    ),
+    re.compile(r"(?i)\bS0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"),
     # Explicit marker on both sides permits whitespace around the separator.
     # ``S1 - S4`` / ``Season 1 - Season 4`` / ``Season 1 - S4``.
     re.compile(
@@ -85,9 +84,7 @@ SEASON_RANGE_PATTERNS = (
     # ``Season 1-4`` is common, but only accept the no-second-marker form when
     # the range separator is compact. This deliberately does NOT match
     # ``Season 1 - 02``, which is a common season + episode spelling.
-    re.compile(
-        r"(?i)\bSeason[ ._-]*0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"
-    ),
+    re.compile(r"(?i)\bSeason[ ._-]*0*(?P<start>\d{1,2})(?:-|~|–|—)0*(?P<end>\d{1,2})\b"),
 )
 ROMAN_SEASONS = {
     "ii": 2,
@@ -210,7 +207,7 @@ def _magnet_info_hash(value: str) -> str:
     for xt in params.get("xt", []):
         prefix = "urn:btih:"
         if xt.casefold().startswith(prefix):
-            info_hash = xt[len(prefix):].strip().lower()
+            info_hash = xt[len(prefix) :].strip().lower()
             # BEP 9 permits btih values as either 40 hexadecimal characters or
             # 32 base32 characters. aria2/qBittorrent expose the canonical hex
             # form through their APIs, so normalize the RSS value before it is
@@ -230,7 +227,7 @@ def parse_subsplease_rss(xml_text: str) -> list[NyaaRelease]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
-        raise NyaaError(f"SubsPlease returned invalid RSS: {exc}") from exc
+        raise NyaaError(err("nyaa.subspleaseInvalidRss", error=exc)) from exc
 
     releases: list[NyaaRelease] = []
     for item in root.findall("./channel/item"):
@@ -295,7 +292,12 @@ class SubsPleaseClient:
         resolution = preferred_resolution.casefold().strip()
         if "720" in resolution:
             value = "720"
-        elif "1080" in resolution or resolution in {"highest", "best", "max"} or "1440" in resolution or "2160" in resolution:
+        elif (
+            "1080" in resolution
+            or resolution in {"highest", "best", "max"}
+            or "1440" in resolution
+            or "2160" in resolution
+        ):
             # SubsPlease RSS currently exposes 1080p as its highest standard
             # feed. Higher/best preferences are still applied to Nyaa scoring.
             value = "1080"
@@ -330,16 +332,14 @@ class SubsPleaseClient:
             cached = _load_release_history(self.history_path)
             if cached:
                 return cached
-            raise NyaaError(f"SubsPlease RSS unavailable: {exc}") from exc
-
-
+            raise NyaaError(err("nyaa.subspleaseUnavailable", error=exc)) from exc
 
 
 def parse_shana_rss(xml_text: str) -> list[NyaaRelease]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
-        raise NyaaError(f"Shana Project returned invalid RSS: {exc}") from exc
+        raise NyaaError(err("nyaa.shanaInvalidRss", error=exc)) from exc
 
     releases: list[NyaaRelease] = []
     for item in root.findall("./channel/item"):
@@ -371,7 +371,8 @@ def parse_shana_rss(xml_text: str) -> list[NyaaRelease]:
                 title=title,
                 link=link or guid or download_url,
                 torrent_url=download_url,
-                info_hash=_magnet_info_hash(download_url) or (hash_match.group(1).lower() if hash_match else ""),
+                info_hash=_magnet_info_hash(download_url)
+                or (hash_match.group(1).lower() if hash_match else ""),
                 size_text=size_text,
                 size_bytes=parse_size(size_text),
                 seeders=0,
@@ -424,7 +425,8 @@ class ShanaProjectClient:
             cached = _load_release_history(self.history_path)
             if cached:
                 return cached
-            raise NyaaError(f"Shana Project RSS unavailable: {exc}") from exc
+            raise NyaaError(err("nyaa.shanaUnavailable", error=exc)) from exc
+
 
 def parse_size(value: str) -> int:
     match = re.search(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)", value)
@@ -497,6 +499,30 @@ def _season_episode_pair_range(
     )
 
 
+def release_double_episode(
+    title: str,
+    requested_episode: int | None,
+    anime: LibraryAnime | None = None,
+    alternative_episodes: tuple[int, ...] = (),
+) -> tuple[int, int] | None:
+    """Two consecutive episodes in one release starting at the requested one (audit 17А).
+
+    ``alternative_episodes`` holds the absolute numbers of the requested
+    episode, so ``13-14`` can be cour 2 episodes 1-2. Split-stage titles keep
+    their per-episode identity rules and never take a double.
+    """
+    if requested_episode is None or (anime is not None and is_split_stage(anime)):
+        return None
+    span = double_episode_span(title)
+    if span is None:
+        return None
+    if span[0] != int(requested_episode) and span[0] not in {
+        int(value) for value in alternative_episodes if int(value) > 0
+    }:
+        return None
+    return span
+
+
 def _release_is_eligible_for_episode(
     title: str,
     requested_episode: int,
@@ -515,16 +541,31 @@ def _release_is_eligible_for_episode(
     # Reject it before scoring so S00E02 cannot masquerade as normal episode 2.
     if anime is not None and _season_number(title) == 0:
         return False
+    if release_double_episode(title, requested_episode, anime, alternative_episodes) is not None:
+        return True
     episode_range = release_episode_range(title)
-    if episode_range is not None and not (anime and _season_episode_pair_range(title, anime, requested_episode)):
+    if episode_range is not None and not (
+        anime and _season_episode_pair_range(title, anime, requested_episode)
+    ):
         return False
     if BATCH_RE.search(title) and not (anime and _season_episode_pair_range(title, anime, requested_episode)):
         return False
     if anime is not None and is_split_stage(anime):
-        match = match_release_episode(anime, parse_release_name(title), requested_episode, numbering_context, alternative_episodes=alternative_episodes)
-        return match.status == "ambiguous" or (match.status == "resolved" and match.mapped_media_episode == int(requested_episode))
+        match = match_release_episode(
+            anime,
+            parse_release_name(title),
+            requested_episode,
+            numbering_context,
+            alternative_episodes=alternative_episodes,
+        )
+        return match.status == "ambiguous" or (
+            match.status == "resolved" and match.mapped_media_episode == int(requested_episode)
+        )
     found_episode, explicit = _release_episode_match(title)
-    allowed_episodes = {int(requested_episode), *(int(value) for value in alternative_episodes if int(value) > 0)}
+    allowed_episodes = {
+        int(requested_episode),
+        *(int(value) for value in alternative_episodes if int(value) > 0),
+    }
     if explicit and found_episode not in allowed_episodes:
         return False
     return True
@@ -571,7 +612,7 @@ def parse_rss(xml_text: str) -> list[NyaaRelease]:
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:
-        raise NyaaError(f"Nyaa вернул некорректный RSS: {exc}") from exc
+        raise NyaaError(err("nyaa.invalidRss", error=exc)) from exc
 
     releases: list[NyaaRelease] = []
     for item in root.findall("./channel/item"):
@@ -581,12 +622,15 @@ def parse_rss(xml_text: str) -> list[NyaaRelease]:
         info_hash = _nyaa_text(item, "infoHash")
         size_text = _nyaa_text(item, "size")
         group = release_group(title)
+        seeders_text = _nyaa_text(item, "seeders", "")
+        seeders_known = bool(seeders_text)
         try:
-            seeders = int(_nyaa_text(item, "seeders", "0") or 0)
+            seeders = int(seeders_text or 0)
             leechers = int(_nyaa_text(item, "leechers", "0") or 0)
             downloads = int(_nyaa_text(item, "downloads", "0") or 0)
         except ValueError:
             seeders = leechers = downloads = 0
+            seeders_known = False
         releases.append(
             NyaaRelease(
                 title=title,
@@ -604,6 +648,7 @@ def parse_rss(xml_text: str) -> list[NyaaRelease]:
                 published=_text(item, "pubDate"),
                 is_batch=bool(BATCH_RE.search(title)),
                 group=group,
+                seeders_known=seeders_known,
             )
         )
     return releases
@@ -639,6 +684,8 @@ class NyaaClient:
         self._mirror_backoff = _MIRROR_BACKOFF
         self._clients: dict[str, httpx.Client] = {}
         self._client_lock = threading.Lock()
+        # Manual searches run a few queries in parallel on one client.
+        self._order_lock = threading.Lock()
 
     @staticmethod
     def _normalize_proxy_url(value: str) -> str:
@@ -664,7 +711,7 @@ class NyaaClient:
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
-            raise NyaaError(f"Команда перед поиском Nyaa завершилась с ошибкой: {detail}")
+            raise NyaaError(err("nyaa.preSearchCommandFailed", error=detail))
 
     def _client_for_proxy(self, proxy: str | None) -> httpx.Client:
         key = str(proxy or "")
@@ -682,7 +729,7 @@ class NyaaClient:
 
     def _get(self, url: str, proxy: str | None) -> str:
         if not self._breaker.allow():
-            raise NyaaError("Nyaa temporarily paused after repeated network failures")
+            raise NyaaError(err("nyaa.paused"))
         try:
             response = self._client_for_proxy(proxy).get(url)
             response.raise_for_status()
@@ -690,42 +737,36 @@ class NyaaClient:
             return response.text
         except ImportError as exc:
             self._breaker.failure()
-            raise NyaaError(
-                "Для SOCKS-прокси не установлена зависимость socksio. "
-                "Повторно запустите ./install.sh."
-            ) from exc
+            raise NyaaError(err("nyaa.socksioMissing")) from exc
         except httpx.HTTPError as exc:
             self._breaker.failure()
-            route = f" через {proxy}" if proxy else " напрямую"
-            raise NyaaError(f"Nyaa недоступен{route}: {exc}") from exc
+            route = err("nyaa.routeVia", proxy=proxy) if proxy else err("nyaa.routeDirect")
+            raise NyaaError(err("nyaa.unavailable", route=route, error=exc)) from exc
 
     def _get_bytes(self, url: str, proxy: str | None) -> bytes:
         if not self._breaker.allow():
-            raise NyaaError("Nyaa temporarily paused after repeated network failures")
+            raise NyaaError(err("nyaa.paused"))
         try:
             response = self._client_for_proxy(proxy).get(url)
             response.raise_for_status()
             payload = bytes(response.content)
             if not payload or len(payload) > 12 * 1024 * 1024:
-                raise NyaaError("Nyaa returned invalid torrent metadata")
+                raise NyaaError(err("nyaa.invalidTorrent"))
             self._breaker.success()
             return payload
         except ImportError as exc:
             self._breaker.failure()
-            raise NyaaError(
-                "Для SOCKS-прокси не установлена зависимость socksio. "
-                "Повторно запустите ./install.sh."
-            ) from exc
+            raise NyaaError(err("nyaa.socksioMissing")) from exc
         except httpx.HTTPError as exc:
             self._breaker.failure()
-            route = f" через {proxy}" if proxy else " напрямую"
-            raise NyaaError(f"Nyaa недоступен{route}: {exc}") from exc
+            route = err("nyaa.routeVia", proxy=proxy) if proxy else err("nyaa.routeDirect")
+            raise NyaaError(err("nyaa.unavailable", route=route, error=exc)) from exc
 
     def fetch_torrent_payload(self, url: str) -> bytes:
         """Fetch a small .torrent file through the same Nyaa proxy route."""
         source = str(url or "").strip()
         if not source.casefold().startswith(("http://", "https://")):
-            raise NyaaError("Release does not contain a downloadable torrent file")
+            raise NyaaError(err("nyaa.noTorrentFile"))
         mode = self.proxy_mode.casefold()
         if mode == "proxy_only":
             attempts = [self.proxy_url or None]
@@ -782,10 +823,9 @@ class NyaaClient:
         errors: list[str] = []
         had_successful_response = False
         now = time.monotonic()
-        candidates = [
-            base for base in self.search_base_urls
-            if self._mirror_backoff.get(base, 0.0) <= now
-        ] or list(self.search_base_urls)
+        with self._order_lock:
+            bases = list(self.search_base_urls)
+        candidates = [base for base in bases if self._mirror_backoff.get(base, 0.0) <= now] or bases
         for base_url in candidates:
             base_failed = False
             url = (
@@ -813,9 +853,10 @@ class NyaaClient:
                     # later alias queries in this search. This avoids repeatedly
                     # paying a dead-primary timeout while still letting an empty
                     # stale mirror fall through to a fresher one.
-                    if self.search_base_urls[0] != base_url:
-                        self.search_base_urls.remove(base_url)
-                        self.search_base_urls.insert(0, base_url)
+                    with self._order_lock:
+                        if self.search_base_urls[0] != base_url and base_url in self.search_base_urls:
+                            self.search_base_urls.remove(base_url)
+                            self.search_base_urls.insert(0, base_url)
                     self._mirror_backoff.pop(base_url, None)
                     return releases
                 except NyaaError as exc:
@@ -844,7 +885,7 @@ class NyaaClient:
                     if releases:
                         return releases
             return []
-        raise NyaaError("; ".join(dict.fromkeys(errors)) or "Nyaa недоступен")
+        raise NyaaError("; ".join(dict.fromkeys(errors)) or err("nyaa.unavailablePlain"))
 
 
 def release_group(title: str) -> str:
@@ -858,9 +899,22 @@ def release_group(title: str) -> str:
     group = suffix.group("group").strip()
     normalized = _normalized_group(group)
     reserved = {
-        "webdl", "webrip", "bluray", "bdrip", "remux",
-        "h264", "x264", "h265", "x265", "hevc", "av1",
-        "aac", "flac", "ddp", "ddp20", "ddp51",
+        "webdl",
+        "webrip",
+        "bluray",
+        "bdrip",
+        "remux",
+        "h264",
+        "x264",
+        "h265",
+        "x265",
+        "hevc",
+        "av1",
+        "aac",
+        "flac",
+        "ddp",
+        "ddp20",
+        "ddp51",
     }
     return "" if normalized in reserved else group
 
@@ -909,7 +963,10 @@ def _season_number(title: str) -> int | None:
     # Season: ``Youjo Senki II`` or ``Otomege ... 2``. Treat only a final,
     # standalone suffix as a season marker; embedded numbers such as 86 or
     # titles ending in a year are intentionally ignored.
-    roman_match = re.search(r"(?i)(?:^|[ ._:-])(?P<roman>II|III|IV|V|VI|VII|VIII|IX|X)(?=\s*(?:$|[-._]\s*\d{1,3}\b|\[|\(|S\d{1,2}E))", title)
+    roman_match = re.search(
+        r"(?i)(?:^|[ ._:-])(?P<roman>II|III|IV|V|VI|VII|VIII|IX|X)(?=\s*(?:$|[-._]\s*\d{1,3}\b|\[|\(|S\d{1,2}E))",
+        title,
+    )
     if roman_match:
         return ROMAN_SEASONS.get(roman_match.group("roman").casefold())
     numeric_match = re.search(
@@ -946,7 +1003,10 @@ def _expected_season(anime: LibraryAnime) -> int:
         if value is not None
         and (
             any(pattern.search(name) for pattern in SEASON_PATTERNS)
-            or re.search(r"(?i)\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)[ ._-]+Season\b", name)
+            or re.search(
+                r"(?i)\b(?:first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)[ ._-]+Season\b",
+                name,
+            )
         )
     ]
     if explicit:
@@ -954,8 +1014,6 @@ def _expected_season(anime: LibraryAnime) -> int:
     if has_prequel and seasons:
         return max(seasons)
     return 1
-
-
 
 
 _FINAL_SEASON_IDENTITY_RE = re.compile(r"(?i)\b(?:the[ ._-]+)?final[ ._-]+season\b")
@@ -1026,7 +1084,8 @@ def release_identity_mismatch_reason(anime: LibraryAnime, title: str) -> str | N
     if target_format in {"TV", "TV_SHORT"} and target_year and parsed.title:
         year_match = re.search(
             re.escape(parsed.title) + r"\s*\(((?:19|20)\d{2})\)\s*-\s*\d",
-            value, re.IGNORECASE,
+            value,
+            re.IGNORECASE,
         )
         is_web = bool(re.search(r"(?i)\b(?:WEB[ ._-]?(?:DL|Rip)|CR|HIDIVE)\b", value))
         is_disc = bool(re.search(r"(?i)\b(?:BD|BDRip|Blu[ ._-]?Ray)\b", value))
@@ -1049,7 +1108,6 @@ def release_identity_mismatch_reason(anime: LibraryAnime, title: str) -> str | N
     if release_season == 0:
         return "special-season-zero"
     return None
-
 
 
 def _absolute_episode_alias_overrides_season_identity(
@@ -1083,9 +1141,7 @@ def release_is_safe_batch_candidate(
     reasons = {str(reason) for reason in getattr(item, "reasons", [])}
     if any(reason.startswith("wrong-season=") for reason in reasons):
         return False
-    if "single-episode" in reasons or any(
-        reason.startswith("single-episode=") for reason in reasons
-    ):
+    if "single-episode" in reasons or any(reason.startswith("single-episode=") for reason in reasons):
         return False
 
     has_range = any(reason.startswith("range=") for reason in reasons)
@@ -1216,7 +1272,10 @@ def _token_phrase_present(alias: str, release_title: str) -> bool:
     if not alias_tokens or len(alias_tokens) > len(release_tokens):
         return False
     width = len(alias_tokens)
-    return any(release_tokens[index:index + width] == alias_tokens for index in range(len(release_tokens) - width + 1))
+    return any(
+        release_tokens[index : index + width] == alias_tokens
+        for index in range(len(release_tokens) - width + 1)
+    )
 
 
 def _relation_title_candidates(relations: Iterable[dict[str, object]]) -> list[str]:
@@ -1279,11 +1338,7 @@ def release_related_title_conflict_reason(
     positive_values: list[str] = []
     for value in [anime.title, *anime.titles, *anime.synonyms]:
         positive_values.extend(_release_search_title_variants(str(value or "")))
-    positives = list(dict.fromkeys(
-        value.strip()
-        for value in positive_values
-        if value.strip()
-    ))
+    positives = list(dict.fromkeys(value.strip() for value in positive_values if value.strip()))
     release = str(release_title or "")
     positive_exact = [value for value in positives if _token_phrase_present(value, release)]
     for negative in relation_negative_titles(anime, negative_titles):
@@ -1294,10 +1349,7 @@ def release_related_title_conflict_reason(
         negative_tokens = normalize_title(negative).split()
         for positive in positive_exact:
             positive_tokens = normalize_title(positive).split()
-            if (
-                len(negative_tokens) > len(positive_tokens)
-                and _token_phrase_present(positive, negative)
-            ):
+            if len(negative_tokens) > len(positive_tokens) and _token_phrase_present(positive, negative):
                 return "related-media-title"
     return None
 
@@ -1326,11 +1378,7 @@ def _title_match_score(
     raw_aliases: list[str] = []
     for value in [anime.title, *alternative_titles, *anime.titles, *anime.synonyms]:
         raw_aliases.extend(_release_search_title_variants(value))
-    aliases = list(dict.fromkeys(
-        value.strip()
-        for value in raw_aliases
-        if value.strip()
-    ))
+    aliases = list(dict.fromkeys(value.strip() for value in raw_aliases if value.strip()))
     if not aliases:
         return -200.0, ["title-missing"]
 
@@ -1344,20 +1392,22 @@ def _title_match_score(
     alias_norm = normalize_title(best_alias)
     alias_tokens = alias_norm.split()
     release_tokens = set(normalize_title(release_title).split())
-    coverage = (
-        len(set(alias_tokens) & release_tokens) / len(set(alias_tokens))
-        if alias_tokens
-        else 0.0
-    )
+    coverage = len(set(alias_tokens) & release_tokens) / len(set(alias_tokens)) if alias_tokens else 0.0
 
     # Short titles must appear as complete tokens. This blocks e.g. "Akira"
     # matching the unrelated word "Akiraka" while still accepting "AKIRA (1988)".
     if len(alias_tokens) == 1 and len(alias_norm) <= 12:
         return best_similarity * 0.20 - 185.0, [f"title={best_similarity:.0f}", "short-title-token-mismatch"]
     if coverage < 0.60:
-        return best_similarity * 0.25 - 125.0, [f"title={best_similarity:.0f}", f"title-token-coverage={coverage:.2f}"]
+        return best_similarity * 0.25 - 125.0, [
+            f"title={best_similarity:.0f}",
+            f"title-token-coverage={coverage:.2f}",
+        ]
     if coverage < 0.85:
-        return best_similarity * 0.35 - 45.0, [f"title={best_similarity:.0f}", f"partial-title-coverage={coverage:.2f}"]
+        return best_similarity * 0.35 - 45.0, [
+            f"title={best_similarity:.0f}",
+            f"partial-title-coverage={coverage:.2f}",
+        ]
     return best_similarity * 0.40 - 15.0, [f"title={best_similarity:.0f}", "fuzzy-title-match"]
 
 
@@ -1469,7 +1519,9 @@ def _video_policy_score(
 
     dub_only = bool(
         re.search(r"(?i)\b(?:English[ ._-]?Dub|ENG[ ._-]?Dub|Dubbed)\b", title)
-        and not re.search(r"(?i)\b(?:Dual[ ._-]?Audio|Multi[ ._-]?Audio|Japanese|JPN|JA[ ._-]?Audio)\b", title)
+        and not re.search(
+            r"(?i)\b(?:Dual[ ._-]?Audio|Multi[ ._-]?Audio|Japanese|JPN|JA[ ._-]?Audio)\b", title
+        )
     )
     if require_japanese_audio and dub_only:
         score -= 220.0
@@ -1514,11 +1566,7 @@ def score_context_key(score_kwargs: dict) -> str:
             return int(value)
         return value
 
-    payload = {
-        key: norm(value)
-        for key, value in score_kwargs.items()
-        if key != "seadex"
-    }
+    payload = {key: norm(value) for key, value in score_kwargs.items() if key != "seadex"}
     payload["seadex"] = seadex_fingerprint(score_kwargs.get("seadex"))
     digest = hashlib.sha1(
         json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
@@ -1567,14 +1615,36 @@ def score_release(
         reasons.append(f"wrong-season={release_season}")
 
     found_episode, explicit_episode = _release_episode_match(release.title)
-    episode_match = match_release_episode(anime, parse_release_name(release.title), episode, numbering_context, alternative_episodes=alternative_episodes, trusted_source=release.trusted or _contains_any(release.group, trusted_groups)) if not batch and episode is not None else None
+    episode_match = (
+        match_release_episode(
+            anime,
+            parse_release_name(release.title),
+            episode,
+            numbering_context,
+            alternative_episodes=alternative_episodes,
+            trusted_source=release.trusted or _contains_any(release.group, trusted_groups),
+        )
+        if not batch and episode is not None
+        else None
+    )
     if batch:
         episode_range = release_episode_range(release.title)
         range_count = episode_range[1] - episode_range[0] + 1 if episode_range else 0
+        # One episode number and no range is a single episode, also when the release counts
+        # episodes across seasons (S03E49 for the first episode of season 3): only a
+        # pack-sized file with such a number is left to the size rules below.
         plausible_single_episode = (
             found_episode
             if found_episode is not None
-            and (anime.episodes is None or found_episode <= max(3, anime.episodes + 3))
+            and (
+                anime.episodes is None
+                or found_episode <= max(3, anime.episodes + 3)
+                or (
+                    episode_range is None
+                    and not release.is_batch
+                    and (not release.size_bytes or release.size_bytes < 4 * 1024**3)
+                )
+            )
             else None
         )
         likely_pack = bool(
@@ -1633,7 +1703,18 @@ def score_release(
         episode_range = release_episode_range(release.title)
         if episode_range is not None and _season_episode_pair_range(release.title, anime, episode):
             episode_range = None
-        if release.is_batch or episode_range is not None:
+        double = release_double_episode(release.title, episode, anime, alternative_episodes)
+        if double is not None:
+            # Two episodes in one file: usable, but a single-episode release
+            # of the same quality ranks above it (audit 17А).
+            score += 34 - 30
+            if double[0] == episode:
+                reasons.append(f"ep={episode}")
+            else:
+                reasons.append(f"absolute-ep={double[0]}")
+                reasons.append(f"relative-ep={episode}")
+            reasons.append(f"double-episode={double[0]}-{double[1]}")
+        elif release.is_batch or episode_range is not None:
             score -= 500
             reasons.append("episode-pack")
             if episode_range is not None:
@@ -1645,7 +1726,9 @@ def score_release(
                 reasons.append(f"found-episode={found_episode}")
             if episode_match.rejection_reason:
                 reasons.append(episode_match.rejection_reason)
-        elif found_episode == episode and (episode_match is None or episode_match.mapped_media_episode == found_episode):
+        elif found_episode == episode and (
+            episode_match is None or episode_match.mapped_media_episode == found_episode
+        ):
             score += 34
             reasons.append(f"ep={episode}")
         elif found_episode in {int(value) for value in alternative_episodes if int(value) > 0}:
@@ -1710,21 +1793,24 @@ def score_release(
         reasons.append("jp-subs")
 
     official_subsplease = release.category_id == "subsplease-rss"
-    fresh_trusted_zero_seeders = fresh_trusted_zero_seeders_allowed(
-        release, trusted_groups
-    )
+    fresh_trusted_zero_seeders = fresh_trusted_zero_seeders_allowed(release, trusted_groups)
     if official_subsplease:
         score += 18
         reasons.extend(["official-subsplease-rss", "seeders-unknown"])
     elif fresh_trusted_zero_seeders:
         reasons.append("fresh-trusted-zero-seeders")
+    elif not release.seeders_known:
+        # A mirror without swarm counts is not a dead torrent: no penalty, but a
+        # release with known seeders still wins a close call.
+        score -= 8
+        reasons.append("seeders-unknown")
     elif release.seeders <= 0:
         score -= 60
         reasons.append("no-seeders")
     elif release.seeders < min_seeders:
         score -= 48
         reasons.append("few-seeders")
-    if not official_subsplease:
+    if not official_subsplease and release.seeders_known:
         seed_bonus = _seed_availability_bonus(release.seeders)
         score += seed_bonus
         reasons.append(f"seeds={release.seeders}")
@@ -1745,7 +1831,9 @@ def score_release(
         if release.size_bytes > target_episode_max_bytes * 2:
             score -= 8
             reasons.append("too-large")
-        elif release.size_bytes and release.size_bytes < min(target_episode_min_bytes, 800 * 1024 * 1024) // 2:
+        elif (
+            release.size_bytes and release.size_bytes < min(target_episode_min_bytes, 800 * 1024 * 1024) // 2
+        ):
             score -= 8
             reasons.append("below-configured-minimum")
 
@@ -1755,14 +1843,28 @@ def score_release(
     score += seadex_bonus
     reasons.extend(seadex_reasons)
 
-    identity = {} if episode_match is None else {
-        "mapped_media_episode": episode_match.mapped_media_episode,
-        "raw_release_episode": episode_match.raw_release_episode,
-        "numbering_status": episode_match.status,
-        "numbering_scheme": episode_match.scheme_id,
-        "numbering_rule": episode_match.rule_id,
-        "numbering_revision": episode_match.rule_revision,
-    }
+    identity = (
+        {}
+        if episode_match is None
+        else {
+            "mapped_media_episode": episode_match.mapped_media_episode,
+            "raw_release_episode": episode_match.raw_release_episode,
+            "numbering_status": episode_match.status,
+            "numbering_scheme": episode_match.scheme_id,
+            "numbering_rule": episode_match.rule_id,
+            "numbering_revision": episode_match.rule_revision,
+        }
+    )
+    if episode_match is not None and not batch and episode is not None:
+        double = release_double_episode(release.title, episode, anime, alternative_episodes)
+        if double is not None:
+            identity.update(
+                mapped_media_episode=int(episode),
+                raw_release_episode=double[0],
+                numbering_status="resolved",
+                numbering_scheme="double-episode",
+                numbering_rule="double-episode",
+            )
     return replace(release, score=round(score, 3), reasons=reasons, **identity)
 
 
@@ -1781,6 +1883,71 @@ def _release_search_title_variants(value: str) -> tuple[str, ...]:
     if stripped and stripped != original:
         return (stripped, original)
     return (original,)
+
+
+def _manual_query_key(client: NyaaClient, query: str) -> tuple[str, ...]:
+    return (client.base_url, str(client.category), str(client.proxy_mode), str(client.proxy_url), query)
+
+
+def _manual_parallel_search(
+    client: NyaaClient, queries: list[str]
+) -> tuple[dict[str, list[NyaaRelease]], list[str], bool]:
+    """Run a manual search's RSS queries 3 at a time under one deadline.
+
+    Results are merged in the original query order by the caller, so the
+    outcome does not depend on which request finished first.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+    found: dict[str, list[NyaaRelease]] = {}
+    errors: list[str] = []
+    now = time.monotonic()
+    pending_queries: list[str] = []
+    with _MANUAL_QUERY_CACHE_LOCK:
+        for key in [
+            key
+            for key, (stamp, _rows) in _MANUAL_QUERY_CACHE.items()
+            if now - stamp >= MANUAL_QUERY_CACHE_SECONDS
+        ]:
+            _MANUAL_QUERY_CACHE.pop(key, None)
+        for query in queries:
+            cached = _MANUAL_QUERY_CACHE.get(_manual_query_key(client, query))
+            if cached is not None:
+                found[query] = [replace(release) for release in cached[1]]
+            else:
+                pending_queries.append(query)
+    if not pending_queries:
+        return found, errors, False
+    deadline = now + MANUAL_SEARCH_DEADLINE_SECONDS
+    executor = ThreadPoolExecutor(max_workers=MANUAL_SEARCH_WORKERS, thread_name_prefix="nyaa-search")
+    exhausted = False
+    try:
+        futures = {executor.submit(client.search, query): query for query in pending_queries}
+        remaining = set(futures)
+        while remaining:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                exhausted = True
+                break
+            done, remaining = wait(remaining, timeout=timeout, return_when=FIRST_COMPLETED)
+            for future in done:
+                query = futures[future]
+                try:
+                    rows = future.result()
+                except NyaaError as exc:
+                    errors.append(f"{query}: {exc}")
+                    continue
+                found[query] = rows
+                with _MANUAL_QUERY_CACHE_LOCK:
+                    _MANUAL_QUERY_CACHE[_manual_query_key(client, query)] = (
+                        time.monotonic(),
+                        [replace(release) for release in rows],
+                    )
+    finally:
+        # Queries not started before the deadline are dropped; a request already
+        # in flight finishes in the background and is discarded.
+        executor.shutdown(wait=False, cancel_futures=True)
+    return found, errors, exhausted
 
 
 def search_ranked(
@@ -1849,9 +2016,7 @@ def search_ranked(
         for alias in selected_aliases:
             if _season_number(alias) is not None:
                 continue
-            bases.extend(
-                [f"{alias} S{expected_season:02d}", f"{alias} {_ordinal(expected_season)} Season"]
-            )
+            bases.extend([f"{alias} S{expected_season:02d}", f"{alias} {_ordinal(expected_season)} Season"])
 
     queries: list[str] = []
     unique_bases = list(dict.fromkeys(value.strip() for value in bases if value.strip()))
@@ -1896,12 +2061,16 @@ def search_ranked(
 
     by_hash: dict[str, NyaaRelease] = {}
     search_errors: list[str] = []
-    deadline = (
-        time.monotonic() + max(0.0, query_budget_seconds)
-        if query_budget_seconds is not None
-        else None
-    )
+    deadline = time.monotonic() + max(0.0, query_budget_seconds) if query_budget_seconds is not None else None
     budget_exhausted = False
+    if query_budget_seconds is None and isinstance(client, NyaaClient):
+        found_by_query, search_errors, budget_exhausted = _manual_parallel_search(client, queries)
+        for query in queries:
+            for release in found_by_query.get(query, []):
+                key = release.info_hash or release.torrent_url or release.link
+                if key not in by_hash:
+                    by_hash[key] = release
+        queries = []
     for query in queries:
         if deadline is not None and time.monotonic() >= deadline:
             budget_exhausted = True
@@ -1969,7 +2138,6 @@ def search_ranked(
     return ranked
 
 
-
 def search_shana_ranked(
     client: ShanaProjectClient,
     anime: LibraryAnime,
@@ -2016,19 +2184,36 @@ def search_shana_ranked(
             numbering_context=numbering_context,
         )
         for release in client.releases()
-        if (release.is_batch if batch else not release.is_batch)
-        and (batch or episode is None or _release_is_eligible_for_episode(release.title, episode, anime, alternative_episodes, numbering_context))
+        # "01-02" looks like a pack but is two episodes in one file (audit 17А).
+        if (
+            release.is_batch
+            if batch
+            else (not release.is_batch or double_episode_span(release.title) is not None)
+        )
+        and (
+            batch
+            or episode is None
+            or _release_is_eligible_for_episode(
+                release.title, episode, anime, alternative_episodes, numbering_context
+            )
+        )
     ]
     ranked = [
         item
         for item in ranked
-        if any(reason.startswith("exact-title") or reason.startswith("alias-title") or reason.startswith("fuzzy-title") for reason in item.reasons)
+        if any(
+            reason.startswith("exact-title")
+            or reason.startswith("alias-title")
+            or reason.startswith("fuzzy-title")
+            for reason in item.reasons
+        )
         and release_title_is_plausible(
             anime, item.title, alternative_titles, negative_titles, alternative_episodes
         )
     ]
     ranked.sort(key=lambda item: (item.score, item.published), reverse=True)
     return ranked
+
 
 def search_subsplease_ranked(
     client: SubsPleaseClient,
@@ -2063,9 +2248,7 @@ def search_subsplease_ranked(
             release.title, episode, anime, alternative_episodes, numbering_context
         ):
             continue
-        title_score, _title_reasons = _title_match_score(
-            anime, release.title, alternative_titles
-        )
+        title_score, _title_reasons = _title_match_score(anime, release.title, alternative_titles)
         if title_score < 25.0 or not release_title_is_plausible(
             anime, release.title, alternative_titles, negative_titles, alternative_episodes
         ):

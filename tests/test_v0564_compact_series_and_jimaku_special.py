@@ -1,16 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from css_support import css_rules
 
 from pudge.cli import _find_online_subtitles
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -34,7 +33,9 @@ def relation(media_id: int, title: str) -> dict:
     }
 
 
-def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Path) -> None:
+def monogatari_state(tmp_path: Path) -> dict:
+    """A get_state payload (real backend): three ready Monogatari entries grouped into one
+    watch sequence on Home."""
     api = make_api(tmp_path)
     entries = [
         (1, "Bakemonogatari", 2),
@@ -64,32 +65,64 @@ def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Pat
                 state="ready",
             )
         )
+    return json.loads(json.dumps(api.get_state(), default=str))
 
-    group = api.get_state()["home"]["completed_ready"][0]
+
+# The watch-sequence card on Home, read from the window.
+SEQUENCE = r"""
+const card = document.querySelector('.ready-sequence-card');
+const rows = () => [...card.querySelectorAll('.ready-sequence-row')].map(row => row.innerText.replace(/\s+/g, ' ').trim());
+"""
+
+
+def test_monogatari_sequence_gets_franchise_title_and_compact_card(tmp_path: Path, page) -> None:
+    state = monogatari_state(tmp_path)
+    group = state["home"]["completed_ready"][0]
     assert group["kind"] == "watch_sequence"
     assert group["title"] == "Monogatari Series"
+    for lang in ("en", "ru"):
+        result = page.run(
+            SEQUENCE
+            + """
+            return {cards: document.querySelectorAll('.ready-sequence-card').length, series: card.title, rows: rows(),
+                    lead: card.querySelector('.ready-sequence-meta strong').innerText, text: card.innerText,
+                    orderLabels: ['label.watchSequence', 'label.releaseOrder', 'label.anilistOrder'].map(key => t(key))};
+            """,
+            lang=lang,
+            state=state,
+        )
+        out = result.value
+        assert out["cards"] == 1 and out["series"] == "Monogatari Series"
+        assert out["rows"] == ["1 Bakemonogatari", "2 Nisemonogatari", "3 Kizumonogatari"]
+        assert out["lead"] == "Bakemonogatari"
+        assert not any(label in out["text"] for label in out["orderLabels"])  # no "Watch order" caption
+    # A normal-sized card in the grid, not a full-width row.
+    rules = css_rules("index.html")
+    assert rules.get(".ready-sequence-card", "position") == "relative"
+    assert rules.get(".ready-sequence-card", "grid-column") is None
 
-    html = HTML.read_text(encoding="utf-8")
-    assert ".ready-sequence-card { position:relative;" in html
-    ready_sequence_css = html.split(".ready-sequence-card {", 1)[1].split("}", 1)[0]
-    assert "grid-column:1/-1" not in ready_sequence_css
-    assert "group.title||items[0].title" in html
-    assert "ready-sequence-list" in html
-    assert "t('label.watchSequence')" not in html
 
-
-def test_waiting_card_never_prints_episode_null() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    home = (HTML.parent / "home_status.js").read_text(encoding="utf-8")
-    assert "validEpisodeNumber" in html
-    assert "episode!==null?t('label.episodeNotReady'" in home
-    assert "t('label.notReady')" in home
-    assert "episode:a.next_episode" not in home
-    start = html.index("function waitingHomeCard(a){")
-    end = html.index("function downloadAvailableHomeCard(a){", start)
-    block = html[start:end]
-    assert "const state=episodePresentationStatus(a,episode);" in block
-    assert "finalSuffix" not in block
+def test_waiting_card_never_prints_episode_null(page) -> None:
+    waiting = [
+        {"media_id": 1, "title": "No next episode", "next_episode": None},
+        {"media_id": 2, "title": "Local without number", "next_episode": None, "local": {"episode": None}},
+        {"media_id": 3, "title": "Zero", "next_episode": 0},
+        {"media_id": 4, "title": "Episode three", "next_episode": 3},
+        {"media_id": 5, "title": "Local five", "local": {"episode": 5}},
+    ]
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            return {states: [...document.querySelectorAll('.waiting-card .airing-state')].map(el => el.innerText),
+                    notReady: t('label.notReady'), three: t('label.episodeNotReady', {episode: 3}),
+                    five: t('label.episodeNotReady', {episode: 5})};
+            """,
+            lang=lang,
+            state={"home": {"waiting": waiting}},
+        )
+        out = result.value
+        assert out["states"] == [out["notReady"], out["notReady"], out["notReady"], out["three"], out["five"]]
+        assert not any("null" in text or "undefined" in text for text in out["states"])
 
 
 def test_exact_title_single_special_is_accepted_without_jimaku_anilist_id(

@@ -37,7 +37,9 @@ class Pmset:
             if self.fail_battery:
                 raise OSError("pmset battery unavailable")
             source = "Battery Power" if self.on_battery else "AC Power"
-            return SimpleNamespace(stdout=f"Now drawing from '{source}'\n -InternalBattery-0 ({self.percent}%)")
+            return SimpleNamespace(
+                stdout=f"Now drawing from '{source}'\n -InternalBattery-0 ({self.percent}%)"
+            )
         if self.fail_thermal:
             raise OSError("pmset thermal unavailable")
         limit = 80 if self.thermal else 100
@@ -178,7 +180,6 @@ def test_scheduler_user_and_playback_priority_bypass_energy_saving_background_do
     lease.release()
 
 
-
 def test_scheduler_admission_log_uses_exact_power_reason(tmp_path: Path) -> None:
     clock, pmset = Clock(), Pmset(percent=10)
     p = policy(pmset, clock)
@@ -206,6 +207,7 @@ def test_fresh_policy_after_restart_enters_immediately_at_19_percent() -> None:
     assert snap.mode == "energy_saving"
     assert snap.auto_latched is True
 
+
 def test_two_process_policies_have_same_config_and_independent_latches() -> None:
     clock = Clock()
     pmset_a, pmset_b = Pmset(percent=19), Pmset(percent=19)
@@ -231,21 +233,58 @@ def test_power_config_roundtrip_and_defaults(tmp_path: Path) -> None:
     assert loaded.power.auto_battery_energy_saving is False
 
 
-def test_power_ui_contract_present() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="s_power_manual"' in html
-    assert 'id="s_power_auto"' in html
-    assert "power_manual_energy_saving:c('s_power_manual')" in html
-    assert "power_auto_battery_energy_saving:c('s_power_auto')" in html
-    assert "pywebview.api.power_status" in html
-    assert "energy-saving" in html
-    assert "if(!ui.windowActive||ui.page!=='current')return;" in html
-    assert "if(energySavingActive())return;" in html
+def test_power_settings_are_saved_and_the_window_follows_the_power_mode(page) -> None:
+    # The foil covers stay still in energy saving: test_v0653_energy_idle.py.
+    result = page.run(
+        """
+        await __tick(100);
+        setPage('settings');
+        await __click('#settingsContent [data-settings-category=advanced]');
+        const box = id => ({checked: document.getElementById(id).checked, visible: __visible('#' + id)});
+        const before = {manual: box('s_power_manual'), auto: box('s_power_auto'), status: __text('#powerPolicyStatus')};
+        await __input('#s_power_manual', true);
+        await __input('#s_power_auto', false);
+        const clickedAt = __apiCalls.length;
+        await __click('#saveSettings');
+        await __tick(100);
+        const refreshed = __apiCalls.slice(clickedAt).filter(call => call.name === 'power_status').map(call => call.args);
+        const saved = {refreshed, saving: document.documentElement.classList.contains('energy-saving'), status: __text('#powerPolicyStatus')};
+        const polls = () => __apiCalls.filter(call => call.name === 'power_status').length;
+        let mark = polls();
+        await __tick(60000);
+        const front = polls() - mark;
+        document.hidden = true; document.visibilityState = 'hidden';
+        document.dispatchEvent(new Event('visibilitychange'));
+        mark = polls();
+        await __tick(120000);
+        return {before, saved, front, behind: polls() - mark,
+                texts: {normal: t('settings.powerNormal'), active: t('settings.powerActive'), manual: t('settings.powerReasonManual')}};
+        """,
+        lang="ru",
+        before="""
+        __api.save_settings = async values => ({settings: {...(await __api.get_state()).settings, ...values}});
+        __api.power_status = async () => ({mode: 'energy_saving', reasons: ['manual'], battery_percent: 64});
+        """,
+        state={"settings": {"power_manual_energy_saving": False, "power_auto_battery_energy_saving": True}},
+        api={"startup_maintenance": {"running": False}, "ui_state_versions": {"ready": "1", "ui": "1"}},
+    )
+    out, texts = result.value, result.value["texts"]
+    assert out["before"] == {
+        "manual": {"checked": False, "visible": True},
+        "auto": {"checked": True, "visible": True},
+        "status": texts["normal"],
+    }
+    saved = result.calls_of("save_settings")[0][0]
+    assert (saved["power_manual_energy_saving"], saved["power_auto_battery_energy_saving"]) == (True, False)
+    assert out["saved"] == {
+        "refreshed": [[True]],  # the policy is refreshed at once
+        "saving": True,
+        "status": f"{texts['active']} · {texts['manual']} · 64%",
+    }
+    assert out["front"] == 2 and out["behind"] == 2  # every 30 s in front, every minute behind
 
 
-def test_scheduler_background_allowed_override_remains_admission_seam(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_scheduler_background_allowed_override_remains_admission_seam(tmp_path: Path, monkeypatch) -> None:
     clock, pmset = Clock(), Pmset(percent=10)
     scheduler = WorkScheduler(tmp_path, power_policy=policy(pmset, clock))
 

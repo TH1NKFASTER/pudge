@@ -81,11 +81,13 @@ def test_stop_uses_cached_position_and_kills_slow_mpv_without_ipc_reads(
 
     assert result["stopped"] is True
     assert saved == [(7, 42.75)]
-    assert commands == [[
-        ["set_property", "mute", True],
-        ["set_property", "pause", True],
-        ["quit"],
-    ]]
+    assert commands == [
+        [
+            ["set_property", "mute", True],
+            ["set_property", "pause", True],
+            ["quit"],
+        ]
+    ]
     assert process.terminate_calls == 1
     assert process.kill_calls == 1
     assert process.wait_timeouts
@@ -93,13 +95,3 @@ def test_stop_uses_cached_position_and_kills_slow_mpv_without_ipc_reads(
     assert 7 not in service._players
     assert 7 not in service._ipc_paths
     assert 7 not in service._last_positions
-
-
-def test_stop_source_has_no_blocking_position_query() -> None:
-    import inspect
-
-    source = inspect.getsource(AudiobookService.stop)
-
-    assert "_global_position" not in source
-    assert "_ipc_commands_no_wait" in source
-    assert "_wait_or_kill" in source

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import zipfile
 from pathlib import Path
 
@@ -8,6 +7,7 @@ import pytest
 
 from pudge.config import AppConfig
 from pudge.light_novels import LightNovelService
+from study_page_support import LN_BOOK
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -22,8 +22,14 @@ def cfg(tmp_path: Path) -> AppConfig:
 
 def make_epub(path: Path) -> None:
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("META-INF/container.xml", '''<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>''')
-        zf.writestr("OEBPS/content.opf", '''<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>テスト Novel Vol. 2</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>''')
+        zf.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>""",
+        )
+        zf.writestr(
+            "OEBPS/content.opf",
+            """<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>テスト Novel Vol. 2</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/><item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>""",
+        )
         zf.writestr("OEBPS/c1.xhtml", "<html><body><p>猫が好きです。</p></body></html>")
         zf.writestr("OEBPS/c2.xhtml", "<html><body><p>犬も好きです。</p></body></html>")
 
@@ -57,7 +63,18 @@ def test_jiten_parse_is_persistently_cached(tmp_path: Path, monkeypatch: pytest.
         calls.append((action, payload))
         assert action == "reader/parse"
         return {
-            "tokens": [[{"wordId": 10, "readingIndex": 1, "start": 0, "end": 1, "length": 1, "card": {"spelling": "猫", "reading": "ねこ", "cardState": ["young"]}}]],
+            "tokens": [
+                [
+                    {
+                        "wordId": 10,
+                        "readingIndex": 1,
+                        "start": 0,
+                        "end": 1,
+                        "length": 1,
+                        "card": {"spelling": "猫", "reading": "ねこ", "cardState": ["young"]},
+                    }
+                ]
+            ],
             "vocabulary": [{"wordId": 10, "readingIndex": 1, "spelling": "猫", "reading": "ねこ"}],
         }
 
@@ -70,7 +87,9 @@ def test_jiten_parse_is_persistently_cached(tmp_path: Path, monkeypatch: pytest.
     # Cache survives a new service instance because it lives in SQLite.
     service2 = LightNovelService(service.config)
     service2.save_settings({"jiten_api_key": "token", "parse_ahead": "current"})
-    monkeypatch.setattr(service2, "_jiten_request", lambda *_args, **_kwargs: pytest.fail("network should not be used"))
+    monkeypatch.setattr(
+        service2, "_jiten_request", lambda *_args, **_kwargs: pytest.fail("network should not be used")
+    )
     assert service2.chapter(book["id"], 0)["tokens"]
 
 
@@ -100,7 +119,10 @@ def test_anilist_open_and_finish_volume(tmp_path: Path, monkeypatch: pytest.Monk
     txt.write_text("本文", encoding="utf-8")
     book = service.import_file(txt)
     with service._connect() as conn:
-        conn.execute("UPDATE ln_books SET anilist_id=99,anilist_status='PLANNING',anilist_total_volumes=2 WHERE id=?", (book["id"],))
+        conn.execute(
+            "UPDATE ln_books SET anilist_id=99,anilist_status='PLANNING',anilist_total_volumes=2 WHERE id=?",
+            (book["id"],),
+        )
     service.config.anilist.access_token = "x"
     service.config.anilist.enabled = True
     saved = []
@@ -116,14 +138,47 @@ def test_anilist_open_and_finish_volume(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved[-1] == (99, 2, "COMPLETED")
 
 
-def test_light_novel_ui_is_wired():
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert 'data-page="lightnovels"' in html
-    assert 'id="lnReaderShell"' in html
-    assert "light_novel_chapter" in html
-    assert "light_novel_study_action" in html
-    assert "lnrCustomCss" in html
-    assert "light_novel_search_nyaa" in html
+# The window side: the Light Novels page opens a book, shows its chapter and sends a review.
+# (Reader appearance and custom CSS: tests/test_v0667_ln_reader_translation.py. The per-volume
+# Nyaa search was removed in v0.6.72: tests/test_v0672_ln_qbt_bleach_repair.py.)
+LIBRARY = (
+    LN_BOOK
+    + r"""
+__api.light_novel_state = async () => ({version: 1, settings: {}, books: [{id: 6, title: 'Novel', volume: 1}]});
+__api.study_provider_capabilities = async () => ({account_key: 'jiten:me', configured: true});
+__api.study_action = async () => ({ok: true, outcome: 'confirmed'});
+"""
+)
+
+
+def test_light_novel_page_opens_a_book_and_sends_a_review(page) -> None:
+    result = page.run(
+        r"""
+        await __click('.sidebar [data-page="lightnovels"]'); await __tick(100);
+        const out = {page: ui.page, shown: __visible('#lightnovels')};
+        await __click('#lightNovelsContent [data-ln-book="6"] .ln-card-title'); await __tick(400);
+        out.reader = {open: __visible('#lnReaderShell'), title: __text('#lnReaderTitle'), text: __text('#lnReader')};
+        await __click('#lnReader [data-ln-token="0:2"]'); await __tick(50);
+        out.card = __visible('#pudgeStudyCard');
+        await __click('#pudgeStudyCard [data-pudge-study-review="good"]'); await __tick(50);
+        return out;
+        """,
+        before=LIBRARY,
+        state={"settings": {"review_gate_ln_enabled": False}},
+    )
+    out = result.value
+    assert out["page"] == "lightnovels" and out["shown"] is True
+    assert out["reader"] == {"open": True, "title": "Novel", "text": "猫が好きだ。\n犬も好きだ。"}
+    assert result.calls_of("light_novel_open") == [[6]] and result.calls_of("light_novel_chapter") == [[6, 0]]
+    assert out["card"] is True
+    [[review]] = result.calls_of("study_action")
+    assert (review["action"], review["word_id"], review["grade"], review["backend"]) == (
+        "review",
+        103,
+        "good",
+        "jiten",
+    )
+
 
 def test_auto_binds_imported_volume_to_anilist_novel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     service = LightNovelService(cfg(tmp_path))
@@ -133,8 +188,22 @@ def test_auto_binds_imported_volume_to_anilist_novel(tmp_path: Path, monkeypatch
     service.config.anilist.access_token = "x"
     service.config.anilist.enabled = True
     novels = [
-        {"media_id": 7, "title": "Spice and Wolf", "status": "PLANNING", "progress_volumes": 0, "volumes": 17, "cover": "c"},
-        {"media_id": 8, "title": "Completely Different Novel", "status": "CURRENT", "progress_volumes": 1, "volumes": 3, "cover": "d"},
+        {
+            "media_id": 7,
+            "title": "Spice and Wolf",
+            "status": "PLANNING",
+            "progress_volumes": 0,
+            "volumes": 17,
+            "cover": "c",
+        },
+        {
+            "media_id": 8,
+            "title": "Completely Different Novel",
+            "status": "CURRENT",
+            "progress_volumes": 1,
+            "volumes": 3,
+            "cover": "d",
+        },
     ]
     monkeypatch.setattr(service, "anilist_novels", lambda: novels)
     assert service.auto_bind_anilist() == 1

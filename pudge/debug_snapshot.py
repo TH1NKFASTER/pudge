@@ -10,8 +10,13 @@ from typing import Any
 
 from .build_identity import build_identity
 from .logging_utils import DEFAULT_LOG_PATH, tail_log
+from .i18n import err
 
 DEBUG_SCHEMA = 1
+# Subtitle traces are kept for the most recently prepared videos only.
+SUBTITLE_DEBUG_KEEP_VIDEOS = 20
+_SUBTITLE_DEBUG_DIRS = ("subtitle-debug", "subtitle-timeline-debug")
+_VIDEO_DIGEST_PREFIX = re.compile(r"^([0-9a-f]{40})(?:[-.]|$)")
 
 
 def _jsonable(value: Any) -> Any:
@@ -32,16 +37,16 @@ def _jsonable(value: Any) -> Any:
 
 
 def _redact(text: str) -> str:
-    value = str(text or "")
-    patterns = (
-        (r"(?i)(authorization:\s*bearer\s+)[^\s'\"\\]+", r"\1<redacted>"),
-        (r"(?i)(api[_ -]?key[=:]\s*)[^\s,;'\"\\]+", r"\1<redacted>"),
-        (r"(?i)(access[_ -]?token[=:]\s*)[^\s,;'\"\\]+", r"\1<redacted>"),
-        (r"(?i)(password[=:]\s*)[^\s,;'\"\\]+", r"\1<redacted>"),
-    )
-    for pattern, replacement in patterns:
-        value = re.sub(pattern, replacement, value)
-    return value
+    """Scrub credentials from log text with the debug bundle's rules (one set everywhere)."""
+    from .diagnostics import DebugBundleBuilder
+
+    return DebugBundleBuilder._sanitize_text(str(text or ""))
+
+
+def _media_id_pattern(media_id: int) -> re.Pattern[str]:
+    """A log line about *media_id*: ``media_id=7`` but not ``media_id=71`` or a timestamp containing 7."""
+    value = re.escape(str(int(media_id)))
+    return re.compile(rf"\b\w*(?:media_id|anilist_id|media)={value}\b|\banilist[-:]{value}\b")
 
 
 def subtitle_debug_paths(cache_dir: Path, video: Path) -> dict[str, Path]:
@@ -93,6 +98,45 @@ def write_prepare_debug_result(
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
+
+
+def prune_subtitle_debug(cache_dir: Path, *, keep_videos: int = SUBTITLE_DEBUG_KEEP_VIDEOS) -> int:
+    """Delete subtitle traces of all but the newest `keep_videos` videos.
+
+    Files are grouped by the video digest their names start with (the
+    canonical `<digest>.json(l)` and every `<digest>-<attempt>` copy), and a
+    video's age is its newest file.
+    """
+    removed = 0
+    for name in _SUBTITLE_DEBUG_DIRS:
+        root = Path(cache_dir).expanduser() / name
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        groups: dict[str, list[Any]] = {}
+        for path in entries:
+            match = _VIDEO_DIGEST_PREFIX.match(path.name)
+            if match is None:
+                continue
+            try:
+                if not path.is_file():
+                    continue
+                modified = path.stat().st_mtime
+            except OSError:
+                continue
+            group = groups.setdefault(match.group(1), [0.0, []])
+            group[0] = max(group[0], modified)
+            group[1].append(path)
+        ranked = sorted(groups.values(), key=lambda item: item[0], reverse=True)
+        for _newest, paths in ranked[max(0, int(keep_videos)) :]:
+            for path in paths:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+    return removed
 
 
 def record_video_selection_debug(
@@ -201,9 +245,7 @@ def summarize_stage_trace(
 
 def _timing_rows(lines: list[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    pattern = re.compile(
-        r"\b(?:DONE|FAIL|TIMING)\s+step=(?P<step>[^\s]+).*?\bduration_ms=(?P<ms>[0-9.]+)"
-    )
+    pattern = re.compile(r"\b(?:DONE|FAIL|TIMING)\s+step=(?P<step>[^\s]+).*?\bduration_ms=(?P<ms>[0-9.]+)")
     for line in lines:
         match = pattern.search(line)
         if match:
@@ -228,10 +270,7 @@ class DebugSnapshotService:
         if not rows:
             return None
         anime = self.manager.db.get_anime(int(media_id))
-        is_movie = bool(
-            anime is not None
-            and str(getattr(anime, "format", "") or "").upper() == "MOVIE"
-        )
+        is_movie = bool(anime is not None and str(getattr(anime, "format", "") or "").upper() == "MOVIE")
         if is_movie:
             return next((item for item in rows if item.episode is None), rows[0])
         if episode is not None:
@@ -270,7 +309,7 @@ class DebugSnapshotService:
         media_id = int(media_id)
         anime = self.manager.db.get_anime(media_id)
         if anime is None:
-            raise ValueError(f"AniList id={media_id} is not in the local database")
+            raise ValueError(err("manager.animeNotInLocalDbShort", mediaId=media_id))
         selected_episode = self._target_episode(media_id, episode)
         # A debug snapshot must describe one coherent state. Diagnosis performs
         # safe reconciliation, so run the same repairs before capturing the
@@ -286,10 +325,7 @@ class DebugSnapshotService:
             external_ready = False
             if item.subtitle_path is not None:
                 try:
-                    external_ready = (
-                        item.subtitle_path.is_file()
-                        and item.subtitle_path.stat().st_size > 0
-                    )
+                    external_ready = item.subtitle_path.is_file() and item.subtitle_path.stat().st_size > 0
                 except OSError:
                     external_ready = False
             available_episodes.append(
@@ -297,15 +333,12 @@ class DebugSnapshotService:
                     "episode": int(item.episode),
                     "state": str(item.state or ""),
                     "video_path": str(item.video_path),
-                    "has_subtitles": bool(
-                        external_ready or item.embedded_subtitle_id is not None
-                    ),
+                    "has_subtitles": bool(external_ready or item.embedded_subtitle_id is not None),
                     "subtitle_path_exists": external_ready,
                 }
             )
-        if (
-            selected_episode is not None
-            and not any(int(item["episode"]) == int(selected_episode) for item in available_episodes)
+        if selected_episode is not None and not any(
+            int(item["episode"]) == int(selected_episode) for item in available_episodes
         ):
             available_episodes.append(
                 {
@@ -361,8 +394,7 @@ class DebugSnapshotService:
             started_at = float(prepare_result.get("started_at") or 0.0)
             if started_at:
                 timeline_attempts = [
-                    row for row in timeline_attempts
-                    if float(row.get("timestamp") or 0.0) >= started_at - 2.0
+                    row for row in timeline_attempts if float(row.get("timestamp") or 0.0) >= started_at - 2.0
                 ]
         video_debug_path = (
             self.cache_dir
@@ -371,17 +403,18 @@ class DebugSnapshotService:
         )
         video_selection = _read_json(video_debug_path)
         runtime_lines = self._runtime_lines(per_file_limit=2500)
-        needles = {str(media_id)}
+        needles: set[str] = set()
         if video is not None:
             needles.add(video.name)
         for item in downloads:
             torrent_hash = str(item.get("torrent_hash") or "")
             if torrent_hash:
                 needles.add(torrent_hash)
+        media_line = _media_id_pattern(media_id)
         relevant = [
             _redact(line)
             for line in runtime_lines
-            if any(needle and needle in line for needle in needles)
+            if any(needle and needle in line for needle in needles) or media_line.search(line)
         ][-500:]
         subtitle_lines = [
             line
@@ -389,8 +422,16 @@ class DebugSnapshotService:
             if any(
                 marker in line.casefold()
                 for marker in (
-                    "subtitle", "jimaku", "alass", "ffsubsync", "embedded",
-                    "reference", "ocr", "stt", "sync", "semantic",
+                    "subtitle",
+                    "jimaku",
+                    "alass",
+                    "ffsubsync",
+                    "embedded",
+                    "reference",
+                    "ocr",
+                    "stt",
+                    "sync",
+                    "semantic",
                 )
             )
         ][-300:]
@@ -400,8 +441,13 @@ class DebugSnapshotService:
             if any(
                 marker in line.casefold()
                 for marker in (
-                    "nyaa", "qbittorrent", "aria2", "download", "release",
-                    "torrent", "seeders",
+                    "nyaa",
+                    "qbittorrent",
+                    "aria2",
+                    "download",
+                    "release",
+                    "torrent",
+                    "seeders",
                 )
             )
         ][-300:]
@@ -428,7 +474,9 @@ class DebugSnapshotService:
             },
             "subtitle_selection": {
                 "selected": {
-                    "path": str(selected.subtitle_path) if selected is not None and selected.subtitle_path else "",
+                    "path": str(selected.subtitle_path)
+                    if selected is not None and selected.subtitle_path
+                    else "",
                     "path_exists": bool(
                         selected is not None
                         and selected.subtitle_path is not None

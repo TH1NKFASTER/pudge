@@ -38,6 +38,7 @@ SR = SAMPLE_RATE
 
 # ------------------------------------------------------------ synthesis ---
 
+
 def music(seed: int, seconds: float, sr: int = SR) -> np.ndarray:
     rng = np.random.default_rng(seed)
     out = np.zeros(int(seconds * sr), np.float32)
@@ -48,7 +49,7 @@ def music(seed: int, seconds: float, sr: int = SR) -> np.ndarray:
         n = np.arange(min(dur, out.size - t))
         env = np.minimum(1, n / 200) * np.exp(-n / sr * 2)
         tone = sum(np.sin(2 * np.pi * f0 * h * n / sr) / h for h in (1, 2, 3, 4))
-        out[t:t + n.size] += (0.3 * env * tone).astype(np.float32)
+        out[t : t + n.size] += (0.3 * env * tone).astype(np.float32)
         t += dur
     return out + 0.01 * rng.standard_normal(out.size).astype(np.float32)
 
@@ -80,6 +81,7 @@ ED = music(2, 72.0)
 
 # ------------------------------------------------------ fingerprint unit ---
 
+
 def test_fingerprint_finds_shifted_shared_music() -> None:
     a = speech(11, 360.0)
     b = speech(12, 360.0)
@@ -97,8 +99,8 @@ def test_unrelated_audio_silence_and_short_logo_do_not_match() -> None:
     logo = music(5, 6.0)
     place(a, logo, 0.0)
     place(b, logo, 3.0)
-    a[int(100 * SR):int(160 * SR)] = 0.0  # a minute of silence in both
-    b[int(200 * SR):int(260 * SR)] = 0.0
+    a[int(100 * SR) : int(160 * SR)] = 0.0  # a minute of silence in both
+    b[int(200 * SR) : int(260 * SR)] = 0.0
     fa, fb = fingerprint_samples(a), fingerprint_samples(b)
     assert best_shared_run(fa, fb, min_seconds=30, max_seconds=180) is None
     # The logo is found as a short match, but it is below the OP length.
@@ -115,8 +117,16 @@ def test_fingerprint_roundtrip(tmp_path: Path) -> None:
 
 # ---------------------------------------------------- detector (no ffmpeg) ---
 
-def _episode(seed: int, *, op_at: float | None, ed_at: float | None, op=OP, total: float = 840.0,
-             op_dialogue: bool = False) -> np.ndarray:
+
+def _episode(
+    seed: int,
+    *,
+    op_at: float | None,
+    ed_at: float | None,
+    op=OP,
+    total: float = 840.0,
+    op_dialogue: bool = False,
+) -> np.ndarray:
     track = speech(seed, total)
     if op_at is not None:
         place(track, op, op_at)
@@ -131,7 +141,7 @@ def _fps(track: np.ndarray) -> tuple:
     duration = track.size / SR
     tail_start = duration - intro_skipper.TAIL_SECONDS
     head = fingerprint_samples(track[: int(intro_skipper.HEAD_SECONDS * SR)], start_seconds=0.0)
-    tail = fingerprint_samples(track[int(tail_start * SR):], start_seconds=tail_start)
+    tail = fingerprint_samples(track[int(tail_start * SR) :], start_seconds=tail_start)
     return head, tail, duration
 
 
@@ -154,7 +164,9 @@ def test_detector_per_file_boundaries_and_confidence() -> None:
     seg2 = {s.kind: s for s in detect_segments(_ef(2), eps[2], [(_ef(1), eps[1])], settings)}
     assert abs(seg2["intro"].start_seconds - 95.0) <= 2 and abs(seg2["intro"].end_seconds - 180.0) <= 2
     assert seg2["intro"].confidence == 0.6  # only one partner
-    seg3 = {s.kind: s for s in detect_segments(_ef(3), eps[3], [(_ef(1), eps[1]), (_ef(2), eps[2])], settings)}
+    seg3 = {
+        s.kind: s for s in detect_segments(_ef(3), eps[3], [(_ef(1), eps[1]), (_ef(2), eps[2])], settings)
+    }
     assert abs(seg3["intro"].start_seconds - 30.0) <= 2 and abs(seg3["intro"].end_seconds - 115.0) <= 2
     assert abs(seg3["outro"].end_seconds - 840.0) <= 2
     assert all(s.media_fingerprint == "id3" for s in seg3.values())
@@ -164,8 +176,10 @@ def test_changed_op_and_recap_give_no_false_intro() -> None:
     new_op = _fps(_episode(201, op_at=10.0, ed_at=700.0, op=OP2))
     old_a = _fps(_episode(202, op_at=10.0, ed_at=700.0))
     old_b = _fps(_episode(203, op_at=40.0, ed_at=710.0))
-    segments = {s.kind: s for s in detect_segments(
-        _ef(9), new_op, [(_ef(1), old_a), (_ef(2), old_b)], DetectorSettings())}
+    segments = {
+        s.kind: s
+        for s in detect_segments(_ef(9), new_op, [(_ef(1), old_a), (_ef(2), old_b)], DetectorSettings())
+    }
     assert "intro" not in segments  # nobody shares the new OP
     assert "outro" in segments  # the ED is still the same
 
@@ -178,7 +192,10 @@ def test_negative_titles_have_no_segments() -> None:
 
 # ---------------------------------------------- analyze_title with a cache ---
 
-def _patch_fingerprints(monkeypatch, tracks: dict[str, np.ndarray], calls: list[str], *, fail: set[str] = frozenset()):
+
+def _patch_fingerprints(
+    monkeypatch, tracks: dict[str, np.ndarray], calls: list[str], *, fail: set[str] = frozenset()
+):
     def fake(item, cache, *, ffmpeg, ffprobe, allow_compute, cancel_check):
         if not allow_compute:
             return None
@@ -245,14 +262,26 @@ def test_new_partner_triggers_recheck_of_empty_result(tmp_path, monkeypatch) -> 
     files = _files(tmp_path, 3)
     cache = IntroSkipperCache(tmp_path / "cache")
     settings = DetectorSettings()
-    cache.write_result(files[0].identity, {
-        "algorithm": ALGORITHM_VERSION, "status": "empty", "segments": [],
-        "partners": [files[1].identity], "retry_after": 10**12,
-    })
-    cache.write_result(files[1].identity, {
-        "algorithm": ALGORITHM_VERSION, "status": "empty", "segments": [],
-        "partners": [files[0].identity], "retry_after": 10**12,
-    })
+    cache.write_result(
+        files[0].identity,
+        {
+            "algorithm": ALGORITHM_VERSION,
+            "status": "empty",
+            "segments": [],
+            "partners": [files[1].identity],
+            "retry_after": 10**12,
+        },
+    )
+    cache.write_result(
+        files[1].identity,
+        {
+            "algorithm": ALGORITHM_VERSION,
+            "status": "empty",
+            "segments": [],
+            "partners": [files[0].identity],
+            "retry_after": 10**12,
+        },
+    )
     assert not intro_skipper.title_needs_analysis(files[:2], cache, settings, 0.0)
     assert intro_skipper.title_needs_analysis(files, cache, settings, 0.0)
 
@@ -268,8 +297,9 @@ def test_stop_between_files(tmp_path, monkeypatch) -> None:
         state["n"] += 1
         return "foreground" if len(calls) >= 1 else None
 
-    report = analyze_title(files, cache=IntroSkipperCache(tmp_path / "c"), ffmpeg="f", ffprobe="p",
-                           should_stop=should_stop)
+    report = analyze_title(
+        files, cache=IntroSkipperCache(tmp_path / "c"), ffmpeg="f", ffprobe="p", should_stop=should_stop
+    )
     assert report.stopped == "foreground" and len(calls) == 1 and report.analysed == 0
 
 
@@ -278,12 +308,14 @@ def test_fingerprint_budget_per_pass(tmp_path, monkeypatch) -> None:
     tracks = {f.identity: _episode(800 + i, op_at=0.0, ed_at=700.0) for i, f in enumerate(files)}
     calls: list[str] = []
     _patch_fingerprints(monkeypatch, tracks, calls)
-    report = analyze_title(files, cache=IntroSkipperCache(tmp_path / "c"), ffmpeg="f", ffprobe="p",
-                           max_new_fingerprints=2)
+    report = analyze_title(
+        files, cache=IntroSkipperCache(tmp_path / "c"), ffmpeg="f", ffprobe="p", max_new_fingerprints=2
+    )
     assert len(calls) == 2 and report.fingerprinted == 2 and report.analysed == 2
 
 
 # ------------------------------------------------------- background pass ---
+
 
 class FakeLease:
     def __init__(self, scheduler) -> None:
@@ -314,7 +346,10 @@ class FakeScheduler:
 def _fake_db(tmp_path: Path, files: list[EpisodeFile], *, state: str = "ready"):
     anime = SimpleNamespace(media_id=77, title="Show", status="CURRENT")
     rows = [SimpleNamespace(episode=f.episode, video_path=f.path, state=state) for f in files]
-    db = SimpleNamespace(anime_list=lambda *a: [anime], episodes=lambda media_id: rows if media_id == 77 else [])
+    db = SimpleNamespace(
+        anime_list=lambda *a: [anime],
+        episodes=lambda media_id=None: rows if media_id in (77, None) else [],
+    )
     return db
 
 
@@ -326,8 +361,13 @@ def test_background_pass_uses_background_lease_and_releases_it(tmp_path, monkeyp
     tracks = {f.identity: _episode(900 + i, op_at=0.0, ed_at=700.0) for i, f in enumerate(files)}
     _patch_fingerprints(monkeypatch, tracks, [])
     scheduler = FakeScheduler()
-    result = run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path / "cache", ffmpeg="ffmpeg",
-                                 ffprobe="ffprobe", scheduler=scheduler)
+    result = run_background_pass(
+        db=_fake_db(tmp_path, files),
+        cache_dir=tmp_path / "cache",
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        scheduler=scheduler,
+    )
     assert result["status"] == "ran" and result["found"] == 2 and result["media_id"] == 77
     from pudge.work_scheduler import WorkPriority
 
@@ -335,8 +375,13 @@ def test_background_pass_uses_background_lease_and_releases_it(tmp_path, monkeyp
     assert scheduler.acquired[0]["foreground_sensitive"] is True
     assert scheduler.released == 1
     # Everything analysed: the next pass is idle and takes no lease.
-    again = run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path / "cache", ffmpeg="ffmpeg",
-                                ffprobe="ffprobe", scheduler=scheduler)
+    again = run_background_pass(
+        db=_fake_db(tmp_path, files),
+        cache_dir=tmp_path / "cache",
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        scheduler=scheduler,
+    )
     assert again["status"] == "idle" and len(scheduler.acquired) == 1
 
 
@@ -351,8 +396,13 @@ def test_background_pass_releases_lease_on_error(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(intro_skipper, "analyze_title", boom)
     scheduler = FakeScheduler()
     with pytest.raises(RuntimeError):
-        run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path / "c", ffmpeg="f", ffprobe="p",
-                            scheduler=scheduler)
+        run_background_pass(
+            db=_fake_db(tmp_path, files),
+            cache_dir=tmp_path / "c",
+            ffmpeg="f",
+            ffprobe="p",
+            scheduler=scheduler,
+        )
     assert scheduler.released == 1
 
 
@@ -361,14 +411,29 @@ def test_background_pass_defers_during_playback_and_without_tools(tmp_path, monk
     files = _files(tmp_path, 2)
     monkeypatch.setattr(intro_skipper, "tools_missing", lambda *_a: [])
     playing = FakeScheduler(wait_reason="foreground")
-    assert run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path, ffmpeg="f", ffprobe="p",
-                               scheduler=playing) == {"status": "deferred", "reason": "foreground"}
+    assert run_background_pass(
+        db=_fake_db(tmp_path, files), cache_dir=tmp_path, ffmpeg="f", ffprobe="p", scheduler=playing
+    ) == {"status": "deferred", "reason": "foreground"}
     assert playing.acquired == []
     monkeypatch.setattr(intro_skipper, "tools_missing", lambda *_a: ["ffprobe"])
-    assert run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path, ffmpeg="f", ffprobe="p",
-                               scheduler=FakeScheduler())["status"] == "tool_missing"
-    assert run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path, ffmpeg="f", ffprobe="p",
-                               scheduler=FakeScheduler(), enabled=False) == {"status": "disabled"}
+    assert (
+        run_background_pass(
+            db=_fake_db(tmp_path, files),
+            cache_dir=tmp_path,
+            ffmpeg="f",
+            ffprobe="p",
+            scheduler=FakeScheduler(),
+        )["status"]
+        == "tool_missing"
+    )
+    assert run_background_pass(
+        db=_fake_db(tmp_path, files),
+        cache_dir=tmp_path,
+        ffmpeg="f",
+        ffprobe="p",
+        scheduler=FakeScheduler(),
+        enabled=False,
+    ) == {"status": "disabled"}
 
 
 def test_downloading_files_are_not_analysed(tmp_path, monkeypatch) -> None:
@@ -376,11 +441,22 @@ def test_downloading_files_are_not_analysed(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(intro_skipper, "tools_missing", lambda *_a: [])
     files = _files(tmp_path, 2)
     scheduler = FakeScheduler()
-    result = run_background_pass(db=_fake_db(tmp_path, files, state="downloading"), cache_dir=tmp_path / "c",
-                                 ffmpeg="f", ffprobe="p", scheduler=scheduler)
+    result = run_background_pass(
+        db=_fake_db(tmp_path, files, state="downloading"),
+        cache_dir=tmp_path / "c",
+        ffmpeg="f",
+        ffprobe="p",
+        scheduler=scheduler,
+    )
     assert result["status"] == "idle"
-    result = run_background_pass(db=_fake_db(tmp_path, files), cache_dir=tmp_path / "c", ffmpeg="f",
-                                 ffprobe="p", scheduler=scheduler, incomplete_paths=[tmp_path])
+    result = run_background_pass(
+        db=_fake_db(tmp_path, files),
+        cache_dir=tmp_path / "c",
+        ffmpeg="f",
+        ffprobe="p",
+        scheduler=scheduler,
+        incomplete_paths=[tmp_path],
+    )
     assert result["status"] == "idle" and scheduler.acquired == []
 
 
@@ -409,10 +485,15 @@ def test_manager_pass_is_isolated_from_failures(tmp_path, monkeypatch) -> None:
     from tests.test_manager import _upgrade_manager
 
     manager = _upgrade_manager(tmp_path)
-    monkeypatch.setattr(intro_skipper, "run_background_pass", lambda **_k: (_ for _ in ()).throw(OSError("x")))
+    monkeypatch.setattr(
+        intro_skipper, "run_background_pass", lambda **_k: (_ for _ in ()).throw(OSError("x"))
+    )
     assert manager.run_intro_detection() == 0
-    monkeypatch.setattr(intro_skipper, "run_background_pass", lambda **k: {"status": "ran", "analysed": 2,
-                                                                          "enabled": k["enabled"]})
+    monkeypatch.setattr(
+        intro_skipper,
+        "run_background_pass",
+        lambda **k: {"status": "ran", "analysed": 2, "enabled": k["enabled"]},
+    )
     assert manager.run_intro_detection() == 2
 
 
@@ -446,8 +527,21 @@ def test_end_to_end_reencoded_corpus(tmp_path) -> None:
         wav = tmp_path / f"ep{n}.wav"
         _write_wav(wav, _episode(1000 + n, op_at=op_at, ed_at=ed_at))
         mkv = tmp_path / f"Show - {n:02d}.mkv"
-        subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(wav), "-metadata:s:a:0", "language=jpn",
-                        *codec, str(mkv)], check=True)
+        subprocess.run(
+            [
+                FFMPEG,
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(wav),
+                "-metadata:s:a:0",
+                "language=jpn",
+                *codec,
+                str(mkv),
+            ],
+            check=True,
+        )
         wav.unlink()
         files.append(EpisodeFile(path=mkv, episode=n, identity=intro_skipper.identity_of(mkv)))
     cache = IntroSkipperCache(tmp_path / "cache")

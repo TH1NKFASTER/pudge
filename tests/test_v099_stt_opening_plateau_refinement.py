@@ -25,14 +25,8 @@ def test_opening_plateau_refinement_can_shift_pre_and_post_independently(tmp_pat
     post = [140.0, 147.0, 155.0, 164.0, 174.0, 185.0, 197.0, 210.0]
     source_cues = [(value, value + 1.4, f"s{index}") for index, value in enumerate(pre + post)]
     aligned_cues = list(source_cues)
-    reference_cues = [
-        (value + 5.2, value + 6.6, f"r{index}")
-        for index, value in enumerate(pre)
-    ]
-    reference_cues += [
-        (value + 0.5, value + 1.9, f"p{index}")
-        for index, value in enumerate(post)
-    ]
+    reference_cues = [(value + 5.2, value + 6.6, f"r{index}") for index, value in enumerate(pre)]
+    reference_cues += [(value + 0.5, value + 1.9, f"p{index}") for index, value in enumerate(post)]
 
     write_srt(source_cues, source)
     write_srt(aligned_cues, aligned)

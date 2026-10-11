@@ -13,12 +13,48 @@ from pudge.models import AniListAnime
 def _graph():
     return {
         "nodes": [
-            {"media_id": 101280, "title": "Tensei Shitara Slime Datta Ken", "format": "TV", "episodes": 24, "start_date": "2018-10-02"},
-            {"media_id": 161802, "title": "Tensei Shitara Slime Datta Ken: Coleus no Yume", "format": "OVA", "episodes": 3, "start_date": "2023-11-01"},
-            {"media_id": 108511, "title": "Tensei Shitara Slime Datta Ken 2nd Season", "format": "TV", "episodes": 12, "start_date": "2021-01-12"},
-            {"media_id": 116742, "title": "Tensei Shitara Slime Datta Ken 2nd Season Part 2", "format": "TV", "episodes": 12, "start_date": "2021-07-06"},
-            {"media_id": 156822, "title": "Tensei Shitara Slime Datta Ken 3rd Season", "format": "TV", "episodes": 24, "start_date": "2024-04-05"},
-            {"media_id": 182205, "title": "Tensei Shitara Slime Datta Ken 4th Season", "format": "TV", "episodes": None, "start_date": "2026-04-03"},
+            {
+                "media_id": 101280,
+                "title": "Tensei Shitara Slime Datta Ken",
+                "format": "TV",
+                "episodes": 24,
+                "start_date": "2018-10-02",
+            },
+            {
+                "media_id": 161802,
+                "title": "Tensei Shitara Slime Datta Ken: Coleus no Yume",
+                "format": "OVA",
+                "episodes": 3,
+                "start_date": "2023-11-01",
+            },
+            {
+                "media_id": 108511,
+                "title": "Tensei Shitara Slime Datta Ken 2nd Season",
+                "format": "TV",
+                "episodes": 12,
+                "start_date": "2021-01-12",
+            },
+            {
+                "media_id": 116742,
+                "title": "Tensei Shitara Slime Datta Ken 2nd Season Part 2",
+                "format": "TV",
+                "episodes": 12,
+                "start_date": "2021-07-06",
+            },
+            {
+                "media_id": 156822,
+                "title": "Tensei Shitara Slime Datta Ken 3rd Season",
+                "format": "TV",
+                "episodes": 24,
+                "start_date": "2024-04-05",
+            },
+            {
+                "media_id": 182205,
+                "title": "Tensei Shitara Slime Datta Ken 4th Season",
+                "format": "TV",
+                "episodes": None,
+                "start_date": "2026-04-03",
+            },
         ],
         "edges": [
             {"source": 101280, "target": 161802, "relation_type": "SEQUEL"},

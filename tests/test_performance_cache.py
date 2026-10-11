@@ -47,13 +47,11 @@ def test_llm_semantic_result_is_cached(tmp_path: Path, monkeypatch) -> None:
     japanese = tmp_path / "ja.srt"
     english = tmp_path / "en.srt"
     japanese.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n\n"
-        "2\n00:00:05,000 --> 00:00:06,000\n元気ですか\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n\n2\n00:00:05,000 --> 00:00:06,000\n元気ですか\n",
         encoding="utf-8",
     )
     english.write_text(
-        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
-        "2\n00:00:05,000 --> 00:00:06,000\nHow are you?\n",
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n00:00:05,000 --> 00:00:06,000\nHow are you?\n",
         encoding="utf-8",
     )
     config = LLMConfig(

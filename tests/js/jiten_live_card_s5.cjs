@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 
 const WEB = process.argv[2];
 const timeout = setTimeout(() => { console.error('jiten live card S5 timed out'); process.exit(1); }, 5000);
@@ -61,7 +62,7 @@ const window = {
       if (holdLive) await holdLive.promise;
       return {ok: true, provider: 'jiten', account_scope: scope, states: payload.words.map(([w, r]) => ({
         ok: true, provider: 'jiten', wordId: w, readingIndex: r, states: liveStatesOverride || (ids.length ? ['young'] : ['new']),
-        normalizedState: liveStatesOverride ? '' : (ids.length ? 'learning' : 'new'), studyDeckIds: ids, stale: false,
+        normalizedState: liveStatesOverride ? '' : (ids.length ? 'young' : 'new'), studyDeckIds: ids, stale: false,
       }))};
     },
     study_action: async payload => { submitted.push(payload); return actionResult; },
@@ -76,6 +77,7 @@ const context = {
 context.globalThis = context;
 vm.createContext(context);
 vm.runInContext('const ui={state:{settings:{}}};', context);
+loadI18n(context, WEB);
 for (const name of ['review_actions.js', 'reading_tools.js']) {
   vm.runInContext(fs.readFileSync(path.join(WEB, name), 'utf8'), context, {filename: name});
 }
@@ -249,7 +251,7 @@ async function establishScope() {
   assert.equal(await study.openElement(node), true);
   await flush();
   assert.equal(node.dataset.pudgeStudyVerified, '1', 'registered node verified');
-  assert.ok(node.classList.contains('state-learning'), 'registered node recolored');
+  assert.ok(node.classList.contains('state-young'), 'registered node recolored');
   await click(gradeButton('good'));
   await flush();
   assert.equal(submitted.length, 1);
@@ -269,10 +271,11 @@ async function establishScope() {
   holdLive.resolve();
   await flush();
   assert.deepEqual([...token.card.studyDeckIds], [7], 'in-flight refresh does not overwrite a pending mutation');
-  // outcome unknown → no automatic second POST.
+  // outcome unknown → no automatic second POST; the toast says grading again is safe
+  // (the backend resends the same attempt id).
   await flush();
   assert.equal(submitted.length, 1, 'outcome unknown is not retried');
-  assert.deepEqual(toasts, ['unknown']);
+  assert.deepEqual(toasts, [context.PudgeI18n.t('reading.reviewOutcomeUnknownGradeAgain')]);
 
   // 10. Live refresh unavailable (bridge failure) → cached [] still requires a deck.
   reset();
@@ -294,7 +297,7 @@ async function establishScope() {
   window.pywebview.api.study_state = async payload => {
     singleCalls.push(payload);
     return {ok: true, provider: 'jiten', wordId: payload.word_id, readingIndex: payload.reading_index,
-      states: ['young'], normalizedState: 'learning', studyDeckIds: [123], stale: false, account_scope: 'jiten:account-A'};
+      states: ['young'], normalizedState: 'young', studyDeckIds: [123], stale: false, account_scope: 'jiten:account-A'};
   };
   token = lnToken(93);
   await study.open({token, target: el(), backend: 'jiten'});

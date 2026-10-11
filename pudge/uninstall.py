@@ -20,6 +20,7 @@ from .branding import (
     LEGACY_APP_SLUGS,
     LEGACY_BUNDLE_IDS,
 )
+from .i18n import err
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +160,7 @@ def build_uninstall_plan(
     exact_targets = _unique_paths(targets)
     unsafe = [path for path in exact_targets if path == Path("/") or path == home]
     if unsafe:
-        raise ValueError(f"Refusing unsafe uninstall target: {unsafe[0]}")
+        raise ValueError(err("setup.unsafeUninstallTarget", target=unsafe[0]))
     return UninstallPlan(
         targets=exact_targets,
         launch_agent_labels=launch_agent_labels,
@@ -213,9 +214,7 @@ def render_uninstall_script(plan: UninstallPlan, *, parent_pid: int) -> str:
                 "done",
             )
         )
-        lines.append(
-            f"/usr/bin/tccutil reset All {quote(service)} >/dev/null 2>&1 || true"
-        )
+        lines.append(f"/usr/bin/tccutil reset All {quote(service)} >/dev/null 2>&1 || true")
     for target in plan.targets:
         lines.append(f"/bin/rm -rf -- {quote(str(target))}")
     lines.append('/bin/rm -f -- "$0"')

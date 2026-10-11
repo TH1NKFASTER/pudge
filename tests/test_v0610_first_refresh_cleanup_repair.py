@@ -111,12 +111,15 @@ def test_schedule_cleanup_falls_back_to_media_and_episode(tmp_path: Path) -> Non
     )
 
     stale_tracking_path = tmp_path / "old-location" / "Koukaku - 05.mkv"
-    assert db.schedule_cleanup(
-        stale_tracking_path,
-        0,
-        media_id=177699,
-        episode=5,
-    ) == 1
+    assert (
+        db.schedule_cleanup(
+            stale_tracking_path,
+            0,
+            media_id=177699,
+            episode=5,
+        )
+        == 1
+    )
 
     row = db.episode_by_path(actual)
     assert row is not None
@@ -126,9 +129,7 @@ def test_schedule_cleanup_falls_back_to_media_and_episode(tmp_path: Path) -> Non
 
 def test_repair_missing_cleanup_schedule_from_playback_evidence(tmp_path: Path) -> None:
     db = Database(tmp_path / "library.sqlite3")
-    db.upsert_anime(
-        LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12)
-    )
+    db.upsert_anime(LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12))
     video = tmp_path / "Koukaku - 05.mkv"
     video.write_bytes(b"video")
     db.upsert_episode(
@@ -170,9 +171,7 @@ def test_cleanup_repairs_and_deletes_overdue_episode(tmp_path: Path) -> None:
     cfg.agent.delete_only_managed_files = True
     cfg.agent.delete_after_watched_hours = 2.0
     manager = AnimeManager(cfg, log=lambda _message: None)
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12)
-    )
+    manager.db.upsert_anime(LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12))
     video = cfg.library.root_dir / "Koukaku - 05.mkv"
     video.write_bytes(b"video")
     manager.db.upsert_episode(

@@ -9,6 +9,8 @@ from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.web_app import WebAppApi
+from test_anilist_lua import of, tracker
+from tests.lua_harness import needs_lua
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -160,9 +162,58 @@ def test_reset_progress_repairs_anilist_and_local_watched_rows(tmp_path: Path, m
     assert episode.delete_after is None
 
 
-def test_mpv_script_tracks_active_seconds_and_retries_deferred_update() -> None:
-    source = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
-    assert "--playback-active-seconds" in source
-    assert "active_since_save" in source
-    assert "ANILIST_DEFERRED:1" in source
-    assert "triggered = false" in source
+def _active_seconds(log: list[tuple[str, str]]) -> list[float]:
+    saves = of(log, "subprocess", "--playback-save")
+    return [float(save.split("--playback-active-seconds ", 1)[1].split()[0]) for save in saves]
+
+
+@needs_lua
+def test_mpv_saves_only_really_watched_seconds_since_the_previous_save(tmp_path: Path) -> None:
+    # 25 s played, 20 s paused, 5 s played: 30 s of real watching over all saves.
+    env = {
+        "PUDGE_PLAYBACK_ENABLED": "1",
+        "PUDGE_PLAYBACK_VIDEO": "/media/Show - 05.mkv",
+        "PUDGE_PLAYBACK_INTERVAL": "10",
+    }
+    log = tracker(
+        tmp_path,
+        """
+        sim.set('duration', 1440); sim.set('time-pos', 0)
+        sim.fire('file-loaded')
+        sim.play(25)
+        sim.set('pause', true); sim.play(20); sim.set('pause', false)
+        sim.play(5)
+        sim.fire('end-file')
+    """,
+        env,
+    )
+    active = _active_seconds(log)
+    assert len(active) >= 3  # periodic saves and the one at the end
+    assert 29 < sum(active) < 31
+    total = float(
+        of(log, "subprocess", "--playback-save")[-1].split("--playback-active-total ", 1)[1].split()[0]
+    )
+    assert 29 < total < 31
+
+
+@needs_lua
+def test_mpv_retries_a_deferred_automatic_update_after_30_seconds(tmp_path: Path) -> None:
+    # The helper answers ANILIST_DEFERRED:1 while too little was really watched; the
+    # tracker shows its message and asks again 30 s later instead of giving up.
+    env = {"PUDGE_ANILIST_TRACKING_FILE": str(tmp_path / "tracking.json"), "PUDGE_ANILIST_AUTO_UPDATE": "1"}
+    log = tracker(
+        tmp_path,
+        r"""
+        sim_stdout = 'ANILIST_DEFERRED:1\nOSD: not watched enough yet\n'
+        sim.set('duration', 1440); sim.set('time-pos', 1300)
+        sim.fire('file-loaded')
+        sim.play(2); mark('first', #sim.commands('anilist%-action'))
+        sim.play(25); mark('waiting', #sim.commands('anilist%-action'))
+        sim_stdout = ''
+        sim.play(10); mark('retried', #sim.commands('anilist%-action'))
+        sim.play(60); mark('done', #sim.commands('anilist%-action'))
+    """,
+        env,
+    )
+    assert of(log, "mark") == ["first=1", "waiting=1", "retried=2", "done=2"]
+    assert of(log, "osd")[0] == "not watched enough yet"

@@ -79,19 +79,39 @@ def test_score_release_bonus_is_additive_and_not_doubled(monkeypatch):
     from pudge.providers.nyaa import score_release
 
     # Title similarity is not under test here (and needs native rapidfuzz).
-    monkeypatch.setattr(nyaa, "_title_match_score", lambda anime, title, alternatives=(): (100.0, ["title=100"]))
+    monkeypatch.setattr(
+        nyaa, "_title_match_score", lambda anime, title, alternatives=(): (100.0, ["title=100"])
+    )
 
-    anime = LibraryAnime(media_id=165790, title="365 Days to the Wedding", titles=["365 Days to the Wedding"], episodes=12)
+    anime = LibraryAnime(
+        media_id=165790, title="365 Days to the Wedding", titles=["365 Days to the Wedding"], episodes=12
+    )
     kwargs = dict(
-        episode=1, batch=False, trusted_groups=[], preferred_groups=[], blocked_groups=[], preferred_resolution="1080p",
-        min_seeders=1, target_episode_min_bytes=250 * 1024 * 1024, target_episode_max_bytes=3500 * 1024 * 1024,
+        episode=1,
+        batch=False,
+        trusted_groups=[],
+        preferred_groups=[],
+        blocked_groups=[],
+        preferred_resolution="1080p",
+        min_seeders=1,
+        target_episode_min_bytes=250 * 1024 * 1024,
+        target_episode_max_bytes=3500 * 1024 * 1024,
     )
 
     def release(info_hash):
         return NyaaRelease(
-            title="[SubsPlease] 365 Days to the Wedding - 01 (1080p) [ABCD1234].mkv", link="https://nyaa.si/view/1", torrent_url="",
-            info_hash=info_hash, size_text="1.4 GiB", size_bytes=1400 * 1024 * 1024, seeders=30, leechers=2, downloads=500,
-            trusted=True, remake=False, group="SubsPlease",
+            title="[SubsPlease] 365 Days to the Wedding - 01 (1080p) [ABCD1234].mkv",
+            link="https://nyaa.si/view/1",
+            torrent_url="",
+            info_hash=info_hash,
+            size_text="1.4 GiB",
+            size_bytes=1400 * 1024 * 1024,
+            seeders=30,
+            leechers=2,
+            downloads=500,
+            trusted=True,
+            remake=False,
+            group="SubsPlease",
         )
 
     rec = sd.parse_entries(165790, _with_best_nyaa(SAMPLE), fetched_at=1.0)

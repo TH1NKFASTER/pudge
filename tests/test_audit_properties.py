@@ -8,7 +8,6 @@ import pytest
 from hypothesis import given, settings, strategies as st
 
 from pudge.filename import normalize_title, parse_anime_filename
-from pudge.mobile_sync import MobileSyncService
 from pudge.release_parser import EXTRA_TYPES, SPECIAL_TYPES
 from pudge.subtitle_formats import parse_srt, write_srt
 
@@ -67,18 +66,3 @@ def test_srt_write_parse_round_trip_keeps_valid_monotonic_cues(
     assert parsed
     assert all(start < end for start, end, _text in parsed)
     assert [start for start, _end, _text in parsed] == sorted(start for start, _end, _text in parsed)
-
-
-@given(
-    episode=st.integers(min_value=-1000, max_value=1000),
-    position=st.integers(min_value=-(10**9), max_value=10**9),
-    duration=st.integers(min_value=-(10**9), max_value=10**9),
-)
-def test_mobile_sync_anime_position_is_always_bounded(episode: int, position: int, duration: int) -> None:
-    normalized = MobileSyncService._normalize_position(
-        "anime_episode",
-        {"episode": episode, "position_ms": position, "duration_ms": duration},
-    )
-    assert normalized["episode"] >= 1
-    assert normalized["position_ms"] >= 0
-    assert normalized["duration_ms"] >= 0

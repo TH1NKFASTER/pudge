@@ -2,7 +2,6 @@
 (() => {
   let depth = 0;
   const surface = () => document.getElementById('lightNovelsContent');
-  const ru = () => (typeof ui !== 'undefined' ? ui.lang : window.ui?.lang || document.documentElement?.lang || 'en') === 'ru';
   const active = () => document.getElementById('lightnovels')?.classList.contains('active');
   const external = event => [...(event.dataTransfer?.types || [])].includes('Files');
   const supported = event => {
@@ -14,7 +13,7 @@
     if (!active() || !external(event) || !supported(event)) return;
     if (event.type === 'dragenter') depth += 1;
     const box = surface();
-    if (box) { box.dataset.dropLabel = ru() ? 'Бросьте файл сюда · EPUB/TXT' : 'Drop EPUB/TXT here'; box.classList.add('ln-file-drag'); }
+    if (box) { box.dataset.dropLabel = PudgeI18n.t('lnDrop.dropEpubTxtHere'); box.classList.add('ln-file-drag'); }
     event.preventDefault();
     event.dataTransfer.dropEffect = 'copy';
   }
@@ -30,7 +29,7 @@
     clear();
     if (reject) {
       event.preventDefault(); event.stopImmediatePropagation(); event.stopPropagation();
-      window.toast?.(ru() ? 'Поддерживаются EPUB и TXT' : 'EPUB and TXT files are supported');
+      window.toast?.(PudgeI18n.t('lnDrop.epubAndTxtFilesAre'));
     }
   }, true);
   for (const name of ['dragend', 'blur', 'pudge-files-imported']) window.addEventListener(name, clear);

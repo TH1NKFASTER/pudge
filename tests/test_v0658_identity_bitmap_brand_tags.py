@@ -149,7 +149,9 @@ def test_bitmap_movie_never_appears_ready_when_ocr_is_off(tmp_path: Path) -> Non
     write_config(cfg, cfg.config_path)
     api = WebAppApi(cfg.config_path)
     api.manager.db.upsert_anime(
-        LibraryAnime(media_id=178788, title="Demon Slayer: Kimetsu no Yaiba - Infinity Castle", format="MOVIE")
+        LibraryAnime(
+            media_id=178788, title="Demon Slayer: Kimetsu no Yaiba - Infinity Castle", format="MOVIE"
+        )
     )
     video = cfg.library.root_dir / "Demon Slayer" / "movie.mkv"
     video.parent.mkdir(parents=True)
@@ -179,7 +181,9 @@ def test_bitmap_movie_never_appears_ready_when_ocr_is_off(tmp_path: Path) -> Non
     assert group["episodes"][0]["subtitle_source"] == "image"
 
 
-def test_catmahjong_stale_match_is_removed_even_when_anilist_is_rate_limited(monkeypatch, tmp_path: Path) -> None:
+def test_catmahjong_stale_match_is_removed_even_when_anilist_is_rate_limited(
+    monkeypatch, tmp_path: Path
+) -> None:
     watched = tmp_path / "Downloads"
     watched.mkdir()
     video = watched / "catmahjong.mp4"
@@ -192,7 +196,9 @@ def test_catmahjong_stale_match_is_removed_even_when_anilist_is_rate_limited(mon
     cfg.anilist.enabled = True
     cfg.anilist.access_token = "token"
     manager = AnimeManager(cfg, log=lambda _message: None)
-    manager.db.upsert_anime(LibraryAnime(media_id=999, title="Mahoutsukai no Yoru", synonyms=["Mahoyo"], format="MOVIE"))
+    manager.db.upsert_anime(
+        LibraryAnime(media_id=999, title="Mahoutsukai no Yoru", synonyms=["Mahoyo"], format="MOVIE")
+    )
     manager.db.upsert_episode(
         LibraryEpisode(
             media_id=999,
@@ -239,6 +245,7 @@ def test_web_state_exposes_pudge_brand_for_sidebar(tmp_path: Path) -> None:
 
     assert state["branding"]["name"] == "pudge"
     assert state["branding"]["slug"] == "pudge"
+
 
 def test_asset_server_renders_brand_before_state_load(tmp_path: Path) -> None:
     from pudge.config import AppConfig

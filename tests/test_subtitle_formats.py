@@ -60,26 +60,24 @@ def test_plain_subtitle_text_removes_embedded_furigana():
 
     assert plain_subtitle_text("漢字（かんじ）です") == "漢字です"
     assert plain_subtitle_text("｜明日《あした》") == "明日"
-    assert plain_subtitle_text(
-        "<ruby><rb>東京</rb><rt>とうきょう</rt></ruby>"
-    ) == "東京"
+    assert plain_subtitle_text("<ruby><rb>東京</rb><rt>とうきょう</rt></ruby>") == "東京"
 
 
 def test_clean_srt_for_playback_creates_clean_copy(tmp_path):
     from pudge.subtitle_formats import clean_srt_for_playback
 
-    source = tmp_path / "episode.srt"
-    source.write_text(
+    text = (
         "1\n00:00:34,301 --> 00:00:37,804\n＜（黒絵）\nずっと　自分が嫌いだった＞\n\n"
-        "2\n00:00:48,315 --> 00:00:50,317\n（南）赤石さん\n",
-        encoding="utf-8",
+        "2\n00:00:48,315 --> 00:00:50,317\n（南）赤石さん\n"
     )
+    original = tmp_path / "episode.srt"
+    original.write_text(text, encoding="utf-8")
 
-    output, result = clean_srt_for_playback(source, tmp_path / "cache")
+    output, result = clean_srt_for_playback(original, tmp_path / "cache")
 
     assert result["cleaned"] is True
-    assert output != source
-    assert source.read_text(encoding="utf-8").startswith("1\n")
+    assert output != original
+    assert original.read_text(encoding="utf-8") == text  # the user's file is left untouched
     text = output.read_text(encoding="utf-8")
     assert "＜" not in text
     assert "＞" not in text
@@ -128,8 +126,7 @@ def test_clean_srt_for_playback_invalidates_old_cached_timing(tmp_path):
 
     source = tmp_path / "episode.srt"
     source.write_text(
-        "1\n00:00:37,804 --> 00:00:42,476\nПервая\n\n"
-        "2\n00:00:42,476 --> 00:00:47,080\nВторая\n",
+        "1\n00:00:37,804 --> 00:00:42,476\nПервая\n\n2\n00:00:42,476 --> 00:00:47,080\nВторая\n",
         encoding="utf-8",
     )
 

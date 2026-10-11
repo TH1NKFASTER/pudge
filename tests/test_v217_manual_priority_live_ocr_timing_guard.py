@@ -1,12 +1,21 @@
+"""Manual work goes first: a user request makes background heavy work yield, Debug fresh waits for its slot even during maintenance; a weaker speech
+match cannot replace a strong embedded winner (behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
+from pudge.foreground import mark_foreground
+from pudge.maintenance_lock import maintenance_lock
 from pudge.models import SubtitleCandidate
 from pudge.syncing import _embedded_rank_regression_guard
+from pudge.task_supervisor import TaskSupervisor
+from pudge.web_app import WebAppApi
 from pudge.work_scheduler import WorkPriority, WorkScheduler
+from t71g08_support import subtitle_library
 
 
 def test_user_priority_request_makes_running_background_cooperatively_yield(tmp_path: Path) -> None:
@@ -56,17 +65,22 @@ def test_user_waiter_gets_heavy_slot_before_background_reacquire(tmp_path: Path)
     thread = threading.Thread(target=user, daemon=True)
     thread.start()
     deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and not scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND):
+    while time.monotonic() < deadline and not scheduler.should_yield_to_higher_priority(
+        WorkPriority.BACKGROUND
+    ):
         time.sleep(0.01)
     background.release()
     assert acquired.wait(2)
     # A background retry must not jump ahead while the manual request/lease lives.
-    assert scheduler.acquire_heavy(
-        "background-retry",
-        blocking=False,
-        foreground_sensitive=False,
-        priority=WorkPriority.BACKGROUND,
-    ) is None
+    assert (
+        scheduler.acquire_heavy(
+            "background-retry",
+            blocking=False,
+            foreground_sensitive=False,
+            priority=WorkPriority.BACKGROUND,
+        )
+        is None
+    )
     release_user.set()
     thread.join(2)
     scheduler.end_priority_request(token)
@@ -128,18 +142,39 @@ def test_small_activity_difference_does_not_disable_speech_verification(tmp_path
     assert meta["accepted"] is False
 
 
-def test_v84_source_contracts_are_wired_to_real_paths() -> None:
-    root = Path(__file__).resolve().parents[1]
-    manga = (root / "pudge/manga.py").read_text(encoding="utf-8")
-    web = (root / "pudge/web_app.py").read_text(encoding="utf-8")
-    js = (root / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    syncing = (root / "pudge/syncing.py").read_text(encoding="utf-8")
-    assert '"preempted": True' in manga
-    assert "should_yield(WorkPriority.BACKGROUND)" in manga
-    assert "begin_priority_request(" in web and "WorkPriority.USER" in web
-    debug = web[web.index("def debug_reselect_subtitles"):]
-    debug = debug[: debug.find("\n    def ", 10)]
-    assert "with maintenance_lock" not in debug
-    assert "wait_for_slot=True" in debug
-    assert "status?.prepared_pages" in js
-    assert "embedded_rank_over_weaker_speech" in syncing
+def test_debug_fresh_waits_for_its_slot_as_user_work_even_during_maintenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, video, commands = subtitle_library(tmp_path, monkeypatch)
+    scheduler = manager.work_scheduler
+    supervisor = TaskSupervisor()
+    window = SimpleNamespace(
+        manager=manager,
+        task_supervisor=supervisor,
+        logger=SimpleNamespace(info=lambda *_a, **_k: None, exception=lambda *_a, **_k: None),
+    )
+    # An episode plays, a volume OCR holds the heavy-work slot and maintenance runs.
+    playback = mark_foreground(scheduler.cache_dir)
+    ocr = scheduler.acquire_heavy("manga-ocr-book", foreground_sensitive=False)
+    assert ocr is not None
+    with maintenance_lock(manager.config.paths.cache_dir) as maintenance:
+        assert maintenance is True
+        answer = WebAppApi.debug_reselect_subtitles(window, str(video))
+        time.sleep(0.3)
+        # From the click on, the running volume OCR is asked to yield to the user's request.
+        waiting = [(scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND), list(commands))]
+        playback.unlink()
+        time.sleep(0.7)
+        waiting.append((scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND), list(commands)))
+        ocr.release()
+        deadline = time.monotonic() + 5
+        while not commands and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert supervisor.shutdown(timeout=5) == []
+    assert answer["ok"] is True
+    assert waiting == [(True, []), (True, [])]
+    [command] = commands
+    assert "--force-search" in command and "--resync" in command
+    assert manager.db.episode_by_path(video).state == "ready"
+    # The request ends with the job: background work no longer yields.
+    assert not scheduler.should_yield_to_higher_priority(WorkPriority.BACKGROUND)

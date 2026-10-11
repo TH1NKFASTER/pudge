@@ -18,6 +18,7 @@ import httpx
 
 from . import __version__
 from .branding import APP_NAME, APP_SLUG, DATA_DIR, LOG_DIR
+from .i18n import err, t
 
 
 GITHUB_REPOSITORY = "TH1NKFASTER/pudge"
@@ -27,6 +28,13 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPOSITORY}/releases"
 
 class UpdateError(RuntimeError):
     pass
+
+
+# A Pudge release archive is a few MB of source. Generous caps stop a hostile
+# or broken download (or a zip bomb) from filling the disk before the checks run.
+MAX_UPDATE_DOWNLOAD_BYTES = 300 * 1024 * 1024
+MAX_UPDATE_EXTRACTED_BYTES = 1024 * 1024 * 1024
+MAX_UPDATE_ARCHIVE_ENTRIES = 20000
 
 
 def _version_key(value: str) -> tuple[int, ...]:
@@ -97,7 +105,7 @@ class AppUpdater:
         response.raise_for_status()
         value = response.json()
         if not isinstance(value, dict):
-            raise UpdateError("GitHub returned an invalid update response")
+            raise UpdateError(err("web.updateInvalidResponse"))
         return value
 
     def _latest_release(self, *, force: bool = False) -> dict[str, Any]:
@@ -107,7 +115,7 @@ class AppUpdater:
         value = self._get_json(f"{GITHUB_API}/releases/latest")
         tag = str(value.get("tag_name") or "").lstrip("v")
         if not _version_key(tag):
-            raise UpdateError("The latest GitHub release has no valid version")
+            raise UpdateError(err("web.updateNoVersion"))
         value["version"] = tag
         self._latest_release_cache = (time.monotonic(), dict(value))
         return value
@@ -165,18 +173,18 @@ class AppUpdater:
         remote_url = self._git_optional(path, "remote", "get-url", "origin")
         blocked = ""
         if not self._official_remote(remote_url):
-            blocked = "The development checkout origin is not the official Pudge repository"
+            blocked = err("web.updateNotOfficialRepo", app=APP_NAME)
         elif dirty:
-            blocked = "The development checkout has local changes"
+            blocked = err("web.updateLocalChanges")
         elif not branch:
-            blocked = "The development checkout is on a detached HEAD"
+            blocked = err("web.updateDetachedHead")
         remote_sha = ""
         if branch and not blocked:
             try:
                 self._git(path, "fetch", "--quiet", "--no-tags", "origin", branch, timeout=60)
                 remote_sha = self._git(path, "rev-parse", "FETCH_HEAD")
             except Exception as exc:
-                blocked = blocked or f"Could not check the GitHub branch: {exc}"
+                blocked = blocked or err("web.updateBranchCheckFailed", error=exc)
         available = False
         if remote_sha and not blocked:
             if remote_sha == head:
@@ -186,7 +194,7 @@ class AppUpdater:
             elif self._git_succeeds(path, "merge-base", "--is-ancestor", remote_sha, head):
                 available = bool(installed_revision and installed_revision != head)
             else:
-                blocked = "The development branch has diverged from its GitHub branch"
+                blocked = err("web.updateDiverged")
         return {
             "state": "checked",
             "channel": "development",
@@ -254,7 +262,11 @@ class AppUpdater:
                     "detail": "",
                     "release_url": GITHUB_RELEASES_URL,
                 }
-                target = self._development_worker if source.get("channel") == "development" else self._release_worker
+                target = (
+                    self._development_worker
+                    if source.get("channel") == "development"
+                    else self._release_worker
+                )
                 self._thread = threading.Thread(
                     target=target,
                     args=(source,),
@@ -273,18 +285,18 @@ class AppUpdater:
             self._log("APP development update started")
             status = self._development_status(source)
             if status.get("blocked"):
-                raise UpdateError(str(status.get("detail") or "Development update is blocked"))
+                raise UpdateError(str(status.get("detail") or err("web.updateBlocked")))
             if not status.get("available"):
-                self._set_state("current", "The development checkout is already current")
+                self._set_state("current", t("web.updateDevCurrent"))
                 return
             path = Path(str(source["source_path"])).resolve()
             branch = str(status.get("branch") or "")
             remote_revision = str(status.get("remote_revision") or "")
             if not remote_revision:
-                raise UpdateError("GitHub did not return a revision to install")
+                raise UpdateError(err("web.updateNoRevision"))
             self._set_state(
                 "installing",
-                f"Installing {remote_revision[:10]} from {branch}",
+                t("web.updateInstallingRevision", revision=remote_revision[:10], branch=branch),
                 channel="development",
                 available=True,
                 branch=branch,
@@ -315,8 +327,18 @@ class AppUpdater:
                     "GET", url, headers=self._github_headers(), timeout=120, follow_redirects=True
                 ) as response:
                     response.raise_for_status()
+                    try:
+                        announced = int(response.headers.get("Content-Length") or 0)
+                    except ValueError:
+                        announced = 0
+                    if announced > MAX_UPDATE_DOWNLOAD_BYTES:
+                        raise UpdateError(err("web.updateTooLarge"))
+                    received = 0
                     with target.open("wb") as handle:
                         for chunk in response.iter_bytes():
+                            received += len(chunk)
+                            if received > MAX_UPDATE_DOWNLOAD_BYTES:
+                                raise UpdateError(err("web.updateTooLarge"))
                             handle.write(chunk)
                             digest.update(chunk)
                 return digest.hexdigest()
@@ -333,7 +355,7 @@ class AppUpdater:
                     exc,
                 )
                 time.sleep(delay)
-        raise UpdateError("Update download failed")
+        raise UpdateError(err("web.updateDownloadFailed"))
 
     def _expected_digest(self, release: dict[str, Any], asset: dict[str, Any], archive_name: str) -> str:
         digest = str(asset.get("digest") or "")
@@ -353,24 +375,29 @@ class AppUpdater:
             value = response.text.strip().split()[0].casefold()
             if re.fullmatch(r"[0-9a-f]{64}", value):
                 return value
-        raise UpdateError("This release has no SHA-256 digest; open GitHub Releases and update manually")
+        raise UpdateError(err("web.updateNoDigest"))
 
     @staticmethod
     def _extract_archive(archive: Path, destination: Path, version: str) -> Path:
         root = destination.resolve()
         with zipfile.ZipFile(archive) as bundle:
-            for entry in bundle.infolist():
+            entries = bundle.infolist()
+            if len(entries) > MAX_UPDATE_ARCHIVE_ENTRIES:
+                raise UpdateError(err("web.updateTooManyFiles"))
+            if sum(max(0, int(entry.file_size)) for entry in entries) > MAX_UPDATE_EXTRACTED_BYTES:
+                raise UpdateError(err("web.updateUnexpectedSize"))
+            for entry in entries:
                 resolved = (root / entry.filename).resolve()
                 if resolved != root and root not in resolved.parents:
-                    raise UpdateError("The release archive contains an unsafe path")
+                    raise UpdateError(err("web.updateUnsafePath"))
             bundle.extractall(root)
         candidates = [path.parent for path in root.glob("*/install.sh") if path.is_file()]
         if len(candidates) != 1:
-            raise UpdateError("The release archive does not contain one installer")
+            raise UpdateError(err("web.updateNoInstaller"))
         project = candidates[0]
         metadata = (project / "pyproject.toml").read_text(encoding="utf-8")
         if not re.search(rf'^version\s*=\s*"{re.escape(version)}"\s*$', metadata, re.MULTILINE):
-            raise UpdateError("The release archive version does not match GitHub")
+            raise UpdateError(err("web.updateVersionMismatch"))
         return project
 
     def _release_worker(self, _source: dict[str, Any]) -> None:
@@ -379,7 +406,7 @@ class AppUpdater:
             release = self._latest_release(force=True)
             version = str(release["version"])
             if _version_key(version) <= _version_key(__version__):
-                self._set_state("current", "Pudge is already current", latest_version=version)
+                self._set_state("current", t("web.updateCurrent", app=APP_NAME), latest_version=version)
                 return
             archive_name = f"{version}.zip"
             asset = self._asset(release, archive_name)
@@ -387,19 +414,25 @@ class AppUpdater:
                 archive_name = f"{APP_SLUG}-macos-v{version}.zip"
                 asset = self._asset(release, archive_name)
             if not asset:
-                raise UpdateError(f"GitHub Release does not contain {archive_name}")
+                raise UpdateError(err("web.updateMissingAsset", archive=archive_name))
             expected = self._expected_digest(release, asset, archive_name)
             self._log("APP release update v%s started", version)
             self.update_root.mkdir(parents=True, exist_ok=True)
             self._prune_update_sources()
             temporary = Path(tempfile.mkdtemp(prefix=f"v{version}-", dir=self.update_root))
             archive = temporary / archive_name
-            self._set_state("downloading", f"Downloading Pudge {version}", latest_version=version)
+            self._set_state(
+                "downloading",
+                t("web.updateDownloading", app=APP_NAME, version=version),
+                latest_version=version,
+            )
             actual = self._download(str(asset.get("browser_download_url") or ""), archive)
             if actual != expected:
-                raise UpdateError("The downloaded update failed SHA-256 verification")
+                raise UpdateError(err("web.updateDigestMismatch"))
             self._log("APP release update v%s SHA-256 verified", version)
-            self._set_state("installing", f"Installing Pudge {version}", latest_version=version)
+            self._set_state(
+                "installing", t("web.updateInstalling", app=APP_NAME, version=version), latest_version=version
+            )
             project = self._extract_archive(archive, temporary / "release", version)
             self._launch_script(project, [])
         except Exception as exc:
@@ -441,14 +474,16 @@ class AppUpdater:
             relative = project.relative_to(update_root)
             if relative.parts and re.fullmatch(r"v\d+\.\d+\.\d+-.+", relative.parts[0]):
                 downloaded = update_root / relative.parts[0]
-                commands.extend([
-                    "cleanup_update_source() {",
-                    "  local result=$?",
-                    f"  /bin/rm -rf {shlex.quote(str(downloaded))}",
-                    "  return $result",
-                    "}",
-                    "trap cleanup_update_source EXIT",
-                ])
+                commands.extend(
+                    [
+                        "cleanup_update_source() {",
+                        "  local result=$?",
+                        f"  /bin/rm -rf {shlex.quote(str(downloaded))}",
+                        "  return $result",
+                        "}",
+                        "trap cleanup_update_source EXIT",
+                    ]
+                )
         if prefix_line:
             commands.append(prefix_line)
         commands.extend(
@@ -492,6 +527,6 @@ class AppUpdater:
         # them and must survive that cleanup (it was silently killed before).
         self.installer_pid = int(getattr(installer, "pid", 0) or 0) or None
         self._log("APP update installer launched from %s", project)
-        self._set_state("restarting", "Installer started; Pudge will reopen automatically")
+        self._set_state("restarting", t("web.updateRestarting", app=APP_NAME))
         if callable(self.request_quit):
             self.request_quit()

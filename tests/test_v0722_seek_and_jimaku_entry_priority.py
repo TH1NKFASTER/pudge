@@ -8,19 +8,61 @@ from pudge.filename import VideoIdentity
 from pudge.models import AniListAnime, SubtitleCandidate
 from pudge.providers.jimaku import JimakuClient, JimakuEntry, JimakuFile
 
+# The LN reader listening together: three words of 10 characters; the audio is at `position`
+# seconds and the backend's paired state says which character it reads. Arrow keys seek
+# the audiobook; the window waits for the backend's new state (answered by the test).
+LISTENING = r"""
+const reader = document.getElementById('lnReader');
+reader.innerHTML = '<p data-ln-paragraph="0" data-ln-audio-start="0" data-ln-audio-end="30">'
+  + ['一', '二', '三'].map((w, i) => `<span class="ln-word" data-ln-token="${i}" data-ln-audio-start="${i * 10}" data-ln-audio-end="${i * 10 + 10}">${w}</span>`).join('')
+  + '</p>';
+$('lnReaderShell').classList.add('open');
+ui.lnBook = {id: 7, paired_audio: true};
+ui.lnChapter = {chapter_index: 0};
+ui.lnPairedExpanded = true;
+const state = (offset, position) => ({audiobook_id: 3, alignment_mode: 'stt', alignment: {ready: true}, playing: true,
+  paused: false, ln_chapter_index: 0, position, chapter_char_offset_exact: offset, speed: 1});
+const playAt = (offset, position) => { ui.lnPairedState = state(offset, position); renderLnPairedPosition(state(offset, position), offset, {speechActive: true}); };
+// "*" marks the highlighted word, then its filled part.
+const words = () => [...reader.querySelectorAll('.ln-word')].map(word =>
+  (word.classList.contains('ln-paired-word-current') ? '*' : '') + (word.style.getPropertyValue('--ln-paired-word-progress') || '-'));
+const answers = [];
+__api.audiobook_seek = async () => ({ok: true});
+__api.light_novel_paired_state = () => new Promise(resolve => answers.push(resolve));
+const answer = async (index, offset, position) => { answers[index](state(offset, position)); await __flush(); await __flush(); };
+"""
 
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
 
-
-def test_arrow_seek_forces_fresh_paint_and_drops_stale_responses() -> None:
-    source = HTML.read_text(encoding="utf-8")
-
-    assert "seekJump=options.seekJump===true||" in source
-    assert "ui.lnPairedSeekGeneration=generation" in source
-    assert "generation!==Number(ui.lnPairedSeekGeneration||0)" in source
-    assert "applyLnPairedPosition(updated,{seekJump:true,reason:'shortcut'})" in source
-    assert "lnPairedResetWordProgress(reader)" in source
+def test_arrow_seek_forces_fresh_paint_and_drops_stale_responses(page) -> None:
+    result = page.run(
+        LISTENING
+        + r"""
+        const out = {};
+        // Near the chapter start Left lands 0.3 s back: too small to look like a seek, still painted anew.
+        playAt(1.5, 0.3);
+        await __key('ArrowLeft'); await __flush();
+        await answer(0, 0, 0);
+        out.start = words();
+        // From the second word back into the first: nothing of the second stays filled.
+        playAt(15, 10.0); playAt(16, 10.2);
+        await __key('ArrowLeft'); await __flush();
+        await answer(1, 5, 5.2);
+        out.back = words();
+        // Two quick presses: the late answer to the first must not move the highlight back.
+        await __key('ArrowRight'); await __flush();
+        await __key('ArrowRight'); await __flush();
+        await answer(3, 25, 15.2);
+        out.second = words();
+        await answer(2, 12, 10.2);
+        out.late = words();
+        return out;
+        """
+    )
+    assert result.calls_of("audiobook_seek") == [[3, -5], [3, -5], [3, 5], [3, 5]]
+    out = result.value
+    assert out["start"] == ["*0.0%", "-", "-"]
+    assert out["back"] == ["*50.0%", "-", "-"]
+    assert out["second"] == out["late"] == ["-", "-", "*50.0%"]
 
 
 def test_exact_anime_title_entry_is_not_hidden_behind_four_id_duplicates(
@@ -73,9 +115,7 @@ def test_exact_anime_title_entry_is_not_hidden_behind_four_id_duplicates(
             return [target_entry] if query else []
 
         def rank_entries(self, entries, identity, anilist_id):
-            return JimakuClient.rank_entries(
-                object.__new__(JimakuClient), entries, identity, anilist_id
-            )
+            return JimakuClient.rank_entries(object.__new__(JimakuClient), entries, identity, anilist_id)
 
         def files_for_episode(self, entry_id, _episode, alternative_episodes=()):
             requested_entries.append(entry_id)

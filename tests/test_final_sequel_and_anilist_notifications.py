@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 from pudge.manager_models import LibraryAnime
@@ -204,9 +203,7 @@ def test_pudge_related_notifications_filter_anime_recent_and_persist_seen_ids() 
     manager = SimpleNamespace(db=db)
     api = object.__new__(WebAppApi)
     api.manager = manager
-    api.config = SimpleNamespace(
-        anilist=SimpleNamespace(enabled=True, access_token="token")
-    )
+    api.config = SimpleNamespace(anilist=SimpleNamespace(enabled=True, access_token="token"))
     api.logger = _Logger()
 
     class FakeClient:
@@ -306,17 +303,54 @@ def test_download_final_sequel_reports_missing_torrent_without_status_change() -
     assert api.manager.calls == [(2, None, False)]
 
 
-def test_score_modal_and_notification_ui_hooks_exist() -> None:
-    html = (Path(__file__).resolve().parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
+def test_score_modal_offers_the_sequel_actions_and_opens_it_on_anilist(page) -> None:
+    # After the final episode the score modal shows the next anime with its actions;
+    # without a site_url the card opens the AniList page built from the media id.
+    sequel = {
+        "media_id": 2,
+        "title": "Show 2",
+        "released": True,
+        "media_status": "FINISHED",
+        "can_planning": True,
+        "can_watching": True,
+        "can_download": True,
+    }
+    result = page.run(
+        """
+        showScoreModal({media_id: 1, title: 'Show', episodes: 12}, true, 12);
+        await __tick(5000);
+        const buttons = [...document.querySelectorAll('#modalBody .anime-card button')].map(b => b.innerText);
+        const expected = [t('nav.planned'), t('ui.watching'), PudgeI18n.t('action.download')];
+        await __click('#modalBody .anime-card strong');                     // the card itself
+        for (const action of ['planning', 'watching', 'download']) {        // the panel is redrawn after each
+          await __click(`#modalBody [data-action=final-sequel-${action}]`); await __tick(10);
+        }
+        return {buttons, expected, title: __text('#modalBody .anime-card strong'),
+                message: __text('#modalBody'), downloaded: PudgeI18n.t('ui.downloadAdded', {release: '[Group] Show 2'})};
+        """,
+        lang="ru",
+        api={
+            "final_sequel_option": {"ok": True, "sequel": sequel},
+            "add_to_planning": {"ok": True},
+            "set_anime_watching": {"ok": True},
+            "download_final_sequel": {"ok": True, "release": "[Group] Show 2"},
+        },
     )
-    assert 'data-action="final-sequel-planning"' in html
-    assert 'data-action="final-sequel-watching"' in html
-    assert 'data-action="final-sequel-download"' in html
-    assert 'const siteUrl=sequel.site_url||`https://anilist.co/anime/${Number(sequel.media_id)}`' in html
-    assert 'data-action="url" data-url="${escapeHtml(siteUrl)}"' in html
-    assert "startAniListRelatedNotificationPolling()" in html
-    assert 'id="anilistRelatedBackdrop"' in html
+    out = result.value
+    assert out["title"] == "Show 2" and out["buttons"] == out["expected"]
+    assert result.calls_of("open_url") == [["https://anilist.co/anime/2"]]
+    assert result.calls_of("add_to_planning") == [[2]]
+    assert result.calls_of("set_anime_watching") == [[2]]
+    assert result.calls_of("download_final_sequel") == [[1]]  # the finished anime's id
+    assert out["downloaded"] in out["message"]
+    # The sequel's own AniList link wins when the backend has one.
+    sequel_with_url = {**sequel, "site_url": "https://anilist.co/anime/2/Show-2"}
+    linked = page.run(
+        "showScoreModal({media_id: 1, title: 'Show'}, true, 12); await __tick(5000);"
+        "await __click('#modalBody .anime-card strong');",
+        api={"final_sequel_option": {"ok": True, "sequel": sequel_with_url}},
+    )
+    assert linked.calls_of("open_url") == [["https://anilist.co/anime/2/Show-2"]]
 
 
 def test_download_final_airing_sequel_reuses_episode_auto_download_without_status_change() -> None:
@@ -435,10 +469,59 @@ def test_download_final_sequel_does_not_attach_to_other_running_job() -> None:
     assert db.get_anime(2).status == ""
 
 
-def test_related_notification_ui_has_planning_action_and_disables_existing_list_entries() -> None:
-    html = (Path(__file__).resolve().parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-
-    assert "data-anilist-related-planning" in html
-    assert "pywebview.api.add_media_to_planning" in html
-    assert "['PLANNING','CURRENT','REPEATING','COMPLETED'].includes(listStatus)" in html
-    assert "planning.className='primary'" in html
+def test_new_related_anime_popup_adds_to_planning_and_opens_anilist(page) -> None:
+    # The window asks for AniList notifications when it opens; titles already in a list
+    # cannot be added to Planning again; music entries are not shown.
+    notifications = [
+        {
+            "id": 11,
+            "media_id": 101,
+            "title": "Sequel",
+            "site_url": "https://anilist.co/anime/101",
+            "created_at": 1790000000,
+        },
+        {
+            "id": 12,
+            "media_id": 102,
+            "title": "Spin-off",
+            "site_url": "https://anilist.co/anime/102",
+            "created_at": 1790000000,
+            "list_status": "COMPLETED",
+        },
+        {"id": 13, "media_id": 103, "title": "Theme song", "format": "MUSIC", "created_at": 1790000000},
+    ]
+    result = page.run(
+        """
+        await __tick(10);
+        const button = row => document.querySelector(`#anilistRelatedList .anime-card:nth-child(${row}) [data-anilist-related-planning]`);
+        const state = row => ({text: button(row).innerText, disabled: button(row).disabled, primary: button(row).classList.contains('primary')});
+        const before = {visible: __visible('#anilistRelatedBackdrop'), heading: __text('#anilistRelatedHeading'),
+                        titles: [...document.querySelectorAll('#anilistRelatedList strong')].map(n => n.innerText),
+                        first: state(1), second: state(2)};
+        await __click('#anilistRelatedList .anime-card:nth-child(1) [data-anilist-related-planning]');
+        await __tick(10);
+        const added = {first: state(1), toast: __text('#toast')};
+        await __click('#anilistRelatedList .anime-card:nth-child(2) strong');
+        await __click('#anilistRelatedClose');
+        return {before, added, closed: !__visible('#anilistRelatedBackdrop'),
+                texts: {heading: PudgeI18n.t('ui.newAnimeOnAnilist'), planned: t('nav.planned'), toast: t('toast.addedPlanning')}};
+        """,
+        api={
+            "poll_anilist_related_media_notifications": {"notifications": notifications},
+            "add_media_to_planning": {"ok": True},
+        },
+    )
+    out, texts = result.value, result.value["texts"]
+    before = out["before"]
+    assert before["visible"] and before["heading"] == texts["heading"]
+    assert before["titles"] == ["Sequel", "Spin-off"]
+    assert before["first"] == {"text": texts["planned"], "disabled": False, "primary": True}
+    assert before["second"] == {"text": texts["planned"], "disabled": True, "primary": False}
+    assert result.calls_of("mark_anilist_related_media_notifications_seen") == [[[11, 12]]]
+    assert result.calls_of("add_media_to_planning") == [[101, "anime"]]
+    assert out["added"] == {
+        "first": {"text": texts["planned"], "disabled": True, "primary": False},
+        "toast": texts["toast"],
+    }
+    assert result.calls_of("open_url") == [["https://anilist.co/anime/102"]]
+    assert out["closed"]

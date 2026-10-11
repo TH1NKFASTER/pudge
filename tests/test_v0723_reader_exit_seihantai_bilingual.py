@@ -1,3 +1,6 @@
+"""Leaving the light-novel reader, Seihantai release numbering and bilingual playback
+subtitles (behaviour; audit 71Б rewrite of the reader-close source check)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,12 +12,10 @@ from pudge.library import scan_library
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime
 from pudge.subtitle_formats import clean_srt_for_playback
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from t71g21_support import READER, paired
 
 
-def test_explicit_stop_stops_audio_and_reader_close_hands_audio_to_sidebar() -> None:
+def test_explicit_stop_of_a_read_together_book_stops_its_audiobook() -> None:
     service = object.__new__(AudiobookService)
     calls: list[int] = []
     service.link_for_light_novel = lambda _ln, include_alignment=False: {"book": {"id": 75}}  # type: ignore[method-assign]
@@ -24,13 +25,30 @@ def test_explicit_stop_stops_audio_and_reader_close_hands_audio_to_sidebar() -> 
 
     assert result == {"ok": True, "stopped": True, "audiobook_id": 75}
     assert calls == [75]
-    html = HTML.read_text(encoding="utf-8")
-    close = html[html.index("if(target.id==='lnReaderClose')"):]
-    close = close[: close.index("return;") + len("return;")]
-    assert "acceptPairedState?.(closingPairedState||{},closingLnBook)" in close
-    assert "light_novel_stop_paired(" not in close
-    assert "light_novel_cancel_reader_background()" in close
-    assert "ui.lnPairedState=null" in close
+
+
+STOPS = ("light_novel_stop_paired", "audiobook_stop", "audiobook_set_paused")
+
+
+def test_closing_the_reader_keeps_the_audiobook_playing_in_the_sidebar(page) -> None:
+    # Back from a book read together with its audiobook: the narration goes on and the
+    # sidebar player takes it over; the reader's own background work (parsing ahead) is cancelled.
+    result = page.run(
+        READER
+        + r"""
+        await openReader();
+        await __click('#lnReaderClose'); await __tick(20);
+        const out = {reader: $('lnReaderShell').classList.contains('open'), sidebar: __visible('[data-sidebar-audio] [data-sc-book="75"]'),
+                     pause: __text('[data-sidebar-audio] [data-sc-book="75"] [data-sc-audio="toggle"]')};
+        return out;
+        """,
+        **paired(playing=True),
+    )
+    out = result.value
+    assert out["reader"] is False
+    assert out["sidebar"] is True and out["pause"] == "Ⅱ"  # still playing there
+    assert not any(result.called(name) for name in STOPS)
+    assert result.calls_of("light_novel_cancel_reader_background") == [[]]
 
 
 def test_library_scan_repairs_detached_absolute_release_to_media_episode(tmp_path: Path, monkeypatch) -> None:
@@ -50,12 +68,16 @@ def test_library_scan_repairs_detached_absolute_release_to_media_episode(tmp_pat
             status="CURRENT",
         )
     )
-    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None))
+    monkeypatch.setattr(
+        "pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None)
+    )
 
     rows = scan_library(
         root,
         db,
-        media_episode_resolver=lambda anime, release: 7 if anime.media_id == 210031 and release == 19 else release,
+        media_episode_resolver=lambda anime, release: (
+            7 if anime.media_id == 210031 and release == 19 else release
+        ),
     )
 
     assert len(rows) == 1
@@ -65,8 +87,9 @@ def test_library_scan_repairs_detached_absolute_release_to_media_episode(tmp_pat
     assert rows[0].release_episode == 19
 
 
-
-def test_manager_scan_maps_seihantai_release_19_to_episode_7_from_numbering_cache(tmp_path: Path, monkeypatch) -> None:
+def test_manager_scan_maps_seihantai_release_19_to_episode_7_from_numbering_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -89,7 +112,9 @@ def test_manager_scan_maps_seihantai_release_19_to_episode_7_from_numbering_cach
     cache = cfg.paths.cache_dir / "anilist-release-numbering" / "210031.json"
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text('{"offset":12,"resolver_version":2,"prequel_titles":[]}', encoding="utf-8")
-    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None))
+    monkeypatch.setattr(
+        "pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None)
+    )
 
     manager.scan_library()
 
@@ -100,7 +125,10 @@ def test_manager_scan_maps_seihantai_release_19_to_episode_7_from_numbering_cach
     assert episode.media_episode == 7
     assert episode.release_episode == 19
 
-def test_library_scan_uses_completed_download_metadata_before_backend_forgets_task(tmp_path: Path, monkeypatch) -> None:
+
+def test_library_scan_uses_completed_download_metadata_before_backend_forgets_task(
+    tmp_path: Path, monkeypatch
+) -> None:
     root = tmp_path / "library"
     folder = root / "Seihantai na Kimi to Boku 2nd Season"
     folder.mkdir(parents=True)
@@ -125,7 +153,9 @@ def test_library_scan_uses_completed_download_metadata_before_backend_forgets_ta
             raw={"backend": "aria2", "total_size": 5, "downloaded": 5},
         )
     )
-    monkeypatch.setattr("pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None))
+    monkeypatch.setattr(
+        "pudge.library.japanese_subtitle_details", lambda *_args, **_kwargs: ("none", None, None)
+    )
 
     rows = scan_library(root, db, media_episode_resolver=lambda _anime, _release: None)
 
@@ -142,10 +172,10 @@ def test_same_cue_japanese_chinese_second_line_is_removed_and_cache_is_new(tmp_p
         encoding="utf-8",
     )
 
-    cleaned, result = clean_srt_for_playback(source, tmp_path / "cache")
-    payload = cleaned.read_text(encoding="utf-8")
+    cleaned_output, result = clean_srt_for_playback(source, tmp_path / "cache")
+    payload = cleaned_output.read_text(encoding="utf-8")
 
-    assert cleaned.name.startswith("v16-")
+    assert cleaned_output.name.startswith("v16-")
     assert "这是中文翻译台词" not in payload
     assert "我们继续说话" not in payload
     assert "これは日本語の台詞です" in payload
@@ -159,9 +189,14 @@ def test_same_cue_japanese_chinese_second_line_is_removed_and_cache_is_new(tmp_p
     config = AppConfig(config_path=tmp_path / "config.toml")
     config.paths.cache_dir = tmp_path / "cache"
     manifest = pipeline_cache.save_final_pipeline_result(
-        video, config, subtitle=cleaned, subtitle_id=None, source="jimaku",
+        video,
+        config,
+        subtitle=cleaned_output,
+        subtitle_id=None,
+        source="jimaku",
     )
     import json
+
     old = json.loads(manifest.read_text())
     old["schema"] = "final-pipeline-v9"
     manifest.write_text(json.dumps(old))

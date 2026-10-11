@@ -4,6 +4,14 @@ import threading
 import sys
 from typing import Any
 
+from . import js_bridge
+from .i18n import err, t
+
+
+# A float hidden this long is destroyed (its WebView holds 40-70 MB); showing
+# it again recreates it.
+HIDDEN_DESTROY_SECONDS = 10 * 60
+
 
 class AudiobookFloatWindow:
     """One optional native window, sharing the application's existing transport.
@@ -24,6 +32,7 @@ class AudiobookFloatWindow:
         # Reader suppression: {"ln_book_id", "audiobook_id", "generation"} or None.
         self._suppression: dict[str, int] | None = None
         self._reader_generation = -1
+        self._hidden_generation = 0
 
     @property
     def opened(self) -> bool:
@@ -68,22 +77,32 @@ class AudiobookFloatWindow:
                 self._hide_locked("display-matches-reader")
             return {"ok": True, "opened": self.opened, "suppressed": self._suppressed_locked()}
 
-    def reader_context(self, *, open: bool, ln_book_id: int, audiobook_id: int, generation: int) -> dict[str, Any]:
+    def reader_context(
+        self, *, open: bool, ln_book_id: int, audiobook_id: int, generation: int
+    ) -> dict[str, Any]:
         """Apply the newest reader visibility context; stale generations are ignored."""
         with self._lock:
             if int(generation) < self._reader_generation:
                 return {"ok": True, "stale": True, "opened": self.opened}
             self._reader_generation = int(generation)
             if open and int(audiobook_id or 0) > 0:
-                self._suppression = {"ln_book_id": int(ln_book_id or 0),
-                                     "audiobook_id": int(audiobook_id), "generation": int(generation)}
+                self._suppression = {
+                    "ln_book_id": int(ln_book_id or 0),
+                    "audiobook_id": int(audiobook_id),
+                    "generation": int(generation),
+                }
                 if self._window is not None and not self._hidden and self._suppressed_locked():
                     self._hide_locked("reader-open")
             else:
                 # Lifting suppression never re-shows: a hidden or user-closed
                 # float stays away until the user explicitly opens it again.
                 self._suppression = None
-            return {"ok": True, "stale": False, "opened": self.opened, "suppressed": self._suppressed_locked()}
+            return {
+                "ok": True,
+                "stale": False,
+                "opened": self.opened,
+                "suppressed": self._suppressed_locked(),
+            }
 
     def hide(self) -> dict[str, Any]:
         with self._lock:
@@ -107,6 +126,24 @@ class AudiobookFloatWindow:
             except Exception:
                 pass
         self._log("info", "audiobook.float_hidden reason=%s book=%s", reason, self._display_book_id)
+        self._hidden_generation += 1
+        timer = threading.Timer(
+            HIDDEN_DESTROY_SECONDS,
+            self._destroy_if_still_hidden,
+            args=(window, self._hidden_generation),
+        )
+        timer.daemon = True
+        timer.start()
+
+    def _destroy_if_still_hidden(self, window: Any, generation: int) -> None:
+        with self._lock:
+            if self._window is not window or not self._hidden or generation != self._hidden_generation:
+                return
+        try:
+            window.destroy()
+            self._log("info", "audiobook.float_destroyed reason=hidden_%ss", HIDDEN_DESTROY_SECONDS)
+        except Exception as exc:
+            self._log("warning", "FALLBACK audiobook.float_destroy error=%r", str(exc))
 
     def _enforce_hidden(self, window: Any) -> None:
         """A late native creation may order the window in after hide(); undo it."""
@@ -133,15 +170,17 @@ class AudiobookFloatWindow:
                 return {"ok": True, "opened": False, "suppressed": True}
             if self._window is not None:
                 self._hidden = False
+                self._hidden_generation += 1  # cancels a pending destroy
                 self._window.show()
                 return {"ok": True, "opened": True}
             base = str(getattr(self._api, "asset_base", "") or "").rstrip("/")
             if not base:
-                return {"ok": False, "error": "Asset server is not ready"}
-            window = webview.create_window(
-                "Pudge · Audiobook",
+                return {"ok": False, "error": err("media.assetServerNotReady")}
+            window = js_bridge.create_window(
+                webview,
+                t("cli.windowAudiobook"),
+                self._api,
                 url=f"{base}/audiobook_float.html",
-                js_api=self._api,
                 width=320,
                 height=550,
                 min_size=(260, 340),
@@ -227,7 +266,10 @@ class AudiobookFloatWindow:
                 self._configured_native = native
                 self._api.logger.info(
                     "audiobook.float_native configured level=%s collection_behavior=%s all_applications=%s class=%s nonactivating=%s",
-                    level, behavior, bool(all_apps), type(native).__name__,
+                    level,
+                    behavior,
+                    bool(all_apps),
+                    type(native).__name__,
                     bool(int(native.styleMask()) & int(AppKit.NSWindowStyleMaskNonactivatingPanel)),
                 )
         except Exception as exc:

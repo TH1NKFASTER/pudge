@@ -2,15 +2,9 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 import threading
 import types
-from pathlib import Path
-
 from pudge.web_app import WebAppApi
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _api() -> WebAppApi:
@@ -24,7 +18,10 @@ def test_manga_state_never_waits_for_anilist() -> None:
     gate = threading.Event()
     calls: list[str] = []
     api.config = types.SimpleNamespace(anilist=types.SimpleNamespace(enabled=True, access_token="t"))
-    api.manga = types.SimpleNamespace(state=lambda: {"books": [{"id": 1, "anilist_id": 5, "mean_score": None}]}, set_mean_scores=lambda s: True)
+    api.manga = types.SimpleNamespace(
+        state=lambda: {"books": [{"id": 1, "anilist_id": 5, "mean_score": None}]},
+        set_mean_scores=lambda s: True,
+    )
 
     def slow_post(*_a, **_k):
         calls.append("anilist")
@@ -45,7 +42,9 @@ def test_manga_state_never_waits_for_anilist() -> None:
 def test_audiobook_state_reads_display_state_and_queues_maintenance_off_call() -> None:
     api = _api()
     seen: list[bool] = []
-    api.audiobooks = types.SimpleNamespace(state=lambda *, queue_missing=True: seen.append(queue_missing) or {"books": []})
+    api.audiobooks = types.SimpleNamespace(
+        state=lambda *, queue_missing=True: seen.append(queue_missing) or {"books": []}
+    )
     api.audiobook_state()
     api.audiobook_state()
     for thread in threading.enumerate():
@@ -65,33 +64,44 @@ def test_visual_novel_windows_are_cached_briefly_and_forced_on_refresh() -> None
     assert len(calls) == 2
 
 
-def test_rapid_tab_switching_starts_one_loader_per_page_and_skips_left_pages() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    start = html.index("function loadActivatedPage(page){")
-    load_fn = html[start : html.index("\nfunction setPage(", start)]
-    sp = html.index("function setPage(page,force=false){")
-    set_page = html[sp : html.index("\nfunction updateCount(", sp)]
-    script = f"""
-const frames=[];global.requestAnimationFrame=fn=>frames.push(fn);global.performance={{now:()=>0}};
-const calls={{}};const pending={{}};
-const mk=name=>()=>{{calls[name]=(calls[name]||0)+1;return new Promise(r=>{{pending[name]=r;}});}};
-global.window={{PudgeMangaReaderV2:{{renderLibrary:mk('manga')}},PudgeMedia:{{loadAudio:mk('audio')}},PudgeVisualNovels:{{load:mk('vn')}},PudgeStatistics:{{load:mk('stats')}}}};
-global.loadLightNovels=mk('ln');global.logUiEvent=()=>{{}};
-global.ui={{page:'current'}};global.document={{querySelectorAll:()=>[]}};global.$=()=>({{textContent:'',scrollTop:0}});global.t=x=>x;
-global.clearLnSelection=()=>{{}};global.updatePageSelectionActions=()=>{{}};global.updateCount=()=>{{}};global.queuePolychromeWake=()=>{{}};
-{load_fn}
-{set_page}
-(async()=>{{
-  setPage('manga');setPage('visualnovels');setPage('audiobooks');   // left before their frames
-  frames.splice(0).forEach(fn=>fn());
-  setPage('manga');frames.splice(0).forEach(fn=>fn());
-  setPage('statistics');frames.splice(0).forEach(fn=>fn());
-  setPage('manga');frames.splice(0).forEach(fn=>fn());               // manga load still running -> reused
-  process.stdout.write(JSON.stringify({{calls,page:ui.page}}));
-}})();
-"""
-    result = json.loads(subprocess.check_output(["node", "-e", script], text=True))
-    assert result["page"] == "manga"
-    # manga/vn left before their frame never loaded; audiobooks was active at the
-    # frame; the third manga visit reused the still-running manga load.
-    assert result["calls"] == {"audio": 1, "manga": 1, "stats": 1}, result
+def test_rapid_tab_switching_starts_one_loader_per_page_and_skips_left_pages(page) -> None:
+    # The backend is slow: no Manga/Audiobooks/VN/Statistics state ever arrives.
+    result = page.run(
+        r"""
+        await __tick(3000);
+        const mark = __apiCalls.length;
+        const go = page => __click(`.nav button[data-page="${page}"]`);
+        await go('manga'); await go('visualnovels'); await go('audiobooks');     // left before the next frame
+        await __tick(50);
+        await go('manga'); await __tick(50);
+        await go('statistics'); await __tick(50);
+        await go('manga'); await __tick(50);                                     // its first load is still running
+        const loads = {};
+        for (const call of __apiCalls.slice(mark)) loads[call.name] = (loads[call.name] || 0) + 1;
+        return {page: ui.page, loads};
+        """,
+        before="""
+        for (const name of ['manga_state', 'audiobook_state', 'visual_novel_windows', 'visual_novel_state', 'consumption_statistics_query'])
+          __api[name] = () => new Promise(() => {});
+        """,
+    )
+    assert result.value["page"] == "manga"
+    # Manga and Visual Novels, left before their frame, loaded nothing then; Audiobooks was
+    # open at the frame; the third Manga visit reused the still-running Manga load.
+    loads = result.value["loads"]
+    assert {
+        name: loads.get(name, 0)
+        for name in (
+            "manga_state",
+            "audiobook_state",
+            "visual_novel_windows",
+            "visual_novel_state",
+            "consumption_statistics_query",
+        )
+    } == {
+        "manga_state": 1,
+        "audiobook_state": 1,
+        "visual_novel_windows": 0,
+        "visual_novel_state": 0,
+        "consumption_statistics_query": 1,
+    }

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -146,9 +146,7 @@ def test_backup_round_trip_restores_database_config_and_cached_subtitle(tmp_path
     )
     assert result["cached_files"] == 1
     with zipfile.ZipFile(output) as archive:
-        assert {"manifest.json", "config.toml", "library.sqlite3"}.issubset(
-            archive.namelist()
-        )
+        assert {"manifest.json", "config.toml", "library.sqlite3"}.issubset(archive.namelist())
 
     config_path.write_text("broken", encoding="utf-8")
     database_path.unlink()
@@ -160,7 +158,7 @@ def test_backup_round_trip_restores_database_config_and_cached_subtitle(tmp_path
         cache_dir=cache_dir,
     )
     assert restored["restart_required"] is True
-    assert 'language = "ru"' in config_path.read_text(encoding="utf-8")
+    assert tomllib.loads(config_path.read_text(encoding="utf-8"))["ui"]["language"] == "ru"
     restored_db = Database(database_path)
     assert restored_db.get_state("custom_mapping") == "saved"
     episode = restored_db.episodes(200)[0]
@@ -238,19 +236,59 @@ def test_upgrade_settings_round_trip(tmp_path: Path) -> None:
     assert loaded.matching.max_subtitle_upgrade_checks_per_run == 2
 
 
-def test_web_ui_exposes_selected_competitor_features() -> None:
-    source = (
-        Path(__file__).resolve().parents[1]
-        / "pudge"
-        / "web"
-        / "index.html"
-    ).read_text(encoding="utf-8")
-    assert "checkReleaseUpgrades" in source
-    assert "checkSubtitleUpgrades" in source
-    assert "create_next_episodes_queue" not in source
-    assert "create_franchise_queue" in source
-    assert "advance_playlist" in source
-    assert "create_full_backup" in source
-    assert "restore_full_backup" in source
-    assert "s_auto_upgrade_downloaded" in source
-    assert "s_auto_upgrade_subtitles" in source
+def test_settings_back_up_and_restore_everything(page) -> None:
+    # Settings > Maintenance: a full backup, and a restore after a confirmation (cancelling
+    # the confirmation restores nothing). Upgrade checks there are tested in
+    # test_v0663_ln_reader_search_and_epub.py, the franchise queue (and that "queue next" is
+    # gone) in test_v0720_second_six_contract.py, advancing a queue after an episode in
+    # test_v0727_review_gate_play_preflight_v96p18.py.
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('settings', true); await __tick(20);
+            const maintenance = ['createBackup', 'restoreBackup'].every(id => $(id).closest('#settingsMaintenance'));
+            await __click('#createBackup'); await __tick(20);
+            const created = __toasts().at(-1);
+            await __click('#restoreBackup'); await __tick(20);
+            const question = __text('#pudgeConfirmMessage');
+            await __click('[data-pudge-confirm="cancel"]'); await __tick(20);
+            const afterCancel = __apiCalls.filter(call => call.name === 'restore_full_backup').length;
+            await __click('#restoreBackup'); await __tick(20);
+            await __click('[data-pudge-confirm="ok"]'); await __tick(50);
+            return {maintenance, created, question, afterCancel, restored: __toasts().at(-1), page: ui.page, shows: __text('#currentContent').includes('Restored show'),
+                    texts: {created: t('toast.backupCreated', {path: '/Backups/pudge.zip'}), question: t('confirm.restoreBackup'), restored: t('toast.backupRestored')}};
+            """,
+            lang=lang,
+            before="""
+            __api.create_full_backup = async () => ({ok: true, path: '/Backups/pudge.zip'});
+            __api.restore_full_backup = async () => ({ok: true, state: {...(await __api.get_state()),
+              home: {waiting: [{media_id: 5, title: 'Restored show', next_episode: 1, site_url: 'https://anilist.co/anime/5'}]}}});
+            """,
+        )
+        out, texts = result.value, result.value["texts"]
+        assert out["maintenance"] is True
+        assert result.calls_of("create_full_backup") == [[]] and out["created"] == texts["created"]
+        assert out["question"] == texts["question"] and out["afterCancel"] == 0
+        assert result.calls_of("restore_full_backup") == [[]]
+        assert out["restored"] == texts["restored"] and out["page"] == "settings" and out["shows"] is True
+
+
+def test_settings_switch_automatic_release_upgrades(page) -> None:
+    # Automatic subtitle upgrades have no switch any more (always on; see
+    # test_v0103_settings_ln_listen_simplify.py); release upgrades keep theirs.
+    for enabled in (True, False):
+        result = page.run(
+            r"""
+            const box = $('s_auto_upgrade_downloaded');
+            const shown = {checked: box.checked, label: box.closest('label').innerText.trim(), expected: t('settings.autoUpgradeDownloaded')};
+            await __input('#s_auto_upgrade_downloaded', !box.checked);
+            await __click('#saveSettings'); await __tick(20);
+            return shown;
+            """,
+            state={"settings": {"auto_upgrade_downloaded": enabled}},
+            before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+        )
+        assert result.value["checked"] is enabled
+        assert result.value["label"] == result.value["expected"]
+        [[values]] = result.calls_of("save_settings")
+        assert values["auto_upgrade_downloaded"] is (not enabled)

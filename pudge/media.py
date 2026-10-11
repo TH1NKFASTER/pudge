@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from .branding import APP_SLUG
+from .i18n import err
 from typing import Any
 
 from .language import (
@@ -28,17 +29,19 @@ class MediaProbeError(RuntimeError):
 def probe_media(video: Path, ffprobe: str) -> dict[str, Any]:
     command = [
         ffprobe,
-        "-v", "error",
+        "-v",
+        "error",
         "-show_streams",
         "-show_format",
-        "-of", "json",
+        "-of",
+        "json",
         str(video),
     ]
     try:
         completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=20)
         return json.loads(completed.stdout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
-        raise MediaProbeError(f"Не удалось прочитать контейнер через ffprobe: {exc}") from exc
+        raise MediaProbeError(err("media.ffprobeFailed", error=exc)) from exc
 
 
 def _extract_text_sample(video: Path, stream_index: int, ffmpeg: str) -> str:
@@ -46,15 +49,22 @@ def _extract_text_sample(video: Path, stream_index: int, ffmpeg: str) -> str:
         output = Path(temp_dir) / "sample.srt"
         command = [
             ffmpeg,
-            "-v", "error",
+            "-v",
+            "error",
             "-y",
             "-nostdin",
-            "-probesize", "10M",
-            "-analyzeduration", "10000000",
-            "-i", str(video),
-            "-map", f"0:{stream_index}",
-            "-t", "600",
-            "-c:s", "srt",
+            "-probesize",
+            "10M",
+            "-analyzeduration",
+            "10000000",
+            "-i",
+            str(video),
+            "-map",
+            f"0:{stream_index}",
+            "-t",
+            "600",
+            "-c:s",
+            "srt",
             str(output),
         ]
         try:
@@ -94,9 +104,13 @@ def find_embedded_japanese_subtitles(
         # Subtitle-track ranking adapted from SubPlz's pragmatic stream scorer.
         # For Pudge a signs/forced-only Japanese track is worse than no full
         # Japanese track: accepting it would make an episode look playback-ready.
-        if any(word in lowered_title for word in ("commentary", "comment", "comms")) or int(disposition.get("comment", 0) or 0):
+        if any(word in lowered_title for word in ("commentary", "comment", "comms")) or int(
+            disposition.get("comment", 0) or 0
+        ):
             score -= 200
-        if any(word in lowered_title for word in ("sign", "song", "karaoke", "forced")) or int(disposition.get("forced", 0) or 0):
+        if any(word in lowered_title for word in ("sign", "song", "karaoke", "forced")) or int(
+            disposition.get("forced", 0) or 0
+        ):
             score -= 110
         if any(word in lowered_title for word in ("dialog", "dialogue", "full")):
             score += 20

@@ -1,3 +1,4 @@
+from pudge import i18n
 from pudge.syncing import subtitle_quality_accepted
 
 
@@ -34,7 +35,8 @@ def test_exact_numbered_jimaku_episode_can_override_noisy_llm_title_card_sample(
     accepted, reason = subtitle_quality_accepted(result)
 
     assert accepted is True
-    assert "точная серия AniList/Jimaku" in reason
+    assert "exact AniList/Jimaku episode" in reason
+    assert "точная серия AniList/Jimaku" in i18n.message(reason, "ru")
 
 
 def test_exact_numbered_episode_still_requires_strong_timing_structure():

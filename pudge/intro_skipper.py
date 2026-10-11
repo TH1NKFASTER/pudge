@@ -8,9 +8,14 @@ neighbouring episodes and keep a stretch of 30–180 s (configurable heuristic)
 that is shared.  Each file gets its *own* boundaries (the median of the
 partners that agree on them); a second agreeing partner raises confidence.
 
-Only files already on disk are used; nothing is downloaded for analysis.
-A single episode, silence, a short logo (< min length), a recap or a changed
-OP that no other file shares produce no segment.
+Only files already on disk are analysed; nothing is downloaded for analysis.
+For titles whose episodes are still expected, ``intro_library`` keeps the
+fingerprints of found OP/ED variants (and, until a variant is confirmed, the
+head/tail of episodes) after the files are deleted, so a lone new episode is
+matched against them first; a changed OP/ED falls back to cross-episode
+detection and becomes another variant.  A single episode without such data,
+silence, a short logo (< min length), a recap or a changed OP that no other
+episode shares produce no segment.
 
 Caches (``cache_dir/intro-skipper/``, quota via ``CacheRegistry``):
 
@@ -53,6 +58,7 @@ from .audio_fingerprints import (
     numpy_available,
     save_fingerprint,
 )
+from .intro_library import TitleLibrary, VariantRef, episodes_expected, match_variant, prune_libraries
 
 DETECTOR_VERSION = "intro-1"
 ALGORITHM_VERSION = f"{ENGINE_VERSION}+{DETECTOR_VERSION}"
@@ -213,6 +219,7 @@ def write_playback_session(cache_dir: Path, video: Path) -> Path | None:
 
 # ---------------------------------------------------------------- probing ---
 
+
 def probe_audio(video: Path, ffprobe: str, *, timeout: float = 30.0) -> tuple[float, int | None]:
     """(duration seconds, Japanese audio stream index or None for the first track)."""
     from .subtitles.stt import _select_japanese_audio_stream
@@ -220,7 +227,10 @@ def probe_audio(video: Path, ffprobe: str, *, timeout: float = 30.0) -> tuple[fl
     try:
         completed = subprocess.run(
             [str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video)],
-            text=True, capture_output=True, timeout=timeout, check=False,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
         )
         duration = float(json.loads(completed.stdout or "{}")["format"]["duration"])
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as exc:
@@ -233,6 +243,28 @@ def probe_audio(video: Path, ffprobe: str, *, timeout: float = 30.0) -> tuple[fl
     return duration, index
 
 
+def _meta_path(cache: IntroSkipperCache, identity: str) -> Path:
+    return cache.root / "fingerprints" / f"{hashlib.sha256(identity.encode()).hexdigest()[:32]}.json"
+
+
+def cached_fingerprints(
+    cache: IntroSkipperCache, identity: str
+) -> tuple[AudioFingerprint, AudioFingerprint, float] | None:
+    """(head, tail, duration) from the per-file cache; works after the file is gone."""
+    try:
+        meta = json.loads(_meta_path(cache, identity).read_text(encoding="utf-8"))
+        stream = meta.get("stream")
+        duration = float(meta["duration"])
+        if meta.get("engine") == ENGINE_VERSION:
+            head = load_fingerprint(cache.fingerprint_path(identity, stream, "head"))
+            tail = load_fingerprint(cache.fingerprint_path(identity, stream, "tail"))
+            if head is not None and tail is not None:
+                return head[0], tail[0], duration
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
 def _fingerprints_for(
     item: EpisodeFile,
     cache: IntroSkipperCache,
@@ -243,18 +275,10 @@ def _fingerprints_for(
     cancel_check: Callable[[], bool] | None,
 ) -> tuple[AudioFingerprint, AudioFingerprint, float, bool] | None:
     """Cached or new (head, tail, duration, computed); None when not cached and not allowed to compute."""
-    meta_path = cache.root / "fingerprints" / f"{hashlib.sha256(item.identity.encode()).hexdigest()[:32]}.json"
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        stream = meta.get("stream")
-        duration = float(meta["duration"])
-        if meta.get("engine") == ENGINE_VERSION:
-            head = load_fingerprint(cache.fingerprint_path(item.identity, stream, "head"))
-            tail = load_fingerprint(cache.fingerprint_path(item.identity, stream, "tail"))
-            if head is not None and tail is not None:
-                return head[0], tail[0], duration, False
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
+    meta_path = _meta_path(cache, item.identity)
+    cached = cached_fingerprints(cache, item.identity)
+    if cached is not None:
+        return (*cached, False)
     if not allow_compute:
         return None
     duration, stream = probe_audio(item.path, ffprobe)
@@ -263,13 +287,25 @@ def _fingerprints_for(
     head_len = min(HEAD_SECONDS, duration)
     tail_start = max(0.0, duration - TAIL_SECONDS)
     head = fingerprint_samples(
-        decode_region(item.path, ffmpeg=ffmpeg, start_seconds=0.0, duration_seconds=head_len,
-                      stream_index=stream, cancel_check=cancel_check),
+        decode_region(
+            item.path,
+            ffmpeg=ffmpeg,
+            start_seconds=0.0,
+            duration_seconds=head_len,
+            stream_index=stream,
+            cancel_check=cancel_check,
+        ),
         start_seconds=0.0,
     )
     tail = fingerprint_samples(
-        decode_region(item.path, ffmpeg=ffmpeg, start_seconds=tail_start, duration_seconds=duration - tail_start,
-                      stream_index=stream, cancel_check=cancel_check),
+        decode_region(
+            item.path,
+            ffmpeg=ffmpeg,
+            start_seconds=tail_start,
+            duration_seconds=duration - tail_start,
+            stream_index=stream,
+            cancel_check=cancel_check,
+        ),
         start_seconds=tail_start,
     )
     info = {"identity": item.identity, "stream": stream}
@@ -279,7 +315,9 @@ def _fingerprints_for(
     save_fingerprint(tail_path, tail, meta={**info, "region": "tail"})
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(
-        json.dumps({"engine": ENGINE_VERSION, "stream": stream, "duration": duration, "identity": item.identity}),
+        json.dumps(
+            {"engine": ENGINE_VERSION, "stream": stream, "duration": duration, "identity": item.identity}
+        ),
         encoding="utf-8",
     )
     cache.written.extend([head_path, tail_path, meta_path])
@@ -288,12 +326,19 @@ def _fingerprints_for(
 
 # --------------------------------------------------------------- matching ---
 
-def _consensus(candidates: list[tuple[float, float, float]], agree: float) -> tuple[float, float, int, float] | None:
+
+def _consensus(
+    candidates: list[tuple[float, float, float]], agree: float
+) -> tuple[float, float, int, float] | None:
     """(start, end, supporters, mean BER) of the largest group of agreeing candidates."""
     best: tuple[int, float, float, list[tuple[float, float, float]]] | None = None
     for start, end, _ber in candidates:
         group = [c for c in candidates if abs(c[0] - start) <= agree and abs(c[1] - end) <= agree]
-        key = (len(group), statistics.median(c[1] - c[0] for c in group), -statistics.mean(c[2] for c in group))
+        key = (
+            len(group),
+            statistics.median(c[1] - c[0] for c in group),
+            -statistics.mean(c[2] for c in group),
+        )
         if best is None or key > (best[0], best[1], best[2]):
             best = (key[0], key[1], key[2], group)
     if best is None:
@@ -307,6 +352,9 @@ def _consensus(candidates: list[tuple[float, float, float]], agree: float) -> tu
     )
 
 
+CONFIRMED_SUPPORT = 3  # a confirmed library variant counts like three agreeing partners
+
+
 def _confidence(supporters: int, ber: float) -> float:
     base = 0.6 if supporters <= 1 else 0.8 if supporters == 2 else 0.9
     return round(max(0.3, base - max(0.0, ber - 0.2)), 3)
@@ -317,16 +365,69 @@ def detect_segments(
     target_fp: tuple[AudioFingerprint, AudioFingerprint, float],
     partners: Sequence[tuple[EpisodeFile, tuple[AudioFingerprint, AudioFingerprint, float]]],
     settings: DetectorSettings,
+    variants: dict[str, Sequence[VariantRef]] | None = None,
 ) -> list[MediaSegment]:
-    """Segments of ``target`` from its shared audio with ``partners`` (pure)."""
+    """Segments of ``target`` from stored OP/ED ``variants`` or its shared audio with ``partners`` (pure)."""
+    return [segment for segment, _variant in _detect(target, target_fp, partners, settings, variants or {})]
+
+
+def _match_library(
+    mine: AudioFingerprint, refs: Sequence[VariantRef], settings: DetectorSettings
+) -> tuple[float, float, float, VariantRef] | None:
+    best: tuple[float, float, float, VariantRef] | None = None
+    for ref in refs:
+        run = match_variant(
+            mine,
+            ref.fingerprint,
+            min_seconds=settings.min_seconds,
+            max_seconds=settings.max_seconds,
+            max_bit_error=settings.max_bit_error,
+        )
+        if run is None:
+            continue
+        if best is None or run.duration > best[1] - best[0] + 0.5:
+            best = (run.a_start, run.a_end, run.bit_error_rate, ref)
+    return best
+
+
+def _detect(
+    target: EpisodeFile,
+    target_fp: tuple[AudioFingerprint, AudioFingerprint, float],
+    partners: Sequence[tuple[EpisodeFile, tuple[AudioFingerprint, AudioFingerprint, float]]],
+    settings: DetectorSettings,
+    variants: dict[str, Sequence[VariantRef]],
+) -> list[tuple[MediaSegment, str | None]]:
     head, tail, duration = target_fp
     segments: list[MediaSegment] = []
+    found: list[tuple[MediaSegment, str | None]] = []
     for kind, mine, index in (("intro", head, 0), ("outro", tail, 1)):
+        stored = _match_library(mine, variants.get(kind) or (), settings)
+        if stored is not None:
+            start, end, ber, ref = stored
+            start, end = max(0.0, start), min(duration, end)
+            if settings.min_seconds <= end - start <= settings.max_seconds and not any(
+                s.start_seconds < end and start < s.end_seconds for s in segments
+            ):
+                supporters = CONFIRMED_SUPPORT if ref.confirmed else ref.episodes
+                segment = MediaSegment(
+                    kind=kind,
+                    start_seconds=round(start, 2),
+                    end_seconds=round(end, 2),
+                    source=SOURCE,
+                    confidence=_confidence(supporters, ber),
+                    media_fingerprint=target.identity,
+                )
+                segments.append(segment)
+                found.append((segment, ref.id))
+                continue
         candidates: list[tuple[float, float, float]] = []
         for _partner, fps in partners:
             run = best_shared_run(
-                mine, fps[index], min_seconds=settings.min_seconds,
-                max_seconds=settings.max_seconds, max_bit_error=settings.max_bit_error,
+                mine,
+                fps[index],
+                min_seconds=settings.min_seconds,
+                max_seconds=settings.max_seconds,
+                max_bit_error=settings.max_bit_error,
             )
             if run is not None:
                 candidates.append((run.a_start, run.a_end, run.bit_error_rate))
@@ -339,13 +440,17 @@ def detect_segments(
             continue
         if any(s.start_seconds < end and start < s.end_seconds for s in segments):
             continue  # short file: the tail window saw the OP again
-        segments.append(
-            MediaSegment(
-                kind=kind, start_seconds=round(start, 2), end_seconds=round(end, 2), source=SOURCE,
-                confidence=_confidence(supporters, ber), media_fingerprint=target.identity,
-            )
+        segment = MediaSegment(
+            kind=kind,
+            start_seconds=round(start, 2),
+            end_seconds=round(end, 2),
+            source=SOURCE,
+            confidence=_confidence(supporters, ber),
+            media_fingerprint=target.identity,
         )
-    return segments
+        segments.append(segment)
+        found.append((segment, None))
+    return found
 
 
 def _needs_analysis(result: dict[str, Any] | None, partner_ids: set[str], now: float) -> bool:
@@ -359,18 +464,41 @@ def _needs_analysis(result: dict[str, Any] | None, partner_ids: set[str], now: f
     if status == "empty":
         return new_partners or now >= float(result.get("retry_after") or 0)
     if status == "found":
-        confidence = min((float(s.get("confidence") or 0) for s in result.get("segments") or []), default=0.0)
-        return new_partners and confidence < 0.9
+        rows = result.get("segments") or []
+        confidence = min((float(s.get("confidence") or 0) for s in rows), default=0.0)
+        both = {str(s.get("kind")) for s in rows} >= {"intro", "outro"}
+        return new_partners and (confidence < 0.9 or not both)
     return True
 
 
+def _stored_files(library: TitleLibrary | None, exclude: set[int]) -> list[tuple[EpisodeFile, Any]]:
+    if library is None:
+        return []
+    return [
+        (EpisodeFile(path=Path(), episode=episode, identity=identity), fps)
+        for episode, identity, fps in library.stored_partners(exclude)
+    ]
+
+
+def _partner_ids(
+    pool: Sequence[EpisodeFile], item: EpisodeFile, settings: DetectorSettings, library
+) -> set[str]:
+    ids = {p.identity for p in _nearest(pool, item, settings.max_partners)}
+    return ids | (library.variant_ids() if library is not None else set())
+
+
 def title_needs_analysis(
-    files: Sequence[EpisodeFile], cache: IntroSkipperCache, settings: DetectorSettings, now: float
+    files: Sequence[EpisodeFile],
+    cache: IntroSkipperCache,
+    settings: DetectorSettings,
+    now: float,
+    library: TitleLibrary | None = None,
 ) -> bool:
     """Same partner choice as ``analyze_title``; files in an error back-off are left out."""
     results = {item.identity: cache.read_result(item.identity) for item in files}
     usable = [
-        item for item in files
+        item
+        for item in files
         if not (
             results[item.identity]
             and results[item.identity].get("status") == "error"
@@ -378,10 +506,15 @@ def title_needs_analysis(
             and now < float(results[item.identity].get("retry_after") or 0)
         )
     ]
-    if len(usable) < 2:
+    has_library = library is not None and library.has_reference(item.episode for item in usable)
+    if len(usable) < 2 and not (usable and has_library):
         return False
+    if library is not None and any(not library.observed(item.episode, item.identity) for item in usable):
+        return True
+    stored = library.stored_ids({i.episode for i in usable}) if library is not None else []
+    pool = list(usable) + [EpisodeFile(path=Path(), episode=e, identity=i) for e, i in stored]
     return any(
-        _needs_analysis(results[item.identity], {p.identity for p in _nearest(usable, item, settings.max_partners)}, now)
+        _needs_analysis(results[item.identity], _partner_ids(pool, item, settings, library), now)
         for item in usable
     )
 
@@ -403,13 +536,47 @@ def analyze_title(
     max_new_fingerprints: int = 4,
     logger: logging.Logger | None = None,
     now: Callable[[], float] = time.time,
+    library: TitleLibrary | None = None,
 ) -> AnalysisReport:
     log = logger or logging.getLogger(__name__)
     report = AnalysisReport()
+    try:
+        return _analyze_title(
+            files,
+            report=report,
+            cache=cache,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            settings=settings,
+            should_stop=should_stop,
+            max_new_fingerprints=max_new_fingerprints,
+            log=log,
+            stamp=now(),
+            library=library,
+        )
+    finally:
+        if library is not None:
+            library.reconcile(settings, log)
+            library.save()
+
+
+def _analyze_title(
+    files: Sequence[EpisodeFile],
+    *,
+    report: AnalysisReport,
+    cache: IntroSkipperCache,
+    ffmpeg: str,
+    ffprobe: str,
+    settings: DetectorSettings,
+    should_stop: Callable[[], str | None],
+    max_new_fingerprints: int,
+    log: logging.Logger,
+    stamp: float,
+    library: TitleLibrary | None,
+) -> AnalysisReport:
     ordered = sorted(files, key=lambda item: (item.episode, str(item.path)))
     fingerprints: dict[str, tuple[AudioFingerprint, AudioFingerprint, float]] = {}
     budget = max(0, int(max_new_fingerprints))
-    stamp = now()
 
     def cancel() -> bool:
         return should_stop() is not None
@@ -423,19 +590,28 @@ def analyze_title(
         if existing and existing.get("status") == "error" and stamp < float(existing.get("retry_after") or 0):
             continue
         try:
-            fps = _fingerprints_for(item, cache, ffmpeg=ffmpeg, ffprobe=ffprobe,
-                                    allow_compute=budget > 0, cancel_check=cancel)
+            fps = _fingerprints_for(
+                item, cache, ffmpeg=ffmpeg, ffprobe=ffprobe, allow_compute=budget > 0, cancel_check=cancel
+            )
         except FingerprintError as exc:
             if str(exc) == "cancelled":
                 report.stopped = should_stop() or "cancelled"
                 return report
             report.errors += 1
             log.info("FAIL step=intro_skipper.fingerprint path=%s error=%r", item.path.name, str(exc)[:200])
-            cache.write_result(item.identity, {
-                "algorithm": ALGORITHM_VERSION, "status": "error", "error": str(exc)[:300],
-                "checked_at": stamp, "retry_after": stamp + ERROR_RETRY_SECONDS, "segments": [],
-                "partners": [], "path": str(item.path),
-            })
+            cache.write_result(
+                item.identity,
+                {
+                    "algorithm": ALGORITHM_VERSION,
+                    "status": "error",
+                    "error": str(exc)[:300],
+                    "checked_at": stamp,
+                    "retry_after": stamp + ERROR_RETRY_SECONDS,
+                    "segments": [],
+                    "partners": [],
+                    "path": str(item.path),
+                },
+            )
             continue
         if fps is None:
             continue
@@ -445,46 +621,104 @@ def analyze_title(
         fingerprints[item.identity] = fps[:3]
 
     ready = [item for item in ordered if item.identity in fingerprints]
+    if library is not None:
+        for item in ready:
+            library.add_episode(item.episode, item.identity, fingerprints[item.identity])
+    stored = _stored_files(library, {item.episode for item in ready})
+    stored_fps = {partner.identity: fps for partner, fps in stored}
+    pool = list(ready) + [partner for partner, _fps in stored]
     for item in ready:
         reason = should_stop()
         if reason:
             report.stopped = reason
             return report
-        partners = _nearest(ready, item, settings.max_partners)
-        if not partners:
-            continue  # one episode alone proves nothing
-        partner_ids = {p.identity for p in partners}
-        if not _needs_analysis(cache.read_result(item.identity), partner_ids, stamp):
-            continue
-        segments = detect_segments(
-            item, fingerprints[item.identity], [(p, fingerprints[p.identity]) for p in partners], settings,
+        variants = (
+            {"intro": library.variants("intro"), "outro": library.variants("outro")}
+            if library is not None
+            else {}
         )
+        partners = _nearest(pool, item, settings.max_partners)
+        if not partners and not any(variants.values()):
+            continue  # one episode alone proves nothing
+        partner_ids = _partner_ids(pool, item, settings, library)
+        existing = cache.read_result(item.identity)
+        if not _needs_analysis(existing, partner_ids, stamp):
+            if library is not None and not library.observed(item.episode, item.identity):
+                library.observe(
+                    item.episode,
+                    item.identity,
+                    fingerprints[item.identity],
+                    _result_segments(existing),
+                    settings,
+                )
+            continue
+        found = _detect(
+            item,
+            fingerprints[item.identity],
+            [(p, fingerprints.get(p.identity) or stored_fps[p.identity]) for p in partners],
+            settings,
+            variants,
+        )
+        segments = [segment for segment, _variant in found]
+        if library is not None:
+            library.observe(
+                item.episode,
+                item.identity,
+                fingerprints[item.identity],
+                [(s.kind, s.start_seconds, s.end_seconds, variant) for s, variant in found],
+                settings,
+            )
         report.analysed += 1
         status = "found" if segments else "empty"
         if segments:
             report.found += 1
         else:
             report.empty += 1
-        cache.write_result(item.identity, {
-            "algorithm": ALGORITHM_VERSION,
-            "status": status,
-            "segments": [asdict(segment) for segment in segments],
-            "partners": sorted(partner_ids),
-            "checked_at": stamp,
-            "retry_after": stamp + EMPTY_RETRY_SECONDS if not segments else 0,
-            "path": str(item.path),
-            "episode": item.episode,
-            "settings": asdict(settings),
-        })
+        cache.write_result(
+            item.identity,
+            {
+                "algorithm": ALGORITHM_VERSION,
+                "status": status,
+                "segments": [asdict(segment) for segment in segments],
+                # Variants this file itself just gave are no news for it next time.
+                "partners": sorted(partner_ids | (library.variant_ids() if library is not None else set())),
+                "checked_at": stamp,
+                "retry_after": stamp + EMPTY_RETRY_SECONDS if not segments else 0,
+                "path": str(item.path),
+                "episode": item.episode,
+                "settings": asdict(settings),
+            },
+        )
         log.info(
-            "RESULT step=intro_skipper.detect episode=%s status=%s partners=%s segments=%s",
-            item.episode, status, len(partners),
-            ",".join(f"{s.kind}:{s.start_seconds:.1f}-{s.end_seconds:.1f}@{s.confidence}" for s in segments) or "-",
+            "RESULT step=intro_skipper.detect episode=%s status=%s partners=%s stored=%s segments=%s",
+            item.episode,
+            status,
+            len(partners),
+            sum(1 for p in partners if p.identity in stored_fps),
+            ",".join(
+                f"{s.kind}:{s.start_seconds:.1f}-{s.end_seconds:.1f}@{s.confidence}"
+                + (f"(variant {variant})" if variant else "")
+                for s, variant in found
+            )
+            or "-",
         )
     return report
 
 
+def _result_segments(result: dict[str, Any] | None) -> list[tuple[str, float, float, str | None]]:
+    if not result or result.get("status") != "found":
+        return []
+    rows = []
+    for row in result.get("segments") or []:
+        try:
+            rows.append((str(row["kind"]), float(row["start_seconds"]), float(row["end_seconds"]), None))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
+
+
 # -------------------------------------------------------- background pass ---
+
 
 def _ready_files(db: Any, media_id: int, incomplete: Iterable[Path]) -> list[EpisodeFile]:
     blocked = [Path(path).expanduser() for path in incomplete]
@@ -542,6 +776,12 @@ def run_background_pass(
     log = logger or logging.getLogger(__name__)
     if not enabled or os.environ.get("PUDGE_INTRO_DETECTION", "1").strip() == "0":
         return {"status": "disabled"}
+    cache = IntroSkipperCache(cache_dir)
+    all_animes = list(db.anime_list())
+    try:
+        prune_libraries(cache.root, all_animes, logger=log)
+    except Exception as exc:  # noqa: BLE001 - library bookkeeping never breaks the agent
+        log.warning("FAIL step=intro_skipper.library_prune error=%r", str(exc)[:200])
     missing = tools_missing(ffmpeg, ffprobe)
     if missing:
         log.info("SKIP step=intro_skipper.pass reason=tool_missing tools=%s", ",".join(missing))
@@ -550,24 +790,37 @@ def run_background_pass(
     if reason is not None:
         return {"status": "deferred", "reason": reason}
 
-    cache = IntroSkipperCache(cache_dir)
     incomplete = list(incomplete_paths)
     stamp = time.time()
-    chosen: tuple[int, list[EpisodeFile]] | None = None
-    animes = sorted(db.anime_list(), key=lambda anime: (anime.status != "CURRENT", anime.title.casefold()))
+    chosen: tuple[int, list[EpisodeFile], TitleLibrary | None] | None = None
+    animes = sorted(all_animes, key=lambda anime: (anime.status != "CURRENT", anime.title.casefold()))
+    migration: dict[str, Any] = {}
     for anime in animes:
         files = _ready_files(db, anime.media_id, incomplete)
-        if len(files) < 2:
+        library = TitleLibrary(cache.root, int(anime.media_id)) if episodes_expected(anime) else None
+        if library is not None and not library.migrated:
+            try:
+                _migrate_title(db, int(anime.media_id), library, cache, files, migration, settings, log)
+            except Exception as exc:  # noqa: BLE001 - migration is best effort
+                log.warning(
+                    "FAIL step=intro_skipper.library_migrate media_id=%s error=%r",
+                    anime.media_id,
+                    str(exc)[:200],
+                )
+        if not files:
             continue
-        if title_needs_analysis(files, cache, settings, stamp):
-            chosen = (int(anime.media_id), files)
+        if title_needs_analysis(files, cache, settings, stamp, library):
+            chosen = (int(anime.media_id), files, library)
             break
     if chosen is None:
         return {"status": "idle"}
 
     lease = scheduler.acquire_heavy(
-        "intro-skipper", blocking=False, foreground_sensitive=True,
-        priority=WorkPriority.BACKGROUND, resource="cpu",
+        "intro-skipper",
+        blocking=False,
+        foreground_sensitive=True,
+        priority=WorkPriority.BACKGROUND,
+        resource="cpu",
     )
     if lease is None:
         return {"status": "deferred", "reason": "heavy_busy"}
@@ -582,11 +835,18 @@ def run_background_pass(
             return "higher_priority"
         return None
 
-    media_id, files = chosen
+    media_id, files, library = chosen
     try:
         report = analyze_title(
-            files, cache=cache, ffmpeg=_resolve(ffmpeg), ffprobe=_resolve(ffprobe), settings=settings,
-            should_stop=should_stop, max_new_fingerprints=max_new_fingerprints, logger=log,
+            files,
+            cache=cache,
+            ffmpeg=_resolve(ffmpeg),
+            ffprobe=_resolve(ffprobe),
+            settings=settings,
+            should_stop=should_stop,
+            max_new_fingerprints=max_new_fingerprints,
+            logger=log,
+            library=library,
         )
     finally:
         lease.release()
@@ -594,10 +854,92 @@ def run_background_pass(
     _register_and_enforce(db, cache_dir, cache.written, log)
     log.info(
         "DONE step=intro_skipper.pass media_id=%s files=%s fingerprinted=%s analysed=%s found=%s empty=%s errors=%s stopped=%s",
-        media_id, len(files), report.fingerprinted, report.analysed, report.found, report.empty,
-        report.errors, report.stopped or "-",
+        media_id,
+        len(files),
+        report.fingerprinted,
+        report.analysed,
+        report.found,
+        report.empty,
+        report.errors,
+        report.stopped or "-",
     )
     return {"status": "stopped" if report.stopped else "ran", **asdict(report)}
+
+
+def _results_index(cache: IntroSkipperCache) -> dict[str, dict[str, Any]]:
+    """Analysed results by file path (``path``/``episode`` are kept in every found/empty result)."""
+    index: dict[str, dict[str, Any]] = {}
+    directory = cache.root / "results"
+    if not directory.is_dir():
+        return index
+    for path in directory.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("status") not in {"found", "empty"}:
+            continue
+        if not data.get("path") or not data.get("identity") or data.get("episode") is None:
+            continue
+        key = str(Path(str(data["path"])).expanduser())
+        if key not in index or float(data.get("checked_at") or 0) > float(index[key].get("checked_at") or 0):
+            index[key] = data
+    return index
+
+
+def _migrate_title(
+    db: Any,
+    media_id: int,
+    library: TitleLibrary,
+    cache: IntroSkipperCache,
+    files: Sequence[EpisodeFile],
+    shared: dict[str, Any],
+    settings: DetectorSettings,
+    log: logging.Logger,
+) -> None:
+    """One-time import of cached fingerprints of this title's already deleted episodes."""
+    rows = list(db.episodes(media_id))
+    anchors = {Path(row.video_path).expanduser().parent for row in rows if getattr(row, "video_path", None)}
+    anchors |= {item.path.parent for item in files}
+    if not anchors:
+        return  # nothing of this title was ever on disk
+    if "owners" not in shared:
+        owners: dict[Path, set[int]] = {}
+        for row in db.episodes():
+            if getattr(row, "video_path", None) and getattr(row, "media_id", None) is not None:
+                owners.setdefault(Path(row.video_path).expanduser().parent, set()).add(int(row.media_id))
+        shared["owners"] = owners
+        shared["results"] = _results_index(cache)
+    anchors = {folder for folder in anchors if shared["owners"].get(folder, set()) <= {media_id}}
+    on_disk = {item.episode for item in files}
+    best: dict[int, dict[str, Any]] = {}
+    for key, data in shared["results"].items():
+        path = Path(key)
+        try:
+            episode = int(data["episode"])
+        except (TypeError, ValueError):
+            continue
+        if path.parent not in anchors or episode in on_disk or path.exists():
+            continue
+        if episode not in best or float(data.get("checked_at") or 0) > float(
+            best[episode].get("checked_at") or 0
+        ):
+            best[episode] = data
+    imported = 0
+    for episode in sorted(best):
+        data = best[episode]
+        if str(episode) in library.data["episodes"]:
+            continue
+        fps = cached_fingerprints(cache, str(data["identity"]))
+        if fps is None:
+            continue
+        library.add_episode(episode, str(data["identity"]), fps)
+        library.observe(episode, str(data["identity"]), fps, _result_segments(data), settings)
+        imported += 1
+    library.mark_migrated()
+    library.reconcile(settings, log)
+    library.save()
+    log.info("MIGRATE step=intro_skipper.library media_id=%s imported_episodes=%s", media_id, imported)
 
 
 def _register_and_enforce(db: Any, cache_dir: Path, written: Sequence[Path], log: logging.Logger) -> None:
@@ -608,6 +950,8 @@ def _register_and_enforce(db: Any, cache_dir: Path, written: Sequence[Path], log
         for path in dict.fromkeys(written):
             if Path(path).exists():
                 registry.register(CACHE_CATEGORY, Path(path), metadata={"algorithm": ALGORITHM_VERSION})
-        registry.enforce({CACHE_CATEGORY: CachePolicy(max_bytes=CACHE_MAX_BYTES, max_age_seconds=CACHE_MAX_AGE_SECONDS)})
+        registry.enforce(
+            {CACHE_CATEGORY: CachePolicy(max_bytes=CACHE_MAX_BYTES, max_age_seconds=CACHE_MAX_AGE_SECONDS)}
+        )
     except Exception as exc:  # noqa: BLE001 - cache bookkeeping never breaks the agent
         log.warning("FAIL step=intro_skipper.cache_registry error=%r", str(exc)[:200])

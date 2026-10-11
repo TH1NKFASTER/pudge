@@ -336,7 +336,9 @@ class AnimeMappings:
         fribb = parse_fribb(payloads["fribb"])
         lists = parse_anime_lists(payloads["anime_lists"])
         if len(fribb) < self.min_rows["fribb"] or len(lists) < self.min_rows["anime_lists"]:
-            raise AnimeMappingsError(f"suspiciously small source: fribb={len(fribb)} anime_lists={len(lists)}")
+            raise AnimeMappingsError(
+                f"suspiciously small source: fribb={len(fribb)} anime_lists={len(lists)}"
+            )
         self.root.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(prefix=".index.", suffix=".sqlite3", dir=str(self.root))
         os.close(fd)
@@ -362,24 +364,48 @@ class AnimeMappings:
                 conn.executemany(
                     "INSERT INTO fribb VALUES(?,?,?,?,?,?,?,?,?,?)",
                     [
-                        (r["anidb_id"], r["anilist_id"], r["mal_id"], r["tvdb_id"], r["tvdb_season"], r["tvdb_offset"],
-                         r["tmdb_tv"], r["tmdb_season"], r["tmdb_offset"], r["media_type"])
+                        (
+                            r["anidb_id"],
+                            r["anilist_id"],
+                            r["mal_id"],
+                            r["tvdb_id"],
+                            r["tvdb_season"],
+                            r["tvdb_offset"],
+                            r["tmdb_tv"],
+                            r["tmdb_season"],
+                            r["tmdb_offset"],
+                            r["media_type"],
+                        )
                         for r in fribb
                     ],
                 )
                 conn.executemany(
                     "INSERT OR REPLACE INTO lists VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     [
-                        (r["anidb_id"], r["tvdb_id"], r["tvdb_sentinel"], r["tvdb_season"], int(r["tvdb_absolute"]),
-                         r["tvdb_offset"], r["tmdb_tv"], r["tmdb_season"], r["tmdb_offset"], r["name"],
-                         json.dumps(r["rules"]))
+                        (
+                            r["anidb_id"],
+                            r["tvdb_id"],
+                            r["tvdb_sentinel"],
+                            r["tvdb_season"],
+                            int(r["tvdb_absolute"]),
+                            r["tvdb_offset"],
+                            r["tmdb_tv"],
+                            r["tmdb_season"],
+                            r["tmdb_offset"],
+                            r["name"],
+                            json.dumps(r["rules"]),
+                        )
                         for r in lists
                     ],
                 )
                 conn.executemany(
                     "INSERT INTO meta VALUES(?,?)",
-                    [("schema", str(INDEX_SCHEMA)), ("built_at", str(self.now())),
-                     ("fribb_rows", str(len(fribb))), ("anime_lists_rows", str(len(lists)))],
+                    [
+                        ("schema", str(INDEX_SCHEMA)),
+                        ("built_at", str(self.now())),
+                        ("fribb_rows", str(len(fribb))),
+                        ("anime_lists_rows", str(len(lists))),
+                    ],
                 )
             check = conn.execute("PRAGMA integrity_check").fetchone()[0]
             conn.close()
@@ -421,7 +447,11 @@ class AnimeMappings:
                 for item in json.loads(lists["rules_json"] or "[]")
             )
         state = self._state()
-        tvdb_id = row["tvdb_id"] if row["tvdb_id"] is not None else (lists["tvdb_id"] if lists is not None else None)
+        tvdb_id = (
+            row["tvdb_id"]
+            if row["tvdb_id"] is not None
+            else (lists["tvdb_id"] if lists is not None else None)
+        )
         return ExternalMapping(
             anilist_id=int(row["anilist_id"]),
             anidb_id=row["anidb_id"],
@@ -448,7 +478,9 @@ class AnimeMappings:
         if conn is None:
             return []
         try:
-            rows = conn.execute("SELECT * FROM fribb WHERE anilist_id=? ORDER BY anidb_id", (int(media_id),)).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM fribb WHERE anilist_id=? ORDER BY anidb_id", (int(media_id),)
+            ).fetchall()
             return [self._mapping(conn, row) for row in rows]
         except sqlite3.Error:
             return []
@@ -496,14 +528,18 @@ def refresh_in_background(mappings: AnimeMappings, *, logger: Any = None) -> thr
     def run() -> None:
         result = mappings.refresh_if_due()
         if logger is not None:
-            logger.info("DONE step=anime_mappings.refresh result=%s", json.dumps(result, ensure_ascii=False)[:300])
+            logger.info(
+                "DONE step=anime_mappings.refresh result=%s", json.dumps(result, ensure_ascii=False)[:300]
+            )
 
     thread = threading.Thread(target=run, name="pudge-anime-mappings", daemon=True)
     thread.start()
     return thread
 
 
-def episode_pairs(rules: Iterable[EpisodeRule], target: str = "tvdb") -> dict[tuple[int, int], tuple[int, int]]:
+def episode_pairs(
+    rules: Iterable[EpisodeRule], target: str = "tvdb"
+) -> dict[tuple[int, int], tuple[int, int]]:
     """Explicit single-episode pairs: (anidb_season, ep) -> (target_season, ep).
 
     Only rules with a concrete target season and one non-zero target episode

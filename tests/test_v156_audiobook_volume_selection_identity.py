@@ -4,13 +4,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from pudge.audiobooks import audiobook_torrent_pack_plan
+from tests.test_v159_audiobook_search_downloads_local_first import NYAA_OPTIONS, NYAA_PAGE
 
 
 def test_bare_numeric_chapter_folder_is_not_a_volume_without_series_context() -> None:
-    plan = audiobook_torrent_pack_plan([
-        {"index": 0, "name": "02/001.mp3", "size": 100},
-        {"index": 1, "name": "03/001.mp3", "size": 100},
-    ], allow_bare_numeric_volume_dirs=False)
+    plan = audiobook_torrent_pack_plan(
+        [
+            {"index": 0, "name": "02/001.mp3", "size": 100},
+            {"index": 1, "name": "03/001.mp3", "size": 100},
+        ],
+        allow_bare_numeric_volume_dirs=False,
+    )
     assert plan["volumes"] == []
     assert [row["file_id"] for row in plan["ungrouped_audio"]] == [0, 1]
 
@@ -116,18 +120,21 @@ def test_download_uses_exact_file_list_returned_by_search(monkeypatch, tmp_path:
     )
     api.logger = SimpleNamespace(info=lambda *a, **k: None)
 
-    result = api.light_novel_download_audiobook_nyaa(180, {
-        "title": "TMW Japanese Audiobooks Collection",
-        "link": "https://nyaa.invalid/view/1",
-        "torrent_url": "https://nyaa.invalid/download/1.torrent",
-        "info_hash": "a" * 40,
-        "size": "1 GiB",
-        "seeders": 1,
-        "trusted": True,
-        "target_volume": 2,
-        "collection": True,
-        "selected_files": ["[A]/狼と香辛料/[02] 狼と香辛料II.m4b"],
-    })
+    result = api.light_novel_download_audiobook_nyaa(
+        180,
+        {
+            "title": "TMW Japanese Audiobooks Collection",
+            "link": "https://nyaa.invalid/view/1",
+            "torrent_url": "https://nyaa.invalid/download/1.torrent",
+            "info_hash": "a" * 40,
+            "size": "1 GiB",
+            "seeders": 1,
+            "trusted": True,
+            "target_volume": 2,
+            "collection": True,
+            "selected_files": ["[A]/狼と香辛料/[02] 狼と香辛料II.m4b"],
+        },
+    )
 
     assert priorities == [([0, 1], 0), ([0], 6)]
     assert started == ["abc"]
@@ -135,8 +142,24 @@ def test_download_uses_exact_file_list_returned_by_search(monkeypatch, tmp_path:
     assert thread_args and thread_args[0][-1] == {0}
 
 
-def test_nyaa_modal_shows_volume_identity_not_chapter_file_paths() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "volumeTitle=row.volume_title" in html
-    assert "selected_track_count" in html
-    assert "files.map(escapeHtml).join" not in html
+def test_nyaa_modal_shows_volume_identity_not_chapter_file_paths(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            NYAA_PAGE
+            + r"""
+            await menu(180); await __click('[data-ln-context-action="find-audiobook-nyaa"]'); await __tick(50);
+            window.releaseSearch(); await __tick(50);
+            return {rows: rows().map(row => row.text), modal: __text('#modalBody'),
+                    collection: `${t('ui.collection')} · 狼と香辛料II · ${tn('uiB.ln.audioFileCount', 12)}`,
+                    single: `${t('ui.singleRelease')} · ${t('ui.volume', {volume: 2})} · ${t('ui.filesCheckedOnDownload')}`};
+            """,
+            lang=lang,
+            **NYAA_OPTIONS,
+        )
+        out = result.value
+        # Each release says which volume it brings and how many audio files: never the chapter file list.
+        assert [row.splitlines() for row in out["rows"]] == [
+            ["TMW Japanese Audiobooks Collection", out["collection"]],
+            ["狼と香辛料II 単品", out["single"]],
+        ]
+        assert "chapter.mp3" not in out["modal"] and "[A]/" not in out["modal"]

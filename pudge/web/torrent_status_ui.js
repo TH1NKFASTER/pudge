@@ -13,9 +13,9 @@ function torrentUiState(download,enabled,transition='enabled'){
   return 'unknown';
 }
 function torrentUiLabel(state,lang){
-  const ru={finished:'Готово',error:'Ошибка',paused:'Пауза',unconfirmed:'Остановка не подтверждена',waiting:'В очереди',stalled:'Нет соединений',checking:'Проверка',downloading:'Загрузка',unknown:'Состояние неизвестно'};
-  const en={finished:'Finished',error:'Error',paused:'Paused',unconfirmed:'Shutdown not confirmed',waiting:'Queued',stalled:'No connections',checking:'Checking',downloading:'Downloading',unknown:'Status unknown'};
-  return (lang==='ru'?ru:en)[state]||(lang==='ru'?ru.unknown:en.unknown);
+  const keys={finished:'torrent.state.finished',error:'ui.error',paused:'ui.paused',unconfirmed:'ui.shutdownNotConfirmed',waiting:'torrent.state.waiting',stalled:'torrent.state.stalled',checking:'torrent.state.checking',downloading:'torrent.state.downloading',unknown:'torrent.state.unknown'};
+  const language=lang?(String(lang).toLowerCase().startsWith('ru')?'ru':'en'):undefined;
+  return PudgeI18n.t(keys[state]||keys.unknown,{},language);
 }
 function torrentTrafficFresh(live,enabled,now=Date.now()/1000){
   const observed=Number(live?.updated_at||0);

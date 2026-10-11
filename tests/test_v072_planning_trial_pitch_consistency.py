@@ -12,9 +12,7 @@ from pudge.light_novels import LightNovelService
 from pudge.jimaku_trial import apply_jimaku_trial
 from pudge.manager_models import LibraryAnime, LibraryEpisode, NyaaRelease
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.css_support import css_rules
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -29,9 +27,7 @@ def _config(tmp_path: Path) -> AppConfig:
     return config
 
 
-def test_jimaku_bundled_key_is_runtime_only_and_expires(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_jimaku_bundled_key_is_runtime_only_and_expires(tmp_path: Path, monkeypatch) -> None:
     config = _config(tmp_path)
     write_config(config, config.config_path)
     monkeypatch.setenv("PUDGE_BUNDLED_JIMAKU_API_KEY", "trial-secret")
@@ -123,7 +119,9 @@ def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path
         ),
     )
     api = object.__new__(WebAppApi)
-    api.logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None, exception=lambda *_args, **_kwargs: None)
+    api.logger = SimpleNamespace(
+        warning=lambda *_args, **_kwargs: None, exception=lambda *_args, **_kwargs: None
+    )
     api._planning_episode_download_lock = threading.Lock()
     api._planning_episode_download_state = {
         "status": "running",
@@ -150,9 +148,7 @@ def test_planning_background_job_skips_local_and_uses_full_search(tmp_path: Path
     }
 
 
-def test_audiobook_stop_uses_cached_position_without_blocking_reads(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_audiobook_stop_uses_cached_position_without_blocking_reads(tmp_path: Path, monkeypatch) -> None:
     database = Database(tmp_path / "library.sqlite3")
     service = AudiobookService(
         database,
@@ -204,11 +200,13 @@ def test_audiobook_stop_uses_cached_position_without_blocking_reads(
     result = service.stop(book_id)
 
     assert result["stopped"] is True
-    assert ipc_commands == [[
-        ["set_property", "mute", True],
-        ["set_property", "pause", True],
-        ["quit"],
-    ]]
+    assert ipc_commands == [
+        [
+            ["set_property", "mute", True],
+            ["set_property", "pause", True],
+            ["quit"],
+        ]
+    ]
     assert events[:2] == ["terminate", "wait:0.12"]
     assert service.book(book_id)["position"] == 42.0
 
@@ -220,17 +218,82 @@ def test_light_novel_pitch_setting_defaults_on_and_persists(tmp_path: Path) -> N
     assert LightNovelService(service.config).settings_payload()["show_pitch_accent"] is False
 
 
-def test_inline_pitch_and_background_planning_frontend_contracts() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    reading = (ROOT / "pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    css = (ROOT / "pudge/web/reading_tools.css").read_text(encoding="utf-8")
-    manager = (ROOT / "pudge/manager.py").read_text(encoding="utf-8")
+def test_study_cards_draw_the_pitch_contour_inline(page) -> None:
+    # Review cards and the sidebar draw the accent as high/low morae (PudgeReadingTools.study.inlinePitch).
+    result = page.run(
+        """
+        const draw = card => {
+          const box = document.createElement('div'); box.innerHTML = PudgeReadingTools.study.inlinePitch(card);
+          const root = box.firstElementChild;
+          return root && {classes: root.className, title: root.title,
+                          morae: [...root.querySelectorAll('.pudge-pitch-mora')].map(m => [m.textContent, m.className.replace('pudge-pitch-mora ', '')])};
+        };
+        return {atamadaka: draw({reading: 'はし', pitchAccents: [1]}), heiban: draw({reading: 'さくら', pitchAccents: [0]}),
+                derived: draw({reading: 'たべた', pitchAccents: [2], pitchDerived: true}), unknown: draw({reading: 'ねこ'}),
+                derivedTitle: PudgeI18n.t('reading.inflectionContourDerivedFromDictionary')};
+        """,
+    )
+    out = result.value
+    assert out["atamadaka"]["morae"] == [["は", "high drop"], ["し", "low"]]
+    assert out["heiban"]["morae"] == [["さ", "low rise"], ["く", "high"], ["ら", "high"]]
+    assert "pitch-derived" in out["derived"]["classes"] and out["derived"]["title"] == out["derivedTitle"]
+    assert out["unknown"] is None
 
-    assert "renderInlinePitch" in reading
-    assert "inlinePitch: renderInlinePitch" in reading
-    assert "lnrPitchAccent" not in html
-    assert ".ln-reader.hide-pitch-accent" in css
-    assert "planning_episode_download_status" in html
-    assert "resumePlanningEpisodeDownload" in html
-    assert "if not self.config.matching.ocr_image_subtitles:" in manager
-    assert "attempts >= 3 and not self.config.matching.ocr_image_subtitles" not in manager
+
+READER = """
+__api.light_novel_open = async id => ({id, title: 'Novel', current_chapter: 0, current_offset: 0, chapters: [{chapter_index: 0, title: 'One'}]});
+__api.light_novel_chapter = async (id, index) => ({book_id: id, chapter_index: index, paragraphs: ['本文です。'], tokens: [[]]});
+"""
+
+
+def test_reader_text_never_shows_inline_pitch_and_has_no_switch_for_it(page) -> None:
+    # Pitch accent lives in the word card; the reader's "Show inline pitch accent" switch is gone.
+    result = page.run(
+        """
+        await __settle(openLightNovel(6));
+        await __click('#lnReaderAppearanceToggle'); await __tick(20);
+        return {hidden: $('lnReader').classList.contains('hide-pitch-accent'), panel: __text('#lnReaderAppearance'),
+                pitchControls: [...document.querySelectorAll('#lnReaderAppearance input, #lnReaderAppearance select')].map(el => el.id).filter(id => /pitch/i.test(id))};
+        """,
+        before=READER,
+        state={"settings": {"review_gate_ln_enabled": False}},
+        api={
+            "light_novel_state": {
+                "version": 1,
+                "settings": {"show_pitch_accent": True},
+                "books": [{"id": 6, "title": "Novel", "volume": 1}],
+            }
+        },
+    )
+    out = result.value
+    assert out["hidden"] is True and out["pitchControls"] == []
+    assert "pitch" not in out["panel"].lower()
+    rules = css_rules("reading_tools.css")
+    assert rules.get(".ln-reader.hide-pitch-accent .ln-pitch-ruby>rt", "display") == "none"
+    assert rules.get(".ln-reader.hide-pitch-accent .ln-inline-pitch-surface", "display") == "none"
+
+
+def test_background_planning_download_is_picked_up_after_a_restart(page) -> None:
+    # The window was reopened while the search for released episodes still runs in Python:
+    # it keeps checking and shows the result when the search is done.
+    result = page.run(
+        """
+        await __tick(2000);
+        return {title: __text('#modalTitle'), body: __text('#modalBody'), open: $('modalBackdrop').classList.contains('open'),
+                complete: PudgeI18n.t('ui.searchComplete'), added: PudgeI18n.t('ui.added'), episode: t('table.episode')};
+        """,
+        before="""
+        let calls = 0;
+        __api.planning_episode_download_status = async () => (++calls < 3 ? {running: true, title: 'Planned', current: 1, total: 2, episodes: []}
+          : {running: false, title: 'Planned', current: 2, total: 2, finished_at: 1790000000, episodes: [{episode: 1, status: 'added'}, {episode: 2, status: 'added'}]});
+        """,
+    )
+    out = result.value
+    assert result.calls_of("planning_episode_download_status") == [[], [], []]
+    assert out["open"] is True and out["title"] == f"{out['complete']} — Planned"
+    assert out["body"].splitlines()[1:] == [
+        f"{out['episode']} 1",
+        out["added"],
+        f"{out['episode']} 2",
+        out["added"],
+    ]

@@ -53,11 +53,7 @@ def test_spoken_book_metadata_cannot_collapse_ln_prefix_at_story_start() -> None
     assert repaired[0]["offset"] == 0
     assert repaired[0]["time"] == pytest.approx(30.0, abs=0.4)
     # No hundreds-of-characters jump around the first real prose timestamp.
-    assert max(
-        float(row["offset"])
-        for row in repaired
-        if float(row["time"]) <= 40.0
-    ) < 120
+    assert max(float(row["offset"]) for row in repaired if float(row["time"]) <= 40.0) < 120
     assert not any(
         abs(float(left["time"]) - float(right["time"])) < 0.0005
         and float(right["offset"]) - float(left["offset"]) > 16

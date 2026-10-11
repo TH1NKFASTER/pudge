@@ -19,18 +19,81 @@ def _write_srt(path: Path, starts: list[float]) -> None:
     path.write_text("\n".join(rows), encoding="utf-8")
 
 
-def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active():
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "function nextPrioritySubtitleDelay()" in html
-    assert "function nextForegroundSubtitleDelay()" in html
-    assert "activeDownloads().length>0||effectiveSubtitleDueCount()>0" in html
-    assert "ui.startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in html
-    assert "hasActiveForegroundWork()||effectiveSubtitleActiveCount()>0||ui.emptyPolls<2" in html
-    assert "if(hidden)return 60000" in html
-    assert "if(ui.subtitleForegroundBlocked)return 5000" in html
-    assert "return 1000" in html
-    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in html
-    assert "function ensureForegroundPollScheduled()" in html
+# The harness clock starts at 1790856000 (2026-10-01 12:00 UTC).
+FUTURE_JOB = {
+    "video": "Show - 03.mkv",
+    "video_path": "/v/Show - 03.mkv",
+    "state": "pending",
+    "priority": 200,
+    "next_check": 1790856000 + 3600,
+    "attempts": 1,
+}
+
+
+def test_future_priority_subtitle_jobs_do_not_keep_checking_ui_active(page) -> None:
+    # A manual subtitle retry scheduled in an hour: the window does not say "Checking…" and
+    # keeps Refresh usable meanwhile; it polls when the retry is due, not every second.
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const polls = () => __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles').map(c => c.at);
+            await __tick(30000);
+            const waiting = {polls: polls(), status: __text('#status'), button: {disabled: $('refreshAll').disabled, text: __text('#refreshAll')}};
+            await __tick(3600000 - 30000 + 2500);
+            return {waiting, due: {polls: polls(), status: __text('#status')},
+                    texts: {checking: t('status.subtitleCheckingBackground'), refresh: t('action.refresh')}};
+            """,
+            lang=lang,
+            state={"subtitle_jobs": [FUTURE_JOB]},
+            before="__api.poll_downloads_and_subtitles = async () => ({stats: {}});",
+        )
+        out, texts = result.value, result.value["texts"]
+        assert out["waiting"] == {
+            "polls": [],
+            "status": "",
+            "button": {"disabled": False, "text": texts["refresh"]},
+        }
+        assert out["due"] == {"polls": [3600000, 3601000, 3602000], "status": texts["checking"]}
+    # A running download keeps the window polling meanwhile; the retry still does not count
+    # as a subtitle check in progress.
+    download = {"name": "Other 04", "torrent_hash": "abc", "state": "downloading", "progress": 0.5}
+    busy = page.run(
+        r"""
+        await __tick(60000);
+        return {polls: __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles').length, status: __text('#status'),
+                disabled: $('refreshAll').disabled};
+        """,
+        state={"subtitle_jobs": [FUTURE_JOB], "downloads": [download]},
+        before="__api.poll_downloads_and_subtitles = async () => ({stats: {}});",
+    )
+    assert busy.value["polls"] >= 1 and busy.value["status"] == "" and busy.value["disabled"] is False
+
+
+def test_a_new_due_subtitle_job_restarts_the_stopped_foreground_polling(page) -> None:
+    # Nothing to do: polling stopped after two empty checks. The library changes (seen by the
+    # state version check) and brings a due subtitle job: checking resumes at once.
+    result = page.run(
+        r"""
+        const polls = () => __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles').map(c => c.at);
+        await __tick(30000);
+        const idle = polls();
+        window.__versions = {ready: '1', ui: '2'};
+        await __tick(5000);
+        return {idle, after: polls().filter(at => at > 30000), status: __text('#status'), checking: t('status.subtitleCheckingBackground')};
+        """,
+        before=r"""
+        window.__versions = {ready: '1', ui: '1'};
+        const base = __api.get_state;
+        __api.ui_state_versions = async () => window.__versions;
+        __api.get_state = __api.get_state_fast = async () => ({...(await base()), ui_state_version: window.__versions.ui,
+          subtitle_jobs: window.__versions.ui === '2' ? [{video: 'Show - 03.mkv', video_path: '/v/Show - 03.mkv', state: 'pending',
+                                                          priority: 200, next_check: Date.now() / 1000, attempts: 0}] : []});
+        __api.poll_downloads_and_subtitles = async () => ({stats: {}});
+        """,
+    )
+    out = result.value
+    assert out["idle"] == [1000, 16000]
+    assert out["after"] == [32000, 33000, 34000, 35000] and out["status"] == out["checking"]
 
 
 def test_constant_offset_search_is_bounded_and_keeps_small_global_shift(tmp_path: Path, monkeypatch):
@@ -63,9 +126,3 @@ def test_constant_offset_search_is_bounded_and_keeps_small_global_shift(tmp_path
     )
     assert calls["count"] <= 140
     assert max(int(item.get("candidate_evaluations") or 0) for item in results) <= 140
-
-
-def test_sync_cache_generation_changed_for_new_alignment_algorithm():
-    source = Path("pudge/syncing.py").read_text(encoding="utf-8")
-    assert "syncing-v0.3." in source
-    assert "syncing-v0.3.43-preop-embedded-reference-refine" in source

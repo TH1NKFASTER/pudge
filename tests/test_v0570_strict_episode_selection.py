@@ -9,8 +9,7 @@ from pudge.providers.nyaa import release_episode, score_release, search_ranked
 
 
 WRONG_TITLE = (
-    "[Erai-raws] Kimi ga Shinu made Koi wo Shitai - 01 "
-    "[1080p CR WEB-DL AVC AAC][MultiSub][0846EAB5]"
+    "[Erai-raws] Kimi ga Shinu made Koi wo Shitai - 01 [1080p CR WEB-DL AVC AAC][MultiSub][0846EAB5]"
 )
 
 
@@ -90,8 +89,7 @@ def test_exact_episode_05_still_survives_search() -> None:
         episodes=12,
     )
     correct = release(
-        "[Erai-raws] Kimi ga Shinu made Koi wo Shitai - 05 "
-        "[1080p CR WEB-DL AVC AAC][MultiSub][ABCDEF12]",
+        "[Erai-raws] Kimi ga Shinu made Koi wo Shitai - 05 [1080p CR WEB-DL AVC AAC][MultiSub][ABCDEF12]",
         "correct",
     )
 

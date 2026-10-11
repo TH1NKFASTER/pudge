@@ -4,10 +4,15 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("relative", [
-    "tests/conftest.py", "tests/helpers.py", "tests/js/scenario.cjs",
-    ".github/release/run_test_batch.py",
-])
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "tests/conftest.py",
+        "tests/helpers.py",
+        "tests/js/scenario.cjs",
+        ".github/release/run_test_batch.py",
+    ],
+)
 def test_verification_fingerprint_includes_test_support_and_runner(tmp_path, relative):
     source = Path(__file__).resolve().parents[1] / ".github/release/run_test_batch.py"
     spec = importlib.util.spec_from_file_location("runner_fingerprint_regression", source)

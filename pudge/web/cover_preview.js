@@ -43,7 +43,12 @@
     const rect=image.getBoundingClientRect();
     return {left:rect.left,top:rect.top,width:rect.width,height:rect.height};
   };
-  const imageSource = image => String(image?.currentSrc || image?.src || '').trim();
+  // Lists show small covers; the preview opens the full one: a local
+  // "<cover>.list.jpg" copy, or AniList's "medium" (large) size of a cover.
+  const fullCoverSource = source => String(source || '')
+    .replace(/(\/covers\/[^/?#]+)\.list\.jpg(?=$|[?#])/, '$1')
+    .replace(/(anilistcdn\/media\/[a-z]+\/cover\/)medium\//, '$1large/');
+  const imageSource = image => fullCoverSource(String(image?.currentSrc || image?.src || '').trim());
 
   function makePeek(image){
     const rect=rectFor(image);if(!rect.width||!rect.height)return null;
@@ -219,7 +224,7 @@
     closePreview({invalidate:false,restoreFocus:false});
     const generation=++previewRequestGeneration;
     previewRestoreFocus=restoreFocusTo?.isConnected?restoreFocusTo:(document.activeElement&&document.activeElement!==document.body?document.activeElement:null);
-    const overlay=document.createElement('div');overlay.className='pudge-cover-preview';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Cover preview');overlay.innerHTML=`<div class="pudge-cover-preview-card"><button class="pudge-cover-preview-close" type="button" aria-label="Close">×</button><button class="pudge-cover-preview-retry" type="button" aria-label="Retry high-resolution cover" title="Retry high-resolution cover" hidden>↻</button><img alt="" draggable="false" src="${src.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}"></div>`;
+    const overlay=document.createElement('div');overlay.className='pudge-cover-preview';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label',PudgeI18n.t('cover.preview'));overlay.innerHTML=`<div class="pudge-cover-preview-card"><button class="pudge-cover-preview-close" type="button" aria-label="${PudgeI18n.t('action.close')}">×</button><button class="pudge-cover-preview-retry" type="button" aria-label="${PudgeI18n.t('cover.retryHighResolution')}" title="${PudgeI18n.t('cover.retryHighResolution')}" hidden>↻</button><img alt="" draggable="false" src="${src.replace(/&/g,'&amp;').replace(/"/g,'&quot;')}"></div>`;
     document.body.appendChild(overlay);previewZoom=1;previewPanX=0;previewPanY=0;
     const openedImage=overlay.querySelector('img');
     openedImage?.addEventListener('load',()=>{if(generation===previewRequestGeneration&&overlay.isConnected){fitPreviewImage(openedImage);applyPreviewTransform();}});

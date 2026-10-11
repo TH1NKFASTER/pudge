@@ -9,6 +9,7 @@ from pudge.pipeline_cache import (
 )
 from pudge.subtitle_formats import clean_srt_for_playback
 from pudge.web_app import WebAppApi
+from tests.i18n_support import has_text
 
 
 def _srt(text: str = "日本語") -> str:
@@ -92,9 +93,7 @@ def test_alignment_generation_requeues_only_playback_copies_from_alignment_cache
     assert manager.db.get_state("subtitle_validation_generation", "") == "17"
 
 
-def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(tmp_path: Path, monkeypatch) -> None:
     cfg = _cfg(tmp_path)
     write_config(cfg, cfg.config_path)
     api = WebAppApi(cfg.config_path)
@@ -123,8 +122,24 @@ def test_qbittorrent_failure_does_not_block_due_subtitle_jobs(
     assert result["stats"]["subs"] == 1
 
 
-def test_random_score_wheel_explanation_is_removed() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "The wheel chooses one score; middle values have larger sectors." not in html
-    assert "Колесо выбирает одну оценку; у средних значений сектора больше." not in html
-    assert "const introHtml=intro?" in html
+def test_random_score_wheel_explanation_is_removed(page) -> None:
+    # The rating wheel no longer explains its sector sizes; only the final-episode prompt
+    # keeps its one line of text.
+    assert not has_text("The wheel chooses one score")
+    assert not has_text("Колесо выбирает одну оценку", "ru")
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const copy = () => [...document.querySelectorAll('#modalBody .modal-copy')].map(p => p.textContent);
+            showScoreModal({media_id: 7, title: 'Show'});
+            const plain = {copy: copy(), wheel: Boolean($('scoreWheel'))};
+            closeModal();
+            showScoreModal({media_id: 7, title: 'Show'}, true, 12);
+            return {plain, final: copy(), rateText: t('modal.rateText')};
+            """,
+            lang=lang,
+            api={"final_sequel_option": {"sequel": None}},
+        )
+        out = result.value
+        assert out["plain"] == {"copy": [], "wheel": True}
+        assert out["final"] == [out["rateText"]]

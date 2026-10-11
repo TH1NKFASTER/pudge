@@ -1,27 +1,36 @@
 """Exercise actual DOM event handlers with synthetic drag events."""
-from pathlib import Path
+
+import json
 import subprocess
 
+from page_harness import web_module
+from tests.i18n_support import i18n_source, ru
+
+
 def test_ln_external_drag_nested_children_and_unsupported_file():
-    source=Path('pudge/web/ln_drop.js').read_text()
-    setup=r'''
+    source = web_module("ln_drop.js")
+    setup = r"""
 const assert=require('assert'); const listeners={}; const classes=new Set();
 const box={dataset:{},classList:{add:x=>classes.add(x),remove:x=>classes.delete(x)}};
 const page={classList:{contains:x=>x==='active'}};
 global.window=global;window.ui={lang:'ru'};window.addEventListener=(k,f)=>listeners[k]=f;
 global.document={getElementById:id=>id==='lightnovels'?page:box,addEventListener:(k,f)=>listeners[k]=f};
-let notices=0;window.toast=()=>notices++;
+let notices=0,lastNotice='';window.toast=message=>{notices++;lastNotice=message;};
 function event(type,names=[],types=['Files']){return {type,dataTransfer:{types,files:names.map(name=>({name}))},preventDefault(){this.prevented=true},stopImmediatePropagation(){this.stopped=true},stopPropagation(){}}}
-'''
-    checks=r'''
+"""
+    checks = r"""
 listeners.dragenter(event('dragenter',['a.epub']));listeners.dragenter(event('dragenter',['a.epub']));
-assert(classes.has('ln-file-drag'));listeners.dragleave(event('dragleave'));
+assert(classes.has('ln-file-drag'));assert.equal(box.dataset.dropLabel,EXPECTED.label);listeners.dragleave(event('dragleave'));
 assert(classes.has('ln-file-drag'));listeners.dragleave(event('dragleave'));assert(!classes.has('ln-file-drag'));
 listeners.dragenter(event('dragenter',[],['text/plain']));assert(!classes.has('ln-file-drag'));
 listeners.dragenter(event('dragenter',['a.pdf']));assert(!classes.has('ln-file-drag'));
-const bad=event('drop',['a.pdf']);listeners.drop(bad);assert(bad.stopped&&bad.prevented);assert.equal(notices,1);
+const bad=event('drop',['a.pdf']);listeners.drop(bad);assert(bad.stopped&&bad.prevented);assert.equal(notices,1);assert.equal(lastNotice,EXPECTED.notice);
 listeners.dragenter(event('dragenter',['a.txt']));const good=event('drop',['a.txt']);listeners.drop(good);
 assert(!good.stopped);assert(!classes.has('ln-file-drag'));
 listeners.dragenter(event('dragenter',['a.epub']));listeners.keydown({key:'Escape'});assert(!classes.has('ln-file-drag'));
-'''
-    subprocess.run(['node','-e',setup+source+checks],check=True)
+"""
+    # Interface strings (audit 68Б): catalogs + PudgeI18n first; the window is in Russian.
+    expected = json.dumps({"label": ru("lnDrop.dropEpubTxtHere"), "notice": ru("lnDrop.epubAndTxtFilesAre")})
+    assert ru("lnDrop.epubAndTxtFilesAre") == "Поддерживаются EPUB и TXT"
+    script = setup + f"const EXPECTED={expected};\n;" + i18n_source() + "\n;\n" + source + checks
+    subprocess.run(["node", "-"], input=script, text=True, check=True)

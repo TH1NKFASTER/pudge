@@ -80,14 +80,18 @@ def test_final_ocr_pipeline_cache_is_invalid_when_ocr_setting_is_off(tmp_path: P
     subtitle = tmp_path / "ocr.srt"
     video.write_bytes(b"video")
     subtitle.write_text("subtitle", encoding="utf-8")
-    save_final_pipeline_result(video, cfg, subtitle=subtitle, subtitle_id=None, dependency=subtitle, source="ocr")
+    save_final_pipeline_result(
+        video, cfg, subtitle=subtitle, subtitle_id=None, dependency=subtitle, source="ocr"
+    )
     assert load_final_pipeline_result(video, cfg) is not None
 
     cfg.matching.ocr_image_subtitles = False
     assert load_final_pipeline_result(video, cfg) is None
 
 
-def test_save_settings_returns_reconciled_state_and_requests_immediate_recheck(tmp_path: Path, monkeypatch) -> None:
+def test_save_settings_returns_reconciled_state_and_requests_immediate_recheck(
+    tmp_path: Path, monkeypatch
+) -> None:
     cfg = _config(tmp_path)
     cfg.matching.ocr_image_subtitles = True
     config_path = tmp_path / "config.toml"
@@ -112,9 +116,13 @@ def test_save_settings_returns_reconciled_state_and_requests_immediate_recheck(t
 
     assert result["recheck_subtitles"] is True
     assert result["reconcile"]["ocr_invalidated"] == 1
-    episode = next(item for item in result["state"]["episodes"] if item["video_path"] == str(video))
+    episode = next(
+        item
+        for group in result["state"]["library"]
+        for item in group["episodes"]
+        if item["video_path"] == str(video)
+    )
     assert episode["state"] == "waiting_text_subtitles"
-
 
 
 def test_legacy_cleaned_ocr_cache_is_recognized_without_db_origin(tmp_path: Path) -> None:
@@ -135,14 +143,58 @@ def test_legacy_cleaned_ocr_cache_is_recognized_without_db_origin(tmp_path: Path
     assert persisted.subtitle_origin == ""
     assert manager._is_legacy_ocr_prepared_subtitle(persisted) is True
 
-def test_web_ui_applies_settings_state_and_polls_priority_jobs_immediately() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "duePrioritySubtitleJobs" in html
-    assert "if(hidden)return 60000" in html
-    assert "return 1000" in html
-    assert "poll_downloads_and_subtitles(knownVersion,activeDownloads().length>0,!document.hidden&&ui.windowActive)" in html
-    assert "if(r?.state){acceptUiState(r.state)" in html
-    assert "else if(r?.ui_state_version)" in html
-    assert "if(r.recheck_subtitles)" in html
-    assert "setTimeout(pollForegroundWork,0)" in html
-    assert "if(progress>=.95)return 2000" in html
+
+# A manual subtitle check (priority 200) is due now; window.__blocked makes the backend say
+# it waits until playback ends (heavy work is not run while mpv plays).
+PRIORITY_JOB = {
+    "video": "Show - 03.mkv",
+    "video_path": "/v/Show - 03.mkv",
+    "state": "pending",
+    "priority": 200,
+    "next_check": 1790856000,
+    "attempts": 0,
+}  # the harness clock's start
+
+
+def test_window_checks_a_due_priority_subtitle_job_every_second(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const polls = after => __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles' && c.at > after).map(c => c.at);
+            await __tick(5500);
+            const front = {polls: polls(0), status: __text('#status')};
+            window.__blocked = true;
+            await __tick(15000);
+            const blocked = {polls: polls(5500), status: __text('#status')};
+            await __setHidden(true);
+            await __tick(200000);
+            return {front, blocked, hidden: polls(20500),
+                    texts: [t('status.subtitleCheckingBackground'), t('status.subtitleWaitingPlayback')]};
+            """,
+            lang=lang,
+            state={"subtitle_jobs": [PRIORITY_JOB]},
+            before="__api.poll_downloads_and_subtitles = async () => ({stats: window.__blocked ? {subtitle_waiting_for_foreground: 1} : {}});",
+        )
+        out = result.value
+        checking, after_playback = out["texts"]
+        assert out["front"] == {"polls": [1000, 2000, 3000, 4000, 5000], "status": checking}
+        # Waiting for the player: every 5 s; in the background once a minute.
+        assert out["blocked"] == {"polls": [6000, 11000, 16000], "status": after_playback}
+        assert out["hidden"] == [80500, 140500, 200500]
+
+
+def test_saving_settings_that_need_a_subtitle_recheck_polls_at_once(page) -> None:
+    # Nothing to do: the window stopped polling. Settings that change subtitle readiness
+    # (OCR off, a new Jimaku key, ...) make the backend ask for a recheck; the window polls
+    # right away instead of waiting for the next check or a Refresh.
+    for recheck in (True, False):
+        result = page.run(
+            r"""
+            await __tick(30000);
+            setPage('settings', true); await __tick(20);
+            await __click('#saveSettings'); await __tick(5);
+            return __apiCalls.filter(c => c.name === 'poll_downloads_and_subtitles').map(c => c.at);
+            """,
+            before=f"__api.save_settings = async values => ({{ok: true, settings: {{...values, light_novels: {{}}}}, recheck_subtitles: {str(recheck).lower()}}});",
+        )
+        assert result.value == ([1000, 16000, 30020] if recheck else [1000, 16000])

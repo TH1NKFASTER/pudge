@@ -13,8 +13,12 @@ def test_process_snapshot_does_not_store_command_arguments(monkeypatch) -> None:
     secret = "TEST_SENTINEL_PROCESS_67213"
     rows = [
         {
-            "pid": 123, "ppid": 1, "cpu_percent": 5.0,
-            "memory_percent": 1.0, "rss_mb": 300.0, "elapsed": "00:30",
+            "pid": 123,
+            "ppid": 1,
+            "cpu_percent": 5.0,
+            "memory_percent": 1.0,
+            "rss_mb": 300.0,
+            "elapsed": "00:30",
             "command": f"/usr/bin/aria2c --rpc-secret={secret}",
         },
     ]
@@ -37,18 +41,25 @@ def test_debug_bundle_scrubs_historical_jsonl_logs_rotations_and_free_text(tmp_p
         "TEST_SENTINEL_COOKIE_107",
     )
     energy = tmp_path / "energy.jsonl"
-    energy.write_text(json.dumps({
-        "timestamp": 100,
-        "app_cpu_percent": 11,
-        "processes": [{"pid": 101, "command": f"aria2c --rpc-secret={secrets[0]}", "role": "aria2"}],
-    }) + "\n", encoding="utf-8")
+    energy.write_text(
+        json.dumps(
+            {
+                "timestamp": 100,
+                "app_cpu_percent": 11,
+                "processes": [{"pid": 101, "command": f"aria2c --rpc-secret={secrets[0]}", "role": "aria2"}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     runtime = tmp_path / "runtime.log"
     runtime.write_text(
         f"INFO rpc --rpc-secret={secrets[0]}\n"
         f"WARN --rpc-secret {secrets[1]}\n"
         f"Authorization: Bearer {secrets[2]}\n"
         f"GET https://alice:{secrets[3]}@example.org/path\n"
-        f"Cookie: session={secrets[6]}\n", encoding="utf-8",
+        f"Cookie: session={secrets[6]}\n",
+        encoding="utf-8",
     )
     Path(str(runtime) + ".1").write_text(
         json.dumps({"payload": {"nested": {"api_key": secrets[5]}}}) + "\n",
@@ -59,7 +70,9 @@ def test_debug_bundle_scrubs_historical_jsonl_logs_rotations_and_free_text(tmp_p
     recorder.record("trace", "test", "request", payload={"description": "api_key=" + secrets[4]})
     result = tmp_path / "bundle.zip"
     DebugBundleBuilder(database, recorder).build(
-        result, version="0.7.28", frontend={"note": "--rpc-secret " + secrets[0]},
+        result,
+        version="0.7.28",
+        frontend={"note": "--rpc-secret " + secrets[0]},
         snapshots=[{"nested": [{"Authorization": secrets[2]}]}],
         logs={"runtime": runtime, "energy": energy},
     )

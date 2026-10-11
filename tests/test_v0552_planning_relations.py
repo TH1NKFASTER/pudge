@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from css_support import css_rules
 
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
@@ -133,10 +136,105 @@ def test_anilist_library_keeps_direct_anime_prequel_and_sequel_relations(monkeyp
     ]
 
 
-def test_planning_ui_contains_relation_diagram() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "function planningRelationDiagram(a)" in html
-    assert "relations.prequel_levels" in html
-    assert "relations.sequel_levels" in html
-    assert "planned-with-relations" in html
-    assert "current?'current':''" in html
+def _node(relation_type: str, media_id: int, title: str, year: int, **extra) -> dict:
+    return {**relation(relation_type, media_id, title, year), "episodes": 12, **extra}
+
+
+def planning_relations_state(tmp_path: Path, *, by_release_date: bool = False) -> dict:
+    """A get_state payload (real backend): "Current entry" (100) planned with a prequel chain
+    (First season 80 → Prequel 90, watched) and three sequels; "Standalone" (200) without relations."""
+    api = make_api(tmp_path)
+    api.config.anilist.relations_by_release_date = by_release_date
+    api.manager.db.upsert_anime(
+        LibraryAnime(
+            media_id=100,
+            title="Current entry",
+            status="PLANNING",
+            format="TV",
+            season_year=2026,
+            episodes=12,
+            studio="Kyoto Animation",
+            site_url="https://anilist.co/anime/100",
+            media_status="FINISHED",
+            relations=[
+                _node(
+                    "PREQUEL",
+                    90,
+                    "Prequel",
+                    2024,
+                    studio="Sunrise",
+                    cover_url="https://img.example/90.jpg",
+                    list_status="COMPLETED",
+                    progress=12,
+                    relations=[_node("PREQUEL", 80, "First season", 2022)],
+                ),
+                _node("SEQUEL", 110, "Next season", 2027, list_status="PLANNING", media_status="FINISHED"),
+                _node("SEQUEL", 111, "Sequel movie", 2027, format="MOVIE"),
+                _node("SEQUEL", 112, "Third sequel", 2028),
+            ],
+        )
+    )
+    api.manager.db.upsert_anime(
+        LibraryAnime(media_id=200, title="Standalone", status="PLANNING", studio="Bones")
+    )
+    return json.loads(json.dumps(api.get_state(), default=str))
+
+
+# The Planning page and its cards' relation diagrams, read from the window.
+DIAGRAM = """
+setPage('planned');
+await __tick(20);
+const card = id => document.querySelector(`#plannedContent > [data-media-id="${id}"]`);
+const relationNode = id => card(100).querySelector(`.relation-node[data-media-id="${id}"]`);
+const diagram = id => [...card(id).querySelectorAll('.relation-stage')].map(stage => ({
+  label: stage.querySelector('.relation-stage-label').innerText,
+  nodes: [...stage.querySelectorAll('.relation-node')].map(node => Number(node.dataset.mediaId))}));
+"""
+
+
+def test_planning_card_shows_the_prequel_entry_sequel_chain(tmp_path: Path, page) -> None:
+    state = planning_relations_state(tmp_path)
+    for lang in ("en", "ru"):
+        result = page.run(
+            DIAGRAM
+            + """
+            return {chain: diagram(100), standalone: diagram(200),
+                    labels: [t('relation.prequelStep', {step: 2}), t('relation.prequelStep', {step: 1}), t('relation.entry'),
+                             t('relation.sequelStep', {step: 1})],
+                    current: [...card(100).querySelectorAll('.relation-node.current')].map(node => Number(node.dataset.mediaId)),
+                    wide: [card(100).classList.contains('planned-with-relations'), card(200).classList.contains('planned-with-relations')]};
+            """,
+            lang=lang,
+            state=state,
+        )
+        out = result.value
+        assert [stage["label"] for stage in out["chain"]] == out["labels"]
+        assert [stage["nodes"] for stage in out["chain"]] == [
+            [80],
+            [90],
+            [100],
+            [110, 111],
+        ]  # two per level at most
+        assert out["current"] == [100]
+        assert out["standalone"] == [] and out["wide"] == [True, False]
+    # The wide card gets its own grid column for the diagram.
+    assert (
+        len(
+            css_rules("index.html").get(".anime-card.planned-with-relations", "grid-template-columns").split()
+        )
+        == 4
+    )
+
+
+def test_release_ordered_relations_are_labelled_earlier_and_later(tmp_path: Path, page) -> None:
+    result = page.run(
+        DIAGRAM
+        + """
+        return {chain: diagram(100),
+                expected: [t('relation.earlierStep', {step: 1}), t('relation.entry'),
+                           t('relation.laterStep', {step: 1}), t('relation.laterStep', {step: 2})]};
+        """,
+        state=planning_relations_state(tmp_path, by_release_date=True),
+    )
+    assert [stage["label"] for stage in result.value["chain"]] == result.value["expected"]
+    assert [stage["nodes"] for stage in result.value["chain"]] == [[80, 90], [100], [110, 111], [112]]

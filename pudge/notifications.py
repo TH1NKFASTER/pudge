@@ -19,9 +19,9 @@ _HELPER_FLAG = "--pudge-native-notification"
 _HELPER_ACTIVE_ENV = "PUDGE_NOTIFICATION_HELPER_ACTIVE"
 _HELPER_PATH_ENV = "PUDGE_NOTIFICATION_HELPER"
 
-_APPLE_SCRIPT = r'''on run argv
+_APPLE_SCRIPT = r"""on run argv
     display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
-end run'''
+end run"""
 
 
 def _notification_helper_path() -> Path | None:
@@ -94,9 +94,7 @@ def _run_notification_delivery_window(seconds: float = 1.0) -> None:
     try:
         from Foundation import NSDate, NSRunLoop
 
-        NSRunLoop.currentRunLoop().runUntilDate_(
-            NSDate.dateWithTimeIntervalSinceNow_(duration)
-        )
+        NSRunLoop.currentRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(duration))
     except Exception:
         time.sleep(duration)
 

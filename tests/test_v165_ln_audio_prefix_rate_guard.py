@@ -42,19 +42,14 @@ def test_prefix_recovery_rejects_textually_monotonic_but_physically_impossible_c
         {"offset": 620, "time": 110.0},
     ]
 
-    repaired, story_start, debug = _recover_leading_prefix_clock(
-        story, segments, broken_clock
-    )
+    repaired, story_start, debug = _recover_leading_prefix_clock(story, segments, broken_clock)
 
     assert debug["recovered"] is True
     assert story_start == pytest.approx(35.84, abs=0.5)
     assert repaired[0]["offset"] == 0
     early = [row for row in repaired if float(row["time"]) <= 40.1]
     assert max(float(row["offset"]) for row in early) < 100
-    assert not any(
-        float(row["offset"]) >= 300 and float(row["time"]) < 50.0
-        for row in repaired
-    )
+    assert not any(float(row["offset"]) >= 300 and float(row["time"]) < 50.0 for row in repaired)
 
 
 def test_runtime_mapping_never_interpolates_trace_0_to_411_in_point_four_seconds() -> None:

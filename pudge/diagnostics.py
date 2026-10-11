@@ -30,8 +30,16 @@ class DiagnosticRecorder:
         media_episode: int | None = None,
         payload: dict[str, Any] | None = None,
     ) -> int:
+        payload = dict(payload or {})
         with self.database.connect() as conn:
-            self.database._ensure_anime_parent(conn, media_id)
+            # A diagnostic about an unknown title must not add a placeholder anime
+            # to the library: keep the id in the payload instead of the FK column.
+            if (
+                media_id is not None
+                and conn.execute("SELECT 1 FROM anime WHERE media_id=?", (int(media_id),)).fetchone() is None
+            ):
+                payload.setdefault("unlinked_media_id", int(media_id))
+                media_id = None
             cursor = conn.execute(
                 "INSERT INTO diagnostic_events(correlation_id,component,event,severity,media_id,"
                 "media_episode,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -42,7 +50,7 @@ class DiagnosticRecorder:
                     str(severity),
                     media_id,
                     media_episode,
-                    json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, default=str),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
                     time.time(),
                 ),
             )
@@ -61,8 +69,10 @@ class DiagnosticRecorder:
             where.append("correlation_id=?")
             values.append(str(correlation_id))
         if media_id is not None:
-            where.append("media_id=?")
-            values.append(int(media_id))
+            where.append(
+                "(media_id=? OR (media_id IS NULL AND json_extract(payload_json,'$.unlinked_media_id')=?))"
+            )
+            values.extend([int(media_id), int(media_id)])
         sql = "SELECT * FROM diagnostic_events"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -161,22 +171,36 @@ class DebugBundleBuilder:
         return value
 
     @classmethod
+    def _sanitized_lines(cls, lines: Any) -> str:
+        output: list[str] = []
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except (ValueError, TypeError):
+                output.append(cls._sanitize_text(line))
+            else:
+                if isinstance(item, (dict, list)):
+                    output.append(json.dumps(cls._redact(item), ensure_ascii=False) + "\n")
+                else:
+                    output.append(cls._sanitize_text(line))
+        return "".join(output)
+
+    @classmethod
     def _sanitized_log(cls, source: Path) -> str:
         # Never copy raw log bytes directly into a support ZIP. Historical
         # energy JSONL can contain command values even after logger upgrades.
-        output: list[str] = []
         with source.open("r", encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    item = json.loads(line)
-                except (ValueError, TypeError):
-                    output.append(cls._sanitize_text(line))
-                else:
-                    if isinstance(item, (dict, list)):
-                        output.append(json.dumps(cls._redact(item), ensure_ascii=False) + "\n")
-                    else:
-                        output.append(cls._sanitize_text(line))
-        return "".join(output)
+            return cls._sanitized_lines(stream)
+
+    @classmethod
+    def _sanitized_file(cls, source: Path) -> bytes:
+        """A copied text file (subtitle, JSON trace) with credentials scrubbed.
+
+        Bytes that are not UTF-8 (a Shift-JIS subtitle) are kept exactly as
+        they are; only the text around them is rewritten.
+        """
+        text = source.read_bytes().decode("utf-8", errors="surrogateescape")
+        return cls._sanitized_lines(text.splitlines(keepends=True)).encode("utf-8", errors="surrogateescape")
 
     def _database_summary(self) -> dict[str, Any]:
         with self.database.connect() as conn:
@@ -290,7 +314,7 @@ class DebugBundleBuilder:
                     if path.stat().st_size > 20 * 1024 * 1024:
                         continue
                     digest = hashlib.sha256(str(path).encode()).hexdigest()[:10]
-                    archive.write(path, f"subtitles/{digest}-{path.name}")
+                    archive.writestr(f"subtitles/{digest}-{path.name}", self._sanitized_file(path))
                 except OSError:
                     continue
         return target

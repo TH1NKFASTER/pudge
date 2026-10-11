@@ -32,12 +32,14 @@ class _Response:
 
     def json(self) -> dict:
         return {
-            "tokens": [[
-                {"wordId": 1, "readingIndex": 1, "start": 0, "end": 4},
-                {"wordId": 2, "readingIndex": 1, "start": 4, "end": 5},
-                {"wordId": 3, "readingIndex": 1, "start": 5, "end": 8},
-                {"wordId": 4, "readingIndex": 1, "start": 8, "end": 10},
-            ]],
+            "tokens": [
+                [
+                    {"wordId": 1, "readingIndex": 1, "start": 0, "end": 4},
+                    {"wordId": 2, "readingIndex": 1, "start": 4, "end": 5},
+                    {"wordId": 3, "readingIndex": 1, "start": 5, "end": 8},
+                    {"wordId": 4, "readingIndex": 1, "start": 8, "end": 10},
+                ]
+            ],
             "vocabulary": [
                 {"wordId": 1, "readingIndex": 1, "reading": "小[こ]高[だか]い丘[おか]"},
                 {"wordId": 2, "readingIndex": 1, "reading": "が"},
@@ -64,7 +66,9 @@ def _service(tmp_path: Path) -> AudiobookService:
     return service
 
 
-def test_precision_alignment_bootstraps_readings_when_full_reader_cache_is_absent(tmp_path, monkeypatch) -> None:
+def test_precision_alignment_bootstraps_readings_when_full_reader_cache_is_absent(
+    tmp_path, monkeypatch
+) -> None:
     service = _service(tmp_path)
     calls = []
 
@@ -87,9 +91,10 @@ def test_precision_alignment_bootstraps_readings_when_full_reader_cache_is_absen
     ]
     assert len(calls) == 1
     assert calls[0][1]["json"]["text"][0].startswith("小高い丘")
+    # The cache file the service wrote keeps the readings but never the Jiten API key.
+    output_cache = service._chapter_start_reading_cache_path(digest)
     assert "secret-test-key" not in json.dumps(
-        json.loads(service._chapter_start_reading_cache_path(digest).read_text()),
-        ensure_ascii=False,
+        json.loads(output_cache.read_text(encoding="utf-8")), ensure_ascii=False
     )
 
 

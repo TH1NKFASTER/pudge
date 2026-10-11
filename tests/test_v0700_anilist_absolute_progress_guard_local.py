@@ -31,11 +31,41 @@ def test_absolute_bleach_43_becomes_cour_episode_3_from_cached_graph(tmp_path) -
         {
             "root_id": 5,
             "nodes": [
-                {"media_id": 1, "title": "BLEACH", "format": "TV", "episodes": 366, "start_date": "2004-10-05"},
-                {"media_id": 2, "title": "BLEACH: Sennen Kessen-hen", "format": "TV", "episodes": 13, "start_date": "2022-10-11"},
-                {"media_id": 3, "title": "BLEACH: Sennen Kessen-hen - Ketsubetsu-tan", "format": "TV", "episodes": 13, "start_date": "2023-07-08"},
-                {"media_id": 4, "title": "BLEACH: Sennen Kessen-hen - Soukoku-tan", "format": "TV", "episodes": 14, "start_date": "2024-10-05"},
-                {"media_id": 5, "title": "BLEACH: Sennen Kessen-hen - Kashin-tan", "format": "TV", "episodes": 10, "start_date": "2026-07-25"},
+                {
+                    "media_id": 1,
+                    "title": "BLEACH",
+                    "format": "TV",
+                    "episodes": 366,
+                    "start_date": "2004-10-05",
+                },
+                {
+                    "media_id": 2,
+                    "title": "BLEACH: Sennen Kessen-hen",
+                    "format": "TV",
+                    "episodes": 13,
+                    "start_date": "2022-10-11",
+                },
+                {
+                    "media_id": 3,
+                    "title": "BLEACH: Sennen Kessen-hen - Ketsubetsu-tan",
+                    "format": "TV",
+                    "episodes": 13,
+                    "start_date": "2023-07-08",
+                },
+                {
+                    "media_id": 4,
+                    "title": "BLEACH: Sennen Kessen-hen - Soukoku-tan",
+                    "format": "TV",
+                    "episodes": 14,
+                    "start_date": "2024-10-05",
+                },
+                {
+                    "media_id": 5,
+                    "title": "BLEACH: Sennen Kessen-hen - Kashin-tan",
+                    "format": "TV",
+                    "episodes": 10,
+                    "start_date": "2026-07-25",
+                },
             ],
             "edges": [
                 {"source": 1, "target": 2, "relation_type": "SEQUEL"},

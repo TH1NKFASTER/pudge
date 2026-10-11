@@ -5,10 +5,7 @@ def test_boundary_refinement_does_not_blindly_choose_largest_silence() -> None:
     # True clock change is at ~600s, but there is a much larger silence later.
     # Old code returned 640s solely because 610..670 was the largest gap.
     source = [545.0, 560.0, 575.0, 590.0, 600.0, 610.0, 670.0, 680.0, 695.0, 710.0]
-    reference = [
-        onset + (11.0 if onset < 600.0 else 16.0)
-        for onset in source
-    ]
+    reference = [onset + (11.0 if onset < 600.0 else 16.0) for onset in source]
 
     boundary = _refine_boundary(
         source,
@@ -24,10 +21,7 @@ def test_boundary_refinement_does_not_blindly_choose_largest_silence() -> None:
 
 def test_boundary_refinement_can_still_choose_inside_real_silence() -> None:
     source = [545.0, 560.0, 575.0, 590.0, 610.0, 670.0, 680.0, 695.0, 710.0]
-    reference = [
-        onset + (11.0 if onset < 640.0 else 16.0)
-        for onset in source
-    ]
+    reference = [onset + (11.0 if onset < 640.0 else 16.0) for onset in source]
 
     boundary = _refine_boundary(
         source,

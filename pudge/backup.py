@@ -9,10 +9,13 @@ import tempfile
 import tomllib
 import time
 import zipfile
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
 
 from .branding import APP_NAME, BACKUP_APP_ID, APP_SLUG
+from .i18n import err
+from .restore_guard import DatabaseInUse, exclusive_database
 
 
 BACKUP_FORMAT = 2
@@ -111,7 +114,237 @@ def _sqlite_snapshot(source: Path, target: Path) -> None:
         src.backup(dst)
 
 
-def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, output: Path, version: str) -> dict[str, Any]:
+# Local copies of the library beside the database: one before every restore
+# (so a restore can be undone) and one a day. ``pre-v<N>`` copies are made by
+# schema migrations (Database._backup_before_migration).
+SNAPSHOT_KEEP = {"pre-restore": 3, "daily": 7}
+# How long a restore waits for mpv helper processes to finish a database write.
+RESTORE_LOCK_TIMEOUT = 10.0
+_SNAPSHOT_NAME = re.compile(r"^(?:(pre-restore|daily)-(\d{8}-\d{6})(?:-(\d+))?|pre-v\d+)$")
+
+
+def _snapshot_identity(database_path: Path, candidate: Path) -> tuple[str, float | None, int]:
+    """(kind, time from the name, same-second counter) of a local copy; kind "" for other files."""
+    prefix, suffix = database_path.name + ".", ".backup"
+    name = candidate.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return "", None, 0
+    match = _SNAPSHOT_NAME.match(name[len(prefix) : -len(suffix)])
+    if match is None:
+        return "", None, 0
+    if match.group(1) is None:
+        return "migration", None, 0
+    try:
+        created = time.mktime(time.strptime(match.group(2), "%Y%m%d-%H%M%S"))
+    except (OverflowError, ValueError):
+        return "", None, 0
+    return match.group(1), created, int(match.group(3) or 1)
+
+
+def list_database_snapshots(database_path: Path) -> list[dict[str, Any]]:
+    """Local copies of the library database, newest first."""
+    database_path = Path(database_path).expanduser()
+    found: list[tuple[float, int, dict[str, Any]]] = []
+    try:
+        candidates = list(database_path.parent.glob(database_path.name + ".*.backup"))
+    except OSError:
+        return []
+    for candidate in candidates:
+        kind, created_at, counter = _snapshot_identity(database_path, candidate)
+        if not kind:
+            continue
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        if not candidate.is_file() or stat.st_size <= 0:
+            continue
+        created = stat.st_mtime if created_at is None else created_at
+        found.append(
+            (
+                created,
+                counter,
+                {"path": str(candidate), "kind": kind, "created_at": created, "size": stat.st_size},
+            )
+        )
+    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item for _created, _counter, item in found]
+
+
+def _check_database_file(path: Path) -> None:
+    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)) as conn:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+    if row is None or str(row[0]).casefold() != "ok":
+        raise ValueError(err("backup.integrityFailed"))
+
+
+def make_database_snapshot(
+    database_path: Path, kind: str, *, now: float | None = None, prune: bool = True
+) -> Path:
+    """A checked copy of the live database (SQLite backup API), then rotation of that kind."""
+    database_path = Path(database_path).expanduser()
+    if kind not in SNAPSHOT_KEEP:
+        raise ValueError(f"unknown snapshot kind {kind!r}")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(time.time() if now is None else now))
+    # Several copies in one second count up from the highest one there: a counter freed by
+    # pruning must not be reused, or the newest copy would sort as the oldest.
+    counters = [0] + [
+        _snapshot_identity(database_path, existing)[2]
+        for existing in database_path.parent.glob(f"{database_path.name}.{kind}-{stamp}*.backup")
+        if _snapshot_identity(database_path, existing)[0] == kind
+    ]
+    counter = max(counters) + 1
+    target = database_path.with_name(
+        f"{database_path.name}.{kind}-{stamp}.backup"
+        if counter == 1
+        else f"{database_path.name}.{kind}-{stamp}-{counter}.backup"
+    )
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        with closing(sqlite3.connect(database_path, timeout=10)) as source:
+            with closing(sqlite3.connect(temporary)) as destination:
+                # One step: a single read transaction, so the copy is consistent
+                # while WAL writers go on.
+                source.backup(destination)
+                destination.execute("PRAGMA journal_mode=DELETE")
+        _check_database_file(temporary)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    if prune:
+        _prune_snapshots(database_path, kind, keep_path=target)
+    return target
+
+
+def _prune_snapshots(database_path: Path, kind: str, *, keep_path: Path | None = None) -> list[str]:
+    same_kind = [item for item in list_database_snapshots(database_path) if item["kind"] == kind]
+    removed: list[str] = []
+    # Copies interrupted by a quit or crash.
+    try:
+        for leftover in database_path.parent.glob(f".{database_path.name}.{kind}-*.tmp"):
+            if leftover.stat().st_mtime < time.time() - 3600:
+                leftover.unlink(missing_ok=True)
+    except OSError:
+        pass
+    for item in same_kind[SNAPSHOT_KEEP[kind] :]:
+        if keep_path is not None and Path(item["path"]) == keep_path:
+            continue
+        try:
+            Path(item["path"]).unlink()
+            removed.append(item["path"])
+        except OSError:
+            continue
+    return removed
+
+
+def make_daily_snapshot(database_path: Path, *, now: float | None = None) -> Path | None:
+    """Today's copy of the library, unless one was already made today."""
+    database_path = Path(database_path).expanduser()
+    if not database_path.is_file():
+        return None
+    current = time.time() if now is None else float(now)
+    today = time.strftime("%Y%m%d", time.localtime(current))
+    for item in list_database_snapshots(database_path):
+        if item["kind"] == "daily" and time.strftime("%Y%m%d", time.localtime(item["created_at"])) == today:
+            return None
+    return make_database_snapshot(database_path, "daily", now=current)
+
+
+# The Mac's iPhone/iPad identity (server ID and TLS pin) lives beside the
+# database, outside it. A full backup carries it, so a restore on a new Mac is
+# still the Mac the phones were paired with.
+_IPHONE_IDENTITY_NAME = re.compile(r"^(server-secret|tls-[A-Za-z0-9_-]+\.pem)$")
+
+
+def _iphone_identity_files(database_path: Path) -> list[Path]:
+    root = database_path.parent / "iphone"
+    try:
+        return sorted(
+            path for path in root.iterdir() if path.is_file() and _IPHONE_IDENTITY_NAME.match(path.name)
+        )
+    except OSError:
+        return []
+
+
+def _table_columns(conn: sqlite3.Connection, table: str, schema: str = "main") -> list[str]:
+    return [str(row[1]) for row in conn.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def _merge_iphone_access(staged_db: Path, live_db: Path) -> None:
+    """Pairings and revocations are today's, not the backup's.
+
+    Devices and invitations of the live database are kept (a revoked iPhone
+    stays revoked, a re-paired one keeps its new key); devices known only to the
+    restored copy come back (a backup moved to a new Mac). The restore time lets
+    the iPhone service accept a phone position newer than the restored one.
+    """
+    with closing(sqlite3.connect(staged_db)) as conn:
+        if live_db.is_file():
+            try:
+                conn.execute("ATTACH DATABASE ? AS live", (str(live_db),))
+            except sqlite3.Error:
+                pass  # an unreadable live library has no pairings to keep
+            else:
+                try:
+                    _copy_live_iphone_access(conn)
+                    conn.commit()
+                except BaseException as exc:
+                    conn.rollback()
+                    # Only a damaged live library ("malformed", "not a database")
+                    # is skipped: the restored pairings stay.
+                    if type(exc) is not sqlite3.DatabaseError:
+                        raise
+                finally:
+                    conn.execute("DETACH DATABASE live")
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='state'").fetchone():
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES('iphone_restored_at',?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (str(int(time.time() * 1000)), time.time()),
+            )
+        conn.commit()
+
+
+def _copy_live_iphone_access(conn: sqlite3.Connection) -> None:
+    for table in ("iphone_devices", "iphone_invites"):
+        live_sql = conn.execute(
+            "SELECT sql FROM live.sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if live_sql is None:
+            continue
+        if not conn.execute(
+            "SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone():
+            conn.execute(str(live_sql[0]))
+        live_columns = set(_table_columns(conn, table, "live"))
+        columns = [name for name in _table_columns(conn, table) if name in live_columns]
+        key = "id" if table == "iphone_devices" else "hash"
+        if key not in columns:
+            continue
+        revoked_before: set[tuple[str, str]] = set()
+        if table == "iphone_devices" and {"token_hash", "revoked"} <= set(columns):
+            revoked_before = {
+                (str(row[0]), str(row[1]))
+                for row in conn.execute("SELECT id,token_hash FROM main.iphone_devices WHERE revoked<>0")
+            }
+        names = ",".join(columns)
+        updates = ",".join(f"{name}=excluded.{name}" for name in columns if name != key)
+        conn.execute(
+            f"INSERT INTO main.{table}({names}) SELECT {names} FROM live.{table} WHERE true "
+            f"ON CONFLICT({key}) DO " + (f"UPDATE SET {updates}" if updates else "NOTHING")
+        )
+        # The same key revoked in the restored copy stays revoked.
+        for device, token_hash in revoked_before:
+            conn.execute(
+                "UPDATE main.iphone_devices SET revoked=1 WHERE id=? AND token_hash=?",
+                (device, token_hash),
+            )
+
+
+def create_backup(
+    *, config_path: Path, database_path: Path, cache_dir: Path, output: Path, version: str
+) -> dict[str, Any]:
     config_path = config_path.expanduser()
     database_path = database_path.expanduser()
     cache_dir = cache_dir.expanduser()
@@ -182,6 +415,7 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
                 }
             )
 
+        identity_files = _iphone_identity_files(database_path)
         manifest = {
             "app": BACKUP_APP_ID,
             "format": BACKUP_FORMAT,
@@ -194,12 +428,11 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
             "includes_media": False,
             "secrets_included": False,
             "redacted_secret_count": redacted_secret_count,
+            "iphone_identity": [path.name for path in identity_files],
         }
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             if config_path.exists():
-                redacted_config, config_secret_count = _redact_config(
-                    config_path.read_text(encoding="utf-8")
-                )
+                redacted_config, config_secret_count = _redact_config(config_path.read_text(encoding="utf-8"))
                 redacted_secret_count += config_secret_count
                 manifest["redacted_secret_count"] = redacted_secret_count
                 archive.writestr("config.toml", redacted_config)
@@ -207,6 +440,8 @@ def create_backup(*, config_path: Path, database_path: Path, cache_dir: Path, ou
             archive.write(db_copy, "library.sqlite3")
             for item in cached_files:
                 archive.write(Path(item["original"]), item["archive"])
+            for path in identity_files:
+                archive.write(path, f"iphone/{path.name}")
     return {
         "path": str(output),
         "cached_files": len(cached_files),
@@ -228,7 +463,6 @@ def _atomic_copy(source: Path, target: Path) -> None:
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-
 
 
 # These locations belong to the receiving machine, not to the backup producer.
@@ -254,11 +488,11 @@ def _restore_config_for_destination(
         # In that case retain only the explicitly supplied destination DB/cache.
         current = {}
     if not isinstance(restored, dict) or not isinstance(current, dict):
-        raise ValueError("Invalid backup configuration")
+        raise ValueError(err("backup.invalidConfig"))
     for section_name, keys in _LOCAL_PATH_FIELDS.items():
         section_values = restored.get(section_name, {})
         if not isinstance(section_values, dict):
-            raise ValueError(f"Invalid backup [{section_name}] section")
+            raise ValueError(err("backup.invalidSection", section=section_name))
         for key, value in section_values.items():
             if key in keys:
                 valid = (
@@ -267,10 +501,10 @@ def _restore_config_for_destination(
                     else isinstance(value, str)
                 )
                 if not valid:
-                    raise ValueError(f"Invalid backup path {section_name}.{key}")
+                    raise ValueError(err("backup.invalidPath", section=section_name, key=key))
 
     if not isinstance(current.get("paths", {}), dict) or not isinstance(current.get("library", {}), dict):
-        raise ValueError("Invalid existing configuration paths")
+        raise ValueError(err("backup.invalidExistingPaths"))
 
     local: dict[tuple[str, str], Any] = {
         ("library", "database_path"): str(database_path),
@@ -285,13 +519,13 @@ def _restore_config_for_destination(
         if key in current_paths:
             value = current_paths[key]
             if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
-                raise ValueError(f"Invalid existing paths.{key}")
+                raise ValueError(err("backup.invalidExistingPath", key=key))
             local[("paths", key)] = value
     # Old installations may still use download_dirs rather than watched_media_dirs.
     if "watched_media_dirs" not in current_paths and "download_dirs" in current_paths:
         value = current_paths["download_dirs"]
         if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
-            raise ValueError("Invalid existing paths.download_dirs")
+            raise ValueError(err("backup.invalidExistingPath", key="download_dirs"))
         local[("paths", "download_dirs")] = value
 
     def literal(value: Any) -> str:
@@ -299,7 +533,7 @@ def _restore_config_for_destination(
             return json.dumps(value, ensure_ascii=False)
         if isinstance(value, list) and all(isinstance(x, str) for x in value):
             return "[" + ", ".join(json.dumps(x, ensure_ascii=False) for x in value) + "]"
-        raise ValueError("Invalid destination path setting")
+        raise ValueError(err("backup.invalidDestination"))
 
     # Preserve comments, unknown settings and non-path settings. TOML arrays for
     # the operational paths are expected to use Pudge's one-line writer format.
@@ -317,7 +551,7 @@ def _restore_config_for_destination(
         identity = (section, key)
         if section in _LOCAL_PATH_FIELDS and key in _LOCAL_PATH_FIELDS[section]:
             if identity in seen:
-                raise ValueError("Duplicate location setting in backup")
+                raise ValueError(err("backup.duplicateLocation"))
             seen.add(identity)
             # After removing this one line, the document must still be complete.
             # A multiline value would fail the final tomllib validation.
@@ -328,29 +562,34 @@ def _restore_config_for_destination(
 
     text = "".join(result)
     for sec in ("library", "paths"):
-        missing = [(key, value) for (name, key), value in local.items() if name == sec and (name, key) not in seen]
+        missing = [
+            (key, value) for (name, key), value in local.items() if name == sec and (name, key) not in seen
+        ]
         if not missing:
             continue
         lines = text.splitlines(keepends=True)
-        start = next((i for i, line in enumerate(lines)
-                      if line.strip() == f"[{sec}]"), None)
+        start = next((i for i, line in enumerate(lines) if line.strip() == f"[{sec}]"), None)
         additions = [f"{key} = {literal(value)}\n" for key, value in missing]
         if start is None:
             text = text.rstrip("\n") + f"\n\n[{sec}]\n" + "".join(additions)
         else:
-            lines[start + 1:start + 1] = additions
+            lines[start + 1 : start + 1] = additions
             text = "".join(lines)
 
     checked = tomllib.loads(text)
-    for sec, key in (("library", "database_path"), ("library", "root_dir"),
-                     ("library", "cover_cache_dir"), ("paths", "cache_dir")):
+    for sec, key in (
+        ("library", "database_path"),
+        ("library", "root_dir"),
+        ("library", "cover_cache_dir"),
+        ("paths", "cache_dir"),
+    ):
         value = checked[sec][key]
         if not isinstance(value, str):
-            raise ValueError(f"Invalid path type: {sec}.{key}")
+            raise ValueError(err("backup.invalidPathType", section=sec, key=key))
     for key in ("subtitle_dirs", "watched_media_dirs", "download_dirs"):
         value = checked.get("paths", {}).get(key, [])
         if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
-            raise ValueError(f"Invalid paths.{key}")
+            raise ValueError(err("backup.invalidBackupPath", key=key))
     return text
 
 
@@ -358,16 +597,28 @@ def _validate_staged_config(staged_config: Path, *, database_path: Path, cache_d
     # Full application parser, not merely syntactic TOML validation. This runs
     # before live database/config replacement, so malformed settings cannot
     # strand the application in an unbootable state.
-    from .config import load_config
+    from .config import CONFIG_WARNINGS, load_config
 
-    parsed = load_config(staged_config)
+    parsed = load_config(  # only validates the backup
+        staged_config, apply_language=False, recover_invalid=False
+    )
+    if CONFIG_WARNINGS:
+        # The app itself starts with defaults; a backup must be valid as written.
+        raise ValueError(err("backup.invalidValues", details="; ".join(CONFIG_WARNINGS[:3])))
     if parsed.library.database_path.expanduser().resolve() != database_path.expanduser().resolve():
-        raise ValueError("Restored configuration points to a different database")
+        raise ValueError(err("backup.otherDatabase"))
     if parsed.paths.cache_dir.expanduser().resolve() != cache_dir.expanduser().resolve():
-        raise ValueError("Restored configuration points to a different cache directory")
+        raise ValueError(err("backup.otherCache"))
 
 
-def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path, cache_dir: Path, post_commit: Callable[[], None] | None = None) -> dict[str, Any]:
+def restore_backup(
+    *,
+    archive_path: Path,
+    config_path: Path,
+    database_path: Path,
+    cache_dir: Path,
+    post_commit: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Validate completely in staging, then replace live files with rollback.
 
     Callers that own long-lived services should quiesce their writers before this
@@ -395,11 +646,11 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
         with zipfile.ZipFile(archive_path) as archive:
             names = set(archive.namelist())
             if "manifest.json" not in names or "library.sqlite3" not in names:
-                raise ValueError(f"This is not an {APP_NAME} backup")
+                raise ValueError(err("backup.notBackup", app=APP_NAME))
             manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
             backup_format = int(manifest.get("format", 0))
             if manifest.get("app") != BACKUP_APP_ID or backup_format not in {1, BACKUP_FORMAT}:
-                raise ValueError(f"Unsupported {APP_NAME} backup format")
+                raise ValueError(err("backup.unsupportedFormat", app=APP_NAME))
 
             with archive.open("library.sqlite3") as source, restored_db.open("wb") as destination:
                 shutil.copyfileobj(source, destination)
@@ -425,34 +676,40 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
                 staged_cached.append((original, staged, target))
                 restored_paths[original] = str(target)
 
+            staged_identity: list[tuple[Path, Path, int | None]] = []
+            identity_dir = database_path.parent / "iphone"
+            for name in manifest.get("iphone_identity", []) if backup_format >= 2 else []:
+                name = str(name)
+                member = f"iphone/{name}"
+                if not _IPHONE_IDENTITY_NAME.match(name) or member not in names:
+                    continue
+                data = archive.read(member)
+                if name == "server-secret" and len(data) != 32:
+                    raise ValueError(err("backup.invalidIphoneIdentity"))
+                staged = tmp / f"iphone-{name}"
+                staged.write_bytes(data)
+                staged_identity.append((staged, identity_dir / name, 0o600))
+
         # Everything below this line works only with staged files until all
         # validation and path rewrites have succeeded.
         existing_database_secrets = _read_database_secrets(database_path)
-        with sqlite3.connect(restored_db) as conn:
+        with closing(sqlite3.connect(restored_db)) as conn:
             conn.execute("PRAGMA journal_mode=DELETE")
             integrity = conn.execute("PRAGMA integrity_check").fetchone()
             if integrity is None or str(integrity[0]).casefold() != "ok":
-                raise ValueError("Backup database failed integrity check")
+                raise ValueError(err("backup.integrityFailed"))
             for old_path, new_path in restored_paths.items():
                 conn.execute(
                     "UPDATE episodes SET subtitle_path=? WHERE subtitle_path=?",
                     (new_path, old_path),
                 )
-            if existing_database_secrets:
-                table = conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
-                ).fetchone()
-                if table:
-                    for key, value in existing_database_secrets.items():
-                        conn.execute(
-                            "INSERT INTO ln_settings(key,value) VALUES(?,?) "
-                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                            (key, value),
-                        )
             conn.commit()
+        _keep_database_secrets(restored_db, existing_database_secrets)
+        _merge_iphone_access(restored_db, database_path)
+        with closing(sqlite3.connect(restored_db)) as conn:
             final_integrity = conn.execute("PRAGMA integrity_check").fetchone()
             if final_integrity is None or str(final_integrity[0]).casefold() != "ok":
-                raise ValueError("Prepared backup database failed integrity check")
+                raise ValueError(err("backup.preparedIntegrityFailed"))
 
         staged_config: Path | None = None
         if restored_config.exists():
@@ -472,64 +729,167 @@ def restore_backup(*, archive_path: Path, config_path: Path, database_path: Path
             )
             _validate_staged_config(staged_config, database_path=database_path, cache_dir=cache_dir)
 
-        rollback_dir = tmp / "rollback"
-        rollback_dir.mkdir(parents=True, exist_ok=True)
-        rollback_db = rollback_dir / "library.sqlite3"
-        database_existed = database_path.is_file()
-        if database_existed:
-            _sqlite_snapshot(database_path, rollback_db)
-
-        rollback_config = rollback_dir / "config.toml"
-        config_existed = config_path.is_file()
-        if config_existed:
-            shutil.copy2(config_path, rollback_config)
-
-        cache_rollbacks: list[tuple[Path, Path | None]] = []
-        for index, (_original, _staged, target) in enumerate(staged_cached, start=1):
-            if target.is_file():
-                backup_target = rollback_dir / f"cached-{index:04d}-{target.name}"
-                shutil.copy2(target, backup_target)
-                cache_rollbacks.append((target, backup_target))
-            else:
-                cache_rollbacks.append((target, None))
-
-        try:
-            # No writer may be active while WAL/SHM are removed. WebApp owns
-            # that lifecycle guarantee before calling restore_backup().
-            for suffix in ("-wal", "-shm"):
-                Path(str(database_path) + suffix).unlink(missing_ok=True)
-            _atomic_copy(restored_db, database_path)
-            if staged_config is not None:
-                _atomic_copy(staged_config, config_path)
-                config_path.chmod(0o600)
-            for _original, staged, target in staged_cached:
-                _atomic_copy(staged, target)
-            # Keep rollback snapshots alive through service rebind. The caller
-            # must not declare success until the new runtime is operational.
-            if post_commit is not None:
-                post_commit()
-        except Exception:
-            for target, backup_target in reversed(cache_rollbacks):
-                if backup_target is None:
-                    target.unlink(missing_ok=True)
-                else:
-                    _atomic_copy(backup_target, target)
-            if staged_config is not None:
-                if config_existed:
-                    _atomic_copy(rollback_config, config_path)
-                    config_path.chmod(0o600)
-                else:
-                    config_path.unlink(missing_ok=True)
-            for suffix in ("-wal", "-shm"):
-                Path(str(database_path) + suffix).unlink(missing_ok=True)
-            if database_existed:
-                _atomic_copy(rollback_db, database_path)
-            else:
-                database_path.unlink(missing_ok=True)
-            raise
+        files: list[tuple[Path, Path, int | None]] = []
+        if staged_config is not None:
+            files.append((staged_config, config_path, 0o600))
+        files.extend((staged, target, None) for _original, staged, target in staged_cached)
+        if staged_identity:
+            identity_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            files.extend(staged_identity)
+        undo = _commit_restore(
+            database_path=database_path,
+            restored_db=restored_db,
+            files=files,
+            rollback_dir=tmp / "rollback",
+            post_commit=post_commit,
+        )
 
     return {
         "path": str(archive_path),
         "restored_cached_files": len(restored_paths),
+        "restored_iphone_identity": len(staged_identity),
+        "undo_snapshot": str(undo) if undo is not None else "",
+        "restart_required": True,
+    }
+
+
+def _keep_database_secrets(staged_db: Path, secrets: dict[str, str]) -> None:
+    """API keys of this Mac win over the (redacted or older) ones of the restored copy."""
+    if not secrets:
+        return
+    with closing(sqlite3.connect(staged_db)) as conn:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_settings'"
+        ).fetchone():
+            return
+        for key, value in secrets.items():
+            conn.execute(
+                "INSERT INTO ln_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+        conn.commit()
+
+
+def _commit_restore(
+    *,
+    database_path: Path,
+    restored_db: Path,
+    files: list[tuple[Path, Path, int | None]],
+    rollback_dir: Path,
+    post_commit: Callable[[], None] | None,
+) -> Path | None:
+    """Swap the live database (and files) with rollback; returns the undo copy.
+
+    The current library is first copied to ``<db>.pre-restore-<time>.backup``:
+    the rollback source if anything fails, and afterwards the copy that undoes
+    this restore. Helper processes (mpv) cannot open the database meanwhile.
+    """
+    rollback_dir.mkdir(parents=True, exist_ok=True)
+    file_rollbacks: list[tuple[Path, Path | None, int | None]] = []
+    for index, (_staged, target, mode) in enumerate(files, start=1):
+        if target.is_file():
+            saved = rollback_dir / f"file-{index:04d}-{target.name}"
+            shutil.copy2(target, saved)
+            file_rollbacks.append((target, saved, mode))
+        else:
+            file_rollbacks.append((target, None, mode))
+    try:
+        with exclusive_database(database_path, timeout=RESTORE_LOCK_TIMEOUT):
+            undo: Path | None = None
+            damaged: Path | None = None
+            if database_path.is_file():
+                try:
+                    undo = make_database_snapshot(database_path, "pre-restore", prune=False)
+                except (sqlite3.Error, ValueError):
+                    # The live library is damaged (often the reason to restore):
+                    # keep it as it is for the rollback, never offered as a copy.
+                    damaged = database_path.with_name(
+                        f"{database_path.name}.damaged-{time.strftime('%Y%m%d-%H%M%S')}.backup"
+                    )
+                    shutil.copy2(database_path, damaged)
+                    for suffix in ("-wal", "-shm"):
+                        side = Path(str(database_path) + suffix)
+                        if side.is_file():
+                            shutil.copy2(side, Path(str(damaged) + suffix))
+            try:
+                # No writer may be active while WAL/SHM are removed. WebApp owns
+                # that lifecycle guarantee before calling restore; helper
+                # processes wait on the restore lock.
+                for suffix in ("-wal", "-shm"):
+                    Path(str(database_path) + suffix).unlink(missing_ok=True)
+                _atomic_copy(restored_db, database_path)
+                for staged, target, mode in files:
+                    _atomic_copy(staged, target)
+                    if mode is not None:
+                        target.chmod(mode)
+                # Keep rollback copies alive through service rebind. The caller
+                # must not declare success until the new runtime is operational.
+                if post_commit is not None:
+                    post_commit()
+            except Exception:
+                for target, saved, mode in reversed(file_rollbacks):
+                    if saved is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        _atomic_copy(saved, target)
+                        if mode is not None:
+                            target.chmod(mode)
+                for suffix in ("-wal", "-shm"):
+                    Path(str(database_path) + suffix).unlink(missing_ok=True)
+                if undo is not None:
+                    _atomic_copy(undo, database_path)
+                    undo.unlink(missing_ok=True)
+                elif damaged is not None:
+                    for suffix in ("-wal", "-shm"):
+                        side = Path(str(damaged) + suffix)
+                        if side.is_file():
+                            _atomic_copy(side, Path(str(database_path) + suffix))
+                    _atomic_copy(damaged, database_path)
+                else:
+                    database_path.unlink(missing_ok=True)
+                raise
+    except DatabaseInUse as exc:
+        raise RuntimeError(err("backup.helpersBusy")) from exc
+    _prune_snapshots(database_path, "pre-restore", keep_path=undo)
+    return undo
+
+
+def restore_database_snapshot(
+    *,
+    snapshot_path: Path,
+    database_path: Path,
+    post_commit: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Put a local copy of the library back (before a restore, daily, before an update).
+
+    Settings and files stay as they are; the current library is kept as a
+    pre-restore copy first, so this can be undone the same way.
+    """
+    database_path = Path(database_path).expanduser()
+    snapshot_path = Path(snapshot_path).expanduser()
+    if not any(Path(item["path"]) == snapshot_path for item in list_database_snapshots(database_path)):
+        raise ValueError(err("backup.unknownSnapshot"))
+    with tempfile.TemporaryDirectory(prefix=f"{APP_SLUG}-restore-") as raw_tmp:
+        tmp = Path(raw_tmp)
+        staged = tmp / "library.sqlite3"
+        shutil.copy2(snapshot_path, staged)
+        with closing(sqlite3.connect(staged)) as conn:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            integrity = conn.execute("PRAGMA integrity_check").fetchone()
+            if integrity is None or str(integrity[0]).casefold() != "ok":
+                raise ValueError(err("backup.integrityFailed"))
+        _keep_database_secrets(staged, _read_database_secrets(database_path))
+        _merge_iphone_access(staged, database_path)
+        undo = _commit_restore(
+            database_path=database_path,
+            restored_db=staged,
+            files=[],
+            rollback_dir=tmp / "rollback",
+            post_commit=post_commit,
+        )
+    return {
+        "path": str(snapshot_path),
+        "restored_cached_files": 0,
+        "undo_snapshot": str(undo) if undo is not None else "",
         "restart_required": True,
     }

@@ -21,10 +21,7 @@ def _anime(media_id: int) -> AniListAnime:
 
 
 def test_season_marker_is_not_an_episode_range() -> None:
-    name = (
-        "[NanakoRaws] Re Zero kara Hajimeru Isekai Seikatsu "
-        "S3 - 13 (AT-X 1920x1080 x265 AAC).ass"
-    )
+    name = "[NanakoRaws] Re Zero kara Hajimeru Isekai Seikatsu S3 - 13 (AT-X 1920x1080 x265 AAC).ass"
     assert explicit_episode_range(name) is None
 
 
@@ -109,9 +106,7 @@ def test_optimizer_rejects_cross_season_even_when_base_title_matches(tmp_path: P
     assert _candidate_explicit_anilist_mismatch(candidate) is True
 
 
-def test_rezero_s4_absolute_episode_rejects_exact_title_s1_entry(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_rezero_s4_absolute_episode_rejects_exact_title_s1_entry(tmp_path: Path, monkeypatch) -> None:
     cfg = AppConfig()
     cfg.jimaku.api_key = "token"
     cfg.paths.cache_dir = tmp_path / "cache"

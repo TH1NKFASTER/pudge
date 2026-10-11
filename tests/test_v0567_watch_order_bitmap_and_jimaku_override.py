@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from desktop_isolation import patch_webapp_popen
@@ -18,10 +19,7 @@ from pudge.models import (
     VideoIdentity,
 )
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from test_v0564_compact_series_and_jimaku_special import SEQUENCE, monogatari_state
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -35,15 +33,26 @@ def make_api(tmp_path: Path) -> WebAppApi:
     return WebAppApi(cfg.config_path)
 
 
-def test_watch_order_rows_use_immediate_tooltip_and_hide_order_mode() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    source = html[html.index("function readySequenceCard"):html.index("function readyHomeRenderer")]
-
-    assert 'class="ready-sequence-row-title" data-tooltip="${escapeHtml(a.title)}"' in source
-    assert "const mode=" not in source
-    assert "label.releaseOrder" not in source
-    assert "label.anilistOrder" not in source
-    assert "<span>${mode}</span>" not in source
+def test_watch_order_rows_use_immediate_tooltip_and_hide_order_mode(tmp_path: Path, page) -> None:
+    # Long entry titles are cut in the list: hovering one shows the full title at once
+    # (Pudge's tooltip, not the delayed native one); the list does not say which order it uses.
+    for lang in ("en", "ru"):
+        result = page.run(
+            SEQUENCE
+            + """
+            const list = card.querySelector('.ready-sequence-list');
+            await __fire('.ready-sequence-row[data-entry-index="1"] .ready-sequence-row-title', 'mouseover', {relatedTarget: document.body}, 'MouseEvent');
+            const tip = {shown: $('titleTooltip').classList.contains('show'), text: $('titleTooltip').textContent};
+            return {tip, native: [...list.querySelectorAll('[title]')].length, list: list.innerText,
+                    orderLabels: ['label.watchSequence', 'label.releaseOrder', 'label.anilistOrder'].map(key => t(key))};
+            """,
+            lang=lang,
+            state=monogatari_state(tmp_path / lang),
+        )
+        out = result.value
+        assert out["tip"] == {"shown": True, "text": "Nisemonogatari"}
+        assert out["native"] == 0
+        assert not any(label in out["list"] for label in out["orderLabels"])
 
 
 def test_bitmap_embedded_subtitle_is_waiting_for_text_and_kept_for_library(
@@ -169,15 +178,13 @@ def test_jimaku_entry_12479_uses_normal_exact_anilist_mapping(
 
     monkeypatch.setattr(
         "pudge.cli.JimakuClient.search_entries",
-        lambda self, *, anilist_id=None, query=None: [entry]
-        if anilist_id == 211711 or "I am a hero too" in str(query or "")
-        else [],
+        lambda self, *, anilist_id=None, query=None: (
+            [entry] if anilist_id == 211711 or "I am a hero too" in str(query or "") else []
+        ),
     )
     monkeypatch.setattr(
         "pudge.cli.JimakuClient.files_for_episode",
-        lambda self, entry_id, episode, alternative_episodes=(): [jimaku_file]
-        if entry_id == 12479
-        else [],
+        lambda self, entry_id, episode, alternative_episodes=(): [jimaku_file] if entry_id == 12479 else [],
     )
     monkeypatch.setattr("pudge.cli.JimakuClient.close", lambda self: None)
 
@@ -216,6 +223,31 @@ def test_jimaku_entry_12479_uses_normal_exact_anilist_mapping(
     assert candidates[0].details["entry_id"] == 12479
     assert candidates[0].details["entry_anilist_match"] is True
     assert candidates[0].details["single_special_exact_entry"] is True
-    assert "KNOWN_JIMAKU_ENTRY_OVERRIDES" not in (
-        ROOT / "pudge" / "cli.py"
-    ).read_text(encoding="utf-8")
+
+    # Entry 12479 has no hard-coded override any more: the same entry id, listed under
+    # another AniList show and name, is not taken for this special.
+    unrelated = replace(
+        entry, anilist_id=1, name="Unrelated show", english_name="Unrelated show", japanese_name="無関係"
+    )
+    monkeypatch.setattr(
+        "pudge.cli.JimakuClient.search_entries", lambda self, *, anilist_id=None, query=None: [unrelated]
+    )
+    assert (
+        _find_online_subtitles(
+            video,
+            VideoIdentity(title="Boku no Hero Academia: I am a hero too", episode=1),
+            cfg,
+            None,
+            False,
+            anime_hint=AniListAnime(
+                id=211711,
+                titles=["Boku no Hero Academia: I am a hero too"],
+                synonyms=[],
+                season_year=2026,
+                episodes=1,
+                format="SPECIAL",
+            ),
+            skip_airing_lookup=True,
+        )
+        == []
+    )

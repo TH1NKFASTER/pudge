@@ -27,7 +27,6 @@
   const WARM_SYNC_MAX_MS = 15_000;
 
   const uiRef = () => typeof ui !== 'undefined' ? ui : window.ui;
-  const ru = () => document.documentElement.lang === 'ru' || uiRef()?.lang === 'ru';
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[ch]));
@@ -194,12 +193,10 @@
   }
 
   function progressText(status) {
-    if (status?.checked && status?.reason === 'no_due_cards') return ru() ? 'Карточки проверены' : 'Cards checked';
+    if (status?.checked && status?.reason === 'no_due_cards') return PudgeI18n.t('gate.cardsChecked');
     const completed = displayedCompleted(status);
     const required = Math.max(1, Number(status?.required || 1));
-    return ru()
-      ? `Повторено ${completed} из ${required}`
-      : `Reviewed ${completed} of ${required}`;
+    return PudgeI18n.t('gate.reviewedOf',{completed:completed,required:required});
   }
 
   function selectedReading(card) {
@@ -273,10 +270,10 @@
   function secondsText(raw) {
     const seconds = Number(raw || 0);
     if (!Number.isFinite(seconds) || seconds <= 0) return '';
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-    if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
-    return `${Math.round(seconds / 86400)}d`;
+    if (seconds < 60) return PudgeI18n.t('gate.intervalSeconds', {value: Math.round(seconds)});
+    if (seconds < 3600) return PudgeI18n.t('gate.intervalMinutes', {value: Math.round(seconds / 60)});
+    if (seconds < 86400) return PudgeI18n.t('gate.intervalHours', {value: Math.round(seconds / 3600)});
+    return PudgeI18n.t('gate.intervalDays', {value: Math.round(seconds / 86400)});
   }
 
   function activeGateActions() {
@@ -319,8 +316,8 @@
     const meta = [
       Number(card?.frequencyRank || 0) > 0 ? `#${Number(card.frequencyRank)}` : '',
       ...(Array.isArray(card?.partsOfSpeech) ? card.partsOfSpeech.slice(0, 4) : []),
-      Number(card?.lapses || 0) > 0 ? `${ru() ? 'Ошибок' : 'Lapses'}: ${Number(card.lapses)}` : '',
-      card?.isLeech ? (ru() ? 'Leech' : 'Leech') : '',
+      Number(card?.lapses || 0) > 0 ? PudgeI18n.t('gate.lapsesCount', {count: Number(card.lapses)}) : '',
+      card?.isLeech ? (PudgeI18n.t('gate.leech')) : '',
     ].filter(Boolean);
     const source = String(card?.sourceDeckName || '').trim();
     const occurrences = (Array.isArray(card?.deckOccurrences) ? card.deckOccurrences : [])
@@ -341,15 +338,15 @@
       ${contextImage ? `<div class="pudge-review-gate-image"><img src="${esc(contextImage)}" alt="" loading="lazy"></div>` : ''}
       ${meta.length ? `<div class="pudge-review-gate-meta">${meta.map(value => `<span>${esc(value)}</span>`).join('')}</div>` : ''}
       ${meanings.length ? `<ol class="pudge-review-gate-meanings">${meanings.map(value => `<li>${esc(value)}</li>`).join('')}</ol>` : ''}
-      ${example ? `<div class="pudge-review-gate-example"><small>${ru() ? 'Пример' : 'Example'}</small>${esc(example)}</div>` : ''}
-      ${(source || occurrences.length) ? `<div class="pudge-review-gate-source"><small>${ru() ? 'Источник' : 'Source'}</small>${esc(source || occurrences.join(' · '))}</div>` : ''}
+      ${example ? `<div class="pudge-review-gate-example"><small>${PudgeI18n.t('gate.example')}</small>${esc(example)}</div>` : ''}
+      ${(source || occurrences.length) ? `<div class="pudge-review-gate-source"><small>${PudgeI18n.t('table.source')}</small>${esc(source || occurrences.join(' · '))}</div>` : ''}
       ${gradeButtonsHtml(card)}`;
   }
 
   function jitenWordHtml(card, markup, className = '') {
     const wordId = Number(card?.wordId), readingIndex = Number(card?.readingIndex);
     if (!Number.isSafeInteger(wordId) || wordId <= 0 || !Number.isSafeInteger(readingIndex) || readingIndex < 0) return markup;
-    const label = ru() ? 'Открыть слово на Jiten' : 'Open word on Jiten';
+    const label = PudgeI18n.t('gate.openWordOnJiten');
     return `<button type="button" class="pudge-review-gate-word-link ${className}" data-review-gate-jiten data-word-id="${wordId}" data-reading-index="${readingIndex}" title="${esc(label)}" aria-label="${esc(label)}">${markup}</button>`;
   }
 
@@ -373,10 +370,10 @@
     const tone = String(action?.tone || grade);
     return `
       <div class="pudge-review-gate-previous">
-        <span class="pudge-review-gate-previous-label">${ru() ? 'Предыдущее' : 'Previous'}</span>
+        <span class="pudge-review-gate-previous-label">${PudgeI18n.t('gate.previous')}</span>
         <strong>${esc(word)}</strong>
         <span class="pudge-review-gate-previous-grade grade-${esc(tone)}">${esc(action ? actionLabel(action) : grade)}</span>
-        <button type="button" data-review-gate-undo ${undoing ? 'disabled' : ''}>${ru() ? 'Отменить' : 'Undo'}</button>
+        <button type="button" data-review-gate-undo ${undoing ? 'disabled' : ''}>${PudgeI18n.t('manga.undo')}</button>
       </div>`;
   }
 
@@ -406,8 +403,8 @@
       body = `
         <div class="pudge-review-gate-front">
           <div class="pudge-review-gate-word">${jitenWordHtml(card, frontMarkup, 'pudge-review-gate-word-text')}</div>
-          ${frontConfusable.length ? `<div class="pudge-review-gate-front-confusable"><small>${ru() ? 'Похожие чтения' : 'Confusable readings'}</small><span>${esc(frontConfusable.join(' ・ '))}</span></div>` : ''}
-          <button class="primary pudge-review-gate-show-answer" data-review-gate-show-answer>${ru() ? 'Показать ответ' : 'Show answer'} <kbd>Space</kbd></button>
+          ${frontConfusable.length ? `<div class="pudge-review-gate-front-confusable"><small>${PudgeI18n.t('gate.confusableReadings')}</small><span>${esc(frontConfusable.join(' ・ '))}</span></div>` : ''}
+          <button class="primary pudge-review-gate-show-answer" data-review-gate-show-answer>${PudgeI18n.t('gate.showAnswer')} <kbd>${PudgeI18n.t('gate.spaceKey')}</kbd></button>
         </div>
         <div class="pudge-review-gate-back"${revealed ? '' : ' hidden'}>${backDetails(card)}</div>`;
     } else {
@@ -415,26 +412,24 @@
       revealed = false;
       if (view?.loading || saving) {
         const loadingText = saving
-          ? (ru() ? 'Сохраняю предыдущее повторение…' : 'Saving previous review…')
-          : (ru() ? 'Загружаю карточку Jiten…' : 'Loading Jiten review card…');
+          ? (PudgeI18n.t('gate.savingPreviousReview'))
+          : (PudgeI18n.t('gate.loadingJitenReviewCard'));
         body = `<div class="pudge-review-gate-loading"><span class="spinner"></span>${esc(loadingText)}</div>`;
       } else {
-        const message = String(view?.message || (ru()
-          ? 'Нет доступных уже изученных карточек. Новые карточки здесь никогда не создаются.'
-          : 'No previously studied cards are available. This gate never creates new cards.'));
+        const message = view?.message ? PudgeI18n.message(String(view.message)) : PudgeI18n.t('gate.noPreviouslyStudiedCardsAre');
         const checkedEmpty = view.checked && view.reason === 'no_due_cards' && view.granted;
         const action = checkedEmpty
-          ? `<button class="primary" data-review-gate-continue>${ru() ? 'Продолжить чтение' : 'Continue reading'}</button>`
-          : `<button data-review-gate-retry>${ru() ? 'Повторить' : 'Retry'}</button>`;
+          ? `<button class="primary" data-review-gate-continue>${PudgeI18n.t('gate.continueReading')}</button>`
+          : `<button data-review-gate-retry>${PudgeI18n.t('media.retry')}</button>`;
         body = `<div class="pudge-review-gate-empty">${esc(message)}</div><div class="pudge-review-gate-actions">${action}</div>`;
       }
     }
     const stateNote = undoing && card
-      ? `<span class="pudge-review-gate-saving">${esc(ru() ? 'Отменяю предыдущее повторение…' : 'Undoing previous review…')}</span>`
+      ? `<span class="pudge-review-gate-saving">${esc(PudgeI18n.t('gate.undoingPreviousReview'))}</span>`
       : (saving && card
-        ? `<span class="pudge-review-gate-saving">${esc(ru() ? 'Сохраняю предыдущую…' : 'Saving previous…')}</span>`
+        ? `<span class="pudge-review-gate-saving">${esc(PudgeI18n.t('gate.savingPrevious'))}</span>`
         : (card && !cardAuthorized
-          ? `<span class="pudge-review-gate-saving">${esc(authorizing ? (ru() ? 'Подтверждаю карточку…' : 'Authorizing card…') : (ru() ? 'Карточка ещё не подтверждена' : 'Card authorization pending'))}</span>`
+          ? `<span class="pudge-review-gate-saving">${esc(authorizing ? (PudgeI18n.t('gate.authorizingCard')) : (PudgeI18n.t('gate.cardAuthorizationPending')))}</span>`
           : ''));
     // WebKit can retain the focus/hover compositor of a button that is removed
     // by innerHTML. Blur it before replacing the card to avoid transient ghosts.
@@ -445,13 +440,13 @@
     root.innerHTML = `
       <div class="pudge-review-gate-head">
         <div class="pudge-review-gate-head-copy">
-          <div class="pudge-review-gate-title">${launch?.content?(ru()?'Повторение перед чтением':'Review before reading'):(ru() ? `Повторение перед серией${episode ? ` ${episode}` : ''}` : `Review before episode${episode ? ` ${episode}` : ''}`)}</div>
+          <div class="pudge-review-gate-title">${launch?.content?(PudgeI18n.t('gate.reviewBeforeReading')):(episode ? PudgeI18n.t('gate.reviewBeforeEpisodeNumber',{episode}) : PudgeI18n.t('gate.reviewBeforeEpisodePlain'))}</div>
 
         </div>
-        <button class="pudge-review-gate-close" data-review-gate-close aria-label="Close">×</button>
+        <button class="pudge-review-gate-close" data-review-gate-close aria-label="${PudgeI18n.t('action.close')}">×</button>
       </div>
       <div class="pudge-review-gate-progress"><span style="width:${width}%"></span></div>
-      <div class="pudge-review-gate-status${unknownCount ? ' warning' : ''}">${esc(progressText(view))}${unknownCount ? esc(ru() ? ` • ${unknownCount} неоднозначных попыток не засчитано` : ` • ${unknownCount} ambiguous attempt(s) not counted`) : ''}${stateNote}</div>
+      <div class="pudge-review-gate-status${unknownCount ? ' warning' : ''}">${esc(progressText(view))}${unknownCount ? ` • ${esc(PudgeI18n.tn('gate.ambiguousAttemptsNotCounted',unknownCount))}` : ''}${stateNote}</div>
       ${previousReviewHtml()}
       ${body}`;
     root.classList.toggle('answer-shown', revealed);
@@ -502,7 +497,7 @@
       }
     };
     void syncWarm();
-    prefetchTimer = setInterval(() => void prefetch(false), PREFETCH_INTERVAL_MS);
+    prefetchTimer = setInterval(() => { if (!document.hidden) void prefetch(false); }, PREFETCH_INTERVAL_MS);
   }
 
   async function finishAndLaunch() {
@@ -531,6 +526,7 @@
       !!pending.allowImageSubtitles,
       pending.queueContext || null,
       !!pending.allowUnsyncedSubtitles,
+      true,
     );
   }
 
@@ -551,14 +547,21 @@
     try {
       const status = await (launch.content ? window.pywebview.api.content_review_begin(launch.kind,launch.bookId,launch.part) : window.pywebview.api.review_gate_begin(launch.path));
       if (myGeneration !== generation || !launch) return;
+      if (status && status.blocking === false && status.granted !== true && status.reason === 'review_unavailable') {
+        // Nothing can be issued (no Jiten, no OCR text, provider down): reading goes on.
+        uiLog('begin_done', {granted:false, reason:'review_unavailable', message:String(status.message || ''),
+          duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt)});
+        await finishAndLaunch();
+        return;
+      }
       if (!status || (status.granted !== true && status.blocking !== true)) {
-        throw new Error(ru() ? 'Ревью ещё не проверено. Повторите запрос.' : 'Review status has not been checked. Retry.');
+        throw new Error(PudgeI18n.t('gate.reviewStatusHasNotBeen'));
       }
       if (launch.content && status.checked && status.reason === 'no_due_cards' && status.granted) {
         authorizing = false;
         busy = false;
         overlay?.classList.remove('pudge-review-gate-busy');
-        render({...status, loading:false, message:ru() ? 'В этой части нет карточек для повторения.' : 'No cards are due in this part.'}, {replaceCards:true});
+        render({...status, loading:false, message:PudgeI18n.t('gate.noCardsAreDueIn')}, {replaceCards:true});
         uiLog('begin_done', {granted:true, checked:true, reason:'no_due_cards', awaiting_continue:true,
           duration_ms:Math.round((performance?.now?.() ?? Date.now()) - startedAt)});
         return;
@@ -675,7 +678,7 @@
       uiLog('review_result', {card:submittedKey, grade:String(grade || 'good'), outcome:String(result?.outcome || ''), completed:Number(result?.completed || 0), remaining:Number(result?.remaining || 0), granted:Boolean(result?.granted), duration_ms:Math.round((performance?.now?.() ?? Date.now()) - submitStartedAt)});
       if (result?.outcome === 'unknown') {
         uiLog('review_optimistic_rollback', {card:submittedKey, reason:'outcome_unknown', displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
-        window.toast?.(result?.message || (ru() ? 'Результат неизвестен; карточка не засчитана и не будет автоматически повторена.' : 'Review outcome is unknown; it was not counted and will not be retried automatically.'));
+        window.toast?.(result?.message || (PudgeI18n.t('gate.reviewOutcomeIsUnknownIt')));
       } else {
         uiLog('review_optimistic_confirm', {card:submittedKey, displayed_completed:displayedCompleted(currentStatus), confirmed_completed:Number(currentStatus?.completed || 0), optimistic_pending:optimisticReviewed});
         window.dispatchEvent?.(new CustomEvent('pudge-review-completed',{detail:{backend:'jiten',wordId,readingIndex}}));
@@ -735,7 +738,7 @@
       if (!providerHasReview) {
         throw new Error(
           submitted?.message
-          || (ru() ? 'Предыдущее повторение не было подтверждено сервером.' : 'The previous review was not confirmed by the server.')
+          || (PudgeI18n.t('gate.thePreviousReviewWasNot'))
         );
       }
 
@@ -745,7 +748,7 @@
         Number(entry.card?.readingIndex || 0),
       );
       if (!result?.ok || String(result?.outcome || '') !== 'undone') {
-        throw new Error(result?.message || `Undo failed: ${String(result?.outcome || 'unknown')}`);
+        throw new Error(result?.message || PudgeI18n.t('gate.undoFailed', {outcome: String(result?.outcome || 'unknown')}));
       }
 
       currentStatus = {...(currentStatus || {}), ...(result || {})};
@@ -763,8 +766,7 @@
       render({}, {replaceCards:false});
       uiLog('review_undo_error', {card:entry.cardKey, error:String(error?.message || error || '')});
       window.toast?.(
-        (ru() ? 'Не удалось отменить предыдущее повторение: ' : 'Could not undo previous review: ')
-        + String(error?.message || error || '')
+        PudgeI18n.t('gate.couldNotUndoPreviousReviewError', {error: String(error?.message || error || '')})
       );
       if (launch && !busy && cardQueue.length === 0) void loadBatch();
       return false;

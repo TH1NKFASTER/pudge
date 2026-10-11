@@ -2,6 +2,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 const pop = {
   _html:'',
   style:{removeProperty(){}},
@@ -34,10 +35,12 @@ const window = {
   }},
   addEventListener(){},
 };
-vm.runInNewContext(fs.readFileSync(process.argv[2],'utf8'),{
+const context = vm.createContext({
   window,document,requestAnimationFrame(){},getComputedStyle(){return {}},
   setTimeout(){return 1},clearTimeout(){},console,Date,
-}, {filename:'reading_tools.js'});
+});
+loadI18n(context, require('node:path').dirname(process.argv[2]));
+vm.runInContext(fs.readFileSync(process.argv[2],'utf8'), context, {filename:'reading_tools.js'});
 const study = window.PudgeReadingTools.study;
 const words = Array.from({length:11},(_,i)=>`語${i+1}`);
 const sentence = words.join(' ')+'。';

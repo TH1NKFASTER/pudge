@@ -7,17 +7,29 @@ from pudge.manager import AnimeManager, ManagerError
 from pudge.manager_models import LibraryAnime, NyaaRelease
 
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_waiting_card_has_no_final_suffix_after_not_ready() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    start = html.index("function waitingHomeCard(a){")
-    end = html.index("function downloadAvailableHomeCard(a){", start)
-    block = html[start:end]
-    assert "const state=episodePresentationStatus(a,episode);" in block
-    assert "finalSuffix" not in block
-    assert "is_final_episode" not in block
+def test_waiting_card_has_no_final_suffix_after_not_ready(page) -> None:
+    # "Episode 12 is not ready • Final" read as if the final episode were a status.
+    final = {"media_id": 7, "title": "Show", "episodes": 12, "next_episode": 12, "is_final_episode": True}
+    subtitles = {
+        **final,
+        "media_id": 8,
+        "title": "Other",
+        "presentation": {"status": "waiting_subtitles", "episode": 12},
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('current', true); renderCurrent(); await __tick(20);
+            const state = id => __text(`.waiting-card[data-media-id="${id}"] .airing-state`);
+            return {plain: state(7), subtitles: state(8), notReady: t('label.episodeNotReady', {episode: 12}),
+                    waitingSubs: t('label.waitingSubs'), final: t('label.final'), page: __text('#current')};
+            """,
+            lang=lang,
+            state={"current": [final, subtitles], "home": {"waiting": [final, subtitles]}},
+        )
+        out = result.value
+        assert out["plain"] == out["notReady"] and out["subtitles"] == out["waitingSubs"]
+        assert out["final"] not in out["page"]
 
 
 def test_sync_download_observation_failure_does_not_abort_maintenance() -> None:

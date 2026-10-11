@@ -1,8 +1,15 @@
+"""Listen together: the local reading-rate guard of the alignment clock (behaviour; the
+revision and pipeline checks rewritten in audit 71Б)."""
+
 from __future__ import annotations
 
 import pytest
 
-from pudge.reading_audio_alignment import _prune_rejoining_local_rate_outliers
+from pudge import audiobooks
+from pudge import reading_audio_alignment as raa
+from pudge.audiobooks import _READING_AUDIO_ALIGNMENT_REVISION
+from pudge.reading_audio_alignment import _prune_rejoining_local_rate_outliers, light_novel_position_for_audio
+from t71g23_support import paired_book, write_alignment
 
 
 def _spice_wolf_v1_clock() -> list[dict[str, float]]:
@@ -19,9 +26,7 @@ def _spice_wolf_v1_clock() -> list[dict[str, float]]:
 
 
 def test_real_v1_clock_drops_only_transient_rate_outliers() -> None:
-    rows, debug = _prune_rejoining_local_rate_outliers(
-        _spice_wolf_v1_clock(), max_rate=7.512
-    )
+    rows, debug = _prune_rejoining_local_rate_outliers(_spice_wolf_v1_clock(), max_rate=7.512)
 
     assert [(float(row["offset"]), float(row["time"])) for row in rows] == [
         (8.0, 311.228),
@@ -79,36 +84,53 @@ def test_rate_guard_preserves_non_monotonic_tail_for_existing_safeguards() -> No
     assert debug["dropped"] == 0
 
 
-def test_local_rate_guard_bumps_persisted_alignment_revision() -> None:
-    from pathlib import Path
+V21 = "reading-audio-v3-leading-prefix-v21"
 
-    source = (Path(__file__).parents[1] / "pudge" / "audiobooks.py").read_text(
-        encoding="utf-8"
+
+def test_alignment_made_before_the_local_rate_guard_is_rebuilt_and_reports_its_revision(
+    tmp_path, monkeypatch
+) -> None:
+    # The guard changed the clock (v22): an alignment cached by the v21 algorithm is not
+    # used — neither at the cache path v21 had nor through the migration of compatible
+    # caches — so the book is aligned again. Status and the paired state name the
+    # algorithm revision of the alignment in use (for diagnosing real traces).
+    audio, ln_id, audio_id = paired_book(
+        tmp_path,
+        [("一", "吾輩は猫である。名前はまだない。"), ("二", "どこで生まれたか見当がつかぬ。")],
+        duration=20.0,
     )
-    assert '_READING_AUDIO_ALIGNMENT_REVISION = "reading-audio-v3-leading-prefix-v22"' in source
+    chapters = [
+        {
+            "chapter_index": index,
+            "title": title,
+            "normalized_length": length,
+            "confidence": 0.9,
+            "leading_prefix_debug": {"recovered": True, "chapter": index},
+            "anchors": [{"offset": 0, "time": 10.0 * index}, {"offset": length, "time": 10.0 * index + 9.0}],
+        }
+        for index, (title, length) in enumerate([("一", 14), ("二", 14)])
+    ]
+    current_path = audio._alignment_path(ln_id, audio_id)
+    with monkeypatch.context() as patch:
+        patch.setattr(audiobooks, "_READING_AUDIO_ALIGNMENT_REVISION", V21)
+        audio._fingerprint_cache.clear()
+        v21_path = audio._alignment_path(ln_id, audio_id)
+    audio._fingerprint_cache.clear()
+    assert v21_path != current_path
+    write_alignment(audio, audio_id, v21_path, chapters, V21)
+    assert audio.alignment_status(ln_id) == {"status": "not_prepared", "ready": False}
+    assert audio.paired_state(ln_id)["alignment"] == {"status": "not_prepared", "ready": False}
 
-    fingerprint = source.split("def _alignment_fingerprint", 1)[1].split(
-        "def _alignment_path", 1
-    )[0]
-    assert "_READING_AUDIO_ALIGNMENT_REVISION" in fingerprint
-
-    migration = source.split("def _migrate_compatible_alignment", 1)[1].split(
-        "def alignment_status", 1
-    )[0]
-    assert "revision != _READING_AUDIO_ALIGNMENT_REVISION" in migration
-
-
-def test_alignment_status_exposes_algorithm_revision_for_real_trace_diagnostics() -> None:
-    from pathlib import Path
-
-    source = (Path(__file__).parents[1] / "pudge" / "audiobooks.py").read_text(
-        encoding="utf-8"
+    write_alignment(audio, audio_id, current_path, chapters, _READING_AUDIO_ALIGNMENT_REVISION)
+    status = audio.alignment_status(ln_id)
+    assert (
+        status["ready"] is True and status["algorithm_revision"] == _READING_AUDIO_ALIGNMENT_REVISION != V21
     )
-    status = source.split("def alignment_status", 1)[1].split(
-        "def _shift_transcription_segments", 1
-    )[0]
-    assert '"algorithm_revision"' in status
-    assert 'processing.get("alignment_algorithm_revision")' in status
+    audio.set_position(audio_id, 13.0)
+    paired = audio.paired_state(ln_id)
+    assert paired["ln_chapter_index"] == 1
+    assert paired["alignment"]["algorithm_revision"] == _READING_AUDIO_ALIGNMENT_REVISION
+    assert paired["alignment"]["chapter_start_debug"] == {"recovered": True, "chapter": 1}
 
 
 def test_rate_guard_can_be_scoped_to_verified_prefix_without_touching_tail() -> None:
@@ -147,57 +169,75 @@ def test_rate_guard_can_be_scoped_to_verified_prefix_without_touching_tail() -> 
     assert debug["max_offset_exclusive"] == pytest.approx(102.0)
 
 
-def test_alignment_pipeline_prunes_after_punctuation_injection() -> None:
-    from pathlib import Path
-
-    source = (Path(__file__).parents[1] / "pudge" / "reading_audio_alignment.py").read_text(
-        encoding="utf-8"
-    )
-    pipeline = source.split("for chapter in aligned:", 1)[1].split(
-        "return {", 1
-    )[0]
-
-    inject_index = pipeline.index(
-        'chapter["anchors"], pause_count = _inject_punctuation_pause_anchors'
-    )
-    scoped_prune_index = pipeline.index(
-        'max_offset_exclusive=verified_through_offset'
-    )
-    preferred_rate_index = pipeline.index(
-        'preferred_rate=float(leading_debug.get("verified_rate") or 0.0)'
-    )
-    assert scoped_prune_index > inject_index
-    assert preferred_rate_index > inject_index
+# The Spice and Wolf v1 prefix after punctuation pause holds were added.
+_ENRICHED_PREFIX = [
+    {"offset": 8.0, "time": 311.228},
+    {"offset": 19.999, "time": 312.528},
+    {"offset": 19.999, "time": 313.027},
+    {"offset": 20.0, "time": 313.028},
+    {"offset": 24.999, "time": 313.728},
+    {"offset": 24.999, "time": 314.547},
+    {"offset": 25.0, "time": 314.548},
+    {"offset": 32.999, "time": 315.308},
+    {"offset": 32.999, "time": 315.867},
+    {"offset": 33.0, "time": 315.868},
+    {"offset": 44.0, "time": 319.928},
+]
 
 
-def test_ready_alignment_trace_exposes_current_algorithm_revision() -> None:
-    from pathlib import Path
+def test_alignment_prunes_the_fast_edges_that_punctuation_pauses_create(monkeypatch) -> None:
+    # Punctuation/VAD enrichment can itself create transient fast edges inside the recovered
+    # prose prefix (real Spice and Wolf v1: 8 -> 19.999 and 25 -> 32.999). The finished
+    # alignment must not contain them: the rate guard runs after the enrichment, at the
+    # chapter's verified reading rate, and only before the verified end of the prefix.
+    text = "吾輩は猫である。名前はまだない。どこで生まれたか見当がつかぬ。何でも薄暗いじめじめした所で泣いていたことだけは記憶している。"
+    leading = {
+        "attempted": True,
+        "recovered": True,
+        "verified_through_offset": 102,
+        "verified_rate": 4.173,
+        "max_bridge_rate": 7.512,
+    }
 
-    source = (Path(__file__).parents[1] / "pudge" / "audiobooks.py").read_text(
-        encoding="utf-8"
+    def recovered_prefix(_text, _segments, _clock, **_kwargs):
+        return (
+            [{"offset": 0, "time": 309.0}, {"offset": 8, "time": 311.228}, {"offset": 44, "time": 319.928}],
+            309.0,
+            dict(leading),
+        )
+
+    def enriched(_anchors, _boundaries, _regions):
+        # What the enrichment makes of this prefix: pause holds that rejoin too fast.
+        rows = [
+            {"offset": 0, "time": 309.0},
+            *[dict(row) for row in _ENRICHED_PREFIX],
+            {"offset": 120, "time": 340.0},
+        ]
+        return rows, 3
+
+    monkeypatch.setattr(raa, "_recover_leading_prefix_clock", recovered_prefix)
+    monkeypatch.setattr(raa, "_inject_punctuation_pause_anchors", enriched)
+    normalized = raa.normalize_reading_text(text)
+    alignment = raa.align_light_novel_to_transcript(
+        [{"chapter_index": 0, "title": "第一章", "text": text}],
+        [{"start": 309.0, "end": 340.0, "text": normalized}],
+        duration=400.0,
+        model="test-model",
+        speech_regions=[{"start": 309.0, "end": 340.0}],
     )
-    marker = '"chapter_start_debug": chapter_start_debug'
-    marker_index = source.index(marker)
-    paired_state = source[max(0, marker_index - 1200) : marker_index + len(marker)]
-    assert '"algorithm_revision": _READING_AUDIO_ALIGNMENT_REVISION' in paired_state
+    chapter = alignment["chapters"][0]
+    assert [(float(row["offset"]), float(row["time"])) for row in chapter["anchors"]] == [
+        (0.0, 309.0),
+        (8.0, 311.228),
+        (44.0, 319.928),
+        (120.0, 340.0),
+    ]
+    prune = chapter["leading_prefix_debug"]["local_rate_prune"]
+    assert prune["dropped"] == 9 and prune["preferred_rate"] == pytest.approx(4.173)
 
 
 def test_rate_prune_rejoin_uses_wall_clock_so_vad_cannot_restore_runaway() -> None:
-    from pudge.reading_audio_alignment import light_novel_position_for_audio
-
-    rows = [
-        {"offset": 8.0, "time": 311.228},
-        {"offset": 19.999, "time": 312.528},
-        {"offset": 19.999, "time": 313.027},
-        {"offset": 20.0, "time": 313.028},
-        {"offset": 24.999, "time": 313.728},
-        {"offset": 24.999, "time": 314.547},
-        {"offset": 25.0, "time": 314.548},
-        {"offset": 32.999, "time": 315.308},
-        {"offset": 32.999, "time": 315.867},
-        {"offset": 33.0, "time": 315.868},
-        {"offset": 44.0, "time": 319.928},
-    ]
+    rows = [dict(row) for row in _ENRICHED_PREFIX]
     repaired, debug = _prune_rejoining_local_rate_outliers(
         rows,
         max_rate=7.512,

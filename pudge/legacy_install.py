@@ -6,6 +6,7 @@ legacy default locations and the matching config values.  Conflicting source
 files are left in place; config paths are rewritten only when the referenced
 legacy path no longer exists and the corresponding Pudge path does exist.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,11 +41,7 @@ class MigrationReport:
 
 
 def split_legacy(value: str, current: str) -> list[str]:
-    return [
-        item.strip()
-        for item in str(value or "").split("|")
-        if item.strip() and item.strip() != current
-    ]
+    return [item.strip() for item in str(value or "").split("|") if item.strip() and item.strip() != current]
 
 
 def _sha256(path: Path) -> str:
@@ -323,7 +320,8 @@ def main() -> int:
             legacy_names=legacy_names,
             legacy_slugs=legacy_slugs,
         )
-    print(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))
+    if any(report.as_dict().values()):  # an update with nothing to migrate prints nothing
+        print(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))
     return 0
 
 

@@ -1,25 +1,56 @@
+"""Audiobook volume cards select on a plain click; a full backup keeps prepared subtitles
+(behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
 import zipfile
 from pathlib import Path
 
-from pudge import __version__
+from t71g01_support import AUDIOBOOKS, AUDIO_SELECTION
+
 from pudge.backup import create_backup, restore_backup
 from pudge.database import Database
 from pudge.manager_models import LibraryEpisode
 
 
-ROOT = Path(__file__).resolve().parents[1]
-
-
-def test_audiobook_volume_card_selects_on_plain_background_click() -> None:
-    js = (ROOT / "pudge/web/media.js").read_text(encoding="utf-8")
-
-    assert "if(target.closest?.('.audiobook-cover'))return false" in js
-    assert "[data-media-action],.audiobook-bookmarks,.audiobook-scrubber-shell" in js
-    assert ".audiobook-controls,.audiobook-bookmarks" not in js
-    assert "if(!modified&&!audioSelection.size)return" not in js
-    assert "if(audioSelection.has(id))audioSelection.delete(id);else audioSelection.add(id)" in js
+def test_audiobook_volume_card_selects_on_plain_background_click(page) -> None:
+    result = page.run(
+        AUDIO_SELECTION
+        + r"""
+        const out = {};
+        const step = async (name, selector) => { await __click(selector); await __tick(10); out[name] = selected(); };
+        await step('background', `${card(5)} .audiobook-main`);
+        // The empty part of the controls row is card background too.
+        await step('controlsRow', `${card(4)} .audiobook-controls`);
+        await step('toggleOff', `${card(4)} .audiobook-controls`);
+        // Real controls, the cover, bookmarks and the timeline keep their own actions.
+        await step('play', `${card(4)} [data-media-action="play-audio"]`);
+        await step('cover', `${card(3)} .audiobook-cover`);
+        await step('plainCover', `${card(4)} .audiobook-cover`);   // cover art without a link
+        await step('bookmarks', `${card(3)} .audiobook-bookmarks`);
+        await step('bookmark', `${card(3)} .audiobook-bookmark-label`);
+        await step('timeline', `${card(4)} .audiobook-scrubber-shell`);
+        // A volume of a series card selects just that volume.
+        await step('volume', `${card(3)} .audiobook-main`);
+        return out;
+        """,
+        api={**AUDIOBOOKS, "audiobook_play": {"ok": True}, "audiobook_seek_to": {"ok": True}},
+    )
+    assert result.value == {
+        "background": [5],
+        "controlsRow": [4, 5],
+        "toggleOff": [5],
+        "play": [5],
+        "cover": [5],
+        "plainCover": [5],
+        "bookmarks": [5],
+        "bookmark": [5],
+        "timeline": [5],
+        "volume": [3, 5],
+    }
+    assert [call[0] for call in result.calls_of("audiobook_play")] == [4]
+    assert result.calls_of("open_url") == [["https://anilist.co/manga/9"]]
+    assert result.calls_of("audiobook_seek_to") == [[3, 60]]
 
 
 def test_full_backup_keeps_durable_prepared_subtitle(tmp_path: Path) -> None:

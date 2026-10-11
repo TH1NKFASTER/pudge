@@ -6,6 +6,9 @@ from pudge.config import AppConfig, load_config, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, NyaaRelease
 from pudge.providers.aria2 import Aria2Client
+from source_policy import source
+from tests.i18n_support import en, ru
+from test_v0711_gui_homebrew_path import FORMULAS, brew_calls, run_installer
 
 
 def release() -> NyaaRelease:
@@ -144,9 +147,7 @@ def test_aria2_prefers_tracker_rich_torrent_payload(tmp_path: Path, monkeypatch)
     client.close()
 
 
-def test_aria2_large_torrent_avoids_default_rpc_request_limit(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_aria2_large_torrent_avoids_default_rpc_request_limit(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
     calls: list[tuple[str, list[object]]] = []
     monkeypatch.setattr(client, "ensure_running", lambda: None)
@@ -209,9 +210,7 @@ def test_aria2_start_and_pause_are_idempotent(tmp_path: Path, monkeypatch) -> No
     client.close()
 
 
-def test_aria2_reconnect_force_pauses_and_unpauses_without_removing_data(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_aria2_reconnect_force_pauses_and_unpauses_without_removing_data(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
     calls: list[str] = []
     monkeypatch.setattr(client, "ensure_running", lambda: None)
@@ -339,9 +338,7 @@ def test_manager_eventually_reconnects_zero_progress_aria2_download(
     assert client.calls == ["abc"]
 
 
-def test_aria2_exposes_verification_without_publishing_completion(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_aria2_exposes_verification_without_publishing_completion(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
     gid = "0123456789abcdef"
     client._save_metadata(
@@ -465,14 +462,70 @@ def test_aria2_delete_removes_owned_metadata(tmp_path: Path, monkeypatch) -> Non
     client.close()
 
 
-def test_release_contains_aria2_ui_and_installer() -> None:
-    root = Path(__file__).resolve().parents[1]
-    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    installer = (root / "install.sh").read_text(encoding="utf-8")
-    assert "s_aria2_enabled" in html
-    assert "pywebview.api.test_aria2" in html
-    assert "brew --prefix aria2" in installer
-    assert "PUDGE_ARIA2C" in installer
+ARIA2_SETTINGS = r"""
+const out = {label: $('s_aria2_enabled').closest('label').innerText.trim(), expected: t('settings.useAria2'),
+             checked: $('s_aria2_enabled').checked};
+await __input('#s_aria2_seed_mode', 'ratio');
+await __click('#testAria2');
+await __tick(10);
+out.toast = __toasts().at(-1);
+await __input('#s_aria2_enabled', false);
+out.testWhenOff = $('testAria2').disabled;
+await __click('#saveSettings');
+await __tick(10);
+return out;
+"""
+
+
+def test_settings_switch_and_test_the_built_in_downloader(page) -> None:
+    # The window offers the built-in downloader (aria2) and a check of it with the current form.
+    for lang in ("en", "ru"):
+        result = page.run(
+            ARIA2_SETTINGS,
+            lang=lang,
+            state={"settings": {"aria2_enabled": True}},
+            api={"test_aria2": {"version": "1.37.0", "url": "http://127.0.0.1:6800/jsonrpc"}},
+            before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+        )
+        out = result.value
+        assert out["label"] == out["expected"] and out["checked"] is True
+        [[form]] = result.calls_of("test_aria2")
+        assert (form["aria2_enabled"], form["aria2_seed_mode"]) == (True, "ratio")  # the form as it is now
+        assert out["toast"] == "aria2 1.37.0; http://127.0.0.1:6800/jsonrpc"
+        assert out["testWhenOff"] is True
+        assert result.calls_of("save_settings")[0][0]["aria2_enabled"] is False
+
+
+def test_installer_installs_aria2_and_finds_aria2c(tmp_path: Path) -> None:
+    # Homebrew installs the aria2 formula when it is missing; the app gets the path of its aria2c.
+    completed, lines = run_installer(
+        tmp_path / "missing", installed=tuple(name for name in FORMULAS if name != "aria2")
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "brew install aria2" in [call for call, _ran, _path in brew_calls(lines)]
+    assert lines[-1].split("|")[2] == str(
+        tmp_path / "missing" / "installer" / "prefix" / "aria2" / "bin" / "aria2c"
+    )
+    # A broken formula without aria2c stops the install with a clear message.
+    completed, lines = run_installer(tmp_path / "broken", aria2c=False)
+    assert completed.returncode == 1
+    assert "aria2 was installed but aria2c was not found" in completed.stderr
+    assert not [line for line in lines if line.startswith("stop|")]
+    # policy: the compiled launcher and the LaunchAgent get PUDGE_ARIA2C deep in the macOS-only
+    # part of install.sh (venv, clang, launchctl); there is nothing to run here.
+    assert source("install.sh").count("PUDGE_ARIA2C") >= 2
+
+
+def test_aria2_client_uses_the_installed_binary(tmp_path: Path, monkeypatch) -> None:
+    installed = tmp_path / "Cellar" / "aria2" / "bin" / "aria2c"
+    installed.parent.mkdir(parents=True)
+    installed.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("PUDGE_ARIA2C", str(installed))
+    client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
+    try:
+        assert client._binary_path() == str(installed)
+    finally:
+        client.close()
 
 
 def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, monkeypatch) -> None:
@@ -514,7 +567,9 @@ def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, mo
                     "completedLength": "50",
                     "infoHash": release().info_hash,
                     "dir": str(tmp_path),
-                    "files": [{"path": str(tmp_path / "episode.mkv"), "length": "100", "completedLength": "50"}],
+                    "files": [
+                        {"path": str(tmp_path / "episode.mkv"), "length": "100", "completedLength": "50"}
+                    ],
                     "bittorrent": {"info": {"name": "episode.mkv"}},
                 },
             ]
@@ -531,26 +586,63 @@ def test_aria2_hides_magnet_metadata_parent_and_keeps_payload(tmp_path: Path, mo
     client.close()
 
 
-def test_first_experience_explains_qbittorrent_is_optional() -> None:
-    root = Path(__file__).resolve().parents[1]
-    html = (root / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "автоматические загрузки выполнит управляемый aria2c" in html
-    assert "с меньшим набором функций" in html
-    assert "Torrent: ${d.qbt_enabled?'qBittorrent':'aria2'}" in html
+ONBOARDING = r"""
+const next = async () => { await __click('#onboardingNext'); await __tick(20); };
+await __input('#o_profile', PROFILE);
+while (ui.onboardingStep < 4) await next();
+const step4 = {text: [...document.querySelectorAll('#onboardingBody > p')].map(p => p.innerText.trim()),
+               callout: __text('#onboardingBody .setup-callout')};
+if (USE_QBT) await __input('#o_qbt_enabled', true);
+await next();
+return {step4, summary: __text('#onboardingBody .setup-callout'), torrent: t('uiB.onboarding.torrent'),
+        qbtText: t('onboarding.qbtText'), aria2Notice: t('onboarding.aria2Notice')};
+"""
+FIRST_START = {
+    "state": {"settings": {"onboarding_completed": False}},
+    "api": {"first_experience_dependencies": {"mpv": {"installed": True}, "ffmpeg": {"installed": True}}},
+}
 
 
-
-
+def test_first_experience_explains_qbittorrent_is_optional(page) -> None:
+    # Audit 68Б: the onboarding texts are catalog entries (their final wording:
+    # downloads work through Pudge's built-in aria2 without a torrent client).
+    assert en("onboarding.qbtText") == "Automatic downloads work through Pudge with no torrent-client setup."
+    assert (
+        ru("onboarding.qbtText")
+        == "Автоматические загрузки работают через Pudge без настройки торрент-клиента."
+    )
+    assert (
+        en("onboarding.aria2Notice")
+        == "Downloads are ready. Pudge will start its built-in downloader when needed."
+    )
+    assert "встроенный загрузчик" in ru("onboarding.aria2Notice")
+    assert en("uiB.onboarding.torrent") == "Torrent"
+    # The downloads step says so; the last step names the downloader that was chosen.
+    for lang, profile, use_qbt, downloader in (
+        ("en", "full", False, "Pudge"),
+        ("ru", "full", False, "Pudge"),
+        ("en", "full", True, "qBittorrent"),
+        ("en", "subtitles", False, "—"),
+    ):
+        code = ONBOARDING.replace("PROFILE", repr(profile)).replace("USE_QBT", "true" if use_qbt else "false")
+        out = page.run(code, lang=lang, **FIRST_START).value
+        assert out["step4"]["text"][0] == out["qbtText"]
+        assert out["step4"]["callout"] == out["aria2Notice"]
+        assert f"{out['torrent']}: {downloader}" in out["summary"]
 
 
 def test_aria2_set_file_priority_uses_one_based_select_file(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
     calls: list[tuple[str, list[object]]] = []
-    monkeypatch.setattr(client, "files", lambda _hash: [
-        {"index": 0, "priority": 1},
-        {"index": 1, "priority": 1},
-        {"index": 2, "priority": 1},
-    ])
+    monkeypatch.setattr(
+        client,
+        "files",
+        lambda _hash: [
+            {"index": 0, "priority": 1},
+            {"index": 1, "priority": 1},
+            {"index": 2, "priority": 1},
+        ],
+    )
     monkeypatch.setattr(client, "_resolve_gid", lambda _hash: "0123456789abcdef")
 
     def rpc(method: str, params=None):
@@ -560,7 +652,5 @@ def test_aria2_set_file_priority_uses_one_based_select_file(tmp_path: Path, monk
     monkeypatch.setattr(client, "_rpc_raw", rpc)
     client.set_file_priority("hash", [0, 2], 0)
 
-    assert calls == [
-        ("aria2.changeOption", ["0123456789abcdef", {"select-file": "2"}])
-    ]
+    assert calls == [("aria2.changeOption", ["0123456789abcdef", {"select-file": "2"}])]
     client.close()

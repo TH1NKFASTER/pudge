@@ -37,6 +37,13 @@ def _pid_command(pid: int) -> str:
     return " ".join((completed.stdout or "").strip().split())
 
 
+# Waiting background workers ask every 0.5 s; the command check forks ``ps``.
+# A marker whose command was verified stays trusted for a short while (the
+# cheap PID liveness check still runs every time).
+_COMMAND_CHECK_TTL_SECONDS = 30.0
+_verified_marker: dict[tuple[int, float, str], float] = {}
+
+
 def foreground_active(cache_dir: Path) -> bool:
     marker = _marker(cache_dir)
     try:
@@ -53,10 +60,16 @@ def foreground_active(cache_dir: Path) -> bool:
     # markers keep the original command fingerprint so an unrelated process
     # cannot block all background work for up to six hours.
     if expected_command:
-        current_command = _pid_command(pid)
-        if current_command and current_command != expected_command:
-            marker.unlink(missing_ok=True)
-            return False
+        key = (pid, created_at, expected_command)
+        verified_at = _verified_marker.get(key)
+        if verified_at is None or time.monotonic() - verified_at > _COMMAND_CHECK_TTL_SECONDS:
+            current_command = _pid_command(pid)
+            if current_command and current_command != expected_command:
+                _verified_marker.pop(key, None)
+                marker.unlink(missing_ok=True)
+                return False
+            _verified_marker.clear()
+            _verified_marker[key] = time.monotonic()
     return True
 
 

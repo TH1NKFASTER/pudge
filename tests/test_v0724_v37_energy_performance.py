@@ -17,9 +17,7 @@ def test_energy_monitor_runs_even_in_safe_mode(monkeypatch) -> None:
     events: list[str] = []
     api = object.__new__(WebAppApi)
     api.safe_mode = SimpleNamespace(active=True)
-    api.config = SimpleNamespace(
-        diagnostics=SimpleNamespace(energy_monitoring_enabled=True)
-    )
+    api.config = SimpleNamespace(diagnostics=SimpleNamespace(energy_monitoring_enabled=True))
     api.energy_monitor = SimpleNamespace(
         running=False,
         start=lambda: events.append("start"),
@@ -179,7 +177,9 @@ def test_refresh_passes_first_library_scan_to_interactive_refresh(tmp_path: Path
     api.scan_watched_media_folders = lambda: {}
     api.manager = SimpleNamespace(
         scan_library=lambda **kwargs: scans.append(dict(kwargs)) or [1, 2, 3],
-        run_interactive_refresh=lambda *, pre_scanned_library_count=None: received.append(pre_scanned_library_count) or {"library": 999},
+        run_interactive_refresh=lambda *, pre_scanned_library_count=None: (
+            received.append(pre_scanned_library_count) or {"library": 999}
+        ),
         reconcile_prepared_subtitle_rows=lambda: 0,
         sync_downloads=lambda: 0,
         log=lambda *_args: None,

@@ -1,9 +1,11 @@
 """User-selected ScreenCaptureKit window access, kept alive for one VN session."""
+
 from __future__ import annotations
 
 import threading
 import time
 from typing import Any
+from .i18n import err
 
 _observer_class: Any = None
 
@@ -14,7 +16,9 @@ def _observer_type():
         import objc
         from Foundation import NSObject
 
-        class PudgeWindowPickerObserver(NSObject, protocols=[objc.protocolNamed("SCContentSharingPickerObserver")]):
+        class PudgeWindowPickerObserver(
+            NSObject, protocols=[objc.protocolNamed("SCContentSharingPickerObserver")]
+        ):
             def contentSharingPicker_didUpdateWithFilter_forStream_(self, picker, content_filter, stream):
                 if stream is None:
                     self.completed("filter", content_filter)
@@ -48,8 +52,10 @@ class WindowPickerSession:
 
     def _present(self) -> None:
         from .visual_novels import VisualNovelError
+
         try:
             import ScreenCaptureKit as SCK
+
             with self._lock:
                 if self._closed:
                     return
@@ -66,9 +72,13 @@ class WindowPickerSession:
                 picker.setActive_(True)
             picker.presentPickerUsingContentStyle_(SCK.SCShareableContentStyleWindow)
         except Exception as exc:
-            self._complete("exception", VisualNovelError(
-                f"macOS window picker could not open: {exc}", code="capture_backend_unavailable",
-            ))
+            self._complete(
+                "exception",
+                VisualNovelError(
+                    f"macOS window picker could not open: {exc}",
+                    code="capture_backend_unavailable",
+                ),
+            )
 
     def select(self, stop_event: threading.Event, *, timeout: float = 90.0) -> Any:
         from PyObjCTools import AppHelper
@@ -79,15 +89,16 @@ class WindowPickerSession:
         try:
             while not self._done.wait(0.05):
                 if stop_event.is_set():
-                    raise VisualNovelError("Window selection cancelled", code="cancelled")
+                    raise VisualNovelError(err("vn.selectionCancelled"), code="cancelled")
                 if time.monotonic() >= deadline:
-                    raise VisualNovelError("Window selection timed out", code="capture_timeout")
+                    raise VisualNovelError(err("vn.selectionTimeout"), code="capture_timeout")
             if self._closed or stop_event.is_set() or self._result.get("cancelled"):
-                raise VisualNovelError("Window selection cancelled", code="cancelled")
+                raise VisualNovelError(err("vn.selectionCancelled"), code="cancelled")
             if "exception" in self._result:
                 raise self._result["exception"]
             if "error" in self._result:
                 from .visual_novels import VisualNovelService
+
                 error = self._result["error"]
                 raise VisualNovelError(
                     VisualNovelService._objc_error_text(error),
@@ -95,7 +106,7 @@ class WindowPickerSession:
                 )
             content_filter = self._result.get("filter")
             if content_filter is None:
-                raise VisualNovelError("macOS did not select a window", code="window_unavailable")
+                raise VisualNovelError(err("vn.noWindowSelected"), code="window_unavailable")
             return content_filter
         except BaseException:
             self.close()

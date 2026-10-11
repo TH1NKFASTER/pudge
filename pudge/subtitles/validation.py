@@ -14,6 +14,44 @@ def _number(value: object, default: float = 0.0) -> float:
     return result if math.isfinite(result) else default
 
 
+def alass_transition_matching_timeline_boundary(
+    transition_rows: object,
+    boundaries: object,
+) -> dict[str, object] | None:
+    """Return the gap-supported ALASS jump that repeats an embedded timeline edit."""
+
+    if not isinstance(transition_rows, list) or not isinstance(boundaries, list):
+        return None
+    matching: list[dict[str, object]] = []
+    for row in transition_rows:
+        if not isinstance(row, dict) or not bool(row.get("gap_supported")):
+            continue
+        try:
+            jump = float(row.get("jump_seconds") or 0.0)
+            nearby_gap_seconds = float(row.get("nearby_gap_seconds") or 0.0)
+            nearby_gap_time = float(row.get("nearby_gap_time") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if abs(jump) < 2.0 or nearby_gap_seconds < 45.0:
+            continue
+        for boundary in boundaries:
+            if not isinstance(boundary, dict):
+                continue
+            try:
+                boundary_time = float(boundary.get("source_time"))
+                boundary_jump = float(boundary.get("jump_seconds"))
+            except (TypeError, ValueError):
+                continue
+            if abs(nearby_gap_time - boundary_time) <= 15.0 and abs(jump - boundary_jump) <= max(
+                1.5, 0.25 * abs(boundary_jump)
+            ):
+                matching.append(row)
+                break
+    if not matching:
+        return None
+    return max(matching, key=lambda row: abs(float(row.get("jump_seconds") or 0.0)))
+
+
 def _candidate_context(result: Mapping[str, Any]) -> Mapping[str, Any]:
     value = result.get("candidate_context")
     return value if isinstance(value, Mapping) else {}
@@ -35,9 +73,12 @@ def unresolved_early_edit(result: Mapping[str, Any]) -> bool:
     if isinstance(scaffold, Mapping) and scaffold.get("applied"):
         return False
     plateau = result.get("stt_opening_plateau_refinement")
-    if (isinstance(plateau, Mapping) and plateau.get("applied")
-            and plateau.get("sparse_consensus_accepted")
-            and not result.get("alignment_output_rejected")):
+    if (
+        isinstance(plateau, Mapping)
+        and plateau.get("applied")
+        and plateau.get("sparse_consensus_accepted")
+        and not result.get("alignment_output_rejected")
+    ):
         return False
     engine = str(result.get("engine") or "")
     if "timeline" in engine and "alass" not in engine:
@@ -67,12 +108,21 @@ def unverified_timeline_edit(result: Mapping[str, Any]) -> bool:
     speech = result.get("speech_verification")
     if isinstance(speech, Mapping):
         attempts = speech.get("attempts")
-        if (speech.get("accepted") or (speech.get("engine") and speech.get("sync_was_successful") is not False)
-                or (isinstance(attempts, list) and any(isinstance(row, Mapping) and row.get("accepted") for row in attempts))):
+        if (
+            speech.get("accepted")
+            or (speech.get("engine") and speech.get("sync_was_successful") is not False)
+            or (
+                isinstance(attempts, list)
+                and any(isinstance(row, Mapping) and row.get("accepted") for row in attempts)
+            )
+        ):
             return False
         guard = result.get("unsafe_stt_map")
-        if (speech.get("reason") == "stt_alass_no_safe_map" and isinstance(guard, Mapping)
-                and guard.get("reason") == "strong_embedded_timeline_after_unsafe_stt"):
+        if (
+            speech.get("reason") == "stt_alass_no_safe_map"
+            and isinstance(guard, Mapping)
+            and guard.get("reason") == "strong_embedded_timeline_after_unsafe_stt"
+        ):
             return False
     return True
 

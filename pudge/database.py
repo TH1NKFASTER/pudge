@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 from .language import IMAGE_SUBTITLE_EXTENSIONS
 from .manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from .release_parser import double_episode_span
 from .episode_state import transition_episode_state, stronger_episode_state
 from .personal_schedule import (
     PersonalReleaseItem,
@@ -20,8 +22,12 @@ from .personal_schedule import (
     PersonalScheduleRevisionConflict,
     materialize_schedule_items,
     normalize_schedule_rule,
+    reanchored_start_local_datetime,
 )
+from .i18n import err
 
+
+_LOGGER = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS anime (
@@ -147,6 +153,18 @@ CREATE TABLE IF NOT EXISTS app_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_app_jobs_state_updated
 ON app_jobs(state,updated_at DESC);
+
+-- Split-stage numbering learned from a manual release choice:
+-- "this uploader numbers this title continuously, with this offset".
+CREATE TABLE IF NOT EXISTS release_numbering_rules (
+    media_id INTEGER NOT NULL,
+    release_group TEXT NOT NULL,
+    season_key TEXT NOT NULL,
+    episode_offset INTEGER NOT NULL,
+    example_title TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    PRIMARY KEY(media_id, release_group, season_key)
+);
 
 CREATE TABLE IF NOT EXISTS release_history (
     info_hash TEXT PRIMARY KEY,
@@ -279,11 +297,9 @@ CREATE TABLE IF NOT EXISTS state (
 -- Cheap cross-process UI invalidation marker. These triggers bump one integer
 -- only when data that can change rendered UI state changes. Playback heartbeat
 -- fields are intentionally excluded so watching a video does not rebuild the UI
--- every second.
+-- every second. The UPDATE triggers of anime, episodes, downloads and
+-- subtitle_jobs are installed by Database._install_ui_state_update_triggers.
 CREATE TRIGGER IF NOT EXISTS anime_ui_state_insert AFTER INSERT ON anime BEGIN
-    UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
-END;
-CREATE TRIGGER IF NOT EXISTS anime_ui_state_update AFTER UPDATE ON anime BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
 CREATE TRIGGER IF NOT EXISTS anime_ui_state_delete AFTER DELETE ON anime BEGIN
@@ -293,10 +309,6 @@ END;
 CREATE TRIGGER IF NOT EXISTS episodes_ui_state_insert AFTER INSERT ON episodes BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
-CREATE TRIGGER IF NOT EXISTS episodes_ui_state_update
-AFTER UPDATE OF media_id,title,episode,video_path,subtitle_path,embedded_subtitle_id,subtitle_origin,state,torrent_hash,downloaded_at,watched_at,delete_after ON episodes BEGIN
-    UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
-END;
 CREATE TRIGGER IF NOT EXISTS episodes_ui_state_delete AFTER DELETE ON episodes BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
@@ -304,17 +316,11 @@ END;
 CREATE TRIGGER IF NOT EXISTS downloads_ui_state_insert AFTER INSERT ON downloads BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
-CREATE TRIGGER IF NOT EXISTS downloads_ui_state_update AFTER UPDATE ON downloads BEGIN
-    UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
-END;
 CREATE TRIGGER IF NOT EXISTS downloads_ui_state_delete AFTER DELETE ON downloads BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
 
 CREATE TRIGGER IF NOT EXISTS subtitle_jobs_ui_state_insert AFTER INSERT ON subtitle_jobs BEGIN
-    UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
-END;
-CREATE TRIGGER IF NOT EXISTS subtitle_jobs_ui_state_update AFTER UPDATE ON subtitle_jobs BEGIN
     UPDATE state SET value=CAST(value AS INTEGER)+1,updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';
 END;
 CREATE TRIGGER IF NOT EXISTS subtitle_jobs_ui_state_delete AFTER DELETE ON subtitle_jobs BEGIN
@@ -669,6 +675,33 @@ CREATE TABLE IF NOT EXISTS consumption_sync_receipts (
     received_at_utc REAL NOT NULL,
     PRIMARY KEY(device_id,record_id)
 );
+
+-- Statistics words (consumption_words.py): parsed words of each piece of text consumed
+-- (episode subtitles, a manga page, a VN line, an LN chapter), filled in the background.
+CREATE TABLE IF NOT EXISTS consumption_word_units (
+    unit_key TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    words_json TEXT NOT NULL DEFAULT '',
+    source_json TEXT NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_after REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consumption_word_units_status
+ON consumption_word_units(status,updated_at);
+
+-- Lines a visual-novel capture session read (the capture keeps only the last ones in memory).
+CREATE TABLE IF NOT EXISTS vn_capture_lines (
+    session_id TEXT NOT NULL,
+    line_id INTEGER NOT NULL,
+    captured_at_utc REAL NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY(session_id,line_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vn_capture_lines_time
+ON vn_capture_lines(captured_at_utc);
 """
 
 LATEST_SCHEMA_VERSION = 13
@@ -697,6 +730,90 @@ def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
         raise sqlite3.OperationalError("incomplete SQL migration statement")
 
 
+# Continue Watching lists an episode from this position on, until this close to its end.
+RESUME_MIN_POSITION = 30.0
+RESUME_MIN_REMAINING = 60.0
+
+
+def _resumable(state: object, position: float | None, duration: float | None) -> bool:
+    """True when the episode belongs in Continue Watching (as resumable_episodes selects it)."""
+    if str(state or "") == "watched" or position is None or float(position) < RESUME_MIN_POSITION:
+        return False
+    return duration is None or float(duration) - float(position) >= RESUME_MIN_REMAINING
+
+
+_UI_STATE_BUMP_SQL = (
+    "UPDATE state SET value=CAST(value AS INTEGER)+1,"
+    "updated_at=CAST(strftime('%s','now') AS REAL) WHERE key='ui_state_version';"
+)
+_EPISODE_UI_COLUMNS = (
+    "media_id",
+    "title",
+    "episode",
+    "video_path",
+    "subtitle_path",
+    "embedded_subtitle_id",
+    "subtitle_origin",
+    "state",
+    "torrent_hash",
+    "downloaded_at",
+    "watched_at",
+    "delete_after",
+)
+# (trigger, table, columns the rendered UI never reads, extra condition).
+# A no-op upsert, a timestamp touch or a worker heartbeat no longer forces a
+# full Home rebuild; every other column (including ones added by later
+# migrations) still invalidates it.
+_UI_STATE_UPDATE_TRIGGERS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("anime_ui_state_update", "anime", ("updated_at",), ""),
+    ("downloads_ui_state_update", "downloads", ("updated_at",), ""),
+    (
+        "subtitle_jobs_ui_state_update",
+        "subtitle_jobs",
+        ("updated_at", "heartbeat_at", "lease_until", "progress_json", "stage", "next_check"),
+        # A processing job's next_check is its lease (the UI shows "preparing");
+        # a pending job's next_check is the "Next check" time the UI shows.
+        "(OLD.next_check IS NOT NEW.next_check AND "
+        "(OLD.state IS NOT 'processing' OR NEW.state IS NOT 'processing'))",
+    ),
+)
+
+
+def _ui_state_update_trigger_sql(conn: sqlite3.Connection) -> dict[str, str]:
+    specs: dict[str, str] = {}
+    for name, table, skipped, extra in _UI_STATE_UPDATE_TRIGGERS:
+        columns = [str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        changed = [f"OLD.{column} IS NOT NEW.{column}" for column in columns if column not in skipped]
+        if extra:
+            changed.append(extra)
+        specs[name] = (
+            f"CREATE TRIGGER {name} AFTER UPDATE ON {table}\nWHEN "
+            + " OR ".join(changed)
+            + f" BEGIN\n    {_UI_STATE_BUMP_SQL}\nEND"
+        )
+    episode_changed = " OR ".join(f"OLD.{column} IS NOT NEW.{column}" for column in _EPISODE_UI_COLUMNS)
+    specs["episodes_ui_state_update"] = (
+        "CREATE TRIGGER episodes_ui_state_update\nAFTER UPDATE OF "
+        + ",".join(_EPISODE_UI_COLUMNS)
+        + f" ON episodes\nWHEN {episode_changed} BEGIN\n    {_UI_STATE_BUMP_SQL}\nEND"
+    )
+    return specs
+
+
+def reused_connection(db: object) -> AbstractContextManager[object]:
+    """``db.reuse_connection()`` for a real Database, a no-op for test doubles."""
+    return db.reuse_connection() if isinstance(db, Database) else nullcontext()
+
+
+def _json_object(value: object) -> dict[str, object]:
+    """Stored JSON object; one damaged row must not break a whole listing."""
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 class Database:
     def __init__(self, path: Path, *, initialize: bool = True) -> None:
         self.path = path.expanduser()
@@ -720,18 +837,43 @@ class Database:
             previous_version = int(version_row[0] if version_row else 0)
             if existing_database and previous_version < LATEST_SCHEMA_VERSION:
                 self._backup_before_migration(conn, previous_version)
+            migrating = previous_version < LATEST_SCHEMA_VERSION
             conn.execute("BEGIN IMMEDIATE")
             try:
                 _execute_sql_script(conn, SCHEMA)
                 self._migrate(conn)
-                integrity = conn.execute("PRAGMA quick_check").fetchone()
-                if integrity is None or str(integrity[0]).casefold() != "ok":
-                    raise sqlite3.DatabaseError(
-                        f"database integrity check failed: {integrity[0] if integrity else 'no result'}"
-                    )
+                self._install_ui_state_update_triggers(conn)
+                if migrating:
+                    self._quick_check(conn)
             except BaseException:
                 conn.rollback()
                 raise
+        if not migrating:
+            # The full scan runs outside the write transaction, so the agent and
+            # mpv heartbeat are not blocked for its duration on every launch.
+            with self.connect() as conn:
+                self._quick_check(conn)
+
+    @staticmethod
+    def _install_ui_state_update_triggers(conn: sqlite3.Connection) -> None:
+        """(Re)create UI invalidation triggers only when their SQL changed."""
+        existing = {
+            str(row[0]): str(row[1] or "")
+            for row in conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'").fetchall()
+        }
+        for name, sql in _ui_state_update_trigger_sql(conn).items():
+            if existing.get(name) == sql:
+                continue
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+            conn.execute(sql)
+
+    @staticmethod
+    def _quick_check(conn: sqlite3.Connection) -> None:
+        integrity = conn.execute("PRAGMA quick_check").fetchone()
+        if integrity is None or str(integrity[0]).casefold() != "ok":
+            raise sqlite3.DatabaseError(
+                f"database integrity check failed: {integrity[0] if integrity else 'no result'}"
+            )
 
     def _backup_before_migration(self, conn: sqlite3.Connection, version: int) -> Path:
         """Create a consistent last-known-good copy before changing the schema."""
@@ -743,7 +885,6 @@ class Database:
         finally:
             destination.close()
         return backup_path
-
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         version_row = conn.execute("PRAGMA user_version").fetchone()
@@ -794,9 +935,7 @@ class Database:
         self._ensure_column(conn, "manga_books", "site_url", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "manga_books", "user_score", "REAL")
         self._ensure_column(conn, "manga_books", "mean_score", "REAL")
-        manga_progress_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(manga_books)").fetchall()
-        }
+        manga_progress_columns = {row[1] for row in conn.execute("PRAGMA table_info(manga_books)").fetchall()}
         manga_read_pages_missing = "read_pages" not in manga_progress_columns
         self._ensure_column(conn, "manga_books", "read_pages", "INTEGER NOT NULL DEFAULT 0")
         if manga_read_pages_missing:
@@ -806,6 +945,10 @@ class Database:
                 "CASE WHEN position>0 THEN MIN(page_count,position+1) ELSE 0 END"
             )
         self._ensure_column(conn, "subtitle_jobs", "generation", "INTEGER NOT NULL DEFAULT 0")
+        # Two episodes in one file (audit 17А): the last episode and where it starts.
+        self._ensure_column(conn, "episodes", "media_episode_end", "INTEGER")
+        self._ensure_column(conn, "episodes", "part_boundary", "REAL")
+        self._ensure_column(conn, "downloads", "media_episode_end", "INTEGER")
         self._ensure_column(conn, "subtitle_jobs", "owner_token", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(
             conn,
@@ -816,6 +959,14 @@ class Database:
         self._ensure_column(conn, "manga_books", "source_fingerprint", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column(conn, "audiobooks", "speed", "REAL NOT NULL DEFAULT 1")
         self._ensure_column(conn, "audiobooks", "last_played_at", "REAL NOT NULL DEFAULT 0")
+        # Hot predicates of the job/torrent queries (idempotent, instant once present).
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_torrent_hash ON episodes(torrent_hash)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subtitle_jobs_state_next ON subtitle_jobs(state,next_check)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subtitle_jobs_media_episode ON subtitle_jobs(media_id,episode)"
+        )
         bookmark_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(audiobook_bookmarks)").fetchall()
         }
@@ -875,9 +1026,7 @@ class Database:
             conn.execute("ALTER TABLE anime ADD COLUMN user_score REAL")
         if "relations_json" not in columns:
             conn.execute("ALTER TABLE anime ADD COLUMN relations_json TEXT NOT NULL DEFAULT '[]'")
-        episode_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()
-        }
+        episode_columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()}
         if "embedded_subtitle_id" not in episode_columns:
             conn.execute("ALTER TABLE episodes ADD COLUMN embedded_subtitle_id INTEGER")
         if "subtitle_origin" not in episode_columns:
@@ -890,13 +1039,10 @@ class Database:
             conn.execute("ALTER TABLE episodes ADD COLUMN playback_updated_at REAL")
         if "playback_active_seconds" not in episode_columns:
             conn.execute("ALTER TABLE episodes ADD COLUMN playback_active_seconds REAL NOT NULL DEFAULT 0")
-        subtitle_job_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(subtitle_jobs)").fetchall()
-        }
+        subtitle_job_columns = {row[1] for row in conn.execute("PRAGMA table_info(subtitle_jobs)").fetchall()}
         if "priority" not in subtitle_job_columns:
-            conn.execute(
-                "ALTER TABLE subtitle_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
-            )
+            conn.execute("ALTER TABLE subtitle_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+
     def _migrate_v2(self, conn: sqlite3.Connection) -> None:
         for column, declaration in (
             ("stage", "TEXT NOT NULL DEFAULT 'queued'"),
@@ -950,7 +1096,7 @@ class Database:
                 PRIMARY KEY(book_id,chapter_index),
                 FOREIGN KEY(book_id) REFERENCES audiobooks(id) ON DELETE CASCADE
             );
-            """
+            """,
         )
 
     def _migrate_v3(self, conn: sqlite3.Connection) -> None:
@@ -990,7 +1136,7 @@ class Database:
                 updated_at REAL NOT NULL,
                 FOREIGN KEY(audiobook_id) REFERENCES audiobooks(id) ON DELETE CASCADE
             );
-            """
+            """,
         )
 
     def _migrate_v4(self, conn: sqlite3.Connection) -> None:
@@ -1015,7 +1161,7 @@ class Database:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(kind,local_id)
             );
-            """
+            """,
         )
 
     def _migrate_v8(self, conn: sqlite3.Connection) -> None:
@@ -1154,7 +1300,6 @@ class Database:
         )
         self._ensure_column(conn, "consumption_devices", "device_name", "TEXT NOT NULL DEFAULT ''")
 
-
     def _migrate_v11(self, conn: sqlite3.Connection) -> None:
         """Add R9 native-volume/offline consumption transport state."""
         _execute_sql_script(
@@ -1188,9 +1333,15 @@ class Database:
     def _migrate_v12(self, conn: sqlite3.Connection) -> None:
         """Add versioned personal-release interval rules and cycle identity."""
         self._ensure_column(conn, "personal_release_schedules", "rule_version", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "personal_release_schedules", "interval_unit", "TEXT NOT NULL DEFAULT 'weeks'")
-        self._ensure_column(conn, "personal_release_schedules", "interval_every", "INTEGER NOT NULL DEFAULT 1")
-        self._ensure_column(conn, "personal_release_schedules", "interval_clock", "TEXT NOT NULL DEFAULT 'wall'")
+        self._ensure_column(
+            conn, "personal_release_schedules", "interval_unit", "TEXT NOT NULL DEFAULT 'weeks'"
+        )
+        self._ensure_column(
+            conn, "personal_release_schedules", "interval_every", "INTEGER NOT NULL DEFAULT 1"
+        )
+        self._ensure_column(
+            conn, "personal_release_schedules", "interval_clock", "TEXT NOT NULL DEFAULT 'wall'"
+        )
         self._ensure_column(conn, "personal_release_schedules", "cycle_id", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column(conn, "personal_release_items", "dst_adjusted", "INTEGER NOT NULL DEFAULT 0")
         # Every pre-v12 schedule was the original one-episode-per-week rule.
@@ -1212,6 +1363,9 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        # WAL + NORMAL stays consistent after a crash or power loss but does not
+        # fsync on every commit (Pudge commits on nearly every repository call).
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     @contextmanager
@@ -1246,7 +1400,7 @@ class Database:
             while self._active_connections:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Database transactions did not stop before restore")
+                    raise TimeoutError(err("backup.dbBusy"))
                 self._connection_condition.wait(remaining)
 
     @contextmanager
@@ -1254,18 +1408,82 @@ class Database:
         # API payload assembly calls many small repository methods. When the
         # caller established connection_scope(), reuse one thread-local SQLite
         # connection instead of reparsing the large schema dozens of times.
-        shared = getattr(self._scope_local(), "connection", None)
+        local = self._scope_local()
+        shared = getattr(local, "connection", None)
         if shared is not None:
+            if getattr(local, "per_call", False):
+                with self._reused_call(local, shared) as conn:
+                    yield conn
+                return
             yield shared
             return
         with self._managed_connection() as conn:
             yield conn
 
     @contextmanager
+    def _reused_call(self, local: threading.local, conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+        """One repository call on a reused connection, committed like a fresh one."""
+        depth = int(getattr(local, "depth", 0) or 0)
+        if depth:
+            local.depth = depth + 1
+            try:
+                yield conn
+            finally:
+                local.depth = depth
+            return
+        with self._connection_condition:
+            if self._retired:
+                raise RuntimeError("Database is retired")
+            self._active_connections += 1
+        local.depth = 1
+        try:
+            try:
+                yield conn
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        finally:
+            local.depth = 0
+            with self._connection_condition:
+                self._active_connections -= 1
+                self._connection_condition.notify_all()
+
+    @contextmanager
+    def reuse_connection(self) -> Iterator[None]:
+        """Share one SQLite connection across a long pass of small calls.
+
+        Unlike connection_scope(), every outermost call still commits or rolls
+        back on its own exactly as with a fresh connection, and no lock or
+        transaction is held between calls (restore can still retire the
+        database mid-pass). Only the per-call open, schema parse and close are
+        saved — the dominant cost of library scans and maintenance passes.
+        """
+        local = self._scope_local()
+        if getattr(local, "connection", None) is not None:
+            yield
+            return
+        conn = self._open_connection()
+        local.connection, local.per_call, local.depth = conn, True, 0
+        try:
+            yield
+        finally:
+            local.connection, local.per_call, local.depth = None, False, 0
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+
+    @contextmanager
     def connection_scope(self) -> Iterator[sqlite3.Connection]:
         local = self._scope_local()
         shared = getattr(local, "connection", None)
         if shared is not None:
+            if getattr(local, "per_call", False):
+                # Inside reuse_connection() a scope is one atomic call.
+                with self._reused_call(local, shared) as conn:
+                    yield conn
+                return
             yield shared
             return
         with self._managed_connection() as conn:
@@ -1330,7 +1548,7 @@ class Database:
             ON episodes(media_id,media_episode);
             CREATE INDEX IF NOT EXISTS idx_episodes_release_identity
             ON episodes(media_id,release_episode);
-            """
+            """,
         )
 
     def _migrate_v6(self, conn: sqlite3.Connection) -> None:
@@ -1401,7 +1619,7 @@ class Database:
                 FOREIGN KEY(source_device_id) REFERENCES sync_devices(device_id),
                 FOREIGN KEY(event_id) REFERENCES sync_events(id) ON DELETE CASCADE
             );
-            """
+            """,
         )
 
     def _migrate_v7(self, conn: sqlite3.Connection) -> None:
@@ -1534,9 +1752,7 @@ class Database:
             return {}
         placeholders = ",".join("?" for _ in keys)
         with self.connect() as conn:
-            rows = conn.execute(
-                f"SELECT key,value FROM state WHERE key IN ({placeholders})", keys
-            ).fetchall()
+            rows = conn.execute(f"SELECT key,value FROM state WHERE key IN ({placeholders})", keys).fetchall()
         return {str(row["key"]): str(row["value"]) for row in rows}
 
     def delete_state(self, key: str) -> None:
@@ -1553,9 +1769,7 @@ class Database:
         owner_token: str,
     ) -> bool:
         with self.connect() as conn:
-            if not self._lock_subtitle_job_owner(
-                conn, video_path, generation, owner_token
-            ):
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
                 return False
             conn.execute(
                 "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
@@ -1573,13 +1787,104 @@ class Database:
         owner_token: str,
     ) -> bool:
         with self.connect() as conn:
-            if not self._lock_subtitle_job_owner(
-                conn, video_path, generation, owner_token
-            ):
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
                 return False
             conn.execute("DELETE FROM state WHERE key=?", (key,))
             return True
 
+    def prune_history(self, *, now: float | None = None, keep_seconds: float = 5 * 86400) -> dict[str, int]:
+        """Drop debug/history rows older than ``keep_seconds`` (5 days).
+
+        Kept regardless of age: the latest subtitle choice per video and the
+        latest selected one, the latest release per episode and every release
+        whose torrent is still on disk or downloading (upgrades and recovery
+        read them), and the last 100 winning torrent observations per provider
+        (they tune race deadlines).
+        """
+        cutoff = (time.time() if now is None else float(now)) - max(0.0, float(keep_seconds))
+        removed: dict[str, int] = {}
+        statements = {
+            "diagnostic_events": ("DELETE FROM diagnostic_events WHERE created_at<?", (cutoff,)),
+            "episode_state_history": ("DELETE FROM episode_state_history WHERE created_at<?", (cutoff,)),
+            "subtitle_history": (
+                """DELETE FROM subtitle_history WHERE created_at<? AND id NOT IN (
+                       SELECT MAX(id) FROM subtitle_history GROUP BY video_path
+                       UNION SELECT MAX(id) FROM subtitle_history
+                             WHERE status IN ('selected','upgraded','manual','legacy') GROUP BY video_path)""",
+                (cutoff,),
+            ),
+            "release_history": (
+                """DELETE FROM release_history WHERE selected_at<?
+                       AND lower(info_hash) NOT IN (SELECT lower(torrent_hash) FROM episodes WHERE COALESCE(torrent_hash,'')<>'')
+                       AND lower(info_hash) NOT IN (SELECT lower(torrent_hash) FROM downloads WHERE COALESCE(torrent_hash,'')<>'')
+                       AND info_hash NOT IN (
+                           SELECT info_hash FROM release_history r
+                           WHERE r.selected_at=(SELECT MAX(selected_at) FROM release_history x
+                                                WHERE x.media_id IS r.media_id
+                                                  AND COALESCE(x.media_episode,x.episode) IS COALESCE(r.media_episode,r.episode)))""",
+                (cutoff,),
+            ),
+            "torrent_observations": (
+                """DELETE FROM torrent_observations WHERE observed_at<? AND id NOT IN (
+                       SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY provider ORDER BY observed_at DESC) AS n
+                                       FROM torrent_observations WHERE outcome='winner') WHERE n<=100)""",
+                (cutoff,),
+            ),
+            "playback_markers": (
+                "DELETE FROM state WHERE substr(key,1,17)='playback_save:v1:' AND updated_at<?",
+                (cutoff,),
+            ),
+        }
+        with self.connect() as conn:
+            tables = {
+                str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            for name, (sql, args) in statements.items():
+                table = "state" if name == "playback_markers" else name
+                if table not in tables:
+                    continue
+                try:
+                    removed[name] = int(conn.execute(sql, args).rowcount or 0)
+                except sqlite3.OperationalError as exc:
+                    # An older SQLite without window functions keeps the rows.
+                    removed[name] = 0
+                    _LOGGER.warning("SKIP step=database.prune table=%s error=%r", name, exc)
+        return removed
+
+    def release_numbering_rules(self, media_id: int) -> list[dict[str, object]]:
+        with self.connect() as conn:
+            try:
+                rows = conn.execute(
+                    "SELECT media_id,release_group,season_key,episode_offset,example_title,created_at "
+                    "FROM release_numbering_rules WHERE media_id=? ORDER BY created_at",
+                    (int(media_id),),
+                ).fetchall()
+            except sqlite3.OperationalError:  # opened read-only before the app created the table
+                return []
+        return [dict(row) for row in rows]
+
+    def store_release_numbering_rule(
+        self, media_id: int, release_group: str, season_key: str, offset: int, *, example_title: str = ""
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO release_numbering_rules(media_id,release_group,season_key,episode_offset,example_title,created_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(media_id,release_group,season_key) DO UPDATE SET "
+                "episode_offset=excluded.episode_offset,example_title=excluded.example_title,created_at=excluded.created_at",
+                (
+                    int(media_id),
+                    str(release_group).casefold(),
+                    str(season_key),
+                    int(offset),
+                    str(example_title)[:300],
+                    time.time(),
+                ),
+            )
+
+    def forget_release_numbering_rules(self, media_id: int) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM release_numbering_rules WHERE media_id=?", (int(media_id),))
+        return int(cursor.rowcount or 0)
 
     def relation_graph_for_media(self, media_id: int) -> dict[str, object] | None:
         with self.connect() as conn:
@@ -1856,21 +2161,25 @@ class Database:
             progress=int(row["progress"] or 0),
             episodes=int(row["episodes"]) if row["episodes"] is not None else None,
             format=str(row["format"]) if row["format"] else None,
-            season_year=int(row["season_year"]) if "season_year" in row.keys() and row["season_year"] is not None else None,
+            season_year=int(row["season_year"])
+            if "season_year" in row.keys() and row["season_year"] is not None
+            else None,
             start_date=str(row["start_date"]) if "start_date" in row.keys() and row["start_date"] else None,
             studio=str(row["studio"] or "") if "studio" in row.keys() else "",
             media_status=str(row["media_status"]) if row["media_status"] else None,
             end_date=str(row["end_date"]) if row["end_date"] else None,
             mean_score=int(row["mean_score"]) if row["mean_score"] is not None else None,
-            user_score=float(row["user_score"]) if "user_score" in row.keys() and row["user_score"] is not None else None,
+            user_score=float(row["user_score"])
+            if "user_score" in row.keys() and row["user_score"] is not None
+            else None,
             duration=int(row["duration"]) if row["duration"] is not None else None,
             next_airing_episode=(
-                int(row["next_airing_episode"])
-                if row["next_airing_episode"] is not None
-                else None
+                int(row["next_airing_episode"]) if row["next_airing_episode"] is not None else None
             ),
             next_airing_at=int(row["next_airing_at"]) if row["next_airing_at"] else None,
-            relations=list(json.loads(row["relations_json"] or "[]")) if "relations_json" in row.keys() else [],
+            relations=list(json.loads(row["relations_json"] or "[]"))
+            if "relations_json" in row.keys()
+            else [],
         )
 
     @staticmethod
@@ -1895,8 +2204,21 @@ class Database:
             (int(media_id), str(title or f"AniList {int(media_id)}"), now),
         )
 
+    @staticmethod
+    def _span_end(name: str, first: int | None, end: int | None, *, batch: bool = False) -> int | None:
+        """The second episode of a two-episode file or download ("01-02", audit 17А).
+
+        Derived once when a row is written; reads trust the stored column.
+        """
+        if end is not None or first is None or batch:
+            return end
+        return int(first) + 1 if double_episode_span(Path(str(name or "")).name) is not None else None
+
     def upsert_episode(self, episode: LibraryEpisode, *, downloaded_at: float | None = None) -> None:
         now = time.time()
+        episode_end = self._span_end(
+            str(episode.video_path), episode.media_episode, episode.media_episode_end
+        )
         with self.connect() as conn:
             self._ensure_anime_parent(conn, episode.media_id, episode.title)
             previous = conn.execute(
@@ -1911,13 +2233,15 @@ class Database:
                 """
                 INSERT INTO episodes(
                     media_id,title,episode,media_episode,release_episode,video_path,subtitle_path,embedded_subtitle_id,subtitle_origin,state,torrent_hash,
-                    downloaded_at,watched_at,delete_after,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    downloaded_at,watched_at,delete_after,updated_at,media_episode_end
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,episodes.media_id),
                     title=excluded.title,
                     episode=COALESCE(excluded.media_episode,episodes.episode),
                     media_episode=COALESCE(excluded.media_episode,episodes.media_episode,episodes.episode),
+                    media_episode_end=CASE WHEN excluded.media_episode IS NOT NULL
+                        THEN excluded.media_episode_end ELSE episodes.media_episode_end END,
                     release_episode=COALESCE(excluded.release_episode,episodes.release_episode),
                     subtitle_path=CASE
                         WHEN excluded.subtitle_path IS NOT NULL THEN excluded.subtitle_path
@@ -1960,6 +2284,7 @@ class Database:
                     episode.watched_at,
                     episode.delete_after,
                     now,
+                    episode_end,
                 ),
             )
             if previous is not None and str(previous["state"]) != requested_state:
@@ -1977,9 +2302,7 @@ class Database:
         *,
         trigger: str,
     ) -> str:
-        row = conn.execute(
-            "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
-        ).fetchone()
+        row = conn.execute("SELECT state FROM episodes WHERE video_path=?", (str(video_path),)).fetchone()
         if row is None:
             return str(requested)
         current = str(row["state"] or "local")
@@ -2010,18 +2333,24 @@ class Database:
 
     def episode_by_path(self, video_path: Path) -> LibraryEpisode | None:
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM episodes WHERE video_path=?", (str(video_path),)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM episodes WHERE video_path=?", (str(video_path),)).fetchone()
         return self._episode_from_row(row) if row else None
 
     def ready_episode(self, media_id: int, episode: int | None = None) -> LibraryEpisode | None:
         sql = "SELECT * FROM episodes WHERE media_id=? AND state IN ('ready','local','watched','waiting_subtitles','waiting_text_subtitles','couldnt_sync')"
         params: list[object] = [media_id]
         if episode is not None:
-            sql += " AND COALESCE(media_episode,episode)=?"
+            # A two-episode file also serves its second episode (audit 17А).
+            sql += (
+                " AND ? BETWEEN COALESCE(media_episode,episode)"
+                " AND COALESCE(media_episode_end,media_episode,episode)"
+            )
             params.append(episode)
-        sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode) IS NULL THEN 1 ELSE 0 END, COALESCE(media_episode,episode) LIMIT 1"
+            # An exact single-episode file wins over a double that also covers it.
+            sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode)=? THEN 0 ELSE 1 END, COALESCE(media_episode,episode) LIMIT 1"
+            params.append(episode)
+        else:
+            sql += " ORDER BY CASE WHEN COALESCE(media_episode,episode) IS NULL THEN 1 ELSE 0 END, COALESCE(media_episode,episode) LIMIT 1"
         with self.connect() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
         return self._episode_from_row(row) if row else None
@@ -2055,9 +2384,7 @@ class Database:
             video_path=Path(str(row["video_path"])),
             subtitle_path=Path(str(row["subtitle_path"])) if row["subtitle_path"] else None,
             embedded_subtitle_id=(
-                int(row["embedded_subtitle_id"])
-                if row["embedded_subtitle_id"] is not None
-                else None
+                int(row["embedded_subtitle_id"]) if row["embedded_subtitle_id"] is not None else None
             ),
             subtitle_origin=(str(row["subtitle_origin"] or "") if "subtitle_origin" in row.keys() else ""),
             state=str(row["state"]),
@@ -2084,6 +2411,16 @@ class Database:
                 if "playback_active_seconds" in row.keys()
                 else 0.0
             ),
+            media_episode_end=(
+                int(row["media_episode_end"])
+                if "media_episode_end" in row.keys() and row["media_episode_end"] is not None
+                else None
+            ),
+            part_boundary=(
+                float(row["part_boundary"])
+                if "part_boundary" in row.keys() and row["part_boundary"] is not None
+                else None
+            ),
         )
 
     def record_playback(
@@ -2097,19 +2434,31 @@ class Database:
         duration = max(0.0, float(duration))
         active_seconds = max(0.0, float(active_seconds))
         now = time.time()
+        finished = duration > 0 and position >= duration * 0.95
         with self.connect() as conn:
-            if duration > 0 and position >= duration * 0.95:
+            before = conn.execute(
+                "SELECT state,playback_position,playback_duration FROM episodes WHERE video_path=?",
+                (str(video_path),),
+            ).fetchone()
+            if finished:
                 conn.execute(
                     "UPDATE episodes SET playback_position=NULL,playback_duration=?,"
                     "playback_updated_at=NULL,playback_active_seconds=playback_active_seconds+?,updated_at=? WHERE video_path=?",
                     (duration, active_seconds, now, str(video_path)),
                 )
-                return
-            conn.execute(
-                "UPDATE episodes SET playback_position=?,playback_duration=?,"
-                "playback_updated_at=?,playback_active_seconds=playback_active_seconds+?,updated_at=? WHERE video_path=?",
-                (position, duration or None, now, active_seconds, now, str(video_path)),
-            )
+            else:
+                conn.execute(
+                    "UPDATE episodes SET playback_position=?,playback_duration=?,"
+                    "playback_updated_at=?,playback_active_seconds=playback_active_seconds+?,updated_at=? WHERE video_path=?",
+                    (position, duration or None, now, active_seconds, now, str(video_path)),
+                )
+            # Heartbeats leave the UI version alone, except when the episode enters or
+            # leaves Continue Watching: a cached Home snapshot would otherwise keep
+            # showing it under New episodes ready while a fresh one shows it resumable.
+            if before is not None and _resumable(
+                before["state"], before["playback_position"], before["playback_duration"]
+            ) != _resumable(before["state"], None if finished else position, duration or None):
+                conn.execute(_UI_STATE_BUMP_SQL)
 
     def playback_evidence(self, video_path: Path) -> dict[str, float]:
         with self.connect() as conn:
@@ -2168,8 +2517,8 @@ class Database:
     def resumable_episodes(
         self,
         *,
-        min_position: float = 30.0,
-        min_remaining: float = 60.0,
+        min_position: float = RESUME_MIN_POSITION,
+        min_remaining: float = RESUME_MIN_REMAINING,
         limit: int = 12,
     ) -> list[LibraryEpisode]:
         with self.connect() as conn:
@@ -2188,18 +2537,41 @@ class Database:
         return [self._episode_from_row(row) for row in rows]
 
     def has_episode(self, media_id: int, episode: int) -> bool:
+        """True when a file or a download already covers the episode.
+
+        A two-episode file ("01-02") covers both numbers (audit 17А).
+        """
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT 1 FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? LIMIT 1",
+                "SELECT 1 FROM episodes WHERE media_id=? AND ? BETWEEN COALESCE(media_episode,episode) "
+                "AND COALESCE(media_episode_end,media_episode,episode) LIMIT 1",
                 (media_id, episode),
             ).fetchone()
             if row:
                 return True
             row = conn.execute(
-                "SELECT 1 FROM downloads WHERE media_id=? AND COALESCE(media_episode,episode)=? AND state NOT IN ('error','missing') LIMIT 1",
+                "SELECT 1 FROM downloads WHERE media_id=? AND ? BETWEEN COALESCE(media_episode,episode) "
+                "AND COALESCE(media_episode_end,media_episode,episode) AND state NOT IN ('error','missing') LIMIT 1",
                 (media_id, episode),
             ).fetchone()
         return bool(row)
+
+    def set_part_boundary(self, video_path: Path, seconds: float | None) -> bool:
+        """Where the second episode of a two-episode file starts (from subtitle preparation)."""
+        value = None if seconds is None else max(0.0, float(seconds))
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE episodes SET part_boundary=? WHERE video_path=? AND media_episode_end IS NOT NULL",
+                (value, str(video_path)),
+            )
+        return bool(cursor.rowcount)
+
+    def raise_anime_progress(self, media_id: int, progress: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE anime SET progress=MAX(progress,?),updated_at=? WHERE media_id=?",
+                (int(progress), time.time(), int(media_id)),
+            )
 
     @staticmethod
     def _subtitle_job_owner_matches(
@@ -2220,13 +2592,9 @@ class Database:
             and str(row["owner_token"] or "") == str(owner_token or "")
         )
 
-    def subtitle_job_owned(
-        self, video_path: Path, generation: int, owner_token: str
-    ) -> bool:
+    def subtitle_job_owned(self, video_path: Path, generation: int, owner_token: str) -> bool:
         with self.connect() as conn:
-            return self._subtitle_job_owner_matches(
-                conn, video_path, int(generation), str(owner_token)
-            )
+            return self._subtitle_job_owner_matches(conn, video_path, int(generation), str(owner_token))
 
     @classmethod
     def _lock_subtitle_job_owner(
@@ -2239,9 +2607,7 @@ class Database:
         """Serialize an owner check with the mutation that follows it."""
         if generation is not None:
             conn.execute("BEGIN IMMEDIATE")
-        return cls._subtitle_job_owner_matches(
-            conn, video_path, generation, owner_token
-        )
+        return cls._subtitle_job_owner_matches(conn, video_path, generation, owner_token)
 
     def set_subtitle_ready(
         self,
@@ -2255,17 +2621,13 @@ class Database:
         clear_state_keys: Iterable[str] = (),
     ) -> bool:
         with self.connect() as conn:
-            if not self._lock_subtitle_job_owner(
-                conn, video_path, generation, owner_token
-            ):
+            if not self._lock_subtitle_job_owner(conn, video_path, generation, owner_token):
                 return False
             previous = conn.execute(
                 "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
             ).fetchone()
             now = time.time()
-            resolved = self._transition_episode(
-                conn, video_path, "ready", trigger="subtitle_ready"
-            )
+            resolved = self._transition_episode(conn, video_path, "ready", trigger="subtitle_ready")
             conn.execute(
                 "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=?,subtitle_origin=?,"
                 "state=?,updated_at=? WHERE video_path=?",
@@ -2297,7 +2659,6 @@ class Database:
                 )
             return True
 
-
     def set_waiting_text_subtitles(
         self,
         video_path: Path,
@@ -2326,7 +2687,6 @@ class Database:
                 ),
             )
             return True
-
 
     def set_ocr_fallback_not_ready(
         self,
@@ -2399,15 +2759,11 @@ class Database:
         disappear while a better candidate is being evaluated.
         """
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT state FROM episodes WHERE video_path=?", (str(video_path),)
-            ).fetchone()
+            row = conn.execute("SELECT state FROM episodes WHERE video_path=?", (str(video_path),)).fetchone()
             if row is None:
                 return False
             current = str(row["state"] or "local")
-            resolved = transition_episode_state(
-                current, "ready", trigger="subtitle_upgrade_restore"
-            )
+            resolved = transition_episode_state(current, "ready", trigger="subtitle_upgrade_restore")
             conn.execute(
                 "UPDATE episodes SET subtitle_path=?,embedded_subtitle_id=?,subtitle_origin=?,"
                 "state=?,updated_at=? WHERE video_path=?",
@@ -2421,6 +2777,7 @@ class Database:
                 ),
             )
             return resolved == "ready"
+
     def clear_subtitle_selection(
         self,
         video_path: Path,
@@ -2471,21 +2828,19 @@ class Database:
                     """
                     INSERT INTO subtitle_jobs(
                         video_path,media_id,episode,state,attempts,next_check,last_error,updated_at
-                    ) VALUES(?,?,?,'pending',0,?,'Waiting for Japanese text subtitles',?)
+                    ) VALUES(?,?,?,'pending',0,?,?,?)
                     ON CONFLICT(video_path) DO UPDATE SET
                         media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                         episode=COALESCE(excluded.episode,subtitle_jobs.episode),
                         state='pending',next_check=excluded.next_check,
                         last_error=excluded.last_error,updated_at=excluded.updated_at
                     """,
-                    (video_path, media_id, episode, now, now),
+                    (video_path, media_id, episode, now, err("jobs.waitingTextSubtitles"), now),
                 )
                 repaired.append((video_path, media_id, episode))
         return len(repaired)
 
-    def repair_spurious_ready_subtitle_jobs(
-        self, *, preserve_paths: set[str] | None = None
-    ) -> int:
+    def repair_spurious_ready_subtitle_jobs(self, *, preserve_paths: set[str] | None = None) -> int:
         """Remove resolver jobs accidentally attached to valid ready rows.
 
         Versions through 0.5.79 could preserve a prepared subtitle during a
@@ -2527,9 +2882,7 @@ class Database:
                 )
         return len(removable)
 
-    def repair_stale_subtitle_selections(
-        self, *, preserve_paths: set[str] | None = None
-    ) -> int:
+    def repair_stale_subtitle_selections(self, *, preserve_paths: set[str] | None = None) -> int:
         """Clear subtitle paths that are not currently considered validated.
 
         Upgrade checks are explicitly excluded: their current selection must
@@ -2590,7 +2943,7 @@ class Database:
                         """
                         INSERT INTO subtitle_jobs(
                             video_path,media_id,episode,state,attempts,priority,next_check,last_error,updated_at
-                        ) VALUES(?,?,?,'pending',0,260,?,'Prepared subtitle cache file is missing',?)
+                        ) VALUES(?,?,?,'pending',0,260,?,?,?)
                         ON CONFLICT(video_path) DO UPDATE SET
                             media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                             episode=COALESCE(excluded.episode,subtitle_jobs.episode),
@@ -2600,7 +2953,14 @@ class Database:
                             progress_json='{}',action_code='',
                             last_error=excluded.last_error,updated_at=excluded.updated_at
                         """,
-                        (video_path, row["media_id"], row["episode"], now, now),
+                        (
+                            video_path,
+                            row["media_id"],
+                            row["episode"],
+                            now,
+                            err("jobs.subtitleCacheMissing"),
+                            now,
+                        ),
                     )
                 changed += 1
         return changed
@@ -2699,9 +3059,7 @@ class Database:
     ) -> bool:
         with self.connect() as conn:
             if generation is None:
-                cursor = conn.execute(
-                    "DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),)
-                )
+                cursor = conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (str(video_path),))
             else:
                 cursor = conn.execute(
                     "DELETE FROM subtitle_jobs WHERE video_path=? AND generation=? AND owner_token=?",
@@ -2723,7 +3081,7 @@ class Database:
                 """
                 INSERT INTO subtitle_jobs(
                     video_path,media_id,episode,state,attempts,next_check,last_error,updated_at
-                ) VALUES(?,?,?,'pending',0,?,'Waiting for Japanese subtitles',?)
+                ) VALUES(?,?,?,'pending',0,?,?,?)
                 ON CONFLICT(video_path) DO UPDATE SET
                     media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                     episode=CASE
@@ -2732,7 +3090,7 @@ class Database:
                     END,
                     updated_at=excluded.updated_at
                 """,
-                (str(video_path), media_id, episode, now, now),
+                (str(video_path), media_id, episode, now, err("jobs.waitingSubtitles"), now),
             )
         return bool(cursor.rowcount)
 
@@ -2756,30 +3114,29 @@ class Database:
         affected_paths: set[str] = set()
         with self.connect() as conn:
             existing = conn.execute(
-                "SELECT video_path FROM subtitle_jobs "
-                "WHERE state IN ('pending','processing','needs_action')"
+                "SELECT video_path FROM subtitle_jobs WHERE state IN ('pending','processing','needs_action')"
             ).fetchall()
             for row in existing:
                 affected_paths.add(str(row["video_path"]))
             conn.execute(
                 "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
-                "priority=MAX(priority,?),last_error='Manual refresh',updated_at=? "
+                "priority=MAX(priority,?),last_error=?,updated_at=? "
                 "WHERE state='pending'",
-                (now, priority, now),
+                (now, priority, err("jobs.manualRefresh"), now),
             )
             if recover_processing:
                 conn.execute(
                     "UPDATE subtitle_jobs SET state='pending',stage='queued',action_code='',next_check=?,"
-                    "priority=MAX(priority,?),last_error='Manual refresh',updated_at=? "
+                    "priority=MAX(priority,?),last_error=?,updated_at=? "
                     "WHERE state='processing'",
-                    (now, priority, now),
+                    (now, priority, err("jobs.manualRefresh"), now),
                 )
             else:
                 conn.execute(
                     "UPDATE subtitle_jobs SET priority=MAX(priority,?),"
-                    "last_error='Manual refresh (already checking)',updated_at=? "
+                    "last_error=?,updated_at=? "
                     "WHERE state='processing'",
-                    (priority, now),
+                    (priority, err("jobs.manualRefreshChecking"), now),
                 )
 
             rows = conn.execute(
@@ -2800,7 +3157,7 @@ class Database:
                     """
                     INSERT INTO subtitle_jobs(
                         video_path,media_id,episode,state,attempts,priority,next_check,last_error,updated_at
-                    ) VALUES(?,?,?,'pending',0,?,?,'Manual refresh',?)
+                    ) VALUES(?,?,?,'pending',0,?,?,?,?)
                     ON CONFLICT(video_path) DO UPDATE SET
                         media_id=COALESCE(excluded.media_id,subtitle_jobs.media_id),
                         episode=COALESCE(excluded.episode,subtitle_jobs.episode),
@@ -2814,6 +3171,7 @@ class Database:
                         int(row["episode"]) if row["episode"] is not None else None,
                         priority,
                         now,
+                        err("jobs.manualRefresh"),
                         now,
                     ),
                 )
@@ -2853,6 +3211,7 @@ class Database:
             {alias}.next_check,
             {alias}.updated_at DESC
         """
+
     def due_subtitle_jobs(self, limit: int = 10) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
@@ -3156,70 +3515,174 @@ class Database:
         return int(cursor.rowcount or 0)
 
     def plan_episode_identity_repair(
-        self, torrent_hash: str, video_path: Path, *, media_id: int,
-        expected_media_episode: int, media_episode: int, release_episode: int,
+        self,
+        torrent_hash: str,
+        video_path: Path,
+        *,
+        media_id: int,
+        expected_media_episode: int,
+        media_episode: int,
+        release_episode: int,
         migrate_history: bool = False,
     ) -> dict:
         """Read-only diff for one user-confirmed file, never a franchise rule."""
         video = Path(video_path).expanduser().resolve()
-        if media_id < 1 or expected_media_episode < 1 or media_episode < 1 or release_episode < 1 or not torrent_hash.strip():
-            raise ValueError("Episode numbers must be positive")
+        if (
+            media_id < 1
+            or expected_media_episode < 1
+            or media_episode < 1
+            or release_episode < 1
+            or not torrent_hash.strip()
+        ):
+            raise ValueError(err("db.episodeNumbersPositive"))
         conflicts = []
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM episodes WHERE video_path=?", (str(video),)).fetchone()
             before = dict(row) if row is not None else None
-            if row is None or int(row["media_id"] or 0) != media_id or int(row["media_episode"] or row["episode"] or 0) != expected_media_episode or str(row["torrent_hash"]).casefold() != torrent_hash.casefold():
+            if (
+                row is None
+                or int(row["media_id"] or 0) != media_id
+                or int(row["media_episode"] or row["episode"] or 0) != expected_media_episode
+                or str(row["torrent_hash"]).casefold() != torrent_hash.casefold()
+            ):
                 conflicts.append("File identity no longer matches the expected source")
             if row is not None and float(row["playback_updated_at"] or 0) > time.time() - 120:
                 conflicts.append("Recent playback owns this file; stop playback and wait before repairing")
-            target = conn.execute("SELECT video_path FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? AND video_path!=?", (media_id, media_episode, str(video))).fetchall()
+            target = conn.execute(
+                "SELECT video_path FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? AND video_path!=?",
+                (media_id, media_episode, str(video)),
+            ).fetchall()
             if target:
                 conflicts.append("Target local episode already has another file")
-            ledgers = [dict(item) for item in conn.execute("SELECT * FROM media_identity_ledger WHERE video_path=? OR torrent_hash=?", (str(video), torrent_hash))]
+            ledgers = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM media_identity_ledger WHERE video_path=? OR torrent_hash=?",
+                    (str(video), torrent_hash),
+                )
+            ]
             canonical_id = f"anime:{media_id}:episode:{media_episode}"
-            target_ledger = conn.execute("SELECT * FROM media_identity_ledger WHERE canonical_id=?", (canonical_id,)).fetchone()
+            target_ledger = conn.execute(
+                "SELECT * FROM media_identity_ledger WHERE canonical_id=?", (canonical_id,)
+            ).fetchone()
             if target_ledger is not None and str(target_ledger["video_path"]) != str(video):
                 conflicts.append("Target identity ledger belongs to another file")
-            if any(item["video_path"] not in {"", str(video)} or item["media_id"] not in {None, media_id} for item in ledgers):
+            if any(
+                item["video_path"] not in {"", str(video)} or item["media_id"] not in {None, media_id}
+                for item in ledgers
+            ):
                 conflicts.append("Torrent identity ledger includes another file or media")
-            if any(item["locked"] and (item["media_id"] != media_id or item["media_episode"] != media_episode or item["release_episode"] != release_episode) for item in ledgers):
+            if any(
+                item["locked"]
+                and (
+                    item["media_id"] != media_id
+                    or item["media_episode"] != media_episode
+                    or item["release_episode"] != release_episode
+                )
+                for item in ledgers
+            ):
                 conflicts.append("A manually locked identity conflicts with the repair")
-            jobs = [dict(item) for item in conn.execute("SELECT * FROM subtitle_jobs WHERE video_path=?", (str(video),))]
+            jobs = [
+                dict(item)
+                for item in conn.execute("SELECT * FROM subtitle_jobs WHERE video_path=?", (str(video),))
+            ]
             if any(float(item["lease_until"] or 0) > time.time() or item["owner_token"] for item in jobs):
                 conflicts.append("An active subtitle job owns this file")
-            download = conn.execute("SELECT * FROM downloads WHERE torrent_hash=?", (torrent_hash,)).fetchone()
-            if download is not None and (download["media_id"] != media_id or int(download["media_episode"] or download["episode"] or 0) != expected_media_episode or download["is_batch"]):
+            download = conn.execute(
+                "SELECT * FROM downloads WHERE torrent_hash=?", (torrent_hash,)
+            ).fetchone()
+            if download is not None and (
+                download["media_id"] != media_id
+                or int(download["media_episode"] or download["episode"] or 0) != expected_media_episode
+                or download["is_batch"]
+            ):
                 conflicts.append("Download identity conflicts with the repair")
             key = f"download_intent:{media_id}:episode:{expected_media_episode}"
             intent_row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
             intent = json.loads(intent_row["value"]) if intent_row else None
-            if intent and str(intent.get("selected_hash") or "").casefold() not in {"", torrent_hash.casefold()}:
+            if intent and str(intent.get("selected_hash") or "").casefold() not in {
+                "",
+                torrent_hash.casefold(),
+            }:
                 conflicts.append("A newer intent selected another release")
-            if intent and (intent.get("owned_candidates") or str(intent.get("state") or "") in {"trying", "selecting", "recovery_required"}):
+            if intent and (
+                intent.get("owned_candidates")
+                or str(intent.get("state") or "") in {"trying", "selecting", "recovery_required"}
+            ):
                 conflicts.append("An active acquisition owns this episode")
-            history = conn.execute("SELECT * FROM release_history WHERE lower(info_hash)=lower(?)", (torrent_hash,)).fetchone()
-            identity_row = conn.execute("SELECT value FROM state WHERE key=?", ("release_identity:" + torrent_hash.casefold(),)).fetchone()
+            history = conn.execute(
+                "SELECT * FROM release_history WHERE lower(info_hash)=lower(?)", (torrent_hash,)
+            ).fetchone()
+            identity_row = conn.execute(
+                "SELECT value FROM state WHERE key=?", ("release_identity:" + torrent_hash.casefold(),)
+            ).fetchone()
             identity = json.loads(identity_row["value"]) if identity_row else None
-            if identity and (identity.get("media_id"), identity.get("media_episode"), identity.get("release_episode")) != (media_id, media_episode, release_episode):
+            if identity and (
+                identity.get("media_id"),
+                identity.get("media_episode"),
+                identity.get("release_episode"),
+            ) != (media_id, media_episode, release_episode):
                 conflicts.append("A confirmed file identity conflicts with the repair")
-            subtitle_history = [dict(item) for item in conn.execute("SELECT * FROM subtitle_history WHERE video_path=? ORDER BY id", (str(video),))]
-            playlist_items = [dict(item) for item in conn.execute("SELECT * FROM playlist_items WHERE video_path=? ORDER BY id", (str(video),))]
-            consumption = [dict(item) for item in conn.execute("SELECT * FROM consumption_media WHERE (kind='anime_episode' AND current_library_id IN (?,?)) OR media_uuid IN (SELECT media_uuid FROM consumption_media_aliases WHERE alias_type='video_path' AND alias_value=?)", (f"{media_id}:{expected_media_episode}", f"{media_id}:{media_episode}", str(video)))]
-            sync_entities = [dict(item) for item in conn.execute("SELECT * FROM sync_entities WHERE kind='anime_episode' AND local_key IN (?,?)", (f"{media_id}:{expected_media_episode}", f"{media_id}:{media_episode}"))]
-            consumption_aliases = [dict(item) for item in conn.execute(
-                "SELECT kind,alias_type,alias_value,media_uuid FROM consumption_media_aliases WHERE media_uuid IN (%s) ORDER BY alias_type,alias_value"
-                % ",".join("?" * len(consumption)), [item["media_uuid"] for item in consumption])] if consumption else []
+            subtitle_history = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM subtitle_history WHERE video_path=? ORDER BY id", (str(video),)
+                )
+            ]
+            playlist_items = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM playlist_items WHERE video_path=? ORDER BY id", (str(video),)
+                )
+            ]
+            consumption = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM consumption_media WHERE (kind='anime_episode' AND current_library_id IN (?,?)) OR media_uuid IN (SELECT media_uuid FROM consumption_media_aliases WHERE alias_type='video_path' AND alias_value=?)",
+                    (f"{media_id}:{expected_media_episode}", f"{media_id}:{media_episode}", str(video)),
+                )
+            ]
+            sync_entities = [
+                dict(item)
+                for item in conn.execute(
+                    "SELECT * FROM sync_entities WHERE kind='anime_episode' AND local_key IN (?,?)",
+                    (f"{media_id}:{expected_media_episode}", f"{media_id}:{media_episode}"),
+                )
+            ]
+            consumption_aliases = (
+                [
+                    dict(item)
+                    for item in conn.execute(
+                        "SELECT kind,alias_type,alias_value,media_uuid FROM consumption_media_aliases WHERE media_uuid IN (%s) ORDER BY alias_type,alias_value"
+                        % ",".join("?" * len(consumption)),
+                        [item["media_uuid"] for item in consumption],
+                    )
+                ]
+                if consumption
+                else []
+            )
             if sync_entities or (consumption and not migrate_history):
-                conflicts.append("Published consumption/mobile history requires a separate reviewed history migration"
-                                 + ("" if sync_entities else " (re-plan with --migrate-history to relabel it)"))
+                conflicts.append(
+                    "Published consumption/mobile history requires a separate reviewed history migration"
+                    + ("" if sync_entities else " (re-plan with --migrate-history to relabel it)")
+                )
             elif consumption:
                 # Reviewed relabel of ONE history entry that belongs to this file:
                 # its watch time moves with the file to the corrected episode.
                 target_alias = f"anilist:{media_id}:episode:{media_episode}"
-                foreign = conn.execute("SELECT media_uuid FROM consumption_media_aliases WHERE kind='anime_episode' AND alias_type='external' AND alias_value=? AND media_uuid!=?",
-                                       (target_alias, consumption[0]["media_uuid"])).fetchone()
-                if len(consumption) != 1 or consumption[0]["current_library_id"] not in {"", f"{media_id}:{expected_media_episode}"} or foreign is not None:
-                    conflicts.append("History relabel is ambiguous: several history entries own these episodes")
+                foreign = conn.execute(
+                    "SELECT media_uuid FROM consumption_media_aliases WHERE kind='anime_episode' AND alias_type='external' AND alias_value=? AND media_uuid!=?",
+                    (target_alias, consumption[0]["media_uuid"]),
+                ).fetchone()
+                if (
+                    len(consumption) != 1
+                    or consumption[0]["current_library_id"]
+                    not in {"", f"{media_id}:{expected_media_episode}"}
+                    or foreign is not None
+                ):
+                    conflicts.append(
+                        "History relabel is ambiguous: several history entries own these episodes"
+                    )
         fingerprint = None
         if video.is_file():
             digest = hashlib.sha256()
@@ -3231,39 +3694,56 @@ class Database:
             conflicts.append("The expected video file is missing")
         return {
             "database_path": str(self.path.resolve()),
-            "torrent_hash": torrent_hash, "video_path": str(video), "media_id": media_id,
-            "expected_media_episode": expected_media_episode, "media_episode": media_episode,
-            "release_episode": release_episode, "before": before,
+            "torrent_hash": torrent_hash,
+            "video_path": str(video),
+            "media_id": media_id,
+            "expected_media_episode": expected_media_episode,
+            "media_episode": media_episode,
+            "release_episode": release_episode,
+            "before": before,
             "download_before": dict(download) if download is not None else None,
-            "ledger_before": ledgers, "jobs_before": jobs, "intent_before": intent,
+            "ledger_before": ledgers,
+            "jobs_before": jobs,
+            "intent_before": intent,
             "history_before": dict(history) if history is not None else None,
             "identity_before": identity,
             "target_ledger_before": dict(target_ledger) if target_ledger is not None else None,
-            "subtitle_history_before": subtitle_history, "playlist_items_before": playlist_items,
-            "consumption_before": consumption, "sync_entities_before": sync_entities,
-            "consumption_aliases_before": consumption_aliases, "migrate_history": bool(migrate_history),
-            "fingerprint": fingerprint, "conflicts": conflicts,
+            "subtitle_history_before": subtitle_history,
+            "playlist_items_before": playlist_items,
+            "consumption_before": consumption,
+            "sync_entities_before": sync_entities,
+            "consumption_aliases_before": consumption_aliases,
+            "migrate_history": bool(migrate_history),
+            "fingerprint": fingerprint,
+            "conflicts": conflicts,
         }
 
     def apply_episode_identity_repair(self, plan: dict) -> dict:
         """Apply a reviewed dry-run atomically, preserving bytes and playback truth."""
         if plan.get("conflicts"):
             raise ValueError("Identity repair conflict: " + "; ".join(plan["conflicts"]))
-        parameters = {key: plan[key] for key in ("media_id", "expected_media_episode", "media_episode", "release_episode")}
+        parameters = {
+            key: plan[key]
+            for key in ("media_id", "expected_media_episode", "media_episode", "release_episode")
+        }
         parameters["migrate_history"] = bool(plan.get("migrate_history", False))
-        current = self.plan_episode_identity_repair(plan["torrent_hash"], Path(plan["video_path"]), **parameters)
+        current = self.plan_episode_identity_repair(
+            plan["torrent_hash"], Path(plan["video_path"]), **parameters
+        )
         anchor = current.get("identity_before") or {}
-        if (plan.get("database_path") == str(self.path.resolve())
-                and anchor.get("source") == "user-confirmed-file"
-                and anchor.get("video_path") == plan["video_path"]
-                and anchor.get("fingerprint") == current.get("fingerprint") == plan.get("fingerprint")
-                and (anchor.get("media_id"), anchor.get("media_episode"), anchor.get("release_episode"))
-                    == (plan["media_id"], plan["media_episode"], plan["release_episode"])
-                and current.get("before") is not None
-                and current["before"]["media_episode"] == plan["media_episode"]):
+        if (
+            plan.get("database_path") == str(self.path.resolve())
+            and anchor.get("source") == "user-confirmed-file"
+            and anchor.get("video_path") == plan["video_path"]
+            and anchor.get("fingerprint") == current.get("fingerprint") == plan.get("fingerprint")
+            and (anchor.get("media_id"), anchor.get("media_episode"), anchor.get("release_episode"))
+            == (plan["media_id"], plan["media_episode"], plan["release_episode"])
+            and current.get("before") is not None
+            and current["before"]["media_episode"] == plan["media_episode"]
+        ):
             return {"identity": anchor, "backup": anchor.get("backup", ""), "already_applied": True}
         if current != plan:
-            raise ValueError("Identity repair source changed since dry-run")
+            raise ValueError(err("db.repairSourceChanged"))
         backup = self.path.with_name(f"{self.path.name}.identity-repair-{time.time_ns()}.backup")
         with self.connect() as source, sqlite3.connect(backup) as destination:
             source.backup(destination)
@@ -3271,31 +3751,88 @@ class Database:
         with self.connection_scope() as conn:
             conn.execute("BEGIN IMMEDIATE")
             # Recheck all mutable ownership records under the write lock.
-            current = self.plan_episode_identity_repair(plan["torrent_hash"], Path(plan["video_path"]), **parameters)
+            current = self.plan_episode_identity_repair(
+                plan["torrent_hash"], Path(plan["video_path"]), **parameters
+            )
             if current != plan:
-                raise ValueError("Identity repair source changed since dry-run")
+                raise ValueError(err("db.repairSourceChanged"))
             video, hash_, media = plan["video_path"], plan["torrent_hash"], plan["media_id"]
             local, release = plan["media_episode"], plan["release_episode"]
-            anchor = {"media_id": media, "media_episode": local, "release_episode": release,
-                      "source": "user-confirmed-file", "fingerprint": plan["fingerprint"],
-                      "video_path": video, "revision": 1, "cleanup_protected_until": now + 7 * 86400,
-                      "backup": str(backup)}
+            anchor = {
+                "media_id": media,
+                "media_episode": local,
+                "release_episode": release,
+                "source": "user-confirmed-file",
+                "fingerprint": plan["fingerprint"],
+                "video_path": video,
+                "revision": 1,
+                "cleanup_protected_until": now + 7 * 86400,
+                "backup": str(backup),
+            }
             raw = json.loads(plan["download_before"]["raw_json"]) if plan["download_before"] else {}
             raw["_release_identity"] = anchor
-            conn.execute("UPDATE episodes SET episode=?,media_episode=?,release_episode=?,delete_after=NULL,updated_at=? WHERE video_path=?", (local, local, release, now, video))
-            conn.execute("UPDATE downloads SET episode=?,media_episode=?,release_episode=?,raw_json=?,updated_at=? WHERE torrent_hash=?", (local, local, release, json.dumps(raw), now, hash_))
-            conn.execute("UPDATE release_history SET episode=?,media_episode=?,release_episode=? WHERE lower(info_hash)=lower(?)", (local, local, release, hash_))
-            conn.execute("UPDATE subtitle_jobs SET episode=?,generation=generation+1,owner_token='',lease_until=0,updated_at=? WHERE video_path=?", (local, now, video))
-            conn.execute("UPDATE subtitle_history SET episode=? WHERE video_path=? AND media_id=? AND episode=?", (local, video, media, plan["expected_media_episode"]))
-            conn.execute("UPDATE playlist_items SET episode=?,updated_at=? WHERE video_path=? AND media_id=? AND episode=?", (local, now, video, media, plan["expected_media_episode"]))
-            conn.execute("DELETE FROM media_identity_ledger WHERE video_path=? OR torrent_hash=?", (video, hash_))
+            # A two-episode file keeps its span from the confirmed first episode (audit 17А).
+            span_end = "media_episode_end=CASE WHEN media_episode_end IS NOT NULL AND ? IS NOT NULL THEN ?+1 ELSE NULL END"
+            conn.execute(
+                f"UPDATE episodes SET episode=?,media_episode=?,release_episode=?,{span_end},delete_after=NULL,updated_at=? WHERE video_path=?",
+                (local, local, release, local, local, now, video),
+            )
+            conn.execute(
+                f"UPDATE downloads SET episode=?,media_episode=?,release_episode=?,{span_end},raw_json=?,updated_at=? WHERE torrent_hash=?",
+                (local, local, release, local, local, json.dumps(raw), now, hash_),
+            )
+            conn.execute(
+                "UPDATE release_history SET episode=?,media_episode=?,release_episode=? WHERE lower(info_hash)=lower(?)",
+                (local, local, release, hash_),
+            )
+            conn.execute(
+                "UPDATE subtitle_jobs SET episode=?,generation=generation+1,owner_token='',lease_until=0,updated_at=? WHERE video_path=?",
+                (local, now, video),
+            )
+            conn.execute(
+                "UPDATE subtitle_history SET episode=? WHERE video_path=? AND media_id=? AND episode=?",
+                (local, video, media, plan["expected_media_episode"]),
+            )
+            conn.execute(
+                "UPDATE playlist_items SET episode=?,updated_at=? WHERE video_path=? AND media_id=? AND episode=?",
+                (local, now, video, media, plan["expected_media_episode"]),
+            )
+            conn.execute(
+                "DELETE FROM media_identity_ledger WHERE video_path=? OR torrent_hash=?", (video, hash_)
+            )
             created_at = min((float(item["created_at"]) for item in plan["ledger_before"]), default=now)
-            conn.execute("INSERT INTO media_identity_ledger(canonical_id,media_id,media_episode,release_episode,video_path,fingerprint,torrent_hash,source,provenance_json,locked,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)", (f"anime:{media}:episode:{local}", media, local, release, video, plan["fingerprint"], hash_, "user-confirmed-file", json.dumps(anchor), created_at, now))
+            conn.execute(
+                "INSERT INTO media_identity_ledger(canonical_id,media_id,media_episode,release_episode,video_path,fingerprint,torrent_hash,source,provenance_json,locked,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",
+                (
+                    f"anime:{media}:episode:{local}",
+                    media,
+                    local,
+                    release,
+                    video,
+                    plan["fingerprint"],
+                    hash_,
+                    "user-confirmed-file",
+                    json.dumps(anchor),
+                    created_at,
+                    now,
+                ),
+            )
             key = "release_identity:" + hash_.casefold()
-            conn.execute("INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, json.dumps(anchor), now))
-            conn.execute("INSERT INTO state(key,value,updated_at) VALUES(?,?,?)", (f"identity_repair_audit:{hash_}:{time.time_ns()}", json.dumps({"before": plan, "after": anchor, "backup": str(backup)}), now))
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, json.dumps(anchor), now),
+            )
+            conn.execute(
+                "INSERT INTO state(key,value,updated_at) VALUES(?,?,?)",
+                (
+                    f"identity_repair_audit:{hash_}:{time.time_ns()}",
+                    json.dumps({"before": plan, "after": anchor, "backup": str(backup)}),
+                    now,
+                ),
+            )
             if plan.get("migrate_history") and plan.get("consumption_before"):
-                from .consumption import ConsumptionLedger, _json as _cjson, _sha as _csha
+                from .consumption import _json as _cjson
+
                 item = plan["consumption_before"][0]
                 media_uuid = item["media_uuid"]
                 anime_row = conn.execute("SELECT title FROM anime WHERE media_id=?", (media,)).fetchone()
@@ -3305,21 +3842,41 @@ class Database:
                 except (TypeError, ValueError):
                     metadata = {}
                 metadata.update(media_id=media, episode=local)
-                conn.execute("UPDATE consumption_media SET title_snapshot=?,current_library_kind='anime_episode',current_library_id=?,metadata_json=?,deleted_at=NULL,updated_at=? WHERE media_uuid=?",
-                             (title, f"{media}:{local}", _cjson(metadata), now, media_uuid))
-                conn.execute("DELETE FROM consumption_media_aliases WHERE kind='anime_episode' AND alias_type='external' AND alias_value=? AND media_uuid=?",
-                             (f"anilist:{media}:episode:{plan['expected_media_episode']}", media_uuid))
-                for alias_type, alias_value in (("external", f"anilist:{media}:episode:{local}"), ("video_path", video)):
-                    conn.execute("INSERT INTO consumption_media_aliases(kind,alias_type,alias_value,media_uuid,created_at) VALUES('anime_episode',?,?,?,?) "
-                                 "ON CONFLICT(kind,alias_type,alias_value) DO UPDATE SET media_uuid=excluded.media_uuid", (alias_type, alias_value, media_uuid, now))
-                    ConsumptionLedger._queue_sync_record(conn, "alias", _csha(_cjson(["anime_episode", alias_type, alias_value, media_uuid])), {
-                        "kind": "anime_episode", "alias_type": alias_type, "alias_value": alias_value,
-                        "media": {"media_uuid": media_uuid, "kind": "anime_episode", "title": title, "source_revision": str(item.get("source_revision") or "")},
-                    }, created_at=now)
+                conn.execute(
+                    "UPDATE consumption_media SET title_snapshot=?,current_library_kind='anime_episode',current_library_id=?,metadata_json=?,deleted_at=NULL,updated_at=? WHERE media_uuid=?",
+                    (title, f"{media}:{local}", _cjson(metadata), now, media_uuid),
+                )
+                conn.execute(
+                    "DELETE FROM consumption_media_aliases WHERE kind='anime_episode' AND alias_type='external' AND alias_value=? AND media_uuid=?",
+                    (f"anilist:{media}:episode:{plan['expected_media_episode']}", media_uuid),
+                )
+                for alias_type, alias_value in (
+                    ("external", f"anilist:{media}:episode:{local}"),
+                    ("video_path", video),
+                ):
+                    conn.execute(
+                        "INSERT INTO consumption_media_aliases(kind,alias_type,alias_value,media_uuid,created_at) VALUES('anime_episode',?,?,?,?) "
+                        "ON CONFLICT(kind,alias_type,alias_value) DO UPDATE SET media_uuid=excluded.media_uuid",
+                        (alias_type, alias_value, media_uuid, now),
+                    )
             intent = dict(plan["intent_before"]) if plan["intent_before"] else None
             if intent:
-                intent.update(state="waiting", revision=int(intent.get("revision") or 0) + 1, selected_hash="", selected_title="", detail="Selected file belongs to another local episode", updated_at=now)
-                conn.execute("UPDATE state SET value=?,updated_at=? WHERE key=?", (json.dumps(intent), now, f"download_intent:{media}:episode:{plan['expected_media_episode']}"))
+                intent.update(
+                    state="waiting",
+                    revision=int(intent.get("revision") or 0) + 1,
+                    selected_hash="",
+                    selected_title="",
+                    detail="Selected file belongs to another local episode",
+                    updated_at=now,
+                )
+                conn.execute(
+                    "UPDATE state SET value=?,updated_at=? WHERE key=?",
+                    (
+                        json.dumps(intent),
+                        now,
+                        f"download_intent:{media}:episode:{plan['expected_media_episode']}",
+                    ),
+                )
         return {"identity": anchor, "backup": str(backup)}
 
     def upsert_download(self, item: DownloadItem) -> None:
@@ -3329,8 +3886,8 @@ class Database:
                 """
                 INSERT INTO downloads(
                     torrent_hash,name,state,progress,save_path,content_path,media_id,episode,media_episode,release_episode,
-                    is_batch,added_on,completed_on,raw_json,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    is_batch,added_on,completed_on,raw_json,updated_at,media_episode_end
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(torrent_hash) DO UPDATE SET
                     name=excluded.name,state=excluded.state,progress=excluded.progress,
                     save_path=excluded.save_path,content_path=excluded.content_path,
@@ -3338,7 +3895,9 @@ class Database:
                     episode=COALESCE(downloads.media_episode,excluded.media_episode,downloads.episode,excluded.episode),
                     media_episode=COALESCE(downloads.media_episode,excluded.media_episode,downloads.episode,excluded.episode),
                     release_episode=COALESCE(downloads.release_episode,excluded.release_episode),
-                    is_batch=MAX(downloads.is_batch,excluded.is_batch),added_on=excluded.added_on,
+                    media_episode_end=COALESCE(excluded.media_episode_end,downloads.media_episode_end),
+                    is_batch=CASE WHEN ? THEN 0 ELSE MAX(downloads.is_batch,excluded.is_batch) END,
+                    added_on=excluded.added_on,
                     completed_on=excluded.completed_on,raw_json=excluded.raw_json,
                     updated_at=excluded.updated_at
                 """,
@@ -3358,6 +3917,11 @@ class Database:
                     item.completed_on,
                     json.dumps(item.raw, ensure_ascii=False),
                     time.time(),
+                    self._span_end(
+                        str(item.name or ""), item.media_episode, item.media_episode_end, batch=item.is_batch
+                    ),
+                    # The client saw a single video file: an earlier "series pack" flag was wrong.
+                    1 if (item.raw or {}).get("single_video_file") and not item.is_batch else 0,
                 ),
             )
 
@@ -3375,13 +3939,36 @@ class Database:
                     save_path=str(row["save_path"]),
                     content_path=str(row["content_path"]),
                     media_id=int(row["media_id"]) if row["media_id"] is not None else None,
-                    episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
-                    media_episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
-                    release_episode=(int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+                    episode=(
+                        int(row["media_episode"])
+                        if row["media_episode"] is not None
+                        else int(row["episode"])
+                        if row["episode"] is not None
+                        else None
+                    ),
+                    media_episode=(
+                        int(row["media_episode"])
+                        if row["media_episode"] is not None
+                        else int(row["episode"])
+                        if row["episode"] is not None
+                        else None
+                    ),
+                    release_episode=(
+                        int(row["release_episode"])
+                        if row["release_episode"] is not None
+                        else int(row["episode"])
+                        if row["episode"] is not None
+                        else None
+                    ),
                     is_batch=bool(row["is_batch"]),
                     added_on=int(row["added_on"] or 0),
                     completed_on=int(row["completed_on"] or 0),
-                    raw=json.loads(row["raw_json"] or "{}"),
+                    raw=_json_object(row["raw_json"]),
+                    media_episode_end=(
+                        int(row["media_episode_end"])
+                        if "media_episode_end" in row.keys() and row["media_episode_end"] is not None
+                        else None
+                    ),
                 )
             )
         return result
@@ -3399,7 +3986,10 @@ class Database:
 
     def delete_torrent_records(self, torrent_hash: str) -> None:
         with self.connect() as conn:
-            conn.execute("DELETE FROM subtitle_jobs WHERE video_path IN (SELECT video_path FROM episodes WHERE torrent_hash=?)", (torrent_hash,))
+            conn.execute(
+                "DELETE FROM subtitle_jobs WHERE video_path IN (SELECT video_path FROM episodes WHERE torrent_hash=?)",
+                (torrent_hash,),
+            )
             conn.execute("DELETE FROM episodes WHERE torrent_hash=?", (torrent_hash,))
             conn.execute("DELETE FROM downloads WHERE torrent_hash=?", (torrent_hash,))
 
@@ -3416,8 +4006,20 @@ class Database:
             self._ensure_anime_parent(conn, media_id)
             conn.execute(
                 "UPDATE downloads SET media_id=?,episode=?,media_episode=?,"
+                "media_episode_end=CASE WHEN media_episode_end IS NOT NULL AND ? IS NOT NULL AND ?=0 THEN ?+1 ELSE NULL END,"
                 "release_episode=COALESCE(?,release_episode),is_batch=?,updated_at=? WHERE torrent_hash=?",
-                (media_id, episode, episode, release_episode, int(is_batch), time.time(), torrent_hash),
+                (
+                    media_id,
+                    episode,
+                    episode,
+                    episode,
+                    int(is_batch),
+                    episode,
+                    release_episode,
+                    int(is_batch),
+                    time.time(),
+                    torrent_hash,
+                ),
             )
 
     def set_episode_torrent_hash(self, video_path: Path, torrent_hash: str) -> int:
@@ -3446,10 +4048,16 @@ class Database:
         numbering_metadata: dict | None = None,
     ) -> None:
         with self.connect() as conn:
-            anchor_row = conn.execute("SELECT value FROM state WHERE key=?", ("release_identity:" + info_hash.casefold(),)).fetchone()
+            anchor_row = conn.execute(
+                "SELECT value FROM state WHERE key=?", ("release_identity:" + info_hash.casefold(),)
+            ).fetchone()
             anchor = json.loads(anchor_row["value"]) if anchor_row else {}
             if anchor.get("source") == "user-confirmed-file":
-                media_id, episode, release_episode = anchor["media_id"], anchor["media_episode"], anchor["release_episode"]
+                media_id, episode, release_episode = (
+                    anchor["media_id"],
+                    anchor["media_episode"],
+                    anchor["release_episode"],
+                )
                 numbering_metadata = dict(anchor)
             self._ensure_anime_parent(conn, media_id, title)
             conn.execute(
@@ -3458,14 +4066,27 @@ class Database:
                 "score_formula,score_context"
                 ") VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    info_hash.lower(), media_id, episode, episode,
+                    info_hash.lower(),
+                    media_id,
+                    episode,
+                    episode,
                     release_episode if release_episode is not None else episode,
-                    title, score, time.time(),
-                    str(score_formula or ""), str(score_context or ""),
+                    title,
+                    score,
+                    time.time(),
+                    str(score_formula or ""),
+                    str(score_context or ""),
                 ),
             )
             if numbering_metadata is not None:
-                conn.execute("INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", ("release_numbering:" + info_hash.casefold(), json.dumps(numbering_metadata), time.time()))
+                conn.execute(
+                    "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                    (
+                        "release_numbering:" + info_hash.casefold(),
+                        json.dumps(numbering_metadata),
+                        time.time(),
+                    ),
+                )
 
     def release_score_record(
         self, media_id: int, episode: int | None, torrent_hash: str
@@ -3474,7 +4095,11 @@ class Database:
         value = str(torrent_hash or "").strip().lower()
         if not value:
             return None
-        episode_clause = "COALESCE(media_episode,episode) IS NULL" if episode is None else "COALESCE(media_episode,episode)=?"
+        episode_clause = (
+            "COALESCE(media_episode,episode) IS NULL"
+            if episode is None
+            else "COALESCE(media_episode,episode)=?"
+        )
         episode_args: tuple[object, ...] = () if episode is None else (episode,)
         with self.connect() as conn:
             row = conn.execute(
@@ -3486,9 +4111,7 @@ class Database:
             return None
         return float(row["score"]), str(row["score_formula"] or ""), str(row["score_context"] or "")
 
-    def release_metadata_by_hash(
-        self, torrent_hash: str
-    ) -> tuple[int, int | None, int | None, float] | None:
+    def release_metadata_by_hash(self, torrent_hash: str) -> tuple[int, int | None, int | None, float] | None:
         value = torrent_hash.strip().lower()
         if not value:
             return None
@@ -3502,8 +4125,16 @@ class Database:
             return None
         return (
             int(row["media_id"]),
-            int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None,
-            int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None,
+            int(row["media_episode"])
+            if row["media_episode"] is not None
+            else int(row["episode"])
+            if row["episode"] is not None
+            else None,
+            int(row["release_episode"])
+            if row["release_episode"] is not None
+            else int(row["episode"])
+            if row["episode"] is not None
+            else None,
             float(row["score"]),
         )
 
@@ -3515,7 +4146,11 @@ class Database:
     ) -> float | None:
         with self.connect() as conn:
             row = None
-            episode_clause = "COALESCE(media_episode,episode) IS NULL" if episode is None else "COALESCE(media_episode,episode)=?"
+            episode_clause = (
+                "COALESCE(media_episode,episode) IS NULL"
+                if episode is None
+                else "COALESCE(media_episode,episode)=?"
+            )
             episode_args: tuple[object, ...] = () if episode is None else (episode,)
             if torrent_hash:
                 row = conn.execute(
@@ -3530,9 +4165,7 @@ class Database:
                 ).fetchone()
         return float(row["score"]) if row else None
 
-    def episode_for_torrent(
-        self, media_id: int, episode: int, torrent_hash: str
-    ) -> LibraryEpisode | None:
+    def episode_for_torrent(self, media_id: int, episode: int, torrent_hash: str) -> LibraryEpisode | None:
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode)=? AND torrent_hash=? "
@@ -3551,9 +4184,7 @@ class Database:
 
     def download_by_hash(self, torrent_hash: str) -> DownloadItem | None:
         with self.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM downloads WHERE torrent_hash=?", (torrent_hash,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM downloads WHERE torrent_hash=?", (torrent_hash,)).fetchone()
         if row is None:
             return None
         return DownloadItem(
@@ -3564,13 +4195,36 @@ class Database:
             save_path=str(row["save_path"]),
             content_path=str(row["content_path"]),
             media_id=int(row["media_id"]) if row["media_id"] is not None else None,
-            episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
-            media_episode=(int(row["media_episode"]) if row["media_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
-            release_episode=(int(row["release_episode"]) if row["release_episode"] is not None else int(row["episode"]) if row["episode"] is not None else None),
+            episode=(
+                int(row["media_episode"])
+                if row["media_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
+            media_episode=(
+                int(row["media_episode"])
+                if row["media_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
+            release_episode=(
+                int(row["release_episode"])
+                if row["release_episode"] is not None
+                else int(row["episode"])
+                if row["episode"] is not None
+                else None
+            ),
             is_batch=bool(row["is_batch"]),
             added_on=int(row["added_on"] or 0),
             completed_on=int(row["completed_on"] or 0),
             raw=json.loads(row["raw_json"] or "{}"),
+            media_episode_end=(
+                int(row["media_episode_end"])
+                if "media_episode_end" in row.keys() and row["media_episode_end"] is not None
+                else None
+            ),
         )
 
     def has_pending_upgrade(self, media_id: int, episode: int) -> bool:
@@ -3628,10 +4282,26 @@ class Database:
                 (time.time(), new_info_hash.lower()),
             )
 
+    def expire_upgrades(self, max_age_seconds: float) -> list[sqlite3.Row]:
+        """Give up on pending upgrade jobs older than ``max_age_seconds``.
+
+        The old file stays and the episode becomes eligible for upgrade checks again.
+        """
+        now = time.time()
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM upgrade_jobs WHERE state IN ('downloading','ready_to_replace') AND created_at<?",
+                (now - max(0.0, float(max_age_seconds)),),
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    "UPDATE upgrade_jobs SET state='expired',updated_at=? WHERE new_info_hash=?",
+                    [(now, str(row["new_info_hash"])) for row in rows],
+                )
+        return rows
+
     @staticmethod
-    def _sampled_video_fingerprint(
-        video_path: Path, *, chunk_size: int = 128 * 1024
-    ) -> str | None:
+    def _sampled_video_fingerprint(video_path: Path, *, chunk_size: int = 128 * 1024) -> str | None:
         """Path-independent identity for safe subtitle-history recovery."""
 
         path = Path(video_path)
@@ -3717,21 +4387,23 @@ class Database:
                 details = json.loads(str(row["details_json"] or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 details = {}
-            result.append({
-                "id": int(row["id"]),
-                "video_path": str(row["video_path"]),
-                "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
-                "episode": int(row["episode"]) if row["episode"] is not None else None,
-                "anime_title": str(row["anime_title"] or ""),
-                "source": str(row["source"] or ""),
-                "candidate_name": str(row["candidate_name"] or ""),
-                "candidate_path": str(row["candidate_path"] or ""),
-                "score": float(row["score"]) if row["score"] is not None else None,
-                "status": str(row["status"] or ""),
-                "reason": str(row["reason"] or ""),
-                "details": details if isinstance(details, dict) else {},
-                "created_at": float(row["created_at"] or 0),
-            })
+            result.append(
+                {
+                    "id": int(row["id"]),
+                    "video_path": str(row["video_path"]),
+                    "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
+                    "episode": int(row["episode"]) if row["episode"] is not None else None,
+                    "anime_title": str(row["anime_title"] or ""),
+                    "source": str(row["source"] or ""),
+                    "candidate_name": str(row["candidate_name"] or ""),
+                    "candidate_path": str(row["candidate_path"] or ""),
+                    "score": float(row["score"]) if row["score"] is not None else None,
+                    "status": str(row["status"] or ""),
+                    "reason": str(row["reason"] or ""),
+                    "details": details if isinstance(details, dict) else {},
+                    "created_at": float(row["created_at"] or 0),
+                }
+            )
         return result
 
     def latest_selected_subtitle(self, video_path: Path) -> dict[str, object] | None:
@@ -3793,15 +4465,10 @@ class Database:
             # is internal metadata stored in its own column.  The details fallback
             # accepts rows written by an aborted/local v8.6 attempt.
             historical_fingerprint = str(
-                row["video_fingerprint"]
-                or details.get("video_content_fingerprint")
-                or ""
+                row["video_fingerprint"] or details.get("video_content_fingerprint") or ""
             ).strip()
             if historical_fingerprint:
-                if (
-                    not current_fingerprint
-                    or historical_fingerprint != current_fingerprint
-                ):
+                if not current_fingerprint or historical_fingerprint != current_fingerprint:
                     return None
             elif require_fingerprint:
                 return None
@@ -3838,9 +4505,7 @@ class Database:
             clauses: list[tuple[str, tuple[object, ...]]] = []
             if media_id is not None:
                 if episode is None:
-                    clauses.append(
-                        ("media_id=? AND episode IS NULL", (int(media_id),))
-                    )
+                    clauses.append(("media_id=? AND episode IS NULL", (int(media_id),)))
                 else:
                     clauses.append(
                         (
@@ -3911,32 +4576,33 @@ class Database:
 
     def playlists(self) -> list[dict[str, object]]:
         with self.connect() as conn:
-            queues = conn.execute(
-                "SELECT * FROM playlists ORDER BY updated_at DESC,id DESC"
-            ).fetchall()
-            rows = conn.execute(
-                "SELECT * FROM playlist_items ORDER BY playlist_id,position,id"
-            ).fetchall()
+            queues = conn.execute("SELECT * FROM playlists ORDER BY updated_at DESC,id DESC").fetchall()
+            rows = conn.execute("SELECT * FROM playlist_items ORDER BY playlist_id,position,id").fetchall()
         grouped: dict[int, list[dict[str, object]]] = {}
         for row in rows:
-            grouped.setdefault(int(row["playlist_id"]), []).append({
+            grouped.setdefault(int(row["playlist_id"]), []).append(
+                {
+                    "id": int(row["id"]),
+                    "position": int(row["position"]),
+                    "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
+                    "episode": int(row["episode"]) if row["episode"] is not None else None,
+                    "video_path": str(row["video_path"]),
+                    "title": str(row["title"] or ""),
+                    "state": str(row["state"] or "pending"),
+                }
+            )
+        return [
+            {
                 "id": int(row["id"]),
-                "position": int(row["position"]),
+                "name": str(row["name"]),
+                "kind": str(row["kind"]),
                 "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
-                "episode": int(row["episode"]) if row["episode"] is not None else None,
-                "video_path": str(row["video_path"]),
-                "title": str(row["title"] or ""),
-                "state": str(row["state"] or "pending"),
-            })
-        return [{
-            "id": int(row["id"]),
-            "name": str(row["name"]),
-            "kind": str(row["kind"]),
-            "media_id": int(row["media_id"]) if row["media_id"] is not None else None,
-            "created_at": float(row["created_at"] or 0),
-            "updated_at": float(row["updated_at"] or 0),
-            "items": grouped.get(int(row["id"]), []),
-        } for row in queues]
+                "created_at": float(row["created_at"] or 0),
+                "updated_at": float(row["updated_at"] or 0),
+                "items": grouped.get(int(row["id"]), []),
+            }
+            for row in queues
+        ]
 
     def playlist(self, playlist_id: int) -> dict[str, object] | None:
         return next((item for item in self.playlists() if int(item["id"]) == int(playlist_id)), None)
@@ -3971,18 +4637,21 @@ class Database:
                 """,
                 (max(1, int(limit)),),
             ).fetchall()
-        return [{
-            "new_info_hash": str(row["new_info_hash"]),
-            "old_torrent_hash": str(row["old_torrent_hash"]),
-            "media_id": int(row["media_id"]),
-            "anime_title": str(row["anime_title"] or ""),
-            "episode": int(row["episode"]),
-            "old_score": float(row["old_score"]),
-            "new_score": float(row["new_score"]),
-            "state": str(row["state"]),
-            "created_at": float(row["created_at"] or 0),
-            "updated_at": float(row["updated_at"] or 0),
-        } for row in rows]
+        return [
+            {
+                "new_info_hash": str(row["new_info_hash"]),
+                "old_torrent_hash": str(row["old_torrent_hash"]),
+                "media_id": int(row["media_id"]),
+                "anime_title": str(row["anime_title"] or ""),
+                "episode": int(row["episode"]),
+                "old_score": float(row["old_score"]),
+                "new_score": float(row["new_score"]),
+                "state": str(row["state"]),
+                "created_at": float(row["created_at"] or 0),
+                "updated_at": float(row["updated_at"] or 0),
+            }
+            for row in rows
+        ]
 
     def schedule_cleanup(
         self,
@@ -4022,7 +4691,9 @@ class Database:
                 resolved_matches: list[sqlite3.Row] = []
                 for candidate in candidates:
                     try:
-                        candidate_resolved = Path(str(candidate["video_path"])).expanduser().resolve(strict=False)
+                        candidate_resolved = (
+                            Path(str(candidate["video_path"])).expanduser().resolve(strict=False)
+                        )
                     except OSError:
                         candidate_resolved = Path(str(candidate["video_path"])).expanduser().absolute()
                     if candidate_resolved == wanted_resolved:
@@ -4040,7 +4711,8 @@ class Database:
                     else:
                         fallback_rows = conn.execute(
                             "SELECT media_id,episode,media_episode,video_path FROM episodes "
-                            "WHERE media_id=? AND COALESCE(media_episode,episode)=?",
+                            "WHERE media_id=? AND ? BETWEEN COALESCE(media_episode,episode) "
+                            "AND COALESCE(media_episode_end,media_episode,episode)",
                             (int(media_id), int(episode)),
                         ).fetchall()
                     if len(fallback_rows) == 1:
@@ -4112,6 +4784,124 @@ class Database:
                 (now, int(media_id)),
             )
             return max(0, int(cursor.rowcount or 0))
+
+    def pending_deletion_media_ids(self) -> set[int]:
+        """Titles whose local files are scheduled for deletion from the anime menu."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT media_id FROM episodes "
+                "WHERE state='dropped' AND delete_after IS NOT NULL AND media_id IS NOT NULL"
+            ).fetchall()
+        return {int(row["media_id"]) for row in rows}
+
+    # What Delete/Drop replaced, so "Keep" can put the title back: the list
+    # status before and each episode row's state before it became 'dropped'.
+    @staticmethod
+    def _drop_restore_key(media_id: int) -> str:
+        return f"drop_restore:{int(media_id)}"
+
+    def save_drop_restore(self, media_id: int, previous_status: str) -> None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT video_path,state FROM episodes WHERE media_id=? AND state!='dropped'",
+                (int(media_id),),
+            ).fetchall()
+        payload = {
+            "status": str(previous_status or ""),
+            "episodes": {str(row["video_path"]): str(row["state"] or "") for row in rows},
+        }
+        # Deleting again while the files are still pending keeps the original
+        # status/states (a finished deletion leaves only a stale record).
+        if int(media_id) in self.pending_deletion_media_ids():
+            try:
+                earlier = json.loads(self.get_state(self._drop_restore_key(media_id), "") or "{}")
+            except (TypeError, ValueError):
+                earlier = {}
+            if isinstance(earlier, dict) and earlier:
+                payload["status"] = str(earlier.get("status") or payload["status"])
+                if isinstance(earlier.get("episodes"), dict):
+                    payload["episodes"] = {**payload["episodes"], **earlier["episodes"]}
+        self.set_state(self._drop_restore_key(media_id), json.dumps(payload, ensure_ascii=False))
+
+    def pop_drop_restore(self, media_id: int) -> dict[str, Any]:
+        raw = self.get_state(self._drop_restore_key(media_id), "")
+        self.delete_state(self._drop_restore_key(media_id))
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def restore_dropped_episode_states(self, media_id: int, states: dict[str, str]) -> int:
+        """Give kept episode rows back the state they had before Delete/Drop."""
+        restored = 0
+        now = time.time()
+        with self.connect() as conn:
+            for video_path, state in states.items():
+                if not state or state == "dropped":
+                    continue
+                cursor = conn.execute(
+                    "UPDATE episodes SET state=?,updated_at=? "
+                    "WHERE media_id=? AND video_path=? AND state='dropped' AND delete_after IS NULL",
+                    (str(state), now, int(media_id), str(video_path)),
+                )
+                restored += max(0, int(cursor.rowcount or 0))
+        return restored
+
+    def keep_dropped_anime(self, media_id: int) -> int:
+        """Cancel the scheduled deletion of a dropped title's local files (AniList stays Dropped)."""
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE episodes SET delete_after=NULL,updated_at=? "
+                "WHERE media_id=? AND state='dropped' AND delete_after IS NOT NULL",
+                (time.time(), int(media_id)),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
+    # Episodes deleted from the anime menu while the title stayed in the list:
+    # automatic downloading must not fetch them again (until the user allows it
+    # or downloads one by hand). A JSON list of AniList episode numbers.
+    @staticmethod
+    def _redownload_block_key(media_id: int) -> str:
+        return f"redownload_blocked:{int(media_id)}"
+
+    def redownload_blocked(self, media_id: int) -> set[int]:
+        try:
+            values = json.loads(self.get_state(self._redownload_block_key(media_id), "") or "[]")
+        except (TypeError, ValueError):
+            return set()
+        if not isinstance(values, list):
+            return set()
+        return {int(value) for value in values if isinstance(value, int) and value > 0}
+
+    def block_redownload(self, media_id: int) -> set[int]:
+        """Block re-downloading every episode the title has rows for now."""
+        blocked = self.redownload_blocked(media_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(media_episode,episode) AS first,"
+                "COALESCE(media_episode_end,media_episode,episode) AS last "
+                "FROM episodes WHERE media_id=? AND COALESCE(media_episode,episode) IS NOT NULL",
+                (int(media_id),),
+            ).fetchall()
+        for row in rows:
+            first, last = int(row["first"]), int(row["last"])
+            blocked.update(range(first, max(first, last) + 1))
+        blocked = {episode for episode in blocked if episode > 0}
+        if blocked:
+            self.set_state(self._redownload_block_key(media_id), json.dumps(sorted(blocked)))
+        return blocked
+
+    def allow_redownload(self, media_id: int, episode: int | None = None) -> int:
+        """Lift the block for one episode, or for the whole title; returns how many were lifted."""
+        blocked = self.redownload_blocked(media_id)
+        lifted = blocked if episode is None else blocked & {int(episode)}
+        remaining = blocked - lifted
+        if remaining:
+            self.set_state(self._redownload_block_key(media_id), json.dumps(sorted(remaining)))
+        elif blocked:
+            self.delete_state(self._redownload_block_key(media_id))
+        return len(lifted)
 
     def rating_prompted(self, media_id: int, episode: int) -> bool:
         return self.get_state(f"rating_prompted:{int(media_id)}:{int(episode)}", "") == "1"
@@ -4220,7 +5010,7 @@ class Database:
     ) -> PersonalReleaseSchedule:
         ordered = [int(value) for value in episodes]
         if not ordered or any(value < 1 for value in ordered) or len(set(ordered)) != len(ordered):
-            raise ValueError("Personal schedule requires a unique ordered episode list")
+            raise ValueError(err("db.scheduleEpisodesUnique"))
         rule = normalize_schedule_rule(rule_unit, rule_every)
         current = time.time() if now is None else float(now)
         materialized = materialize_schedule_items(
@@ -4237,6 +5027,43 @@ class Database:
             actual_revision = int(previous["revision"]) if previous is not None else 0
             if expected_revision is not None and int(expected_revision) != actual_revision:
                 raise PersonalScheduleRevisionConflict(int(expected_revision), actual_revision)
+            if previous is not None and bool(previous["enabled"]) and not new_cycle:
+                try:
+                    previous_rule = normalize_schedule_rule(
+                        str(previous["interval_unit"] or "weeks"),
+                        int(previous["interval_every"] or 1),
+                        version=int(previous["rule_version"] or 1),
+                    )
+                except (ValueError, TypeError):
+                    previous_rule = PersonalReleaseRule()
+                reanchored = reanchored_start_local_datetime(
+                    [
+                        PersonalReleaseItem(
+                            episode=int(row["logical_episode_id"]),
+                            ordinal=int(row["ordinal"]),
+                            unlock_at_utc=float(row["unlock_at_utc"]),
+                            nominal_local_datetime=str(row["nominal_local_datetime"]),
+                            unlocked=bool(row["unlocked_once"]),
+                            watched_at=float(row["watched_at"]) if row["watched_at"] is not None else None,
+                        )
+                        for row in conn.execute(
+                            "SELECT * FROM personal_release_items WHERE schedule_id=?",
+                            (int(previous["schedule_id"]),),
+                        ).fetchall()
+                    ],
+                    previous_rule=previous_rule,
+                    rule=rule,
+                    timezone_iana=timezone_iana,
+                    now=current,
+                )
+                if reanchored is not None:
+                    start_local_datetime = reanchored
+                    materialized = materialize_schedule_items(
+                        ordered,
+                        start_local_datetime=start_local_datetime,
+                        timezone_iana=timezone_iana,
+                        rule=rule,
+                    )
             revision = actual_revision + 1
             cadence = "weekly" if rule.is_default_weekly else "interval"
             if previous is None:
@@ -4249,9 +5076,22 @@ class Database:
                     ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        str(profile_id), int(anime_id), 1, str(start_local_datetime),
-                        str(timezone_iana), cadence, rule.version, rule.unit, rule.every, rule.clock,
-                        1, ordered[0], revision, int(bool(rewatch)), current, current,
+                        str(profile_id),
+                        int(anime_id),
+                        1,
+                        str(start_local_datetime),
+                        str(timezone_iana),
+                        cadence,
+                        rule.version,
+                        rule.unit,
+                        rule.every,
+                        rule.clock,
+                        1,
+                        ordered[0],
+                        revision,
+                        int(bool(rewatch)),
+                        current,
+                        current,
                     ),
                 )
                 schedule_id = int(cursor.lastrowid)
@@ -4261,14 +5101,22 @@ class Database:
                 schedule_id = int(previous["schedule_id"])
                 previous_cycle = max(1, int(previous["cycle_id"] or 1))
                 cycle_id = previous_cycle + 1 if bool(new_cycle) else previous_cycle
-                preserved = {} if new_cycle else {
-                    int(row["logical_episode_id"]): row
-                    for row in conn.execute(
-                        "SELECT * FROM personal_release_items WHERE schedule_id=?",
-                        (schedule_id,),
-                    ).fetchall()
-                    if bool(row["unlocked_once"]) or row["watched_at"] is not None
-                }
+                preserved = (
+                    {}
+                    if new_cycle
+                    else {
+                        int(row["logical_episode_id"]): row
+                        for row in conn.execute(
+                            "SELECT * FROM personal_release_items WHERE schedule_id=?",
+                            (schedule_id,),
+                        ).fetchall()
+                        # Released (time passed, maybe not marked open yet) or
+                        # watched episodes keep their real stored dates.
+                        if bool(row["unlocked_once"])
+                        or row["watched_at"] is not None
+                        or float(row["unlock_at_utc"]) <= current
+                    }
+                )
                 conn.execute(
                     """
                     UPDATE personal_release_schedules
@@ -4278,18 +5126,34 @@ class Database:
                     WHERE schedule_id=?
                     """,
                     (
-                        str(start_local_datetime), str(timezone_iana), cadence,
-                        rule.version, rule.unit, rule.every, rule.clock, cycle_id,
-                        ordered[0], revision, int(bool(rewatch)), current, schedule_id,
+                        str(start_local_datetime),
+                        str(timezone_iana),
+                        cadence,
+                        rule.version,
+                        rule.unit,
+                        rule.every,
+                        rule.clock,
+                        cycle_id,
+                        ordered[0],
+                        revision,
+                        int(bool(rewatch)),
+                        current,
+                        schedule_id,
                     ),
                 )
                 conn.execute("DELETE FROM personal_release_items WHERE schedule_id=?", (schedule_id,))
             for item in materialized:
                 old = preserved.get(item.episode)
                 unlock_at = float(old["unlock_at_utc"]) if old is not None else item.unlock_at_utc
-                nominal = str(old["nominal_local_datetime"]) if old is not None else item.nominal_local_datetime
+                nominal = (
+                    str(old["nominal_local_datetime"]) if old is not None else item.nominal_local_datetime
+                )
                 dst_adjusted = int(bool(old["dst_adjusted"])) if old is not None else int(item.dst_adjusted)
-                unlocked = int(bool(old["unlocked_once"])) if old is not None else int(item.unlock_at_utc <= current)
+                unlocked = (
+                    int(bool(old["unlocked_once"]) or float(old["unlock_at_utc"]) <= current)
+                    if old is not None
+                    else int(item.unlock_at_utc <= current)
+                )
                 watched_at = old["watched_at"] if old is not None else None
                 item_revision = int(old["schedule_revision"]) if old is not None else revision
                 conn.execute(
@@ -4300,8 +5164,16 @@ class Database:
                     ) VALUES(?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
-                        schedule_id,item.episode,item.ordinal,unlock_at,nominal,item_revision,
-                        dst_adjusted,unlocked,watched_at,current,
+                        schedule_id,
+                        item.episode,
+                        item.ordinal,
+                        unlock_at,
+                        nominal,
+                        item_revision,
+                        dst_adjusted,
+                        unlocked,
+                        watched_at,
+                        current,
                     ),
                 )
             conn.execute(
@@ -4310,7 +5182,7 @@ class Database:
             )
         result = self.personal_release_schedule(anime_id, profile_id=profile_id, now=current)
         if result is None:
-            raise RuntimeError("Failed to persist personal release schedule")
+            raise RuntimeError(err("db.scheduleSaveFailed"))
         return result
 
     def disable_personal_release_schedule(self, anime_id: int, *, profile_id: str = "default") -> bool:
@@ -4392,7 +5264,7 @@ class Database:
                     updated_at=?
                 WHERE media_id=?
                   AND episode IS NOT NULL
-                  AND episode>?
+                  AND COALESCE(media_episode_end,episode)>?
                   AND (
                       state='watched'
                       OR watched_at IS NOT NULL
@@ -4440,7 +5312,7 @@ class Database:
                       AND e.watched_at IS NULL
                       AND e.delete_after IS NULL
                       AND e.episode IS NOT NULL
-                      AND e.episode<=a.progress
+                      AND COALESCE(e.media_episode_end,e.episode)<=a.progress
                       AND (e.torrent_hash!='' OR e.downloaded_at IS NOT NULL)
                       AND e.playback_duration IS NOT NULL
                       AND e.playback_duration>0
@@ -4554,7 +5426,9 @@ class Database:
                         title,
                         new["episode"] if new["episode"] is not None else old["episode"],
                         new["subtitle_path"] or old["subtitle_path"],
-                        new["embedded_subtitle_id"] if new["embedded_subtitle_id"] is not None else old["embedded_subtitle_id"],
+                        new["embedded_subtitle_id"]
+                        if new["embedded_subtitle_id"] is not None
+                        else old["embedded_subtitle_id"],
                         str(new["subtitle_origin"] or old["subtitle_origin"] or ""),
                         state,
                         str(new["torrent_hash"] or old["torrent_hash"] or ""),
@@ -4562,9 +5436,13 @@ class Database:
                         new["watched_at"] if new["watched_at"] is not None else old["watched_at"],
                         new["delete_after"] if new["delete_after"] is not None else old["delete_after"],
                         playback_source["playback_position"],
-                        max(float(old["playback_duration"] or 0.0), float(new["playback_duration"] or 0.0)) or None,
+                        max(float(old["playback_duration"] or 0.0), float(new["playback_duration"] or 0.0))
+                        or None,
                         playback_source["playback_updated_at"],
-                        max(float(old["playback_active_seconds"] or 0.0), float(new["playback_active_seconds"] or 0.0)),
+                        max(
+                            float(old["playback_active_seconds"] or 0.0),
+                            float(new["playback_active_seconds"] or 0.0),
+                        ),
                         now,
                         new_value,
                     ),
@@ -4582,7 +5460,9 @@ class Database:
                 else:
                     conn.execute("DELETE FROM subtitle_jobs WHERE video_path=?", (old_value,))
 
-            conn.execute("UPDATE subtitle_history SET video_path=? WHERE video_path=?", (new_value, old_value))
+            conn.execute(
+                "UPDATE subtitle_history SET video_path=? WHERE video_path=?", (new_value, old_value)
+            )
 
             # Playlist rows have a UNIQUE(playlist_id, video_path) constraint.
             # Remove an obsolete duplicate before rewriting any remaining rows.

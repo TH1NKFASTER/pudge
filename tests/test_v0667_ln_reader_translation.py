@@ -10,6 +10,9 @@ import pytest
 
 from pudge.config import AppConfig
 from pudge.light_novels import LightNovelService
+from study_page_support import SELECTION
+from t71g18_support import ln_book
+from tests.i18n_support import has_text
 
 
 def cfg(tmp_path: Path) -> AppConfig:
@@ -76,7 +79,7 @@ def test_online_selection_translation_is_cached(tmp_path: Path, monkeypatch: pyt
         return httpx.Response(
             200,
             request=httpx.Request("GET", url),
-            json=[[['Это тест.', 'これはテストです。', None, None]]],
+            json=[[["Это тест.", "これはテストです。", None, None]]],
         )
 
     monkeypatch.setattr(httpx, "get", fake_get)
@@ -88,7 +91,9 @@ def test_online_selection_translation_is_cached(tmp_path: Path, monkeypatch: pyt
     assert calls == [("https://translate.googleapis.com/translate_a/single", "ru")]
 
 
-def test_local_llm_translation_uses_extended_preceding_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_llm_translation_uses_extended_preceding_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     c = cfg(tmp_path)
     c.llm.enabled = True
     c.llm.base_url = "http://127.0.0.1:11434"
@@ -122,7 +127,9 @@ def test_local_llm_translation_uses_extended_preceding_context(tmp_path: Path, m
     assert before.count("前") == 260
 
 
-def test_light_novel_state_refresh_is_background_and_deduplicated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_light_novel_state_refresh_is_background_and_deduplicated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = LightNovelService(cfg(tmp_path))
     entered = threading.Event()
     release = threading.Event()
@@ -152,22 +159,114 @@ def test_light_novel_state_refresh_is_background_and_deduplicated(tmp_path: Path
     assert service._state_refreshing is False
 
 
-def test_reader_ui_owns_appearance_and_selection_translation() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    settings_block = html[html.index("function renderSettings(){"):html.index("function fillSettings")]
-    assert 'id="lnReaderAppearance"' in html
-    assert 'id="lnrFont"' in html and 'id="lnUnknownFuriganaToggle"' in html and 'id="lnrCustomCss"' in html
-    assert 'id="lnrFurigana"' not in html
-    assert "lnStudyStateMenu" in html
-    assert 'id="s_ln_reader_font"' not in settings_block
-    assert 'id="s_ln_furigana"' not in settings_block
-    assert 'id="s_ln_custom_css"' not in settings_block
-    assert 'id="s_ln_translation_language"' not in settings_block
-    assert "light_novel_translate" in html
-    assert ".slice(-200)" in html
-    assert "light_novel_cancel_reader_background" in html
-    assert "App navigation uses standard Cmd+1…N and Cmd+F" not in html
-    assert "Навигация приложения использует стандартные Cmd+1…N и Cmd+F" not in html
+READER_CONTROLS = [
+    "lnrFont",
+    "lnrFontSize",
+    "lnrTheme",
+    "lnrTextColor",
+    "lnrBgColor",
+    "lnrWidth",
+    "lnrLineHeight",
+    "lnrIndent",
+    "lnrVertical",
+    "lnrMode",
+    "lnrWordTheme",
+    "lnrWordNew",
+    "lnrWordNotInDeck",
+    "lnrWordYoung",
+    "lnrWordMature",
+    "lnrWordMastered",
+    "lnrWordDue",
+    "lnrWordBlacklisted",
+    "lnrWordSuspended",
+    "lnrWordRedundant",
+    "lnrWordJitenProfile",
+    "lnrCustomCss",
+]
+REMOVED_SETTINGS = ["s_ln_reader_font", "s_ln_furigana", "s_ln_custom_css", "s_ln_translation_language"]
+# Chapter: a long first paragraph (the context) and a short one to translate.
+TRANSLATE_BOOK = (
+    ln_book(paragraphs=["前" * 300, "これはテストです。"])
+    + """
+__api.light_novel_save_settings = async patch => ({...patch});
+__api.translate_text = async () => ({translation: 'This is a test.'});
+__api.light_novel_translate = async () => ({translation: 'This is a test.'});
+"""
+)
+
+
+def test_reader_owns_its_appearance_and_settings_do_not(page) -> None:
+    result = page.run(
+        r"""
+        setPage('settings', true); await __tick(50);
+        const out = {settings: REMOVED.filter(id => document.getElementById(id)), settingsText: __text('#settingsContent')};
+        await __settle(openLightNovel(6)); await __tick(300);
+        await __click('#lnReaderAppearanceToggle'); await __tick(10);
+        const panel = $('lnReaderAppearance');
+        out.panel = {open: panel.checkVisibility(), missing: CONTROLS.filter(id => !panel.querySelector('#' + id)),
+                     furiganaSelect: Boolean(document.getElementById('lnrFurigana'))};
+        const saves = () => __apiCalls.filter(c => c.name === 'light_novel_save_settings').map(c => c.args[0]);
+        await __input('#lnrFontSize', '26'); await __tick(400);
+        out.size = {shown: $('lnReader').style.getPropertyValue('--ln-font-size'), saved: saves().at(-1)?.reader_font_size};
+        await __input('#lnrCustomCss', '.ln-reader p { letter-spacing: 1px; }'); await __tick(400);
+        out.applied = {size: $('lnReader').style.getPropertyValue('--ln-font-size'), css: $('lnCustomStyle').textContent};
+        out.saved = saves().at(-1);
+        // Furigana for unknown words: a click turns it off, a right-click chooses the word states.
+        await __click('#lnUnknownFuriganaToggle'); await __tick(400);
+        out.furigana = saves().at(-1);
+        await __fire('#lnUnknownFuriganaToggle', 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent'); await __tick(10);
+        out.menu = $('lnStudyStateMenu')?.classList.contains('open');
+        await __input('#lnStudyStateMenu [data-ln-study-state="known"]', true); await __tick(400);
+        out.states = saves().at(-1);
+        return out;
+        """.replace("REMOVED", json.dumps(REMOVED_SETTINGS)).replace("CONTROLS", json.dumps(READER_CONTROLS)),
+        before=TRANSLATE_BOOK,
+        state={"settings": {"review_gate_ln_enabled": False}},
+    )
+    out = result.value
+    assert out["settings"] == []
+    assert out["panel"] == {"open": True, "missing": [], "furiganaSelect": False}
+    assert out["size"] == {"shown": "26px", "saved": 26}
+    assert out["applied"] == {"size": "26px", "css": ".ln-reader p { letter-spacing: 1px; }"}
+    assert (
+        out["saved"]["reader_font_size"] == 26
+        and out["saved"]["custom_css"] == ".ln-reader p { letter-spacing: 1px; }"
+    )
+    assert out["furigana"] == {"show_furigana": False}
+    assert out["menu"] is True and "known" in out["states"]["furigana_states"]
+    # The old note about standard app shortcuts is gone from Settings and the catalogs.
+    for lang, text in (
+        ("en", "App navigation uses standard Cmd+1…N and Cmd+F"),
+        ("ru", "Навигация приложения использует стандартные Cmd+1…N и Cmd+F"),
+    ):
+        assert not has_text(text, lang)
+    assert "App navigation uses standard" not in out["settingsText"]
+
+
+def test_selection_translation_sends_the_preceding_context_and_closing_cancels_background_work(page) -> None:
+    for lang, missing in (("en", []), ("ru", ["translate_text"])):  # older backends: light_novel_translate
+        result = page.run(
+            SELECTION
+            + r"""
+            await __settle(openLightNovel(6)); await __tick(300);
+            await selectParagraph(1);
+            await press('[data-pudge-translate-now]'); await __tick(20);
+            const out = {shown: __text('#pudgeTranslationPop .pudge-translation-text')};
+            await __click('#lnReaderClose'); await __tick(50);
+            return out;
+            """,
+            lang=lang,
+            before=TRANSLATE_BOOK,
+            state={"settings": {"review_gate_ln_enabled": False}},
+            missingApi=missing,
+        )
+        [[text, context, language, _media]] = result.calls_of(
+            "light_novel_translate" if missing else "translate_text"
+        )
+        assert (text, language) == ("これはテストです。", lang)
+        assert context == "前" * 200  # the last 200 characters before the selection
+        assert result.value["shown"] == "This is a test."
+        assert result.calls_of("light_novel_cancel_reader_background") == [[]]
 
 
 def test_cli_reuses_library_anilist_identity_for_absolute_bleach(tmp_path: Path) -> None:

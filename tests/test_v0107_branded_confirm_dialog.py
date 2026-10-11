@@ -1,55 +1,84 @@
-from pathlib import Path
+"""Pudge's own confirmation dialog replaces the browser's confirm() (behaviour; audit 71Б
+rewrite). Window checks run the real index.html (tests/page_harness.py)."""
+
+from __future__ import annotations
+
 import re
 
-ROOT = Path(__file__).parents[1]
-WEB = ROOT / "pudge" / "web"
+from source_policy import sources
+
+# The dialog's stylesheet is added by pudge_confirm.js at run time, which the harness does not
+# model; its `open` class is what that stylesheet shows (`.pudge-confirm-backdrop.open`).
+DIALOG = r"""
+const dialog = () => {
+  const backdrop = document.getElementById('pudgeConfirmBackdrop');
+  return {open: backdrop.classList.contains('open'), logo: backdrop.querySelector('img')?.getAttribute('src'),
+    title: __text('#pudgeConfirmTitle'), message: __text('#pudgeConfirmMessage'), ok: __text('[data-pudge-confirm="ok"]'),
+    cancel: __text('[data-pudge-confirm="cancel"]'), danger: backdrop.querySelector('[data-pudge-confirm="ok"]').classList.contains('danger')};
+};
+const isOpen = () => document.getElementById('pudgeConfirmBackdrop').classList.contains('open');
+// The answer once the dialog has had its chance to close ('pending' while it is still open).
+const answered = async promise => { let value = 'pending'; promise.then(result => { value = result; }); await __tick(20); return value; };
+"""
 
 
-def test_branded_confirm_dialog_uses_pudge_logo() -> None:
-    source = (WEB / "pudge_confirm.js").read_text(encoding="utf-8")
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert 'src="app-logo.png"' in source
-    assert "window.pudgeConfirm = (message, options = {}) => new Promise" in source
-    # Escape ownership moved to the single window-capture dispatcher in R1.
-    # The confirm module exposes a close API instead of competing for Escape.
-    assert "window.PudgeConfirm =" in source
-    assert "closeIfOpen:" in source
-    assert "event.key === 'Escape'" not in source
-    assert "window.addEventListener('keydown',dispatchEscapeEvent,true)" in html
-    assert "window.PudgeConfirm?.closeIfOpen?.()" in html
-    # Enter-to-confirm remains local because it is not part of Escape dispatch.
-    assert "event.key === 'Enter'" in source
-
-
-def test_branded_confirm_is_loaded_before_ui_modules() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    tag = '<script src="pudge_confirm.js"></script>'
-    assert tag in html
-    confirm_pos = html.index(tag)
-    positions = []
-    for name in ("media.js", "library.js", "settings.js"):
-        pos = html.find(f'<script src="{name}"></script>')
-        if pos >= 0:
-            positions.append(pos)
-    assert positions
-    assert confirm_pos < min(positions)
+def test_branded_confirm_dialog_answers_by_button_enter_and_escape(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            DIALOG
+            + r"""
+            const out = {expected: {ok: t('ui.confirm'), cancel: t('action.cancel')}};
+            let answer = pudgeConfirm('Delete the episode?'); await __tick(20);
+            out.shown = dialog();
+            await __click('[data-pudge-confirm="ok"]'); out.ok = await answered(answer); out.closedAfterOk = !isOpen();
+            answer = pudgeConfirm('Again?'); await __tick(20); await __click('[data-pudge-confirm="cancel"]'); out.cancel = await answered(answer);
+            answer = pudgeConfirm('Enter?'); await __tick(20); await __key('Enter'); out.enter = await answered(answer);
+            // Over an open window (the releases list) one Escape answers "no" and closes only
+            // the confirmation; the next Escape closes the window.
+            await __settle(openRelease(7, 3, false));
+            answer = pudgeConfirm('Remove everything?', {danger: true, title: 'Delete', confirmText: 'Delete all'}); await __tick(20);
+            out.danger = dialog();
+            await __key('Enter'); await __tick(20); out.openAfterEnter = isOpen();   // Enter never confirms a dangerous action
+            await __key('Escape');
+            out.escape = await answered(answer); out.afterEscape = {confirm: isOpen(), releases: __visible('#modalBackdrop')};
+            await __key('Escape'); await __tick(20); out.releasesAfterSecondEscape = __visible('#modalBackdrop');
+            return out;
+            """,
+            lang=lang,
+            api={"search_releases": []},
+        )
+        out = result.value
+        assert out["shown"] == {
+            "open": True,
+            "logo": "app-logo.png",
+            "title": "Pudge",
+            "message": "Delete the episode?",
+            "ok": out["expected"]["ok"],
+            "cancel": out["expected"]["cancel"],
+            "danger": False,
+        }
+        assert (out["ok"], out["closedAfterOk"], out["cancel"], out["enter"]) == (True, True, False, True)
+        assert out["danger"] == {
+            "open": True,
+            "logo": "app-logo.png",
+            "title": "Delete",
+            "message": "Remove everything?",
+            "ok": "Delete all",
+            "cancel": out["expected"]["cancel"],
+            "danger": True,
+        }
+        assert out["openAfterEnter"] is True
+        assert out["escape"] is False and out["afterEscape"] == {"confirm": False, "releases": True}
+        assert out["releasesAfterSecondEscape"] is False
+        assert result.dialogs == []  # never the browser's own dialog
 
 
 def test_no_native_confirm_calls_remain_in_web_ui() -> None:
-    leftovers = []
-    for path in [WEB / "index.html", *WEB.glob("*.js")]:
-        if path.name == "pudge_confirm.js":
-            continue
-        source = path.read_text(encoding="utf-8")
-        if re.search(r"(?<![A-Za-z0-9_$])confirm\(", source):
-            leftovers.append(path.name)
+    # policy: every confirmation in the window (dozens of call sites) must use pudgeConfirm; the
+    # browser's confirm() shows WebKit's unbranded sheet and blocks the page.
+    leftovers = [
+        name
+        for name, text in {**sources("pudge/web/*.js"), **sources("pudge/web/index.html")}.items()
+        if not name.endswith("pudge_confirm.js") and re.search(r"(?<![A-Za-z0-9_$])confirm\(", text)
+    ]
     assert leftovers == []
-
-
-def test_existing_confirmation_calls_use_async_pudge_confirm() -> None:
-    combined = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in [WEB / "index.html", *WEB.glob("*.js")]
-        if path.name != "pudge_confirm.js"
-    )
-    assert "await pudgeConfirm(" in combined

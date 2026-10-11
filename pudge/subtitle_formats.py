@@ -7,12 +7,14 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
+from .i18n import err
 
-_TIME_RE = re.compile(
-    r"(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})[,.](?P<ms>\d{1,3})"
-)
+
+_TIME_RE = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})[,.](?P<ms>\d{1,3})")
 _TIMING_RE = re.compile(
     r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*"
     r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
@@ -113,7 +115,7 @@ def format_preference_bonus(filename: str | Path, prefer_srt: bool = True) -> fl
 def _timestamp_to_seconds(value: str) -> float:
     match = _TIME_RE.fullmatch(value.strip())
     if not match:
-        raise ValueError(f"Некорректный timestamp субтитров: {value}")
+        raise ValueError(err("subtitles.invalidTimestamp", value=value))
     milliseconds = match.group("ms").ljust(3, "0")[:3]
     return (
         int(match.group("h")) * 3600
@@ -186,8 +188,30 @@ def plain_subtitle_text(value: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
+# Subtitle preparation parses the same few files dozens of times per episode.
+# Cues are a pure function of the text, so cache by the text itself (never
+# stale, unlike a path/mtime key) and hand every caller its own list.
+_SRT_CUE_CACHE: OrderedDict[str, tuple[tuple[float, float, str], ...]] = OrderedDict()
+_SRT_CUE_CACHE_LIMIT = 32
+_SRT_CUE_CACHE_LOCK = threading.Lock()
+
+
 def parse_srt(path: Path) -> list[tuple[float, float, str]]:
     text = path.read_text(encoding="utf-8-sig", errors="replace")
+    with _SRT_CUE_CACHE_LOCK:
+        cached = _SRT_CUE_CACHE.get(text)
+        if cached is not None:
+            _SRT_CUE_CACHE.move_to_end(text)
+            return list(cached)
+    cues = _parse_srt_text(text)
+    with _SRT_CUE_CACHE_LOCK:
+        _SRT_CUE_CACHE[text] = tuple(cues)
+        while len(_SRT_CUE_CACHE) > _SRT_CUE_CACHE_LIMIT:
+            _SRT_CUE_CACHE.popitem(last=False)
+    return cues
+
+
+def _parse_srt_text(text: str) -> list[tuple[float, float, str]]:
     blocks = re.split(r"\r?\n\s*\r?\n", text.strip())
     cues: list[tuple[float, float, str]] = []
     for block in blocks:
@@ -272,12 +296,10 @@ def bilingual_cjk_profile(
     japanese = sum(kind == "japanese" for kind in kinds)
     han_only = sum(kind == "han_only" for kind in kinds)
     short_han = sum(
-        kind == "han_only" and end - start <= 0.45
-        for (start, end, _text), kind in zip(cues, kinds)
+        kind == "han_only" and end - start <= 0.45 for (start, end, _text), kind in zip(cues, kinds)
     )
     transitions = sum(
-        left != right and {left, right} == {"japanese", "han_only"}
-        for left, right in zip(kinds, kinds[1:])
+        left != right and {left, right} == {"japanese", "han_only"} for left, right in zip(kinds, kinds[1:])
     )
     parallel_han = len(_parallel_han_cue_indices(cues, kinds))
     relevant = japanese + han_only
@@ -287,10 +309,7 @@ def bilingual_cjk_profile(
     suspected = bool(
         japanese >= 20
         and han_only >= 20
-        and (
-            (short_han_ratio >= 0.50 and transition_ratio >= 0.35)
-            or parallel_han_ratio >= 0.50
-        )
+        and ((short_han_ratio >= 0.50 and transition_ratio >= 0.35) or parallel_han_ratio >= 0.50)
     )
     return {
         "suspected_bilingual_cjk": suspected,
@@ -302,6 +321,7 @@ def bilingual_cjk_profile(
         "parallel_han_ratio": round(parallel_han_ratio, 4),
         "alternating_ratio": round(transition_ratio, 4),
     }
+
 
 def subtitle_bilingual_cjk_profile(path: Path) -> dict[str, object]:
     suffix = path.suffix.casefold()
@@ -360,10 +380,7 @@ def _filter_inline_chinese_lines(
         kinds = [_cue_script_kind(line) for line in lines]
         if "japanese" in kinds and "han_only" in kinds:
             mixed_line_cues += 1
-    consistent_inline_bilingual = bool(
-        mixed_line_cues >= 2
-        and mixed_line_cues / max(len(cues), 1) >= 0.25
-    )
+    consistent_inline_bilingual = bool(mixed_line_cues >= 2 and mixed_line_cues / max(len(cues), 1) >= 0.25)
 
     filtered: list[tuple[float, float, str]] = []
     removed = 0
@@ -383,12 +400,8 @@ def _filter_inline_chinese_lines(
                 kept.append(line)
                 continue
             compact = re.sub(r"[^\u3400-\u4dbf\u4e00-\u9fff]", "", line)
-            strong_simplified_hints = sum(
-                ch in _STRONG_SIMPLIFIED_CHINESE_HINTS for ch in compact
-            )
-            likely_translation = bool(
-                consistent_inline_bilingual or strong_simplified_hints >= 2
-            )
+            strong_simplified_hints = sum(ch in _STRONG_SIMPLIFIED_CHINESE_HINTS for ch in compact)
+            likely_translation = bool(consistent_inline_bilingual or strong_simplified_hints >= 2)
             if likely_translation:
                 removed += 1
                 continue
@@ -425,10 +438,7 @@ def _filter_parallel_chinese_cues(
         # parallel Chinese track. Remove it regardless of duration, while keeping
         # unpaired short kanji-only Japanese cues such as 私, 本当 or 大丈夫.
         translated = bool(
-            index in paired_han_indices
-            or duration <= 0.45
-            or len(compact) > 4
-            or has_simplified_hint
+            index in paired_han_indices or duration <= 0.45 or len(compact) > 4 or has_simplified_hint
         )
         if translated:
             removed += 1
@@ -439,10 +449,9 @@ def _filter_parallel_chinese_cues(
     profile["removed_han_only_cues"] = removed
     profile["removed_inline_chinese_lines"] = inline_removed
     profile["remaining_cues"] = len(filtered)
-    profile["suspected_bilingual_cjk"] = bool(
-        profile.get("suspected_bilingual_cjk") or inline_removed
-    )
+    profile["suspected_bilingual_cjk"] = bool(profile.get("suspected_bilingual_cjk") or inline_removed)
     return filtered, profile
+
 
 def _merge_parallel_cues(
     cues: list[tuple[float, float, str]],
@@ -495,6 +504,7 @@ def _merge_parallel_cues(
         merged.append((start, end, text))
 
     return merged, merged_count
+
 
 def _separate_touching_cues(
     cues: list[tuple[float, float, str]],
@@ -569,9 +579,7 @@ def write_srt(
         payload = plain_subtitle_text(text)
         if not payload or end <= start:
             continue
-        blocks.append(
-            f"{index}\n{_seconds_to_timestamp(start)} --> {_seconds_to_timestamp(end)}\n{payload}"
-        )
+        blocks.append(f"{index}\n{_seconds_to_timestamp(start)} --> {_seconds_to_timestamp(end)}\n{payload}")
     payload_text = "\n\n".join(blocks) + ("\n" if blocks else "")
     # Write atomically: callers treat an existing output as a ready cache, so
     # an interrupted write must never leave a truncated file at *path*.
@@ -734,9 +742,7 @@ def _ass_geometry_cues(
             section = line.casefold()
             continue
         if line.casefold().startswith("format:"):
-            names = [
-                part.strip().casefold() for part in line.split(":", 1)[1].split(",")
-            ]
+            names = [part.strip().casefold() for part in line.split(":", 1)[1].split(",")]
             if section == "[events]":
                 fields = names
             elif section in {"[v4+ styles]", "[v4 styles]"}:
@@ -747,11 +753,7 @@ def _ass_geometry_cues(
             row = dict(zip(style_fields, parts))
             styles[row.get("name", "")] = row
             continue
-        if (
-            section != "[events]"
-            or not line.casefold().startswith("dialogue:")
-            or not fields
-        ):
+        if section != "[events]" or not line.casefold().startswith("dialogue:") or not fields:
             continue
         parts = line.split(":", 1)[1].lstrip().split(",", len(fields) - 1)
         if len(parts) != len(fields):
@@ -787,30 +789,17 @@ def _ass_geometry_cues(
             matches = re.findall(r"\\" + tag + r"(-?\d+(?:\.\d+)?)", raw_text)
             return float(matches[-1]) if matches else default
 
-        positions = re.findall(
-            r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", raw_text
-        )
+        positions = re.findall(r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", raw_text)
         position = (
-            positions[0]
-            if len(positions) == 1 and "\n" not in payload and r"\move" not in raw_text
-            else None
+            positions[0] if len(positions) == 1 and "\n" not in payload and r"\move" not in raw_text else None
         )
         font = override("fs", number("fontsize", 40.0))
         height = font * override("fscy", number("scaley", 100.0)) / 100.0
         # Inline scale changes often narrow only the closing punctuation.
         # Its final override is not the width of the entire base sentence.
-        horizontal_scales = [
-            float(v) for v in re.findall(r"\\fscx(-?\d+(?:\.\d+)?)", raw_text)
-        ]
-        scale_x = (
-            max(horizontal_scales) if horizontal_scales else number("scalex", 100.0)
-        )
-        width = (
-            font
-            * scale_x
-            / 100.0
-            * sum(1.0 if ord(ch) >= 0x2E80 else 0.55 for ch in payload)
-        )
+        horizontal_scales = [float(v) for v in re.findall(r"\\fscx(-?\d+(?:\.\d+)?)", raw_text)]
+        scale_x = max(horizontal_scales) if horizontal_scales else number("scalex", 100.0)
+        width = font * scale_x / 100.0 * sum(1.0 if ord(ch) >= 0x2E80 else 0.55 for ch in payload)
         alignment = int(override("an", number("alignment", 2)))
         x, y = (float(position[0]), float(position[1])) if position else (0.0, 0.0)
         if alignment % 3 == 2:
@@ -831,9 +820,7 @@ def _ass_geometry_cues(
         )
     groups: dict[tuple[float, float], list[dict[str, object]]] = {}
     for event in events:
-        groups.setdefault((float(event["start"]), float(event["end"])), []).append(
-            event
-        )
+        groups.setdefault((float(event["start"]), float(event["end"])), []).append(event)
     cues: list[tuple[float, float, str]] = []
     ruby_removed = assembled = 0
     for (start, end), group in groups.items():
@@ -886,10 +873,7 @@ def _ass_geometry_cues(
                 rows.append([event])
         if len(positioned) >= 2:
             lines = [
-                "".join(
-                    str(event["text"])
-                    for event in sorted(row, key=lambda event: float(event["x"]))
-                )
+                "".join(str(event["text"]) for event in sorted(row, key=lambda event: float(event["x"])))
                 for row in rows
             ]
             payload = plain_subtitle_text("\n".join(lines))
@@ -961,19 +945,25 @@ def convert_to_plain_srt(
         geometry_cues, parallel_merged = _merge_parallel_cues(geometry_cues)
         if geometry_cues:
             write_srt(geometry_cues, output, preserve_overlaps=True)
-            return output, {"reason": "converted", "converted": True, "method": "ass-geometry", "output": str(output), "geometry": geometry, "parallel_merged": parallel_merged, "bilingual_cjk": bool(bilingual_profile.get("suspected_bilingual_cjk")), "bilingual_removed": int(bilingual_profile.get("removed_han_only_cues") or 0), "bilingual_profile": bilingual_profile}
+            return output, {
+                "reason": "converted",
+                "converted": True,
+                "method": "ass-geometry",
+                "output": str(output),
+                "geometry": geometry,
+                "parallel_merged": parallel_merged,
+                "bilingual_cjk": bool(bilingual_profile.get("suspected_bilingual_cjk")),
+                "bilingual_removed": int(bilingual_profile.get("removed_han_only_cues") or 0),
+                "bilingual_profile": bilingual_profile,
+            }
 
     filename_language = subtitle_filename_language_profile(subtitle.name)
-    explicit_mixed_cjk = (
-        filename_language.get("purity") == "mixed_japanese_chinese"
-    )
+    explicit_mixed_cjk = filename_language.get("purity") == "mixed_japanese_chinese"
     # ffmpeg may merge two ASS tracks into one multiline cue before we can
     # identify the Chinese half. Explicit mixed files use the manual parser,
     # which keeps parallel Dialogue events separate until filtering.
     resolved = (
-        None
-        if explicit_mixed_cjk
-        else (shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path)
+        None if explicit_mixed_cjk else (shutil.which(ffmpeg_path) if "/" not in ffmpeg_path else ffmpeg_path)
     )
     ffmpeg_error = ""
     ffmpeg_output = output.with_name(f".{output.stem}.ffmpeg.srt")
@@ -1014,12 +1004,8 @@ def convert_to_plain_srt(
                             "method": "ffmpeg",
                             "output": str(output),
                             "parallel_merged": parallel_merged,
-                            "bilingual_cjk": bool(
-                                bilingual_profile.get("suspected_bilingual_cjk")
-                            ),
-                            "bilingual_removed": int(
-                                bilingual_profile.get("removed_han_only_cues") or 0
-                            ),
+                            "bilingual_cjk": bool(bilingual_profile.get("suspected_bilingual_cjk")),
+                            "bilingual_removed": int(bilingual_profile.get("removed_han_only_cues") or 0),
                             "bilingual_profile": bilingual_profile,
                         }
             ffmpeg_error = completed.stdout[-1000:]
@@ -1044,5 +1030,5 @@ def convert_to_plain_srt(
     return subtitle, {
         "reason": "conversion_failed",
         "converted": False,
-        "error": ffmpeg_error if verbose else "Не удалось преобразовать ASS/SSA в SRT",
+        "error": ffmpeg_error if verbose else err("subtitles.assConversionFailed"),
     }

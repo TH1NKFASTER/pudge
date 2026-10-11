@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from pudge.manga_ocr_artifact import MANGA_OCR_ARTIFACT_SCHEMA, normalize_region
-
-ROOT = Path(__file__).parents[1]
+from tests.t71g06_support import column, horizontal, reader, vertical
 
 
 def test_artifact_v3_preserves_alignment_diagnostics_and_marks_unlabeled_geometry_unknown() -> None:
@@ -84,20 +81,71 @@ def test_artifact_does_not_call_synthetic_grid_observed_geometry() -> None:
     assert region["geometry_status"] == "synthetic"
 
 
-def test_frontend_mapping_is_monotonic_and_has_no_reset_to_zero_or_word_grids() -> None:
-    js = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    assert "pudge-manga-recovery-hitbox-contract-v2" in js
-    assert "function mangaMapTokenSurfaces(stream, surfaces)" in js
-    assert "if (found < 0) found = mangaFindCharacterSequence(stream, surface, 0);" not in js
-    start = js.index("function mangaTokenHitboxes(regionNode, region)")
-    end = js.index("function mangaTokenBoxClientRect", start)
-    body = js[start:end]
-    assert "vertical-grid-fallback" not in body
-    assert "horizontal-region-fallback" not in body
-    assert "if (segments.length) return [];" in body
-    assert "region-single-token" in body
+# Word hitboxes, as the OCR debug overlay (Shift+D twice: "words") draws them.
+HITBOX_PAGE = {
+    0: [
+        # The recognizer read more than the detector found ink for: "な猫" has no segments.
+        column("猫が好きな猫", 0.80, 0.90, segment_text="猫が好き"),
+        vertical("魚", 0.60, 0.70, 0.05, 0.10),  # no segments, one word: the region is the word
+        vertical("白い犬", 0.50, 0.60, 0.05, 0.25),  # no segments, two words: no invented grid
+        horizontal("赤い花", 0.10, 0.10, 0.30, 0.05),  # ... nor a horizontal one
+        column("青い鳥", 0.30, 0.90, segment_text="青"),  # a single segment for two words: nothing
+        column("空", 0.25, 0.50),  # one segment: not enough to place a word, and the
+        # region is not used as the word's box instead
+        column("海だ", 0.20, 0.90, source="vision-accurate", status=None),
+    ]
+}
+HITBOX_PARSE = {
+    "猫が好きな猫": [["猫", 1, 0], ["が", 2, 0], ["好き", 3, 0], ["な", 4, 0], ["猫", 1, 0]],
+    "魚": [["魚", 5, 0]],
+    "白い犬": [["白い", 6, 0], ["犬", 7, 0]],
+    "赤い花": [["赤い", 8, 0], ["花", 9, 0]],
+    "青い鳥": [["青い", 10, 0], ["鳥", 11, 0]],
+    "海だ": [["海", 12, 0], ["だ", 13, 0]],
+    "空": [["空", 14, 0]],
+}
 
 
-def test_debug_hitboxes_export_geometry_status() -> None:
-    js = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    assert "core.dataset.geometryStatus = mangaGeometryStatus" in js
+def test_word_hitboxes_follow_the_ocr_ink_in_order_and_are_never_invented(page) -> None:
+    result = reader(
+        page,
+        r"""
+        await __key('D', {shiftKey: true, code: 'KeyD'}); await __tick(10);
+        await __key('D', {shiftKey: true, code: 'KeyD'}); await __tick(10);
+        return {mode: $('mangaReaderV2').dataset.debugOverlay, button: __text('[data-manga-v2-action="toggle-debug-overlay"]'),
+                label: t('manga.ocrDebugWords'), shown: regions().map(r => r.text), boxes: debugBoxes()};
+        """,
+        regions=HITBOX_PAGE,
+        parse=HITBOX_PARSE,
+    )
+    out = result.value
+    assert (out["mode"], out["button"]) == ("words", out["label"])
+    boxes = {}
+    for box in out["boxes"]:
+        boxes.setdefault(out["shown"][box["region"]], []).append(
+            (box["word"], box["token"], box["source"], box["status"])
+        )
+    # Words map onto the ink in reading order; a word the ink does not cover gets no box
+    # (the second 猫 is not mapped back onto the first one).
+    assert boxes["猫が好きな猫"] == [
+        ("猫", 0, "ink-components-v2", "approximate"),
+        ("が", 1, "ink-components-v2", "approximate"),
+        ("好き", 2, "ink-components-v2", "approximate"),
+    ]
+    assert boxes["魚"] == [("魚", 0, "region-single-token", "unavailable")]
+    assert boxes["海だ"] == [
+        ("海", 0, "vision-accurate", "observed"),
+        ("だ", 1, "vision-accurate", "observed"),
+    ]
+    assert set(boxes) == {"猫が好きな猫", "魚", "海だ"}
+
+
+def test_saved_debug_overlay_is_shown_when_a_volume_opens(page) -> None:
+    result = reader(
+        page,
+        "return {mode: $('mangaReaderV2').dataset.debugOverlay, boxes: debugBoxes().length};",
+        regions=HITBOX_PAGE,
+        parse=HITBOX_PARSE,
+        localStorage={"pudge.manga.debugOverlay": "words"},
+    )
+    assert result.value["mode"] == "words" and result.value["boxes"] > 0

@@ -19,6 +19,7 @@ def test_chat_payload_contains_stable_json_options():
     assert payload["keep_alive"] == "10m"
     assert payload["options"] == {"temperature": 0.0, "num_ctx": 8192}
 
+
 from pathlib import Path
 
 from pudge.llm import OllamaClient, build_subtitle_semantic_samples
@@ -93,7 +94,14 @@ def test_llm_semantic_validation_rejects_different_episode(tmp_path: Path, monke
     english = tmp_path / "en.srt"
     _write_srt(japanese, "日本語")
     _write_srt(english, "English")
-    client = OllamaClient(LLMConfig(enabled=True, embedded_reference_sample_count=3, embedded_reference_phrases_per_sample=2, embedded_reference_min_similarity=0.65))
+    client = OllamaClient(
+        LLMConfig(
+            enabled=True,
+            embedded_reference_sample_count=3,
+            embedded_reference_phrases_per_sample=2,
+            embedded_reference_min_similarity=0.65,
+        )
+    )
     monkeypatch.setattr(
         client,
         "_json_chat",
@@ -119,14 +127,14 @@ def test_llm_semantic_validation_rejects_different_episode(tmp_path: Path, monke
 def test_llm_semantic_validation_accepts_one_title_card_outlier(tmp_path: Path, monkeypatch):
     japanese = tmp_path / "ja.srt"
     english = tmp_path / "en.srt"
+
     def write_many(path: Path, prefix: str) -> None:
         blocks = []
         for index in range(1, 13):
             minute = index - 1
-            blocks.append(
-                f"{index}\n00:{minute:02d}:00,000 --> 00:{minute:02d}:02,000\n{prefix} {index}\n"
-            )
+            blocks.append(f"{index}\n00:{minute:02d}:00,000 --> 00:{minute:02d}:02,000\n{prefix} {index}\n")
         path.write_text("\n".join(blocks), encoding="utf-8")
+
     write_many(japanese, "日本語")
     write_many(english, "English")
     client = OllamaClient(
@@ -165,14 +173,14 @@ def test_llm_semantic_validation_accepts_one_title_card_outlier(tmp_path: Path, 
 def test_llm_semantic_validation_rejects_two_outliers(tmp_path: Path, monkeypatch):
     japanese = tmp_path / "ja.srt"
     english = tmp_path / "en.srt"
+
     def write_many(path: Path, prefix: str) -> None:
         blocks = []
         for index in range(1, 13):
             minute = index - 1
-            blocks.append(
-                f"{index}\n00:{minute:02d}:00,000 --> 00:{minute:02d}:02,000\n{prefix} {index}\n"
-            )
+            blocks.append(f"{index}\n00:{minute:02d}:00,000 --> 00:{minute:02d}:02,000\n{prefix} {index}\n")
         path.write_text("\n".join(blocks), encoding="utf-8")
+
     write_many(japanese, "日本語")
     write_many(english, "English")
     client = OllamaClient(

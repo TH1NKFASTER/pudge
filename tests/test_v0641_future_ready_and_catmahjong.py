@@ -11,7 +11,9 @@ from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.web_app import WebAppApi
 
 
-def test_catmahjong_explains_old_mahoyo_false_positive_but_external_scan_rejects_it(monkeypatch, tmp_path: Path):
+def test_catmahjong_explains_old_mahoyo_false_positive_but_external_scan_rejects_it(
+    monkeypatch, tmp_path: Path
+):
     # This is the exact old failure mode: WRatio/token matching considered the
     # unrelated filename "catmahjong" 60% similar to the short synonym "Mahoyo",
     # just above the legacy local matcher threshold of 58.

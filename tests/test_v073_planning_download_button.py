@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.web_app import WebAppApi
+from test_web_app import make_api
 
 
 def _anime(*, media_status: str = "FINISHED", released: int = 3):
@@ -122,9 +125,42 @@ def test_releasing_planning_title_only_requires_currently_released_episodes(
     )
 
 
-def test_frontend_hides_planning_download_button_from_backend_flag() -> None:
-    root = Path(__file__).parents[1]
-    html = (root / "pudge/web/index.html").read_text(encoding="utf-8")
+def test_planning_page_offers_auto_download_only_for_titles_not_yet_local(page, tmp_path: Path) -> None:
+    # The real backend state: "Local Show" has all three episodes on disk, "Remote Show" none.
+    api = make_api(tmp_path)
+    for media_id, title in ((98, "Remote Show"), (99, "Local Show")):
+        api.manager.db.upsert_anime(
+            LibraryAnime(
+                media_id=media_id,
+                title=title,
+                status="PLANNING",
+                episodes=3,
+                media_status="FINISHED",
+                format="TV",
+            )
+        )
+    folder = api.config.library.root_dir / "Local Show"
+    folder.mkdir(parents=True)
+    for number in (1, 2, 3):
+        video = folder / f"Local Show - {number:02d}.mkv"
+        video.write_bytes(b"video")
+        api.manager.db.upsert_episode(
+            LibraryEpisode(media_id=99, title="Local Show", episode=number, video_path=video, state="local")
+        )
+    state = json.loads(json.dumps(api.get_state(), default=str))
 
-    assert "!a.planning_download_hidden" in html
-    assert 'data-action="planning-episodes-auto-card"' in html
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('planned', true); await __tick(50);
+            const buttons = Object.fromEntries([...document.querySelectorAll('[data-planned="1"][data-media-id]')].map(card =>
+              [card.dataset.mediaId, card.querySelector('[data-action="planning-episodes-auto-card"]')?.innerText ?? null]));
+            await __click('[data-media-id="98"] [data-action="planning-episodes-auto-card"]');
+            return {buttons, label: PudgeI18n.t('ui.autoDownloadEpisodes')};
+            """,
+            lang=lang,
+            state=state,
+            api={"start_planning_episode_download": {"running": True, "media_id": 98, "episodes": []}},
+        )
+        assert result.value["buttons"] == {"98": result.value["label"], "99": None}
+        assert result.calls_of("start_planning_episode_download") == [[98]]

@@ -105,17 +105,19 @@ def test_completed_ready_never_skips_broken_nearest_unwatched_episode(tmp_path: 
     manager.db.upsert_anime(anime)
     api = _api(manager)
 
-    downloaded = [{
-        "media_id": 151379,
-        "title": anime.title,
-        "ready_episodes": [2, 3, 4],
-        "local": {"episode": 2, "video_path": "/tmp/ep2.mkv", "state": "ready"},
-    }]
+    downloaded = [
+        {
+            "media_id": 151379,
+            "title": anime.title,
+            "ready_episodes": [2, 3, 4],
+            "local": {"episode": 2, "video_path": "/tmp/ep2.mkv", "state": "ready"},
+        }
+    ]
     api._downloaded_payloads = lambda _anime: downloaded
     api._pending_local_payloads = lambda _anime: []
     api._continue_payloads = lambda _anime: []
     api._is_future_unreleased = lambda _anime: False
-    api._anime_payload = lambda value: {
+    api._anime_payload = lambda value, **_options: {
         "media_id": value.media_id,
         "title": value.title,
         "next_episode": value.next_episode,
@@ -253,9 +255,7 @@ def test_periodic_migration_moves_surviving_ready_cache_srt_out_of_caches(
     assert row.subtitle_path.is_file()
 
 
-def test_successful_subtitle_job_stores_durable_selection_not_cache_path(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_successful_subtitle_job_stores_durable_selection_not_cache_path(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     video = (manager.config.library.root_dir / "Prepared.mkv").resolve()
     video.write_bytes(b"video")
@@ -272,16 +272,17 @@ def test_successful_subtitle_job_stores_durable_selection_not_cache_path(
     manager.db.queue_subtitle_job(video, 999, 1)
 
     meta = json.dumps({"source": "jimaku", "name": "candidate.srt"})
+
     class FakeProcess:
         def __init__(self, _command, **_kwargs):
             self.returncode = 0
+
         def poll(self):
             return self.returncode
+
         def communicate(self):
             return (
-                f"PREPARED_SUBTITLE={cached}\n"
-                "PREPARE_STATUS=ready\n"
-                f"PREPARED_SUBTITLE_META={meta}\n",
+                f"PREPARED_SUBTITLE={cached}\nPREPARE_STATUS=ready\nPREPARED_SUBTITLE_META={meta}\n",
                 "",
             )
 

@@ -34,6 +34,7 @@ def _openai_reasoning_effort(value: Any) -> str:
 
 def _semantic_evidence_valid(result: Any, total: int) -> bool:
     """Validate the provider's evidence without coercing strings or booleans."""
+
     def score(value: Any) -> bool:
         return type(value) in {int, float} and 0 <= value <= 1 and math.isfinite(value)
 
@@ -139,7 +140,8 @@ def _response_format_unsupported(response: Any) -> bool:
     # LM Studio validates this as an enum instead of calling it unsupported.
     return (
         any(name in detail for name in names)
-        and "json_schema" in detail and "text" in detail
+        and "json_schema" in detail
+        and "text" in detail
         and any(marker in detail for marker in ("must be", "should be", "expected", "literal_error"))
     )
 
@@ -225,7 +227,9 @@ def list_models(
     models = (
         payload.get("data", [])
         if kind == "openai" and isinstance(payload, dict)
-        else payload.get("models", []) if isinstance(payload, dict) else []
+        else payload.get("models", [])
+        if isinstance(payload, dict)
+        else []
     )
     result = []
     for item in models:
@@ -272,15 +276,11 @@ def build_subtitle_semantic_samples(
         else [0.10 + 0.80 * index / (sample_count - 1) for index in range(sample_count)]
     )
 
-    def nearest_time(
-        cues: list[tuple[float, float, str]], center: float
-    ) -> list[tuple[float, float, str]]:
+    def nearest_time(cues: list[tuple[float, float, str]], center: float) -> list[tuple[float, float, str]]:
         ranked = sorted(
             cues,
             key=lambda cue: (
-                0.0
-                if cue[0] <= center <= cue[1]
-                else min(abs(center - cue[0]), abs(center - cue[1])),
+                0.0 if cue[0] <= center <= cue[1] else min(abs(center - cue[0]), abs(center - cue[1])),
                 abs(((cue[0] + cue[1]) / 2.0) - center),
             ),
         )[:phrases_per_sample]
@@ -357,7 +357,9 @@ class OllamaClient:
     def available(self) -> bool:
         try:
             provider = str(getattr(self.config, "provider", "ollama") or "ollama").lower()
-            endpoint = _openai_url(self.base_url, "models") if provider == "openai" else f"{self.base_url}/api/tags"
+            endpoint = (
+                _openai_url(self.base_url, "models") if provider == "openai" else f"{self.base_url}/api/tags"
+            )
             response = self.client.get(endpoint)
             if not response.is_success:
                 # /v1/models is common but not mandatory for compatible gateways.
@@ -438,21 +440,38 @@ class OllamaClient:
             content = body["message"]["content"]
         if isinstance(content, list):
             content = "".join(
-                str(part.get("text") or "") if isinstance(part, dict) else str(part)
-                for part in content
+                str(part.get("text") or "") if isinstance(part, dict) else str(part) for part in content
             )
         return str(content or ""), meta
 
-    def _log_call(self, call_id: str, started: float, meta: dict[str, Any], *, ok: bool, request_chars: int) -> None:
+    def _log_call(
+        self, call_id: str, started: float, meta: dict[str, Any], *, ok: bool, request_chars: int
+    ) -> None:
         fields = " ".join(
             f"{key}={meta.get(key)}"
-            for key in ("provider", "attempts", "effort", "http_status", "finish_reason", "prompt_tokens",
-                        "completion_tokens", "reasoning_tokens", "cached_tokens", "request_id")
+            for key in (
+                "provider",
+                "attempts",
+                "effort",
+                "http_status",
+                "finish_reason",
+                "prompt_tokens",
+                "completion_tokens",
+                "reasoning_tokens",
+                "cached_tokens",
+                "request_id",
+            )
             if meta.get(key) not in (None, "")
         )
         self.logger.info(
             "RESULT step=llm.call id=%s operation=%s model=%s ok=%s total_ms=%.1f request_chars=%s %s",
-            call_id, self.operation or "json", self.model, ok, (time.perf_counter() - started) * 1000.0, request_chars, fields,
+            call_id,
+            self.operation or "json",
+            self.model,
+            ok,
+            (time.perf_counter() - started) * 1000.0,
+            request_chars,
+            fields,
         )
 
     def _json_chat(self, system: str, user: str) -> dict[str, Any] | None:
@@ -481,17 +500,24 @@ class OllamaClient:
                     if meta.get("refusal"):
                         self.last_error = f"LLM refused: {str(meta['refusal'])[:200]}"
                     elif not content.strip():
-                        self.last_error = f"LLM returned empty content (finish_reason={finish_reason or 'unknown'})"
-                    else:
                         self.last_error = (
-                            "LLM returned non-JSON content"
-                            + (f" (finish_reason={finish_reason})" if finish_reason and finish_reason != "stop" else "")
+                            f"LLM returned empty content (finish_reason={finish_reason or 'unknown'})"
+                        )
+                    else:
+                        self.last_error = "LLM returned non-JSON content" + (
+                            f" (finish_reason={finish_reason})"
+                            if finish_reason and finish_reason != "stop"
+                            else ""
                         )
                     # The HTTP call succeeded; make the decode failure visible
                     # instead of a bare DONE step=llm.chat.
                     self.logger.warning(
                         "FAIL step=llm.decode id=%s model=%s finish_reason=%s error=%r content_prefix=%r",
-                        call_id, self.model, finish_reason, self.last_error, content[:600],
+                        call_id,
+                        self.model,
+                        finish_reason,
+                        self.last_error,
+                        content[:600],
                     )
                 self._log_call(call_id, started, meta, ok=decoded is not None, request_chars=len(user))
                 return decoded
@@ -502,7 +528,9 @@ class OllamaClient:
                 self.last_error = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
             else:
                 self.last_error = str(exc).strip() or exc.__class__.__name__
-            self._log_call(call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=len(user))
+            self._log_call(
+                call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=len(user)
+            )
             return None
 
     def chat_text(self, messages: list[dict[str, str]]) -> str | None:
@@ -515,7 +543,9 @@ class OllamaClient:
             content, meta = self._complete(messages, json_mode=False)
             self.last_error = ""
             if not content.strip():
-                self.last_error = f"LLM returned empty content (finish_reason={meta.get('finish_reason') or 'unknown'})"
+                self.last_error = (
+                    f"LLM returned empty content (finish_reason={meta.get('finish_reason') or 'unknown'})"
+                )
             self._log_call(call_id, started, meta, ok=bool(content.strip()), request_chars=chars)
             return content if content.strip() else None
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -525,12 +555,16 @@ class OllamaClient:
                 self.last_error = f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
             else:
                 self.last_error = str(exc).strip() or exc.__class__.__name__
-            self._log_call(call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=chars)
+            self._log_call(
+                call_id, started, {**meta, "error": self.last_error}, ok=False, request_chars=chars
+            )
             return None
 
     _EFFORT_LADDER = ("max", "xhigh", "high", "medium", "low")
 
-    def _post_openai_with_fallbacks(self, endpoint: str, payload: dict[str, Any], meta: dict[str, Any] | None = None) -> Any:
+    def _post_openai_with_fallbacks(
+        self, endpoint: str, payload: dict[str, Any], meta: dict[str, Any] | None = None
+    ) -> Any:
         """POST, adapting to what this model/gateway rejects (bounded retries).
 
         * ``response_format`` unsupported -> drop it;
@@ -560,7 +594,11 @@ class OllamaClient:
         attempts = 1
         response = self.client.post(endpoint, json=payload)
         for _attempt in range(6):
-            detail = _response_error_detail(response).casefold() if int(getattr(response, "status_code", 200) or 200) in {400, 404, 422} else ""
+            detail = (
+                _response_error_detail(response).casefold()
+                if int(getattr(response, "status_code", 200) or 200) in {400, 404, 422}
+                else ""
+            )
             if not detail:
                 break
             if "prompt_cache_key" in payload and _parameter_unsupported(response, ("prompt_cache_key",)):
@@ -581,13 +619,17 @@ class OllamaClient:
                     lower = self._EFFORT_LADDER[self._EFFORT_LADDER.index(effort) + 1]
                     payload["reasoning_effort"] = lower
                     learned["effort"] = lower
-                    self.logger.info("FALLBACK step=llm.reasoning_effort model=%s from=%s to=%s", self.model, effort, lower)
+                    self.logger.info(
+                        "FALLBACK step=llm.reasoning_effort model=%s from=%s to=%s", self.model, effort, lower
+                    )
                 else:
                     payload.pop("reasoning_effort", None)
                     learned["drop"].add("reasoning_effort")
                     if "temperature" not in learned["drop"]:
                         payload.setdefault("temperature", self.config.temperature)
-                    self.logger.info("FALLBACK step=llm.reasoning_effort model=%s reason=unsupported_parameter", self.model)
+                    self.logger.info(
+                        "FALLBACK step=llm.reasoning_effort model=%s reason=unsupported_parameter", self.model
+                    )
             else:
                 break
             attempts += 1
@@ -598,7 +640,6 @@ class OllamaClient:
 
     def json_chat(self, system: str, user: str) -> dict[str, Any] | None:
         return self._json_chat(system, user)
-
 
     def compare_subtitle_semantics(
         self,
@@ -615,9 +656,7 @@ class OllamaClient:
         effective_sample_count = sample_count or self.config.embedded_reference_sample_count
         effective_phrases = phrases_per_sample or self.config.embedded_reference_phrases_per_sample
         effective_threshold = float(
-            self.config.embedded_reference_min_similarity
-            if min_similarity is None
-            else min_similarity
+            self.config.embedded_reference_min_similarity if min_similarity is None else min_similarity
         )
         cache_path: Path | None = None
         if self.cache_dir is not None:
@@ -647,14 +686,21 @@ class OllamaClient:
                         total = result.get("total_samples")
                         cached_scores = result.get("sample_scores")
                         cache_valid = (
-                            type(total) is int and total >= 2
+                            type(total) is int
+                            and total >= 2
                             and _semantic_evidence_valid(result, total)
                             and type(result.get("accepted")) is bool
-                            and (not result["accepted"] or (
-                                sum(score >= 0.55 for score in cached_scores) >= total - int(total >= 5)
-                                and statistics.median(sorted(cached_scores, reverse=True)[:total - int(total >= 5)]) >= effective_threshold
-                                and result["similarity"] >= effective_threshold
-                            ))
+                            and (
+                                not result["accepted"]
+                                or (
+                                    sum(score >= 0.55 for score in cached_scores) >= total - int(total >= 5)
+                                    and statistics.median(
+                                        sorted(cached_scores, reverse=True)[: total - int(total >= 5)]
+                                    )
+                                    >= effective_threshold
+                                    and result["similarity"] >= effective_threshold
+                                )
+                            )
                         )
                         if cache_valid and age < ttl:
                             result["cached"] = True
@@ -767,10 +813,15 @@ class OllamaClient:
                 )
 
         strict_accepted = same_episode and usable and similarity >= threshold
-        if strict_accepted and (matched < required_matches or robust_matches < required_matches or robust_similarity < threshold):
+        if strict_accepted and (
+            matched < required_matches or robust_matches < required_matches or robust_similarity < threshold
+        ):
             return {
-                "accepted": False, "reason": "invalid_llm_response", "similarity": 0.0,
-                "matched_samples": 0, "total_samples": len(samples),
+                "accepted": False,
+                "reason": "invalid_llm_response",
+                "similarity": 0.0,
+                "matched_samples": 0,
+                "total_samples": len(samples),
             }
         accepted = strict_accepted or robust_accepted
         reason = str(result.get("reason") or ("accepted" if accepted else "semantic_mismatch"))
@@ -825,7 +876,6 @@ class OllamaClient:
             final_result.get("similarity"),
         )
         return final_result
-
 
     def match_subtitle_anchor_regions(
         self,
@@ -896,8 +946,8 @@ class OllamaClient:
             "captions, signs, or other lines completely absent from the Japanese track. Leave those English rows "
             "unmatched. Japanese and English may split one spoken sentence differently, so one-to-many and "
             "many-to-one groups of up to 3 rows are allowed. Preserve narrative order and never reuse a row. "
-            "Return strict JSON: {\"regions\":[{\"name\":string,\"matches\":["
-            "{\"japanese\":[integer,...],\"english\":[integer,...],\"confidence\":0..1}]}]}. "
+            'Return strict JSON: {"regions":[{"name":string,"matches":['
+            '{"japanese":[integer,...],"english":[integer,...],"confidence":0..1}]}]}. '
             "Indices are the zero-based index fields supplied in each region. Omit uncertain matches."
         )
         result = self._json_chat(
@@ -988,7 +1038,6 @@ class OllamaClient:
                 pass
         return final
 
-
     def improve_identity(self, identity: VideoIdentity) -> VideoIdentity:
         system = (
             "Parse anime release filenames. Return strict JSON with keys title, episode, season, year. "
@@ -1013,7 +1062,7 @@ class OllamaClient:
         ]
         system = (
             "Choose the Japanese subtitle file matching the anime title and exact episode. "
-            "Return JSON: {\"index\": integer|null, \"confidence\": 0..1}. "
+            'Return JSON: {"index": integer|null, "confidence": 0..1}. '
             "Reject files for another episode, signs-only, songs-only, or another season. "
             "When otherwise equally suitable, prefer SRT over ASS/SSA."
         )
@@ -1039,7 +1088,7 @@ class OllamaClient:
         ]
         system = (
             "Choose the AniList anime corresponding to the release filename. "
-            "Return JSON: {\"index\": integer|null, \"confidence\": 0..1}. "
+            'Return JSON: {"index": integer|null, "confidence": 0..1}. '
             "Pay attention to sequel/season numbering and episode range."
         )
         result = self._json_chat(

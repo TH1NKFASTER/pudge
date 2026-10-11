@@ -80,8 +80,20 @@ def test_verified_sparse_speech_plateau_is_not_overwritten_by_coarse_embedded_cl
     )
     embedded = {
         "timeline_segments": [
-            {"offset_seconds": 3.5, "support": 1, "mean_score": 2.4294, "mean_coverage": 0.8571, "kind": "stable"},
-            {"offset_seconds": 0.0, "support": 23, "mean_score": 3.0926, "mean_coverage": 0.8244, "kind": "stable"},
+            {
+                "offset_seconds": 3.5,
+                "support": 1,
+                "mean_score": 2.4294,
+                "mean_coverage": 0.8571,
+                "kind": "stable",
+            },
+            {
+                "offset_seconds": 0.0,
+                "support": 23,
+                "mean_score": 3.0926,
+                "mean_coverage": 0.8244,
+                "kind": "stable",
+            },
         ],
         "timeline_cold_start": {
             "reason": "cold_start_overlaps_main_boundary",
@@ -212,8 +224,7 @@ def test_corrupt_completed_aria2_orphan_is_quarantined_and_redownloaded(tmp_path
     assert repaired is True
     assert not video.exists()
     quarantined = [
-        path for path in tmp_path.iterdir()
-        if path.name.startswith(video.name + ".pudge-corrupt-")
+        path for path in tmp_path.iterdir() if path.name.startswith(video.name + ".pudge-corrupt-")
     ]
     assert len(quarantined) == 1
     assert client.deleted == [("abc123", False)]

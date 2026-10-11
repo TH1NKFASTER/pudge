@@ -35,8 +35,14 @@ def _folder(root: Path, name: str, files: dict[str, bytes], *, age: float = 24 *
 def test_leftover_only_folders_are_removed_and_real_content_kept(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     root = manager.config.library.root_dir
-    stale = _folder(root, "Grand Blue Season 3", {"a" * 40 + ".torrent": b"t", ".anilist.id": b"1", "x.mkv.aria2": b"a"})
-    corrupt = _folder(root, "Kimi ga Shinu", {"b" * 40 + ".torrent": b"t", "ep.mkv.pudge-corrupt-1788688551": b"c", ".anilist.id": b"2"})
+    stale = _folder(
+        root, "Grand Blue Season 3", {"a" * 40 + ".torrent": b"t", ".anilist.id": b"1", "x.mkv.aria2": b"a"}
+    )
+    corrupt = _folder(
+        root,
+        "Kimi ga Shinu",
+        {"b" * 40 + ".torrent": b"t", "ep.mkv.pudge-corrupt-1788688551": b"c", ".anilist.id": b"2"},
+    )
     video = _folder(root, "Sayonara Lara", {"c" * 40 + ".torrent": b"t", "ep01.mkv": b"v"})
     books = _folder(root, "Light Novels", {"book.epub": b"e"})
     fresh = _folder(root, "Just Added", {"d" * 40 + ".torrent": b"t", ".anilist.id": b"3"}, age=60)
@@ -44,7 +50,9 @@ def test_leftover_only_folders_are_removed_and_real_content_kept(tmp_path: Path,
     monkeypatch.setattr(manager, "incomplete_download_paths", lambda: ())
     monkeypatch.setattr(manager.db, "downloads", lambda: [SimpleNamespace(torrent_hash="e" * 40)])
     monkeypatch.setattr(manager, "_download_is_complete", lambda item: False)
-    monkeypatch.setattr(manager.db, "anime_list", lambda *a, **k: [SimpleNamespace(media_id=i) for i in (1, 2, 3, 4)])
+    monkeypatch.setattr(
+        manager.db, "anime_list", lambda *a, **k: [SimpleNamespace(media_id=i) for i in (1, 2, 3, 4)]
+    )
 
     manager._prune_empty_library_dirs()
 

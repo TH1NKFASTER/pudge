@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
 import pytest
@@ -9,6 +8,8 @@ from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
+from tests.css_support import css_rules
+from tests.i18n_support import en, ru
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -106,9 +107,13 @@ def test_subtitle_queue_prioritizes_each_titles_watchable_frontier_before_middle
     # availability still wins: A1/B5 are the exact next unwatched episodes, and
     # C7 is the first broken episode of its local unresolved range.
     rows = [
-        (1, 1, 0), (1, 2, 900), (1, 3, 1000),
-        (2, 5, 0), (2, 6, 950),
-        (3, 7, 0), (3, 8, 999),
+        (1, 1, 0),
+        (1, 2, 900),
+        (1, 3, 1000),
+        (2, 5, 0),
+        (2, 6, 950),
+        (3, 7, 0),
+        (3, 8, 999),
     ]
     for media_id, episode, priority in rows:
         video = tmp_path / f"m{media_id}-e{episode}.mkv"
@@ -125,19 +130,77 @@ def test_subtitle_queue_prioritizes_each_titles_watchable_frontier_before_middle
     assert set(claimed) == {(1, 1), (2, 5)}
 
 
-def test_audiobook_series_ui_is_one_large_scrollable_card_with_volume_labels() -> None:
-    root = Path(__file__).resolve().parents[1]
-    js = (root / "pudge" / "web" / "media.js").read_text(encoding="utf-8")
-    css = (root / "pudge" / "web" / "media.css").read_text(encoding="utf-8")
+def _audiobook(
+    book_id: int, volume: int, *, finished: bool = False, series: str = "spice", title: str = ""
+) -> dict:
+    return {
+        "id": book_id,
+        "title": title or f"狼と香辛料 {volume}",
+        "series_key": series,
+        "series_title": "狼と香辛料",
+        "volume": volume,
+        "duration": 600,
+        "position": 600 if finished else 10,
+        "finished": finished,
+        "speed": 1,
+        "chapters": [],
+    }
 
-    assert 'class="audiobook-series-card ${selectionClass}"' in js
-    assert 'class="audiobook-series-scroll"' in js
-    assert "data-first-unfinished-id" in js
-    assert "seriesScrollPositions" in js
-    assert "displayTitle=grouped&&volume>0" in js
-    assert "`Volume ${volume}`" in js
-    assert "audiobook-series-header" not in js
-    assert ".audiobook-series-card{" in css
-    assert ".audiobook-series-scroll{" in css
-    assert "max-height:430px" in css
-    assert "overflow-y:auto" in css
+
+SERIES_BOOKS = [
+    _audiobook(1, 1, finished=True),
+    _audiobook(2, 2),
+    _audiobook(3, 3),
+    _audiobook(4, 0, series="other", title="Other Book"),
+]
+# No layout in the test DOM: volume cards are stacked 200 px apart (card N at top 200*N).
+STACKED_CARDS = r"""
+const elementProto = Object.getPrototypeOf(document.createElement('div'));
+Object.defineProperty(elementProto, '__rect', {configurable: true,
+  get() { const id = Number(this.dataset?.audiobookId || 0); return id ? {top: 200 * id, left: 0, width: 600, height: 180} : this.__ownRect; },
+  set(value) { this.__ownRect = value; }});
+"""
+
+
+def test_audiobook_series_ui_is_one_large_scrollable_card_with_volume_labels(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            STACKED_CARDS
+            + r"""
+            setPage('audiobooks', true); await __tick(300);
+            const cards = () => [...document.querySelectorAll('.audiobook-series-card')];
+            const view = () => cards().map(card => ({
+              head: card.querySelector('.audiobook-series-card-head').innerText.split('\n'),
+              volumes: [...card.querySelectorAll('.audiobook-series-scroll .audiobook-card .audiobook-title-row strong')].map(x => x.innerText),
+              scroll: card.querySelector('.audiobook-series-scroll').scrollTop}));
+            const out = {series: view(),
+                         loose: [...document.querySelectorAll('#audiobooksContent .audiobook-card')].filter(c => !c.closest('.audiobook-series-card'))
+                           .map(c => c.querySelector('.audiobook-title-row strong').innerText)};
+            // The user scrolls the series; the next refresh keeps that position.
+            document.querySelector('.audiobook-series-scroll').scrollTop = 123;
+            await __settle(PudgeMedia.loadAudio()); await __tick(50);
+            out.redrawn = view();
+            out.texts = {volumes: tn('media.volumeCount', 3), unfinished: t('media.unfinished', {unread: 2}),
+                         labels: [1, 2, 3].map(volume => t('ui.volume', {volume}))};
+            return out;
+            """,
+            lang=lang,
+            api={"audiobook_state": {"books": SERIES_BOOKS}},
+        )
+        out = result.value
+        texts = out["texts"]
+        # One card for the whole series (title, volume count, unfinished count), volumes labelled by number.
+        assert out["series"] == [
+            {
+                "head": ["狼と香辛料", texts["volumes"], texts["unfinished"]],
+                "volumes": texts["labels"],
+                "scroll": 200 * 2 - 4,
+            }
+        ]  # opened at the first unfinished volume
+        assert out["loose"] == ["Other Book"]  # a single book keeps its own title, outside any series card
+        assert out["redrawn"][0]["scroll"] == 123
+    assert en("ui.volume", volume=3) == "Volume 3" and ru("ui.volume", volume=3) == "Том 3"
+    rules = css_rules("media.css")
+    # A long series scrolls inside its card instead of stretching the page.
+    assert rules.get(".audiobook-series-scroll", "max-height") == "430px"
+    assert rules.get(".audiobook-series-scroll", "overflow-y") == "auto"

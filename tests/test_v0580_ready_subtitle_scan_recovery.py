@@ -9,9 +9,7 @@ from pudge.manager_models import LibraryEpisode
 from pudge.pipeline_cache import save_final_pipeline_result
 
 
-def test_library_scan_does_not_enqueue_valid_ready_prepared_subtitle(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_does_not_enqueue_valid_ready_prepared_subtitle(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "library"
     root.mkdir()
     video = root / "Odd Taxi - 01.mkv"
@@ -45,9 +43,7 @@ def test_library_scan_does_not_enqueue_valid_ready_prepared_subtitle(
     assert db.subtitle_jobs() == []
 
 
-def test_library_scan_restores_reset_row_from_valid_final_pipeline_cache(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_restores_reset_row_from_valid_final_pipeline_cache(tmp_path: Path, monkeypatch) -> None:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.root_dir = tmp_path / "library"
@@ -133,9 +129,7 @@ def test_spurious_ready_job_is_removed_before_stale_selection_repair(tmp_path: P
     assert db.subtitle_jobs() == []
 
 
-def test_library_scan_preserves_bitmap_fallback_while_text_job_remains(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_preserves_bitmap_fallback_while_text_job_remains(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "library"
     root.mkdir()
     video = root / "Movie.mkv"

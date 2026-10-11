@@ -126,10 +126,7 @@ def test_local_shift_estimate_survives_small_random_jitter(seed: int) -> None:
     rng = random.Random(seed)
     source = [12.0, 19.0, 27.0, 36.0, 46.0, 57.0, 69.0, 82.0]
     expected_delta = 4.6
-    reference = [
-        value + expected_delta + rng.uniform(-0.16, 0.16)
-        for value in source
-    ]
+    reference = [value + expected_delta + rng.uniform(-0.16, 0.16) for value in source]
 
     result = _local_speech_shift_estimate(source, reference)
 
@@ -185,10 +182,7 @@ def test_scaffold_preserves_cue_order_text_and_durations(tmp_path: Path) -> None
         [cue[1] - cue[0] for cue in before],
         abs=0.001,
     )
-    assert all(
-        after[index][0] <= after[index + 1][0]
-        for index in range(len(after) - 1)
-    )
+    assert all(after[index][0] <= after[index + 1][0] for index in range(len(after) - 1))
 
 
 @pytest.mark.parametrize("common_shift", [23.0, 250.0])

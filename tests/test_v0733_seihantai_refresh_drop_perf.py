@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -10,8 +11,6 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
 from pudge.models import AniListAnime, JimakuFile, VideoIdentity
 from pudge.providers.jimaku import JimakuClient
-
-ROOT = Path(__file__).parents[1]
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -25,9 +24,7 @@ def _manager(tmp_path: Path) -> AnimeManager:
     return AnimeManager(cfg, log=lambda _message: None)
 
 
-def test_seihantai_completed_download_repairs_wrong_episode_row_and_job(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_seihantai_completed_download_repairs_wrong_episode_row_and_job(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     manager.db.upsert_anime(
         LibraryAnime(
@@ -73,9 +70,7 @@ def test_seihantai_completed_download_repairs_wrong_episode_row_and_job(
             completed_on=10,
         )
     )
-    monkeypatch.setattr(
-        "pudge.manager.japanese_subtitle_source", lambda *_a, **_k: ("none", None)
-    )
+    monkeypatch.setattr("pudge.manager.japanese_subtitle_source", lambda *_a, **_k: ("none", None))
     monkeypatch.setattr(
         "pudge.manager.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),
@@ -97,9 +92,7 @@ def test_seihantai_completed_download_repairs_wrong_episode_row_and_job(
     assert jobs[0]["media_id"] == 210031
 
 
-def test_matching_completed_row_recreates_missing_subtitle_job(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_matching_completed_row_recreates_missing_subtitle_job(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     manager.db.upsert_anime(
         LibraryAnime(media_id=210031, title="Seihantai na Kimi to Boku 2nd Season", episodes=13)
@@ -166,9 +159,7 @@ def test_seihantai_online_lookup_uses_media_episode_and_absolute_alias(tmp_path:
 
     assert filename_identity.episode == 19
     assert online_identity.episode == 7
-    aliases = _jimaku_episode_aliases(
-        anime, online_identity.episode, cfg, logging.getLogger("test")
-    )
+    aliases = _jimaku_episode_aliases(anime, online_identity.episode, cfg, logging.getLogger("test"))
     assert aliases == (19,)
 
     file = JimakuFile(
@@ -189,14 +180,49 @@ def test_seihantai_online_lookup_uses_media_episode_and_absolute_alias(tmp_path:
     assert ranked[0].details["language_purity"] == "japanese_only"
 
 
-def test_refresh_button_is_not_owned_by_background_subtitle_checks() -> None:
-    html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
+# An urgent subtitle check (priority >= 200) is running in the background.
+SUBTITLE_JOB = {
+    "video_path": "/lib/Show - 03.mkv",
+    "media_id": 7,
+    "episode": 3,
+    "priority": 200,
+    "state": "processing",
+    "next_check": 0,
+}
 
-    refresh_line = next(line for line in html.splitlines() if line.startswith("async function refreshAll()"))
-    poll_line = next(line for line in html.splitlines() if line.startswith("async function pollForegroundWork()"))
-    assert "startupMaintenanceRunning||duePrioritySubtitleJobs().length" not in refresh_line
-    assert "setLocalRefreshUi(subtitleChecking" not in refresh_line
-    assert "setLocalRefreshUi(true,'status.subtitleCheckingBackground')" not in poll_line
+
+def test_refresh_button_is_not_owned_by_background_subtitle_checks(page) -> None:
+    # The sidebar Refresh button used to show "Checking…" and stay disabled for as long as a
+    # background subtitle check ran; only the status line reports that check now.
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const button = () => ({disabled: $('refreshAll').disabled, text: __text('#refreshAll'), status: __text('#status')});
+            await __tick(1500);                                   // the first background poll has run
+            const polled = button();
+            let answer;
+            __api.refresh_local = () => new Promise(resolve => { answer = resolve; });
+            await __click('#refreshAll');
+            const refreshing = button();
+            answer({state: await __api.get_state(), stats: {}});
+            await __tick(10);
+            const refreshed = button(), toasts = __toasts();
+            await __tick(30000);                                  // more background polls
+            return {polled, refreshing, refreshed, later: button(), toasts,
+                    texts: {refresh: t('action.refresh'), refreshingLabel: t('action.refreshing'),
+                            checking: t('status.subtitleCheckingBackground'), queued: t('toast.refreshedSubtitlesQueued')}};
+            """,
+            lang=lang,
+            state={"subtitle_jobs": [SUBTITLE_JOB]},
+        )
+        out = result.value
+        texts = out["texts"]
+        idle = {"disabled": False, "text": texts["refresh"], "status": texts["checking"]}
+        assert out["polled"] == idle
+        assert out["refreshing"]["disabled"] is True and out["refreshing"]["text"] == texts["refreshingLabel"]
+        assert out["refreshed"] == idle and out["later"] == idle
+        assert texts["queued"] in out["toasts"]
+        assert len(result.calls_of("poll_downloads_and_subtitles")) > 2
 
 
 def test_ln_drop_card_never_sends_embedded_cover_or_chapter_list(tmp_path: Path) -> None:
@@ -221,17 +247,51 @@ def test_ln_drop_card_never_sends_embedded_cover_or_chapter_list(tmp_path: Path)
     assert len(str(card)) < 20_000
 
 
-def test_ln_drop_frontend_inserts_into_existing_series_without_rebuilding_siblings() -> None:
-    html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    start = html.index("function injectLnBook(book){")
-    end = html.index("async function showLnAniListSearch", start)
-    block = html[start:end]
+def _volume(book_id: int, series: str, volume: int) -> dict:
+    return {
+        "id": book_id,
+        "title": series,
+        "series_key": series.lower(),
+        "series_title": series,
+        "volume": volume,
+        "character_count": 1000,
+    }
 
-    assert "if(oldGroup){" in block
-    assert "scroller.appendChild(fresh)" in block
-    assert "hydrateLnCardJiten(fresh)" in block
-    assert 'data-ln-volume="${volume}"' in html
-    assert "setTimeout(scheduleLnStatePoll,2500)" in html
+
+def test_ln_drop_frontend_inserts_into_existing_series_without_rebuilding_siblings(page) -> None:
+    # A dropped volume 2 joins the "Foo" row between volumes 1 and 3; the other cards stay the
+    # same DOM nodes (no full library redraw) and the row's volume count follows.
+    dropped = {
+        "ok": True,
+        "focus": {"page": "lightnovels", "kind": "light_novel", "id": 9, "book": _volume(9, "Foo", 2)},
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const row = key => document.querySelector(`#lightNovelsContent [data-ln-series-key="${key}"]`);
+            const cards = () => new Map([...document.querySelectorAll('#lightNovelsContent [data-ln-book]')].map(node => [node.dataset.lnBook, node]));
+            setPage('lightnovels'); await __tick(10);
+            const before = cards();
+            window.dispatchEvent(new CustomEvent('pudge-files-imported', {detail: DROPPED}));
+            await __tick(500);
+            const after = cards();
+            return {order: [...row('foo').querySelectorAll('.ln-series-books [data-ln-book]')].map(node => node.dataset.lnBook),
+                    kept: [...before.keys()].filter(id => after.get(id) === before.get(id)),
+                    count: row('foo').querySelector('.ln-series-count')?.innerText, expected: tn('uiB.ln.volumeCount', 3)};
+            """.replace("DROPPED", json.dumps(dropped)),
+            lang=lang,
+            api={
+                "light_novel_state": {
+                    "version": 1,
+                    "settings": {},
+                    "books": [_volume(1, "Foo", 1), _volume(2, "Foo", 3), _volume(3, "Bar", 1)],
+                }
+            },
+        )
+        out = result.value
+        assert out["order"] == ["1", "9", "2"]
+        assert sorted(out["kept"]) == ["1", "2", "3"]
+        assert out["count"] == out["expected"]
 
 
 def test_scan_library_keeps_managed_download_identity_over_wrong_parent_match(
@@ -319,7 +379,9 @@ def test_ln_inline_epub_covers_never_enter_state_and_migrate_to_cover_cache(
 
     assert service._migrate_inline_covers() == 1
     with service._connect() as conn:
-        stored = str(conn.execute("SELECT cover_url FROM ln_books WHERE id=?", (int(imported["id"]),)).fetchone()[0])
+        stored = str(
+            conn.execute("SELECT cover_url FROM ln_books WHERE id=?", (int(imported["id"]),)).fetchone()[0]
+        )
     assert stored.startswith("covers/ln-")
     assert (cfg.library.cover_cache_dir / Path(stored).name).read_bytes() == raw
     after = next(book for book in service.books() if int(book["id"]) == int(imported["id"]))
@@ -349,9 +411,7 @@ def test_ln_new_epub_cover_is_file_backed_not_base64(tmp_path: Path, monkeypatch
     assert (cfg.library.cover_cache_dir / Path(str(book["cover_url"])).name).read_bytes() == raw
 
 
-def test_ln_rejected_sources_are_not_reparsed_until_file_changes(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_ln_rejected_sources_are_not_reparsed_until_file_changes(tmp_path: Path, monkeypatch) -> None:
     cfg = AppConfig()
     cfg.library.root_dir = tmp_path / "library"
     cfg.library.database_path = tmp_path / "db.sqlite3"
@@ -379,9 +439,7 @@ def test_ln_rejected_sources_are_not_reparsed_until_file_changes(
     assert len(calls) == 2
 
 
-def test_completed_single_download_materializes_missing_episode_row(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_completed_single_download_materializes_missing_episode_row(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     manager.db.upsert_anime(
         LibraryAnime(
@@ -410,9 +468,7 @@ def test_completed_single_download_materializes_missing_episode_row(
             completed_on=10,
         )
     )
-    monkeypatch.setattr(
-        "pudge.manager.japanese_subtitle_source", lambda *_a, **_k: ("none", None)
-    )
+    monkeypatch.setattr("pudge.manager.japanese_subtitle_source", lambda *_a, **_k: ("none", None))
     monkeypatch.setattr(
         "pudge.manager.japanese_subtitle_details",
         lambda *_a, **_k: ("none", None, None),

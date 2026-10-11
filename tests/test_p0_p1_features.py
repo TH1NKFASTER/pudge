@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,10 +90,10 @@ def test_backup_redacts_secrets_and_preserves_current_tokens_on_restore(tmp_path
         database_path=database,
         cache_dir=cache,
     )
-    restored = config.read_text(encoding="utf-8")
-    assert 'api_key = "current-key"' in restored
-    assert 'access_token = "current-token"' in restored
-    assert 'language = "ru"' in restored
+    restored = tomllib.loads(config.read_text(encoding="utf-8"))
+    assert restored["jimaku"]["api_key"] == "current-key"
+    assert restored["anilist"]["access_token"] == "current-token"
+    assert restored["ui"]["language"] == "ru"
 
 
 def test_video_chapter_is_preferred_as_piecewise_boundary() -> None:
@@ -120,7 +121,9 @@ def test_stt_reference_is_generated_once_and_cached(tmp_path: Path, monkeypatch)
         if "stt_worker" in " ".join(command):
             output = Path(command[-2])
             output.write_text(
-                json.dumps({"segments": [{"start": i, "end": i + 0.8, "text": f"台詞{i}"} for i in range(10)]}),
+                json.dumps(
+                    {"segments": [{"start": i, "end": i + 0.8, "text": f"台詞{i}"} for i in range(10)]}
+                ),
                 encoding="utf-8",
             )
         else:

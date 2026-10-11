@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import plistlib
+import tomllib
 from pathlib import Path
 
 from pudge.config import AppConfig, load_config, write_config
@@ -7,10 +9,7 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime
 from pudge.permissions import request_folder_access
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from source_policy import source
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -177,17 +176,47 @@ def test_folder_permission_probe_is_read_only_and_does_not_create_missing_folder
     assert request_folder_access([folder]) == {str(folder): True}
 
 
-def test_web_app_requests_permissions_before_startup_and_offers_manual_cleanup() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    assert "const firstPermissionRequest=!ui.state.settings.permissions_requested" in html
-    assert "await pywebview.api.request_permissions()" in html
-    assert "cleanupTorrentDuplicates" in html
-    assert "pywebview.api.cleanup_duplicate_torrents()" in html
+# The early permission request at start-up: test_subtitle_folder_permissions_v0605.py
+# (test_first_start_asks_for_folder_access_before_any_other_work).
+
+
+def test_settings_offer_manual_duplicate_torrent_cleanup(page) -> None:
+    code = """
+    const button = $('cleanupTorrentDuplicates');
+    const out = {label: button.innerText, expected: t('action.cleanupDuplicates'), enabled: !button.disabled};
+    if (out.enabled) { await __click('#cleanupTorrentDuplicates'); await __tick(10); }
+    out.toast = __toasts().at(-1);
+    out.removed = t('toast.duplicatesRemoved', {count: 2});
+    out.enabledAfter = !$('cleanupTorrentDuplicates').disabled;
+    return out;
+    """
+    for lang in ("en", "ru"):
+        result = page.run(
+            code,
+            lang=lang,
+            state={"settings": {"qbt_enabled": True}},
+            before="__api.cleanup_duplicate_torrents = async () => ({removed: 2, state: await __api.get_state()});",
+        )
+        out = result.value
+        assert out["label"] == out["expected"] and out["enabled"] is True
+        assert result.calls_of("cleanup_duplicate_torrents") == [[]]
+        assert out["toast"] == out["removed"] and out["enabledAfter"] is True
+    # The cleanup works on qBittorrent: without it the button is unavailable.
+    off = page.run(code, state={"settings": {"qbt_enabled": False}})
+    assert off.value["enabled"] is False and not off.called("cleanup_duplicate_torrents")
 
 
 def test_installer_declares_protected_folder_usage_and_notification_framework() -> None:
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "NSDownloadsFolderUsageDescription" in installer
-    assert "NSDocumentsFolderUsageDescription" in installer
-    assert "pyobjc-framework-UserNotifications" in project
+    # policy: the app bundle's Info.plist is written by install.sh (macOS only: it builds the
+    # launcher with clang first); without these usage descriptions macOS denies the folder
+    # prompts silently. The heredoc is rendered and parsed as a property list.
+    installer = source("install.sh")
+    body = installer.split('cat > "$PLIST" <<PLIST\n', 1)[1].split("\nPLIST\n", 1)[0]
+    plist = plistlib.loads(body.replace("$APP_NAME", "Pudge").replace("$", "").encode("utf-8"))
+    assert plist["NSDownloadsFolderUsageDescription"].startswith("Pudge ")
+    assert plist["NSDocumentsFolderUsageDescription"].startswith("Pudge ")
+    # policy: notifications need the UserNotifications bridge on macOS; a dependency declaration.
+    dependencies = tomllib.loads(source("pyproject.toml"))["project"]["dependencies"]
+    assert any(
+        dep.startswith("pyobjc-framework-UserNotifications") and "darwin" in dep for dep in dependencies
+    )

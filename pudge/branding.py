@@ -22,7 +22,7 @@ def _load_brand() -> dict[str, str]:
             parsed = shlex.split(value, posix=True)
         except ValueError:
             parsed = []
-        values[key.strip()] = parsed[0] if parsed else value.strip().strip('"\'')
+        values[key.strip()] = parsed[0] if parsed else value.strip().strip("\"'")
     return values
 
 

@@ -11,12 +11,26 @@ def _parsed_opening() -> dict:
     text = "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
     return {
         "paragraphs": [text],
-        "tokens": [[
-            {"wordId": 1, "readingIndex": 1, "start": 0, "end": 4, "card": {"reading": "小[こ]高[だか]い丘[おか]"}},
-            {"wordId": 2, "readingIndex": 1, "start": 4, "end": 5, "card": {"reading": "が"}},
-            {"wordId": 3, "readingIndex": 1, "start": 5, "end": 8, "card": {"reading": "延[えん]々[えん]と"}},
-            {"wordId": 4, "readingIndex": 1, "start": 8, "end": 10, "card": {"reading": "続[つづ]く"}},
-        ]],
+        "tokens": [
+            [
+                {
+                    "wordId": 1,
+                    "readingIndex": 1,
+                    "start": 0,
+                    "end": 4,
+                    "card": {"reading": "小[こ]高[だか]い丘[おか]"},
+                },
+                {"wordId": 2, "readingIndex": 1, "start": 4, "end": 5, "card": {"reading": "が"}},
+                {
+                    "wordId": 3,
+                    "readingIndex": 1,
+                    "start": 5,
+                    "end": 8,
+                    "card": {"reading": "延[えん]々[えん]と"},
+                },
+                {"wordId": 4, "readingIndex": 1, "start": 8, "end": 10, "card": {"reading": "続[つづ]く"}},
+            ]
+        ],
         "vocabulary": [],
     }
 
@@ -66,8 +80,7 @@ def test_phonetic_prefix_matches_kana_stt_without_consuming_chapter_marker() -> 
 
 def test_phonetic_prefix_repairs_real_0_to_411_failure_shape() -> None:
     chapter = (
-        "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。"
-        "道は丘と丘の間を縫って作られている。"
+        "小高い丘が延々と続く。岩ばかりが目立ち、草も木も少ない。道は丘と丘の間を縫って作られている。"
     ) * 4
     hints = _reading_hints_from_cached_parse(_parsed_opening())
     old_clock = [
@@ -98,6 +111,7 @@ def test_phonetic_prefix_repairs_real_0_to_411_failure_shape() -> None:
     assert not any(
         float(right["offset"]) - float(left["offset"]) >= 96
         and (float(right["offset"]) - float(left["offset"]))
-        / max(0.02, float(right["time"]) - float(left["time"])) > 24.0
+        / max(0.02, float(right["time"]) - float(left["time"]))
+        > 24.0
         for left, right in zip(clock, clock[1:])
     )

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from .i18n import err
 
 
 RULE_VERSION = 1
@@ -62,29 +63,28 @@ class PersonalScheduleRevisionConflict(ValueError):
         self.expected_revision = int(expected_revision)
         self.actual_revision = int(actual_revision)
         super().__init__(
-            f"Schedule changed since it was opened (expected revision "
-            f"{self.expected_revision}, current {self.actual_revision})"
+            err("web.scheduleRevisionConflict", expected=self.expected_revision, current=self.actual_revision)
         )
 
 
 def validate_timezone(name: str) -> ZoneInfo:
     value = str(name or "").strip()
     if not value:
-        raise ValueError("Timezone is required")
+        raise ValueError(err("web.scheduleTimezoneRequired"))
     try:
         return ZoneInfo(value)
     except ZoneInfoNotFoundError as exc:
-        raise ValueError(f"Unknown IANA timezone: {value}") from exc
+        raise ValueError(err("web.scheduleUnknownTimezone", value=value)) from exc
 
 
 def parse_local_datetime(value: str) -> datetime:
     raw = str(value or "").strip()
     if not raw:
-        raise ValueError("Start date/time is required")
+        raise ValueError(err("web.scheduleStartRequired"))
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError as exc:
-        raise ValueError("Start date/time must be ISO local date/time") from exc
+        raise ValueError(err("web.scheduleStartFormat")) from exc
     if parsed.tzinfo is not None:
         parsed = parsed.replace(tzinfo=None)
     return parsed.replace(second=0, microsecond=0)
@@ -92,20 +92,20 @@ def parse_local_datetime(value: str) -> datetime:
 
 def _positive_integer(value: Any) -> int:
     if isinstance(value, bool):
-        raise ValueError("Schedule interval must be a positive integer")
+        raise ValueError(err("web.scheduleIntervalPositive"))
     if isinstance(value, int):
         result = value
     elif isinstance(value, float):
         if not value.is_integer():
-            raise ValueError("Schedule interval must be a positive integer")
+            raise ValueError(err("web.scheduleIntervalPositive"))
         result = int(value)
     else:
         raw = str(value or "").strip()
         if not raw or not raw.isascii() or not raw.isdigit():
-            raise ValueError("Schedule interval must be a positive integer")
+            raise ValueError(err("web.scheduleIntervalPositive"))
         result = int(raw)
     if result < 1:
-        raise ValueError("Schedule interval must be a positive integer")
+        raise ValueError(err("web.scheduleIntervalPositive"))
     return result
 
 
@@ -117,10 +117,10 @@ def normalize_schedule_rule(
 ) -> PersonalReleaseRule:
     normalized_unit = str(unit or "weeks").strip().casefold()
     if normalized_unit not in RULE_UNITS:
-        raise ValueError("Schedule unit must be hours, days, or weeks")
+        raise ValueError(err("web.scheduleUnit"))
     interval = _positive_integer(every)
     if int(version) != RULE_VERSION:
-        raise ValueError(f"Unsupported personal schedule rule version: {version}")
+        raise ValueError(err("web.scheduleRuleVersion", version=version))
     return PersonalReleaseRule(
         version=RULE_VERSION,
         unit=normalized_unit,
@@ -150,21 +150,21 @@ def resolve_local_datetime(local_naive: datetime, timezone_iana: str) -> datetim
         if _roundtrip_matches(probe, zone, fold=1):
             return probe.replace(tzinfo=zone, fold=1)
         probe += timedelta(minutes=1)
-    raise ValueError("Could not resolve local date/time in timezone")
+    raise ValueError(err("web.scheduleLocalTime"))
 
 
 def _safe_add(value: datetime, delta: timedelta) -> datetime:
     try:
         return value + delta
     except OverflowError as exc:
-        raise ValueError("Schedule interval is too large for the selected start date") from exc
+        raise ValueError(err("web.scheduleIntervalTooLarge")) from exc
 
 
 def _safe_delta(**kwargs: int) -> timedelta:
     try:
         return timedelta(**kwargs)
     except OverflowError as exc:
-        raise ValueError("Schedule interval is too large for the selected start date") from exc
+        raise ValueError(err("web.scheduleIntervalTooLarge")) from exc
 
 
 def materialize_schedule_items(
@@ -215,16 +215,86 @@ def materialize_schedule_items(
     return result
 
 
+def _local_minute(value: float, zone: ZoneInfo) -> datetime:
+    return (
+        datetime.fromtimestamp(float(value), UTC)
+        .astimezone(zone)
+        .replace(tzinfo=None, second=0, microsecond=0)
+    )
+
+
+def reanchored_start_local_datetime(
+    previous_items: Iterable[PersonalReleaseItem],
+    *,
+    previous_rule: PersonalReleaseRule | None,
+    rule: PersonalReleaseRule,
+    timezone_iana: str,
+    now: float,
+) -> str | None:
+    """Cycle start that re-plans a running schedule after its interval changed.
+
+    Rule (shorter and longer intervals alike): count from the last watched
+    episode L, watched at W. Episodes already available stay available. If one
+    after L is already available, the next locked one opens at now + interval;
+    otherwise L+1 opens at W + interval, or right now when that has passed, so
+    at most one new episode opens on the change. Each later episode follows one
+    interval after the previous one. The plan is returned as an equivalent cycle
+    start, so the start-based planner (and saving again unchanged) reproduces
+    it. None keeps the start-date plan: same interval, or nothing watched yet.
+    """
+
+    if previous_rule is None or (previous_rule.unit, previous_rule.every) == (rule.unit, rule.every):
+        return None
+    items = sorted(previous_items, key=lambda item: int(item.ordinal))
+    watched = [item for item in items if item.watched_at is not None]
+    if not watched:
+        return None
+    last = watched[-1]
+    after = [item for item in items if item.ordinal > last.ordinal]
+
+    def available(item: PersonalReleaseItem) -> bool:
+        return bool(item.unlocked) or item.watched_at is not None or item.unlock_at_utc <= now
+
+    locked = [item for item in after if not available(item)]
+    if not locked:
+        return None
+    first = locked[0]
+    ready_before = any(available(item) for item in after if item.ordinal < first.ordinal)
+    base = float(now) if ready_before else float(last.watched_at or now)
+    zone = validate_timezone(timezone_iana)
+    if rule.unit == "hours":
+        target = base + rule.every * 3600
+        if target <= now:
+            target = float(now)
+        target = float(int(target // 60) * 60)
+        start = datetime.fromtimestamp(target - rule.every * 3600 * first.ordinal, UTC)
+        return start.astimezone(zone).replace(tzinfo=None).isoformat(timespec="minutes")
+    days = rule.every * (7 if rule.unit == "weeks" else 1)
+    nominal = _safe_add(_local_minute(base, zone), _safe_delta(days=days))
+    if resolve_local_datetime(nominal, timezone_iana).timestamp() <= now:
+        nominal = _local_minute(now, zone)
+    start_local = _safe_add(nominal, _safe_delta(days=-days * first.ordinal))
+    return start_local.isoformat(timespec="minutes")
+
+
 def preserve_committed_items(
     planned: Iterable[PersonalReleaseItem],
     previous: Iterable[PersonalReleaseItem],
+    *,
+    now: float | None = None,
 ) -> list[PersonalReleaseItem]:
-    """Keep already-unlocked/watched release boundaries stable while editing."""
+    """Keep already-unlocked/watched release boundaries stable while editing.
+
+    With ``now``, an episode whose stored time has passed counts as released
+    too (even if nothing marked it open yet), so it keeps its real date.
+    """
 
     committed = {
         int(item.episode): item
         for item in previous
-        if bool(item.unlocked) or item.watched_at is not None
+        if bool(item.unlocked)
+        or item.watched_at is not None
+        or (now is not None and item.unlock_at_utc <= now)
     }
     result: list[PersonalReleaseItem] = []
     for item in planned:
@@ -238,7 +308,7 @@ def preserve_committed_items(
                 ordinal=item.ordinal,
                 unlock_at_utc=old.unlock_at_utc,
                 nominal_local_datetime=old.nominal_local_datetime,
-                unlocked=old.unlocked,
+                unlocked=bool(old.unlocked) or (now is not None and old.unlock_at_utc <= now),
                 watched_at=old.watched_at,
                 dst_adjusted=old.dst_adjusted,
             )
@@ -279,14 +349,28 @@ def preview_schedule_dates(
     timezone_iana: str,
     rule: PersonalReleaseRule | None = None,
     previous_items: Iterable[PersonalReleaseItem] = (),
+    previous_rule: PersonalReleaseRule | None = None,
+    now: float | None = None,
 ) -> list[dict[str, object]]:
+    previous_items = tuple(previous_items)
+    if previous_rule is not None and rule is not None and now is not None:
+        start_local_datetime = (
+            reanchored_start_local_datetime(
+                previous_items,
+                previous_rule=previous_rule,
+                rule=rule,
+                timezone_iana=timezone_iana,
+                now=now,
+            )
+            or start_local_datetime
+        )
     rows = materialize_schedule_items(
         episodes,
         start_local_datetime=start_local_datetime,
         timezone_iana=timezone_iana,
         rule=rule,
     )
-    rows = preserve_committed_items(rows, previous_items)
+    rows = preserve_committed_items(rows, previous_items, now=now)
     return [
         {
             "episode": row.episode,

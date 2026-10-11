@@ -14,10 +14,7 @@ def test_reference_piecewise_does_not_smear_cold_open_shift_across_long_gap(
     cues = [
         (5.0, 8.0, "cold one"),
         (11.0, 13.0, "cold two"),
-        *[
-            (120.0 + index * 5.0, 122.0 + index * 5.0, f"dialogue {index}")
-            for index in range(30)
-        ],
+        *[(120.0 + index * 5.0, 122.0 + index * 5.0, f"dialogue {index}") for index in range(30)],
     ]
     write_srt(cues, aligned)
     write_srt(cues, reference)

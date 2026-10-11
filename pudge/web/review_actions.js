@@ -3,27 +3,33 @@
 
   // Mirror of pudge/review_actions.py (kept in sync by tests). Used only until
   // the backend settings payload (review_action_sets) has been received.
+  // Rows keep the backend shape [id, wire, label_en, label_ru, tone, default_key];
+  // the labels come from the catalog (review.action.<id>).
+  const row = (id, wire, tone, defaultKey) => {
+    const key = `review.action.${id}`;
+    return [id, wire, PudgeI18n.t(key, {}, 'en'), PudgeI18n.t(key, {}, 'ru'), tone, defaultKey];
+  };
   const DEFAULT_SETS = {
     'jiten:native': [
-      ['again', 'again', 'Again', 'Снова', 'again', '1'],
-      ['hard', 'hard', 'Hard', 'Трудно', 'hard', '2'],
-      ['good', 'good', 'Good', 'Хорошо', 'good', '3'],
-      ['easy', 'easy', 'Easy', 'Легко', 'easy', '4'],
+      row('again', 'again', 'again', '1'),
+      row('hard', 'hard', 'hard', '2'),
+      row('good', 'good', 'good', '3'),
+      row('easy', 'easy', 'easy', '4'),
     ],
     'jiten:binary': [
-      ['fail', 'again', 'Fail', 'Не помню', 'again', '1'],
-      ['pass', 'good', 'Pass', 'Помню', 'good', '2'],
+      row('fail', 'again', 'again', '1'),
+      row('pass', 'good', 'good', '2'),
     ],
     'jpdb:native': [
-      ['nothing', 'nothing', 'Nothing', 'Ничего', 'again', '1'],
-      ['something', 'something', 'Something', 'Что-то', 'something', '2'],
-      ['hard', 'hard', 'Hard', 'Трудно', 'hard', '3'],
-      ['okay', 'okay', 'Okay', 'Хорошо', 'good', '4'],
-      ['easy', 'easy', 'Easy', 'Легко', 'easy', '5'],
+      row('nothing', 'nothing', 'again', '1'),
+      row('something', 'something', 'something', '2'),
+      row('hard', 'hard', 'hard', '3'),
+      row('okay', 'okay', 'good', '4'),
+      row('easy', 'easy', 'easy', '5'),
     ],
     'jpdb:binary': [
-      ['fail', 'fail', 'Fail', 'Не помню', 'again', '1'],
-      ['pass', 'pass', 'Pass', 'Помню', 'good', '2'],
+      row('fail', 'fail', 'again', '1'),
+      row('pass', 'pass', 'good', '2'),
     ],
   };
   const MODIFIERS = ['Meta', 'Ctrl', 'Alt', 'Shift'];
@@ -31,7 +37,6 @@
 
   let latest = null;
 
-  const ru = () => document?.documentElement?.lang === 'ru' || globalThis.ui?.lang === 'ru';
   const provider = value => String(value || '').toLowerCase() === 'jpdb' ? 'jpdb' : 'jiten';
   const mode = value => String(value || '').toLowerCase() === 'binary' ? 'binary' : 'native';
 
@@ -63,7 +68,9 @@
   }
 
   function label(action) {
-    return String((ru() ? action?.label_ru : action?.label_en) || action?.id || '');
+    const key = `review.action.${action?.id}`;
+    if (action?.id && PudgeI18n.has(key)) return PudgeI18n.t(key);
+    return String(action?.label_en || action?.id || '');
   }
 
   function parseShortcut(raw) {

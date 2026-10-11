@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pudge.cli as cli
 from pudge.config import AppConfig, load_config, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryEpisode
+from pudge.models import SubtitleCandidate
+from pudge.pipeline_cache import save_final_pipeline_result
 from pudge.presentation_state import derive_episode_presentation
 
 
@@ -67,9 +70,7 @@ def test_akiba_upgrade_jobs_never_demote_ready_episodes(tmp_path: Path) -> None:
                 }
             ),
         )
-        manager.db.queue_subtitle_job(
-            video, 151379, episode, priority=120, error="Checking subtitle upgrade"
-        )
+        manager.db.queue_subtitle_job(video, 151379, episode, priority=120, error="Checking subtitle upgrade")
 
     preserve = manager._active_subtitle_upgrade_paths()
     assert preserve == {str(video) for video, _subtitle in rows}
@@ -100,9 +101,7 @@ def test_akiba_v39_demotions_are_restored_from_upgrade_markers(tmp_path: Path) -
                 }
             ),
         )
-        manager.db.queue_subtitle_job(
-            video, 151379, episode, priority=120, error="Checking subtitle upgrade"
-        )
+        manager.db.queue_subtitle_job(video, 151379, episode, priority=120, error="Checking subtitle upgrade")
 
     # Reproduce the v39 generic repair race from the production log.
     assert manager.db.repair_stale_subtitle_selections() == 2
@@ -176,40 +175,95 @@ def test_presentation_hides_ocr_ready_when_policy_disallows_it(tmp_path: Path) -
     assert allowed["ready"] is True
 
 
-def test_native_launcher_does_not_drain_outer_objc_pool_after_python_finalize() -> None:
-    source = Path("install.sh").read_text(encoding="utf-8")
-    assert "NATIVE_SHELL_REV=2" in source
-    main = source[source.index("int main(int argc, char *argv[]) {") : source.index('"""', source.index("int main(int argc, char *argv[]) {"))]
-
-    # Py_RunMain finalizes Python. There must be no outer Objective-C pool whose
-    # later drain can invoke PyObjC dealloc callbacks after interpreter teardown.
-    assert "int main(int argc, char *argv[]) {\n    @autoreleasepool" not in main
-    assert "@autoreleasepool {\n        NSString *icon_path" in main
-    assert main.index("@autoreleasepool {\n        NSString *icon_path") < main.index("PyConfig config;")
-    assert main.rstrip().endswith("return Py_RunMain();\n}")
+# The native launcher drains its startup pool before Python runs (no PyObjC callbacks into a
+# finalized interpreter on window close): test_install_script.py::test_launcher_runs_pudge_...
 
 
-def test_startup_home_state_is_rendered_atomically_after_background_maintenance() -> None:
-    source = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    poll = source[source.index("async function pollStartupMaintenance()") : source.index("async function startupSequence()")]
-    startup = source[source.index("async function startupSequence()") : source.index("async function loadState()")]
-
-    assert "if(r.running){ui.startupDeferredState=r.state||ui.startupDeferredState" in poll
-    running_branch = poll.split("if(r.running){", 1)[1].split("return;}", 1)[0]
-    assert "renderDataPages" not in running_branch
-    assert "ui.state=r.state||ui.startupDeferredState||ui.state" in poll
-    assert "renderDataPages(true)" in poll
-
-    assert "if(ui.startupMaintenanceRunning){ui.startupDeferredState=r.state||ui.state;}" in startup
-    assert "else{ui.state=r.state||ui.state;ui.startupDeferredState=null;renderDataPages();}" in startup
-
-    sync = source[source.index("async function syncAniList(startup=false)") : source.index("async function pollStartupMaintenance()")]
-    assert "if(startup)ui.startupDeferredState=r.state||ui.startupDeferredState;else ui.state=r.state" in sync
-    startup_sync_branch = sync.split("if(startup)", 1)[1].split("else ui.state", 1)[0]
-    assert "renderDataPages" not in startup_sync_branch
+STARTUP = r"""
+const base = __api.get_state;
+const titled = title => { const state = base(); state.home.new_ready = [{media_id: 9, title, local: {video_path: '/v/x.mkv'}, ready_episodes: [1]}]; return state; };
+window.__shown = [];
+const seen = () => {
+  const titles = [...document.querySelectorAll('#currentContent .airing-meta strong')].map(el => el.textContent).join(',');
+  if (window.__shown[window.__shown.length - 1] !== titles) window.__shown.push(titles);
+};
+document.addEventListener('DOMContentLoaded', () => new MutationObserver(seen).observe(document.getElementById('currentContent'), {childList: true, subtree: true, characterData: true, attributes: true}));
+__api.get_state = __api.get_state_fast = () => titled('Cached');
+__api.startup_sync_anilist = async () => ({skipped: false, state: titled('AniList sync')});
+__api.startup_maintenance = async () => ({running: true, state: titled('Maintenance started')});
+let polls = 0;
+__api.startup_maintenance_status = async () => (++polls < 3 ? {running: true, state: titled('Maintenance step ' + polls)} : {running: false, error: '', state: titled('Finished')});
+"""
 
 
-def test_text_only_retry_bypasses_ocr_final_cache_paths() -> None:
-    source = Path("pudge/cli.py").read_text(encoding="utf-8")
-    assert 'parser.add_argument("--text-only", action="store_true", help=argparse.SUPPRESS)' in source
-    assert "not args.text_only" in source
+def test_startup_home_state_is_rendered_atomically_after_background_maintenance(page) -> None:
+    result = page.run(
+        "await __tick(5000); return {shown: window.__shown, toasts: __toasts(), finished: t('toast.startupFinished')};",
+        before=STARTUP,
+    )
+    # Home shows the cached state, then the finished one: none of the half-done states of the
+    # AniList sync or the background maintenance in between (cards used to jump around).
+    assert result.value["shown"] == ["Cached", "Finished"]
+    assert result.value["finished"] in result.value["toasts"]
+    assert len(result.calls_of("startup_maintenance_status")) == 3
+
+
+def _prepare_with_cached_ocr(tmp_path: Path, monkeypatch, *flags: str):
+    """An episode whose final cache holds an OCR result; its text subtitle does not pass."""
+    tmp_path.mkdir()
+    video = tmp_path / "Show - 01.mkv"
+    video.write_bytes(b"video")
+    srt, sup, ocr_srt = tmp_path / "Show - 01.ja.srt", tmp_path / "Show - 01.sup", tmp_path / "ocr.srt"
+    srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは。\n", encoding="utf-8")
+    sup.write_bytes(b"PGS")
+    ocr_srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは。これは日本語です。\n", encoding="utf-8")
+    cfg = AppConfig()
+    cfg.paths.cache_dir = tmp_path / "cache"
+    cfg.paths.subtitle_dirs = []
+    cfg.anilist.enabled = False
+    cfg.matching.ocr_image_subtitles = True
+    save_final_pipeline_result(video, cfg, subtitle=ocr_srt, subtitle_id=None, source="ocr")
+    searched: list[bool] = []
+    converted: list[Path] = []
+    monkeypatch.setattr(cli, "find_embedded_japanese_subtitles", lambda *a, **k: [])
+    monkeypatch.setattr(
+        cli,
+        "find_local_subtitles",
+        lambda **_k: (
+            searched.append(True)
+            or [
+                SubtitleCandidate(path=sup, source="local", score=95.0, name=sup.name),
+                SubtitleCandidate(path=srt, source="local", score=80.0, name=srt.name),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        cli, "_sync_one", lambda _video, subtitle, *a, **k: (subtitle, {"sync_was_successful": True})
+    )
+    monkeypatch.setattr(cli, "subtitle_quality_accepted", lambda *a, **k: (False, "low_confidence"))
+    monkeypatch.setattr(
+        cli,
+        "image_subtitle_to_srt",
+        lambda _video, _cache, **kw: (
+            converted.append(kw["subtitle_path"])
+            or (ocr_srt, {"reason": "ocr_ready", "cue_count": 1, "quality": {"accepted": True}})
+        ),
+    )
+    args = cli.build_parser().parse_args(
+        ["--prepare-only", "--offline", "--no-anilist-progress", *flags, str(video)]
+    )
+    return cli.process_video(video, args, cfg, None), searched, converted
+
+
+def test_text_only_retry_bypasses_ocr_final_cache_paths(tmp_path: Path, monkeypatch, capsys) -> None:
+    # An ordinary preparation reuses the cached OCR result ...
+    status, searched, converted = _prepare_with_cached_ocr(tmp_path / "plain", monkeypatch)
+    assert (status, searched, converted) == (0, [], [])
+    assert "PREPARE_STATUS=ready" in capsys.readouterr().out
+    # ... the background retry for verified text neither takes it from the cache nor makes a
+    # new OCR (both made the episode bounce back to Ready on every poll).
+    status, searched, converted = _prepare_with_cached_ocr(tmp_path / "retry", monkeypatch, "--text-only")
+    out = capsys.readouterr().out
+    assert searched == [True] and converted == []
+    assert "PREPARE_STATUS=waiting_text_subtitles" in out and "PREPARE_STATUS=ready" not in out
+    assert "--text-only" not in cli.build_parser().format_help()  # internal flag

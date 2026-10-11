@@ -49,12 +49,11 @@ cp "dist/release-requirements.txt" "$STAGE/"
 chmod +x "$STAGE/install.sh" "$STAGE/build_release.sh" "$STAGE/pudge/legacy_install.py"
 python .github/release/check_release_bundle.py "$STAGE"
 
+ARCHIVE="$PROJECT_DIR/dist/$APP_SLUG-macos-v${VERSION}.zip"
 (
   cd "$PROJECT_DIR/dist/release"
-  zip -qr "../${VERSION}.zip" "$APP_SLUG"
+  zip -qr "$ARCHIVE" "$APP_SLUG"
 )
-
-ARCHIVE="$PROJECT_DIR/dist/${VERSION}.zip"
-python .github/release/finish_release_archives.py "$ARCHIVE" "$APP_SLUG-macos-v${VERSION}.zip"
+python .github/release/finish_release_archives.py "$ARCHIVE"
 
 echo "$ARCHIVE"

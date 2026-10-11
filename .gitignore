@@ -56,3 +56,11 @@ pudge/assets/jimaku-trial-key
 /tests/golden/
 /tests/fixtures/v96p*/
 !/tests/fixtures/v96p37_ruby_click_synthetic.cjs
+
+# iPhone project: local signing and Xcode/SwiftPM state
+ios/Config/Signing.local.xcconfig
+ios/**/xcuserdata/
+ios/PudgeCore/.build/
+
+# Test caches
+.hypothesis/

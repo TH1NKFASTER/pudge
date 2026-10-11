@@ -129,9 +129,7 @@ class WorkScheduler:
         token = object()
         with self._queue_condition:
             self._sequence += 1
-            self._priority_requests.append(
-                (int(requested), self._sequence, token, str(name))
-            )
+            self._priority_requests.append((int(requested), self._sequence, token, str(name)))
             self._queue_condition.notify_all()
         self._log(
             "REQUEST step=work_scheduler.priority name=%s priority=%s",
@@ -143,9 +141,7 @@ class WorkScheduler:
     def end_priority_request(self, token: object) -> None:
         with self._queue_condition:
             removed = [row for row in self._priority_requests if row[2] is token]
-            self._priority_requests = [
-                row for row in self._priority_requests if row[2] is not token
-            ]
+            self._priority_requests = [row for row in self._priority_requests if row[2] is not token]
             self._queue_condition.notify_all()
         if removed:
             self._log(
@@ -160,10 +156,7 @@ class WorkScheduler:
         """Whether local work at *priority* should cooperatively yield now."""
         requested = int(WorkPriority(int(priority)))
         with self._queue_condition:
-            if (
-                self._active_priority is not None
-                and int(self._active_priority) < requested
-            ):
+            if self._active_priority is not None and int(self._active_priority) < requested:
                 return True
             if any(row[0] < requested for row in self._priority_requests):
                 return True
@@ -243,7 +236,9 @@ class WorkScheduler:
     ) -> bool:
         started = time.monotonic()
         while not self.background_allowed(priority=priority, resource=resource):
-            if (cancel_event is not None and cancel_event.is_set()) or (callable(cancel_check) and cancel_check()):
+            if (cancel_event is not None and cancel_event.is_set()) or (
+                callable(cancel_check) and cancel_check()
+            ):
                 return False
             if timeout is not None and time.monotonic() - started >= float(timeout):
                 return False
@@ -278,9 +273,7 @@ class WorkScheduler:
                 ):
                     return None
             else:
-                block_reason = self.background_wait_reason(
-                    priority=requested_priority, resource=resource
-                )
+                block_reason = self.background_wait_reason(priority=requested_priority, resource=resource)
                 if block_reason is not None:
                     self._log(
                         "SKIP step=work_scheduler.heavy name=%s reason=%s",
@@ -306,7 +299,9 @@ class WorkScheduler:
                 self._queue_condition.notify_all()
 
         while True:
-            if (cancel_event is not None and cancel_event.is_set()) or (callable(cancel_check) and cancel_check()):
+            if (cancel_event is not None and cancel_event.is_set()) or (
+                callable(cancel_check) and cancel_check()
+            ):
                 remove_waiter()
                 return None
             if self.should_yield_to_higher_priority(requested_priority):
@@ -366,9 +361,7 @@ class WorkScheduler:
             if locked:
                 try:
                     block_reason = (
-                        self.background_wait_reason(
-                            priority=requested_priority, resource=resource
-                        )
+                        self.background_wait_reason(priority=requested_priority, resource=resource)
                         if foreground_sensitive
                         else None
                     )
@@ -409,9 +402,7 @@ class WorkScheduler:
                 try:
                     handle.seek(0)
                     handle.truncate()
-                    handle.write(
-                        f"pid={os.getpid()} name={name} started_at={time.time():.3f}\n"
-                    )
+                    handle.write(f"pid={os.getpid()} name={name} started_at={time.time():.3f}\n")
                     handle.flush()
                 except OSError:
                     pass

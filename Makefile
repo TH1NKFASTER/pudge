@@ -1,10 +1,11 @@
 PYTHON ?= $(if $(wildcard .venv-test/bin/python),.venv-test/bin/python,python3)
 BATCHES ?= 4
 
-.PHONY: install-dev test test-batches lint quality bump release build-release clean
+.PHONY: install-dev test test-batches format lint quality bump release build-release clean
 
+# The versions in uv.lock, into .venv-test (the PYTHON the other targets use).
 install-dev:
-	$(PYTHON) -m pip install -e ".[dev,sync]"
+	UV_PROJECT_ENVIRONMENT=.venv-test uv sync --locked --python 3.12 --extra dev --extra sync
 
 test:
 	@runtime=$$(mktemp -d "$${TMPDIR:-/tmp}/pudge-pytest-runtime.XXXXXX"); \
@@ -26,7 +27,11 @@ bump:
 	@test -n "$(VERSION)" || (echo "Usage: make bump VERSION=0.6.69" && exit 2)
 	$(PYTHON) .github/release/bump_version.py $(VERSION)
 
+format:
+	$(PYTHON) -m ruff format pudge tests scripts .github
+
 lint:
+	$(PYTHON) -m ruff format --check pudge tests scripts .github
 	$(PYTHON) -m ruff check --select E9,F pudge .github/release
 	$(PYTHON) -m ruff check --select E9,F63,F7 tests
 	$(PYTHON) .github/release/sync_config_example.py --check
@@ -34,7 +39,6 @@ lint:
 
 quality: lint
 	$(PYTHON) -m ruff check --select BLE001 pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/web_controllers.py pudge/manager_services.py pudge/providers/base.py
-	$(PYTHON) -m ruff format --check pudge/alignment_replay.py pudge/cache_registry.py pudge/diagnostics.py pudge/identity.py pudge/manager_services.py pudge/providers/base.py pudge/safe_mode.py pudge/secrets_store.py pudge/subtitles/pipeline.py pudge/task_supervisor.py pudge/web_controllers.py pudge/web_state.py .github/release/check_release_metadata.py .github/release/sync_config_example.py tests/test_audit_properties.py tests/test_audit_v0722_stabilization.py tests/test_performance_budgets.py
 	$(PYTHON) -m mypy --follow-imports=skip pudge/task_supervisor.py pudge/identity.py pudge/cache_registry.py pudge/diagnostics.py pudge/safe_mode.py pudge/web_state.py pudge/providers/base.py
 	$(PYTHON) .github/release/check_release_metadata.py
 

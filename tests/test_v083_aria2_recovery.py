@@ -57,7 +57,6 @@ def test_aria2_missing_control_recovery_uses_hash_check_without_overwrite(
     assert any(method == "aria2.removeDownloadResult" for method, _ in calls)
 
 
-
 def test_aria2_missing_control_recovery_synthesizes_magnet_for_legacy_metadata(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -224,6 +223,7 @@ def test_aria2_seed_off_reports_fully_downloaded_active_nonseeder_as_complete(
     assert rows[0].raw["legacy_seeding_stopped"] is True
     assert ("aria2.forcePause", [gid]) in calls
 
+
 def test_aria2_runtime_poll_never_rewrites_task_options(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path, seed_mode="off")
     calls: list[str] = []
@@ -289,9 +289,7 @@ def test_manager_does_not_publish_aria2_while_verifying_or_on_error() -> None:
     assert AnimeManager._download_is_complete(failed) is False
 
 
-def test_aria2_exposes_recovery_marker_on_metadata_only_task(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_aria2_exposes_recovery_marker_on_metadata_only_task(tmp_path: Path, monkeypatch) -> None:
     client = Aria2Client(state_dir=tmp_path, seed_mode="off")
     gid = "feb989d6d59f9869"
     info_hash = "feb989d6d59f98698b918c1f96061a0d3e638c74"

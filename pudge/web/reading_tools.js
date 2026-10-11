@@ -5,7 +5,6 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[ch]));
-  const ru = () => document.documentElement.lang === 'ru' || window.ui?.lang === 'ru';
   function llmAvailable(settings = (typeof ui !== 'undefined' ? ui : window.ui)?.state?.settings || {}) {
     if (!settings.llm_enabled || !String(settings.llm_model || '').trim()) return false;
     const url = String(settings.llm_url || '').trim();
@@ -16,9 +15,19 @@
     return true;
   }
   const STUDY_THEMES = new Set(['balanced','jiten','jpdb','focus','underline','none','custom']);
+  // Nine word states like Jiten's (wordStateColourKey, groups split), each with a real
+  // colour. not_in_deck: New and in none of the user's study decks.
+  const WORD_STATES = ['new','not_in_deck','young','mature','mastered','due','blacklisted','suspended','redundant'];
+  // Jiten's order, except Due first: a due word always shows as due.
+  const WORD_STATE_PRIORITY = ['due','blacklisted','suspended','redundant','mastered','mature','young'];
+  const STATE_ALIASES = {learning:'young', failed:'due', known:'mature', 'never-forget':'mastered', never_forget:'mastered', neverforget:'mastered', 'not-in-deck':'not_in_deck'};
   const STUDY_COLORS = {
-    new: '#f3f6fb', learning: '#f4bd63', due: '#ff7d8c',
-    known: '#57d38c', blacklisted: '#7d8795', unknown: '#9aa8ba',
+    new: '#f43f5e', not_in_deck: '#f43f5e', young: '#f59e0b', mature: '#4ade80', mastered: '#2dd4bf',
+    due: '#f97316', blacklisted: '#9ca3af', suspended: '#9ca3af', redundant: '#0ea5e9', unknown: '#9aa8ba',
+  };
+  const canonicalState = value => {
+    const name = String(value ?? '').trim().toLowerCase();
+    return STATE_ALIASES[name] || name;
   };
 
   const registry = new Map();
@@ -28,6 +37,9 @@
   let translationRequest = 0;
   let grammarRequest = 0;
   let lastTranslationSelection = null;
+  let translationOffer = null;
+  // The selected text the translation popup points at (it is placed again when it grows).
+  let translationAnchor = null;
   const optimisticStudyPairs = new Set();
   // Native Jiten states are mutable and account-scoped. Parsed vocabulary is not.
   let studyStateEpoch = 0;
@@ -35,6 +47,13 @@
   // S3: jpdb states come from lookup-vocabulary and have their own account scope.
   let jpdbStateScope = '';
   const pendingJitenMutations = new Set();
+  // Reviews still waiting for the provider (the card closes before the request):
+  // a reopened card cannot send a second review of the same word meanwhile.
+  const inflightStudyReviews = new Set();
+  const inflightReviewKey = (token, backend) => {
+    const pair = studyPairKey(token);
+    return pair ? `${String(backend || 'jiten').toLowerCase()}|${pair}` : '';
+  };
 
   // Which provider can refresh this token's state: Jiten, or jpdb for native
   // vid/sid tokens only (a Jiten-ID fallback under jpdb is never sent to jpdb).
@@ -193,14 +212,19 @@
   }
 
   function normalizeState(card = {}) {
-    const explicit = String(card.normalizedState || '').toLowerCase();
-    if (explicit) return explicit;
-    const states = (card.cardState || card.states || []).map(x => String(x).toLowerCase());
-    if (states.includes('due') || states.includes('failed')) return 'due';
-    if (states.some(x => ['known','mastered','never-forget'].includes(x))) return 'known';
-    if (states.some(x => ['learning','young','mature'].includes(x))) return 'learning';
-    if (states.includes('blacklisted')) return 'blacklisted';
-    return 'new';
+    const explicit = String(card.normalizedState ?? '').trim().toLowerCase();
+    if (WORD_STATES.includes(explicit) || explicit === 'unknown') return explicit;
+    // No name, or an older cache's learning/known: the raw states decide (Jiten's priority).
+    const states = new Set((card.cardState || card.states || card.knownState || []).map(canonicalState));
+    for (const name of WORD_STATE_PRIORITY) if (states.has(name)) return name;
+    if (explicit) return canonicalState(explicit);
+    return Array.isArray(card.studyDeckIds) && card.studyDeckIds.length === 0 && [...states].every(x => x === 'new') ? 'not_in_deck' : 'new';
+  }
+
+  // CSS value of a state's colour; a missing or empty one (older saves) is the default.
+  function studyColorValue(settings = {}, state) {
+    const value = String(settings?.[`word_color_${state}`] ?? '').trim();
+    return value || STUDY_COLORS[state];
   }
 
   function applyStudyAppearance(settings = {}, target = document.documentElement) {
@@ -208,9 +232,8 @@
     if (!target?.style) return;
     const theme = String(settings.word_color_theme || 'balanced').toLowerCase();
     target.dataset.pudgeStudyTheme = STUDY_THEMES.has(theme) ? theme : 'balanced';
-    for (const [state, fallback] of Object.entries(STUDY_COLORS)) {
-      const value = String(settings[`word_color_${state}`] || fallback);
-      target.style.setProperty(`--pudge-study-${state}`, value);
+    for (const state of Object.keys(STUDY_COLORS)) {
+      target.style.setProperty(`--pudge-study-${state}`, studyColorValue(settings, state));
     }
     target.style.setProperty(
       '--pudge-pitch-color',
@@ -219,22 +242,21 @@
   }
 
   function stateLabel(card = {}) {
+    if (normalizeState(card) === 'not_in_deck') return PudgeI18n.t('reading.state.notInDeck');
     const liveLabel = String(card.rawStateLabel || '').trim();
     if (liveLabel) return liveLabel;
     const raw = (card.knownState || card.cardState || card.states || [])
       .map(value => String(value || '').trim().toLowerCase());
     for (const [state, label] of [
-      ['blacklisted','Blacklisted'], ['mastered','Mastered'], ['mature','Mature'],
-      ['young','Young'], ['due','Due'], ['suspended','Suspended'],
-      ['redundant','Redundant'], ['new','New'],
+      ['blacklisted','reading.state.blacklisted'], ['mastered','reading.state.mastered'], ['mature','reading.state.mature'],
+      ['young','reading.state.young'], ['due','reading.state.due'], ['suspended','reading.state.suspended'],
+      ['redundant','reading.state.redundant'], ['new','reading.state.new'],
     ]) {
-      if (raw.includes(state)) return label;
+      if (raw.includes(state)) return PudgeI18n.t(label);
     }
     const state = normalizeState(card);
-    const labels = ru()
-      ? {new:'Новое',learning:'Изучается',due:'К повторению',known:'Известно',blacklisted:'Игнорируется',unknown:'Неизвестно'}
-      : {new:'New',learning:'Learning',due:'Due',known:'Known',blacklisted:'Blacklisted',unknown:'Unknown'};
-    return labels[state] || labels.new;
+    const labels = {new:'reading.state.new',not_in_deck:'reading.state.notInDeck',young:'reading.state.young',mature:'reading.state.mature',mastered:'reading.state.mastered',due:'reading.state.due',blacklisted:'reading.state.blacklisted',suspended:'reading.state.suspended',redundant:'reading.state.redundant',unknown:'reading.state.unknown'};
+    return PudgeI18n.t(labels[state] || labels.new);
   }
 
   function rubyReading(value) {
@@ -509,7 +531,7 @@
       return `<span class="pudge-pitch-mora ${high ? 'high' : 'low'}${transition}">${esc(mora)}</span>`;
     }).join('');
     const detail = card.pitchDerived
-      ? (ru() ? 'форма: акцент перенесён со словарной формы' : 'inflection: contour derived from dictionary form')
+      ? (PudgeI18n.t('reading.inflectionContourDerivedFromDictionary'))
       : `${type} ${accent}`;
     return `<span class="pudge-inline-pitch pitch-${type}${card.pitchDerived ? ' pitch-derived' : ''}" title="${esc(detail)}">${nodes}</span>`;
   }
@@ -588,6 +610,13 @@
     if (top + r.height > window.innerHeight - 8) top = Math.max(8, rect.top - r.height - 10);
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;
+    popupLayoutChanged();
+  }
+
+  // A word card / translation opened, changed size or closed (the Screen text
+  // panel grows its small window to fit it).
+  function popupLayoutChanged() {
+    try { window.dispatchEvent?.(new CustomEvent('pudge-popup-layout')); } catch (_) {}
   }
 
   async function apiDecks(backend) {
@@ -649,7 +678,7 @@
       const scoped = String(payload.account_scope || '');
       const expectedScope = String(payload.provider || '').toLowerCase() === 'jpdb' ? jpdbStateScope : studyStateScope;
       const confirmed = scoped && scoped === expectedScope && !payload.stale &&
-        ['new','learning','known','due','blacklisted'].includes(String(card.normalizedState || '').toLowerCase());
+        WORD_STATES.includes(normalizeState(card));
       if (confirmed) {
         target.dataset.pudgeStudyVerified = '1';
         target.dataset.pudgeStudyScope = scoped;
@@ -681,7 +710,7 @@
       badge.classList.add(`state-${state}`);
       badge.textContent = stateLabel(card);
       const providerName = String(payload.provider || current.backend || '').toLowerCase() === 'jpdb' ? 'jpdb' : 'Jiten';
-      badge.title = payload.stale ? (ru() ? `Последнее известное состояние ${providerName}` : `Last known ${providerName} state`) : '';
+      badge.title = payload.stale ? (PudgeI18n.t('reading.lastKnownState',{providerName:providerName})) : '';
       refreshActiveOptimalBadge();
     }
     return true;
@@ -1126,7 +1155,7 @@
       extraActions,
       identity,
       generation,
-      pendingReview: false,
+      pendingReview: inflightStudyReviews.has(inflightReviewKey(token, backend)),
       reviewOutcomeUnknown: false,
       idNamespace: String(token.idNamespace || card.idNamespace || (String(backend || 'jiten') === 'jiten' ? 'jiten' : '')),
       reviewable: token.reviewable !== false && card.reviewable !== false,
@@ -1143,35 +1172,35 @@
     const wordId = Number(token.wordId ?? token.word_id ?? card.wordId ?? card.word_id ?? 0);
     const readingIndex = Number(token.readingIndex ?? token.reading_index ?? card.readingIndex ?? card.reading_index ?? -1);
     const jitenLink = String(activeToken.backend || '').toLowerCase() === 'jiten' && wordId > 0 && readingIndex >= 0
-      ? `<button class="pudge-study-jiten-link" data-pudge-study-jiten data-word-id="${wordId}" data-reading-index="${readingIndex}" title="Open in Jiten" aria-label="Open in Jiten">↗</button>`
+      ? `<button class="pudge-study-jiten-link" data-pudge-study-jiten data-word-id="${wordId}" data-reading-index="${readingIndex}" title="${PudgeI18n.t('reading.openInJiten')}" aria-label="${PudgeI18n.t('reading.openInJiten')}">↗</button>`
       : '';
     pop.innerHTML = `
       <div class="pudge-study-head" data-layout="${headerActions.length ? 'inline' : 'compact'}">
-        <div class="pudge-study-term-wrap"><div class="pudge-study-term">${studyTerm(card, token)}</div><div class="pudge-study-term-controls">${jitenLink}<span class="pudge-study-optimal" hidden tabindex="0" role="img" aria-label="${ru() ? 'Подходит для изучения' : 'A good new word to learn in this context'}" title="${ru() ? 'Хорошее новое слово для изучения в этом контексте' : 'A good new word to learn in this context'}" data-tooltip="${ru() ? 'Хорошее новое слово для изучения в этом контексте' : 'A good new word to learn in this context'}">★</span></div></div>
+        <div class="pudge-study-term-wrap"><div class="pudge-study-term">${studyTerm(card, token)}</div><div class="pudge-study-term-controls">${jitenLink}<span class="pudge-study-optimal" hidden tabindex="0" role="img" aria-label="${PudgeI18n.t('reading.aGoodNewWordTo')}" title="${PudgeI18n.t('reading.aGoodNewWordTo2')}" data-tooltip="${PudgeI18n.t('reading.aGoodNewWordTo2')}">★</span></div></div>
         ${headerActions.length ? `<div class="pudge-study-head-actions">
           ${headerActions.map(action =>
             `<button class="pudge-study-header-action" data-pudge-study-action-tone="${String(action.tone || '') === 'listen' || String(action.id) === 'paired-audio-here' ? 'listen' : ''}" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
           ).join('')}
         </div>` : ''}
-        <button class="pudge-study-close" data-pudge-study-close aria-label="Close">×</button>
+        <button class="pudge-study-close" data-pudge-study-close aria-label="${PudgeI18n.t('action.close')}">×</button>
       </div>
       ${fallbackOnly ? '' : `
-      <div class="pudge-study-subtle"><span class="pudge-study-state state-${esc(state)}">${esc(status)}</span>${card.frequencyRank ? ` <span aria-hidden="true">•</span> Frequency #${Number(card.frequencyRank)}` : ''}</div>
+      <div class="pudge-study-subtle"><span class="pudge-study-state state-${esc(state)}">${esc(status)}</span>${card.frequencyRank ? ` <span aria-hidden="true">•</span> ${esc(PudgeI18n.t('reading.frequencyRank', {rank: Number(card.frequencyRank)}))}` : ''}</div>
       <div class="pudge-study-alt-readings">${esc(window.PudgeJitenWords?.readingsLine(card) || "")}</div>
       ${renderPitchAccent(card)}
       <ol class="pudge-study-meanings">
         ${meanings.length
           ? meanings.slice(0, 8).map(x => `<li>${esc(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')
-          : `<li class="pudge-study-subtle">${ru() ? 'Нет значений' : 'No meanings returned'}</li>`}
+          : `<li class="pudge-study-subtle">${PudgeI18n.t('reading.noMeaningsReturned')}</li>`}
       </ol>
       <div class="pudge-study-controls">
-        <select id="pudgeStudyDeck"><option value="">${ru() ? 'Колода…' : 'Study deck…'}</option></select>
+        <select id="pudgeStudyDeck"><option value="">${PudgeI18n.t('reading.studyDeck')}</option></select>
         <div class="pudge-study-action-row" data-count="${activeToken.reviewActions.actions.length}">
-          <div class="pudge-study-review-actions" role="group" aria-label="Review" data-count="${activeToken.reviewActions.actions.length}">
+          <div class="pudge-study-review-actions" role="group" aria-label="${PudgeI18n.t('reading.reviewGroup')}" data-count="${activeToken.reviewActions.actions.length}">
             ${studyGradeButtonsHtml(activeToken)}
           </div>
-          ${activeToken.reviewable ? '' : `<div class="pudge-study-subtle">${ru() ? 'Нет безопасного соответствия ID для выбранного SRS' : 'No safe native-ID mapping for the selected SRS'}</div>`}
-          <div class="pudge-study-add-wrap"><button class="pudge-study-add" data-pudge-study-add aria-disabled="false">${ru() ? 'Добавить' : 'Add'}</button></div>
+          ${activeToken.reviewable ? '' : `<div class="pudge-study-subtle">${PudgeI18n.t('reading.noSafeNativeIdMapping')}</div>`}
+          <div class="pudge-study-add-wrap"><button class="pudge-study-add" data-pudge-study-add aria-disabled="false">${PudgeI18n.t('reading.add')}</button></div>
         </div>
         ${footerActions.length ? `<div class="pudge-study-secondary-actions">${footerActions.map(action =>
           `<button class="pudge-study-extra-action" data-pudge-study-extra-action="${esc(action.id)}">${esc(action.label || action.id)}</button>`
@@ -1198,6 +1227,8 @@
           const list = pop.querySelector(".pudge-study-meanings");
           if (list && definitions.length) list.innerHTML = definitions.map(value => `<li>${esc(value)}</li>`).join("");
         }
+        // The meanings made the card taller: keep it inside the window.
+        if (pop.classList.contains('open')) position(pop, anchorRect);
       };
       void enrich().catch(() => {});
       setTimeout(() => { if (activeToken?.generation === generation) void enrich().catch(() => {}); }, 750);
@@ -1212,7 +1243,7 @@
       const select = document.getElementById('pudgeStudyDeck');
       if (select) {
         select.dataset.pudgeStudyBackend = String(activeToken.backend || 'jiten');
-        select.innerHTML = `<option value="">${ru() ? 'Колода…' : 'Study deck…'}</option>` +
+        select.innerHTML = `<option value="">${PudgeI18n.t('reading.studyDeck')}</option>` +
           (decks || []).map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('');
         const remembered = await persistedStudyDeck(activeToken.backend);
         if (activeToken?.token !== token) return;
@@ -1225,7 +1256,7 @@
     } catch (error) {
       const select = document.getElementById('pudgeStudyDeck');
       if (select) {
-        select.innerHTML = `<option value="">${esc((window.PudgeUiLanguage?.message(error?.message || String(error)) ?? String(error?.message || String(error))))}</option>`;
+        select.innerHTML = `<option value="">${esc(PudgeI18n.message(String(error?.message || error)))}</option>`;
         select.disabled = true;
       }
     }
@@ -1237,11 +1268,13 @@
     const card = document.getElementById('pudgeStudyCard');
     const focusedInside = document.activeElement;
     if (card && focusedInside && card.contains(focusedInside)) focusedInside.blur?.();
+    const wasOpen = Boolean(card?.classList.contains('open'));
     card?.classList.remove('open');
     if (card) {
       card.style.left = '-10000px';
       card.style.top = '-10000px';
     }
+    if (wasOpen) popupLayoutChanged();
   }
 
   function studyReviewActions(backend) {
@@ -1254,22 +1287,22 @@
   // without a deck. Returns '' when grading is possible, otherwise why not.
   function studyReviewBlockReason(current, deck = document.getElementById('pudgeStudyDeck')?.value || '') {
     if (!current) return '';
-    if (!current.reviewable) return ru() ? 'Нет безопасного соответствия ID для выбранного SRS' : 'No safe native-ID mapping for the selected SRS';
-    if (current.pendingReview) return ru() ? 'Review уже отправляется' : 'Review is already being sent';
-    if (current.reviewOutcomeUnknown) return ru() ? 'Результат прошлого review неизвестен' : 'The previous review outcome is unknown';
+    if (!current.reviewable) return PudgeI18n.t('reading.noSafeNativeIdMapping');
+    if (current.pendingReview) return PudgeI18n.t('reading.reviewIsAlreadyBeingSent');
+    if (current.reviewOutcomeUnknown) return PudgeI18n.t('reading.thePreviousReviewOutcomeIs');
     if (String(current.backend || '').toLowerCase() !== 'jiten' || deck) return '';
     const card = {...(current.renderCard || {}), ...(current.token?.card || {})};
     const memberships = Array.isArray(current.token?.card?.studyDeckIds) ? current.token.card.studyDeckIds : null;
-    if (memberships?.length === 0 && normalizeState(card) === 'new' && current.liveRefreshState !== 'pending') {
-      return ru() ? 'Новое слово: выберите колоду, в которую его добавить' : 'New word: choose a deck to add it to';
+    if (memberships?.length === 0 && ['new','not_in_deck'].includes(normalizeState(card)) && current.liveRefreshState !== 'pending') {
+      return PudgeI18n.t('reading.newWordChooseADeck');
     }
     return '';
   }
 
   function studyAddBlockReason(current, deck = document.getElementById('pudgeStudyDeck')?.value || '') {
     if (!current) return '';
-    if (!current.reviewable) return ru() ? 'Нет безопасного соответствия ID для выбранного SRS' : 'No safe native-ID mapping for the selected SRS';
-    return deck ? '' : (ru() ? 'Выберите колоду' : 'Choose a deck');
+    if (!current.reviewable) return PudgeI18n.t('reading.noSafeNativeIdMapping');
+    return deck ? '' : (PudgeI18n.t('manga.chooseADeck'));
   }
 
   function setStudyButtonAvailability(button, reason, hint = '') {
@@ -1357,11 +1390,33 @@
     translationRequest += 1;
     grammarRequest += 1;
     lastTranslationSelection = null;
+    translationOffer = null;
+    translationAnchor = null;
     const pop = document.getElementById('pudgeTranslationPop');
     if (pop) {
+      const wasOpen = pop.classList.contains('open');
       pop.classList.remove('open', 'loading');
       pop.textContent = '';
+      if (wasOpen) popupLayoutChanged();
     }
+  }
+
+  function rememberTranslationAnchor(range) {
+    let rect = null;
+    try { rect = range.getBoundingClientRect(); } catch (_) {}
+    translationAnchor = {range, rect};
+    return rect;
+  }
+
+  // Placed again after its content grew (an explanation) or the window changed size,
+  // so it stays inside the window.
+  function placeTranslation() {
+    const pop = document.getElementById('pudgeTranslationPop');
+    if (!pop?.classList.contains('open') || !translationAnchor) return;
+    let rect = null;
+    try { rect = translationAnchor.range?.getBoundingClientRect?.(); } catch (_) {}
+    if (!rect || !(rect.width || rect.height || rect.top || rect.left)) rect = translationAnchor.rect;
+    if (rect) position(pop, rect);
   }
 
   // Two selection handlers (reader + generic) can fire for one mouseup: one
@@ -1375,6 +1430,45 @@
     return task;
   }
 
+  // Selecting text only offers a translation: the request goes out when the
+  // user presses Translate (or T). Selecting to copy sends nothing.
+  function offerTranslation(root, {targetLanguage = ''} = {}) {
+    if (!root) return false;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.rangeCount) return false;
+    const range = selection.getRangeAt(0);
+    if (!root.contains(range.commonAncestorContainer)) return false;
+    const text = textWithoutRuby(range.cloneContents()).replace(/\s+/g, ' ').trim();
+    if (!text || !/[\u3040-\u30ff\u3400-\u9fff]/.test(text)) return false;
+    const {translation: pop} = ensureUi();
+    if (translationOffer?.text === text && pop.classList.contains('open')) return true;
+    if (lastTranslationSelection?.text === text && pop.classList.contains('open')) return true;
+    translationRequest += 1;
+    grammarRequest += 1;
+    lastTranslationSelection = null;
+    translationOffer = {root, targetLanguage, text, range: range.cloneRange ? range.cloneRange() : range};
+    const label = PudgeI18n.t('reading.translate');
+    // "Explain grammar" (LLM) is offered next to Translate right away.
+    const explainLabel = PudgeI18n.t('reading.explainGrammar');
+    const explain = llmAvailable() && API()?.analyze_grammar ? `<button type="button" data-pudge-grammar title="${esc(explainLabel)} (G)">${esc(explainLabel)} <kbd>G</kbd></button>` : '';
+    pop.innerHTML = `<div class="pudge-translation-actions pudge-translation-offer"><button type="button" data-pudge-translate-now title="${esc(label)} (T)">${esc(label)} <kbd>T</kbd></button>${explain}</div>${explain ? '<div class="pudge-grammar" hidden></div>' : ''}`;
+    pop.classList.remove('loading');
+    pop.classList.add('open');
+    position(pop, rememberTranslationAnchor(translationOffer.range));
+    return true;
+  }
+
+  async function translateOffered() {
+    const offer = translationOffer;
+    translationOffer = null;
+    if (!offer) return false;
+    const selection = window.getSelection?.();
+    if (selection && offer.range && (selection.isCollapsed || !selection.rangeCount)) {
+      try { selection.removeAllRanges(); selection.addRange(offer.range); } catch (_) {}
+    }
+    return translateSelection(offer.root, {targetLanguage: offer.targetLanguage});
+  }
+
   async function translateSelection(root, {targetLanguage = ''} = {}) {
     if (!root) return false;
     const selection = window.getSelection();
@@ -1386,49 +1480,57 @@
     const context = selectedContext(root, range);
     const {translation: pop} = ensureUi();
     const id = ++translationRequest;
+    // An explanation asked for from the offer (shown or still coming) stays under the translation.
+    const explained = lastTranslationSelection?.text === text ? pop.querySelector?.('.pudge-grammar:not([hidden])') : null;
     // "Explain grammar" is available immediately; it does not need the translation.
     lastTranslationSelection = {text, context, translationId: id};
-    const grammarActions = llmAvailable() && API()?.analyze_grammar ? `<div class="pudge-translation-actions"><button type="button" data-pudge-grammar>${ru() ? 'Разобрать грамматику' : 'Explain grammar'}</button></div><div class="pudge-grammar" hidden></div>` : '';
-    pop.innerHTML = `<div class="pudge-translation-text">${esc(ru() ? 'Перевожу…' : 'Translating…')}</div>${grammarActions}`;
+    const grammarActions = !(llmAvailable() && API()?.analyze_grammar) ? ''
+      : explained ? explained.outerHTML
+      : `<div class="pudge-translation-actions"><button type="button" data-pudge-grammar title="${esc(PudgeI18n.t('reading.explainGrammar'))} (G)">${esc(PudgeI18n.t('reading.explainGrammar'))} <kbd>G</kbd></button></div><div class="pudge-grammar" hidden></div>`;
+    pop.innerHTML = `<div class="pudge-translation-text">${esc(PudgeI18n.t('reading.translating'))}</div>${grammarActions}`;
     pop.classList.add('open', 'loading');
-    position(pop, range.getBoundingClientRect());
-    const paint = value => {
+    position(pop, rememberTranslationAnchor(range));
+    const paint = (value, provider = '') => {
       const box = pop.querySelector?.('.pudge-translation-text');
       if (box) box.textContent = String(value || '');
       else pop.innerHTML = `<div class="pudge-translation-text">${esc(value || '')}</div>${grammarActions}`;
+      // Say when the text went to Google (no local LLM, or it failed).
+      pop.querySelector?.('.pudge-translation-source')?.remove?.();
+      if (String(provider || '') === 'google' && box?.insertAdjacentHTML) {
+        box.insertAdjacentHTML('afterend', `<div class="pudge-translation-source">${esc(PudgeI18n.t('reading.translatedByGoogle'))}</div>`);
+      }
       pop.classList.remove('loading');
-      position(pop, range.getBoundingClientRect());
+      placeTranslation();
     };
     try {
-      const language = String(targetLanguage || (ru() ? 'ru' : 'en')).toLowerCase();
+      const language = String(targetLanguage || PudgeI18n.lang()).toLowerCase();
       const mediaId = Number(root.dataset.pudgeMediaId || 0) || null;
       const result = await translateOnce(text, context, language, mediaId);
       if (id !== translationRequest) return true;
-      paint(result?.translation || '');
+      paint(result?.translation || '', result?.provider || '');
     } catch (error) {
       if (id !== translationRequest) return true;
-      paint(error?.message || String(error));
+      paint(PudgeI18n.message(String(error?.message || error)));
     }
     return true;
   }
 
   const GRAMMAR_REASONS = {
-    llm_disabled: ['Включите LLM в настройках, чтобы разбирать грамматику.', 'Enable the LLM in Settings to explain grammar.'],
-    selection_too_long: ['Выделение слишком длинное: выделите одно-два предложения.', 'Selection is too long: select one or two sentences.'],
-    context_too_long: ['Контекст слишком длинный.', 'Context is too long.'],
-    empty_selection: ['Выделите японский текст.', 'Select Japanese text.'],
-    invalid_structure: ['LLM вернула ответ в неверном формате.', 'The LLM returned an invalid answer.'],
-    llm_no_json: ['LLM не вернула JSON (подробности ниже и в логе).', 'The LLM returned no JSON (details below and in the log).'],
+    llm_disabled: 'reading.grammar.llmDisabled',
+    selection_too_long: 'reading.grammar.selectionTooLong',
+    context_too_long: 'reading.grammar.contextTooLong',
+    empty_selection: 'reading.grammar.emptySelection',
+    invalid_structure: 'reading.grammar.invalidStructure',
+    llm_no_json: 'reading.grammar.llmNoJson',
   };
 
   // Pure renderer (tested in tests/js/grammar_analysis.cjs). Spans are Unicode
   // code point offsets; Array.from() iterates code points, not UTF-16 units.
   function grammarHtml(result) {
-    const lang = ru() ? 0 : 1;
     const status = String(result?.status || 'error');
     if (status === 'unavailable' || status === 'error') {
       const reason = String(result?.reason || '');
-      const message = GRAMMAR_REASONS[reason]?.[lang] || (ru() ? 'Не удалось разобрать грамматику' : 'Grammar analysis failed');
+      const message = PudgeI18n.t(GRAMMAR_REASONS[reason] || 'reading.grammarAnalysisFailed');
       return `<div class="pudge-grammar-error">${esc(message)}${result?.detail ? `<small>${esc(result.detail)}</small>` : ''}</div>`;
     }
     const chars = Array.from(String(result?.sentence || ''));
@@ -1451,10 +1553,10 @@
       sentence += key ? `<span class="pudge-grammar-seg" data-points="${esc(key)}">${piece}</span>` : piece;
       i = j;
     }
-    const certaintyLabel = {high: ru() ? 'уверенно' : 'confident', medium: ru() ? 'вероятно' : 'likely', low: ru() ? 'не уверена' : 'unsure'};
-    const items = points.map(point => `<li data-grammar-point="${esc(point.id)}"${point.anchored ? '' : ' class="unanchored"'}><button type="button" data-grammar-point-toggle="${esc(point.id)}"><b>${esc(point.pattern)}</b>${point.meaning_in_context ? ` — ${esc(point.meaning_in_context)}` : ''}</button><div class="pudge-grammar-detail">${esc(point.explanation || '')}${point.form ? `<small>${esc(point.form)}</small>` : ''}${certaintyLabel[point.certainty] ? `<small>${esc(certaintyLabel[point.certainty])}</small>` : ''}${point.anchored ? '' : `<small>${ru() ? 'Не удалось точно найти в тексте' : 'Could not be located exactly in the text'}</small>`}</div></li>`).join('');
-    const empty = points.length ? '' : `<p class="pudge-grammar-empty">${ru() ? 'Заметных грамматических конструкций нет.' : 'No notable grammar points.'}</p>`;
-    return `<div class="pudge-grammar-sentence" lang="ja">${sentence}</div>${result?.translation ? `<div class="pudge-grammar-translation">${esc(result.translation)}</div>` : ''}${empty}<ol class="pudge-grammar-points">${items}</ol><div class="pudge-grammar-note">${ru() ? 'Разбор сделан LLM и может содержать ошибки.' : 'Generated by an LLM; it may contain mistakes.'}</div>`;
+    const certaintyLabel = {high: PudgeI18n.t('reading.confident'), medium: PudgeI18n.t('reading.likely'), low: PudgeI18n.t('reading.unsure')};
+    const items = points.map(point => `<li data-grammar-point="${esc(point.id)}"${point.anchored ? '' : ' class="unanchored"'}><button type="button" data-grammar-point-toggle="${esc(point.id)}"><b>${esc(point.pattern)}</b>${point.meaning_in_context ? ` — ${esc(point.meaning_in_context)}` : ''}</button><div class="pudge-grammar-detail">${esc(point.explanation || '')}${point.form ? `<small>${esc(point.form)}</small>` : ''}${certaintyLabel[point.certainty] ? `<small>${esc(certaintyLabel[point.certainty])}</small>` : ''}${point.anchored ? '' : `<small>${PudgeI18n.t('reading.couldNotBeLocatedExactly')}</small>`}</div></li>`).join('');
+    const empty = points.length ? '' : `<p class="pudge-grammar-empty">${PudgeI18n.t('reading.noNotableGrammarPoints')}</p>`;
+    return `<div class="pudge-grammar-sentence" lang="ja">${sentence}</div>${result?.translation ? `<div class="pudge-grammar-translation">${esc(result.translation)}</div>` : ''}${empty}<ol class="pudge-grammar-points">${items}</ol><div class="pudge-grammar-note">${PudgeI18n.t('reading.generatedByAnLlmIt')}</div>`;
   }
 
   function setGrammarActive(pop, pointId) {
@@ -1474,6 +1576,11 @@
   async function analyzeGrammarForTranslation() {
     if (!llmAvailable()) return false;
     const pop = document.getElementById('pudgeTranslationPop');
+    const offer = translationOffer;
+    if (offer && (!lastTranslationSelection || lastTranslationSelection.text !== offer.text)) {
+      // Explain straight from the offer (Translate stays available).
+      lastTranslationSelection = {text: offer.text, context: selectedContext(offer.root, offer.range), translationId: translationRequest};
+    }
     const selection = lastTranslationSelection;
     // The reading assistant (chat panel on the right) owns grammar explanations;
     // the inline block below stays as a fallback when it is not loaded.
@@ -1487,7 +1594,8 @@
     const button = pop.querySelector('[data-pudge-grammar]');
     if (button) button.disabled = true;
     root.hidden = false;
-    root.textContent = ru() ? 'Разбираю…' : 'Analysing…';
+    root.textContent = PudgeI18n.t('reading.analysing');
+    placeTranslation();
     let html;
     try {
       const result = await API().analyze_grammar(selection.text, selection.context, requestId);
@@ -1499,7 +1607,7 @@
       html = grammarHtml(result || {});
     } catch (error) {
       if (id !== grammarRequest || !lastTranslationSelection || lastTranslationSelection.text !== selection.text) return true;
-      html = `<div class="pudge-grammar-error">${esc((window.PudgeUiLanguage?.message(error?.message || String(error)) ?? String(error?.message || String(error))))}</div>`;
+      html = `<div class="pudge-grammar-error">${esc(PudgeI18n.message(String(error?.message || error)))}</div>`;
     }
     // Paint into the live popup (the node captured at click time may have
     // been replaced by a re-render of the same translation).
@@ -1508,6 +1616,7 @@
     liveRoot.innerHTML = html;
     const liveButton = document.getElementById('pudgeTranslationPop')?.querySelector?.('[data-pudge-grammar]') || button;
     if (liveButton) liveButton.hidden = true;
+    placeTranslation();
     return true;
   }
 
@@ -1515,6 +1624,7 @@
     const pop = document.getElementById('pudgeTranslationPop');
     if (!pop || !event.target.closest?.('#pudgeTranslationPop')) return;
     if (event.target.closest?.('[data-pudge-grammar]')) { void analyzeGrammarForTranslation(); return; }
+    if (event.target.closest?.('[data-pudge-translate-now]')) { void translateOffered(); return; }
     const toggle = event.target.closest?.('[data-grammar-point-toggle]');
     if (toggle) { setGrammarActive(pop, String(toggle.dataset.grammarPointToggle || '')); return; }
     const seg = event.target.closest?.('.pudge-grammar-seg');
@@ -1769,6 +1879,8 @@
       if (liveStateBackend(current)) invalidateJitenStatePair({...token, backend:current.backend, idNamespace:current.idNamespace});
       suppressOptimalForPair(token, current.target);
       closeStudyCard();
+      const inflightKey = inflightReviewKey(token, current.backend);
+      if (inflightKey) inflightStudyReviews.add(inflightKey);
       try {
         const result = await apiAction({
           backend: current.backend,
@@ -1778,30 +1890,46 @@
           grade: reviewAction,
           deck_id: deck,
           sentence: current.sentence,
+          // The word as written in the sentence: Jiten marks it in the card's custom sentence.
+          surface: String(token.surface || cardSpelling(token.card) || ''),
           media_context: token.mediaContext || null,
           attempt_id: attemptId,
           id_namespace: current.idNamespace,
         });
         if (result?.outcome === 'unknown') {
-          window.toast?.(result?.message || (ru() ? 'Результат review неизвестен; повтор автоматически заблокирован' : 'Review outcome is unknown; automatic retry is blocked'));
+          // It may be saved: no rollback. Grading again resends the same attempt
+          // (the backend keeps its id), so Jiten counts it once.
+          window.toast?.(result?.stage === 'add' && result?.message
+            ? PudgeI18n.message(String(result.message))
+            : PudgeI18n.t('reading.reviewOutcomeUnknownGradeAgain'));
           return;
         }
         if (result?.ok === false) {
           rollbackOptimisticStudyPair(token);
           if (liveStateBackend(current)) void refreshJitenPairAfterMutation({...token, backend:current.backend, idNamespace:current.idNamespace});
-          window.toast?.(result?.message || (ru() ? 'Не удалось сохранить review' : 'Could not save review'));
+          window.toast?.(result?.message || (PudgeI18n.t('reading.couldNotSaveReview')));
           return;
         }
         if (liveStateBackend(current)) {
           void refreshJitenPairAfterMutation({...token, backend:current.backend, idNamespace:current.idNamespace});
         }
         window.dispatchEvent?.(new CustomEvent('pudge-review-completed',{detail:{backend:current.backend,wordId:Number(token.wordId||0),readingIndex:Number(token.readingIndex??-1)}}));
+        if (result?.mining_skipped) window.toast?.(PudgeI18n.t('reading.reviewSavedNotAddedToDeck'));
         if (Array.isArray(result?.enrichment_warnings) && result.enrichment_warnings.length) {
-          window.toast?.(`${ru() ? 'Review сохранён; дополнение не удалось' : 'Review saved; enrichment failed'}: ${result.enrichment_warnings.join('; ')}`);
+          window.toast?.(PudgeI18n.t('reading.reviewSavedEnrichmentFailedDetails', {details: result.enrichment_warnings.join('; ')}));
         }
       } catch (error) {
         rollbackOptimisticStudyPair(token);
         window.toast?.(error?.message || String(error));
+      } finally {
+        if (inflightKey) inflightStudyReviews.delete(inflightKey);
+        // A card of this word reopened meanwhile can grade now.
+        const reopened = activeToken;
+        if (reopened && reopened !== current && reopened.pendingReview &&
+            inflightReviewKey(reopened.token, reopened.backend) === inflightKey) {
+          reopened.pendingReview = false;
+          updateStudyReviewAvailability(reopened);
+        }
       }
       return;
     }
@@ -1822,6 +1950,8 @@
         reading_index: token.readingIndex,
         deck_id: deck,
         sentence: current.sentence,
+        surface: String(token.surface || cardSpelling(token.card) || ''),
+        media_context: token.mediaContext || null,
         id_namespace: current.idNamespace,
       };
       if (liveStateBackend(current)) invalidateJitenStatePair({...token, backend:current.backend, idNamespace:current.idNamespace});
@@ -1829,12 +1959,19 @@
       closeStudyCard();
       try {
         const result = await apiAction(request);
-        if (result?.ok === false) {
+        if (result?.outcome === 'unknown') {
+          // The word may already be in the deck: keep it shown as added. Adding
+          // again first re-reads the deck membership from Jiten (backend).
+          window.toast?.(result?.message ? PudgeI18n.message(String(result.message)) : PudgeI18n.t('reading.addOutcomeUnknown'));
+        } else if (result?.ok === false) {
           rollbackOptimisticStudyPair(token);
           if (liveStateBackend(current)) void refreshJitenPairAfterMutation({...token, backend:current.backend, idNamespace:current.idNamespace});
-          window.toast?.(result?.message || (ru() ? 'Не удалось добавить слово' : 'Could not add word'));
+          window.toast?.(result?.message || (PudgeI18n.t('reading.couldNotAddWord')));
         } else if (result?.outcome !== 'unknown' && liveStateBackend(current)) {
           void refreshJitenPairAfterMutation({...token, backend:current.backend, idNamespace:current.idNamespace});
+        }
+        if (Array.isArray(result?.enrichment_warnings) && result.enrichment_warnings.length) {
+          window.toast?.(PudgeI18n.t('reading.wordAddedEnrichmentFailedDetails', {details: result.enrichment_warnings.join('; ')}));
         }
       } catch (error) {
         rollbackOptimisticStudyPair(token);
@@ -1870,20 +2007,60 @@
     if (selection && !selection.isCollapsed) selection.removeAllRanges();
   }, true);
 
+  // A press anywhere outside the popup closes it — also on the text itself, where a new
+  // selection offers the popup again on mouseup. Only the word card keeps it.
   document.addEventListener('pointerdown', event => {
-    if (!event.target.closest?.('#pudgeTranslationPop') &&
-        !event.target.closest?.('[data-pudge-translate-root]')) {
-      hideTranslation();
-    }
+    if (event.target.closest?.('#pudgeTranslationPop') || event.target.closest?.('#pudgeStudyCard')) return;
+    hideTranslation();
   });
+  // Escape closes the translation / explanation (a word card above it closes first, by its own handler).
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || event.isComposing) return;
+    const pop = document.getElementById('pudgeTranslationPop');
+    if (!pop?.classList.contains('open')) return;
+    if (document.getElementById('pudgeStudyCard')?.classList.contains('open')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    hideTranslation();
+  }, true);
 
   document.addEventListener('mouseup', event => {
     const root = event.target.closest?.('[data-pudge-translate-root]');
     if (!root) return;
-    setTimeout(() => void translateSelection(root, {
+    setTimeout(() => void offerTranslation(root, {
       targetLanguage: root.dataset.pudgeTranslateLanguage || '',
     }), 0);
   });
+  // Keep the text selection when the Translate button is pressed.
+  document.addEventListener('mousedown', event => {
+    if (event.target.closest?.('[data-pudge-translate-now],[data-pudge-grammar]')) event.preventDefault();
+  }, true);
+  // G explains the grammar of the selected sentence, offered or translated (KeyG also
+  // covers the Russian layout).
+  document.addEventListener('keydown', event => {
+    if (event.metaKey || event.ctrlKey || event.altKey || event.isComposing || event.repeat) return;
+    if (String(event.code || '') !== 'KeyG' && String(event.key || '').toLowerCase() !== 'g') return;
+    if (event.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
+    const pop = document.getElementById('pudgeTranslationPop');
+    const button = pop?.classList.contains('open') ? pop.querySelector('[data-pudge-grammar]') : null;
+    if (!button || button.hidden || button.disabled) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    void analyzeGrammarForTranslation();
+  }, true);
+  // T translates the offered selection (KeyT also covers the Russian layout).
+  document.addEventListener('keydown', event => {
+    if (!translationOffer || event.metaKey || event.ctrlKey || event.altKey || event.isComposing || event.repeat) return;
+    if (String(event.code || '') !== 'KeyT' && String(event.key || '').toLowerCase() !== 't') return;
+    if (event.target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
+    if (!document.getElementById('pudgeTranslationPop')?.classList.contains('open')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation?.();
+    void translateOffered();
+  }, true);
 
   if (typeof window.addEventListener === 'function') {
     // Header layout depends on the available width; re-measure on window resize
@@ -1893,10 +2070,13 @@
       if (studyResizeFrame || typeof requestAnimationFrame !== 'function') return;
       studyResizeFrame = requestAnimationFrame(() => {
         studyResizeFrame = 0;
+        placeTranslation();
         const pop = document.getElementById('pudgeStudyCard');
         if (!pop?.classList.contains('open') || !activeToken?.anchorRect) return;
         sizeStudyCard(pop);
-        position(pop, activeToken.anchorRect);
+        // The text reflows with the window: next to the word where it is now.
+        const target = activeToken.target;
+        position(pop, target?.isConnected && target.getBoundingClientRect ? target.getBoundingClientRect() : activeToken.anchorRect);
       });
     });
     window.addEventListener('pywebviewready', () => {
@@ -1947,7 +2127,7 @@
         else if (states.includes('new')) level = 'new';
         else {
           const normalized = normalizeState(token.card || {});
-          if (['new','learning','known'].includes(normalized)) level = normalized;
+          level = {new:'new', not_in_deck:'new', young:'learning', mature:'learning', mastered:'known'}[normalized] || level;
         }
         if (!['new','learning','known'].includes(level)) return null;
         return {level, due, ignored:false, states, pair:jitenTokenPair(token)};
@@ -1960,6 +2140,9 @@
       inlinePitchOnSurface: renderInlinePitchOnSurface,
       inflectedPitchCard,
       applyAppearance: applyStudyAppearance,
+      normalizeState,
+      wordStates: () => [...WORD_STATES],
+      defaultColors: () => ({...STUDY_COLORS}),
     },
     grammar: {
       html: grammarHtml,
@@ -1967,6 +2150,8 @@
     },
     translation: {
       translateSelection,
+      offerTranslation,
+      translateOffered,
       hide: hideTranslation,
     },
     isOpen() {

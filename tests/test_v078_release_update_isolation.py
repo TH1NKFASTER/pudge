@@ -1,17 +1,18 @@
-from pathlib import Path
+"""The installer checks the installed package in an isolated Python (behaviour; audit 71Б
+rewrite: install.sh runs with stand-ins, tests/t71g01_support.py). That the updater starts
+an extracted installer through zsh: test_v074_fast_safe_updater.py
+(test_updater_runs_the_fast_installer_with_zsh_and_a_clean_environment)."""
 
-ROOT = Path(__file__).resolve().parents[1]
+from __future__ import annotations
+
+from t71g01_support import source_history
 
 
-def test_release_updater_invokes_extracted_installer_via_zsh() -> None:
-    updater = (ROOT / "pudge" / "updater.py").read_text(encoding="utf-8")
-    assert '"if ! /bin/zsh ./install.sh --update; then",' in updater
-    assert '"if ! ./install.sh --update; then",' not in updater
-
-
-def test_installer_verifies_managed_package_in_isolated_python() -> None:
-    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert (
-        'EXPECTED_VERSION="$EXPECTED_VERSION" "$VENV_DIR/bin/python" -I - '
-        "<<'PYVERIFY'"
-    ) in installer
+def test_version_check_ignores_a_matching_pudge_on_pythonpath() -> None:
+    # The installed code says 9.8.9 for a 9.9.0 wheel; PYTHONPATH points at a 9.9.0 copy
+    # elsewhere. Only the installed package counts: the install stops before the app is touched.
+    mismatch = source_history().steps["mismatch"]
+    assert mismatch.result.returncode != 0
+    assert "AssertionError: ('9.8.9', '9.9.0')" in mismatch.result.output
+    assert not mismatch.result.calls("clang")
+    assert mismatch.app_after == mismatch.app_before

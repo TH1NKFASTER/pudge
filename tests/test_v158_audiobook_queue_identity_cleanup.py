@@ -13,6 +13,8 @@ from pudge.audiobooks import (
 )
 from pudge.database import Database
 from pudge.work_scheduler import WorkPriority
+from tests.i18n_support import en, ru
+from tests.test_v072_audio_status_credentials_playback import audiobook_cards, reader_button_text
 
 
 def _service(tmp_path: Path) -> AudiobookService:
@@ -33,20 +35,24 @@ def _put_audio(service: AudiobookService, path: Path, title: str, duration: floa
         path=path,
         title=title,
         duration=duration,
-        files=[{
-            "index": 0,
-            "path": str(path),
-            "title": path.stem,
-            "duration": duration,
-            "start": 0.0,
-            "end": duration,
-        }],
-        chapters=[{
-            "index": 0,
-            "title": path.stem,
-            "start": 0.0,
-            "end": duration,
-        }],
+        files=[
+            {
+                "index": 0,
+                "path": str(path),
+                "title": path.stem,
+                "duration": duration,
+                "start": 0.0,
+                "end": duration,
+            }
+        ],
+        chapters=[
+            {
+                "index": 0,
+                "title": path.stem,
+                "start": 0.0,
+                "end": duration,
+            }
+        ],
     )
     return int(book["id"])
 
@@ -54,7 +60,9 @@ def _put_audio(service: AudiobookService, path: Path, title: str, duration: floa
 def test_strict_audiobook_series_identity_rejects_wolf_and_parchment() -> None:
     assert audiobook_series_path_matches("狼と香辛料II～完全版オーディオブック", "狼と香辛料")
     assert audiobook_series_path_matches("[支倉 凍砂]/狼と香辛料/[02] 狼と香辛料II [ASIN].m4b", "狼と香辛料")
-    assert not audiobook_series_path_matches("[支倉 凍砂] 新説 狼と香辛料/[02] 新説 狼と香辛料 狼と羊皮紙II.m4b", "狼と香辛料")
+    assert not audiobook_series_path_matches(
+        "[支倉 凍砂] 新説 狼と香辛料/[02] 新説 狼と香辛料 狼と羊皮紙II.m4b", "狼と香辛料"
+    )
     assert not audiobook_series_path_matches("狼と香辛料 狼と羊皮紙II.m4b", "狼と香辛料")
 
 
@@ -80,8 +88,16 @@ def test_resume_only_queues_linked_audiobooks(tmp_path: Path, monkeypatch: pytes
         )
     queued: list[tuple[int, int]] = []
     aligned: list[tuple[int, int]] = []
-    monkeypatch.setattr(service, "prepare_transcription", lambda aid, **kw: queued.append((int(aid), int(kw.get("priority", 999)))) or {"status": "queued"})
-    monkeypatch.setattr(service, "prepare_alignment", lambda lid, **kw: aligned.append((int(lid), int(kw.get("priority", 999)))) or {"status": "queued"})
+    monkeypatch.setattr(
+        service,
+        "prepare_transcription",
+        lambda aid, **kw: queued.append((int(aid), int(kw.get("priority", 999)))) or {"status": "queued"},
+    )
+    monkeypatch.setattr(
+        service,
+        "prepare_alignment",
+        lambda lid, **kw: aligned.append((int(lid), int(kw.get("priority", 999)))) or {"status": "queued"},
+    )
 
     assert service.resume_pending_transcriptions() == 1
     assert queued == [(linked, int(WorkPriority.BACKGROUND))]
@@ -89,9 +105,19 @@ def test_resume_only_queues_linked_audiobooks(tmp_path: Path, monkeypatch: pytes
     assert unlinked not in [row[0] for row in queued]
 
 
-def test_managed_wrong_link_is_unlinked_without_deleting_audio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_wrong_link_is_unlinked_without_deleting_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service(tmp_path)
-    source = tmp_path / "Pudge Audiobooks" / "狼と香辛料" / "Volume 02" / "Audiobook Collection" / "[支倉 凍砂] 新説 狼と香辛料" / "[02] 新説 狼と香辛料 狼と羊皮紙II.m4b"
+    source = (
+        tmp_path
+        / "Pudge Audiobooks"
+        / "狼と香辛料"
+        / "Volume 02"
+        / "Audiobook Collection"
+        / "[支倉 凍砂] 新説 狼と香辛料"
+        / "[02] 新説 狼と香辛料 狼と羊皮紙II.m4b"
+    )
     audiobook_id = _put_audio(service, source, "狼と香辛料II")
     with service.db.connect() as conn:
         conn.execute(
@@ -99,7 +125,9 @@ def test_managed_wrong_link_is_unlinked_without_deleting_audio(tmp_path: Path, m
             (180, audiobook_id, "chapter", 1.0, 1.0),
         )
     cancelled: list[int] = []
-    monkeypatch.setattr(service, "cancel_transcription", lambda aid: cancelled.append(int(aid)) or {"status": "cancelled"})
+    monkeypatch.setattr(
+        service, "cancel_transcription", lambda aid: cancelled.append(int(aid)) or {"status": "cancelled"}
+    )
 
     removed = service._drop_invalid_managed_links()
     assert removed and removed[0]["ln_book_id"] == 180
@@ -110,7 +138,9 @@ def test_managed_wrong_link_is_unlinked_without_deleting_audio(tmp_path: Path, m
     assert cancelled == [audiobook_id]
 
 
-def test_user_transcription_priority_moves_ahead_of_background_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_user_transcription_priority_moves_ahead_of_background_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service(tmp_path)
     monkeypatch.setattr(service, "_ensure_transcription_dispatcher", lambda: None)
     first = _put_audio(service, tmp_path / "first.m4b", "First")
@@ -129,35 +159,45 @@ def test_foreground_marker_drops_reused_pid(monkeypatch: pytest.MonkeyPatch, tmp
     import pudge.foreground as foreground
 
     marker = tmp_path / "foreground-work.json"
-    marker.write_text(json.dumps({
-        "pid": 123,
-        "created_at": __import__("time").time(),
-        "command": "python -m pudge old-video.mkv",
-        "video": "old-video.mkv",
-    }))
+    marker.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "created_at": __import__("time").time(),
+                "command": "python -m pudge old-video.mkv",
+                "video": "old-video.mkv",
+            }
+        )
+    )
     monkeypatch.setattr(foreground, "_pid_alive", lambda _pid: True)
     monkeypatch.setattr(foreground, "_pid_command", lambda _pid: "unrelated reused process")
     assert foreground.foreground_active(tmp_path) is False
     assert not marker.exists()
 
 
-def test_orphan_player_cleanup_targets_only_dead_owner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_orphan_player_cleanup_targets_only_dead_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     import pudge.audiobooks as audiobooks
 
     ipc_root = tmp_path / "audiobook-ipc"
     ipc_root.mkdir()
     dead_sock = ipc_root / "book-75-75524.sock"
     live_sock = ipc_root / "book-76-12345.sock"
-    dead_sock.touch(); live_sock.touch()
-    stdout = "\n".join([
-        f"501 76606 1 /opt/homebrew/bin/mpv --no-video --input-ipc-server={dead_sock} book.m4b",
-        f"501 76607 1 /opt/homebrew/bin/mpv --no-video --input-ipc-server={live_sock} book.m4b",
-    ])
-    monkeypatch.setattr(audiobooks.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=stdout))
+    dead_sock.touch()
+    live_sock.touch()
+    stdout = "\n".join(
+        [
+            f"501 76606 1 /opt/homebrew/bin/mpv --no-video --input-ipc-server={dead_sock} book.m4b",
+            f"501 76607 1 /opt/homebrew/bin/mpv --no-video --input-ipc-server={live_sock} book.m4b",
+        ]
+    )
+    monkeypatch.setattr(
+        audiobooks.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=stdout)
+    )
     monkeypatch.setattr(audiobooks.os, "getuid", lambda: 501)
     monkeypatch.setattr(audiobooks.os, "getpid", lambda: 99999)
     signals: list[tuple[int, int]] = []
-    checks = {75524: False, 12345: True, 76606: True, 76607: True}
 
     def fake_kill(pid: int, sig: int) -> None:
         if sig == 0:
@@ -177,10 +217,39 @@ def test_orphan_player_cleanup_targets_only_dead_owner(monkeypatch: pytest.Monke
     assert live_sock.exists()
 
 
-def test_queue_wait_reason_is_visible_in_both_audio_surfaces() -> None:
-    root = Path(__file__).resolve().parents[1]
-    media = (root / "pudge/web/media.js").read_text(encoding="utf-8")
-    html = (root / "pudge/web/index.html").read_text(encoding="utf-8")
-    assert "waiting for playback to finish" in media
-    assert "ждёт окончания воспроизведения" in media
-    assert "Audio analysis · waiting for playback" in html
+def test_queue_wait_reason_is_visible_in_both_audio_surfaces(page) -> None:
+    assert en("media.waitingForPlaybackToFinish") == "waiting for playback to finish"
+    assert ru("media.waitingForPlaybackToFinish") == "ждёт окончания воспроизведения"
+    assert en("ui.audioAnalysisWaitingForPlayback") == "Audio analysis · waiting for playback"
+    reasons = {
+        "foreground": ("media.waitingForPlaybackToFinish", "ui.audioAnalysisWaitingForPlayback"),
+        "energy_saving": ("media.pausedEnergySaving", "ui.audioAnalysisPausedEnergySaving"),
+        "thermal": ("media.pausedThermalLimit", "ui.audioAnalysisPausedThermalLimit"),
+        "heavy_work": ("media.waitingForAudioWorker", "ui.audioAnalysisWaitingForWorker"),
+    }
+    books = [
+        {
+            "id": index,
+            "title": f"Book {index}",
+            "duration": 60,
+            "position": 0,
+            "speed": 1,
+            "chapters": [],
+            "transcription": {
+                "status": "queued",
+                "wait_reason": reason,
+                "queue_position": 2,
+                "queue_size": 5,
+            },
+        }
+        for index, reason in enumerate(reasons, 1)
+    ]
+    for lang in ("en", "ru"):
+        text = en if lang == "en" else ru
+        # Audiobooks page: the card says why its analysis waits (not just a queue position).
+        cards = audiobook_cards(page, books, lang)
+        for index, (card_key, _reader_key) in enumerate(reasons.values(), 1):
+            assert cards[str(index)].split() == [*text("ui.audioAnalysis").split(), *text(card_key).split()]
+        # Reader: the Listen button says the same while it waits for the video to finish.
+        foreground = {"status": "queued", "ready": False, "wait_reason": "foreground", "queue_position": 2}
+        assert reader_button_text(page, foreground, lang) == text("ui.audioAnalysisWaitingForPlayback")

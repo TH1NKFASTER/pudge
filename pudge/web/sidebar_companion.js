@@ -114,21 +114,21 @@
     let article = host.querySelector('.sidebar-audio');
     if (!article || article.dataset.shellKey !== key) {
       host.innerHTML = `<article class="sidebar-audio ${linked ? 'with-ln' : ''}" data-sc-book="${Number(book.id)}" data-shell-key="${esc(key)}">
-        ${!floating && api()?.audiobook_float_open ? `<button type="button" class="sidebar-audio-detach" data-sc-audio="float" title="${ru() ? 'Поверх всех окон' : 'Always on top'}" aria-label="${ru() ? 'Поверх всех окон' : 'Always on top'}">↗</button>` : ''}
+        ${!floating && api()?.audiobook_float_open ? `<button type="button" class="sidebar-audio-detach" data-sc-audio="float" title="${PudgeI18n.t('sidebar.alwaysOnTop')}" aria-label="${PudgeI18n.t('sidebar.alwaysOnTop')}">↗</button>` : ''}
         <div class="sidebar-audio-chapter-row">
-          <button type="button" data-sc-audio="previous-chapter" aria-label="${ru() ? 'Предыдущая глава' : 'Previous chapter'}">‹</button>
-          <button class="sidebar-audio-cover" type="button" data-sc-audio="open" title="${ru() ? 'Показать аудиокнигу' : 'Show audiobook'}">${coverMarkup(book)}</button>
-          <button type="button" data-sc-audio="next-chapter" aria-label="${ru() ? 'Следующая глава' : 'Next chapter'}">›</button>
+          <button type="button" data-sc-audio="previous-chapter" aria-label="${PudgeI18n.t('sidebar.previousChapter')}">‹</button>
+          <button class="sidebar-audio-cover" type="button" data-sc-audio="open" title="${PudgeI18n.t('sidebar.showAudiobook')}">${coverMarkup(book)}</button>
+          <button type="button" data-sc-audio="next-chapter" aria-label="${PudgeI18n.t('sidebar.nextChapter')}">›</button>
         </div>
         <div class="sidebar-audio-chapter" data-sc-chapter></div>
         <div class="sidebar-audio-actions">
-          <button type="button" data-sc-audio="toggle" class="sidebar-audio-play" aria-label="Play/Pause"></button>
-          <button type="button" data-sc-audio="seek" data-delta="-15" aria-label="${ru() ? 'Назад на 15 секунд' : 'Back 15 seconds'}" title="−15s">↶</button>
-          <button type="button" data-sc-audio="seek" data-delta="15" aria-label="${ru() ? 'Вперёд на 15 секунд' : 'Forward 15 seconds'}" title="+15s">↷</button>
-          <button type="button" data-sc-audio="speed" class="sidebar-audio-speed" aria-label="${ru() ? 'Скорость' : 'Speed'}" title="${ru() ? 'Скорость воспроизведения' : 'Playback speed'}"></button>
-          <button type="button" data-sc-audio="bookmark" aria-label="Bookmark" title="Bookmark"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
+          <button type="button" data-sc-audio="toggle" class="sidebar-audio-play" aria-label="${PudgeI18n.t('sidebar.play')}"></button>
+          <button type="button" data-sc-audio="seek" data-delta="-15" aria-label="${PudgeI18n.t('ui.back15Seconds')}" title="${PudgeI18n.t('sidebar.seekBackShort')}">↶</button>
+          <button type="button" data-sc-audio="seek" data-delta="15" aria-label="${PudgeI18n.t('ui.forward15Seconds')}" title="${PudgeI18n.t('sidebar.seekForwardShort')}">↷</button>
+          <button type="button" data-sc-audio="speed" class="sidebar-audio-speed" aria-label="${PudgeI18n.t('media.speed')}" title="${PudgeI18n.t('sidebar.playbackSpeed')}"></button>
+          <button type="button" data-sc-audio="bookmark" aria-label="${PudgeI18n.t('media.bookmark')}" title="${PudgeI18n.t('media.bookmark')}"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></button>
         </div>
-        <div class="sidebar-audio-scrubber"><input class="sidebar-audio-timeline" data-sc-audio-timeline type="range" min="0" step="0.1" value="0" aria-label="${ru() ? 'Позиция' : 'Position'}"><span class="audiobook-chapter-hover" data-sc-chapter-hover aria-hidden="true"></span></div>
+        <div class="sidebar-audio-scrubber"><input class="sidebar-audio-timeline" data-sc-audio-timeline type="range" min="0" step="0.1" value="0" aria-label="${PudgeI18n.t('media.position')}"><span class="audiobook-chapter-hover" data-sc-chapter-hover aria-hidden="true"></span></div>
         <div class="sidebar-audio-time"><span data-sc-position></span><span data-sc-duration></span></div>
         ${linked ? '<div data-sc-live-text class="sidebar-ln-live" data-pudge-translate-root data-pudge-study-hover></div>' : ''}
       </article>`;
@@ -150,14 +150,14 @@
     const toggle = article.querySelector('[data-sc-audio="toggle"]');
     if (toggle) {
       toggle.textContent = book.playing ? 'Ⅱ' : '▶';
-      toggle.setAttribute('aria-label', book.playing ? (ru() ? 'Пауза' : 'Pause') : (ru() ? 'Воспроизвести' : 'Play'));
+      toggle.setAttribute('aria-label', book.playing ? (PudgeI18n.t('ui.pause')) : (PudgeI18n.t('sidebar.play')));
     }
     const speed = article.querySelector('[data-sc-audio="speed"]');
     if (speed) speed.textContent = `${Number(book.speed || 1)}×`;
     const chapters = book.chapters || [], chapter = chapters.find(row => Number(row.start || 0) <= Number(book.position || 0)
       && Number(book.position || 0) < Number(row.end ?? book.duration ?? Infinity)) || book.current_chapter || chapters[0];
     const chapterLabel = article.querySelector('[data-sc-chapter]');
-    if (chapterLabel) chapterLabel.textContent = String(chapter?.title || (ru() ? 'Аудиокнига' : 'Audiobook'));
+    if (chapterLabel) chapterLabel.textContent = String(chapter?.title || (PudgeI18n.t('ui.audiobook2')));
     const chapterIndex = chapters.indexOf(chapter);
     const nextButton = article.querySelector('[data-sc-audio="next-chapter"]');
     const previousButton = article.querySelector('[data-sc-audio="previous-chapter"]');
@@ -269,7 +269,9 @@
     } finally {
       audioBusy = false;
       clearTimeout(audioTimer);
-      audioTimer = setTimeout(pollAudio, generation !== audioGeneration ? 40 : energySaving() || document.hidden ? 5000 : activeBook()?.playing ? 1000 : 2000);
+      // Nothing playing and Python reports new players itself: only a slow fallback check.
+      const idle = !anyPlayer() && Boolean(g.PudgePushLive?.());
+      audioTimer = setTimeout(pollAudio, generation !== audioGeneration ? 40 : idle ? 60000 : energySaving() || document.hidden ? 5000 : activeBook()?.playing ? 1000 : 2000);
     }
   }
 
@@ -294,6 +296,8 @@
       audioState = {books:state.books.map(item => ({...item}))};
     } else audioState = reconcileAudioState(state);
     renderAudio();
+    // A player started from the page: leave the slow idle check for the playing pace.
+    if (anyPlayer() && !audioBusy) { clearTimeout(audioTimer); audioTimer = setTimeout(pollAudio, 1000); }
   }
 
   function acceptPairedState(state, lnBook) {
@@ -542,7 +546,7 @@
     if (!book) return;
     if (action === 'float') {
       const result = await api()?.audiobook_float_open?.(Number(book.id));
-      if (result?.ok === false) throw new Error(result.error || 'Could not open floating audiobook');
+      if (result?.ok === false) throw new Error(result.error || PudgeI18n.t('sidebar.couldNotOpenFloat'));
       void pollAudio();
       return;
     }
@@ -693,10 +697,10 @@
   function secondsText(raw) {
     const seconds = Number(raw || 0);
     if (!Number.isFinite(seconds) || seconds <= 0) return '';
-    if (seconds < 60) return `${Math.round(seconds)}s`;
-    if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-    if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
-    return `${Math.round(seconds / 86400)}d`;
+    if (seconds < 60) return PudgeI18n.t('gate.intervalSeconds', {value: Math.round(seconds)});
+    if (seconds < 3600) return PudgeI18n.t('gate.intervalMinutes', {value: Math.round(seconds / 60)});
+    if (seconds < 86400) return PudgeI18n.t('gate.intervalHours', {value: Math.round(seconds / 3600)});
+    return PudgeI18n.t('gate.intervalDays', {value: Math.round(seconds / 86400)});
   }
 
   function confusableReadings(card) {
@@ -746,7 +750,7 @@
     const url = g.PudgeJitenWords?.url?.(card) || '';
     const attributes = `class="sidebar-due-word" data-char-width="${Math.min(8, widest)}" style="--sc-word-width:${Math.min(8, widest)};--sc-reading-width:${Math.max(1,[...reading].length)}"`;
     return url
-      ? `<a ${attributes} href="${esc(url)}" data-sc-jiten-word="${Number(card.wordId)}" data-sc-jiten-reading="${Number(card.readingIndex)}" aria-label="${esc((ru() ? 'Открыть в Jiten: ' : 'Open in Jiten: ') + word)}">${markup}</a>`
+      ? `<a ${attributes} href="${esc(url)}" data-sc-jiten-word="${Number(card.wordId)}" data-sc-jiten-reading="${Number(card.readingIndex)}" aria-label="${esc(PudgeI18n.t('sidebar.openWordInJiten', {word}))}">${markup}</a>`
       : `<div ${attributes}>${markup}</div>`;
   }
 
@@ -765,11 +769,11 @@
     const alternate = readingText(card);
     return `<div class="sidebar-due-answer ${compact ? 'compact' : ''}">
       ${alternate ? `<div class="sidebar-due-readings">${esc(alternate)}</div>` : ''}
-      ${!compact && confusable.length ? `<div class="sidebar-due-confusable"><small>${ru() ? 'Похожие чтения' : 'Confusable readings'}</small>${esc(confusable.join(' ・ '))}</div>` : ''}
+      ${!compact && confusable.length ? `<div class="sidebar-due-confusable"><small>${PudgeI18n.t('gate.confusableReadings')}</small>${esc(confusable.join(' ・ '))}</div>` : ''}
       ${!compact && contextImage ? `<div class="sidebar-due-image"><img src="${esc(contextImage)}" alt="" loading="lazy"></div>` : ''}
       ${defs.length ? `<ol class="sidebar-due-meanings">${defs.slice(0, compact ? 3 : 8).map(item => `<li>${esc(item)}</li>`).join('')}</ol>` : '<div>—</div>'}
-      ${!compact && example ? `<div class="sidebar-due-example"><small>${ru() ? 'Пример' : 'Example'}</small>${esc(example)}</div>` : ''}
-      ${!compact && (source || occurrences.length) ? `<div class="sidebar-due-source"><small>${ru() ? 'Источник' : 'Source'}</small>${esc(source || occurrences.join(' · '))}</div>` : ''}
+      ${!compact && example ? `<div class="sidebar-due-example"><small>${PudgeI18n.t('gate.example')}</small>${esc(example)}</div>` : ''}
+      ${!compact && (source || occurrences.length) ? `<div class="sidebar-due-source"><small>${PudgeI18n.t('table.source')}</small>${esc(source || occurrences.join(' · '))}</div>` : ''}
     </div>`;
   }
 
@@ -791,7 +795,7 @@
     return `<article class="sidebar-due-previous">
       ${frontWordHtml(previousReview.card, true)}
       <div class="sidebar-due-previous-actions"><span class="sidebar-due-last-grade grade-${esc(action?.tone || previousReview.grade || '')}">${esc(label)}</span>
-      <button type="button" data-sc-undo ${(previousReview.pending || remaining > 0) && !previousReview.undoRequested ? '' : 'disabled'}>${ru() ? 'Отменить' : 'Undo'}</button></div>
+      <button type="button" data-sc-undo ${(previousReview.pending || remaining > 0) && !previousReview.undoRequested ? '' : 'disabled'}>${PudgeI18n.t('manga.undo')}</button></div>
     </article>`;
   }
 
@@ -801,16 +805,18 @@
     if (activeBook() && !audioState?.float_open) { host.hidden = true; return; }
     if (!dueCard && !previousReview) {
       host.hidden = false;
-      const messages = {loading:ru()?'Загрузка карточек…':'Loading cards…', empty:ru()?'Нет карточек для повторения':'No cards due', error:ru()?'Не удалось загрузить карточки':'Could not load cards', interval:ru()?'До следующего повторения':'Waiting for next review', unconfigured:ru()?'Настройте Jiten для повторений':'Configure Jiten to review'};
-      host.innerHTML = `<div class="sidebar-due-label">Jiten · ${esc(messages[dueStatus] || messages.loading)}</div>${dueStatus==='error'?`<button type="button" data-sc-retry>${ru()?'Повторить':'Retry'}</button>`:''}`;
+      const messages = {loading:PudgeI18n.t('sidebar.loadingCards'), empty:PudgeI18n.t('sidebar.noCardsDue'), error:PudgeI18n.t('sidebar.couldNotLoadCards'), interval:PudgeI18n.t('sidebar.waitingForNextReview'), unconfigured:PudgeI18n.t('sidebar.configureJitenToReview')};
+      // While the review interval runs, the missing card is the wait (cards may be prefetched or none due yet).
+      const waiting = intervalMs() > 0 && Date.now() - lastReviewAt() < intervalMs() && !['error', 'unconfigured'].includes(dueStatus);
+      host.innerHTML = `<div class="sidebar-due-label">Jiten · ${esc(messages[waiting ? 'interval' : dueStatus] || messages.loading)}</div>${dueStatus==='error'?`<button type="button" data-sc-retry>${PudgeI18n.t('media.retry')}</button>`:''}`;
       host.dataset.renderHtml = '';
       return;
     }
     host.hidden = false;
     const current = dueCard ? `<article class="sidebar-due-card">
-      <div class="sidebar-due-label">Jiten · due</div>
+      <div class="sidebar-due-label">Jiten · ${PudgeI18n.t('sidebar.due')}</div>
       ${frontWordHtml(dueCard, dueRevealed)}
-      ${dueRevealed ? `${answerDetails(dueCard)}${gradeButtonsHtml(dueCard)}` : `<button type="button" data-sc-reveal>${ru() ? 'Показать ответ' : 'Show answer'}</button>`}
+      ${dueRevealed ? `${answerDetails(dueCard)}${gradeButtonsHtml(dueCard)}` : `<button type="button" data-sc-reveal>${PudgeI18n.t('gate.showAnswer')}</button>`}
     </article>` : '';
     const html = `${previousReviewHtml()}${current}`;
     const changed = host.dataset.renderHtml !== html;
@@ -954,7 +960,7 @@
     try {
       const attempt = crypto?.randomUUID?.() || `sidebar-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const result = await api().sidebar_due_review_submit(Number(card.wordId), Number(card.readingIndex), String(grade), attempt);
-      if (result?.ok === false || result?.outcome === 'unknown') throw new Error(result?.message || 'Review outcome unknown');
+      if (result?.ok === false || result?.outcome === 'unknown') throw new Error(result?.message || PudgeI18n.t('sidebar.reviewOutcomeUnknown'));
       const reviewedAt = Date.now();
       recentReviews.set(submittedKey, reviewedAt);
       localStorage.setItem(REVIEW_AT, String(reviewedAt));
@@ -1004,7 +1010,7 @@
     renderDue();
     try {
       const result = await api().sidebar_due_review_undo(Number(entry.card.wordId), Number(entry.card.readingIndex));
-      if (!result?.ok || String(result?.outcome || '') !== 'undone') throw new Error(result?.message || 'Undo failed');
+      if (!result?.ok || String(result?.outcome || '') !== 'undone') throw new Error(result?.message || PudgeI18n.t('sidebar.undoFailed'));
       localStorage.setItem(REVIEW_AT, String(Number(entry.oldLastReviewAt || 0)));
       recentReviews.delete(cardKey(entry.card));
       if (dueCard) dueQueue.unshift(dueCard);
@@ -1016,7 +1022,7 @@
       previousReview = entry;
       renderDue();
       schedulePreviousExpiry();
-      g.toast?.((ru() ? 'Не удалось отменить: ' : 'Could not undo: ') + String(error?.message || error || ''));
+      g.toast?.(PudgeI18n.t('sidebar.couldNotUndoError', {error: String(error?.message || error || '')}));
       return false;
     } finally {
       dueBusy = false;
@@ -1189,10 +1195,10 @@
       menu.className = 'sidebar-audio-menu'; menu.setAttribute('role', 'menu');
       document.body.appendChild(menu);
     }
-    menu.innerHTML = `<button type="button" role="menuitem" data-sc-menu="open">${ru() ? 'Показать аудиокнигу' : 'Show audiobook'}</button>
-      ${!floating && api()?.audiobook_float_open ? `<button type="button" role="menuitem" data-sc-menu="float">${ru() ? 'Поверх всех окон' : 'Always on top'}</button>` : ''}
-      ${book.linked_light_novel ? `<button type="button" role="menuitem" data-sc-menu="read">${ru() ? 'Перейти к чтению' : 'Go to reading'}</button>` : ''}
-      <button type="button" role="menuitem" data-sc-menu="stop">${ru() ? 'Остановить прослушивание' : 'Stop listening'}</button>`;
+    menu.innerHTML = `<button type="button" role="menuitem" data-sc-menu="open">${PudgeI18n.t('sidebar.showAudiobook')}</button>
+      ${!floating && api()?.audiobook_float_open ? `<button type="button" role="menuitem" data-sc-menu="float">${PudgeI18n.t('sidebar.alwaysOnTop')}</button>` : ''}
+      ${book.linked_light_novel ? `<button type="button" role="menuitem" data-sc-menu="read">${PudgeI18n.t('sidebar.goToReading')}</button>` : ''}
+      <button type="button" role="menuitem" data-sc-menu="stop">${PudgeI18n.t('sidebar.stopListening')}</button>`;
     menu.hidden = false;
     menu.dataset.bookId = String(book.id);
     menu.style.left = `${Math.max(4, Math.min(event.clientX, window.innerWidth - 230))}px`;
@@ -1294,6 +1300,11 @@
     return true;
   }
 
-  g.PudgeSidebarCompanion = {navigateAudio, refresh:pollAudio, noteReview:noteExternalReview, prefetch:prefetchDueQueue,
+  function anyPlayer() { return (audioState?.books || []).some(book => book.playing || book.player_running); }
+
+  // Python reports that a player appeared, paused, resumed or ended.
+  function audioChanged() { clearTimeout(audioTimer); void pollAudio(); }
+
+  g.PudgeSidebarCompanion = {navigateAudio, refresh:pollAudio, audioChanged, noteReview:noteExternalReview, prefetch:prefetchDueQueue,
     acceptAudioState, acceptPairedState, powerChanged, showChapterHoverRange, clearChapterHoverRange};
 })();

@@ -34,8 +34,10 @@ class ContentReviewIdentity:
     @property
     def logical_id(self) -> str:
         import hashlib
-        return hashlib.sha256(json.dumps([self.kind, self.content_id, self.revision, self.part],
-                                        separators=(",", ":")).encode()).hexdigest()
+
+        return hashlib.sha256(
+            json.dumps([self.kind, self.content_id, self.revision, self.part], separators=(",", ":")).encode()
+        ).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +124,9 @@ class ReviewGateStore:
         confirmed = self._keys(data.get("confirmed"))
         unknown = [key for key in self._keys(data.get("unknown")) if key not in set(confirmed)]
         normalized_required = max(0, int(required))
-        granted = bool(data.get("granted")) or normalized_required == 0 or len(confirmed) >= normalized_required
+        granted = (
+            bool(data.get("granted")) or normalized_required == 0 or len(confirmed) >= normalized_required
+        )
         return ReviewGateProgress(
             required=normalized_required,
             confirmed_card_keys=tuple(confirmed),
@@ -238,6 +242,43 @@ class ReviewGateStore:
                 granted=granted,
             ),
         )
+
+    def settle(
+        self,
+        account_key: str,
+        identity: EpisodeReviewIdentity,
+        *,
+        required: int,
+        due_keys: set[str],
+        issued_keys: set[str] = frozenset(),
+    ) -> ReviewGateProgress:
+        """Resolve cards against a fresh Jiten due scan.
+
+        A card that was issued (or whose review outcome stayed unknown) and is
+        no longer due was reviewed — here or directly in Jiten — and counts as
+        done. An unknown card that is still due is issued again instead of
+        blocking the part forever.
+        """
+        before = self.status(account_key, identity, required=required)
+        if before.granted:
+            return before
+        confirmed = list(before.confirmed_card_keys)
+        for key in [*before.unknown_card_keys, *sorted(issued_keys)]:
+            key = str(key or "").strip()
+            if key and key not in due_keys and key not in confirmed:
+                confirmed.append(key)
+        unknown: list[str] = []
+        normalized_required = max(0, int(required))
+        granted = normalized_required == 0 or len(confirmed) >= normalized_required
+        progress = ReviewGateProgress(
+            required=normalized_required,
+            confirmed_card_keys=tuple(confirmed),
+            unknown_card_keys=tuple(unknown),
+            granted=granted,
+        )
+        if progress == before:
+            return before
+        return self._save(account_key, identity, progress)
 
     def mark_unknown(
         self,

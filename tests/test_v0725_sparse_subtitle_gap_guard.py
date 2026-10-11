@@ -19,10 +19,7 @@ def _case(*, keep_old_clock_after_gap: bool):
     # the old clock wins on timing error when both explain the same cues.
     reference_onsets.extend(value + 35.4 for value in after)
     reference_onsets.sort()
-    reference_cues = [
-        (value, value + 1.0, "reference")
-        for value in reference_onsets
-    ]
+    reference_cues = [(value, value + 1.0, "reference") for value in reference_onsets]
     reference_bins = _activity_bins(_merge_activity(reference_cues))
 
     segments = [
@@ -52,8 +49,8 @@ def _case(*, keep_old_clock_after_gap: bool):
 
 
 def test_sparse_gap_guard_drops_false_final_clock_when_old_clock_still_explains_tail():
-    result_segments, result_boundaries, diagnostics = (
-        _suppress_ambiguous_sparse_edge_transition(*_case(keep_old_clock_after_gap=True))
+    result_segments, result_boundaries, diagnostics = _suppress_ambiguous_sparse_edge_transition(
+        *_case(keep_old_clock_after_gap=True)
     )
 
     assert diagnostics["applied"] is True
@@ -67,8 +64,8 @@ def test_sparse_gap_guard_drops_false_final_clock_when_old_clock_still_explains_
 
 
 def test_sparse_gap_guard_keeps_real_final_clock_when_it_has_unique_evidence():
-    result_segments, result_boundaries, diagnostics = (
-        _suppress_ambiguous_sparse_edge_transition(*_case(keep_old_clock_after_gap=False))
+    result_segments, result_boundaries, diagnostics = _suppress_ambiguous_sparse_edge_transition(
+        *_case(keep_old_clock_after_gap=False)
     )
 
     assert diagnostics["applied"] is False

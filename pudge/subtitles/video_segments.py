@@ -71,10 +71,13 @@ def choose_edit_boundary(
             continue
         if left_time <= value <= right_time:
             title = str(point.get("title") or "").casefold()
-            named_bonus = 0.25 if any(
-                token in title
-                for token in ("op", "opening", "ed", "ending", "intro", "chapter", "part")
-            ) else 0.0
+            named_bonus = (
+                0.25
+                if any(
+                    token in title for token in ("op", "opening", "ed", "ending", "intro", "chapter", "part")
+                )
+                else 0.0
+            )
             distance = abs(value - midpoint) / span
             candidates.append((1.2 + named_bonus - distance, value, dict(point)))
     for gap_start, gap_end, gap_seconds in cue_gaps:

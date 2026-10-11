@@ -1,0 +1,3 @@
+// Set your own identifier and Apple signing team in Signing.local.xcconfig.
+// This file contains no account-specific defaults.
+#include? "Signing.local.xcconfig"

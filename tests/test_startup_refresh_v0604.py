@@ -14,6 +14,7 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, NyaaRelease
 from pudge.providers.nyaa import NyaaClient, NyaaError, search_ranked
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en, ru
 
 
 def _anime() -> LibraryAnime:
@@ -78,7 +79,7 @@ def test_empty_proxy_is_not_retried_as_duplicate_direct_route(monkeypatch):
     # Empty proxy must not duplicate a route, while the default nyaa.si client
     # may still fail over once per distinct read-only mirror.
     assert [proxy for _url, proxy in calls] == [None, None, None]
-    assert [url.split('/?', 1)[0] for url, _proxy in calls] == [
+    assert [url.split("/?", 1)[0] for url, _proxy in calls] == [
         "https://nyaa.si",
         "https://nyaa.net",
         "https://cn.nyaa.net",
@@ -117,7 +118,9 @@ def test_automatic_manager_search_uses_short_timeout_and_budget(monkeypatch):
     class Client:
         timeout = 6.0
 
-    monkeypatch.setattr(manager, "nyaa_client", lambda *, timeout=20.0: captured.setdefault("client", Client()))
+    monkeypatch.setattr(
+        manager, "nyaa_client", lambda *, timeout=20.0: captured.setdefault("client", Client())
+    )
 
     def fake_search(client, anime, **kwargs):
         captured["timeout"] = client.timeout
@@ -186,28 +189,70 @@ def test_startup_maintenance_returns_before_heavy_pass_finishes(monkeypatch, pla
     assert status["stats"]["library"] == 1
 
 
-def test_web_ui_keeps_full_startup_refresh_but_does_not_block_page():
-    html = Path("pudge/web/index.html").read_text()
+# The window starts while the backend's start-up maintenance runs in the background: the
+# status poll says "running" twice, then "finished" (with window.__error if set). Home shows
+# the waiting title the backend has (Cached, then Finished).
+STARTUP_MAINTENANCE = r"""
+const base = __api.get_state;
+const titled = title => { const state = base(); state.home.waiting = [{media_id: 9, title, next_episode: 2, site_url: 'https://anilist.co/anime/9'}]; return state; };
+let backend = 'Cached';
+__api.get_state = __api.get_state_fast = () => titled(backend);
+__api.startup_maintenance = async () => ({running: true, state: titled('Maintenance started')});
+let polls = 0;
+__api.startup_maintenance_status = async () => {
+  if (++polls < 3) return {running: true, state: titled('Step ' + polls)};
+  backend = 'Finished';
+  return {running: false, error: window.__error || '', state: titled('Finished')};
+};
+"""
+WATCH_STARTUP = r"""
+const button = () => ({disabled: $('refreshAll').disabled, text: __text('#refreshAll'), title: $('refreshAll').getAttribute('title')});
+const shows = () => ['Cached', 'Finished'].filter(title => __text('#currentContent').includes(title));
+await __tick(100);
+const running = {button: button(), status: __text('#status'), shows: shows()};
+await __click('#refreshAll'); await __tick(10);                 // a second refresh is not started
+await __tick(1500);
+window.dispatchEvent(new Event('blur'));                       // the user switched to another app
+await __tick(1500);
+const behind = {shows: shows(), button: button(), status: __text('#status')};
+window.dispatchEvent(new Event('focus'));
+const back = shows();                                           // drawn at once, before any new state arrives
+await __tick(10);
+return {running, behind, back, toasts: __toasts(),
+        polls: __apiCalls.filter(call => call.name === 'startup_maintenance_status').map(call => call.at),
+        texts: {background: t('status.startupBackground'), checking: t('action.checking'), startup: t('status.startup'),
+                refresh: t('action.refresh'), finished: t('toast.startupFinished'), failed: t('error.generic', {error: 'disk full'})}};
+"""
 
-    assert "startup_maintenance_status" in html
-    assert "Startup refresh continues in the background" in html
-    assert "Стартовое обновление продолжается в фоне" in html
-    assert "ui.startupMaintenanceRunning=!!r.running" in html
+
+def test_startup_maintenance_runs_in_background_without_blocking_the_window(page) -> None:
+    assert en("status.startupBackground") == "Refreshing in background…"
+    assert ru("status.startupBackground") == "Обновляю в фоне…"
+    for lang in ("en", "ru"):
+        result = page.run(WATCH_STARTUP, lang=lang, before=STARTUP_MAINTENANCE)
+        out, texts = result.value, result.value["texts"]
+        # The window is usable with the cached Home; the status says the refresh goes on, and
+        # the Refresh button waits for it ("Checking…", the start-up status as its tooltip).
+        assert out["running"] == {
+            "button": {"disabled": True, "text": texts["checking"], "title": texts["startup"]},
+            "status": texts["background"],
+            "shows": ["Cached"],
+        }
+        assert not result.called("refresh_local")
+        # Asked every second (first after half a second) until it is finished.
+        assert out["polls"] == [500, 1500, 2500]
+        # Finished while the window was behind: the button is free again and the result is
+        # kept, then drawn as soon as the window comes back.
+        assert out["behind"] == {
+            "shows": ["Cached"],
+            "button": {"disabled": False, "text": texts["refresh"], "title": None},
+            "status": "",
+        }
+        assert out["back"] == ["Finished"]
+        assert out["toasts"] == [texts["finished"]]
 
 
-def test_initial_refresh_button_stays_disabled_until_background_maintenance_finishes():
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-
-    assert "setLocalRefreshUi(ui.startupMaintenanceRunning" in html
-    assert "setLocalRefreshUi(true,'status.startup')" in html
-    assert "ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,500)" in html
-    assert "ui.startupMaintenancePollTimer=setTimeout(pollStartupMaintenance,1000)" in html
-    assert "setLocalRefreshUi(false);if(r.error)" in html
-
-
-def test_startup_poll_defers_home_refresh_until_maintenance_finishes():
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-
-    assert "if(r.running){ui.startupDeferredState=r.state||ui.startupDeferredState" in html
-    assert "ui.state=r.state||ui.startupDeferredState||ui.state" in html
-    assert "if(ui.windowActive)renderDataPages(true);else ui.pendingDataRender=true" in html
+def test_failed_startup_maintenance_is_reported(page) -> None:
+    result = page.run(WATCH_STARTUP, before="window.__error = 'disk full';" + STARTUP_MAINTENANCE)
+    assert result.value["toasts"] == [result.value["texts"]["failed"]]
+    assert result.value["behind"]["button"]["disabled"] is False

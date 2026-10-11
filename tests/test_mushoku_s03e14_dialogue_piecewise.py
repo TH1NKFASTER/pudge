@@ -18,15 +18,26 @@ def test_dialogue_only_rescue_accepts_sdh_heavy_opening(tmp_path: Path, monkeypa
     aligned = tmp_path / "aligned.srt"
     reference = tmp_path / "reference.srt"
 
-    ref_open = [34.69, 36.93, 45.44, 54.28, 57.79, 61.29, 66.79, 68.92,
-                75.98, 77.93, 82.48, 92.73, 97.60, 99.95]
+    ref_open = [
+        34.69,
+        36.93,
+        45.44,
+        54.28,
+        57.79,
+        61.29,
+        66.79,
+        68.92,
+        75.98,
+        77.93,
+        82.48,
+        92.73,
+        97.60,
+        99.95,
+    ]
     # Spoken Japanese cues are late by ~5.3 s in the bad global map.
     candidate = [(t + 5.3, t + 7.0, f"台詞{i}") for i, t in enumerate(ref_open)]
     # Dense SDH captions that do not exist in the translated reference.
-    candidate += [
-        (8.0 + i * 3.0, 10.2 + i * 3.0, f"（効果音{i}）")
-        for i in range(33)
-    ]
+    candidate += [(8.0 + i * 3.0, 10.2 + i * 3.0, f"（効果音{i}）") for i in range(33)]
     # Opening music marker should not drive dialogue validation.
     candidate += [(120.0, 198.0, "♬～")]
 

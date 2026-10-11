@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
+import subprocess
+import sys
 from pathlib import Path
 
-import pytest
 
 from pudge.providers import anime_mappings as am
 
@@ -35,7 +35,9 @@ class Clock:
 
 
 def _mappings(tmp_path, hub=None, clock=None):
-    return am.AnimeMappings(tmp_path, fetch=hub or FakeHub(), now=clock or Clock(), min_rows={"fribb": 1, "anime_lists": 1})
+    return am.AnimeMappings(
+        tmp_path, fetch=hub or FakeHub(), now=clock or Clock(), min_rows={"fribb": 1, "anime_lists": 1}
+    )
 
 
 def test_without_index_everything_is_empty_and_harmless(tmp_path):
@@ -88,7 +90,9 @@ def test_daily_conditional_refresh(tmp_path):
     assert m.refresh_if_due()["status"] == "fresh" and len(hub.calls) == 2
     clock.t += am.REFRESH_SECONDS + 1
     assert m.refresh_if_due()["status"] == "not_modified"
-    assert all(call[1].get("If-None-Match") for call in hub.calls[2:]), "conditional requests after the first build"
+    assert all(call[1].get("If-None-Match") for call in hub.calls[2:]), (
+        "conditional requests after the first build"
+    )
 
 
 def test_broken_update_keeps_the_working_index(tmp_path):
@@ -123,8 +127,10 @@ def test_failed_index_build_keeps_raw_sources_for_conditional_retry(tmp_path, mo
     hub, clock = FakeHub(), Clock()
     m = _mappings(tmp_path, hub, clock)
     build = m._build
+
     def unavailable_builder(_payloads):
         raise OSError("temporary disk failure")
+
     monkeypatch.setattr(m, "_build", unavailable_builder)
     assert m.refresh_if_due()["status"] == "error"
     assert (m.root / "raw" / "fribb.bin").read_bytes() == FRIBB
@@ -154,9 +160,18 @@ def test_concurrent_updater_skips(tmp_path):
 
 
 def test_module_never_touches_library_or_identity():
-    source = Path(am.__file__).read_text(encoding="utf-8")
-    for forbidden in ("pudge.database", "IdentityResolver", "anilist_tracking", "..database", "..identity"):
-        assert forbidden not in source
+    # The mapping index is a read-only lookup: loading it must not pull in the library
+    # database, identity resolution or AniList tracking (a fresh interpreter shows what it imports).
+    code = "import sys, pudge.providers.anime_mappings; print(sorted(m for m in sys.modules if m.startswith('pudge')))"
+    loaded = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    for forbidden in (
+        "pudge.database",
+        "pudge.identity",
+        "pudge.anilist_tracking",
+        "pudge.manager",
+        "pudge.library",
+    ):
+        assert f"'{forbidden}'" not in loaded, loaded
 
 
 def test_background_refresh_is_off_in_tests_and_on_by_default(tmp_path, monkeypatch):
@@ -176,7 +191,10 @@ def test_manager_maintenance_kicks_refresh_without_blocking(tmp_path, monkeypatc
 
     kicked = []
     monkeypatch.setattr(am, "refresh_in_background", lambda mappings, logger=None: kicked.append(mappings))
-    fake = SimpleNamespace(config=SimpleNamespace(paths=SimpleNamespace(cache_dir=tmp_path)), logger=SimpleNamespace(warning=lambda *a: None))
+    fake = SimpleNamespace(
+        config=SimpleNamespace(paths=SimpleNamespace(cache_dir=tmp_path)),
+        logger=SimpleNamespace(warning=lambda *a: None),
+    )
     AnimeManager._kick_anime_mappings_refresh(fake)
     AnimeManager._kick_anime_mappings_refresh(fake)
     assert len(kicked) == 2 and kicked[0] is kicked[1]

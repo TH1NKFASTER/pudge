@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pudge.config import AppConfig, load_config, write_config
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.web_app import WebAppApi
 
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from tests.i18n_support import ru
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -78,7 +77,7 @@ def test_release_date_setting_persists_and_orders_all_anime_relations(tmp_path: 
     assert load_config(api.config_path).anilist.relations_by_release_date is False
 
 
-def test_completed_ready_single_episode_chain_is_grouped_in_release_order(tmp_path: Path) -> None:
+def test_completed_ready_single_episode_chain_is_grouped_in_release_order(tmp_path: Path, page) -> None:
     api = make_api(tmp_path)
     entries = [
         (1, "Part C", "2022-01-01", 2),
@@ -115,9 +114,26 @@ def test_completed_ready_single_episode_chain_is_grouped_in_release_order(tmp_pa
     assert completed[0]["kind"] == "watch_sequence"
     assert [item["media_id"] for item in completed[0]["items"]] == [2, 3, 1]
 
-    html = HTML.read_text(encoding="utf-8")
-    assert "readySequenceCard" in html
-    assert "Порядок просмотра" in html
+    # The window shows the chain as one card on Home, entries in release order.
+    state = json.loads(json.dumps(api.get_state(), default=str))
+    result = page.run(
+        r"""
+        const cards = [...document.querySelectorAll('#currentContent [data-home-section="section.completedReady"] article')];
+        const card = cards[0];
+        return {cards: cards.length, title: card.querySelector('.ready-sequence-meta strong').innerText,
+                position: __text('#currentContent [data-ready-sequence-position]'), play: card.dataset.playPath,
+                rows: [...card.querySelectorAll('.ready-sequence-row-title')].map(row => row.innerText)};
+        """,
+        state=state,
+    )
+    assert result.value == {
+        "cards": 1,
+        "title": "Part A",
+        "position": "1/3",
+        "play": str(tmp_path / "Part A.mkv"),
+        "rows": ["Part A", "Part B", "Part C"],
+    }
+    assert ru("label.watchSequence") == "Порядок просмотра"
 
 
 def test_downloaded_planning_title_waiting_for_subtitles_is_visible_on_home(tmp_path: Path) -> None:

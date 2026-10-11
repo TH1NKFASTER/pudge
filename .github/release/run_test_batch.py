@@ -30,7 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=900.0, help="timeout per test file in seconds")
     parser.add_argument("--results-dir", type=Path, default=None, help="directory for logs/JUnit/JSON")
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER, help="extra pytest arguments after --")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # argparse retains the separator in REMAINDER. Forward only pytest's
+    # arguments, otherwise pytest treats options such as -k as file paths.
+    if args.pytest_args[:1] == ["--"]:
+        args.pytest_args = args.pytest_args[1:]
+    return args
 
 
 def discover_test_files(root: Path = Path("tests")) -> list[Path]:
@@ -148,8 +153,7 @@ def _junit_counts(path: Path) -> dict[str, int]:
             counts["errors"] += 1
         elif (skipped := case.find("skipped")) is not None:
             marker = " ".join(
-                str(value or "")
-                for value in (skipped.get("type"), skipped.get("message"), skipped.text)
+                str(value or "") for value in (skipped.get("type"), skipped.get("message"), skipped.text)
             ).casefold()
             if "xfail" in marker:
                 counts["xfailed"] += 1
@@ -184,7 +188,10 @@ def run_file(path: Path, *, results_dir: Path, timeout: float, pytest_args: list
     # that runtime artifacts never land in Downloads; report directories are
     # allowed there, isolated runtime state is not.
     system_tmp = Path("/private/tmp") if sys.platform == "darwin" and Path("/private/tmp").is_dir() else None
-    with tempfile.TemporaryDirectory(prefix=f"pudge-{name}-", dir=system_tmp) as isolated_raw:
+    # A short, neutral name: macOS limits a Unix socket path to 104 bytes (tests bind mpv-like
+    # sockets under TMPDIR), and the test file's name in an ancestor folder can read as a manga
+    # volume ("…_v0725_…") to code that looks at parent folders.
+    with tempfile.TemporaryDirectory(prefix="pudge-t-", dir=system_tmp) as isolated_raw:
         isolated = Path(isolated_raw)
         home = isolated / "home"
         tmp = isolated / "tmp"
@@ -228,7 +235,10 @@ def run_file(path: Path, *, results_dir: Path, timeout: float, pytest_args: list
             str(path),
             *pytest_args,
         ]
-        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
+        with (
+            stdout_path.open("w", encoding="utf-8") as stdout,
+            stderr_path.open("w", encoding="utf-8") as stderr,
+        ):
             try:
                 completed = subprocess.run(
                     cmd,
@@ -268,7 +278,7 @@ def _tail(path: Path, *, lines: int = 40) -> str:
         content = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
-    return "\n".join(content[-max(1, int(lines)):])
+    return "\n".join(content[-max(1, int(lines)) :])
 
 
 def main() -> int:

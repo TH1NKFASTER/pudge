@@ -6,34 +6,52 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from pudge import web_app
 from pudge.config import AppConfig
 from pudge.providers.aria2 import Aria2Client, Aria2Error
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.css_support import css_rules
+from tests.t71g06_support import STUDY, column, reader
 
 
 def test_nplus1_tooltip_is_above_study_card() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    css = (ROOT / "pudge/web/reading_tools.css").read_text(encoding="utf-8")
-    assert ".pudge-study-card,.pudge-translation-pop{position:fixed;z-index:13050" in css
-    assert ".title-tooltip { position:fixed; z-index:13120;" in html
+    card, tooltip = css_rules("reading_tools.css"), css_rules("index.html")
+    assert card.get(".pudge-study-card", "position") == tooltip.get(".title-tooltip", "position") == "fixed"
+    assert int(card.get(".pudge-study-card", "z-index")) < int(tooltip.get(".title-tooltip", "z-index"))
 
 
-def test_manga_status_overlay_has_image_space_css() -> None:
-    css = (ROOT / "pudge/web/manga_reader_v2.css").read_text(encoding="utf-8")
-    js = (ROOT / "pudge/web/manga_reader_v2.js").read_text(encoding="utf-8")
-    assert ".manga-v2-status-layer{" in css
-    assert "position:absolute" in css
-    assert "z-index:1" in css
-    assert ".manga-v2-status-word.state-new{fill:var(--manga-status-new" in css
-    assert ".manga-v2-status-word.state-learning{fill:var(--manga-status-learning" in css
-    assert ".manga-v2-status-word.state-known{fill:var(--manga-status-known" in css
-    assert ".manga-v2-status-word.is-due{" in css
-    assert "layer.classList.add('manga-v2-status-layer')" in js
+def test_word_state_marks_are_drawn_in_image_space_over_the_page() -> None:
+    rules = css_rules("manga_reader_v2.css")
+    assert rules.get(".manga-v2-status-layer", "position") == "absolute"
+    assert rules.get(".manga-v2-status-layer", "z-index") == "1"
+    for state in ("new", "learning", "known"):
+        assert rules.get(f".manga-v2-status-word.state-{state}", "fill").startswith(
+            f"var(--manga-status-{state},"
+        )
+    assert rules.get(".manga-v2-status-word.is-due", "stroke").startswith("var(--manga-status-due,")
+
+
+def test_word_state_layer_covers_exactly_the_page_image(page) -> None:
+    result = reader(
+        page,
+        r"""
+        const layer = document.querySelector('#mangaV2Pages .manga-v2-page-frame .manga-v2-status-layer');
+        const reader = $('mangaReaderV2');
+        return {tag: layer.tagName.toLowerCase(), viewBox: layer.getAttribute('viewBox'), aspect: layer.getAttribute('preserveAspectRatio'),
+                box: [layer.style.left, layer.style.top, layer.style.width, layer.style.height], marks: rects(),
+                colors: ['new', 'learning', 'known', 'due'].map(name => reader.style.getPropertyValue(`--manga-status-${name}`))};
+        """,
+        regions={0: [column("猫が好き", 0.80, 0.90)]},
+        parse={"猫が好き": [["猫", 1, 0], ["が", 2, 0], ["好き", 3, 0]]},
+        prefs={"configured": True, "statusHighlight": True},
+        before=STUDY + "window.__live = {'1:0': {states: ['new'], normalizedState: 'new'}};",
+    )
+    out = result.value
+    # An SVG over the 1000 x 1500 px image with a 0..1000 coordinate system in both directions.
+    assert (out["tag"], out["viewBox"], out["aspect"]) == ("svg", "0 0 1000 1000", "none")
+    assert out["box"] == ["0px", "0px", "1000px", "1500px"]
+    [mark] = out["marks"]
+    assert (mark["state"], mark["x"], mark["y"], mark["w"], mark["h"]) == ("state-new", 800, 100, 50, 75)
+    assert out["colors"] == ["#ffdc46", "#4aa9ff", "#45cf80", "#ef8d3d"]
 
 
 def _enabled_aria_api(tmp_path: Path, monkeypatch, client) -> web_app.WebAppApi:

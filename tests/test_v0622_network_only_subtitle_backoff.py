@@ -25,31 +25,43 @@ def _config(tmp_path: Path) -> AppConfig:
 
 def test_non_network_failures_always_use_configured_interval() -> None:
     for attempts in (1, 13, 37, 500):
-        assert _subtitle_retry_delay_seconds(
-            poll_minutes=10,
-            attempts=attempts,
-            detail="Jimaku: файл нужной серии не найден с достаточной уверенностью",
-        ) == 600
+        assert (
+            _subtitle_retry_delay_seconds(
+                poll_minutes=10,
+                attempts=attempts,
+                detail="Jimaku: файл нужной серии не найден с достаточной уверенностью",
+            )
+            == 600
+        )
     assert not _subtitle_retry_is_network_error("ALASS превысил timeout 240s")
     assert not _subtitle_retry_is_network_error("7-Zip не установлен")
 
 
 def test_network_failures_keep_progressive_backoff() -> None:
-    assert _subtitle_retry_delay_seconds(
-        poll_minutes=10,
-        attempts=1,
-        detail="httpx.ConnectError: temporary failure in name resolution",
-    ) == 600
-    assert _subtitle_retry_delay_seconds(
-        poll_minutes=10,
-        attempts=13,
-        detail="Ошибка Jimaku API: HTTP 503",
-    ) == 3600
-    assert _subtitle_retry_delay_seconds(
-        poll_minutes=10,
-        attempts=37,
-        detail="httpx.ReadTimeout: server disconnected",
-    ) == 21600
+    assert (
+        _subtitle_retry_delay_seconds(
+            poll_minutes=10,
+            attempts=1,
+            detail="httpx.ConnectError: temporary failure in name resolution",
+        )
+        == 600
+    )
+    assert (
+        _subtitle_retry_delay_seconds(
+            poll_minutes=10,
+            attempts=13,
+            detail="Ошибка Jimaku API: HTTP 503",
+        )
+        == 3600
+    )
+    assert (
+        _subtitle_retry_delay_seconds(
+            poll_minutes=10,
+            attempts=37,
+            detail="httpx.ReadTimeout: server disconnected",
+        )
+        == 21600
+    )
 
 
 def test_existing_long_backoff_is_made_due_after_upgrade(tmp_path: Path) -> None:

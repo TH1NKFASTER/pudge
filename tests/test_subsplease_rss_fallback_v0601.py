@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from pathlib import Path
 
-import pytest
 
 from pudge.config import AppConfig, load_config, write_config
 from pudge.manager import AnimeManager
@@ -141,11 +141,36 @@ def test_subsplease_setting_round_trips(tmp_path: Path):
     loaded = load_config(path)
 
     assert loaded.nyaa.subsplease_rss_enabled is True
-    assert "subsplease_rss_enabled = true" in path.read_text()
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["nyaa"]["subsplease_rss_enabled"] is True
 
 
-def test_settings_ui_hides_obsolete_subsplease_checkbox():
-    html = Path("pudge/web/index.html").read_text()
+def test_settings_have_no_subsplease_fallback_switch_and_keep_it_on(page, tmp_path: Path) -> None:
+    shown, values, configs = _saved_without_subsplease_switch(page, tmp_path)
+    assert shown == {"nyaa": True, "controls": [], "texts": []}
+    assert "subsplease_rss_enabled" not in values
+    assert [config.nyaa.subsplease_rss_enabled for config in configs] == [True, True]
 
-    assert "checkbox('s_subsplease_rss',t('settings.useSubsPleaseRss'))" not in html
-    assert "subsplease_rss_enabled:c('s_subsplease_rss')" not in html
+
+# Settings shows no SubsPlease switch any more: RSS is always used (fallback and first choice).
+SETTINGS_WITHOUT_SUBSPLEASE = r"""
+const out = {nyaa: Boolean($('s_nyaa_enabled')), controls: ['s_subsplease_rss', 's_subsplease_preferred'].filter(id => $(id)),
+             texts: [t('settings.useSubsPleaseRss'), t('settings.preferSubsPleaseRss')].filter(text => $('settingsContent').textContent.includes(text))};
+await __click('#saveSettings'); await __tick(20);
+return out;
+"""
+
+
+def _saved_without_subsplease_switch(page, tmp_path: Path) -> tuple[dict, dict, list[AppConfig]]:
+    from test_web_app import make_api
+
+    result = page.run(
+        SETTINGS_WITHOUT_SUBSPLEASE,
+        state={"settings": {"subsplease_rss_enabled": True, "subsplease_rss_preferred": True}},
+        before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+    )
+    [[values]] = result.calls_of("save_settings")
+    # An old Settings form (or a hand-edited request) cannot switch it off either.
+    api = make_api(tmp_path)
+    api.save_settings({"subsplease_rss_enabled": False, "subsplease_rss_preferred": False})
+    # What the running app uses and what the next start reads.
+    return result.value, values, [api.manager.config, load_config(api.config.config_path)]

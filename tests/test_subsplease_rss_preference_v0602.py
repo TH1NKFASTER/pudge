@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import tomllib
 from pathlib import Path
 
 from pudge.config import AppConfig, load_config, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, NyaaRelease
+from test_subsplease_rss_fallback_v0601 import _saved_without_subsplease_switch
 
 
 def _anime() -> LibraryAnime:
@@ -112,15 +114,15 @@ def test_preference_setting_round_trips(tmp_path: Path):
     loaded = load_config(path)
 
     assert loaded.nyaa.subsplease_rss_preferred is True
-    assert "subsplease_rss_preferred = true" in path.read_text()
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["nyaa"]["subsplease_rss_preferred"] is True
 
 
-def test_settings_ui_hides_obsolete_rss_first_checkbox():
-    html = Path("pudge/web/index.html").read_text()
-
-    assert "checkbox('s_subsplease_preferred',t('settings.preferSubsPleaseRss'))" not in html
-    assert "subsplease_rss_preferred:c('s_subsplease_preferred')" not in html
-    assert "setStandaloneSettingAvailability(preferred,enabled('s_nyaa_enabled')&&rss.checked)" not in html
+def test_settings_have_no_rss_first_switch_and_keep_rss_first(page, tmp_path: Path) -> None:
+    # The window shows neither SubsPlease switch; see test_subsplease_rss_fallback_v0601.py.
+    shown, values, configs = _saved_without_subsplease_switch(page, tmp_path)
+    assert shown["controls"] == [] and shown["texts"] == []
+    assert "subsplease_rss_preferred" not in values
+    assert [config.nyaa.subsplease_rss_preferred for config in configs] == [True, True]
 
 
 def test_default_order_uses_subsplease_first_and_skips_nyaa_when_rss_is_suitable(monkeypatch):

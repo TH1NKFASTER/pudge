@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from pudge.review_episode_due import build_episode_due_review_cards, resolve_episode_review_subtitle
-from pudge.models import EmbeddedSubtitle
 import pudge.review_episode_due as review_episode_due_module
 from pudge.config import AppConfig, load_config, write_config
 from pudge.light_novels import LightNovelService
 from pudge.review_gate import EpisodeReviewIdentity, ReviewGateStore
 from pudge.web_app import WebAppApi
 import pudge.web_app as web_app_module
+from css_support import css_rules
+from study_page_support import CARD, GATE, GATE_VIEW, LN_BOOK
 
 
 class _State:
@@ -135,8 +137,7 @@ class _FakeJiten:
 def test_episode_due_cards_intersect_episode_vocabulary_with_live_due_state(tmp_path: Path) -> None:
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
-        "1\n00:00:01,000 --> 00:00:03,000\n猫が走る。\n\n"
-        "2\n00:00:04,000 --> 00:00:06,000\n犬も走る。\n",
+        "1\n00:00:01,000 --> 00:00:03,000\n猫が走る。\n\n2\n00:00:04,000 --> 00:00:06,000\n犬も走る。\n",
         encoding="utf-8",
     )
 
@@ -156,8 +157,11 @@ class _FakeDb(_State):
         super().__init__()
         self.video_path = video_path.resolve()
         self.episode = SimpleNamespace(
-            media_id=210482, episode=1, video_path=self.video_path,
-            subtitle_path=subtitle_path, embedded_subtitle_id=None,
+            media_id=210482,
+            episode=1,
+            video_path=self.video_path,
+            subtitle_path=subtitle_path,
+            embedded_subtitle_id=None,
         )
 
     def episode_by_path(self, path: Path):
@@ -190,7 +194,8 @@ class _FakeLightNovels:
 
 
 def test_all_due_begin_uses_dynamic_episode_target_and_authorizes_every_due_card(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     video = tmp_path / "ep.mkv"
     subtitle = tmp_path / "ep.srt"
@@ -235,9 +240,9 @@ def test_all_due_begin_uses_dynamic_episode_target_and_authorizes_every_due_card
     assert api._review_gate_candidates["jiten:test:210482:1"] == {"1:0", "2:0"}
 
 
-
 def test_all_due_reviews_use_separate_progress_and_grant_after_full_snapshot(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     video = tmp_path / "ep.mkv"
     subtitle = tmp_path / "ep.srt"
@@ -284,6 +289,7 @@ def test_all_due_reviews_use_separate_progress_and_grant_after_full_snapshot(
     assert api._review_gate_store.snapshot("jiten:test", identity)["granted"] is False
     assert api._review_gate_due_store.snapshot("jiten:test", identity)["granted"] is True
 
+
 def test_all_due_begin_grants_episode_when_no_due_words(tmp_path: Path, monkeypatch) -> None:
     video = tmp_path / "ep.mkv"
     subtitle = tmp_path / "ep.srt"
@@ -316,20 +322,115 @@ def test_all_due_begin_grants_episode_when_no_due_words(tmp_path: Path, monkeypa
     assert result["granted"] is True
     assert result["blocking"] is False
     assert result["cards"] == []
-    assert api._review_gate_due_store.snapshot("jiten:test", EpisodeReviewIdentity(210482, 1))["granted"] is True
+    assert (
+        api._review_gate_due_store.snapshot("jiten:test", EpisodeReviewIdentity(210482, 1))["granted"] is True
+    )
 
 
-def test_review_gate_ui_uses_episode_sentence_fallback_and_optional_image() -> None:
-    package = Path(__file__).parents[1] / "pudge"
-    js = (package / "web" / "review_gate.js").read_text(encoding="utf-8")
-    css = (package / "web" / "review_gate.css").read_text(encoding="utf-8")
-    html = (package / "web" / "index.html").read_text(encoding="utf-8")
+def _episode_due_cards(tmp_path: Path) -> list[dict]:
+    """Cards as review_gate_begin sends them in "all due words of the episode" mode."""
+    subtitle = tmp_path / "episode.srt"
+    subtitle.write_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n猫が走る。\n\n2\n00:00:04,000 --> 00:00:06,000\n犬も走る。\n",
+        encoding="utf-8",
+    )
+    cards = build_episode_due_review_cards(_FakeJiten(), subtitle, tmp_path / "cache")["cards"]
+    return json.loads(json.dumps(cards, ensure_ascii=False))
 
-    assert "card?.exampleSentence?.text || card?.pudgeContextSentence" in js
-    assert "card?.pudgeContextImage" in js
-    assert ".pudge-review-gate-image" in css
-    assert 'id="s_review_gate_all_due_episode_words"' in html
-    assert "review_gate_all_due_episode_words:c('s_review_gate_all_due_episode_words')" in html
+
+def _all_due_gate(cards: list[dict]) -> str:
+    return (
+        GATE
+        + f"""
+    window.GATE_CARDS = {json.dumps(cards, ensure_ascii=False)};
+    const plainBegin = __api.review_gate_begin;
+    __api.review_gate_status = async () => ({{supported: true, blocking: true, granted: false, all_due_episode_words: true,
+                                             required: 2, completed: 0, remaining: 2, episode: 3}});
+    __api.review_gate_begin = async path => ({{...(await plainBegin(path)), all_due_episode_words: true}});
+    """
+    )
+
+
+def test_review_gate_shows_the_episode_sentence_and_optional_image(tmp_path: Path, page) -> None:
+    # Due words of the episode have no Jiten example: the gate shows the line of the episode
+    # where the word occurs, and the Jiten card image when there is one.
+    for lang in ("en", "ru"):
+        result = page.run(
+            GATE_VIEW
+            + """
+            const answer = () => ({example: __text('.pudge-review-gate-example'), image: gate().querySelector('.pudge-review-gate-image img')?.getAttribute('src') ?? null,
+                                   imageShown: shown('.pudge-review-gate-image')});
+            await startPlay(EPISODE); await __tick(20);
+            await space(); const first = answer();
+            await gradeKey(3); await space(); await __tick(10);
+            await space(); const second = answer();
+            return {first, second, label: PudgeI18n.t('gate.example')};
+            """,
+            lang=lang,
+            before=_all_due_gate(_episode_due_cards(tmp_path)),
+        )
+        label = result.value["label"]
+        assert result.value["first"] == {
+            "example": f"{label}\n猫が走る。",
+            "image": "https://img.test/cat.jpg",
+            "imageShown": True,
+        }
+        assert result.value["second"] == {
+            "example": f"{label}\n猫が走る。",
+            "image": None,
+            "imageShown": False,
+        }
+    # A large image cannot push the answer out of the card.
+    image = css_rules("review_gate.css").declarations(".pudge-review-gate-image img")
+    assert (image["max-width"], image["max-height"], image["object-fit"]) == ("100%", "320px", "contain")
+
+
+def test_revealed_episode_due_word_keeps_its_kanji(tmp_path: Path, page) -> None:
+    result = page.run(
+        GATE_VIEW
+        + """
+        await startPlay(EPISODE); await __tick(20);
+        const closed = frontWord().innerText;
+        await space();
+        const base = frontWord().cloneNode(true); base.querySelectorAll('rt').forEach(rt => rt.remove());
+        return {closed, base: base.textContent.trim(), ruby: frontWord().querySelector('rt')?.textContent ?? null};
+        """,
+        before=_all_due_gate(_episode_due_cards(tmp_path)),
+    )
+    assert result.value == {"closed": "猫", "base": "猫", "ruby": "ねこ"}
+
+
+def test_all_due_episode_words_setting_is_offered_with_the_gate(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            const box = $('s_review_gate_all_due_episode_words');
+            const out = {label: box.closest('label').innerText, expected: PudgeI18n.t('ui.reviewAllQueuedWordsFrom'),
+                         checked: box.checked, enabled: !box.disabled};
+            await __input('#s_review_gate_all_due_episode_words', true);
+            out.countEnabled = !$('s_review_gate_count').disabled;
+            await __click('#saveSettings'); await __tick(10);
+            return out;
+            """,
+            lang=lang,
+            state={
+                "settings": {
+                    "review_gate_enabled": True,
+                    "review_gate_all_due_episode_words": False,
+                    "light_novels": {"jiten_api_key": "key", "study_backend": "jiten"},
+                }
+            },
+            before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+        )
+        out = result.value
+        assert out["label"].strip() == out["expected"]
+        assert (out["checked"], out["enabled"], out["countEnabled"]) == (
+            False,
+            True,
+            False,
+        )  # all due: no fixed count
+        [[values]] = result.calls_of("save_settings")
+        assert values["review_gate_all_due_episode_words"] is True
 
 
 def test_episode_due_resolver_prefers_existing_external_subtitle(tmp_path: Path, monkeypatch) -> None:
@@ -356,7 +457,8 @@ def test_episode_due_resolver_prefers_existing_external_subtitle(tmp_path: Path,
 
 
 def test_episode_due_resolver_extracts_selected_embedded_japanese_text_track_once(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"video")
@@ -375,14 +477,14 @@ def test_episode_due_resolver_extracts_selected_embedded_japanese_text_track_onc
     monkeypatch.setattr(
         review_episode_due_module,
         "find_embedded_japanese_subtitles",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stored text sid should avoid rescanning")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stored text sid should avoid rescanning")
+        ),
     )
 
     def fake_run(args, **_kwargs):
         calls.append([str(value) for value in args])
-        Path(args[-1]).write_text(
-            "1\n00:00:01,000 --> 00:00:02,000\nやれやれだぜ。\n", encoding="utf-8"
-        )
+        Path(args[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nやれやれだぜ。\n", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(review_episode_due_module.subprocess, "run", fake_run)
@@ -465,33 +567,120 @@ def test_all_due_begin_resolves_embedded_subtitle_before_scanning(tmp_path: Path
     assert result["cards"][0]["pudgeCardKey"] == "77:0"
 
 
-def test_review_gate_keyboard_and_stale_warm_pool_contract() -> None:
-    package = Path(__file__).parents[1] / "pudge"
-    gate = (package / "web" / "review_gate.js").read_text(encoding="utf-8")
-    reading = (package / "web" / "reading_tools.js").read_text(encoding="utf-8")
-    html = (package / "web" / "index.html").read_text(encoding="utf-8")
+def test_review_gate_grade_keys_follow_the_active_action_set(page) -> None:
+    # Binary review mode: the gate offers Fail / Pass; their keys (also on the numpad) select
+    # the button, Space confirms it; a key of the hidden native set does nothing.
+    result = page.run(
+        GATE_VIEW
+        + """
+        await startPlay(EPISODE); await __tick(20);
+        await space();
+        const out = {grades: [...gate().querySelectorAll('[data-review-gate-grade]')].map(b => b.dataset.reviewGateGrade)};
+        out.focused = document.activeElement?.dataset.reviewGateGrade ?? null;
+        await __key('1', {code: 'Numpad1'}, 'body'); out.numpad = document.activeElement?.dataset.reviewGateGrade ?? null;
+        await gradeKey(3); out.three = document.activeElement?.dataset.reviewGateGrade ?? null;
+        await gradeKey(2); out.two = document.activeElement?.dataset.reviewGateGrade ?? null;
+        await space(); await __tick(10);
+        return out;
+        """,
+        before=GATE
+        + """
+        const binary = {provider: 'jiten', mode: 'binary', actions: [
+          {id: 'fail', wire: 'again', tone: 'again', shortcut: '1'}, {id: 'pass', wire: 'good', tone: 'good', shortcut: '2'}]};
+        const begin = __api.review_gate_begin;
+        __api.review_gate_begin = async path => ({...(await begin(path)), review_actions: binary});
+        """,
+    )
+    out = result.value
+    assert out["grades"] == ["fail", "pass"]
+    assert out["focused"] == "pass"  # Pass is preselected after the reveal
+    assert (out["numpad"], out["three"], out["two"]) == ("fail", "fail", "pass")
+    assert [call[1:4] for call in result.calls_of("review_gate_review")] == [[1, 0, "pass"]]
 
-    # S2: grade keys come from the shared review action set (per provider and
-    # mode); Digit/Numpad handling is exercised in tests/js/review_actions_s2.cjs.
-    assert "PudgeReviewActions?.matchAction?.(event, activeGateActions())" in gate
-    assert "PudgeReviewActions?.matchAction?.(event, activeToken.reviewActions)" in reading
-    assert "focused.click()" in gate
-    assert "focused.click()" in reading
-    assert "snapshot?.reason === 'episode_due_mode'" in gate
-    assert "initialStatus?.all_due_episode_words" in gate
-    assert "window.__pudgeReviewGateWarmCards = [];" in gate
-    assert "window.PudgeReadingTools?.study?.handleReviewKeydown?.(event)" in html
+
+def test_word_card_grade_keys_select_and_space_confirms(page) -> None:
+    result = page.run(
+        """
+        await __settle(openLightNovel(6)); await __tick(300);
+        await __click('#lnReader [data-ln-token="0:2"]'); await __tick(20);
+        await __key('3', {code: 'Digit3'}, 'body');
+        const focused = document.activeElement?.dataset.pudgeStudyReview;
+        await __key(' ', {code: 'Space'}, 'body'); await __tick(20);
+        return {focused, open: document.getElementById('pudgeStudyCard').classList.contains('open')};
+        """,
+        before=LN_BOOK + "__api.study_action = async () => ({ok: true, outcome: 'confirmed'});",
+        state={"settings": {"review_gate_ln_enabled": False}},
+    )
+    assert result.value == {"focused": "good", "open": False}
+    [[action]] = result.calls_of("study_action")
+    assert (action["action"], action["word_id"], action["reading_index"], action["grade"]) == (
+        "review",
+        103,
+        0,
+        "good",
+    )
 
 
-def test_jiten_study_card_is_positioned_offscreen_before_opening() -> None:
-    package = Path(__file__).parents[1] / "pudge"
-    reading = (package / "web" / "reading_tools.js").read_text(encoding="utf-8")
-    css = (package / "web" / "reading_tools.css").read_text(encoding="utf-8")
+# The minute refresh keeps a warm queue of review cards (window.WARM answers it).
+WARM = (
+    CARD
+    + """
+window.WARM = {cards: [reviewCard(9, '古', 'ふる')], target: 1};
+__api.review_gate_prefetch = async () => window.WARM;
+__api.review_gate_status = async () => ({supported: true, blocking: true, granted: false, required: 1, completed: 0, remaining: 1, episode: 3});
+__api.review_gate_begin = () => new Promise(() => {});                 // authorization still running
+"""
+)
 
-    open_at = reading.index("pop.classList.add('open')")
-    prelude = reading[max(0, open_at - 500):open_at]
-    assert "pop.style.left = '-10000px'" in prelude
-    assert "pop.style.top = '-10000px'" in prelude
-    position_block = reading.split("function position(el, rect)", 1)[1].split("function closeStudyCard", 1)[0]
-    assert "requestAnimationFrame(() =>" not in position_block
-    assert ".pudge-study-grade:focus" in css
+
+def test_review_gate_paints_warm_cards_only_outside_the_episode_due_mode(page) -> None:
+    open_gate = (
+        GATE_VIEW
+        + """
+    await __tick(10);
+    MODE;
+    void startPlay('/lib/Show - 03.mkv'); await __tick(20);
+    return {word: frontWord()?.innerText ?? null, loading: shown('.pudge-review-gate-loading')};
+    """
+    )
+    # Normal gate: the warm card is on screen at once while the gate authorizes it.
+    normal = page.run(open_gate.replace("MODE", ""), before=WARM).value
+    assert normal == {"word": "古", "loading": False}
+    # The backend switched to "all due words of the episode": the warm queue is dropped.
+    switched = page.run(
+        open_gate.replace(
+            "MODE",
+            "window.WARM = {reason: 'episode_due_mode', cards: [], target: 0}; window.dispatchEvent(new Event('focus')); await __tick(10)",
+        ),
+        before=WARM,
+    ).value
+    assert switched == {"word": None, "loading": True}
+    # A gate opened in that mode never shows warm cards, even when some are left.
+    all_due = page.run(
+        open_gate.replace(
+            "MODE",
+            "__api.review_gate_status = async () => ({supported: true, blocking: true, granted: false, all_due_episode_words: true, required: 1, completed: 0, remaining: 1})",
+        ),
+        before=WARM,
+    ).value
+    assert all_due == {"word": None, "loading": True}
+
+
+def test_word_card_appears_next_to_the_word_in_the_same_task(page) -> None:
+    # The card used to be placed one frame later and flashed at its static place (top left).
+    result = page.run(
+        """
+        await __settle(openLightNovel(6)); await __tick(300);
+        const word = document.querySelector('#lnReader [data-ln-token="0:2"]');
+        word.__rect = {x: 300, y: 200, width: 40, height: 30};
+        word.click();                                                      // no frame runs before the check
+        const card = document.getElementById('pudgeStudyCard');
+        return {open: card.classList.contains('open'), left: card.style.left, top: card.style.top};
+        """,
+        before=LN_BOOK,
+        state={"settings": {"review_gate_ln_enabled": False}},
+        viewport={"width": 1300, "height": 900},
+    )
+    assert result.value == {"open": True, "left": "320px", "top": "240px"}
+    # The grade chosen with its key is clearly marked.
+    assert css_rules("reading_tools.css").get(".pudge-study-grade:focus", "outline") == "2px solid #eef5ff"

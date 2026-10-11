@@ -110,7 +110,7 @@ def test_large_offset_is_rejected_by_our_quality_gate(tmp_path: Path, monkeypatc
 
 def test_alass_uses_safe_temp_names_and_writes_output(tmp_path: Path):
     fake = tmp_path / "fake-alass"
-    fake.write_text("#!/bin/sh\ncp \"$2\" \"$3\"\n", encoding="utf-8")
+    fake.write_text('#!/bin/sh\ncp "$2" "$3"\n', encoding="utf-8")
     fake.chmod(0o755)
     video = tmp_path / "[Group] episode.mkv"
     subtitle = tmp_path / "[Subs] episode.srt"
@@ -328,8 +328,7 @@ def test_piecewise_repair_uses_different_offsets_across_episode(tmp_path: Path):
 
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
-        "1\n00:00:10,000 --> 00:00:12,000\n最初\n\n"
-        "2\n00:10:00,000 --> 00:10:02,000\n最後\n",
+        "1\n00:00:10,000 --> 00:00:12,000\n最初\n\n2\n00:10:00,000 --> 00:10:02,000\n最後\n",
         encoding="utf-8",
     )
     diagnostics = {
@@ -495,8 +494,7 @@ def test_piecewise_repair_refuses_unreliable_diagnostics(tmp_path: Path):
 
     subtitle = tmp_path / "episode.srt"
     subtitle.write_text(
-        "1\n00:00:10,000 --> 00:00:12,000\n最初\n\n"
-        "2\n00:10:00,000 --> 00:10:02,000\n最後\n",
+        "1\n00:00:10,000 --> 00:00:12,000\n最初\n\n2\n00:10:00,000 --> 00:10:02,000\n最後\n",
         encoding="utf-8",
     )
     diagnostics = {
@@ -521,9 +519,7 @@ def test_piecewise_repair_refuses_unreliable_diagnostics(tmp_path: Path):
     assert result["reason"] == "piecewise_unreliable_diagnostics"
 
 
-def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable(
-    tmp_path: Path, monkeypatch
-):
+def test_auto_engine_uses_global_score_when_all_local_diagnostics_are_unreliable(tmp_path: Path, monkeypatch):
     from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
@@ -789,9 +785,7 @@ def test_llm_acceptance_allows_embedded_reference_alignment(tmp_path: Path, monk
     assert result["timing_reference_validation"]["accepted"] is True
 
 
-def test_extreme_embedded_map_is_replaced_by_reliable_japanese_speech(
-    tmp_path: Path, monkeypatch
-):
+def test_extreme_embedded_map_is_replaced_by_reliable_japanese_speech(tmp_path: Path, monkeypatch):
     from pudge.syncing import optimize_subtitle
 
     video = tmp_path / "episode.mkv"
@@ -1008,7 +1002,7 @@ def test_alass_normalizes_srt_reference_and_source(tmp_path: Path):
         "#!/bin/sh\n"
         "grep -q $'\\xEF\\xBB\\xBF' \"$1\" && exit 11\n"
         "grep -q $'\\xEF\\xBB\\xBF' \"$2\" && exit 12\n"
-        "cp \"$2\" \"$3\"\n",
+        'cp "$2" "$3"\n',
         encoding="utf-8",
     )
     fake.chmod(0o755)
@@ -1063,9 +1057,7 @@ def test_relative_semantic_samples_ignore_constant_timing_shift(tmp_path: Path):
         assert sample["alignment_mode"] == "relative"
 
 
-def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
-    tmp_path: Path, monkeypatch
-):
+def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(tmp_path: Path, monkeypatch):
     from pudge.subtitle_formats import write_srt
     from pudge.syncing import optimize_subtitle
 
@@ -1074,18 +1066,9 @@ def test_embedded_reference_uses_constant_offset_sampling_when_audio_sync_fails(
     subtitle = tmp_path / "japanese.srt"
     timing_reference = tmp_path / "english.srt"
     alass_output = tmp_path / "alass.srt"
-    source_cues = [
-        (10.0 + index * 5.0, 12.0 + index * 5.0, f"JA-{index}")
-        for index in range(24)
-    ]
-    aligned_cues = [
-        (38.0 + index * 5.0, 40.0 + index * 5.0, f"JA-{index}")
-        for index in range(24)
-    ]
-    reference_cues = [
-        (38.0 + index * 5.0, 40.0 + index * 5.0, f"EN-{index}")
-        for index in range(24)
-    ]
+    source_cues = [(10.0 + index * 5.0, 12.0 + index * 5.0, f"JA-{index}") for index in range(24)]
+    aligned_cues = [(38.0 + index * 5.0, 40.0 + index * 5.0, f"JA-{index}") for index in range(24)]
+    reference_cues = [(38.0 + index * 5.0, 40.0 + index * 5.0, f"EN-{index}") for index in range(24)]
     write_srt(source_cues, subtitle)
     write_srt(reference_cues, timing_reference)
     write_srt(aligned_cues, alass_output)
@@ -1287,20 +1270,13 @@ def test_constant_offset_estimator_rejects_dense_boundary_false_peak(tmp_path: P
         starts.append(current)
 
     source_cues = [(time, time + 1.5, f"JA-{i}") for i, time in enumerate(starts)]
-    reference_starts = [
-        time + 28.0 + rng.uniform(-0.12, 0.12)
-        for i, time in enumerate(starts)
-        if i % 3 != 0
-    ]
+    reference_starts = [time + 28.0 + rng.uniform(-0.12, 0.12) for i, time in enumerate(starts) if i % 3 != 0]
     # Dense unrelated/sign cues create many accidental matches for wide scans.
     extra = 5.0
     while extra < starts[-1] + 60.0:
         extra += rng.uniform(2.5, 5.0)
         reference_starts.append(extra)
-    reference_cues = [
-        (time, time + 1.2, f"EN-{i}")
-        for i, time in enumerate(sorted(reference_starts))
-    ]
+    reference_cues = [(time, time + 1.2, f"EN-{i}") for i, time in enumerate(sorted(reference_starts))]
     write_srt(source_cues, source)
     write_srt(reference_cues, reference)
 
@@ -1449,7 +1425,10 @@ def test_optimize_candidates_uses_embedded_subtitles_before_audio(tmp_path: Path
     aligned = tmp_path / "aligned.srt"
     cues = [(10.0 + index * 4.0, 11.5 + index * 4.0, f"JA-{index}") for index in range(24)]
     write_srt(cues, source)
-    write_srt([(start + 28.0, end + 28.0, f"EN-{index}") for index, (start, end, _text) in enumerate(cues)], reference)
+    write_srt(
+        [(start + 28.0, end + 28.0, f"EN-{index}") for index, (start, end, _text) in enumerate(cues)],
+        reference,
+    )
     write_srt([(start + 28.0, end + 28.0, text) for start, end, text in cues], aligned)
 
     monkeypatch.setattr(
@@ -1588,7 +1567,10 @@ def test_subtitle_quality_gate_accepts_exact_jimaku_boundary_only_mismatch():
     )
 
     assert accepted is True
-    assert "границы" in reason
+    assert reason == "exact Jimaku episode; only broadcast boundaries differ"
+    from pudge import i18n
+
+    assert "границы" in i18n.message(reason, "ru")
 
 
 def test_subtitle_quality_gate_still_rejects_exact_jimaku_large_jumps():
@@ -1728,9 +1710,7 @@ def test_embedded_reference_piecewise_rejects_large_cold_open_when_it_reorders_d
     assert result["sequence_safety"]["reason"] == "safe"
     assert result["edit_boundaries"]
     repaired = parse_srt(output)
-    assert [text for _start, _end, text in repaired] == [
-        text for _start, _end, text in aligned_cues
-    ]
+    assert [text for _start, _end, text in repaired] == [text for _start, _end, text in aligned_cues]
     assert abs(repaired[0][0] - reference_cues[0][0]) < 0.01
     first_after_edit = next(index for index, cue in enumerate(reference_cues) if cue[0] >= 58.0)
     assert abs(repaired[first_after_edit][0] - reference_cues[first_after_edit][0]) < 0.01

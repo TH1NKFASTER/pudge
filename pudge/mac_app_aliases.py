@@ -1,4 +1,5 @@
 """Retire Pudge compatibility symlinks after updating any matching Dock pins."""
+
 from __future__ import annotations
 
 import json
@@ -12,8 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 LSREGISTER = (
-    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
-    "LaunchServices.framework/Support/lsregister"
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 )
 DOCK_KEYS = ("persistent-apps", "persistent-others")
 WEBKIT_BUNDLE_IDS = ("com.pudge.app", "com.anime-mpv.app")
@@ -32,8 +32,11 @@ def unregister_webkit_data_folders(home: Path, run=subprocess.run):
         if contents.exists() or contents.is_symlink():
             continue
         result = run(
-            [LSREGISTER, "-u", str(directory)], check=False,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+            [LSREGISTER, "-u", str(directory)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
         )
         if result.returncode:
             print(f"Could not unregister WebKit data folder: {directory}")
@@ -102,8 +105,15 @@ class DockPreferences:
         return bytes(data)
 
 
-def cleanup_aliases(app: Path, bundle_id: str, names, backup_root: Path, preferences,
-                    run=subprocess.run, webkit_home: Path | None = None):
+def cleanup_aliases(
+    app: Path,
+    bundle_id: str,
+    names,
+    backup_root: Path,
+    preferences,
+    run=subprocess.run,
+    webkit_home: Path | None = None,
+):
     app = Path(os.path.abspath(app.expanduser()))
     if app.is_symlink():
         raise RuntimeError("Canonical application is a symlink; no app flags changed.")
@@ -130,8 +140,7 @@ def cleanup_aliases(app: Path, bundle_id: str, names, backup_root: Path, prefere
             dock_paths.add(alias)
 
     def command(arguments):
-        return run(arguments, check=False, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=15)
+        return run(arguments, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
 
     originals, replacements = {}, {}
     for key in DOCK_KEYS if dock_paths else ():
@@ -146,13 +155,18 @@ def cleanup_aliases(app: Path, bundle_id: str, names, backup_root: Path, prefere
         backup_root.mkdir(parents=True, exist_ok=True)
         backup = backup_root / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         backup.mkdir(mode=0o700)
-        (backup / "aliases.json").write_text(json.dumps(
-            {str(path): target for path, (_, target) in aliases.items()},
-            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (backup / "aliases.json").write_text(
+            json.dumps(
+                {str(path): target for path, (_, target) in aliases.items()}, ensure_ascii=False, indent=2
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         if hidden:
-            (backup / "app-visibility.json").write_text(json.dumps(
-                {"path": str(app), "bsd_flags_before": app_flags}, indent=2
-            ) + "\n", encoding="utf-8")
+            (backup / "app-visibility.json").write_text(
+                json.dumps({"path": str(app), "bsd_flags_before": app_flags}, indent=2) + "\n",
+                encoding="utf-8",
+            )
         if replacements:
             (backup / "dock-before.plist").write_bytes(preferences.serialize(originals))
             try:
@@ -182,8 +196,11 @@ def cleanup_aliases(app: Path, bundle_id: str, names, backup_root: Path, prefere
             unregister_webkit_data_folders(webkit_home, run)
         for alias, (before, _) in aliases.items():
             current = alias.lstat()
-            if ((current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
-                    or not alias.is_symlink() or alias.resolve() != app.resolve()):
+            if (
+                (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                or not alias.is_symlink()
+                or alias.resolve() != app.resolve()
+            ):
                 raise RuntimeError(f"Compatibility path changed; retained: {alias}")
             command([LSREGISTER, "-u", str(alias)])
             # Unlink only this verified symlink; never recursively remove an app.
@@ -206,8 +223,11 @@ def main():
     if len(sys.argv) < 3:
         raise RuntimeError("Usage: cleanup_macos_app_aliases.py APP_PATH BUNDLE_ID [LEGACY_NAME ...]")
     cleanup_aliases(
-        Path(sys.argv[1]), sys.argv[2], sys.argv[3:],
-        Path.home() / ".local/share/pudge/app-alias-backups.noindex", DockPreferences(),
+        Path(sys.argv[1]),
+        sys.argv[2],
+        sys.argv[3:],
+        Path.home() / ".local/share/pudge/app-alias-backups.noindex",
+        DockPreferences(),
         webkit_home=Path.home(),
     )
 

@@ -70,7 +70,9 @@ def _load(path: Path, cache_dir: Path | None) -> list[tuple[float, float, str]]:
     raise ValueError(f"unsupported subtitle for the alignment guard: {path.suffix}")
 
 
-def _match(raw: list[tuple[float, float, str]], final: list[tuple[float, float, str]]) -> list[tuple[int, int]]:
+def _match(
+    raw: list[tuple[float, float, str]], final: list[tuple[float, float, str]]
+) -> list[tuple[int, int]]:
     """Index pairs raw→final: by position when texts agree, else a text walk."""
     if len(raw) == len(final) and all(_norm(a[2]) == _norm(b[2]) for a, b in zip(raw, final)):
         return [(i, i) for i in range(len(raw))]
@@ -146,11 +148,7 @@ def stabilize_music_marker_pairs(
 
     pairs = _match(raw_cues, final_cues)
     by_raw = {i: j for i, j in pairs}
-    speech = [
-        (i, j, final_cues[j][0] - raw_cues[i][0])
-        for i, j in pairs
-        if not music_only(raw_cues[i][2])
-    ]
+    speech = [(i, j, final_cues[j][0] - raw_cues[i][0]) for i, j in pairs if not music_only(raw_cues[i][2])]
     if not speech:
         return {"applied": False, "reason": "no_dialogue_support"}
 
@@ -191,7 +189,9 @@ def stabilize_music_marker_pairs(
             ]
             if nearby:
                 shifts = [shift for _distance, shift in nearby]
-                support_options.append((min(distance for distance, _shift in nearby), statistics.median(shifts), len(shifts)))
+                support_options.append(
+                    (min(distance for distance, _shift in nearby), statistics.median(shifts), len(shifts))
+                )
                 continue
             nearest = min(
                 ((abs(float(raw_cues[i][0]) - marker_start), shift) for i, _j, shift in speech),
@@ -202,7 +202,9 @@ def stabilize_music_marker_pairs(
         if not support_options:
             index += 2
             continue
-        support_distance, supported_shift, support_count = min(support_options, key=lambda row: (-row[2], row[0]))
+        support_distance, supported_shift, support_count = min(
+            support_options, key=lambda row: (-row[2], row[0])
+        )
         # Do not rewrite a pair unless the chosen dialogue clock clearly agrees
         # with at least one existing boundary better than with the invented split.
         if min(abs(supported_shift - first_shift), abs(supported_shift - second_shift)) > 1.0:
@@ -217,14 +219,16 @@ def stabilize_music_marker_pairs(
                 break
             repaired[final_index] = (target_start, target_start + duration, final_cues[final_index][2])
         else:
-            repairs.append({
-                "raw_indexes": [index, index + 1],
-                "raw_span_seconds": round(block_span, 3),
-                "before_shifts": [round(first_shift, 3), round(second_shift, 3)],
-                "supported_shift": round(float(supported_shift), 3),
-                "support_distance_seconds": round(float(support_distance), 3),
-                "support_cues": int(support_count),
-            })
+            repairs.append(
+                {
+                    "raw_indexes": [index, index + 1],
+                    "raw_span_seconds": round(block_span, 3),
+                    "before_shifts": [round(first_shift, 3), round(second_shift, 3)],
+                    "supported_shift": round(float(supported_shift), 3),
+                    "support_distance_seconds": round(float(support_distance), 3),
+                    "support_cues": int(support_count),
+                }
+            )
         index += 2
 
     if not repairs:
@@ -245,15 +249,24 @@ def validate_alignment_output(
         raw_cues = _load(Path(raw), cache_dir)
         final_cues = _load(Path(final), cache_dir)
     except (OSError, ValueError) as exc:
-        return {**base, "status": "needs_verification", "reason": "unreadable", "diagnostics": {"error": str(exc)[:200]}}
+        return {
+            **base,
+            "status": "needs_verification",
+            "reason": "unreadable",
+            "diagnostics": {"error": str(exc)[:200]},
+        }
     try:
         base["raw_sha256"] = _sha(Path(raw))
         base["final_sha256"] = _sha(Path(final))
     except OSError:
         pass
     if not raw_cues or not final_cues:
-        return {**base, "status": "needs_verification", "reason": "empty_track",
-                "diagnostics": {"raw_cues": len(raw_cues), "final_cues": len(final_cues)}}
+        return {
+            **base,
+            "status": "needs_verification",
+            "reason": "empty_track",
+            "diagnostics": {"raw_cues": len(raw_cues), "final_cues": len(final_cues)},
+        }
 
     pairs = _match(raw_cues, final_cues)
     speech = [(i, j) for i, j in pairs if not music_only(raw_cues[i][2])]
@@ -265,11 +278,14 @@ def validate_alignment_output(
         "speech_matched": n,
     }
     if n < 5:
-        return {**base, "status": "needs_verification", "reason": "too_few_matched_cues", "diagnostics": diagnostics}
+        return {
+            **base,
+            "status": "needs_verification",
+            "reason": "too_few_matched_cues",
+            "diagnostics": diagnostics,
+        }
 
-    new_clamped = sum(
-        1 for i, j in speech if raw_cues[i][0] > 1.0 and final_cues[j][0] <= _CLAMP_EPSILON
-    )
+    new_clamped = sum(1 for i, j in speech if raw_cues[i][0] > 1.0 and final_cues[j][0] <= _CLAMP_EPSILON)
     raw_overlaps = _overlaps([raw_cues[i] for i, _ in speech])
     final_overlaps = _overlaps([final_cues[j] for _, j in speech])
     new_overlaps = len(final_overlaps - raw_overlaps)
@@ -301,22 +317,24 @@ def validate_alignment_output(
     runs.append(current)
     scattered = sum(length for length in runs if length < 3) / n
     far = sum(1 for value in shifts if abs(value - median) > 30.0) / n
-    diagnostics.update({
-        "new_clamped_starts": new_clamped,
-        "raw_overlaps": len(raw_overlaps),
-        "new_overlaps": new_overlaps,
-        "order_inversions": inversions,
-        "max_lines_on_one_start": collapsed,
-        "raw_max_lines_on_one_start": raw_max_same_start,
-        "median_shift": round(median, 3),
-        "shift_span_p05_p95": round(spread, 3),
-        "shift_min": round(min(shifts), 3),
-        "shift_max": round(max(shifts), 3),
-        "shift_jumps": jumps,
-        "shift_runs": len(runs),
-        "scattered_fraction": round(scattered, 4),
-        "far_from_median_fraction": round(far, 4),
-    })
+    diagnostics.update(
+        {
+            "new_clamped_starts": new_clamped,
+            "raw_overlaps": len(raw_overlaps),
+            "new_overlaps": new_overlaps,
+            "order_inversions": inversions,
+            "max_lines_on_one_start": collapsed,
+            "raw_max_lines_on_one_start": raw_max_same_start,
+            "median_shift": round(median, 3),
+            "shift_span_p05_p95": round(spread, 3),
+            "shift_min": round(min(shifts), 3),
+            "shift_max": round(max(shifts), 3),
+            "shift_jumps": jumps,
+            "shift_runs": len(runs),
+            "scattered_fraction": round(scattered, 4),
+            "far_from_median_fraction": round(far, 4),
+        }
+    )
 
     reasons: list[str] = []
     if new_clamped >= max(5, int(0.02 * n)):
@@ -332,7 +350,12 @@ def validate_alignment_output(
     if reasons:
         return {**base, "status": "rejected", "reason": ",".join(reasons), "diagnostics": diagnostics}
     if len(pairs) < 0.6 * min(len(raw_cues), len(final_cues)):
-        return {**base, "status": "needs_verification", "reason": "cue_mapping_incomplete", "diagnostics": diagnostics}
+        return {
+            **base,
+            "status": "needs_verification",
+            "reason": "cue_mapping_incomplete",
+            "diagnostics": diagnostics,
+        }
     note = "large_piecewise_map" if spread > 30.0 else "ok"
     return {**base, "status": "accepted", "reason": note, "diagnostics": diagnostics}
 
@@ -348,7 +371,12 @@ def validate_final_standalone(final: Path) -> dict[str, Any]:
     try:
         cues = _load(Path(final), None)
     except (OSError, ValueError) as exc:
-        return {**base, "status": "needs_verification", "reason": "unreadable", "diagnostics": {"error": str(exc)[:200]}}
+        return {
+            **base,
+            "status": "needs_verification",
+            "reason": "unreadable",
+            "diagnostics": {"error": str(exc)[:200]},
+        }
     at_zero = {_norm(text) for start, _end, text in cues if start <= _CLAMP_EPSILON and not music_only(text)}
     diagnostics = {"cues": len(cues), "distinct_lines_at_zero": len(at_zero)}
     if len(at_zero) >= 5:

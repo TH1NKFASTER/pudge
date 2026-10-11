@@ -1,9 +1,8 @@
-from test_v16_updater_script import run_native_quit_scenario, run_update_scenario
+from test_v16_updater_script import run_update_scenario
+
+# The installer quitting a running Pudge through the native app (like Cmd+Q) is tested in
+# test_v16_updater_script.py::test_update_asks_each_pudge_app_once_to_quit_and_a_finished_session_does_not_block.
 
 
-def test_installer_stops_managed_app_through_native_quit(monkeypatch):
-    run_native_quit_scenario(monkeypatch,stuck=False)
-
-
-def test_updater_waits_for_managed_app_before_install(tmp_path,monkeypatch):
-    run_update_scenario(tmp_path,monkeypatch,source_exits=True)
+def test_updater_waits_for_managed_app_before_install(tmp_path, monkeypatch):
+    run_update_scenario(tmp_path, monkeypatch, source_exits=True)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import html
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import signal
@@ -28,8 +30,11 @@ from .audio_activity import (
     merge_activity_regions,
 )
 from .database import Database
+from .i18n import err, t
+from . import library_overrides
 from .metadata_cache import MetadataCache
 from .player import mpv_supports_option
+from .process_priority import mark_background
 from .work_scheduler import WorkPriority
 from .reading_audio_alignment import (
     align_light_novel_to_transcript,
@@ -46,6 +51,8 @@ LOGGER = logging.getLogger(__name__)
 AUDIOBOOK_EXTENSIONS = {".m4b", ".m4a", ".mp3", ".aac", ".opus", ".ogg", ".flac", ".wav"}
 _POSITION_WRITE_INTERVAL = 10.0
 _MONITOR_POLL_INTERVAL = 0.25
+# A player paused this long is closed (position saved); Play resumes from it.
+_PAUSED_PLAYER_STOP_SECONDS = 30 * 60
 _STOP_GRACE_SECONDS = 0.12
 _STOP_IPC_TIMEOUT = 0.05
 _PLAYBACK_STALL_SECONDS = 1.1
@@ -54,6 +61,105 @@ _STT_CHUNK_SECONDS = 300.0
 _STT_MLX_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
 _STT_MLX_MEMORY_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
 _LEGACY_AUDIOBOOK_STT_OUTPUT_RE = re.compile(r"/file-\d{4}\.json(?:\s|$)")
+
+
+class _SttWorker:
+    """One speech-recognition process for a whole book: the model loads once.
+
+    Requests and answers are JSON lines (``stt_worker --serve``). A reader thread
+    turns the answers into a queue, so waiting never blocks cancellation checks.
+    """
+
+    def __init__(self, command: list[str], *, env: dict[str, str], stderr_path: Path) -> None:
+        stderr_path.parent.mkdir(parents=True, exist_ok=True)
+        self.stderr_path = stderr_path
+        self._stderr = stderr_path.open("a", encoding="utf-8")
+        try:
+            self.process = subprocess.Popen(
+                command,
+                env=env,
+                text=True,
+                bufsize=1,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr,
+            )
+        except BaseException:
+            self._stderr.close()
+            raise
+        self._answers: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        threading.Thread(target=self._read, name="audiobook-stt-answers", daemon=True).start()
+
+    def _read(self) -> None:
+        try:
+            for line in self.process.stdout or ():
+                try:
+                    value = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, dict):
+                    self._answers.put(value)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._answers.put(None)  # the worker closed its output: it exited
+
+    def submit(self, request: dict[str, Any]) -> bool:
+        try:
+            assert self.process.stdin is not None
+            self.process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            self.process.stdin.flush()
+            return True
+        except (OSError, ValueError, AssertionError):
+            return False
+
+    def answer(self, timeout: float) -> dict[str, Any] | None | bool:
+        """The next answer, None when the worker exited, False when nothing arrived yet."""
+        try:
+            return self._answers.get(timeout=timeout)
+        except queue.Empty:
+            return False
+
+    def stderr_tail(self) -> str:
+        try:
+            self._stderr.flush()
+            return self.stderr_path.read_text(encoding="utf-8", errors="replace").strip()[-1200:]
+        except OSError:
+            return ""
+
+    def stop(self, timeout: float = 15.0) -> None:
+        try:
+            if self.process.stdin is not None and self.process.poll() is None:
+                self.process.stdin.write(json.dumps({"op": "exit"}) + "\n")
+                self.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.kill()
+        finally:
+            self._close()
+
+    def kill(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=5)
+        self._close()
+
+    def _close(self) -> None:
+        for handle in (self.process.stdin, self._stderr):
+            try:
+                if handle is not None:
+                    handle.close()
+            except (OSError, ValueError):
+                pass
+
+
 _READING_AUDIO_ALIGNMENT_REVISION = "reading-audio-v3-leading-prefix-v22"
 _CHAPTER_START_PRECISION_MODEL = "mlx-community/whisper-small-mlx"
 _CHAPTER_START_PRECISION_BEFORE_SECONDS = 24.0
@@ -63,6 +169,7 @@ _CHAPTER_START_JITEN_BASE = "https://api.jiten.moe/api"
 
 
 _READING_NOTATION_RE = re.compile(r"([\u3400-\u9fff々〆ヵヶ]+)\[([^\]]+)\]")
+
 
 def _reading_notation_to_hiragana(value: Any) -> str:
     """Convert Jiten-style ruby notation into a compact spoken kana form."""
@@ -201,7 +308,12 @@ def terminate_legacy_audiobook_stt_workers(*, grace_seconds: float = 0.6) -> lis
         match = re.match(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(.*)$", raw_line)
         if not match:
             continue
-        uid, pid, _ppid, command = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+        uid, pid, _ppid, command = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+            match.group(4),
+        )
         if uid != own_uid or pid == current_pid:
             continue
         if "pudge.subtitles.stt_worker" not in command or "--words" not in command:
@@ -240,7 +352,6 @@ def terminate_legacy_audiobook_stt_workers(*, grace_seconds: float = 0.6) -> lis
     return terminated
 
 
-
 def audiobook_series_path_matches(value: str, series_title: str) -> bool:
     """Strict series identity for audiobook release/file paths.
 
@@ -249,6 +360,7 @@ def audiobook_series_path_matches(value: str, series_title: str) -> bool:
     (``新説 狼と香辛料``).  Evaluate path components after removing common
     author/index wrappers instead of doing an arbitrary substring match.
     """
+
     def key(text: str) -> str:
         normalized = unicodedata.normalize("NFKC", html.unescape(str(text or "")))
         return re.sub(r"[^0-9A-Za-zぁ-ゟ゠-ヿ一-鿿々〆ヶ]+", "", normalized).casefold()
@@ -256,7 +368,11 @@ def audiobook_series_path_matches(value: str, series_title: str) -> bool:
     needle = key(series_title)
     if not needle:
         return False
-    components = [part.strip() for part in re.split(r"[/\\]+", unicodedata.normalize("NFKC", str(value or ""))) if part.strip()]
+    components = [
+        part.strip()
+        for part in re.split(r"[/\\]+", unicodedata.normalize("NFKC", str(value or "")))
+        if part.strip()
+    ]
     for raw in components or [str(value or "")]:
         cleaned = str(raw)
         # Remove repeated author/index/store wrappers only from the beginning.
@@ -268,13 +384,15 @@ def audiobook_series_path_matches(value: str, series_title: str) -> bool:
         component = key(cleaned)
         if not component.startswith(needle):
             continue
-        suffix = component[len(needle):]
+        suffix = component[len(needle) :]
         if not suffix:
             return True
         # A real volume appends a volume marker/roman numeral or audiobook
         # annotation.  A different Japanese title appended after the requested
         # series (e.g. 狼と香辛料 狼と羊皮紙II) is a spin-off, not that series.
-        if suffix[0].isdigit() or re.match(r"^[ivxlcdm]+(?:完全版|オーディオブック|audiobook|unabridged|$)", suffix, re.I):
+        if suffix[0].isdigit() or re.match(
+            r"^[ivxlcdm]+(?:完全版|オーディオブック|audiobook|unabridged|$)", suffix, re.I
+        ):
             return True
         if suffix.startswith(("完全版", "オーディオブック", "audiobook", "unabridged")):
             return True
@@ -478,13 +596,24 @@ def _audiobook_volume(
             return None
         canonical = ""
         remaining = total
-        for amount, glyph in ((100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+        for amount, glyph in (
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ):
             while remaining >= amount:
                 canonical += glyph
                 remaining -= amount
         return total if canonical == token else None
 
     if series_title:
+
         def compact_title(value: str) -> str:
             normalized = unicodedata.normalize("NFKC", str(value or ""))
             normalized = re.sub(r"^\s*[\[【(（][^\]】)）]{1,100}[\]】)）]\s*", "", normalized).strip()
@@ -499,13 +628,13 @@ def _audiobook_volume(
                 component_folded = component.casefold()
                 if not component_folded.startswith(series_key):
                     continue
-                suffix = component[len(compact_title(series_title)):]
+                suffix = component[len(compact_title(series_title)) :]
                 arabic = re.match(r"^(\d{1,3})(?:$|\D)", suffix)
                 if arabic:
                     number = int(arabic.group(1))
                     if 0 < number <= 300:
                         return number
-                roman = re.match(r"^([IVXLCDM]{1,8})(?:$|[^IVXLCDM])", suffix, flags=re.I)
+                roman = re.match(r"^([IVXLCDM]{1,8})(?:$|[^IVXLCDMivxlcdm])", suffix)
                 if roman:
                     number = roman_number(roman.group(1))
                     if number is not None:
@@ -522,13 +651,13 @@ def _audiobook_volume(
 
     for part in path_parts or [text]:
         stem_text = clean_component(part)
-        suffix = re.search(r"[ぁ-ゟ゠-ヿ一-鿿].*?(\d{1,3})\s*$", stem_text)
+        suffix = re.search(r"[ぁ-ゟ゠-ヿ一-鿿].*?(?<!\d)(\d{1,3})\s*$", stem_text)
         if suffix:
             number = int(suffix.group(1))
             if 0 < number <= 300:
                 return number
 
-        roman = re.search(r"[ぁ-ゟ゠-ヿ一-鿿].*?([IVXLCDM]{1,8})\s*$", stem_text, flags=re.I)
+        roman = re.search(r"[ぁ-ゟ゠-ヿ一-鿿].*?(?<![A-Za-z])([IVXLCDM]{1,8})\s*$", stem_text)
         if roman:
             values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
             token = roman.group(1).upper()
@@ -591,7 +720,6 @@ def _audiobook_volume(
                 if 0 < number <= 300:
                     return number
     return None
-
 
 
 def audiobook_torrent_files_from_payload(payload: bytes) -> list[dict[str, Any]]:
@@ -736,16 +864,18 @@ def audiobook_torrent_pack_plan(
             series_title=series_title,
             allow_bare_numeric_volume_dirs=allow_bare_numeric_volume_dirs,
         )
-        normalized.append({
-            "file_id": file_id,
-            "name": name,
-            "size_bytes": size,
-            "priority": int(raw.get("priority") or 0),
-            "extension": suffix,
-            "volume": volume,
-            "is_audio": suffix in AUDIOBOOK_EXTENSIONS,
-            "is_archive": suffix in {".zip", ".rar", ".7z"},
-        })
+        normalized.append(
+            {
+                "file_id": file_id,
+                "name": name,
+                "size_bytes": size,
+                "priority": int(raw.get("priority") or 0),
+                "extension": suffix,
+                "volume": volume,
+                "is_audio": suffix in AUDIOBOOK_EXTENSIONS,
+                "is_archive": suffix in {".zip", ".rar", ".7z"},
+            }
+        )
 
     payload_files = [row for row in normalized if row["is_audio"] or row["is_archive"]]
     archives = [row for row in payload_files if row["is_archive"]]
@@ -771,17 +901,19 @@ def audiobook_torrent_pack_plan(
     volumes = []
     for volume, rows in sorted(grouped.items()):
         rows = sorted(rows, key=lambda row: (str(row["name"]).casefold(), int(row["file_id"])))
-        volumes.append({
-            "volume": volume,
-            "file_ids": [int(row["file_id"]) for row in rows],
-            "size_bytes": sum(int(row["size_bytes"]) for row in rows),
-            "files": rows,
-        })
+        volumes.append(
+            {
+                "volume": volume,
+                "file_ids": [int(row["file_id"]) for row in rows],
+                "size_bytes": sum(int(row["size_bytes"]) for row in rows),
+                "files": rows,
+            }
+        )
     return {
         "selective": bool(audio and grouped and not archives),
-        "reason": "ok" if audio and grouped and not archives else (
-            "archive_mixed_with_audio" if archives else "volume_not_detected"
-        ),
+        "reason": "ok"
+        if audio and grouped and not archives
+        else ("archive_mixed_with_audio" if archives else "volume_not_detected"),
         "files": normalized,
         "volumes": volumes,
         "ungrouped_audio": sorted(ungrouped, key=lambda row: str(row["name"]).casefold()),
@@ -805,7 +937,9 @@ def _audiobook_title_key(value: str) -> str:
         " ",
         text,
     )
-    text = re.sub(r"(?i)(?:～|~)?\s*(?:完全版\s*)?(?:オーディオブック|朗読版|audio\s*book|audiobook)", " ", text)
+    text = re.sub(
+        r"(?i)(?:～|~)?\s*(?:完全版\s*)?(?:オーディオブック|朗読版|audio\s*book|audiobook)", " ", text
+    )
     text = re.sub(
         r"(?i)\b(?:light[ ._-]*novel|novel|vol(?:ume)?|v)\s*[._ -]*0*\d{1,3}\b",
         " ",
@@ -816,16 +950,40 @@ def _audiobook_title_key(value: str) -> str:
     return re.sub(r"[^\wぁ-ゟ゠-ヿ一-鿿]+", "", text).casefold()
 
 
+_CONTENT_SAMPLE_BYTES = 64 * 1024
+
+
+def _sampled_content_digest(path: Path, size: int) -> str:
+    """Digest of four samples from the middle of an audio file.
+
+    Renaming the file or editing its tags in place does not change the audio
+    in the middle, so hours of STT and alignment survive both.
+    """
+    digest = hashlib.sha256(b"audio-content-v1\0")
+    with path.open("rb") as handle:
+        if size <= 8 * _CONTENT_SAMPLE_BYTES:
+            digest.update(handle.read())
+        else:
+            for fraction in (0.2, 0.4, 0.6, 0.8):
+                handle.seek(int(size * fraction))
+                digest.update(handle.read(_CONTENT_SAMPLE_BYTES))
+    return digest.hexdigest()[:32]
+
+
 def _audiobook_title_match_score(left: str, right: str) -> float:
     left_key, right_key = _audiobook_title_key(left), _audiobook_title_key(right)
     if not left_key or not right_key:
         return 0.0
     score = float(fuzz.ratio(left_key, right_key))
     shorter, longer = sorted((left_key, right_key), key=len)
-    # Strong containment handles legitimate title prefixes such as
-    # また、同じ夢を見ていた -> 同じ夢を見ていた without requiring AniList.
-    if len(shorter) >= 6 and shorter in longer:
-        score = max(score, 98.0 - min(5.0, (len(longer) - len(shorter)) * 0.5))
+    # A title inside a longer one (また、同じ夢を見ていた / 同じ夢を見ていた, or a
+    # spin-off carrying the main series name) is a candidate, never proof on
+    # its own: it stays below the 90-point auto-link threshold unless the
+    # volumes agree or AniList confirms it.
+    if shorter != longer and shorter in longer:
+        if len(shorter) >= 6:
+            score = max(score, 89.0 - min(5.0, (len(longer) - len(shorter)) * 0.5))
+        score = min(score, 89.0)
     return score
 
 
@@ -849,7 +1007,17 @@ def _roman_volume_value(token: str) -> int | None:
         return None
     canonical = ""
     remaining = total
-    for amount, glyph in ((100, "C"), (90, "XC"), (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I")):
+    for amount, glyph in (
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ):
         while remaining >= amount:
             canonical += glyph
             remaining -= amount
@@ -859,8 +1027,12 @@ def _roman_volume_value(token: str) -> int | None:
 def _audiobook_series_title(value: str, *, volume: int | None = None) -> str:
     text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).strip()
     text = re.sub(r"^\s*\[[^\]]{1,80}\]\s*", "", text)
-    text = re.sub(r"(?i)\[(?:audiobook\.jp|audible|amazon|asin|storytel|kikubon|listen|audio)[^\]]{0,100}\]", " ", text)
-    text = re.sub(r"(?i)(?:～|~)?\s*(?:完全版\s*)?(?:オーディオブック|朗読版|audio\s*book|audiobook)", " ", text)
+    text = re.sub(
+        r"(?i)\[(?:audiobook\.jp|audible|amazon|asin|storytel|kikubon|listen|audio)[^\]]{0,100}\]", " ", text
+    )
+    text = re.sub(
+        r"(?i)(?:～|~)?\s*(?:完全版\s*)?(?:オーディオブック|朗読版|audio\s*book|audiobook)", " ", text
+    )
     text = re.sub(r"(?i)\b(?:light[ ._-]*novel|novel|vol(?:ume)?|v)\s*[._ -]*0*\d{1,3}\b", " ", text)
     text = re.sub(r"第\s*0*\d{1,3}\s*巻|0*\d{1,3}\s*巻", " ", text)
     text = re.sub(r"\.(?:m4b|m4a|mp3|aac|opus|ogg|flac|wav)$", "", text, flags=re.I)
@@ -873,11 +1045,11 @@ def _audiobook_series_title(value: str, *, volume: int | None = None) -> str:
     # stable library series.  Requiring Japanese text avoids turning generic
     # numeric/roman titles into accidental series names.
     if volume and re.search(r"[ぁ-ゟ゠-ヿ一-鿿]", text):
-        arabic = re.search(r"\s*0*(\d{1,3})\s*$", text)
+        arabic = re.search(r"\s*(?<!\d)0*(\d{1,3})\s*$", text)
         if arabic and int(arabic.group(1)) == int(volume):
             text = text[: arabic.start()].rstrip(" ～~-/")
         else:
-            roman = re.search(r"\s*([IVXLCDM]{1,8})\s*$", text, flags=re.I)
+            roman = re.search(r"\s*(?<![A-Za-z])([IVXLCDM]{1,8})\s*$", text)
             if roman and _roman_volume_value(roman.group(1)) == int(volume):
                 text = text[: roman.start()].rstrip(" ～~-/")
     return text
@@ -911,7 +1083,9 @@ class AudiobookService:
         self.python = str(python or os.getenv("PUDGE_PYTHON", "").strip() or sys.executable)
         self.stt_model = str(stt_model or "mlx-community/whisper-tiny")
         self.cache_dir = Path(cache_dir)
-        self.cover_cache_dir = Path(cover_cache_dir) if cover_cache_dir is not None else self.cache_dir / "covers"
+        self.cover_cache_dir = (
+            Path(cover_cache_dir) if cover_cache_dir is not None else self.cache_dir / "covers"
+        )
         self.cover_cache_dir.mkdir(parents=True, exist_ok=True)
         self.job_center = job_center
         self.work_scheduler = work_scheduler
@@ -1045,7 +1219,8 @@ class AudiobookService:
         while True:
             with self._worker_lock:
                 workers = [
-                    thread for thread in self._worker_threads
+                    thread
+                    for thread in self._worker_threads
                     if self._worker_alive(thread) and thread is not threading.current_thread()
                 ]
             if not workers:
@@ -1158,11 +1333,15 @@ class AudiobookService:
             completed = subprocess.run(
                 [
                     self.ffmpeg,
-                    "-v", "error",
+                    "-v",
+                    "error",
                     "-y",
-                    "-i", str(source),
-                    "-map", "0:v:0",
-                    "-frames:v", "1",
+                    "-i",
+                    str(source),
+                    "-map",
+                    "0:v:0",
+                    "-frames:v",
+                    "1",
                     str(target),
                 ],
                 text=True,
@@ -1171,7 +1350,12 @@ class AudiobookService:
             )
         except (OSError, subprocess.TimeoutExpired):
             completed = None
-        if completed is not None and completed.returncode == 0 and target.is_file() and target.stat().st_size > 0:
+        if (
+            completed is not None
+            and completed.returncode == 0
+            and target.is_file()
+            and target.stat().st_size > 0
+        ):
             missing.unlink(missing_ok=True)
             return f"covers/{target.name}"
         target.unlink(missing_ok=True)
@@ -1251,7 +1435,9 @@ class AudiobookService:
     @staticmethod
     def _looks_like_disc_folder(path: Path) -> bool:
         name = unicodedata.normalize("NFKC", path.name).strip().casefold()
-        return bool(re.match(r"^(?:cd|disc|disk|part|track|chapter|chap|volume|vol)[ ._-]*\d+(?:\D.*)?$", name))
+        return bool(
+            re.match(r"^(?:cd|disc|disk|part|track|chapter|chap|volume|vol)[ ._-]*\d+(?:\D.*)?$", name)
+        )
 
     def folder_import_targets(self, folder: Path) -> list[Path]:
         """Resolve a selected folder into one or several audiobook roots.
@@ -1263,15 +1449,18 @@ class AudiobookService:
         """
         folder = folder.expanduser().resolve()
         if not folder.is_dir():
-            raise ValueError("Audiobook folder does not exist")
+            raise ValueError(err("audiobook.folderMissing"))
         try:
             direct_audio = [
-                item for item in folder.iterdir()
+                item
+                for item in folder.iterdir()
                 if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
             ]
-            children = [item.resolve() for item in folder.iterdir() if item.is_dir() and not item.name.startswith(".")]
+            children = [
+                item.resolve() for item in folder.iterdir() if item.is_dir() and not item.name.startswith(".")
+            ]
         except OSError as exc:
-            raise ValueError(f"Could not read audiobook folder: {exc}") from exc
+            raise ValueError(err("audiobook.folderUnreadable", error=exc)) from exc
         if direct_audio:
             return [folder]
         groups = [child for child in children if self._folder_files(child)]
@@ -1389,13 +1578,24 @@ class AudiobookService:
     ) -> None:
         try:
             duration, embedded = self._probe(path, timeout=180.0)
-            files = [{
-                "index": 0, "path": str(path), "title": path.stem,
-                "duration": duration, "start": 0.0, "end": duration,
-            }]
-            chapters = embedded or [{
-                "index": 0, "title": path.stem, "start": 0.0, "end": duration,
-            }]
+            files = [
+                {
+                    "index": 0,
+                    "path": str(path),
+                    "title": path.stem,
+                    "duration": duration,
+                    "start": 0.0,
+                    "end": duration,
+                }
+            ]
+            chapters = embedded or [
+                {
+                    "index": 0,
+                    "title": path.stem,
+                    "start": 0.0,
+                    "end": duration,
+                }
+            ]
             self._upsert(
                 path=path,
                 title=str(title_override or path.stem),
@@ -1408,10 +1608,14 @@ class AudiobookService:
             if duration > 0 and prepare_transcription:
                 self.prepare_transcription(int(book_id))
         except Exception as exc:
-            self._set_transcription_job(int(book_id), {
-                "status": "idle", "ready": False,
-                "metadata_error": str(exc),
-            })
+            self._set_transcription_job(
+                int(book_id),
+                {
+                    "status": "idle",
+                    "ready": False,
+                    "metadata_error": str(exc),
+                },
+            )
         finally:
             with self._lock:
                 self._metadata_probe_pending.discard(int(book_id))
@@ -1426,7 +1630,7 @@ class AudiobookService:
     ) -> dict[str, Any]:
         path = path.expanduser().resolve()
         if not path.is_file() or path.suffix.casefold() not in AUDIOBOOK_EXTENSIONS:
-            raise ValueError("Unsupported audiobook format")
+            raise ValueError(err("audiobook.unsupportedFormat"))
         metadata_pending = False
         try:
             # Local files normally probe in milliseconds.  iCloud placeholders
@@ -1441,10 +1645,16 @@ class AudiobookService:
                 duration, embedded = self._probe(path)
         except subprocess.TimeoutExpired:
             duration, embedded, metadata_pending = 0.0, [], True
-        files = [{
-            "index": 0, "path": str(path), "title": path.stem,
-            "duration": duration, "start": 0.0, "end": duration,
-        }]
+        files = [
+            {
+                "index": 0,
+                "path": str(path),
+                "title": path.stem,
+                "duration": duration,
+                "start": 0.0,
+                "end": duration,
+            }
+        ]
         chapters = embedded or [{"index": 0, "title": path.stem, "start": 0.0, "end": duration}]
         book = self._upsert(
             path=path,
@@ -1483,10 +1693,10 @@ class AudiobookService:
     ) -> dict[str, Any]:
         folder = folder.expanduser().resolve()
         if not folder.is_dir():
-            raise ValueError("Audiobook folder does not exist")
+            raise ValueError(err("audiobook.folderMissing"))
         paths = self._folder_files(folder)
         if not paths:
-            raise ValueError("No supported audio files found in this folder")
+            raise ValueError(err("audiobook.noAudioFiles"))
         files: list[dict[str, Any]] = []
         chapters: list[dict[str, Any]] = []
         cursor = 0.0
@@ -1535,6 +1745,21 @@ class AudiobookService:
             self.prepare_transcription(int(book["id"]))
         return self.book(int(book["id"]))
 
+    def _position_file_rows(self, book_id: int) -> list[dict[str, Any]]:
+        """File rows for the 4-per-second position clock, re-read at most every 10 s.
+
+        mpv's playlist is fixed when playback starts, so the rows cannot drift
+        within a session; this only saves a SQLite connection per sample.
+        """
+        cache = self.__dict__.setdefault("_position_rows_cache", {})
+        now = time.monotonic()
+        cached = cache.get(int(book_id))
+        if cached is not None and now - cached[0] < 10.0:
+            return cached[1]
+        rows = self._file_rows(book_id)
+        cache[int(book_id)] = (now, rows)
+        return rows
+
     def _file_rows(self, book_id: int) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             rows = conn.execute(
@@ -1549,10 +1774,7 @@ class AudiobookService:
         with self._lock:
             previous = self._last_positions.get(book_id)
             self._last_positions[book_id] = value
-            if (
-                previous is None
-                or abs(value - float(previous)) >= _PLAYBACK_MOTION_EPSILON
-            ):
+            if previous is None or abs(value - float(previous)) >= _PLAYBACK_MOTION_EPSILON:
                 self._last_motion_at[book_id] = now
 
     def _publish_seek_position(self, book_id: int, position: float) -> None:
@@ -1573,7 +1795,12 @@ class AudiobookService:
         """Return a small, non-library snapshot for the R8 runtime recorder."""
         with self._lock:
             candidates = [
-                (int(book_id), process, self._last_positions.get(int(book_id)), self._speeds.get(int(book_id), 1.0))
+                (
+                    int(book_id),
+                    process,
+                    self._last_positions.get(int(book_id)),
+                    self._speeds.get(int(book_id), 1.0),
+                )
                 for book_id, process in self._players.items()
                 if process is not None and process.poll() is None
             ]
@@ -1582,12 +1809,14 @@ class AudiobookService:
             if process.poll() is not None:
                 continue
             active = self.is_playback_active(book_id)
-            observations.append({
-                "book_id": book_id,
-                "position": max(0.0, float(position or 0.0)),
-                "speed": max(0.1, float(speed or 1.0)),
-                "active": bool(active),
-            })
+            observations.append(
+                {
+                    "book_id": book_id,
+                    "position": max(0.0, float(position or 0.0)),
+                    "speed": max(0.1, float(speed or 1.0)),
+                    "active": bool(active),
+                }
+            )
         return observations
 
     def is_paused(self, book_id: int) -> bool:
@@ -1625,11 +1854,7 @@ class AudiobookService:
 
         with self._lock:
             last_motion_at = getattr(self, "_last_motion_at", {}).get(book_id)
-        if (
-            last_motion_at is not None
-            and time.monotonic() - float(last_motion_at)
-            > _PLAYBACK_STALL_SECONDS
-        ):
+        if last_motion_at is not None and time.monotonic() - float(last_motion_at) > _PLAYBACK_STALL_SECONDS:
             return False
         return True
 
@@ -1638,18 +1863,15 @@ class AudiobookService:
         if not chapters:
             return None
         return next(
-            (
-                chapter
-                for chapter in chapters
-                if float(chapter["start"]) <= position < float(chapter["end"])
-            ),
+            (chapter for chapter in chapters if float(chapter["start"]) <= position < float(chapter["end"])),
             chapters[-1],
         )
 
     def _bookmarks(self, book_id: int) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id", (int(book_id),)
+                "SELECT * FROM audiobook_bookmarks WHERE book_id=? ORDER BY sort_order,position,id",
+                (int(book_id),),
             ).fetchall()
         return [
             {
@@ -1711,7 +1933,7 @@ class AudiobookService:
                 else None
             )
         if row is None:
-            raise KeyError(f"Unknown audiobook id={book_id}")
+            raise KeyError(err("audiobook.unknownBook", bookId=book_id))
         chapter_payload = [
             {
                 "index": int(chapter["chapter_index"]),
@@ -1740,7 +1962,9 @@ class AudiobookService:
             or ""
         )
         embedded_cover = "" if external_cover else self._book_embedded_cover_url(int(book_id))
-        cover_pending = bool(not external_cover and not embedded_cover and self._book_embedded_cover_pending(int(book_id)))
+        cover_pending = bool(
+            not external_cover and not embedded_cover and self._book_embedded_cover_pending(int(book_id))
+        )
         linked_volume = (
             int(linked_novel["volume"] or 0)
             if linked_novel is not None and linked_novel["volume"] is not None
@@ -1773,16 +1997,25 @@ class AudiobookService:
             "bookmarks": self._bookmarks(int(book_id)),
             "sleep_timer_seconds": max(0, round(deadline - time.monotonic())) if deadline else None,
             "sleep_at_chapter_end": chapter_end is not None,
-            "transcription": self.transcription_status(int(book_id)) if include_transcription else {"status": "unknown", "ready": False},
-            "anilist_id": int(identity["anilist_id"]) if identity is not None else (
-                int(linked_novel["anilist_id"]) if linked_novel is not None and linked_novel["anilist_id"] is not None else None
+            "transcription": self.transcription_status(int(book_id))
+            if include_transcription
+            else {"status": "unknown", "ready": False},
+            "anilist_id": int(identity["anilist_id"])
+            if identity is not None
+            else (
+                int(linked_novel["anilist_id"])
+                if linked_novel is not None and linked_novel["anilist_id"] is not None
+                else None
             ),
-            "anilist_title": str(identity["title"] or "") if identity is not None else (
-                str(linked_novel["title"] or "") if linked_novel is not None else ""
-            ),
-            "anilist_site_url": str(identity["site_url"] or "") if identity is not None else (
+            "anilist_title": str(identity["title"] or "")
+            if identity is not None
+            else (str(linked_novel["title"] or "") if linked_novel is not None else ""),
+            "anilist_site_url": str(identity["site_url"] or "")
+            if identity is not None
+            else (
                 f"https://anilist.co/manga/{int(linked_novel['anilist_id'])}"
-                if linked_novel is not None and linked_novel["anilist_id"] is not None else ""
+                if linked_novel is not None and linked_novel["anilist_id"] is not None
+                else ""
             ),
             "linked_light_novel": dict(linked_novel) if linked_novel is not None else None,
             "series_title": series_title,
@@ -1791,7 +2024,45 @@ class AudiobookService:
             "cover_url": external_cover or embedded_cover,
             "cover_pending": cover_pending,
             "metadata_pending": int(book_id) in self._metadata_probe_pending,
+        } | self._shelf_override(int(book_id), series_title, int(inferred_volume))
+
+    def _metadata_overrides(self) -> dict[int, dict[str, Any]]:
+        cached = getattr(self, "_overrides", None)
+        if cached is None:
+            with self.db.connect() as conn:
+                cached = library_overrides.load(conn, "audiobook")
+            self._overrides = cached
+        return cached
+
+    def _shelf_override(self, book_id: int, series_title: str, volume: int) -> dict[str, Any]:
+        """Hand-made volume/series correction for one audiobook payload ({} when none)."""
+        override = self._metadata_overrides().get(int(book_id))
+        if not override:
+            return {}
+        item = {
+            "id": int(book_id),
+            "series_title": series_title,
+            "series_key": _audiobook_title_key(series_title),
+            "volume": int(volume),
         }
+        return library_overrides.apply(item, override, _audiobook_title_key)
+
+    def set_metadata_override(self, book_id: int, *, volume: int | None, series_title: str) -> dict[str, Any]:
+        """Store a hand-made volume/series correction; it wins over the file name and the linked LN."""
+        with self.db.connect() as conn:
+            if conn.execute("SELECT 1 FROM audiobooks WHERE id=?", (int(book_id),)).fetchone() is None:
+                raise ValueError(err("audiobook.notFound"))
+            stored = library_overrides.store(
+                conn, "audiobook", int(book_id), volume=volume, series_title=series_title
+            )
+        self._overrides = None
+        LOGGER.info(
+            "Audiobook manual metadata book=%s volume=%s series=%s",
+            book_id,
+            stored["volume"],
+            stored["series_title"],
+        )
+        return self.book(int(book_id))
 
     def auto_link_audiobook(self, audiobook_id: int) -> dict[str, Any] | None:
         """Link an unambiguous local LN/audiobook pair and share its AniList identity."""
@@ -1803,9 +2074,10 @@ class AudiobookService:
         # AniList-free title linker unnecessarily timing-sensitive while a LN
         # import and audiobook import were completing close together.
         with self.db.connect() as conn:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'"
-            ).fetchone() is None:
+            if (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'").fetchone()
+                is None
+            ):
                 self._last_auto_link_reason = "no-ln-table"
                 return None
             audio = conn.execute(
@@ -1830,7 +2102,9 @@ class AudiobookService:
             ).fetchall()
 
             audio_title = str(audio["title"] or Path(str(audio["path"])).stem)
-            audio_volume = _audiobook_volume(audio_title) or _audiobook_volume(_audiobook_path_label(str(audio["path"])))
+            audio_volume = _audiobook_volume(audio_title) or _audiobook_volume(
+                _audiobook_path_label(str(audio["path"]))
+            )
             identity_id = int(identity["anilist_id"]) if identity is not None else None
             ranked: list[tuple[float, Any]] = []
             for novel in novels:
@@ -1838,8 +2112,18 @@ class AudiobookService:
                 if audio_volume and novel_volume and audio_volume != novel_volume:
                     continue
                 score = _audiobook_title_match_score(audio_title, str(novel["title"]))
-                if identity_id and novel["anilist_id"] is not None and int(novel["anilist_id"]) == identity_id:
+                anilist_match = bool(
+                    identity_id
+                    and novel["anilist_id"] is not None
+                    and int(novel["anilist_id"]) == identity_id
+                )
+                if anilist_match:
                     score = max(score, 120.0)
+                elif not (audio_volume and novel_volume) and _audiobook_title_key(
+                    audio_title
+                ) != _audiobook_title_key(str(novel["title"])):
+                    # Volume unknown on one side: only the same title or AniList links by itself.
+                    score = min(score, 89.0)
                 if audio_volume and novel_volume == audio_volume:
                     score += 8.0
                 ranked.append((score, novel))
@@ -1892,17 +2176,17 @@ class AudiobookService:
 
     def auto_link_light_novel(self, ln_book_id: int) -> dict[str, Any] | None:
         with self.db.connect() as conn:
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'"
-            ).fetchone() is None:
+            if (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'").fetchone()
+                is None
+            ):
                 return None
             linked = conn.execute(
                 "SELECT audiobook_id FROM reading_audio_links WHERE ln_book_id=?",
                 (int(ln_book_id),),
             ).fetchone()
             audiobook_ids = [
-                int(row["id"])
-                for row in conn.execute("SELECT id FROM audiobooks ORDER BY updated_at DESC")
+                int(row["id"]) for row in conn.execute("SELECT id FROM audiobooks ORDER BY updated_at DESC")
             ]
         if linked is not None:
             return {"ln_book_id": int(ln_book_id), "audiobook_id": int(linked["audiobook_id"])}
@@ -1915,16 +2199,19 @@ class AudiobookService:
     def search_catalog(self) -> list[dict[str, Any]]:
         """Return lightweight metadata for global search without STT/cover side effects."""
         with self.db.connect() as conn:
-            books = conn.execute("SELECT id,title,path FROM audiobooks ORDER BY updated_at DESC,id DESC").fetchall()
+            books = conn.execute(
+                "SELECT id,title,path FROM audiobooks ORDER BY updated_at DESC,id DESC"
+            ).fetchall()
             identities = {
                 int(row["local_id"]): row
                 for row in conn.execute(
                     "SELECT local_id,anilist_id,title,cover_url,site_url FROM media_identities WHERE kind='audiobook'"
                 ).fetchall()
             }
-            has_novels = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'"
-            ).fetchone() is not None
+            has_novels = (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ln_books'").fetchone()
+                is not None
+            )
             links = {}
             if has_novels:
                 for row in conn.execute(
@@ -1947,9 +2234,7 @@ class AudiobookService:
                 or _audiobook_volume(_audiobook_path_label(str(row["path"] or "")))
                 or 0
             )
-            series_title = _audiobook_series_title(
-                linked_title or title, volume=inferred_volume
-            ) or title
+            series_title = _audiobook_series_title(linked_title or title, volume=inferred_volume) or title
             result.append(
                 {
                     "id": book_id,
@@ -1958,11 +2243,30 @@ class AudiobookService:
                     "series_title": series_title,
                     "series_key": _audiobook_title_key(series_title),
                     "volume": int(inferred_volume),
-                    "anilist_id": int(identity["anilist_id"]) if identity is not None else (int(linked["anilist_id"]) if linked is not None and linked["anilist_id"] is not None else None),
+                    "anilist_id": int(identity["anilist_id"])
+                    if identity is not None
+                    else (
+                        int(linked["anilist_id"])
+                        if linked is not None and linked["anilist_id"] is not None
+                        else None
+                    ),
                     "anilist_title": str(identity["title"] or "") if identity is not None else linked_title,
-                    "cover_url": str((identity["cover_url"] if identity is not None else "") or (linked["cover_url"] if linked is not None else "") or ""),
-                    "linked_light_novel": ({"title": linked_title, "volume": linked["volume"], "anilist_id": linked["anilist_id"]} if linked is not None else None),
+                    "cover_url": str(
+                        (identity["cover_url"] if identity is not None else "")
+                        or (linked["cover_url"] if linked is not None else "")
+                        or ""
+                    ),
+                    "linked_light_novel": (
+                        {
+                            "title": linked_title,
+                            "volume": linked["volume"],
+                            "anilist_id": linked["anilist_id"],
+                        }
+                        if linked is not None
+                        else None
+                    ),
                 }
+                | self._shelf_override(book_id, series_title, int(inferred_volume))
             )
         return result
 
@@ -2007,9 +2311,7 @@ class AudiobookService:
         with self.db.connect() as conn:
             return {
                 int(row["audiobook_id"])
-                for row in conn.execute(
-                    "SELECT DISTINCT audiobook_id FROM reading_audio_links"
-                ).fetchall()
+                for row in conn.execute("SELECT DISTINCT audiobook_id FROM reading_audio_links").fetchall()
             }
 
     def state(self, *, queue_missing: bool = True) -> dict[str, Any]:
@@ -2029,7 +2331,9 @@ class AudiobookService:
                 if audiobook_id not in linked_ids:
                     continue
                 transcription = book.get("transcription") or {}
-                if str(transcription.get("status") or "") in {"idle", "queued"} and not transcription.get("ready"):
+                if str(transcription.get("status") or "") in {"idle", "queued"} and not transcription.get(
+                    "ready"
+                ):
                     book["transcription"] = self.prepare_transcription(
                         audiobook_id,
                         priority=WorkPriority.BACKGROUND,
@@ -2073,26 +2377,27 @@ class AudiobookService:
             resumed += 1
         for row in links:
             try:
-                self.prepare_alignment(
-                    int(row["ln_book_id"]), priority=WorkPriority.BACKGROUND
-                )
+                self.prepare_alignment(int(row["ln_book_id"]), priority=WorkPriority.BACKGROUND)
             except Exception:
                 continue
         return resumed
 
     def set_position(self, book_id: int, position: float) -> None:
+        mobile = getattr(self, "mobile_progress", None)
+        if mobile is not None and mobile.save_mac_position(int(book_id), float(position)):
+            return
         with self.db.connect() as conn:
-            row = conn.execute(
-                "SELECT duration FROM audiobooks WHERE id=?", (int(book_id),)
-            ).fetchone()
+            row = conn.execute("SELECT duration FROM audiobooks WHERE id=?", (int(book_id),)).fetchone()
             if row is None:
-                raise KeyError(f"Unknown audiobook id={book_id}")
+                raise KeyError(err("audiobook.unknownBook", bookId=book_id))
             duration = float(row["duration"] or 0.0)
             value = max(0.0, min(float(position), duration or float(position)))
-            finished = bool(duration > 0 and value >= duration * 0.98)
+            reached_end = bool(duration > 0 and value >= duration * 0.98)
+            # "Finished" is only ever set here (like light novels): seeking back
+            # to re-listen keeps it; "Mark unfinished" clears it explicitly.
             conn.execute(
-                "UPDATE audiobooks SET position=?,finished=?,updated_at=? WHERE id=?",
-                (value, int(finished), time.time(), int(book_id)),
+                "UPDATE audiobooks SET position=?,finished=CASE WHEN ? THEN 1 ELSE finished END,updated_at=? WHERE id=?",
+                (value, int(reached_end), time.time(), int(book_id)),
             )
 
     @staticmethod
@@ -2108,7 +2413,9 @@ class AudiobookService:
                 if remaining <= 0:
                     return None
                 client.settimeout(remaining)
-                client.sendall(json.dumps({"command": command, "request_id": request_id}).encode("utf-8") + b"\n")
+                client.sendall(
+                    json.dumps({"command": command, "request_id": request_id}).encode("utf-8") + b"\n"
+                )
                 buffer = b""
                 received_bytes = 0
                 while True:
@@ -2134,7 +2441,6 @@ class AudiobookService:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
 
-
     @staticmethod
     def _ipc_commands_no_wait(
         ipc_path: Path,
@@ -2145,8 +2451,7 @@ class AudiobookService:
         # Queue mpv IPC commands without waiting for replies.
         try:
             payload = b"".join(
-                json.dumps({"command": command}).encode("utf-8") + b"\n"
-                for command in commands
+                json.dumps({"command": command}).encode("utf-8") + b"\n" for command in commands
             )
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(max(0.01, float(timeout)))
@@ -2196,7 +2501,7 @@ class AudiobookService:
             except (TypeError, ValueError):
                 return 0
 
-        files = self._file_rows(book_id)
+        files = self._position_file_rows(book_id)
         if len(files) <= 1:
             return read_local()
         # time-pos and playlist-pos are separate IPC reads.  Bracket the clock
@@ -2300,7 +2605,6 @@ class AudiobookService:
         # will read the authoritative post-seek position.
         return requested
 
-
     def _sleep_reached(self, book_id: int, position: float | None) -> bool:
         with self._lock:
             deadline = self._sleep_deadlines.get(book_id)
@@ -2309,7 +2613,6 @@ class AudiobookService:
             (deadline is not None and time.monotonic() >= deadline)
             or (chapter_end is not None and position is not None and position >= chapter_end - 0.25)
         )
-
 
     def _playback_session_owned(
         self,
@@ -2341,40 +2644,60 @@ class AudiobookService:
 
     def _reader_audio_started(self, ln_book_id: int, audiobook_id: int, chapter: int, *, fresh: bool) -> None:
         alignment = self._load_alignment(ln_book_id, audiobook_id)
-        ranges = self._paired_light_novel_chapter_ranges(ln_book_id, audiobook_id,
-                     float(self.book(audiobook_id)["duration"]), alignment=alignment) if alignment else []
+        ranges = (
+            self._paired_light_novel_chapter_ranges(
+                ln_book_id, audiobook_id, float(self.book(audiobook_id)["duration"]), alignment=alignment
+            )
+            if alignment
+            else []
+        )
         with self._lock:
             context = self._review_contexts.setdefault(audiobook_id, {"origin": "audio"})
             if fresh:
                 context["origin"] = "ln"
-            context.update(consumer="ln", ln_book_id=ln_book_id, chapter=int(chapter),
-                           ranges=ranges, pending_chapter=None)
+            context.update(
+                consumer="ln",
+                ln_book_id=ln_book_id,
+                chapter=int(chapter),
+                ranges=ranges,
+                pending_chapter=None,
+            )
 
-    def _refresh_reader_review_alignment_locked(self, ln_book_id: int, audiobook_id: int,
-                                               duration: float, alignment: dict[str, Any]) -> None:
+    def _refresh_reader_review_alignment_locked(
+        self, ln_book_id: int, audiobook_id: int, duration: float, alignment: dict[str, Any]
+    ) -> None:
         """Publication holds _lock; newly mapped past chapters never prompt late."""
         context = getattr(self, "_review_contexts", {}).get(int(audiobook_id))
         if not context or context.get("ln_book_id") != int(ln_book_id):
             return
-        ranges = self._paired_light_novel_chapter_ranges(ln_book_id,audiobook_id,duration,alignment=alignment)
+        ranges = self._paired_light_novel_chapter_ranges(
+            ln_book_id, audiobook_id, duration, alignment=alignment
+        )
         context["ranges"] = ranges
         if context.get("pending_chapter") is None:
-            position = getattr(self,"_last_positions",{}).get(int(audiobook_id),0)
+            position = getattr(self, "_last_positions", {}).get(int(audiobook_id), 0)
             reached = [int(row["chapter_index"]) for row in ranges if float(row["start"]) <= position]
-            context["chapter"] = max([int(context.get("chapter",0)),*reached])
+            context["chapter"] = max([int(context.get("chapter", 0)), *reached])
 
     def _check_reader_review_boundary(self, book_id: int, position: float) -> None:
         with self._lock:
             context = getattr(self, "_review_contexts", {}).get(book_id)
             if not context or context.get("pending_chapter") is not None:
                 return
-            reached = [r for r in context.get("ranges", []) if float(r["start"]) <= position
-                       and int(r["chapter_index"]) > int(context.get("chapter", 0))]
+            reached = [
+                r
+                for r in context.get("ranges", [])
+                if float(r["start"]) <= position and int(r["chapter_index"]) > int(context.get("chapter", 0))
+            ]
             if not reached:
                 return
             target = max(reached, key=lambda r: float(r["start"]))
             context["chapter"] = int(target["chapter_index"])
-            should_pause = context.get("origin") == "ln" and context.get("consumer") == "ln" and self.review_gate_enabled()
+            should_pause = (
+                context.get("origin") == "ln"
+                and context.get("consumer") == "ln"
+                and self.review_gate_enabled()
+            )
             if should_pause:
                 context["pending_chapter"] = int(target["chapter_index"])
         if should_pause:
@@ -2389,6 +2712,7 @@ class AudiobookService:
         session_id: str,
     ) -> None:
         last_saved = 0.0
+        last_idle_check = time.monotonic()
         try:
             while process.poll() is None:
                 if not self._playback_session_owned(book_id, process, ipc_path, session_id):
@@ -2397,16 +2721,12 @@ class AudiobookService:
                     generation = self._position_generations.get(book_id, 0)
                 position = self._global_position(book_id, ipc_path)
                 with self._playback_lock:
-                    if not self._playback_session_owned(
-                        book_id, process, ipc_path, session_id
-                    ):
+                    if not self._playback_session_owned(book_id, process, ipc_path, session_id):
                         break
                     with self._lock:
                         sample_current = generation == self._position_generations.get(book_id, 0)
                     if position is not None and sample_current:
-                        position = self._reconcile_startup_position(
-                            book_id, ipc_path, position
-                        )
+                        position = self._reconcile_startup_position(book_id, ipc_path, position)
                         self._check_reader_review_boundary(book_id, position)
                         with self._lock:
                             sample_current = generation == self._position_generations.get(book_id, 0)
@@ -2435,12 +2755,30 @@ class AudiobookService:
                             self.set_position(book_id, position)
                         self._wait_or_kill(process)
                         break
+                    if time.monotonic() - last_idle_check >= 60.0:
+                        last_idle_check = time.monotonic()
+                        with self._lock:
+                            motion = self._last_motion_at.get(book_id)
+                        if (
+                            motion is not None
+                            and time.monotonic() - float(motion) >= _PAUSED_PLAYER_STOP_SECONDS
+                            and self._ipc_get(ipc_path, "pause") is True
+                        ):
+                            # A long pause keeps a 30-60 MB mpv awake for nothing.
+                            LOGGER.info(
+                                "Audiobook paused player closed book=%s idle_s=%.0f",
+                                book_id,
+                                time.monotonic() - float(motion),
+                            )
+                            self._ipc_commands_no_wait(ipc_path, [["quit"]])
+                            if position is not None:
+                                self.set_position(book_id, position)
+                            self._wait_or_kill(process)
+                            break
                 time.sleep(_MONITOR_POLL_INTERVAL)
         finally:
             with self._playback_lock:
-                owned = self._playback_session_owned(
-                    book_id, process, ipc_path, session_id
-                )
+                owned = self._playback_session_owned(book_id, process, ipc_path, session_id)
                 if owned:
                     with self._lock:
                         final_position = self._last_positions.get(book_id)
@@ -2511,9 +2849,7 @@ class AudiobookService:
 
             with self._lock:
                 sessions = getattr(self, "_playback_sessions", {})
-                session_still_owned = (
-                    session_id is None or sessions.get(book_id) == session_id
-                )
+                session_still_owned = session_id is None or sessions.get(book_id) == session_id
                 if self._players.get(book_id) is process and session_still_owned:
                     self._players.pop(book_id, None)
                     self._ipc_paths.pop(book_id, None)
@@ -2542,17 +2878,19 @@ class AudiobookService:
             if process.poll() is None:
                 process.terminate()
 
-    def play(
-        self, book_id: int, start: float | None = None, speed: float = 1.0
-    ) -> dict[str, Any]:
+    def play(self, book_id: int, start: float | None = None, speed: float = 1.0) -> dict[str, Any]:
         if self._closed_event.is_set():
             raise RuntimeError("Audiobook service is closed")
         with self._playback_lock:
             return self._play_locked(int(book_id), start=start, speed=speed)
 
     def _play_locked(
-        self, book_id: int, start: float | None = None, speed: float = 1.0,
-        *, preserve_transport: bool = False,
+        self,
+        book_id: int,
+        start: float | None = None,
+        speed: float = 1.0,
+        *,
+        preserve_transport: bool = False,
     ) -> dict[str, Any]:
         book_id = int(book_id)
         speed = max(0.5, min(3.0, float(speed or 1.0)))
@@ -2567,8 +2905,11 @@ class AudiobookService:
             self.stop(book_id)
         book = self.book(book_id)
         position = float(book["position"] if start is None else start)
+        mobile = getattr(self, "mobile_progress", None)
+        if mobile is not None and start is None:
+            position = mobile.mac_resume_position(book_id, position)
         # A small smart rewind makes returning after a break less disorienting.
-        if start is None and position > 12:
+        if start is None and position > 12 and mobile is None:
             with self.db.connect() as conn:
                 row = conn.execute("SELECT last_played_at FROM audiobooks WHERE id=?", (book_id,)).fetchone()
             if row is not None and time.time() - float(row["last_played_at"] or 0.0) > 5 * 60:
@@ -2600,6 +2941,10 @@ class AudiobookService:
         ipc_dir = self.cache_dir / "audiobook-ipc"
         ipc_dir.mkdir(parents=True, exist_ok=True)
         session_id = f"{time.monotonic_ns():x}-{threading.get_ident():x}"
+        if mobile is not None:
+            asset = mobile.asset_for_book(book_id)
+            if asset is not None:
+                mobile.begin_mac_session(asset, session_id)
         ipc_path = ipc_dir / f"book-{book_id}-{os.getpid()}-{session_id}.sock"
         ipc_path.unlink(missing_ok=True)
         command = [
@@ -2649,6 +2994,7 @@ class AudiobookService:
             if self._closed_event.is_set():
                 raise RuntimeError("Audiobook service is closed")
             from .runtime import worker_environment
+
             if sys.platform == "darwin" and mpv_supports_option(self.mpv, "macos-app-activation-policy"):
                 command.insert(1, "--macos-app-activation-policy=accessory")
             process = subprocess.Popen(command, env=worker_environment())
@@ -2732,9 +3078,13 @@ class AudiobookService:
             startup_target = getattr(self, "_startup_targets", {}).get(book_id)
             if startup_target is not None:
                 startup_target["speed"] = value
-        LOGGER.info("Audiobook speed request book=%s speed=%.3f player=%s", book_id, value, ipc_path is not None)
+        LOGGER.info(
+            "Audiobook speed request book=%s speed=%.3f player=%s", book_id, value, ipc_path is not None
+        )
         with self.db.connect() as conn:
-            conn.execute("UPDATE audiobooks SET speed=?,updated_at=? WHERE id=?", (value, time.time(), book_id))
+            conn.execute(
+                "UPDATE audiobooks SET speed=?,updated_at=? WHERE id=?", (value, time.time(), book_id)
+            )
         live_speed: Any = None
         restarted = False
         if ipc_path is not None and self.is_playing(book_id):
@@ -2793,9 +3143,7 @@ class AudiobookService:
                     (
                         row
                         for row in files
-                        if float(row.get("start") or 0.0)
-                        <= value
-                        < float(row.get("end") or value + 0.001)
+                        if float(row.get("start") or 0.0) <= value < float(row.get("end") or value + 0.001)
                     ),
                     files[-1] if files else None,
                 )
@@ -2817,7 +3165,10 @@ class AudiobookService:
                 )
                 if response is None or response.get("error") != "success":
                     self._play_locked(
-                        book_id, start=value, speed=float(book["speed"] or 1.0), preserve_transport=True,
+                        book_id,
+                        start=value,
+                        speed=float(book["speed"] or 1.0),
+                        preserve_transport=True,
                     )
                 else:
                     paused = bool(ipc_path and self._ipc_get(ipc_path, "pause"))
@@ -2829,7 +3180,11 @@ class AudiobookService:
                         }
                 self._publish_seek_position(book_id, value)
             else:
-                self.set_position(book_id, value)
+                mobile = getattr(self, "mobile_progress", None)
+                # A seek on a stopped Mac player is a deliberate listening
+                # action: it becomes the shared position, unlike idle saves.
+                if mobile is None or not mobile.record_mac_seek(book_id, value):
+                    self.set_position(book_id, value)
             return {"ok": True, "book": self.book(book_id)}
 
     def set_sleep_timer(
@@ -2909,7 +3264,7 @@ class AudiobookService:
             ).fetchall()
             existing = [int(row["id"]) for row in rows]
             if sorted(requested) != sorted(existing):
-                raise ValueError("Bookmark reorder must contain every bookmark exactly once")
+                raise ValueError(err("audiobook.bookmarkReorder"))
             conn.executemany(
                 "UPDATE audiobook_bookmarks SET sort_order=? WHERE id=? AND book_id=?",
                 [(index, bookmark_id, book_id) for index, bookmark_id in enumerate(requested)],
@@ -2937,9 +3292,11 @@ class AudiobookService:
             existing_ids = [int(row["id"]) for row in rows]
             index = max(0, min(int(sort_order), len(existing_ids)))
             requested_id = int(bookmark_id) if bookmark_id is not None else 0
-            if requested_id > 0 and conn.execute(
-                "SELECT 1 FROM audiobook_bookmarks WHERE id=?", (requested_id,)
-            ).fetchone() is None:
+            if (
+                requested_id > 0
+                and conn.execute("SELECT 1 FROM audiobook_bookmarks WHERE id=?", (requested_id,)).fetchone()
+                is None
+            ):
                 cursor = conn.execute(
                     "INSERT INTO audiobook_bookmarks(id,book_id,position,title,sort_order,created_at) "
                     "VALUES(?,?,?,?,?,?)",
@@ -2963,9 +3320,7 @@ class AudiobookService:
 
     def delete_bookmark(self, bookmark_id: int) -> dict[str, Any]:
         with self.db.connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM audiobook_bookmarks WHERE id=?", (int(bookmark_id),)).fetchone()
             if row is None:
                 return {"ok": False}
             book_id = int(row["book_id"])
@@ -2985,7 +3340,17 @@ class AudiobookService:
         if self.is_playing(int(book_id)):
             self.stop(int(book_id))
         book = self.book(int(book_id))
-        position = float(book["duration"] or 0.0) if finished else 0.0
+        duration = float(book["duration"] or 0.0)
+        if finished:
+            position = duration
+        else:
+            # Clearing the mark keeps where you are, except at the very end
+            # (that would count as finished again on the next save).
+            current = float(book.get("position") or 0.0)
+            position = 0.0 if duration > 0 and current >= duration * 0.98 else current
+        mobile = getattr(self, "mobile_progress", None)
+        if mobile is not None and mobile.mark_mac_finished(int(book_id), bool(finished), position=position):
+            return {"ok": True, "book": self.book(int(book_id))}
         with self.db.connect() as conn:
             conn.execute(
                 "UPDATE audiobooks SET position=?,finished=?,updated_at=? WHERE id=?",
@@ -2993,22 +3358,50 @@ class AudiobookService:
             )
         return {"ok": True, "book": self.book(int(book_id))}
 
-    def _transcript_fingerprint(self, audiobook_id: int) -> str:
+    @staticmethod
+    def _legacy_file_identity(path: Path) -> str:
+        try:
+            stat = path.stat()
+            return f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            return str(path)
+
+    def _content_identity(self, path: Path) -> str:
+        """Rename-proof identity of one audio file (sampled content, cached per stat)."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return str(path)
+        key = (str(path), int(stat.st_size), int(stat.st_mtime_ns))
+        cache = self.__dict__.setdefault("_content_identity_cache", {})
+        value = cache.get(key)
+        if value is None:
+            try:
+                value = "c:" + _sampled_content_digest(path, int(stat.st_size))
+            except OSError:
+                value = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+            if len(cache) > 8192:
+                cache.clear()
+            cache[key] = value
+        return value
+
+    def _file_identity(self, path: Path, *, legacy: bool) -> str:
+        return self._legacy_file_identity(path) if legacy else self._content_identity(path)
+
+    def _transcript_fingerprint(self, audiobook_id: int, *, legacy: bool = False) -> str:
         audiobook_id = int(audiobook_id)
-        key = ("transcript", audiobook_id, 0)
+        key = ("transcript-legacy" if legacy else "transcript", audiobook_id, 0)
         now = time.monotonic()
         with self._lock:
             cached = self._fingerprint_cache.get(key)
         if cached is not None and now - cached[0] < 5.0:
             return cached[1]
-        digest = hashlib.sha256(f"audiobook-stt-v3-chunks\0{self.stt_model}\0".encode())
+        # v4: files are identified by content, not path + mtime (audit 33A).
+        label = "audiobook-stt-v3-chunks" if legacy else "audiobook-stt-v4-content"
+        digest = hashlib.sha256(f"{label}\0{self.stt_model}\0".encode())
         for row in self._file_rows(audiobook_id):
             path = Path(str(row["path"]))
-            try:
-                stat = path.stat()
-                identity = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-            except OSError:
-                identity = str(path)
+            identity = self._file_identity(path, legacy=legacy)
             digest.update(
                 f"{int(row['file_index'])}:{identity}:{row['start']}:{row['end']}\0".encode(
                     "utf-8", errors="replace"
@@ -3025,6 +3418,28 @@ class AudiobookService:
             / "audiobook-transcripts"
             / f"{self._transcript_fingerprint(int(audiobook_id))}.json"
         )
+
+    def _legacy_transcript_path_v3(self, audiobook_id: int) -> Path:
+        return (
+            self.cache_dir
+            / "audiobook-transcripts"
+            / f"{self._transcript_fingerprint(int(audiobook_id), legacy=True)}.json"
+        )
+
+    @staticmethod
+    def _adopt_cache_file(legacy: Path, target: Path) -> bool:
+        """Reuse a path-keyed cache file under its content-keyed name."""
+        if target.is_file() or not legacy.is_file() or legacy == target:
+            return target.is_file()
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(target.name + ".adopt.tmp")
+            shutil.copyfile(legacy, temporary)
+            temporary.replace(target)
+        except OSError:
+            return False
+        LOGGER.info("Audiobook cache adopted content key from=%s to=%s", legacy.name, target.name)
+        return True
 
     def _legacy_transcript_path_v2(self, audiobook_id: int) -> Path:
         digest = hashlib.sha256(f"audiobook-stt-v2\0{self.stt_model}\0".encode())
@@ -3051,7 +3466,11 @@ class AudiobookService:
             payload = json.loads(legacy.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
-        if not isinstance(payload, dict) or payload.get("schema") != "audiobook-stt-v2" or not isinstance(payload.get("segments"), list):
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "audiobook-stt-v2"
+            or not isinstance(payload.get("segments"), list)
+        ):
             return None
         target.parent.mkdir(parents=True, exist_ok=True)
         migrated = {**payload, "schema": "audiobook-stt-v3", "migrated_from": "audiobook-stt-v2"}
@@ -3060,15 +3479,11 @@ class AudiobookService:
         temporary.replace(target)
         return target
 
-    def _activity_fingerprint(self, audiobook_id: int) -> str:
-        digest = hashlib.sha256(b"audiobook-activity-v1\0")
+    def _activity_fingerprint(self, audiobook_id: int, *, legacy: bool = False) -> str:
+        digest = hashlib.sha256(b"audiobook-activity-v1\0" if legacy else b"audiobook-activity-v2-content\0")
         for row in self._file_rows(int(audiobook_id)):
             path = Path(str(row["path"]))
-            try:
-                stat = path.stat()
-                identity = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-            except OSError:
-                identity = str(path)
+            identity = self._file_identity(path, legacy=legacy)
             digest.update(
                 f"{int(row['file_index'])}:{identity}:{row['start']}:{row['end']}\0".encode(
                     "utf-8", errors="replace"
@@ -3077,22 +3492,14 @@ class AudiobookService:
         return digest.hexdigest()[:28]
 
     def _activity_path(self, audiobook_id: int) -> Path:
-        return (
-            self.cache_dir
-            / "audiobook-activity"
-            / f"{self._activity_fingerprint(int(audiobook_id))}.json"
-        )
+        return self.cache_dir / "audiobook-activity" / f"{self._activity_fingerprint(int(audiobook_id))}.json"
 
     def _resolved_ffmpeg(self) -> str:
         resolved = (
-            shutil.which(self.ffmpeg)
-            if os.sep not in self.ffmpeg
-            else str(Path(self.ffmpeg).expanduser())
+            shutil.which(self.ffmpeg) if os.sep not in self.ffmpeg else str(Path(self.ffmpeg).expanduser())
         )
         if not resolved or not Path(resolved).is_file():
-            raise FileNotFoundError(
-                f"Configured ffmpeg was not found: {self.ffmpeg}. Re-run install.sh."
-            )
+            raise FileNotFoundError(err("audiobook.ffmpegMissing", ffmpeg=self.ffmpeg))
         return str(Path(resolved).resolve())
 
     @staticmethod
@@ -3129,6 +3536,13 @@ class AudiobookService:
         already exists; otherwise align immediately from STT activity.
         """
         output = self._activity_path(int(audiobook_id))
+        if not output.is_file():
+            self._adopt_cache_file(
+                self.cache_dir
+                / "audiobook-activity"
+                / f"{self._activity_fingerprint(int(audiobook_id), legacy=True)}.json",
+                output,
+            )
         try:
             cached = json.loads(output.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
@@ -3141,6 +3555,8 @@ class AudiobookService:
 
     def _load_transcript(self, audiobook_id: int) -> dict[str, Any] | None:
         path = self._transcript_path(int(audiobook_id))
+        if not path.is_file():
+            self._adopt_cache_file(self._legacy_transcript_path_v3(int(audiobook_id)), path)
         if not path.is_file():
             migrated = self._migrate_legacy_transcript_v2(int(audiobook_id))
             if migrated is not None:
@@ -3188,7 +3604,9 @@ class AudiobookService:
                         if not hasattr(self, "_transcription_summary_cache"):
                             self._transcription_summary_cache = {}
                         if len(self._transcription_summary_cache) >= 64:
-                            self._transcription_summary_cache.pop(next(iter(self._transcription_summary_cache)))
+                            self._transcription_summary_cache.pop(
+                                next(iter(self._transcription_summary_cache))
+                            )
                         self._transcription_summary_cache[path] = (current_stamp, dict(summary))
             except OSError:
                 pass
@@ -3226,11 +3644,11 @@ class AudiobookService:
         if status == "ready":
             self.job_center.finish(
                 job_id,
-                message="Transcription ready",
+                message=t("web.transcriptionReady"),
                 result={"audiobook_id": int(audiobook_id), "segment_count": updated.get("segment_count", 0)},
             )
         elif status == "error":
-            self.job_center.fail(job_id, updated.get("error") or "Japanese STT failed")
+            self.job_center.fail(job_id, updated.get("error") or err("audiobook.sttFailed"))
         elif status == "cancelled":
             self.job_center.cancelled(job_id)
         else:
@@ -3240,9 +3658,13 @@ class AudiobookService:
                 current=float(updated.get("processed_audio_seconds") or 0.0),
                 total=float(updated.get("total_duration") or 0.0),
                 message=(
-                    f"STT file {int(updated.get('file') or 1)}/{int(updated.get('file_count') or 1)}"
+                    t(
+                        "web.sttFileProgress",
+                        file=int(updated.get("file") or 1),
+                        total=int(updated.get("file_count") or 1),
+                    )
                     if status == "transcribing"
-                    else "Queued"
+                    else t("web.queued")
                 ),
             )
             self.job_center.checkpoint(
@@ -3251,9 +3673,7 @@ class AudiobookService:
                     "audiobook_id": int(audiobook_id),
                     "file": int(updated.get("file") or 0),
                     "file_count": int(updated.get("file_count") or 0),
-                    "processed_audio_seconds": float(
-                        updated.get("processed_audio_seconds") or 0.0
-                    ),
+                    "processed_audio_seconds": float(updated.get("processed_audio_seconds") or 0.0),
                 },
             )
 
@@ -3286,13 +3706,15 @@ class AudiobookService:
                     duration = _STT_CHUNK_SECONDS + 0.01
             # Preserve the old short-file path exactly: no lossy/reencoded
             # intermediate file when the source itself is already bounded.
-            count = max(1, int((duration + _STT_CHUNK_SECONDS - 1e-9) // _STT_CHUNK_SECONDS)) if duration > _STT_CHUNK_SECONDS else 1
+            count = (
+                max(1, int((duration + _STT_CHUNK_SECONDS - 1e-9) // _STT_CHUNK_SECONDS))
+                if duration > _STT_CHUNK_SECONDS
+                else 1
+            )
             for chunk_index in range(count):
                 local_start = chunk_index * _STT_CHUNK_SECONDS
                 chunk_duration = (
-                    max(0.01, min(_STT_CHUNK_SECONDS, duration - local_start))
-                    if duration > 0
-                    else 0.0
+                    max(0.01, min(_STT_CHUNK_SECONDS, duration - local_start)) if duration > 0 else 0.0
                 )
                 global_chunk += 1
                 chunks.append(
@@ -3325,11 +3747,25 @@ class AudiobookService:
     ) -> None:
         destination.unlink(missing_ok=True)
         command = [
-            self._resolved_ffmpeg(), "-v", "error", "-nostdin", "-y",
-            "-ss", f"{max(0.0, start):.3f}",
-            "-t", f"{max(0.01, duration):.3f}",
-            "-i", str(source), "-vn", "-ac", "1", "-ar", "16000",
-            "-c:a", "flac", str(destination),
+            self._resolved_ffmpeg(),
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-t",
+            f"{max(0.01, duration):.3f}",
+            "-i",
+            str(source),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "flac",
+            str(destination),
         ]
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         started = time.monotonic()
@@ -3337,16 +3773,20 @@ class AudiobookService:
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
                     process.terminate()
-                    try: process.wait(timeout=3)
+                    try:
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        process.kill(); process.wait(timeout=3)
-                    raise InterruptedError("Transcription cancelled")
+                        process.kill()
+                        process.wait(timeout=3)
+                    raise InterruptedError(err("audiobook.transcriptionCancelled"))
                 if time.monotonic() - started > max(120.0, duration * 2.0):
                     process.terminate()
-                    try: process.wait(timeout=3)
+                    try:
+                        process.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        process.kill(); process.wait(timeout=3)
-                    raise RuntimeError("ffmpeg STT chunk extraction timed out")
+                        process.kill()
+                        process.wait(timeout=3)
+                    raise RuntimeError(err("audiobook.sttChunkExtractTimeout"))
                 time.sleep(0.08)
             stderr = process.stderr.read() if process.stderr is not None else ""
             if process.returncode != 0 or not destination.is_file():
@@ -3354,6 +3794,10 @@ class AudiobookService:
         finally:
             if process.stderr is not None:
                 process.stderr.close()
+
+    def _start_stt_worker(self, environment: dict[str, str], stderr_path: Path) -> _SttWorker:
+        command = [self.python, "-m", "pudge.subtitles.stt_worker", "--serve", self.stt_model]
+        return _SttWorker(command, env=environment, stderr_path=stderr_path)
 
     def _transcribe_worker(
         self,
@@ -3372,198 +3816,395 @@ class AudiobookService:
                 priority=requested_priority, resource="cpu"
             )
             if block_reason is not None:
-                self._set_transcription_job(audiobook_id, {
-                    "status": "queued", "ready": False,
-                    "phase": "waiting_for_policy", "wait_reason": block_reason,
-                })
+                self._set_transcription_job(
+                    audiobook_id,
+                    {
+                        "status": "queued",
+                        "ready": False,
+                        "phase": "waiting_for_policy",
+                        "wait_reason": block_reason,
+                    },
+                )
             heavy_lease = self.work_scheduler.acquire_heavy(
-                "audiobook-stt", blocking=True, foreground_sensitive=True,
-                wait_for_foreground=True, cancel_event=cancel_event,
+                "audiobook-stt",
+                blocking=True,
+                foreground_sensitive=True,
+                wait_for_foreground=True,
+                cancel_event=cancel_event,
                 priority=requested_priority,
             )
             if heavy_lease is None:
-                self._set_transcription_job(audiobook_id, {"status":"cancelled","ready":False,"error":""})
-                event.set(); return
-        self._set_transcription_job(audiobook_id, {
-            "status": "transcribing", "ready": False,
-            "phase": "starting", "wait_reason": "",
-        })
+                self._set_transcription_job(
+                    audiobook_id, {"status": "cancelled", "ready": False, "error": ""}
+                )
+                event.set()
+                return
+        self._set_transcription_job(
+            audiobook_id,
+            {
+                "status": "transcribing",
+                "ready": False,
+                "phase": "starting",
+                "wait_reason": "",
+            },
+        )
         output.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = self._transcription_checkpoint_dir(output)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         current_audio: Path | None = None
         current_progress: Path | None = None
+        worker: _SttWorker | None = None
+        extractor: concurrent.futures.ThreadPoolExecutor | None = None
+        prefetch: tuple[int, Path, concurrent.futures.Future[None]] | None = None
         try:
             files = self._file_rows(int(audiobook_id))
             if not files:
-                raise ValueError("Audiobook has no readable files")
+                raise ValueError(err("audiobook.noReadableFiles"))
             chunks = self._transcription_chunk_plan(files)
             total_duration = sum(max(0.0, float(row.get("duration") or 0.0)) for row in files)
             started_at = time.time()
             completed_duration = 0.0
             all_segments: list[dict[str, Any]] = []
-            for chunk in chunks:
+            # One worker for the whole book (the model loads once), and the next
+            # chunk is cut from the audio file while the current one is recognized.
+            cached_chunks = {
+                int(chunk["global_chunk"])
+                for chunk in chunks
+                if (checkpoint_dir / f"chunk-{int(chunk['global_chunk']):05d}.json").is_file()
+            }
+            with self._lock:
+                cancel_event = self._transcription_cancel_events.get(audiobook_id)
+            if cancel_event is not None and cancel_event.is_set():
+                # Cancelled before any work: say so even when FFmpeg is missing.
+                raise InterruptedError(err("audiobook.transcriptionCancelled"))
+            environment = os.environ.copy()
+            ffmpeg = self._resolved_ffmpeg()
+            environment["PATH"] = os.pathsep.join(
+                part for part in (str(Path(ffmpeg).resolve().parent), environment.get("PATH", "")) if part
+            )
+            environment.setdefault("PUDGE_MLX_CACHE_LIMIT_BYTES", str(_STT_MLX_CACHE_LIMIT_BYTES))
+            environment.setdefault("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(_STT_MLX_MEMORY_LIMIT_BYTES))
+            mark_background(environment)  # an hours-long job: low CPU priority
+            extractor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="audiobook-stt-cut"
+            )
+            for position, chunk in enumerate(chunks):
                 with self._lock:
                     cancel_event = self._transcription_cancel_events.get(audiobook_id)
                 if cancel_event is not None and cancel_event.is_set():
-                    raise InterruptedError("Transcription cancelled")
+                    raise InterruptedError(err("audiobook.transcriptionCancelled"))
                 source = Path(str(chunk["source"]))
                 if not source.is_file():
                     raise FileNotFoundError(source)
                 chunk_number = int(chunk["global_chunk"])
                 result_path = checkpoint_dir / f"chunk-{chunk_number:05d}.json"
-                cached = self._valid_stt_chunk_result(result_path)
+                cached = self._valid_stt_chunk_result(result_path) if chunk_number in cached_chunks else None
                 chunk_duration = max(0.0, float(chunk["duration"] or 0.0))
                 if cached is not None:
-                    all_segments.extend(self._shift_transcription_segments(
-                        [item for item in (cached.get("segments") or []) if isinstance(item, dict)],
-                        float(chunk["global_offset"]),
-                    ))
+                    all_segments.extend(
+                        self._shift_transcription_segments(
+                            [item for item in (cached.get("segments") or []) if isinstance(item, dict)],
+                            float(chunk["global_offset"]),
+                        )
+                    )
                     completed_duration += chunk_duration
-                    self._set_transcription_job(audiobook_id, {
-                        "status":"transcribing","ready":False,
-                        "file":int(chunk["file"]),"file_count":int(chunk["file_count"]),
-                        "chunk":chunk_number,"chunk_count":int(chunk["total_chunks"]),
-                        "chunk_progress_percent":100,"resumed_chunk":True,
-                        "progress_percent":completed_duration/total_duration*100.0 if total_duration else 100.0,
-                        "processed_audio_seconds":completed_duration,
-                        "remaining_audio_seconds":max(0.0,total_duration-completed_duration),
-                        "total_duration":total_duration,"started_at":started_at,
-                    })
+                    self._set_transcription_job(
+                        audiobook_id,
+                        {
+                            "status": "transcribing",
+                            "ready": False,
+                            "file": int(chunk["file"]),
+                            "file_count": int(chunk["file_count"]),
+                            "chunk": chunk_number,
+                            "chunk_count": int(chunk["total_chunks"]),
+                            "chunk_progress_percent": 100,
+                            "resumed_chunk": True,
+                            "progress_percent": completed_duration / total_duration * 100.0
+                            if total_duration
+                            else 100.0,
+                            "processed_audio_seconds": completed_duration,
+                            "remaining_audio_seconds": max(0.0, total_duration - completed_duration),
+                            "total_duration": total_duration,
+                            "started_at": started_at,
+                        },
+                    )
                     continue
 
                 current_progress = checkpoint_dir / f"chunk-{chunk_number:05d}.progress.json"
                 current_progress.unlink(missing_ok=True)
-                stdout_path = checkpoint_dir / f"chunk-{chunk_number:05d}.stdout.log"
-                stderr_path = checkpoint_dir / f"chunk-{chunk_number:05d}.stderr.log"
                 if bool(chunk["direct"]):
                     input_audio = source
                     current_audio = None
                 else:
                     current_audio = checkpoint_dir / f"chunk-{chunk_number:05d}.flac"
-                    self._set_transcription_job(audiobook_id, {
-                        "status":"transcribing","ready":False,"phase":"extracting",
-                        "file":int(chunk["file"]),"file_count":int(chunk["file_count"]),
-                        "chunk":chunk_number,"chunk_count":int(chunk["total_chunks"]),
-                        "progress_percent":completed_duration/total_duration*100.0 if total_duration else 0.0,
-                        "processed_audio_seconds":completed_duration,"total_duration":total_duration,
-                        "started_at":started_at,
-                    })
-                    self._extract_stt_chunk(
-                        source, current_audio, start=float(chunk["local_start"]),
-                        duration=chunk_duration, cancel_event=cancel_event,
-                    )
+                    if prefetch is not None and prefetch[0] == chunk_number:
+                        future = prefetch[2]
+                        prefetch = None
+                        if not future.done():
+                            self._set_transcription_job(
+                                audiobook_id,
+                                {
+                                    "status": "transcribing",
+                                    "ready": False,
+                                    "phase": "extracting",
+                                    "file": int(chunk["file"]),
+                                    "file_count": int(chunk["file_count"]),
+                                    "chunk": chunk_number,
+                                    "chunk_count": int(chunk["total_chunks"]),
+                                    "progress_percent": completed_duration / total_duration * 100.0
+                                    if total_duration
+                                    else 0.0,
+                                    "processed_audio_seconds": completed_duration,
+                                    "total_duration": total_duration,
+                                    "started_at": started_at,
+                                },
+                            )
+                        future.result()
+                    else:
+                        self._set_transcription_job(
+                            audiobook_id,
+                            {
+                                "status": "transcribing",
+                                "ready": False,
+                                "phase": "extracting",
+                                "file": int(chunk["file"]),
+                                "file_count": int(chunk["file_count"]),
+                                "chunk": chunk_number,
+                                "chunk_count": int(chunk["total_chunks"]),
+                                "progress_percent": completed_duration / total_duration * 100.0
+                                if total_duration
+                                else 0.0,
+                                "processed_audio_seconds": completed_duration,
+                                "total_duration": total_duration,
+                                "started_at": started_at,
+                            },
+                        )
+                        self._extract_stt_chunk(
+                            source,
+                            current_audio,
+                            start=float(chunk["local_start"]),
+                            duration=chunk_duration,
+                            cancel_event=cancel_event,
+                        )
                     input_audio = current_audio
+                upcoming = next(
+                    (
+                        row
+                        for row in chunks[position + 1 :]
+                        if int(row["global_chunk"]) not in cached_chunks and not bool(row["direct"])
+                    ),
+                    None,
+                )
+                if upcoming is not None and prefetch is None and Path(str(upcoming["source"])).is_file():
+                    upcoming_audio = checkpoint_dir / f"chunk-{int(upcoming['global_chunk']):05d}.flac"
+                    prefetch = (
+                        int(upcoming["global_chunk"]),
+                        upcoming_audio,
+                        extractor.submit(
+                            self._extract_stt_chunk,
+                            Path(str(upcoming["source"])),
+                            upcoming_audio,
+                            start=float(upcoming["local_start"]),
+                            duration=max(0.0, float(upcoming["duration"] or 0.0)),
+                            cancel_event=cancel_event,
+                        ),
+                    )
 
-                self._set_transcription_job(audiobook_id, {
-                    "status":"transcribing","ready":False,"phase":"transcribing",
-                    "file":int(chunk["file"]),"file_count":int(chunk["file_count"]),
-                    "chunk":chunk_number,"chunk_count":int(chunk["total_chunks"]),
-                    "chunk_progress_percent":0,
-                    "progress_percent":completed_duration/total_duration*100.0 if total_duration else 0.0,
-                    "processed_audio_seconds":completed_duration,
-                    "remaining_audio_seconds":max(0.0,total_duration-completed_duration),
-                    "total_duration":total_duration,"started_at":started_at,
-                })
-                command = [self.python,"-m","pudge.subtitles.stt_worker","--words",str(input_audio),str(result_path),self.stt_model,str(current_progress)]
-                environment = os.environ.copy()
-                ffmpeg = self._resolved_ffmpeg()
-                environment["PATH"] = os.pathsep.join(part for part in (str(Path(ffmpeg).resolve().parent), environment.get("PATH", "")) if part)
-                environment.setdefault("PUDGE_MLX_CACHE_LIMIT_BYTES", str(_STT_MLX_CACHE_LIMIT_BYTES))
-                environment.setdefault("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(_STT_MLX_MEMORY_LIMIT_BYTES))
+                self._set_transcription_job(
+                    audiobook_id,
+                    {
+                        "status": "transcribing",
+                        "ready": False,
+                        "phase": "transcribing",
+                        "file": int(chunk["file"]),
+                        "file_count": int(chunk["file_count"]),
+                        "chunk": chunk_number,
+                        "chunk_count": int(chunk["total_chunks"]),
+                        "chunk_progress_percent": 0,
+                        "progress_percent": completed_duration / total_duration * 100.0
+                        if total_duration
+                        else 0.0,
+                        "processed_audio_seconds": completed_duration,
+                        "remaining_audio_seconds": max(0.0, total_duration - completed_duration),
+                        "total_duration": total_duration,
+                        "started_at": started_at,
+                    },
+                )
                 timeout = max(12 * 60, min(45 * 60, max(60.0, chunk_duration) * 5.0))
-                with stdout_path.open("w",encoding="utf-8") as stdout_file, stderr_path.open("w",encoding="utf-8") as stderr_file:
-                    process = subprocess.Popen(command, env=environment, text=True, stdout=stdout_file, stderr=stderr_file)
-                    with self._lock:
-                        self._transcription_processes[audiobook_id] = process
-                    chunk_started=time.monotonic(); reported=-1
-                    try:
-                        while process.poll() is None:
-                            if cancel_event is not None and cancel_event.is_set():
-                                process.terminate()
-                                try: process.wait(timeout=5)
-                                except subprocess.TimeoutExpired:
-                                    process.kill(); process.wait(timeout=5)
-                                raise InterruptedError("Transcription cancelled")
-                            if time.monotonic()-chunk_started >= timeout:
-                                process.terminate()
-                                try: process.wait(timeout=5)
-                                except subprocess.TimeoutExpired:
-                                    process.kill(); process.wait(timeout=5)
-                                raise subprocess.TimeoutExpired(command, timeout)
-                            progress={}
-                            try: progress=json.loads(current_progress.read_text(encoding="utf-8"))
-                            except (OSError,ValueError,TypeError,json.JSONDecodeError): pass
-                            current_percent=max(0,min(100,int(progress.get("percent") or 0))) if progress else reported
-                            memory=progress.get("memory") if isinstance(progress,dict) and isinstance(progress.get("memory"),dict) else {}
-                            peak=int(memory.get("peak_bytes") or 0) if memory else 0
-                            if peak > _STT_MLX_MEMORY_LIMIT_BYTES:
-                                process.terminate()
-                                try: process.wait(timeout=5)
-                                except subprocess.TimeoutExpired:
-                                    process.kill(); process.wait(timeout=5)
-                                raise RuntimeError(f"MLX STT memory safety limit exceeded: {peak / (1024**3):.1f} GiB")
-                            if current_percent>=0 and current_percent!=reported:
-                                reported=current_percent
-                                processed=completed_duration+chunk_duration*current_percent/100.0
-                                self._set_transcription_job(audiobook_id, {
-                                    "status":"transcribing","ready":False,"phase":"transcribing",
-                                    "file":int(chunk["file"]),"file_count":int(chunk["file_count"]),
-                                    "chunk":chunk_number,"chunk_count":int(chunk["total_chunks"]),
-                                    "chunk_progress_percent":current_percent,
-                                    "progress_percent":processed/total_duration*100.0 if total_duration else float(current_percent),
-                                    "processed_audio_seconds":processed,
-                                    "remaining_audio_seconds":max(0.0,total_duration-processed),
-                                    "total_duration":total_duration,"mlx_memory":memory,"started_at":started_at,
-                                })
-                            time.sleep(.25)
-                    finally:
+                request = {
+                    "id": chunk_number,
+                    "audio": str(input_audio),
+                    "output": str(result_path),
+                    "progress": str(current_progress),
+                    "words": True,
+                }
+                payload = None
+                for attempt in (1, 2):
+                    if worker is None:
+                        worker = self._start_stt_worker(environment, checkpoint_dir / "worker.stderr.log")
                         with self._lock:
-                            if self._transcription_processes.get(audiobook_id) is process:
-                                self._transcription_processes.pop(audiobook_id,None)
-                stdout=stdout_path.read_text(encoding="utf-8",errors="replace")
-                stderr=stderr_path.read_text(encoding="utf-8",errors="replace")
-                if cancel_event is not None and cancel_event.is_set():
-                    raise InterruptedError("Transcription cancelled")
-                payload=self._valid_stt_chunk_result(result_path)
-                if process.returncode!=0 or payload is None:
-                    result_path.unlink(missing_ok=True)
-                    raise RuntimeError((stderr or stdout).strip()[-1200:] or "Japanese STT failed")
-                all_segments.extend(self._shift_transcription_segments(
-                    [item for item in (payload.get("segments") or []) if isinstance(item,dict)],
-                    float(chunk["global_offset"]),
-                ))
+                            self._transcription_processes[audiobook_id] = worker.process
+                    answer: Any = None
+                    exited = not worker.submit(request)
+                    chunk_started = time.monotonic()
+                    reported = -1
+                    while not exited:
+                        if cancel_event is not None and cancel_event.is_set():
+                            worker.kill()
+                            worker = None
+                            raise InterruptedError(err("audiobook.transcriptionCancelled"))
+                        if time.monotonic() - chunk_started >= timeout:
+                            worker.kill()
+                            worker = None
+                            raise subprocess.TimeoutExpired(request["audio"], timeout)
+                        answer = worker.answer(0.25)
+                        if answer is None:
+                            exited = True
+                            break
+                        if isinstance(answer, dict) and answer.get("id") == chunk_number:
+                            break
+                        progress = {}
+                        try:
+                            progress = json.loads(current_progress.read_text(encoding="utf-8"))
+                        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                            pass
+                        current_percent = (
+                            max(0, min(100, int(progress.get("percent") or 0))) if progress else reported
+                        )
+                        memory = (
+                            progress.get("memory")
+                            if isinstance(progress, dict) and isinstance(progress.get("memory"), dict)
+                            else {}
+                        )
+                        peak = int(memory.get("peak_bytes") or 0) if memory else 0
+                        if peak > _STT_MLX_MEMORY_LIMIT_BYTES:
+                            worker.kill()
+                            worker = None
+                            raise RuntimeError(
+                                err("audiobook.sttMemoryLimit", gib=format(peak / 1024**3, ".1f"))
+                            )
+                        if current_percent >= 0 and current_percent != reported:
+                            reported = current_percent
+                            processed = completed_duration + chunk_duration * current_percent / 100.0
+                            self._set_transcription_job(
+                                audiobook_id,
+                                {
+                                    "status": "transcribing",
+                                    "ready": False,
+                                    "phase": "transcribing",
+                                    "file": int(chunk["file"]),
+                                    "file_count": int(chunk["file_count"]),
+                                    "chunk": chunk_number,
+                                    "chunk_count": int(chunk["total_chunks"]),
+                                    "chunk_progress_percent": current_percent,
+                                    "progress_percent": processed / total_duration * 100.0
+                                    if total_duration
+                                    else float(current_percent),
+                                    "processed_audio_seconds": processed,
+                                    "remaining_audio_seconds": max(0.0, total_duration - processed),
+                                    "total_duration": total_duration,
+                                    "mlx_memory": memory,
+                                    "started_at": started_at,
+                                },
+                            )
+                    if cancel_event is not None and cancel_event.is_set():
+                        worker.kill()
+                        worker = None
+                        raise InterruptedError(err("audiobook.transcriptionCancelled"))
+                    if exited:
+                        # The worker died (crash, killed for memory by macOS…): start a new
+                        # one and retry this chunk once; finished chunks stay checkpointed.
+                        detail = worker.stderr_tail()
+                        worker.kill()
+                        worker = None
+                        result_path.unlink(missing_ok=True)
+                        if attempt == 1:
+                            continue
+                        raise RuntimeError(detail or err("audiobook.sttWorkerStopped"))
+                    if not bool(answer.get("ok")):
+                        result_path.unlink(missing_ok=True)
+                        raise RuntimeError(str(answer.get("error") or err("audiobook.sttFailed"))[-1200:])
+                    payload = self._valid_stt_chunk_result(result_path)
+                    if payload is None:
+                        result_path.unlink(missing_ok=True)
+                        raise RuntimeError(worker.stderr_tail() or err("audiobook.sttFailed"))
+                    break
+                all_segments.extend(
+                    self._shift_transcription_segments(
+                        [item for item in (payload.get("segments") or []) if isinstance(item, dict)],
+                        float(chunk["global_offset"]),
+                    )
+                )
                 completed_duration += chunk_duration
                 if current_audio is not None:
-                    current_audio.unlink(missing_ok=True); current_audio=None
-                current_progress.unlink(missing_ok=True); current_progress=None
+                    current_audio.unlink(missing_ok=True)
+                    current_audio = None
+                current_progress.unlink(missing_ok=True)
+                current_progress = None
 
-            payload={"schema":"audiobook-stt-v3","model":self.stt_model,"created_at":time.time(),"chunk_seconds":_STT_CHUNK_SECONDS,"segments":all_segments}
-            temporary=output.with_suffix(output.suffix+".tmp")
-            temporary.write_text(json.dumps(payload,ensure_ascii=False,separators=(",",":")),encoding="utf-8")
+            if worker is not None:
+                worker.stop()
+                worker = None
+            payload = {
+                "schema": "audiobook-stt-v3",
+                "model": self.stt_model,
+                "created_at": time.time(),
+                "chunk_seconds": _STT_CHUNK_SECONDS,
+                "segments": all_segments,
+            }
+            temporary = output.with_suffix(output.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
             temporary.replace(output)
-            self._set_transcription_job(audiobook_id,{"status":"ready","ready":True,"progress_percent":100.0,"processed_audio_seconds":total_duration,"remaining_audio_seconds":0.0,"segment_count":len(all_segments)})
+            self._set_transcription_job(
+                audiobook_id,
+                {
+                    "status": "ready",
+                    "ready": True,
+                    "progress_percent": 100.0,
+                    "processed_audio_seconds": total_duration,
+                    "remaining_audio_seconds": 0.0,
+                    "segment_count": len(all_segments),
+                },
+            )
             with self.db.connect() as conn:
-                links=conn.execute("SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id=?",(audiobook_id,)).fetchall()
+                links = conn.execute(
+                    "SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id=?", (audiobook_id,)
+                ).fetchall()
             for row in links:
                 try:
-                    self.prepare_alignment(
-                        int(row["ln_book_id"]), priority=requested_priority
-                    )
+                    self.prepare_alignment(int(row["ln_book_id"]), priority=requested_priority)
                 except Exception:
                     continue
         except InterruptedError:
-            self._set_transcription_job(audiobook_id,{"status":"cancelled","ready":False,"error":""})
+            self._set_transcription_job(audiobook_id, {"status": "cancelled", "ready": False, "error": ""})
         except subprocess.TimeoutExpired:
-            self._set_transcription_job(audiobook_id,{"status":"error","ready":False,"error":"Japanese STT chunk timed out"})
+            self._set_transcription_job(
+                audiobook_id, {"status": "error", "ready": False, "error": err("audiobook.sttChunkTimeout")}
+            )
         except Exception as exc:
-            self._set_transcription_job(audiobook_id,{"status":"error","ready":False,"error":str(exc)})
+            self._set_transcription_job(audiobook_id, {"status": "error", "ready": False, "error": str(exc)})
         finally:
-            if current_audio is not None: current_audio.unlink(missing_ok=True)
-            if current_progress is not None: current_progress.unlink(missing_ok=True)
+            if worker is not None:
+                worker.kill()
             with self._lock:
-                self._transcription_cancel_events.pop(audiobook_id,None)
-            if heavy_lease is not None: heavy_lease.release()
+                if worker is not None and self._transcription_processes.get(audiobook_id) is worker.process:
+                    self._transcription_processes.pop(audiobook_id, None)
+            if prefetch is not None:
+                # A cut that was running ahead: let it end (cancellation stops ffmpeg), then drop it.
+                concurrent.futures.wait([prefetch[2]], timeout=180)
+                prefetch[1].unlink(missing_ok=True)
+            if extractor is not None:
+                extractor.shutdown(wait=False, cancel_futures=True)
+            if current_audio is not None:
+                current_audio.unlink(missing_ok=True)
+            if current_progress is not None:
+                current_progress.unlink(missing_ok=True)
+            with self._lock:
+                self._transcription_cancel_events.pop(audiobook_id, None)
+            if heavy_lease is not None:
+                heavy_lease.release()
             event.set()
 
     def prepare_transcription(
@@ -3593,12 +4234,19 @@ class AudiobookService:
                     current = {**current, "priority": int(requested_priority)}
                     self._transcription_jobs[audiobook_id] = current
                     if audiobook_id in self._transcription_queue:
-                        self._transcription_queue = [value for value in self._transcription_queue if value != audiobook_id]
+                        self._transcription_queue = [
+                            value for value in self._transcription_queue if value != audiobook_id
+                        ]
                         self._transcription_queue.append(audiobook_id)
                         self._transcription_queue.sort(
                             key=lambda value: (
-                                int((self._transcription_jobs.get(int(value)) or {}).get("priority") or int(WorkPriority.BACKGROUND)),
-                                float((self._transcription_jobs.get(int(value)) or {}).get("started_at") or 0.0),
+                                int(
+                                    (self._transcription_jobs.get(int(value)) or {}).get("priority")
+                                    or int(WorkPriority.BACKGROUND)
+                                ),
+                                float(
+                                    (self._transcription_jobs.get(int(value)) or {}).get("started_at") or 0.0
+                                ),
                             )
                         )
                 existing = dict(current)
@@ -3610,8 +4258,7 @@ class AudiobookService:
             cancel_event = threading.Event()
             started_at = time.time()
             total_duration = sum(
-                max(0.0, float(row.get("duration") or 0.0))
-                for row in self._file_rows(audiobook_id)
+                max(0.0, float(row.get("duration") or 0.0)) for row in self._file_rows(audiobook_id)
             )
             self._transcription_events[audiobook_id] = event
             self._transcription_cancel_events[audiobook_id] = cancel_event
@@ -3648,7 +4295,10 @@ class AudiobookService:
                 self._transcription_queue.append(audiobook_id)
                 self._transcription_queue.sort(
                     key=lambda value: (
-                        int((self._transcription_jobs.get(int(value)) or {}).get("priority") or int(WorkPriority.BACKGROUND)),
+                        int(
+                            (self._transcription_jobs.get(int(value)) or {}).get("priority")
+                            or int(WorkPriority.BACKGROUND)
+                        ),
                         float((self._transcription_jobs.get(int(value)) or {}).get("started_at") or 0.0),
                     )
                 )
@@ -3656,8 +4306,12 @@ class AudiobookService:
             queue_size = len(self._transcription_queue)
         LOGGER.info(
             "Audiobook STT queued audio=%s title=%r priority=%s queue_pos=%s queue_size=%s duration=%.1f",
-            audiobook_id, str(book.get("title") or ""), requested_priority.name.casefold(),
-            queue_position, queue_size, total_duration,
+            audiobook_id,
+            str(book.get("title") or ""),
+            requested_priority.name.casefold(),
+            queue_position,
+            queue_size,
+            total_duration,
         )
         self._ensure_transcription_dispatcher()
         return self.transcription_status(audiobook_id)
@@ -3698,11 +4352,15 @@ class AudiobookService:
                 job = dict(self._transcription_jobs.get(audiobook_id) or {})
             if event is None:
                 with self._lock:
-                    self._transcription_queue = [value for value in self._transcription_queue if int(value) != audiobook_id]
+                    self._transcription_queue = [
+                        value for value in self._transcription_queue if int(value) != audiobook_id
+                    ]
                 continue
             if cancel_event is not None and cancel_event.is_set():
                 with self._lock:
-                    self._transcription_queue = [value for value in self._transcription_queue if int(value) != audiobook_id]
+                    self._transcription_queue = [
+                        value for value in self._transcription_queue if int(value) != audiobook_id
+                    ]
                 self._set_transcription_job(
                     audiobook_id,
                     {"status": "cancelled", "ready": False, "error": ""},
@@ -3713,18 +4371,23 @@ class AudiobookService:
             priority = WorkPriority(int(job.get("priority") or int(WorkPriority.BACKGROUND)))
             heavy_lease = None
             if self.work_scheduler is not None:
-                block_reason = self.work_scheduler.background_wait_reason(
-                    priority=priority, resource="cpu"
-                )
+                block_reason = self.work_scheduler.background_wait_reason(priority=priority, resource="cpu")
                 if block_reason is not None:
-                    self._set_transcription_job(audiobook_id, {
-                        "status": "queued", "ready": False,
-                        "phase": "waiting_for_policy", "wait_reason": block_reason,
-                    })
+                    self._set_transcription_job(
+                        audiobook_id,
+                        {
+                            "status": "queued",
+                            "ready": False,
+                            "phase": "waiting_for_policy",
+                            "wait_reason": block_reason,
+                        },
+                    )
                     if last_wait != (audiobook_id, block_reason):
                         LOGGER.info(
                             "Audiobook STT waiting audio=%s reason=%s priority=%s",
-                            audiobook_id, block_reason, priority.name.casefold(),
+                            audiobook_id,
+                            block_reason,
+                            priority.name.casefold(),
                         )
                         last_wait = (audiobook_id, block_reason)
                     if cancel_event is not None:
@@ -3740,14 +4403,20 @@ class AudiobookService:
                     resource="cpu",
                 )
                 if heavy_lease is None:
-                    self._set_transcription_job(audiobook_id, {
-                        "status": "queued", "ready": False,
-                        "phase": "waiting_for_worker", "wait_reason": "heavy_work",
-                    })
+                    self._set_transcription_job(
+                        audiobook_id,
+                        {
+                            "status": "queued",
+                            "ready": False,
+                            "phase": "waiting_for_worker",
+                            "wait_reason": "heavy_work",
+                        },
+                    )
                     if last_wait != (audiobook_id, "heavy_work"):
                         LOGGER.info(
                             "Audiobook STT waiting audio=%s reason=heavy_work priority=%s",
-                            audiobook_id, priority.name.casefold(),
+                            audiobook_id,
+                            priority.name.casefold(),
                         )
                         last_wait = (audiobook_id, "heavy_work")
                     if cancel_event is not None:
@@ -3767,7 +4436,8 @@ class AudiobookService:
             last_wait = None
             LOGGER.info(
                 "Audiobook STT dispatch audio=%s priority=%s",
-                audiobook_id, priority.name.casefold(),
+                audiobook_id,
+                priority.name.casefold(),
             )
             self._transcribe_worker(
                 audiobook_id,
@@ -3788,7 +4458,9 @@ class AudiobookService:
         with self._lock:
             was_queued = audiobook_id in self._transcription_queue
             if was_queued:
-                self._transcription_queue = [value for value in self._transcription_queue if value != audiobook_id]
+                self._transcription_queue = [
+                    value for value in self._transcription_queue if value != audiobook_id
+                ]
         if was_queued:
             self._set_transcription_job(audiobook_id, {"status": "cancelled", "ready": False, "error": ""})
             event = self._transcription_events.get(audiobook_id)
@@ -3891,8 +4563,7 @@ class AudiobookService:
         output: dict[int, list[dict[str, Any]]] = {}
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT chapter_index,text_hash FROM ln_chapters "
-                "WHERE book_id=? ORDER BY chapter_index",
+                "SELECT chapter_index,text_hash FROM ln_chapters WHERE book_id=? ORDER BY chapter_index",
                 (int(ln_book_id),),
             ).fetchall()
             for row in rows:
@@ -3968,7 +4639,9 @@ class AudiobookService:
         if not hints:
             return False
         processing = alignment.get("processing") if isinstance(alignment.get("processing"), dict) else {}
-        fingerprint = str(processing.get("input_fingerprint") or self._alignment_fingerprint(ln_book_id, audiobook_id))
+        fingerprint = str(
+            processing.get("input_fingerprint") or self._alignment_fingerprint(ln_book_id, audiobook_id)
+        )
         refresh_key = (ln_book_id, chapter_index, fingerprint)
         with self._lock:
             if refresh_key in self._reader_parse_alignment_refresh_seen:
@@ -4017,9 +4690,7 @@ class AudiobookService:
         """
 
         normalized_text = chapter_audio_text(str(text or ""))
-        digest = str(text_hash or "").strip() or hashlib.sha256(
-            normalized_text.encode("utf-8")
-        ).hexdigest()
+        digest = str(text_hash or "").strip() or hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
 
         # First prefer the canonical full-reader cache if it appeared since the
         # initial alignment pass.
@@ -4068,12 +4739,12 @@ class AudiobookService:
 
         with self.db.connect() as conn:
             try:
-                row = conn.execute(
-                    "SELECT value FROM ln_settings WHERE key='jiten_api_key'"
-                ).fetchone()
+                row = conn.execute("SELECT value FROM ln_settings WHERE key='jiten_api_key'").fetchone()
             except Exception:
                 row = None
-        token = str((row["value"] if row is not None else "") or "").strip()
+        from . import study_secrets
+
+        token = study_secrets.resolve("jiten_api_key", str((row["value"] if row is not None else "") or ""))
         if not token:
             return [], {
                 "source": "unavailable",
@@ -4114,18 +4785,22 @@ class AudiobookService:
                 )
                 if response.status_code == 429 or response.status_code >= 500:
                     if attempt < 2:
-                        time.sleep(0.6 * (2 ** attempt))
+                        time.sleep(0.6 * (2**attempt))
                         continue
                 response.raise_for_status()
                 candidate = response.json() if response.content else {}
                 if isinstance(candidate, dict) and not candidate.get("error_message"):
                     result = candidate
                     break
-                last_error = str(candidate.get("error_message") or "invalid-jiten-response") if isinstance(candidate, dict) else "invalid-jiten-response"
+                last_error = (
+                    str(candidate.get("error_message") or "invalid-jiten-response")
+                    if isinstance(candidate, dict)
+                    else "invalid-jiten-response"
+                )
             except (httpx.HTTPError, ValueError, TypeError) as exc:
                 last_error = str(exc)
                 if attempt < 2:
-                    time.sleep(0.6 * (2 ** attempt))
+                    time.sleep(0.6 * (2**attempt))
 
         if result is None:
             return [], {
@@ -4140,19 +4815,23 @@ class AudiobookService:
             "tokens": result.get("tokens") or [],
             "vocabulary": result.get("vocabulary") or [],
         }
-        hints = _reading_hints_from_cached_parse(
-            parsed, source_limit=_CHAPTER_START_READING_SOURCE_LIMIT
-        )
+        hints = _reading_hints_from_cached_parse(parsed, source_limit=_CHAPTER_START_READING_SOURCE_LIMIT)
         token_groups = result.get("tokens") or []
         vocabulary_rows = result.get("vocabulary") or []
-        reading_field_count = sum(
-            1
-            for item in vocabulary_rows
-            if isinstance(item, dict) and str(item.get("reading") or "").strip()
-        ) if isinstance(vocabulary_rows, list) else 0
-        token_count = sum(
-            len(group) for group in token_groups if isinstance(group, list)
-        ) if isinstance(token_groups, list) else 0
+        reading_field_count = (
+            sum(
+                1
+                for item in vocabulary_rows
+                if isinstance(item, dict) and str(item.get("reading") or "").strip()
+            )
+            if isinstance(vocabulary_rows, list)
+            else 0
+        )
+        token_count = (
+            sum(len(group) for group in token_groups if isinstance(group, list))
+            if isinstance(token_groups, list)
+            else 0
+        )
         metadata = {
             "source": "jiten_prefix_api",
             "hint_count": len(hints),
@@ -4207,7 +4886,7 @@ class AudiobookService:
                 }
             )
         if not overlaps:
-            raise ValueError("Audiobook precision window does not overlap a readable file")
+            raise ValueError(err("audiobook.precisionWindowOutside"))
         actual_start = float(overlaps[0]["global_start"])
         actual_duration = sum(float(row["duration"]) for row in overlaps)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -4243,12 +4922,25 @@ class AudiobookService:
             command = [self._resolved_ffmpeg(), "-v", "error", "-nostdin", "-y"]
             for part in parts:
                 command.extend(["-i", str(part)])
-            graph = "".join(f"[{index}:a]" for index in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1[out]"
-            command.extend([
-                "-filter_complex", graph, "-map", "[out]",
-                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac",
-                str(destination),
-            ])
+            graph = (
+                "".join(f"[{index}:a]" for index in range(len(parts))) + f"concat=n={len(parts)}:v=0:a=1[out]"
+            )
+            command.extend(
+                [
+                    "-filter_complex",
+                    graph,
+                    "-map",
+                    "[out]",
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "-c:a",
+                    "flac",
+                    str(destination),
+                ]
+            )
             completed = subprocess.run(
                 command,
                 text=True,
@@ -4257,7 +4949,9 @@ class AudiobookService:
                 check=False,
             )
             if completed.returncode != 0 or not destination.is_file():
-                raise RuntimeError((completed.stderr or completed.stdout or "ffmpeg concat failed").strip()[-1200:])
+                raise RuntimeError(
+                    (completed.stderr or completed.stdout or "ffmpeg concat failed").strip()[-1200:]
+                )
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return actual_start, actual_duration
@@ -4285,11 +4979,20 @@ class AudiobookService:
         ):
             return (
                 [dict(item) for item in cached.get("segments") or [] if isinstance(item, dict)],
-                {"cached": True, "model": model, "window_start": cached.get("window_start"), "window_end": cached.get("window_end")},
+                {
+                    "cached": True,
+                    "model": model,
+                    "window_start": cached.get("window_start"),
+                    "window_end": cached.get("window_end"),
+                },
             )
 
         window_start = max(0.0, float(reference_time) - _CHAPTER_START_PRECISION_BEFORE_SECONDS)
-        duration_limit = float(total_duration) if float(total_duration) > 0.0 else float(reference_time) + _CHAPTER_START_PRECISION_AFTER_SECONDS
+        duration_limit = (
+            float(total_duration)
+            if float(total_duration) > 0.0
+            else float(reference_time) + _CHAPTER_START_PRECISION_AFTER_SECONDS
+        )
         window_end = min(
             duration_limit,
             float(reference_time) + _CHAPTER_START_PRECISION_AFTER_SECONDS,
@@ -4297,7 +5000,9 @@ class AudiobookService:
         if window_end <= window_start + 0.25:
             return [], {"cached": False, "model": model, "error": "empty-window"}
         cache.parent.mkdir(parents=True, exist_ok=True)
-        work = Path(tempfile.mkdtemp(prefix=f"pudge-chapter-start-{int(chapter_index):04d}-", dir=str(cache.parent)))
+        work = Path(
+            tempfile.mkdtemp(prefix=f"pudge-chapter-start-{int(chapter_index):04d}-", dir=str(cache.parent))
+        )
         audio = work / "window.flac"
         result_path = work / "result.json"
         progress_path = work / "progress.json"
@@ -4321,9 +5026,7 @@ class AudiobookService:
             environment = os.environ.copy()
             ffmpeg = self._resolved_ffmpeg()
             environment["PATH"] = os.pathsep.join(
-                part
-                for part in (str(Path(ffmpeg).resolve().parent), environment.get("PATH", ""))
-                if part
+                part for part in (str(Path(ffmpeg).resolve().parent), environment.get("PATH", "")) if part
             )
             environment.setdefault("PUDGE_MLX_CACHE_LIMIT_BYTES", str(_STT_MLX_CACHE_LIMIT_BYTES))
             environment.setdefault("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(_STT_MLX_MEMORY_LIMIT_BYTES))
@@ -4338,7 +5041,9 @@ class AudiobookService:
             payload = self._valid_stt_chunk_result(result_path)
             if completed.returncode != 0 or payload is None:
                 raise RuntimeError(
-                    (completed.stderr or completed.stdout or "precision chapter-start STT failed").strip()[-1200:]
+                    (completed.stderr or completed.stdout or "precision chapter-start STT failed").strip()[
+                        -1200:
+                    ]
                 )
             shifted = self._shift_transcription_segments(
                 [item for item in payload.get("segments") or [] if isinstance(item, dict)],
@@ -4355,7 +5060,9 @@ class AudiobookService:
                 "segments": shifted,
             }
             temporary = cache.with_suffix(cache.suffix + ".tmp")
-            temporary.write_text(json.dumps(saved, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            temporary.write_text(
+                json.dumps(saved, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
             temporary.replace(cache)
             return shifted, {
                 "cached": False,
@@ -4375,9 +5082,9 @@ class AudiobookService:
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
-    def _alignment_fingerprint(self, ln_book_id: int, audiobook_id: int) -> str:
+    def _alignment_fingerprint(self, ln_book_id: int, audiobook_id: int, *, legacy: bool = False) -> str:
         ln_book_id, audiobook_id = int(ln_book_id), int(audiobook_id)
-        cache_key = ("alignment", ln_book_id, audiobook_id)
+        cache_key = ("alignment-legacy" if legacy else "alignment", ln_book_id, audiobook_id)
         now = time.monotonic()
         with self._lock:
             cached = self._fingerprint_cache.get(cache_key)
@@ -4388,31 +5095,24 @@ class AudiobookService:
         # audiobook STT/alignment when the actual chapter text is unchanged.
         digest = hashlib.sha256(
             f"{_READING_AUDIO_ALIGNMENT_REVISION}-text-only\0{self.stt_model}\0".encode()
+            + (b"" if legacy else b"content-files\0")
         )
         with self.db.connect() as conn:
             chapters = conn.execute(
-                "SELECT chapter_index,text_hash FROM ln_chapters "
-                "WHERE book_id=? ORDER BY chapter_index",
+                "SELECT chapter_index,text_hash FROM ln_chapters WHERE book_id=? ORDER BY chapter_index",
                 (int(ln_book_id),),
             ).fetchall()
             files = conn.execute(
-                "SELECT file_index,path,start,end FROM audiobook_files "
-                "WHERE book_id=? ORDER BY file_index",
+                "SELECT file_index,path,start,end FROM audiobook_files WHERE book_id=? ORDER BY file_index",
                 (int(audiobook_id),),
             ).fetchall()
         for row in chapters:
             digest.update(
-                f"c:{int(row['chapter_index'])}:{row['text_hash']}\0".encode(
-                    "utf-8", errors="replace"
-                )
+                f"c:{int(row['chapter_index'])}:{row['text_hash']}\0".encode("utf-8", errors="replace")
             )
         for row in files:
             path = Path(str(row["path"]))
-            try:
-                stat = path.stat()
-                identity = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
-            except OSError:
-                identity = str(path)
+            identity = self._file_identity(path, legacy=legacy)
             digest.update(
                 f"a:{int(row['file_index'])}:{identity}:{row['start']}:{row['end']}\0".encode(
                     "utf-8", errors="replace"
@@ -4445,7 +5145,11 @@ class AudiobookService:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             payload = None
-        result = payload if isinstance(payload, dict) and payload.get("schema") == "pudge-alignment-report-v1" else None
+        result = (
+            payload
+            if isinstance(payload, dict) and payload.get("schema") == "pudge-alignment-report-v1"
+            else None
+        )
         with self._lock:
             report_cache[cache_key] = dict(result) if isinstance(result, dict) else None
         return dict(result) if isinstance(result, dict) else None
@@ -4476,10 +5180,7 @@ class AudiobookService:
         need_precision_context = any(
             isinstance(row.get("leading_prefix_debug"), dict)
             and bool(row.get("leading_prefix_debug", {}).get("chapter_marker"))
-            and (
-                "_runtime_reading_hints" not in row
-                or "_runtime_precision_segments" not in row
-            )
+            and ("_runtime_reading_hints" not in row or "_runtime_precision_segments" not in row)
             for row in chapters.values()
         )
         if (
@@ -4489,14 +5190,11 @@ class AudiobookService:
             return
 
         reading_hints_by_chapter = (
-            self._cached_chapter_start_reading_hints(int(ln_book_id))
-            if need_precision_context
-            else {}
+            self._cached_chapter_start_reading_hints(int(ln_book_id)) if need_precision_context else {}
         )
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT chapter_index,text FROM ln_chapters "
-                "WHERE book_id=? ORDER BY chapter_index",
+                "SELECT chapter_index,text FROM ln_chapters WHERE book_id=? ORDER BY chapter_index",
                 (int(ln_book_id),),
             ).fetchall()
         for row in rows:
@@ -4520,9 +5218,7 @@ class AudiobookService:
                 continue
 
             hints = reading_hints_by_chapter.get(chapter_index) or []
-            chapter["_runtime_reading_hints"] = [
-                dict(item) for item in hints if isinstance(item, dict)
-            ]
+            chapter["_runtime_reading_hints"] = [dict(item) for item in hints if isinstance(item, dict)]
 
             precision_segments: list[dict[str, Any]] = []
             if alignment_output is not None:
@@ -4540,9 +5236,7 @@ class AudiobookService:
                     and isinstance(cached.get("segments"), list)
                 ):
                     precision_segments = [
-                        dict(item)
-                        for item in cached.get("segments") or []
-                        if isinstance(item, dict)
+                        dict(item) for item in cached.get("segments") or [] if isinstance(item, dict)
                     ]
             chapter["_runtime_precision_segments"] = precision_segments
         payload.pop("_runtime_audio_position_index", None)
@@ -4550,9 +5244,19 @@ class AudiobookService:
     def _load_alignment(self, ln_book_id: int, audiobook_id: int) -> dict[str, Any] | None:
         ln_book_id, audiobook_id = int(ln_book_id), int(audiobook_id)
         path = self._alignment_path(ln_book_id, audiobook_id)
+        if not path.is_file():
+            legacy = (
+                self.cache_dir
+                / "reading-audio-alignment"
+                / f"{self._alignment_fingerprint(ln_book_id, audiobook_id, legacy=True)}.json"
+            )
+            if self._adopt_cache_file(legacy, path):
+                self._adopt_cache_file(legacy.with_suffix(".report.json"), path.with_suffix(".report.json"))
         cache_key = (ln_book_id, audiobook_id, path.stem)
         with self._lock:
-            cached = self._alignment_payload_cache.get(cache_key)
+            cached = self._alignment_payload_cache.pop(cache_key, None)
+            if cached is not None:
+                self._alignment_payload_cache[cache_key] = cached  # most recent last
         if cached is not None:
             return cached
         try:
@@ -4564,6 +5268,12 @@ class AudiobookService:
         if isinstance(payload, dict) and payload.get("schema") == "reading-audio-v3":
             self._attach_runtime_alignment_context(payload, ln_book_id, path)
             with self._lock:
+                # Only the last two books' alignments stay in memory (a long book
+                # is 100+ MB parsed): reader + sidebar of another book still
+                # work without reloading; older ones reload from disk.
+                self._alignment_payload_cache.pop(cache_key, None)
+                while len(self._alignment_payload_cache) >= 2:
+                    self._alignment_payload_cache.pop(next(iter(self._alignment_payload_cache)))
                 self._alignment_payload_cache[cache_key] = payload
             return payload
         return None
@@ -4595,9 +5305,16 @@ class AudiobookService:
         }
         if not source_lengths:
             return None
-        transcript_fingerprint = self._transcript_fingerprint(int(audiobook_id))
+        transcript_fingerprints = {
+            self._transcript_fingerprint(int(audiobook_id)),
+            self._transcript_fingerprint(int(audiobook_id), legacy=True),
+        }
         candidates = sorted(
-            (item for item in root.glob("*.json") if not item.name.endswith(".report.json") and item != destination),
+            (
+                item
+                for item in root.glob("*.json")
+                if not item.name.endswith(".report.json") and item != destination
+            ),
             key=lambda item: item.stat().st_mtime_ns if item.exists() else 0,
             reverse=True,
         )[:96]
@@ -4609,7 +5326,7 @@ class AudiobookService:
             if not isinstance(cached, dict) or cached.get("schema") != "reading-audio-v3":
                 continue
             processing = cached.get("processing") if isinstance(cached.get("processing"), dict) else {}
-            if str(processing.get("transcript_fingerprint") or "") != transcript_fingerprint:
+            if str(processing.get("transcript_fingerprint") or "") not in transcript_fingerprints:
                 continue
             revision = str(processing.get("alignment_algorithm_revision") or "")
             if revision and revision != _READING_AUDIO_ALIGNMENT_REVISION:
@@ -4639,11 +5356,13 @@ class AudiobookService:
                     if length <= 0 or source_lengths.get(new_index) != length:
                         compatible = False
                         break
-                    candidate_rows.append({
-                        **row,
-                        "chapter_index": new_index,
-                        "title": source_titles.get(new_index, str(row.get("title") or "")),
-                    })
+                    candidate_rows.append(
+                        {
+                            **row,
+                            "chapter_index": new_index,
+                            "title": source_titles.get(new_index, str(row.get("title") or "")),
+                        }
+                    )
                 if compatible and len(candidate_rows) == len(aligned_rows):
                     compatible_mappings.append((delta, candidate_rows))
             direct = next((rows for delta, rows in compatible_mappings if delta == 0), None)
@@ -4665,21 +5384,30 @@ class AudiobookService:
             migrated["processing"] = migrated_processing
             destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = destination.with_suffix(".tmp")
-            temporary.write_text(json.dumps(migrated, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            temporary.write_text(
+                json.dumps(migrated, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
             temporary.replace(destination)
-            report = build_alignment_report(migrated, [
-                {**row, "normalized_length": source_lengths[int(row["chapter_index"])]}
-                for row in source_rows
-            ])
+            report = build_alignment_report(
+                migrated,
+                [
+                    {**row, "normalized_length": source_lengths[int(row["chapter_index"])]}
+                    for row in source_rows
+                ],
+            )
             report_path = destination.with_suffix(".report.json")
             report_tmp = report_path.with_suffix(".tmp")
-            report_tmp.write_text(json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            report_tmp.write_text(
+                json.dumps(report, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+            )
             report_tmp.replace(report_path)
             return migrated
         return None
 
     def alignment_status(self, ln_book_id: int) -> dict[str, Any]:
-        link = self.link_for_light_novel(int(ln_book_id), include_alignment=False, include_transcription=False)
+        link = self.link_for_light_novel(
+            int(ln_book_id), include_alignment=False, include_transcription=False
+        )
         if link is None:
             return {"status": "unlinked", "ready": False}
         audiobook_id = int(link["book"]["id"])
@@ -4696,12 +5424,12 @@ class AudiobookService:
                 "matched_chapters": len(alignment.get("chapters") or []),
                 "anchor_count": int(alignment.get("anchor_count") or 0),
                 "timing_source": str(alignment.get("timing_source") or "stt"),
-                "quality_grade": str(report.get("grade") or "unknown") if isinstance(report, dict) else "unknown",
+                "quality_grade": str(report.get("grade") or "unknown")
+                if isinstance(report, dict)
+                else "unknown",
                 "coverage": float(summary.get("coverage") or 0.0),
                 "warning_count": int(summary.get("warning_count") or 0),
-                "algorithm_revision": str(
-                    processing.get("alignment_algorithm_revision") or ""
-                ),
+                "algorithm_revision": str(processing.get("alignment_algorithm_revision") or ""),
             }
         with self._lock:
             job = dict(self._alignment_jobs.get(int(ln_book_id)) or {})
@@ -4721,9 +5449,7 @@ class AudiobookService:
         return job or {"status": "not_prepared", "ready": False}
 
     @staticmethod
-    def _shift_transcription_segments(
-        segments: list[dict[str, Any]], offset: float
-    ) -> list[dict[str, Any]]:
+    def _shift_transcription_segments(segments: list[dict[str, Any]], offset: float) -> list[dict[str, Any]]:
         shifted: list[dict[str, Any]] = []
         for segment in segments:
             if not isinstance(segment, dict):
@@ -4775,9 +5501,7 @@ class AudiobookService:
         cancel_event: threading.Event | None = None,
     ) -> bool:
         with self._lock:
-            return self._alignment_attempt_current_locked(
-                ln_book_id, audiobook_id, generation, cancel_event
-            )
+            return self._alignment_attempt_current_locked(ln_book_id, audiobook_id, generation, cancel_event)
 
     def _require_alignment_attempt(
         self,
@@ -4786,9 +5510,7 @@ class AudiobookService:
         generation: int,
         cancel_event: threading.Event,
     ) -> None:
-        if not self._alignment_attempt_current(
-            ln_book_id, audiobook_id, generation, cancel_event
-        ):
+        if not self._alignment_attempt_current(ln_book_id, audiobook_id, generation, cancel_event):
             raise InterruptedError("Alignment attempt superseded")
 
     def _cancel_alignment_attempt_locked(self, ln_book_id: int) -> None:
@@ -4811,7 +5533,10 @@ class AudiobookService:
                 return
             if generation is not None and int(current.get("generation") or -1) != int(generation):
                 return
-            if cancel_event is not None and self._alignment_cancel_events.get(int(ln_book_id)) is not cancel_event:
+            if (
+                cancel_event is not None
+                and self._alignment_cancel_events.get(int(ln_book_id)) is not cancel_event
+            ):
                 return
             self._alignment_jobs[int(ln_book_id)] = {
                 **current,
@@ -4831,13 +5556,9 @@ class AudiobookService:
         started_at = time.monotonic()
         with self._lock:
             alignment_job = dict(self._alignment_jobs.get(int(ln_book_id)) or {})
-        requested_priority = WorkPriority(
-            int(alignment_job.get("priority") or int(WorkPriority.BACKGROUND))
-        )
+        requested_priority = WorkPriority(int(alignment_job.get("priority") or int(WorkPriority.BACKGROUND)))
         try:
-            self._require_alignment_attempt(
-                ln_book_id, audiobook_id, generation, cancel_event
-            )
+            self._require_alignment_attempt(ln_book_id, audiobook_id, generation, cancel_event)
             with self.db.connect() as conn:
                 chapters = [
                     dict(row)
@@ -4849,12 +5570,10 @@ class AudiobookService:
                 ]
             book = self.book(int(audiobook_id))
             if not chapters:
-                raise ValueError("Linked LN or audiobook has no chapters")
+                raise ValueError(err("audiobook.noChapters"))
             transcript = self._load_transcript(int(audiobook_id))
             if transcript is None:
-                self.prepare_transcription(
-                    int(audiobook_id), priority=requested_priority
-                )
+                self.prepare_transcription(int(audiobook_id), priority=requested_priority)
                 with self._lock:
                     event = self._transcription_events.get(int(audiobook_id))
                 if event is not None:
@@ -4862,12 +5581,8 @@ class AudiobookService:
                 transcript = self._load_transcript(int(audiobook_id))
             if transcript is None:
                 status = self.transcription_status(int(audiobook_id))
-                raise RuntimeError(str(status.get("error") or "Audiobook transcription is unavailable"))
-            all_segments = [
-                dict(item)
-                for item in transcript.get("segments") or []
-                if isinstance(item, dict)
-            ]
+                raise RuntimeError(str(status.get("error") or err("audiobook.transcriptionUnavailable")))
+            all_segments = [dict(item) for item in transcript.get("segments") or [] if isinstance(item, dict)]
             self._set_alignment_job(
                 ln_book_id,
                 audiobook_id,
@@ -4875,9 +5590,7 @@ class AudiobookService:
                 generation=generation,
                 cancel_event=cancel_event,
             )
-            self._require_alignment_attempt(
-                ln_book_id, audiobook_id, generation, cancel_event
-            )
+            self._require_alignment_attempt(ln_book_id, audiobook_id, generation, cancel_event)
             phase_at = time.monotonic()
             speech_regions, timing_source = self._load_or_analyze_activity(
                 int(audiobook_id),
@@ -4887,13 +5600,20 @@ class AudiobookService:
             phase_at = time.monotonic()
             book_duration = float(book["duration"] or 0.0)
             chapter_start_reading_hints = self._cached_chapter_start_reading_hints(int(ln_book_id))
-            alignment = align_light_novel_to_transcript(
-                chapters,
-                all_segments,
-                duration=book_duration,
-                model=self.stt_model,
-                speech_regions=speech_regions,
-                chapter_start_reading_hints=chapter_start_reading_hints,
+            anchor_cache = output.parent / f".{output.stem}.g{int(generation)}.anchors.json"
+            alignment = self._align_reading_audio(
+                dict(
+                    chapters=chapters,
+                    segments=all_segments,
+                    duration=book_duration,
+                    model=self.stt_model,
+                    speech_regions=speech_regions,
+                    chapter_start_reading_hints=chapter_start_reading_hints,
+                ),
+                ln_book_id=int(ln_book_id),
+                cancel_event=cancel_event,
+                anchor_cache=anchor_cache,
+                background=requested_priority >= WorkPriority.BACKGROUND,
             )
             precision_segments: dict[int, list[dict[str, Any]]] = {}
             precision_metadata: dict[int, dict[str, Any]] = {}
@@ -4917,9 +5637,7 @@ class AudiobookService:
                 )
                 chapter_rows = {int(row.get("chapter_index") or 0): row for row in chapters}
                 for candidate in precision_candidates:
-                    self._require_alignment_attempt(
-                        ln_book_id, audiobook_id, generation, cancel_event
-                    )
+                    self._require_alignment_attempt(ln_book_id, audiobook_id, generation, cancel_event)
                     chapter_index = int(candidate.get("chapter_index") or 0)
                     reference_time = self._alignment_chapter_reference_time(candidate)
                     reading_metadata: dict[str, Any] = {
@@ -4948,8 +5666,12 @@ class AudiobookService:
                         "reading_hint_source": str(reading_metadata.get("source") or ""),
                         "reading_hint_count": int(reading_metadata.get("hint_count") or 0),
                         "reading_hint_jiten_token_count": int(reading_metadata.get("jiten_token_count") or 0),
-                        "reading_hint_jiten_vocabulary_count": int(reading_metadata.get("jiten_vocabulary_count") or 0),
-                        "reading_hint_jiten_reading_field_count": int(reading_metadata.get("jiten_reading_field_count") or 0),
+                        "reading_hint_jiten_vocabulary_count": int(
+                            reading_metadata.get("jiten_vocabulary_count") or 0
+                        ),
+                        "reading_hint_jiten_reading_field_count": int(
+                            reading_metadata.get("jiten_reading_field_count") or 0
+                        ),
                         **(
                             {"reading_hint_error": str(reading_metadata.get("error") or "")}
                             if reading_metadata.get("error")
@@ -4960,14 +5682,20 @@ class AudiobookService:
                     if rows:
                         precision_segments[chapter_index] = rows
                 if precision_segments:
-                    alignment = align_light_novel_to_transcript(
-                        chapters,
-                        all_segments,
-                        duration=book_duration,
-                        model=self.stt_model,
-                        speech_regions=speech_regions,
-                        chapter_start_segments=precision_segments,
-                        chapter_start_reading_hints=chapter_start_reading_hints,
+                    alignment = self._align_reading_audio(
+                        dict(
+                            chapters=chapters,
+                            segments=all_segments,
+                            duration=book_duration,
+                            model=self.stt_model,
+                            speech_regions=speech_regions,
+                            chapter_start_segments=precision_segments,
+                            chapter_start_reading_hints=chapter_start_reading_hints,
+                        ),
+                        ln_book_id=int(ln_book_id),
+                        cancel_event=cancel_event,
+                        anchor_cache=anchor_cache,
+                        background=requested_priority >= WorkPriority.BACKGROUND,
                     )
                     for chapter_row in alignment.get("chapters") or []:
                         if not isinstance(chapter_row, dict):
@@ -4987,9 +5715,15 @@ class AudiobookService:
                             "precision_window_end": metadata.get("window_end"),
                             "reading_hint_source": str(metadata.get("reading_hint_source") or ""),
                             "reading_hint_count": int(metadata.get("reading_hint_count") or 0),
-                            "reading_hint_jiten_token_count": int(metadata.get("reading_hint_jiten_token_count") or 0),
-                            "reading_hint_jiten_vocabulary_count": int(metadata.get("reading_hint_jiten_vocabulary_count") or 0),
-                            "reading_hint_jiten_reading_field_count": int(metadata.get("reading_hint_jiten_reading_field_count") or 0),
+                            "reading_hint_jiten_token_count": int(
+                                metadata.get("reading_hint_jiten_token_count") or 0
+                            ),
+                            "reading_hint_jiten_vocabulary_count": int(
+                                metadata.get("reading_hint_jiten_vocabulary_count") or 0
+                            ),
+                            "reading_hint_jiten_reading_field_count": int(
+                                metadata.get("reading_hint_jiten_reading_field_count") or 0
+                            ),
                             **(
                                 {"reading_hint_error": str(metadata.get("reading_hint_error") or "")}
                                 if metadata.get("reading_hint_error")
@@ -5015,9 +5749,7 @@ class AudiobookService:
             report_sources = [
                 {
                     **chapter,
-                    "normalized_length": len(
-                        normalize_reading_text(str(chapter.get("text") or ""))
-                    ),
+                    "normalized_length": len(normalize_reading_text(str(chapter.get("text") or ""))),
                 }
                 for chapter in chapters
             ]
@@ -5027,9 +5759,7 @@ class AudiobookService:
             run_token = f"g{int(generation)}-{threading.get_ident()}-{time.time_ns()}"
             attempt_output = output.with_name(f".{output.name}.{run_token}.tmp")
             report_output = self._alignment_report_path(int(ln_book_id), int(audiobook_id))
-            report_temporary = report_output.with_name(
-                f".{report_output.name}.{run_token}.tmp"
-            )
+            report_temporary = report_output.with_name(f".{report_output.name}.{run_token}.tmp")
             try:
                 attempt_output.write_text(
                     json.dumps(alignment, ensure_ascii=False, separators=(",", ":")),
@@ -5048,18 +5778,24 @@ class AudiobookService:
                     report_temporary.replace(report_output)
                     self._alignment_payload_cache.clear()
                     self._alignment_report_cache.clear()
-                    self._refresh_reader_review_alignment_locked(ln_book_id,audiobook_id,book_duration,alignment)
+                    self._refresh_reader_review_alignment_locked(
+                        ln_book_id, audiobook_id, book_duration, alignment
+                    )
             finally:
                 attempt_output.unlink(missing_ok=True)
                 report_temporary.unlink(missing_ok=True)
             LOGGER.info(
                 "LN audiobook alignment prepared ln=%s audio=%s generation=%s source=%s activity=%.3fs align=%.3fs total=%.3fs anchors=%s",
-                ln_book_id, audiobook_id, generation, timing_source, activity_seconds, alignment_seconds,
-                time.monotonic() - started_at, int(alignment.get("anchor_count") or 0),
+                ln_book_id,
+                audiobook_id,
+                generation,
+                timing_source,
+                activity_seconds,
+                alignment_seconds,
+                time.monotonic() - started_at,
+                int(alignment.get("anchor_count") or 0),
             )
-            self._require_alignment_attempt(
-                ln_book_id, audiobook_id, generation, cancel_event
-            )
+            self._require_alignment_attempt(ln_book_id, audiobook_id, generation, cancel_event)
             with self.db.connect() as conn:
                 conn.execute(
                     "UPDATE reading_audio_links SET alignment_mode='stt_acoustic',updated_at=? "
@@ -5097,6 +5833,106 @@ class AudiobookService:
         finally:
             if heavy_lease is not None:
                 heavy_lease.release()
+            try:
+                (output.parent / f".{output.stem}.g{int(generation)}.anchors.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _align_reading_audio(
+        self,
+        arguments: dict[str, Any],
+        *,
+        ln_book_id: int,
+        cancel_event: threading.Event,
+        anchor_cache: Path,
+        background: bool = False,
+    ) -> dict[str, Any]:
+        """align_light_novel_to_transcript in a child process (result through a file).
+
+        The window process keeps its memory and stays responsive; cancelling the
+        attempt (relink, unlink, a newer generation, quitting) stops the child.
+        """
+        work = anchor_cache.parent
+        work.mkdir(parents=True, exist_ok=True)
+        token = f"{os.getpid()}-{threading.get_ident()}-{time.time_ns()}"
+        request_path = work / f".align-{token}.request.json"
+        result_path = work / f".align-{token}.result.json"
+        stderr_path = work / f".align-{token}.stderr.log"
+        process: subprocess.Popen[Any] | None = None
+        try:
+            with request_path.open("w", encoding="utf-8") as handle:
+                json.dump(
+                    {**arguments, "anchor_cache": str(anchor_cache)},
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            environment = os.environ.copy()
+            package_root = str(Path(__file__).resolve().parents[1])
+            environment["PYTHONPATH"] = os.pathsep.join(
+                part for part in (package_root, environment.get("PYTHONPATH", "")) if part
+            )
+            if background:
+                mark_background(environment)
+            with stderr_path.open("w", encoding="utf-8") as stderr_file:
+                try:
+                    process = subprocess.Popen(
+                        [
+                            self.python,
+                            "-m",
+                            "pudge.reading_audio_alignment_worker",
+                            str(request_path),
+                            str(result_path),
+                        ],
+                        env=environment,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=stderr_file,
+                    )
+                except OSError as exc:
+                    LOGGER.warning("FALLBACK step=ln_audio.align_process error=%r", exc)
+                    return align_light_novel_to_transcript(**arguments)
+            with self._lock:
+                previous = self._alignment_processes.get(int(ln_book_id))
+                self._alignment_processes[int(ln_book_id)] = process
+            if previous is not None and previous is not process and previous.poll() is None:
+                previous.terminate()
+            while process.poll() is None:
+                if cancel_event.is_set() or self._closed_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=3)
+                    raise InterruptedError(err("audiobook.alignmentCancelled"))
+                time.sleep(0.1)
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                payload = None
+            if not isinstance(payload, dict):
+                if cancel_event.is_set():
+                    raise InterruptedError(err("audiobook.alignmentCancelled"))
+                detail = ""
+                try:
+                    detail = stderr_path.read_text(encoding="utf-8", errors="replace").strip()[-1200:]
+                except OSError:
+                    pass
+                raise RuntimeError(detail or err("audiobook.alignmentStopped", code=process.returncode))
+            if not payload.get("ok"):
+                raise RuntimeError(str(payload.get("error") or err("audiobook.alignmentFailed")))
+            alignment = payload.get("alignment")
+            if not isinstance(alignment, dict):
+                raise RuntimeError(err("audiobook.alignmentEmpty"))
+            return alignment
+        finally:
+            if process is not None:
+                with self._lock:
+                    if self._alignment_processes.get(int(ln_book_id)) is process:
+                        self._alignment_processes.pop(int(ln_book_id), None)
+            for path in (request_path, result_path, stderr_path):
+                path.unlink(missing_ok=True)
 
     def alignment_report(self, ln_book_id: int) -> dict[str, Any]:
         link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
@@ -5127,7 +5963,7 @@ class AudiobookService:
     ) -> dict[str, Any]:
         link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
         if link is None:
-            raise KeyError(f"Light novel id={ln_book_id} has no linked audiobook")
+            raise KeyError(err("audiobook.noLinkedAudiobook", bookId=ln_book_id))
         audiobook_id = int(link["book"]["id"])
         with self._lock:
             self._cancel_alignment_attempt_locked(int(ln_book_id))
@@ -5149,7 +5985,7 @@ class AudiobookService:
             raise RuntimeError("Audiobook service is closed")
         link = self.link_for_light_novel(int(ln_book_id), include_alignment=False)
         if link is None:
-            raise KeyError(f"Light novel id={ln_book_id} has no linked audiobook")
+            raise KeyError(err("audiobook.noLinkedAudiobook", bookId=ln_book_id))
         requested_priority = WorkPriority(int(priority))
         audiobook_id = int(link["book"]["id"])
         output = self._alignment_path(int(ln_book_id), audiobook_id)
@@ -5161,9 +5997,7 @@ class AudiobookService:
         with self._lock:
             current = self._alignment_jobs.get(int(ln_book_id)) or {}
             if current.get("status") in {"queued", "transcribing", "aligning"}:
-                current_priority = WorkPriority(
-                    int(current.get("priority") or int(WorkPriority.BACKGROUND))
-                )
+                current_priority = WorkPriority(int(current.get("priority") or int(WorkPriority.BACKGROUND)))
                 if current.get("status") == "queued" and requested_priority < current_priority:
                     current = {**current, "priority": int(requested_priority)}
                     self._alignment_jobs[int(ln_book_id)] = current
@@ -5190,44 +6024,108 @@ class AudiobookService:
         thread.start()
         return {"status": "queued", "ready": False, "generation": generation}
 
-    def link_candidates_for_light_novel(self, ln_book_id: int, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        ln_book_id = int(ln_book_id); query = str(query or "").strip(); limit = max(1, min(100, int(limit or 50)))
+    def link_candidates_for_light_novel(
+        self, ln_book_id: int, query: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        ln_book_id = int(ln_book_id)
+        query = str(query or "").strip()
+        limit = max(1, min(100, int(limit or 50)))
         with self.db.connect() as conn:
-            novel = conn.execute("SELECT id,title,volume,anilist_id FROM ln_books WHERE id=?", (ln_book_id,)).fetchone()
-            if novel is None: raise KeyError(f"Unknown light novel id={ln_book_id}")
-            audio_rows = conn.execute("SELECT id,title,path,duration FROM audiobooks ORDER BY updated_at DESC,id DESC").fetchall()
-            identities = {int(r['local_id']): r for r in conn.execute("SELECT local_id,anilist_id,title FROM media_identities WHERE kind='audiobook'").fetchall()}
-            chapter_counts = {int(r['book_id']): int(r['n']) for r in conn.execute("SELECT book_id,COUNT(*) AS n FROM audiobook_chapters GROUP BY book_id").fetchall()}
-            ln_text = ''.join(str(r['text'] or '') for r in conn.execute("SELECT text FROM ln_chapters WHERE book_id=? ORDER BY chapter_index LIMIT 3", (ln_book_id,)).fetchall())[:12000]
-        def jpkey(text: str) -> str: return re.sub(r"[^ぁ-ゟ゠-ヿ一-鿿]+", "", unicodedata.normalize('NFKC', str(text or '')))
+            novel = conn.execute(
+                "SELECT id,title,volume,anilist_id FROM ln_books WHERE id=?", (ln_book_id,)
+            ).fetchone()
+            if novel is None:
+                raise KeyError(err("audiobook.unknownLightNovel", bookId=ln_book_id))
+            audio_rows = conn.execute(
+                "SELECT id,title,path,duration FROM audiobooks ORDER BY updated_at DESC,id DESC"
+            ).fetchall()
+            identities = {
+                int(r["local_id"]): r
+                for r in conn.execute(
+                    "SELECT local_id,anilist_id,title FROM media_identities WHERE kind='audiobook'"
+                ).fetchall()
+            }
+            chapter_counts = {
+                int(r["book_id"]): int(r["n"])
+                for r in conn.execute(
+                    "SELECT book_id,COUNT(*) AS n FROM audiobook_chapters GROUP BY book_id"
+                ).fetchall()
+            }
+            ln_text = "".join(
+                str(r["text"] or "")
+                for r in conn.execute(
+                    "SELECT text FROM ln_chapters WHERE book_id=? ORDER BY chapter_index LIMIT 3",
+                    (ln_book_id,),
+                ).fetchall()
+            )[:12000]
+
+        def jpkey(text: str) -> str:
+            return re.sub(r"[^ぁ-ゟ゠-ヿ一-鿿]+", "", unicodedata.normalize("NFKC", str(text or "")))
+
         ln_sample = jpkey(ln_text)
-        candidates=[]
+        candidates = []
         for row in audio_rows:
-            aid=int(row['id']); title=str(row['title'] or _audiobook_path_label(str(row['path'])))
-            if query and _audiobook_title_match_score(query,title) < 35 and _audiobook_title_key(query) not in _audiobook_title_key(title): continue
-            score=_audiobook_title_match_score(str(novel['title']),title); signals=["title"]
-            avol=_audiobook_volume(title) or _audiobook_volume(_audiobook_path_label(str(row['path']))); nvol=int(novel['volume'] or 0)
+            aid = int(row["id"])
+            title = str(row["title"] or _audiobook_path_label(str(row["path"])))
+            if (
+                query
+                and _audiobook_title_match_score(query, title) < 35
+                and _audiobook_title_key(query) not in _audiobook_title_key(title)
+            ):
+                continue
+            score = _audiobook_title_match_score(str(novel["title"]), title)
+            signals = ["title"]
+            avol = _audiobook_volume(title) or _audiobook_volume(_audiobook_path_label(str(row["path"])))
+            nvol = int(novel["volume"] or 0)
             if avol and nvol:
-                if avol==nvol: score+=10; signals.append(f"volume {nvol}")
+                if avol == nvol:
+                    score += 10
+                    signals.append(f"volume {nvol}")
                 # A shared series title is weak evidence when both sides carry
                 # explicit, different volume numbers.  Keep the candidate in
                 # search results, but push it well below a matching volume.
-                else: score-=70; signals.append(f"volume mismatch {avol}/{nvol}")
-            ident=identities.get(aid); nid=int(novel['anilist_id']) if novel['anilist_id'] is not None else None
-            if ident is not None and ident['anilist_id'] is not None and nid and int(ident['anilist_id'])==nid: score+=30; signals.append('AniList')
-            cc=chapter_counts.get(aid,0)
-            if cc: signals.append(f"{cc} audio chapters")
+                else:
+                    score -= 70
+                    signals.append(f"volume mismatch {avol}/{nvol}")
+            ident = identities.get(aid)
+            nid = int(novel["anilist_id"]) if novel["anilist_id"] is not None else None
+            if (
+                ident is not None
+                and ident["anilist_id"] is not None
+                and nid
+                and int(ident["anilist_id"]) == nid
+            ):
+                score += 30
+                signals.append("AniList")
+            cc = chapter_counts.get(aid, 0)
+            if cc:
+                signals.append(f"{cc} audio chapters")
             # Existing transcript is useful evidence, but candidate discovery must never launch STT.
-            transcript=self._load_transcript(aid)
+            transcript = self._load_transcript(aid)
             if transcript and ln_sample:
-                spoken=jpkey(''.join(str(seg.get('text') or '') for seg in (transcript.get('segments') or [])[:160]))[:12000]
+                spoken = jpkey(
+                    "".join(str(seg.get("text") or "") for seg in (transcript.get("segments") or [])[:160])
+                )[:12000]
                 if spoken:
-                    grams=lambda x:{x[i:i+4] for i in range(max(0,len(x)-3))}
-                    a,b=grams(ln_sample),grams(spoken); overlap=(len(a & b)/max(1,min(len(a),len(b)))) if a and b else 0.0
-                    if overlap>0: score+=min(25.0,overlap*100.0); signals.append("audio/text")
-            probability=max(0.0,min(0.999,score/125.0))
-            candidates.append({'id':aid,'title':title,'duration':float(row['duration'] or 0.0),'chapter_count':cc,'score':round(score,3),'probability':round(probability,4),'signals':signals})
-        candidates.sort(key=lambda x:(x['score'],x['title']), reverse=True)
+                    grams = lambda x: {x[i : i + 4] for i in range(max(0, len(x) - 3))}
+                    a, b = grams(ln_sample), grams(spoken)
+                    overlap = (len(a & b) / max(1, min(len(a), len(b)))) if a and b else 0.0
+                    if overlap > 0:
+                        score += min(25.0, overlap * 100.0)
+                        signals.append("audio/text")
+            probability = max(0.0, min(0.999, score / 125.0))
+            candidates.append(
+                {
+                    "id": aid,
+                    "title": title,
+                    "duration": float(row["duration"] or 0.0),
+                    "chapter_count": cc,
+                    "score": round(score, 3),
+                    "probability": round(probability, 4),
+                    "signals": signals,
+                }
+            )
+        candidates.sort(key=lambda x: (x["score"], x["title"]), reverse=True)
         return candidates[:limit]
 
     def link_light_novel(
@@ -5256,12 +6154,8 @@ class AudiobookService:
                 (int(ln_book_id), int(audiobook_id), now, now),
             )
         if prepare_alignment:
-            self.prepare_transcription(
-                int(audiobook_id), priority=WorkPriority.USER
-            )
-            self.prepare_alignment(
-                int(ln_book_id), priority=WorkPriority.USER
-            )
+            self.prepare_transcription(int(audiobook_id), priority=WorkPriority.USER)
+            self.prepare_alignment(int(ln_book_id), priority=WorkPriority.USER)
         return {"ok": True, "link": self.link_for_light_novel(int(ln_book_id))}
 
     def unlink_light_novel(self, ln_book_id: int) -> dict[str, Any]:
@@ -5276,7 +6170,9 @@ class AudiobookService:
         # P10: audio keeps playing, but reader review/sync control is disconnected.
         with self._lock:
             contexts = getattr(self, "_review_contexts", {})
-            for audiobook_id in [key for key, ctx in contexts.items() if ctx.get("ln_book_id") == int(ln_book_id)]:
+            for audiobook_id in [
+                key for key, ctx in contexts.items() if ctx.get("ln_book_id") == int(ln_book_id)
+            ]:
                 contexts.pop(audiobook_id, None)
         return {"ok": True}
 
@@ -5316,10 +6212,12 @@ class AudiobookService:
             result["alignment"] = self.alignment_status(int(ln_book_id))
         return result
 
-    def _paired_audio_position(self, ln_book_id: int, chapter_index: int, chapter_progress: float) -> tuple[int, float]:
+    def _paired_audio_position(
+        self, ln_book_id: int, chapter_index: int, chapter_progress: float
+    ) -> tuple[int, float]:
         link = self.link_for_light_novel(int(ln_book_id))
         if link is None:
-            raise KeyError(f"Light novel id={ln_book_id} has no linked audiobook")
+            raise KeyError(err("audiobook.noLinkedAudiobook", bookId=ln_book_id))
         book = link["book"]
         alignment = self._load_alignment(int(ln_book_id), int(book["id"]))
         if alignment is not None:
@@ -5332,15 +6230,21 @@ class AudiobookService:
                 return int(book["id"]), exact
         chapters = book["chapters"] or [{"start": 0.0, "end": float(book["duration"] or 0.0)}]
         with self.db.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) FROM ln_chapters WHERE book_id=?", (int(ln_book_id),)).fetchone()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM ln_chapters WHERE book_id=?", (int(ln_book_id),)
+            ).fetchone()
         ln_count = max(1, int(row[0] if row else 1))
         if ln_count <= 1 or len(chapters) <= 1:
             audio_index = 0
         else:
-            audio_index = round(max(0, min(ln_count - 1, int(chapter_index))) / (ln_count - 1) * (len(chapters) - 1))
+            audio_index = round(
+                max(0, min(ln_count - 1, int(chapter_index))) / (ln_count - 1) * (len(chapters) - 1)
+            )
         chapter = chapters[max(0, min(len(chapters) - 1, audio_index))]
         progress = max(0.0, min(1.0, float(chapter_progress)))
-        position = float(chapter["start"]) + progress * max(0.0, float(chapter["end"]) - float(chapter["start"]))
+        position = float(chapter["start"]) + progress * max(
+            0.0, float(chapter["end"]) - float(chapter["start"])
+        )
         return int(book["id"]), position
 
     def play_paired(
@@ -5372,7 +6276,7 @@ class AudiobookService:
     ) -> dict[str, Any]:
         link = self.link_for_light_novel(int(ln_book_id))
         if link is None:
-            raise KeyError(f"Light novel id={ln_book_id} has no linked audiobook")
+            raise KeyError(err("audiobook.noLinkedAudiobook", bookId=ln_book_id))
         audiobook_id = int(link["book"]["id"])
         alignment = self._load_alignment(int(ln_book_id), audiobook_id)
         position = (
@@ -5458,7 +6362,9 @@ class AudiobookService:
         return ranges
 
     def paired_state(self, ln_book_id: int) -> dict[str, Any]:
-        link = self.link_for_light_novel(int(ln_book_id), include_alignment=False, include_transcription=False)
+        link = self.link_for_light_novel(
+            int(ln_book_id), include_alignment=False, include_transcription=False
+        )
         if link is None:
             return {"linked": False, "playing": False}
         book = link["book"]
@@ -5534,13 +6440,16 @@ class AudiobookService:
                     chapter_start_debug = dict(candidate_debug)
                 break
             alignment_state = {
-                "status": "ready", "ready": True,
+                "status": "ready",
+                "ready": True,
                 "model": str(alignment.get("model") or self.stt_model),
                 "confidence": float(alignment.get("confidence") or 0.0),
                 "matched_chapters": len(alignment.get("chapters") or []),
                 "anchor_count": int(alignment.get("anchor_count") or 0),
                 "timing_source": str(alignment.get("timing_source") or "stt"),
-                "quality_grade": str(report.get("grade") or "unknown") if isinstance(report, dict) else "unknown",
+                "quality_grade": str(report.get("grade") or "unknown")
+                if isinstance(report, dict)
+                else "unknown",
                 "coverage": float(quality.get("coverage") or 0.0),
                 "warning_count": int(quality.get("warning_count") or 0),
                 "algorithm_revision": _READING_AUDIO_ALIGNMENT_REVISION,
@@ -5582,14 +6491,19 @@ class AudiobookService:
 
         with self.db.connect() as conn:
             placeholders = ",".join("?" for _ in ids)
-            links = conn.execute(f"SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})", ids).fetchall()
+            links = conn.execute(
+                f"SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id IN ({placeholders})", ids
+            ).fetchall()
         for link in links:
             self.unlink_light_novel(int(link["ln_book_id"]))
         # Only touch expensive runtime state for jobs/players that actually exist.
         with self._lock:
-            active_transcriptions = {book_id for book_id in ids if book_id in self._transcription_cancel_events}
+            active_transcriptions = {
+                book_id for book_id in ids if book_id in self._transcription_cancel_events
+            }
             active_players = {
-                book_id for book_id in ids
+                book_id
+                for book_id in ids
                 if (proc := self._players.get(book_id)) is not None and proc.poll() is None
             }
         for book_id in active_transcriptions:
@@ -5619,6 +6533,8 @@ class AudiobookService:
             ):
                 conn.execute(f"DELETE FROM {table} WHERE {column} IN ({placeholders})", ids)
             conn.execute(f"DELETE FROM audiobooks WHERE id IN ({placeholders})", ids)
+            library_overrides.forget(conn, "audiobook", ids)
+            self._overrides = None
 
         removed = [book_id for book_id in ids if book_id in found]
         # P10: no review boundary, speed or position sample may outlive the row.
@@ -5629,8 +6545,10 @@ class AudiobookService:
         if delete_files:
             for source in found.values():
                 try:
-                    if source.is_dir(): shutil.rmtree(source)
-                    elif source.is_file(): source.unlink(missing_ok=True)
+                    if source.is_dir():
+                        shutil.rmtree(source)
+                    elif source.is_file():
+                        source.unlink(missing_ok=True)
                 except OSError:
                     pass
         return {"ok": not errors, "removed": removed, "errors": errors}

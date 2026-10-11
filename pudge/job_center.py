@@ -6,6 +6,7 @@ import uuid
 from typing import Any
 
 from .database import Database
+from .i18n import err, t
 
 
 ACTIVE_JOB_STATES = {"queued", "running", "cancel_requested"}
@@ -22,21 +23,21 @@ class JobCenter:
         now = time.time()
         with self.db.connect() as conn:
             conn.execute(
-                "UPDATE app_jobs SET state='queued',error='',message='Ready to resume',"
+                "UPDATE app_jobs SET state='queued',error='',message=?,"
                 "finished_at=0,updated_at=? "
                 "WHERE state IN ('queued','running') AND resumable=1",
-                (now,),
+                (t("web.jobReadyToResume"), now),
             )
             conn.execute(
-                "UPDATE app_jobs SET state='failed',error='Pudge closed before the job finished',"
-                "message='Interrupted',finished_at=?,updated_at=? "
+                "UPDATE app_jobs SET state='failed',error=?,"
+                "message=?,finished_at=?,updated_at=? "
                 "WHERE state IN ('queued','running','cancel_requested') AND resumable=0",
-                (now, now),
+                (err("jobs.appClosed"), t("web.jobInterrupted"), now, now),
             )
             conn.execute(
-                "UPDATE app_jobs SET state='cancelled',message='Cancelled',finished_at=?,updated_at=? "
+                "UPDATE app_jobs SET state='cancelled',message=?,finished_at=?,updated_at=? "
                 "WHERE state='cancel_requested' AND resumable=1",
-                (now, now),
+                (t("ui.cancelled"), now, now),
             )
 
     def start(
@@ -58,13 +59,14 @@ class JobCenter:
                 INSERT INTO app_jobs(
                     id,kind,title,state,current,total,message,error,payload_json,
                     result_json,attempt_of,created_at,updated_at,finished_at,resumable,correlation_id
-                ) VALUES(?,?,?,'queued',0,?,'Queued','',?,'{}',?,?,?,0,?,?)
+                ) VALUES(?,?,?,'queued',0,?,?,'',?,'{}',?,?,?,0,?,?)
                 """,
                 (
                     job_id,
                     str(kind),
                     str(title),
                     max(0.0, float(total)),
+                    t("web.queued"),
                     json.dumps(payload or {}, ensure_ascii=False),
                     str(attempt_of or ""),
                     now,
@@ -88,8 +90,7 @@ class JobCenter:
         requested_state = str(state)
         values: list[Any] = [requested_state, requested_state, time.time()]
         sets = [
-            "state=CASE WHEN state='cancel_requested' AND ? IN ('queued','running') "
-            "THEN state ELSE ? END",
+            "state=CASE WHEN state='cancel_requested' AND ? IN ('queued','running') THEN state ELSE ? END",
             "updated_at=?",
         ]
         if current is not None:
@@ -109,9 +110,10 @@ class JobCenter:
         self,
         job_id: str,
         *,
-        message: str = "Completed",
+        message: str = "",
         result: dict[str, Any] | None = None,
     ) -> None:
+        message = message or t("manager.diagCompleted")
         now = time.time()
         with self.db.connect() as conn:
             conn.execute(
@@ -127,7 +129,8 @@ class JobCenter:
             )
             conn.execute("DELETE FROM app_job_checkpoints WHERE job_id=?", (str(job_id),))
 
-    def fail(self, job_id: str, error: object, *, message: str = "Failed") -> None:
+    def fail(self, job_id: str, error: object, *, message: str = "") -> None:
+        message = message or t("web.jobFailed")
         now = time.time()
         with self.db.connect() as conn:
             conn.execute(
@@ -138,13 +141,14 @@ class JobCenter:
     def request_cancel(self, job_id: str) -> bool:
         with self.db.connect() as conn:
             cursor = conn.execute(
-                "UPDATE app_jobs SET state='cancel_requested',message='Stopping…',updated_at=? "
+                "UPDATE app_jobs SET state='cancel_requested',message=?,updated_at=? "
                 "WHERE id=? AND state IN ('queued','running')",
-                (time.time(), str(job_id)),
+                (t("web.jobStopping"), time.time(), str(job_id)),
             )
         return bool(cursor.rowcount)
 
-    def cancelled(self, job_id: str, *, message: str = "Cancelled") -> None:
+    def cancelled(self, job_id: str, *, message: str = "") -> None:
+        message = message or t("ui.cancelled")
         now = time.time()
         with self.db.connect() as conn:
             conn.execute(
@@ -162,9 +166,7 @@ class JobCenter:
 
         now = time.time()
         with self.db.connect() as conn:
-            row = conn.execute(
-                "SELECT resumable FROM app_jobs WHERE id=?", (str(job_id),)
-            ).fetchone()
+            row = conn.execute("SELECT resumable FROM app_jobs WHERE id=?", (str(job_id),)).fetchone()
             if row is None or not bool(row["resumable"]):
                 raise ValueError("job is not resumable")
             conn.execute(

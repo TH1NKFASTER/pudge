@@ -52,11 +52,7 @@ def test_pre_v160_collection_recovery_selects_only_spice_and_wolf_volume_2(tmp_p
         999,
     )
     _touch(
-        destination
-        / "Audiobook Collection"
-        / "[丸山 くがね] オーバーロード"
-        / "02"
-        / "book.m4b",
+        destination / "Audiobook Collection" / "[丸山 くがね] オーバーロード" / "02" / "book.m4b",
         777,
     )
 
@@ -94,7 +90,9 @@ def test_recovered_multifile_volume_never_imports_neighbor_audio(tmp_path: Path)
 
     class FakeAudiobooks:
         def import_folder(self, folder, **kwargs):
-            files = sorted(path for path in Path(folder).rglob("*") if path.is_file() and path.suffix == ".mp3")
+            files = sorted(
+                path for path in Path(folder).rglob("*") if path.is_file() and path.suffix == ".mp3"
+            )
             calls.append((Path(folder), files, kwargs))
             return {"id": 12}
 
@@ -122,7 +120,9 @@ def test_recovery_links_completed_disk_download_and_starts_alignment(tmp_path: P
     api = _api()
     book = {"id": 42, "title": "狼と香辛料II", "series_title": "狼と香辛料", "volume": 2}
     destination = tmp_path / "Pudge Audiobooks" / "狼と香辛料" / "Volume 02"
-    audio = _touch(destination / "Audiobook Collection" / "[支倉 凍砂] 狼と香辛料" / "狼と香辛料II [B0C58KN4W9].m4b")
+    audio = _touch(
+        destination / "Audiobook Collection" / "[支倉 凍砂] 狼と香辛料" / "狼と香辛料II [B0C58KN4W9].m4b"
+    )
     api.config = SimpleNamespace(
         paths=SimpleNamespace(download_dirs=[str(tmp_path)]),
         library=SimpleNamespace(root_dir=str(tmp_path)),
@@ -148,6 +148,7 @@ def test_recovery_links_completed_disk_download_and_starts_alignment(tmp_path: P
 
     api.audiobooks = FakeAudiobooks()
     import threading
+
     api._ln_audiobook_recovery_lock = threading.Lock()
 
     result = api._recover_light_novel_audiobook_downloads()
@@ -161,8 +162,16 @@ def test_collection_volume_parser_does_not_read_subtitle_roman_suffix_as_volume(
 
     rows = [
         {"index": 2, "name": "[支倉 凍砂] 狼と香辛料/[02] 狼と香辛料II [B0C58KN4W9].m4b", "size": 200},
-        {"index": 11, "name": "[支倉 凍砂] 狼と香辛料/[11] 狼と香辛料XI Side ColorsII [B0CB3348SF].m4b", "size": 1100},
-        {"index": 19, "name": "[支倉 凍砂] 狼と香辛料/[19] 狼と香辛料XIX Spring LogII [B0D2Z6Z8HR].m4b", "size": 1900},
+        {
+            "index": 11,
+            "name": "[支倉 凍砂] 狼と香辛料/[11] 狼と香辛料XI Side ColorsII [B0CB3348SF].m4b",
+            "size": 1100,
+        },
+        {
+            "index": 19,
+            "name": "[支倉 凍砂] 狼と香辛料/[19] 狼と香辛料XIX Spring LogII [B0D2Z6Z8HR].m4b",
+            "size": 1900,
+        },
     ]
 
     plan = audiobook_torrent_pack_plan(rows, series_title="狼と香辛料")

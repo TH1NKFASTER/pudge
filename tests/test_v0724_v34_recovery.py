@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from types import SimpleNamespace
 
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
+from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
-
-ROOT = Path(__file__).parents[1]
+from test_web_app import make_api
+from tests.css_support import css_rules
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -24,18 +25,47 @@ def _manager(tmp_path: Path) -> AnimeManager:
     return AnimeManager(cfg, log=lambda _message: None)
 
 
-def test_interface_text_is_nonselectable_except_reader_debug_and_named_titles() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
+def test_interface_text_is_nonselectable_except_reader_debug_and_named_titles(page) -> None:
+    # Dragging across the window selects nothing, except reader text, debug output and
+    # the titles users copy (Planning cards, audiobooks); furigana is never copied.
+    rules = css_rules("index.html")
+    for selector in ("body", "body *", "#lnReader rt", "#lnReader rp"):
+        assert (rules.get(selector, "user-select"), rules.get(selector, "-webkit-user-select")) == (
+            "none",
+            "none",
+        ), selector
+    selectable = (
+        "input",
+        "textarea",
+        ".pudge-debug-overlay",
+        ".pudge-debug-overlay *",
+        "#lnReader",
+        "#lnReader *",
+        '.anime-card[data-planned="1"] .anime-title',
+        ".audiobook-title-row strong",
+    )
+    for selector in selectable:
+        assert (rules.get(selector, "user-select"), rules.get(selector, "-webkit-user-select")) == (
+            "text",
+            "text",
+        ), selector
+    # Those selectors reach the real elements.
+    anime = {"media_id": 9, "title": "Planned show", "episodes": 2, "media_status": "FINISHED"}
+    result = page.run(
+        """
+        setPage('planned', true); await __tick(20);
+        const out = {planned: document.querySelector('#plannedContent .anime-title')?.matches(SELECTOR)};
+        setPage('audiobooks', true); await __tick(20);
+        out.audiobook = document.querySelector('#audiobooksContent .audiobook-card strong')?.matches('.audiobook-title-row strong');
+        return out;
+        """.replace("SELECTOR", repr(selectable[6])),
+        state={"planned": [anime]},
+        api={"audiobook_state": {"books": [{"id": 5, "title": "Book", "duration": 60, "position": 0}]}},
+    )
+    assert result.value == {"planned": True, "audiobook": True}
 
-    assert "body, body * { user-select:none; -webkit-user-select:none; }" in html
-    assert ".pudge-debug-overlay,.pudge-debug-overlay *" in html
-    assert "#lnReader,#lnReader *" in html
-    assert '.anime-card[data-planned="1"] .anime-title' in html
-    assert ".audiobook-title-row strong" in html
-    assert "#lnReader rt,#lnReader rp { user-select:none" in html
 
-
-def test_planning_card_reports_all_episodes_ready(tmp_path: Path) -> None:
+def test_planning_card_reports_all_episodes_ready(tmp_path: Path, page) -> None:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -70,18 +100,28 @@ def test_planning_card_reports_all_episodes_ready(tmp_path: Path) -> None:
             )
         )
 
-    planned = next(item for item in api.get_state()["planned"] if item["media_id"] == 9785)
+    state = json.loads(json.dumps(api.get_state(), default=str))
+    planned = next(item for item in state["planned"] if item["media_id"] == 9785)
 
     assert planned["ready_episodes"] == [1, 2]
     assert planned["all_episodes_ready"] is True
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    assert "planned&&a.all_episodes_ready" in html
-    assert "${t('label.readyAll')}" in html
+    # The Planning card says so instead of naming one ready episode.
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('planned', true); await __tick(20);
+            const card = document.querySelector('#plannedContent .anime-card[data-media-id="9785"]');
+            return {status: card.querySelector('.anime-status').innerText, all: t('label.readyAll'),
+                    one: t('label.readySubs', {episode: 1})};
+            """,
+            lang=lang,
+            state={**state, "settings": {**state["settings"], "language": lang}},
+        )
+        out = result.value
+        assert out["all"] in out["status"] and out["one"] not in out["status"]
 
 
-def test_stale_zero_aria2_row_cannot_overwrite_completed_local_download(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_stale_zero_aria2_row_cannot_overwrite_completed_local_download(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     folder = manager.config.library.root_dir / "Ghost in the Shell"
     folder.mkdir()
@@ -157,28 +197,95 @@ def test_single_episode_completed_download_never_claims_neighbor_episode(tmp_pat
     assert manager._completed_download_video_files(item) == [episode6.resolve()]
 
 
-def test_cmd_f_routing_and_remote_anilist_suggestions_are_bounded_and_deduped() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    assert "if($('pudgeDebugOverlay')?.classList.contains('open'))return;" in html
-    assert "if(ui.page==='settings')" in html
-    assert "search.focus();search.select();" in html
-    assert "if(item.remote)" in html
+def test_cmd_f_opens_the_search_that_fits_the_open_screen(page) -> None:
+    result = page.run(
+        """
+        const cmdF = async () => { await __key('f', {metaKey: true, code: 'KeyF'}); await __tick(20); };
+        const out = {};
+        void PudgeDebug.open({media_id: 7, title: 'Show'}); await __tick(20);
+        await cmdF();                                        // Anime Debug keeps the native find
+        out.debug = {global: __visible('#globalSearchOverlay'), settingsFocused: document.activeElement?.id === 'settingsSearch'};
+        PudgeDebug.close(); await __tick(20);
 
-    # Local/Planning results render first; AniList is a second phase so a slow
-    # remote request never blocks the local Cmd+F search.
-    local_call = html.index("global_media_search(cleaned,40)")
-    local_render = html.index("renderGlobalSearchResults(localRows,cleaned)", local_call)
-    remote_call = html.index("planning_search_anilist(cleaned)", local_render)
-    assert local_call < local_render < remote_call
-    assert "function mergeGlobalAniListSuggestions" in html
-    assert "added++;if(added>=5)break;" in html
-    assert "ids.has(mediaId)" in html
-    assert "titles.has(titleKey)" in html
+        setPage('settings', true); await __tick(20);
+        $('settingsSearch').value = 'proxy';
+        await cmdF();
+        out.settings = {focused: document.activeElement?.id, selected: [$('settingsSearch').selectionStart, $('settingsSearch').selectionEnd],
+                        global: __visible('#globalSearchOverlay')};
 
-    # Backend global search remains local-only; it must not perform AniList I/O.
-    source = (ROOT / "pudge/web_app.py").read_text(encoding="utf-8")
-    block = source[source.index("    def global_media_search("):source.index("    def test_saved_credentials(")]
-    assert "planning_search_anilist" not in block
+        setPage('current', true); await __tick(20);
+        await cmdF();
+        out.current = {global: __visible('#globalSearchOverlay'), focused: document.activeElement?.id};
+        return out;
+        """,
+        api={"anime_debug_snapshot": {"anime": {"media_id": 7, "title": "Show"}, "selected_episode": 1}},
+    )
+    out = result.value
+    assert out["debug"] == {"global": False, "settingsFocused": False}
+    assert out["settings"] == {"focused": "settingsSearch", "selected": [0, 5], "global": False}
+    assert out["current"] == {"global": True, "focused": "globalSearchInput"}
+
+
+# Local results come back at once; AniList suggestions arrive later.
+SEARCH = """
+let answerAniList;
+__api.global_media_search = async () => [{kind: 'anime', media_id: 1, title: 'Frieren', page: 'planned', priority_tier: 1}];
+__api.planning_search_anilist = () => new Promise(resolve => { answerAniList = resolve; });
+window.__answerAniList = rows => answerAniList(rows);
+"""
+
+
+def test_global_search_shows_local_results_first_then_up_to_five_new_anilist_titles(page) -> None:
+    suggestions = [
+        {
+            "media_id": 1,
+            "title": "Sousou no Frieren",
+            "site_url": "https://anilist.co/anime/1",
+        },  # already listed (same id)
+        {
+            "media_id": 50,
+            "title": "FRIEREN!",
+            "site_url": "https://anilist.co/anime/50",
+        },  # already listed (same title)
+        *(
+            {"media_id": n, "title": f"Frieren {n}", "site_url": f"https://anilist.co/anime/{n}"}
+            for n in range(2, 9)
+        ),
+    ]
+    result = page.run(
+        """
+        const titles = () => [...document.querySelectorAll('#globalSearchResults [data-global-open-index] strong')].map(n => n.textContent);
+        await __key('f', {metaKey: true, code: 'KeyF'}); await __tick(20);
+        await __input('#globalSearchInput', '  Frieren '); await __tick(200);
+        const local = titles();                               // AniList has not answered yet
+        window.__answerAniList(SUGGESTIONS); await __tick(10);
+        const merged = titles();
+        await __click('#globalSearchResults [data-global-open-index="1"]'); await __tick(10);
+        return {local, merged, closed: !__visible('#globalSearchOverlay')};
+        """.replace("SUGGESTIONS", json.dumps(suggestions)),
+        before=SEARCH,
+    )
+    out = result.value
+    assert result.calls_of("global_media_search") == [["Frieren", 40]]
+    assert result.calls_of("planning_search_anilist") == [["Frieren"]]
+    assert out["local"] == ["Frieren"]
+    assert out["merged"] == ["Frieren", "Frieren 2", "Frieren 3", "Frieren 4", "Frieren 5", "Frieren 6"]
+    assert result.calls_of("open_url") == [["https://anilist.co/anime/2"]] and out["closed"] is True
+
+
+def test_backend_global_search_is_local_only(tmp_path: Path, monkeypatch) -> None:
+    api = make_api(tmp_path)
+    api.manager.db.upsert_anime(LibraryAnime(media_id=1, title="Frieren", status="PLANNING", episodes=28))
+    api.config.anilist.enabled = True
+    api.config.anilist.access_token = "token"
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("global search must not query AniList")
+
+    monkeypatch.setattr(AniListClient, "_post", no_network)
+    monkeypatch.setattr(api, "planning_search_anilist", no_network)
+    rows = api.global_media_search("Frieren", 40)
+    assert [(row["kind"], row["media_id"], row["title"]) for row in rows] == [("anime", 1, "Frieren")]
 
 
 def test_stale_zero_aria2_row_recovers_from_exact_completed_file_after_db_was_already_corrupted(
@@ -295,9 +402,7 @@ def test_single_episode_completed_download_does_not_claim_only_newer_sibling_aft
     assert manager._completed_download_video_files(stale_episode6) == []
 
 
-def test_stale_zero_aria2_exact_file_recovery_recreates_library_episode(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_stale_zero_aria2_exact_file_recovery_recreates_library_episode(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     manager.db.upsert_anime(
         LibraryAnime(

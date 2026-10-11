@@ -290,9 +290,7 @@ def test_v110_exact_anilist_identity_recovers_persisted_equal_ids() -> None:
     from types import SimpleNamespace
     from pudge.syncing import _candidate_has_exact_anilist_identity
 
-    candidate = SimpleNamespace(
-        details={"entry_anilist_id": 5114, "requested_anilist_id": "5114"}
-    )
+    candidate = SimpleNamespace(details={"entry_anilist_id": 5114, "requested_anilist_id": "5114"})
     assert _candidate_has_exact_anilist_identity(candidate) is True
 
 
@@ -300,9 +298,7 @@ def test_v110_exact_anilist_identity_rejects_different_ids() -> None:
     from types import SimpleNamespace
     from pudge.syncing import _candidate_has_exact_anilist_identity
 
-    candidate = SimpleNamespace(
-        details={"entry_anilist_id": 5114, "requested_anilist_id": 9999}
-    )
+    candidate = SimpleNamespace(details={"entry_anilist_id": 5114, "requested_anilist_id": 9999})
     assert _candidate_has_exact_anilist_identity(candidate) is False
 
 
@@ -310,7 +306,5 @@ def test_v110_exact_anilist_identity_keeps_live_derived_flag() -> None:
     from types import SimpleNamespace
     from pudge.syncing import _candidate_has_exact_anilist_identity
 
-    candidate = SimpleNamespace(
-        details={"entry_anilist_match": True}
-    )
+    candidate = SimpleNamespace(details={"entry_anilist_match": True})
     assert _candidate_has_exact_anilist_identity(candidate) is True

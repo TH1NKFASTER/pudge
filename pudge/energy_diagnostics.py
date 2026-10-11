@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .branding import APP_NAME, APP_SLUG, DEFAULT_ENERGY_LOG_PATH
 
@@ -24,9 +24,19 @@ class EnergyDiagnosticsMonitor:
     inputs instead: CPU%, memory/RSS and all pudge-related processes.
     """
 
-    def __init__(self, *, interval_seconds: float = 30.0, logger: Any | None = None) -> None:
+    # On battery a sample (``ps`` over every process) is taken at most every 2 minutes.
+    BATTERY_INTERVAL_SECONDS = 120.0
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float = 30.0,
+        logger: Any | None = None,
+        on_battery: Callable[[], bool | None] | None = None,
+    ) -> None:
         self.interval_seconds = max(10.0, float(interval_seconds))
         self.logger = logger
+        self._on_battery = on_battery
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -57,12 +67,25 @@ class EnergyDiagnosticsMonitor:
     def update_interval(self, seconds: float) -> None:
         self.interval_seconds = max(10.0, float(seconds))
 
+    def current_interval(self) -> float:
+        """The configured interval, lengthened to 2 minutes while the Mac runs on battery."""
+        on_battery = None
+        if self._on_battery is not None:
+            try:
+                on_battery = self._on_battery()
+            except Exception:  # noqa: BLE001 - an unknown power source keeps the configured pace
+                on_battery = None
+        if on_battery is True:
+            return max(self.interval_seconds, self.BATTERY_INTERVAL_SECONDS)
+        return self.interval_seconds
+
     @staticmethod
     def _process_rows() -> list[dict[str, Any]]:
         # The selected fields exist on macOS and on the common BSD/GNU ps forms.
         # ``command`` is intentionally last so whitespace in argv is preserved.
         command = [
-            "ps", "axo",
+            "ps",
+            "axo",
             "pid=,ppid=,%cpu=,%mem=,rss=,etime=,command=",
         ]
         try:
@@ -169,8 +192,7 @@ class EnergyDiagnosticsMonitor:
             for row in rows
             if not (
                 str(row.get("command") or "").lstrip().startswith("ps axo ")
-                and "pid=,ppid=,%cpu=,%mem=,rss=,etime=,command="
-                in str(row.get("command") or "")
+                and "pid=,ppid=,%cpu=,%mem=,rss=,etime=,command=" in str(row.get("command") or "")
             )
         ]
         by_parent: dict[int, list[int]] = {}
@@ -239,7 +261,9 @@ class EnergyDiagnosticsMonitor:
             row["scope"] = "app" if pid in app_ids else "context"
             row["role"] = cls._process_role(str(row.get("command") or ""), own=pid == own_pid)
             result.append(row)
-        result.sort(key=lambda row: (0 if row["scope"] == "app" else 1, -float(row["cpu_percent"]), int(row["pid"])))
+        result.sort(
+            key=lambda row: (0 if row["scope"] == "app" else 1, -float(row["cpu_percent"]), int(row["pid"]))
+        )
         return result
 
     @staticmethod
@@ -256,9 +280,13 @@ class EnergyDiagnosticsMonitor:
     def sample(self) -> dict[str, Any]:
         rows = self._related_processes(self._process_rows())
         app_cpu = sum(max(0.0, float(row["cpu_percent"])) for row in rows if row.get("scope") == "app")
-        context_cpu = sum(max(0.0, float(row["cpu_percent"])) for row in rows if row.get("scope") == "context")
+        context_cpu = sum(
+            max(0.0, float(row["cpu_percent"])) for row in rows if row.get("scope") == "context"
+        )
         app_rss = sum(max(0.0, float(row.get("rss_mb") or 0.0)) for row in rows if row.get("scope") == "app")
-        context_rss = sum(max(0.0, float(row.get("rss_mb") or 0.0)) for row in rows if row.get("scope") == "context")
+        context_rss = sum(
+            max(0.0, float(row.get("rss_mb") or 0.0)) for row in rows if row.get("scope") == "context"
+        )
         total_cpu = app_cpu + context_cpu
         role_totals: dict[str, dict[str, float | int]] = {}
         for row in rows:
@@ -270,7 +298,9 @@ class EnergyDiagnosticsMonitor:
             )
             role = str(row.get("role") or "unknown")
             total = role_totals.setdefault(role, {"cpu_percent": 0.0, "rss_mb": 0.0, "process_count": 0})
-            total["cpu_percent"] = float(total["cpu_percent"]) + max(0.0, float(row.get("cpu_percent") or 0.0))
+            total["cpu_percent"] = float(total["cpu_percent"]) + max(
+                0.0, float(row.get("cpu_percent") or 0.0)
+            )
             total["rss_mb"] = float(total["rss_mb"]) + max(0.0, float(row.get("rss_mb") or 0.0))
             total["process_count"] = int(total["process_count"]) + 1
         for total in role_totals.values():
@@ -285,7 +315,7 @@ class EnergyDiagnosticsMonitor:
             "timestamp": time.time(),
             "platform": sys.platform,
             "app_name": APP_NAME,
-            "sample_interval_seconds": self.interval_seconds,
+            "sample_interval_seconds": self.current_interval(),
             "app_cpu_percent": round(app_cpu, 2),
             "context_cpu_percent": round(context_cpu, 2),
             "app_rss_mb": round(app_rss, 2),
@@ -311,7 +341,11 @@ class EnergyDiagnosticsMonitor:
 
     def _run(self) -> None:
         if self.logger is not None:
-            self.logger.info("EVENT energy_diagnostics.start interval_seconds=%s path=%s", self.interval_seconds, ENERGY_LOG_PATH)
+            self.logger.info(
+                "EVENT energy_diagnostics.start interval_seconds=%s path=%s",
+                self.interval_seconds,
+                ENERGY_LOG_PATH,
+            )
         try:
             # Sample immediately so enabling the setting gives useful output
             # without waiting a full interval. A malformed/temporary process
@@ -325,7 +359,7 @@ class EnergyDiagnosticsMonitor:
                             "FAIL step=energy_diagnostics.sample error=%r",
                             str(exc),
                         )
-                if self._stop.wait(self.interval_seconds):
+                if self._stop.wait(self.current_interval()):
                     break
         finally:
             if self.logger is not None:
@@ -431,22 +465,32 @@ def summarize_energy_samples(
             "window_seconds": seconds,
             "sample_count": len(selected),
             "app_cpu_percent": _metric_stats(float(row.get("app_cpu_percent") or 0.0) for row in selected),
-            "context_cpu_percent": _metric_stats(float(row.get("context_cpu_percent") or 0.0) for row in selected),
-            "related_cpu_percent": _metric_stats(float(row.get("related_cpu_percent") or 0.0) for row in selected),
+            "context_cpu_percent": _metric_stats(
+                float(row.get("context_cpu_percent") or 0.0) for row in selected
+            ),
+            "related_cpu_percent": _metric_stats(
+                float(row.get("related_cpu_percent") or 0.0) for row in selected
+            ),
             "app_rss_mb": _metric_stats(
-                float(row.get("app_rss_mb") or sum(
-                    float(proc.get("rss_mb") or 0.0)
-                    for proc in row.get("processes") or []
-                    if isinstance(proc, dict) and proc.get("scope") == "app"
-                ))
+                float(
+                    row.get("app_rss_mb")
+                    or sum(
+                        float(proc.get("rss_mb") or 0.0)
+                        for proc in row.get("processes") or []
+                        if isinstance(proc, dict) and proc.get("scope") == "app"
+                    )
+                )
                 for row in selected
             ),
             "context_rss_mb": _metric_stats(
-                float(row.get("context_rss_mb") or sum(
-                    float(proc.get("rss_mb") or 0.0)
-                    for proc in row.get("processes") or []
-                    if isinstance(proc, dict) and proc.get("scope") == "context"
-                ))
+                float(
+                    row.get("context_rss_mb")
+                    or sum(
+                        float(proc.get("rss_mb") or 0.0)
+                        for proc in row.get("processes") or []
+                        if isinstance(proc, dict) and proc.get("scope") == "context"
+                    )
+                )
                 for row in selected
             ),
             "roles": role_summary,

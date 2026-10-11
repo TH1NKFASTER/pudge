@@ -150,7 +150,9 @@ def test_schedule_snapshot_moves_caught_up_to_ready_and_handles_missing_subs(tmp
     db.upsert_anime(anime)
     video = tmp_path / "ep1.mkv"
     video.write_bytes(b"video")
-    db.upsert_episode(LibraryEpisode(media_id=anime.media_id, title=anime.title, episode=1, video_path=video, state="local"))
+    db.upsert_episode(
+        LibraryEpisode(media_id=anime.media_id, title=anime.title, episode=1, video_path=video, state="local")
+    )
     schedule = db.save_personal_release_schedule(
         anime.media_id,
         episodes=[1, 2],
@@ -166,7 +168,16 @@ def test_schedule_snapshot_moves_caught_up_to_ready_and_handles_missing_subs(tmp
     assert after["status"] == "waiting"
     subtitle = tmp_path / "ep1.srt"
     subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\n字幕\n", encoding="utf-8")
-    db.upsert_episode(LibraryEpisode(media_id=anime.media_id, title=anime.title, episode=1, video_path=video, subtitle_path=subtitle, state="ready"))
+    db.upsert_episode(
+        LibraryEpisode(
+            media_id=anime.media_id,
+            title=anime.title,
+            episode=1,
+            video_path=video,
+            subtitle_path=subtitle,
+            state="ready",
+        )
+    )
     ready = api._personal_schedule_snapshot(anime, now=schedule.items[0].unlock_at_utc)
     assert ready["status"] == "new_ready"
     assert ready["next_episode"] == 1
@@ -211,7 +222,10 @@ def test_schema_version_contains_personal_schedule_tables(tmp_path: Path) -> Non
     assert "personal_release_schedules" in tables
     assert "personal_release_items" in tables
 
-def test_play_admission_blocks_future_and_out_of_order_items(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+def test_play_admission_blocks_future_and_out_of_order_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = Database(tmp_path / "db.sqlite3")
     anime = _anime()
     db.upsert_anime(anime)
@@ -357,16 +371,15 @@ def test_schedule_notification_uses_schedule_dedupe_even_if_original_notificatio
         lambda subtitle, message: delivered.append((subtitle, message)) or True,
     )
 
-    manager._notify_ready_episode(
-        video=(tmp_path / "ep1.mkv"), media_id=anime.media_id, episode=1
-    )
+    manager._notify_ready_episode(video=(tmp_path / "ep1.mkv"), media_id=anime.media_id, episode=1)
 
     assert len(delivered) == 1
     assert "episode 1" in delivered[0][1].lower()
     assert "all episodes" not in delivered[0][1].lower()
-    assert manager.db.get_state(
-        f"personal_schedule_notification:{schedule.schedule_id}:1:ready", ""
-    ) == "delivered"
+    assert (
+        manager.db.get_state(f"personal_schedule_notification:{schedule.schedule_id}:1:ready", "")
+        == "delivered"
+    )
 
 
 def test_schedule_dialog_preview_lists_every_scheduled_episode(tmp_path: Path) -> None:

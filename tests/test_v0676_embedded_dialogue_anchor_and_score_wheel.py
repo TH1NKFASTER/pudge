@@ -6,6 +6,7 @@ import pudge.syncing as syncing
 from pudge.config import LLMConfig, SyncConfig
 from pudge.llm import OllamaClient
 from pudge.subtitle_formats import parse_srt, write_srt
+from tests.i18n_support import catalog
 
 
 class _SemanticAnchorLLM:
@@ -29,8 +30,7 @@ class _SemanticAnchorLLM:
                     (
                         row
                         for row in english
-                        if isinstance(row, dict)
-                        and str(row.get("text") or "") == f"EN {token}"
+                        if isinstance(row, dict) and str(row.get("text") or "") == f"EN {token}"
                     ),
                     None,
                 )
@@ -182,17 +182,51 @@ def test_llm_anchor_matcher_preserves_unmatched_english_lyrics(
     assert matches[1]["english"] == [3]
 
 
-def test_v0676_wires_direct_reference_before_old_piecewise_and_removes_score_copy() -> None:
-    syncing_source = Path("pudge/syncing.py").read_text(encoding="utf-8")
-    web_source = Path("pudge/web/index.html").read_text(encoding="utf-8")
+def test_v0676_tries_direct_dialogue_anchors_before_the_old_opening_repair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # With an LLM to match lines, the embedded-reference repair first anchors Japanese lines
+    # to English dialogue; the older opening-plateau repair is only the fallback.
+    candidate, reference = _episode_cues()
+    candidate_path = tmp_path / "ja.srt"
+    reference_path = tmp_path / "en.srt"
+    write_srt(candidate, candidate_path)
+    write_srt(reference, reference_path)
 
-    direct = syncing_source.index("_repair_with_embedded_reference_dialogue_anchors(")
-    fallback = syncing_source.index("_repair_stable_opening_plateaus(", direct)
-    assert direct < fallback
-    assert "reference-dialogue-anchor-v2" in syncing_source
-    assert "syncing-v0.3." in syncing_source
-    assert "syncing-v0.3.43-preop-embedded-reference-refine" in syncing_source
-    assert "modal.randomScoreText" not in web_source
+    def activity(path: Path, _reference: Path, **_kwargs):
+        better = path != candidate_path
+        return {
+            "available": True,
+            "weighted": 0.72 if better else 0.62,
+            "start": 0.75 if better else 0.55,
+            "middle": 0.82 if better else 0.80,
+            "full": 0.76 if better else 0.70,
+        }
+
+    plateau_calls: list[Path] = []
+
+    def plateau(aligned, *_args, **_kwargs):
+        plateau_calls.append(aligned)
+        return aligned, {"applied": True, "strategy": "stable_opening_plateaus"}
+
+    monkeypatch.setattr(syncing, "compare_timing_activity", activity)
+    monkeypatch.setattr(syncing, "_repair_stable_opening_plateaus", plateau)
+
+    _output, direct = syncing.repair_with_embedded_reference_piecewise(
+        candidate_path, reference_path, tmp_path / "cache", SyncConfig(), llm=_SemanticAnchorLLM(), force=True
+    )
+    assert direct["applied"] is True and direct["strategy"] == "embedded_reference_dialogue_anchors"
+    assert plateau_calls == []
+
+    _output, fallback = syncing.repair_with_embedded_reference_piecewise(
+        candidate_path, reference_path, tmp_path / "cache", SyncConfig(), llm=None, force=True
+    )
+    assert fallback["strategy"] == "stable_opening_plateaus" and plateau_calls == [candidate_path]
+
+
+def test_v0676_rating_dialog_text_is_gone_from_the_catalogs() -> None:
+    # The window no longer shows it (test_v0670_bleach_qbt_ci.py opens the rating dialog).
+    assert "modal.randomScoreText" not in catalog("en") and "modal.randomScoreText" not in catalog("ru")
 
 
 def test_direct_reference_supports_single_strong_pre_opening_dialogue_anchor(
@@ -201,16 +235,8 @@ def test_direct_reference_supports_single_strong_pre_opening_dialogue_anchor(
 ) -> None:
     candidate, reference = _episode_cues()
 
-    candidate = [
-        cue
-        for cue in candidate
-        if not cue[2].startswith("JP B") or cue[2] == "JP B0"
-    ]
-    reference = [
-        cue
-        for cue in reference
-        if not cue[2].startswith("EN B") or cue[2] == "EN B0"
-    ]
+    candidate = [cue for cue in candidate if not cue[2].startswith("JP B") or cue[2] == "JP B0"]
+    reference = [cue for cue in reference if not cue[2].startswith("EN B") or cue[2] == "EN B0"]
 
     candidate_path = tmp_path / "ja-short-cold-open.srt"
     reference_path = tmp_path / "en-short-cold-open.srt"

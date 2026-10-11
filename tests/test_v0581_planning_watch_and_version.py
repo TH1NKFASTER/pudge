@@ -12,6 +12,7 @@ from pudge.database import Database
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en, ru
 
 
 def _client(handler) -> AniListClient:
@@ -124,14 +125,19 @@ def test_watching_planned_final_episode_or_movie_moves_entry_to_completed() -> N
     assert result["reason"] == "completed_from_planning"
 
 
-def test_version_is_exposed_in_regular_and_advanced_settings(tmp_path: Path) -> None:
+def test_version_is_exposed_in_regular_and_advanced_settings(tmp_path: Path, page) -> None:
     api = WebAppApi(tmp_path / "config.toml")
-    assert api._settings_payload()["version"] == __version__
-
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    advanced = Path("pudge/settings_ui.py").read_text(encoding="utf-8")
-    assert "${t('settings.version')}: ${escapeHtml(s.version||'—')}" in html
-    assert 'text=tr("Version: {0}", "Версия: {0}").format(__version__)' in advanced
+    settings = json.loads(json.dumps(api._settings_payload(), default=str))
+    assert settings["version"] == __version__
+    assert en("settings.version") == "Version"
+    assert ru("settings.version") == "Версия"
+    code = "return {line: __text('#settingsContent .settings-header p'), label: t('settings.version')};"
+    for lang in ("en", "ru"):
+        shown = page.run(code, lang=lang, state={"settings": settings}).value
+        assert shown["line"].startswith(f"{shown['label']}: {__version__}")
+    unknown = page.run(code, state={"settings": {**settings, "version": ""}}).value
+    assert unknown["line"].startswith(f"{unknown['label']}: —")
+    # The Tk advanced settings window (pudge/settings_ui.py) was removed in 68Б; no second surface to check.
 
 
 def test_confirmed_watch_updates_planned_local_entry_and_episode(tmp_path: Path, monkeypatch) -> None:

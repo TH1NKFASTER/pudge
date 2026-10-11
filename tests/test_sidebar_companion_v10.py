@@ -1,16 +1,16 @@
 """Reader-aware float visibility (plan §9) and sidebar chapter hover (plan §12)."""
-from pathlib import Path
-from types import SimpleNamespace
-import subprocess
+
+import json
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
+from css_support import css_rules
+
 from pudge.audiobook_float import AudiobookFloatWindow
 from pudge.web_app import WebAppApi
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class Event:
@@ -67,6 +67,7 @@ class Audio:
         def record(*args, **kwargs):
             self.calls.append((name, args))
             return {}
+
         return record
 
 
@@ -75,11 +76,23 @@ def env(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     pending, windows, logs = [], [], []
     monkeypatch.setattr("pudge.audiobook_panel.promote_to_panel", lambda window: window.native)
-    monkeypatch.setitem(sys.modules, "PyObjCTools", SimpleNamespace(AppHelper=SimpleNamespace(
-        callAfter=lambda callback, *args: pending.append((callback, args)))))
-    monkeypatch.setitem(sys.modules, "AppKit", SimpleNamespace(
-        NSWindowCollectionBehaviorCanJoinAllSpaces=1, NSWindowCollectionBehaviorFullScreenAuxiliary=256,
-        NSScreenSaverWindowLevel=1000, NSWindowStyleMaskNonactivatingPanel=128))
+    monkeypatch.setitem(
+        sys.modules,
+        "PyObjCTools",
+        SimpleNamespace(
+            AppHelper=SimpleNamespace(callAfter=lambda callback, *args: pending.append((callback, args)))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        SimpleNamespace(
+            NSWindowCollectionBehaviorCanJoinAllSpaces=1,
+            NSWindowCollectionBehaviorFullScreenAuxiliary=256,
+            NSScreenSaverWindowLevel=1000,
+            NSWindowStyleMaskNonactivatingPanel=128,
+        ),
+    )
 
     def create(*args, **kwargs):
         window = Window()
@@ -88,8 +101,11 @@ def env(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=create))
     audio = Audio()
-    api = SimpleNamespace(asset_base="http://local", audiobooks=audio, logger=SimpleNamespace(
-        info=lambda *a: logs.append(a), warning=lambda *a: pytest.fail(str(a))))
+    api = SimpleNamespace(
+        asset_base="http://local",
+        audiobooks=audio,
+        logger=SimpleNamespace(info=lambda *a: logs.append(a), warning=lambda *a: pytest.fail(str(a))),
+    )
     controller = AudiobookFloatWindow(api)
 
     def drain():
@@ -97,7 +113,9 @@ def env(monkeypatch):
             callback, args = pending.pop(0)
             callback(*args)
 
-    return SimpleNamespace(controller=controller, windows=windows, pending=pending, drain=drain, audio=audio, api=api)
+    return SimpleNamespace(
+        controller=controller, windows=windows, pending=pending, drain=drain, audio=audio, api=api
+    )
 
 
 def ctx(open_, ln, audio, gen):
@@ -215,27 +233,182 @@ def test_closed_callback_and_float_open_do_not_overwrite_ln_consumer(env):
 
 def test_web_api_reader_context_validates_and_delegates(env):
     logs = []
-    api = SimpleNamespace(_audiobook_float=env.controller, logger=SimpleNamespace(info=lambda *a: logs.append(a)))
+    api = SimpleNamespace(
+        _audiobook_float=env.controller, logger=SimpleNamespace(info=lambda *a: logs.append(a))
+    )
     env.controller.show(5)
-    result = WebAppApi.audiobook_reader_context(api, {"open": True, "ln_book_id": 3, "audiobook_id": 5, "generation": 4})
+    result = WebAppApi.audiobook_reader_context(
+        api, {"open": True, "ln_book_id": 3, "audiobook_id": 5, "generation": 4}
+    )
     assert result["ok"] and result["opened"] is False and logs
     assert WebAppApi.audiobook_reader_context(api, {"generation": "x"})["ok"] is False
     assert WebAppApi.audiobook_float_display(api, 9)["ok"]
     assert env.controller.display_book_id == 9
 
 
-def test_sidebar_float_reports_display_and_hover_api_contract():
-    js = (ROOT / "pudge/web/sidebar_companion.js").read_text(encoding="utf-8")
-    assert "api()?.audiobook_float_open?.(Number(book.id))" in js
-    assert "audiobook_float_display" in js
-    assert "showChapterHoverRange, clearChapterHoverRange}" in js
-    assert 'class="sidebar-audio-scrubber"><input class="sidebar-audio-timeline" data-sc-audio-timeline' in js
-    css = (ROOT / "pudge/web/sidebar_companion.css").read_text(encoding="utf-8")
-    rule = css[css.index(".sidebar-audio-scrubber .audiobook-chapter-hover{"):]
-    assert "pointer-events:none" in rule.split("}")[0]
+FLOAT_BOOK = {
+    "id": 7,
+    "title": "Book",
+    "duration": 100,
+    "position": 5,
+    "playing": True,
+    "player_running": True,
+    "chapters": [],
+}
 
 
-def test_sidebar_chapter_hover_behaviour():
-    result = subprocess.run(["node", str(ROOT / "tests/js/sidebar_chapter_hover.cjs"), str(ROOT / "pudge/web")],
-                            capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr + result.stdout
+def test_float_reports_the_book_it_shows_and_the_sidebar_opens_it(page):
+    # The float tells the backend which audiobook it shows (on change only), so a light-novel
+    # reader for that book can hide the duplicate surface.
+    floating = page.run(
+        """
+        await __tick(3000);
+        window.floatBooks = [{...window.floatBooks[0], id: 8}];
+        await __tick(3000);
+        """,
+        name="audiobook_float.html",
+        api={"audiobook_float_settings": {"language": "en"}},
+        before="window.floatBooks = BOOKS; __api.sidebar_audio_state = async () => ({books: window.floatBooks});".replace(
+            "BOOKS", json.dumps([FLOAT_BOOK])
+        ),
+    )
+    assert floating.calls_of("audiobook_float_display") == [[7], [8]]
+    # In the main window the sidebar player's ↗ opens the always-on-top float for its book.
+    main = page.run(
+        "await __tick(100); const label = $('pudgeSidebarCompanion').querySelector('[data-sc-audio=\"float\"]').title;"
+        "await __click('[data-sc-audio=\"float\"]'); await __tick(10); return [label, PudgeI18n.t('sidebar.alwaysOnTop')];",
+        api={
+            "sidebar_audio_state": {"books": [FLOAT_BOOK]},
+            "audiobook_float_open": {"ok": True, "opened": True},
+        },
+    )
+    assert main.value[0] == main.value[1]
+    assert main.calls_of("audiobook_float_open") == [[7]]
+    assert not main.called("audiobook_float_display")
+
+
+HOVER_BOOK = {
+    "id": 7,
+    "title": "Book",
+    "duration": 100,
+    "position": 5,
+    "playing": False,
+    "player_running": True,
+    "chapters": [
+        {"start": 0, "title": "One"},
+        {"start": 10, "title": "Two"},
+        {"start": 20, "title": "Three"},
+        {"start": 90, "title": "Last"},
+    ],
+}
+OTHER_BOOK = {
+    "id": 8,
+    "title": "Other",
+    "duration": 50,
+    "position": 0,
+    "playing": False,
+    "player_running": False,
+    "chapters": [{"start": 0, "title": "A"}, {"start": 25, "title": "B"}],
+}
+HOVER = r"""
+setPage('audiobooks', true); await __tick(100);
+const marker = selector => { const m = document.querySelector(selector); return m && (m.classList.contains('show') ? [m.style.left, m.style.width] : null); };
+const card = () => marker('[data-audiobook-id="7"] [data-audio-timeline] .audiobook-chapter-hover');
+const side = () => marker('.sidebar-audio-scrubber .audiobook-chapter-hover');
+const row = (book, n) => `[data-audiobook-id="${book}"] .chapter-list [data-audio-chapter-start]:nth-child(${n})`;
+const over = (selector, related = null) => __fire(selector, 'pointerover', {relatedTarget: related && document.querySelector(related)}, 'PointerEvent');
+const out = (selector, related = null) => __fire(selector, 'pointerout', {relatedTarget: related && document.querySelector(related)}, 'PointerEvent');
+for (const details of document.querySelectorAll('details.audiobook-chapters')) details.open = true;
+"""
+
+
+def test_hovered_chapter_marks_its_range_on_the_card_and_sidebar_timelines(page):
+    result = page.run(
+        HOVER
+        + r"""
+        const shellBefore = document.querySelector('.sidebar-audio');
+        const steps = {};
+        await over(row(7, 2)); steps.second = [card(), side()];
+        await out(row(7, 2), row(7, 3)); await over(row(7, 3), row(7, 2));   // moving to the next row
+        steps.third = [card(), side()];
+        await over(row(7, 2), row(7, 3)); await over(row(7, 3), row(7, 2)); await out(row(7, 2), row(7, 3));
+        steps.lateLeave = side();                                             // a late leave of the older row
+        await out(row(7, 3)); steps.left = [card(), side()];
+        await over(row(7, 4)); steps.last = [card(), side()];
+        const details = document.querySelector('[data-audiobook-id="7"] details.audiobook-chapters');
+        details.open = false; details.dispatchEvent(new Event('toggle'));      // closed with the pointer inside
+        steps.closed = side();
+        details.open = true;
+        await over(row(7, 2));
+        await PudgeMedia.loadAudio(); await __tick(10);                        // a redraw removed the hovered row
+        steps.redrawn = side();
+        await over(row(8, 2)); steps.otherBook = [marker('[data-audiobook-id="8"] .audiobook-chapter-hover'), side()];
+        steps.sameShell = document.querySelector('.sidebar-audio') === shellBefore;
+        return steps;
+        """,
+        api={
+            "audiobook_state": {"books": [HOVER_BOOK, OTHER_BOOK]},
+            "sidebar_audio_state": {"books": [HOVER_BOOK, OTHER_BOOK]},
+        },
+    )
+    steps = result.value
+    assert steps["second"] == [["10%", "10%"], ["10%", "10%"]]
+    assert steps["third"] == [["20%", "70%"], ["20%", "70%"]]
+    assert steps["lateLeave"] == ["20%", "70%"]
+    assert steps["left"] == [None, None]
+    assert steps["last"] == [["90%", "10%"], ["90%", "10%"]]
+    assert steps["closed"] is None and steps["redrawn"] is None
+    assert steps["otherBook"] == [["50%", "50%"], None]  # the sidebar plays another book
+    assert steps["sameShell"] is True
+    # Hovering is visual only: no transport call at all.
+    assert not [
+        call
+        for call in result.calls
+        if call["name"].startswith("audiobook_") and call["name"] != "audiobook_state"
+    ]
+
+
+def test_sidebar_chapter_range_is_clipped_validated_and_dropped_with_its_book(page):
+    result = page.run(
+        r"""
+        await __tick(100);
+        const side = () => { const m = document.querySelector('.sidebar-audio-scrubber .audiobook-chapter-hover'); return m.classList.contains('show') ? [m.style.left, m.style.width] : null; };
+        const sc = PudgeSidebarCompanion, out = {};
+        out.clipped = [sc.showChapterHoverRange({audiobookId: 7, start: 90, end: 150, source: 'a'}), side()];
+        out.invalid = [sc.showChapterHoverRange({audiobookId: 7, start: 30, end: 30, source: 'b'}), sc.showChapterHoverRange({audiobookId: 7, start: 'x', end: 30, source: 'c'}), side()];
+        out.other = [sc.showChapterHoverRange({audiobookId: 9, start: 0, end: 10, source: 'd'}), side()];
+        sc.showChapterHoverRange({audiobookId: 7, start: 10, end: 20, source: 'e'});
+        window.audioBooks = [{...window.audioBooks[0], position: 6}];
+        await __tick(2100);                                                     // a poll keeps the range
+        out.polled = side();
+        window.audioBooks = [{...window.audioBooks[0], id: 9}];
+        await __tick(2100);                                                     // the sidebar switched books
+        out.switched = side();
+        window.audioBooks = [{...window.audioBooks[0], id: 7, duration: 0}];
+        await __tick(2100);
+        out.noDuration = [sc.showChapterHoverRange({audiobookId: 7, start: 1, end: 2, source: 'f'}), side()];
+        return out;
+        """,
+        before="window.audioBooks = BOOKS; __api.sidebar_audio_state = async () => ({books: window.audioBooks});".replace(
+            "BOOKS", json.dumps([HOVER_BOOK])
+        ),
+    )
+    out = result.value
+    assert out["clipped"] == [True, ["90%", "10%"]]
+    assert out["invalid"] == [False, False, None]
+    assert out["other"] == [False, None]
+    assert out["polled"] == ["10%", "10%"] and out["switched"] is None
+    assert out["noDuration"] == [False, None]
+
+
+def test_chapter_range_marker_looks_the_same_everywhere_and_never_takes_the_pointer():
+    for sheet, selector in (
+        ("media.css", ".audiobook-chapter-hover"),
+        ("sidebar_companion.css", ".sidebar-audio-scrubber .audiobook-chapter-hover"),
+    ):
+        rules = css_rules(sheet)
+        assert rules.get(selector, "pointer-events") == "none"
+        assert rules.get(selector, "background").startswith(
+            "repeating-linear-gradient(135deg,rgba(87,211,140,.92)"
+        )
+        assert rules.get(selector, "opacity") == "0" and rules.get(selector + ".show", "opacity") == "1"

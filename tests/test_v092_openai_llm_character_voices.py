@@ -10,6 +10,7 @@ import pudge.web_app as web_app_module
 from pudge.config import AppConfig, load_config, write_config
 from pudge.llm import OllamaClient, list_models
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en
 
 
 def _api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebAppApi:
@@ -108,7 +109,9 @@ def test_test_llm_provider_accepts_gateway_without_model_listing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     api = _api(tmp_path, monkeypatch)
-    monkeypatch.setattr(web_app_module, "list_models", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("404")))
+    monkeypatch.setattr(
+        web_app_module, "list_models", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("404"))
+    )
 
     class FakeClient:
         def __init__(self, cfg):
@@ -157,7 +160,11 @@ def test_character_voice_annotation_uses_known_characters_and_stable_profiles(
             prompts.append(payload)
             return {
                 "assignments": [
-                    {"id": row["id"], "speaker": "堀北鈴音", "caption": "若い女性。低めで澄んだ声。落ち着いた硬質な話し方。"}
+                    {
+                        "id": row["id"],
+                        "speaker": "堀北鈴音",
+                        "caption": "若い女性。低めで澄んだ声。落ち着いた硬質な話し方。",
+                    }
                     for row in payload["segments"]
                     if row["kind"] == "dialogue"
                 ]
@@ -184,7 +191,11 @@ def test_character_voice_annotation_uses_known_characters_and_stable_profiles(
     assert sum(consumed for _, consumed, _, _ in first) == len(source)
 
     # Cached chapter/profile must make the second call LLM-free and keep the same voice caption.
-    monkeypatch.setattr(web_app_module, "OllamaClient", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("LLM should not run")))
+    monkeypatch.setattr(
+        web_app_module,
+        "OllamaClient",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("LLM should not run")),
+    )
     second = api._audiobook_speaker_parts(
         book_id=12,
         book_title="Test LN",
@@ -246,14 +257,41 @@ def test_tts_source_includes_anilist_id(tmp_path: Path, monkeypatch: pytest.Monk
     assert api.light_novels.tts_source(book_id)["anilist_id"] == 12345
 
 
-def test_v92_ui_avoids_tts_resume_full_render_and_has_generic_llm_settings() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="s_llm_provider"' in html
-    assert "OpenAI-compatible API" in html
-    assert 'id="testLlmProvider"' in html
-    assert 'id="s_ln_character_voices"' in html
-    poll = html.split("function scheduleLnStatePoll", 1)[1].split("function lnBookCard", 1)[0]
-    assert "wasAudiobookActive||nextAudiobookActive" in poll
-    assert "patchLnAudiobookProgress(next)" in poll
-    assert "bookListChanged" in poll
-    assert "wasAudiobookActive&&!nextAudiobookActive" in poll
+def test_llm_settings_offer_ollama_and_any_openai_compatible_api_and_test_the_connection(page) -> None:
+    # The audiobook progress of a resumed generation is patched in place (no shelf redraw at
+    # every poll): test_v090_irodori_progress.py::test_generating_an_audiobook_cannot_be_started_twice_and_shows_its_progress_in_place.
+    assert en("uiB.settings.openaiCompatible") == "OpenAI-compatible API"
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('settings'); await __tick(100);
+            await __click('[data-settings-category="advanced"]'); await __tick(10);
+            const out = {options: [...$('s_llm_provider').options].map(o => [o.value, o.textContent])};
+            await __input('#s_llm_provider', 'openai');
+            await __input('#s_llm_url', 'https://gateway.example/v1-root');
+            await __input('#s_llm_model', 'arbitrary-model');
+            await __click('#testLlmProvider'); await __tick(10);
+            out.toasts = __toasts();
+            out.expected = {openai: t('uiB.settings.openaiCompatible'), ok: `${t('uiC.settings.openaiCompatible')} · arbitrary-model: OK`};
+            return out;
+            """,
+            lang=lang,
+            state={
+                "settings": {
+                    "llm_enabled": True,
+                    "llm_provider": "ollama",
+                    "llm_url": "http://127.0.0.1:11434",
+                    "llm_model": "qwen",
+                }
+            },
+            before="__api.test_llm_provider = async values => ({ok: true, provider: values.provider, model: values.model});",
+        )
+        out = result.value
+        assert out["options"] == [["ollama", "Ollama API"], ["openai", out["expected"]["openai"]]]
+        [[tested]] = result.calls_of("test_llm_provider")
+        assert (tested["provider"], tested["url"], tested["model"]) == (
+            "openai",
+            "https://gateway.example/v1-root",
+            "arbitrary-model",
+        )
+        assert out["expected"]["ok"] in out["toasts"]

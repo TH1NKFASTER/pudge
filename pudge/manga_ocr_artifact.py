@@ -76,7 +76,6 @@ def _orientation(value: Any, *, width: float, height: float) -> str:
     return orientation
 
 
-
 def _copy_diagnostic_fields(source: dict[str, Any], target: dict[str, Any]) -> None:
     for key in _DIAGNOSTIC_KEYS:
         if key not in source:
@@ -137,8 +136,9 @@ def normalize_region(region: dict[str, Any], *, page_index: int, order: int) -> 
     detector = str(region.get("detector") or region.get("source") or "unknown")
     confidence = max(0.0, min(1.0, _number(region.get("confidence"), 0.0)))
     identity = hashlib.sha1(
-        f"{page_index}:{round(x, 5)}:{round(y, 5)}:{round(width, 5)}:"
-        f"{round(height, 5)}:{text}".encode("utf-8", errors="replace")
+        f"{page_index}:{round(x, 5)}:{round(y, 5)}:{round(width, 5)}:{round(height, 5)}:{text}".encode(
+            "utf-8", errors="replace"
+        )
     ).hexdigest()[:16]
     segments = [
         _normalize_segment(dict(segment))
@@ -161,7 +161,9 @@ def normalize_region(region: dict[str, Any], *, page_index: int, order: int) -> 
         "word_geometry": (
             "mapped_segments"
             if segments and all(str(segment.get("text") or "").strip() for segment in segments)
-            else "unlabeled_segments" if segments else "unavailable"
+            else "unlabeled_segments"
+            if segments
+            else "unavailable"
         ),
     }
     if segments:
@@ -278,9 +280,7 @@ def write_artifact(path: Path, artifact: dict[str, Any]) -> None:
             suffix=".tmp",
             delete=False,
         ) as temporary:
-            temporary.write(
-                json.dumps(artifact, ensure_ascii=False, separators=(",", ":"))
-            )
+            temporary.write(json.dumps(artifact, ensure_ascii=False, separators=(",", ":")))
             temporary.flush()
             temporary_path = Path(temporary.name)
         temporary_path.replace(path)

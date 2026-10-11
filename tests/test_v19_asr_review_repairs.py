@@ -22,29 +22,39 @@ from pudge.subtitles.speech_recovery import recover_constant_speech_clock
 FIXTURES = Path(__file__).parent / "fixtures" / "asr_review_v19"
 
 
-@pytest.mark.parametrize("name,count,digest", [
-    ("seirei-asr.json", 400, "ffa3242c126e4998ce61d0e4a4795e128fdd9e136c08cefcc5f588f7496fd0e4"),
-    ("solo-asr.json", 285, "81f1cfa4c31f2dd8775767d5b4c5d9bb44616d76a32988889ed48264b9aba222"),
-    ("tokyo-asr.json", 384, "db920c8f48a1d5aa96f0653b52d1013d2fad8bf17a719918df578c8962364291"),
-    ("seirei-source.srt", 489, "6a1268b7f77406ec65087ba867c2a2b9b1ae4b8043870b1d734013c4f13db9ca"),
-    ("solo-native.srt", 298, "d65b19f92d9243bc71ffa5eeb7c981e26681267e601a1ffc33a0ca0699fcbfce"),
-    ("tokyo-source.srt", 331, "a31e584cbce9777647d28d38af779db57b2aee199158bd1ac7664a48011f615d"),
-    ("solo-original.ass", 1319, "0ff42d8fa393dc995f6ff212f38a01c8d223c960d450d67bcbd609b34990ce99"),
-])
+@pytest.mark.parametrize(
+    "name,count,digest",
+    [
+        ("seirei-asr.json", 400, "ffa3242c126e4998ce61d0e4a4795e128fdd9e136c08cefcc5f588f7496fd0e4"),
+        ("solo-asr.json", 285, "81f1cfa4c31f2dd8775767d5b4c5d9bb44616d76a32988889ed48264b9aba222"),
+        ("tokyo-asr.json", 384, "db920c8f48a1d5aa96f0653b52d1013d2fad8bf17a719918df578c8962364291"),
+        ("seirei-source.srt", 489, "6a1268b7f77406ec65087ba867c2a2b9b1ae4b8043870b1d734013c4f13db9ca"),
+        ("solo-native.srt", 298, "d65b19f92d9243bc71ffa5eeb7c981e26681267e601a1ffc33a0ca0699fcbfce"),
+        ("tokyo-source.srt", 331, "a31e584cbce9777647d28d38af779db57b2aee199158bd1ac7664a48011f615d"),
+        ("solo-original.ass", 1319, "0ff42d8fa393dc995f6ff212f38a01c8d223c960d450d67bcbd609b34990ce99"),
+    ],
+)
 def test_sanitized_corpus_retains_independent_regression_geometry(name, count, digest):
     # These fingerprints were measured independently from snapshot 37cd773;
     # caption and word text are deliberately absent from the signature.
     text = gzip.decompress((FIXTURES / (name + ".gz")).read_bytes()).decode()
     if name.endswith(".json"):
         geometry = [
-            [s.get("id"), s.get("start"), s.get("end"), s.get("metrics"), s.get("review_flags"),
-             [(w.get("start"), w.get("end"), w.get("probability")) for w in s.get("words", [])]]
+            [
+                s.get("id"),
+                s.get("start"),
+                s.get("end"),
+                s.get("metrics"),
+                s.get("review_flags"),
+                [(w.get("start"), w.get("end"), w.get("probability")) for w in s.get("words", [])],
+            ]
             for s in json.loads(text)["segments"]
         ]
     elif name.endswith(".ass"):
         geometry = [
             [*line.split(",", 9)[:9], re.findall(r"\{[^}]*\}", line.split(",", 9)[-1])]
-            for line in text.splitlines() if line.startswith("Dialogue:")
+            for line in text.splitlines()
+            if line.startswith("Dialogue:")
         ]
     else:
         geometry = re.findall(r"^.*? --> .*?$", text.replace("\r", ""), re.MULTILINE)
@@ -59,14 +69,20 @@ def test_generator_recreates_corpus_without_the_original_sources(tmp_path):
     for name in ("generate.py", "geometry.json.gz"):
         shutil.copy2(FIXTURES / name, generator / name)
     output = tmp_path / "output"
-    subprocess.run([sys.executable, "-I", str(generator / "generate.py"), "--output", str(output)],
-                   check=True, capture_output=True, timeout=30)
+    subprocess.run(
+        [sys.executable, "-I", str(generator / "generate.py"), "--output", str(output)],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
     expected = {path.name for path in FIXTURES.glob("*.gz") if path.name != "geometry.json.gz"}
     assert {path.name for path in output.iterdir()} == expected
     for name in expected:
         # Compare the content: the gzip header OS byte and deflate stream depend
         # on the platform's zlib (macOS writes OS=19), the corpus does not.
-        assert gzip.decompress((output / name).read_bytes()) == gzip.decompress((FIXTURES / name).read_bytes())
+        assert gzip.decompress((output / name).read_bytes()) == gzip.decompress(
+            (FIXTURES / name).read_bytes()
+        )
 
 
 def materialize(tmp_path: Path, name: str) -> Path:
@@ -126,10 +142,15 @@ def test_seirei_constant_clock_is_distributed_and_structurally_safe(tmp_path: Pa
     assert result["quarter_anchor_counts"] == [34, 35, 48, 24]
     assert result["inlier_fraction"] == 0.9362
     assert result["quarter_shift_spread_seconds"] == 0.049
-    anchors = [{key: value for key, value in anchor.items() if key != "mean_word_probability"}
-               for anchor in result["anchors"]]
+    anchors = [
+        {key: value for key, value in anchor.items() if key != "mean_word_probability"}
+        for anchor in result["anchors"]
+    ]
     encoded = json.dumps(anchors, sort_keys=True, separators=(",", ":")).encode()
-    assert hashlib.sha256(encoded).hexdigest() == "15160f9d71555b1c77fdd7775424ec0b1b7e6167598216e952351349313262cb"
+    assert (
+        hashlib.sha256(encoded).hexdigest()
+        == "15160f9d71555b1c77fdd7775424ec0b1b7e6167598216e952351349313262cb"
+    )
     assert result["alignment_output_guard"]["status"] == "accepted"
     assert result["alignment_output_guard"]["diagnostics"]["new_overlaps"] == 0
     before, after = parse_srt(source), parse_srt(output)
@@ -289,8 +310,6 @@ def test_final_identity_failure_does_not_mask_valid_candidate_guard(
     assert result["identity_rejected"][0]["name"] == "S2"
 
 
-
-
 @pytest.mark.parametrize(
     "title,release",
     [
@@ -306,8 +325,6 @@ def test_real_targets_and_re_prefix_still_accepted(title: str, release: str) -> 
     anime = LibraryAnime(media_id=1, title=title, episodes=12, format="TV")
     assert release_identity_mismatch_reason(anime, release) is None
     assert release_title_is_plausible(anime, release)
-
-
 
 
 def test_old_final_pipeline_cache_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,15 +8,9 @@ def test_local_episode_shadows_stale_single_download(tmp_path: Path) -> None:
     video.write_bytes(b"video")
     card = {"local": {"episode": 6, "video_path": str(video)}}
 
-    assert WebAppApi._download_shadowed_by_local(
-        card, {"episode": 6, "is_batch": False}
-    )
-    assert not WebAppApi._download_shadowed_by_local(
-        card, {"episode": 7, "is_batch": False}
-    )
-    assert not WebAppApi._download_shadowed_by_local(
-        card, {"episode": 6, "is_batch": True}
-    )
+    assert WebAppApi._download_shadowed_by_local(card, {"episode": 6, "is_batch": False})
+    assert not WebAppApi._download_shadowed_by_local(card, {"episode": 7, "is_batch": False})
+    assert not WebAppApi._download_shadowed_by_local(card, {"episode": 6, "is_batch": True})
 
 
 def test_bitmap_without_action_job_stays_waiting() -> None:

@@ -75,12 +75,24 @@ class NativePanel(NativeWindow):
 
 def setup(monkeypatch):
     monkeypatch.setattr(audiobook_panel, "_panel_class", None)
-    monkeypatch.setitem(sys.modules, "AppKit", SimpleNamespace(NSPanel=NativePanel,
-        NSWindowStyleMaskNonactivatingPanel=128, NSBackingStoreBuffered=2))
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        SimpleNamespace(
+            NSPanel=NativePanel, NSWindowStyleMaskNonactivatingPanel=128, NSBackingStoreBuffered=2
+        ),
+    )
     old = NativeWindow()
     browser = SimpleNamespace(window=old, webview=object(), js_bridge=object())
-    monkeypatch.setitem(sys.modules, "webview.platforms.cocoa", SimpleNamespace(
-        BrowserView=SimpleNamespace(get_instance=lambda attribute, native: browser if browser.window is native else None)))
+    monkeypatch.setitem(
+        sys.modules,
+        "webview.platforms.cocoa",
+        SimpleNamespace(
+            BrowserView=SimpleNamespace(
+                get_instance=lambda attribute, native: browser if browser.window is native else None
+            )
+        ),
+    )
     return old, browser, SimpleNamespace(native=old)
 
 
@@ -152,8 +164,13 @@ def test_float_controller_configures_the_adopted_panel_not_the_old_window(monkey
     appkit.NSWindowCollectionBehaviorCanJoinAllApplications = 262144
     appkit.NSScreenSaverWindowLevel = 1000
     logs = []
-    controller = AudiobookFloatWindow(SimpleNamespace(logger=SimpleNamespace(
-        info=lambda *args: logs.append(args), warning=lambda *args: pytest.fail(str(args)))))
+    controller = AudiobookFloatWindow(
+        SimpleNamespace(
+            logger=SimpleNamespace(
+                info=lambda *args: logs.append(args), warning=lambda *args: pytest.fail(str(args))
+            )
+        )
+    )
     controller._window = window
     controller._join_spaces(window)
     panel = window.native

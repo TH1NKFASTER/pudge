@@ -20,9 +20,7 @@ def test_schema_v5_backfills_separate_episode_identity(tmp_path: Path) -> None:
     db = Database(path)
     assert LATEST_SCHEMA_VERSION >= 7
     with db.connect() as conn:
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()
-        }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)").fetchall()}
     assert {"episode", "media_episode", "release_episode"} <= columns
 
 
@@ -55,9 +53,7 @@ def test_v5_migration_repairs_absolute_episode_from_managed_download(
         # unrelated legacy columns that are irrelevant to this repair.
         db = object.__new__(Database)
         db._migrate_v5(conn)
-        row = conn.execute(
-            "SELECT episode,media_episode,release_episode FROM episodes"
-        ).fetchone()
+        row = conn.execute("SELECT episode,media_episode,release_episode FROM episodes").fetchone()
     assert row == (12, 12, 78)
 
 
@@ -97,15 +93,11 @@ def test_episode_and_download_round_trip_both_numbers(tmp_path: Path) -> None:
 
 def test_release_history_keeps_media_and_release_numbers(tmp_path: Path) -> None:
     db = Database(tmp_path / "library.sqlite3")
-    db.record_release(
-        "hash78", 189046, 12, "ReZero - 78", 100.0, release_episode=78
-    )
+    db.record_release("hash78", 189046, 12, "ReZero - 78", 100.0, release_episode=78)
     assert db.release_metadata_by_hash("HASH78") == (189046, 12, 78, 100.0)
 
 
-def test_jiten_key_writer_preserves_config_and_is_private(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_jiten_key_writer_preserves_config_and_is_private(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = tmp_path / ".config" / "jiten-mpv" / "config.json"
     config.parent.mkdir(parents=True)
@@ -116,9 +108,7 @@ def test_jiten_key_writer_preserves_config_and_is_private(
     assert config.stat().st_mode & 0o777 == 0o600
 
 
-def test_jpdb_token_writer_preserves_config_and_is_private(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_jpdb_token_writer_preserves_config_and_is_private(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     plugin = tmp_path / ".config" / "mpv" / "scripts" / "jpdb-mpv-plugin"
     plugin.mkdir(parents=True)
@@ -131,9 +121,7 @@ def test_jpdb_token_writer_preserves_config_and_is_private(
     assert config.stat().st_mode & 0o777 == 0o600
 
 
-def test_mpv_plugins_use_jiten_key_and_jpdb_managed_auth(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_mpv_plugins_use_jiten_key_and_jpdb_managed_auth(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     scripts = tmp_path / ".config" / "mpv" / "scripts"
     (tmp_path / ".local" / "share" / "jiten-mpv").mkdir(parents=True)
@@ -173,9 +161,7 @@ def test_mpv_script_plan_keeps_other_scripts_and_loads_only_selected_plugin(
     server.write_text("binary", encoding="utf-8")
     server.chmod(0o755)
 
-    plan = mpv_study_script_plan(
-        "jpdb", jiten_api_key="jiten-key", jpdb_api_token="jpdb-key"
-    )
+    plan = mpv_study_script_plan("jpdb", jiten_api_key="jiten-key", jpdb_api_token="jpdb-key")
     assert plan["exclusive"] is True
     assert plan["selected"] == "jpdb"
     assert str(ordinary) in plan["scripts"]
@@ -195,14 +181,9 @@ def test_dependency_status_accepts_configured_absolute_tools(tmp_path: Path) -> 
     assert status["ffmpeg"]["installed"] is True
 
 
-def test_jpdb_detection_accepts_macos_and_versioned_installer_layout(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_jpdb_detection_accepts_macos_and_versioned_installer_layout(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
-    plugin = (
-        tmp_path / "Library" / "Application Support" / "mpv" / "scripts"
-        / "jpdb-player"
-    )
+    plugin = tmp_path / "Library" / "Application Support" / "mpv" / "scripts" / "jpdb-player"
     plugin.mkdir(parents=True)
     script = plugin / "jpdb.lua"
     script.write_text("-- jpdb plugin", encoding="utf-8")
@@ -221,9 +202,7 @@ def test_jpdb_detection_accepts_macos_and_versioned_installer_layout(
     assert status["mpv_study"]["effective"] == "jpdb"
 
 
-def test_jpdb_detection_reads_generic_installer_generated_main_lua(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_jpdb_detection_reads_generic_installer_generated_main_lua(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     scripts = tmp_path / ".config" / "mpv" / "scripts"
     scripts.mkdir(parents=True)
@@ -238,11 +217,55 @@ def test_jpdb_detection_reads_generic_installer_generated_main_lua(
     assert status["mpv_study"]["effective"] == "jpdb"
 
 
-def test_onboarding_exposes_dependency_and_jiten_mpv_flow() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "first_experience_dependencies" in html
-    assert "install_first_experience_dependencies" in html
-    assert "install_jiten_mpv" in html
-    assert "JitenMPV" in html
+# The window side (behaviour; audit 71Б rewrite): the setup guide checks the components,
+# installs JitenMPV on request and asks for the Developer Tools permission.
+DEPENDENCIES = """
+let installed = false;
+const deps = () => ({mpv: {installed: true, version: '0.38'}, ffmpeg: {installed: true}, manga_ocr: {installed: false},
+                     jiten_mpv: {installed, key_configured: installed}, jpdb_mpv: {installed: false}});
+__api.first_experience_dependencies = async () => deps();
+__api.install_first_experience_dependencies = async options => { installed = Boolean(options.install_jiten_mpv); return deps(); };
+"""
+
+
+def test_setup_guide_installs_jitenmpv_and_asks_for_developer_tools(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            const next = async () => { await __click('#onboardingNext'); await __tick(20); };
+            const row = name => [...document.querySelectorAll('#onboardingBody .dependency-row')]
+              .find(node => node.querySelector('strong').innerText === name)?.querySelector('.dependency-state').innerText;
+            await next();
+            const out = {step: ui.onboardingStep, before: row('JitenMPV'), mpv: row('mpv'), texts: {installed: PudgeI18n.t('ui.installed'), missing: PudgeI18n.t('ui.missing')}};
+            await __input('#o_jiten_mpv', true);
+            await __input('#o_jiten_key', 'jiten-key');
+            await __click('#onboardingInstallDependencies');
+            await __tick(20);
+            out.after = row('JitenMPV');
+            out.installToast = __text('#toast');
+            out.ready = PudgeI18n.t('ui.componentsAreReady');
+            await next();                                  // Developer Tools not confirmed yet
+            out.blocked = {step: ui.onboardingStep, toast: __text('#toast'), expected: t('ui.enablePudgeAndMpvIn')};
+            await __input('#o_jiten_devtools_confirmed', true);
+            await next();
+            out.stepAfter = ui.onboardingStep;
+            return out;
+            """,
+            lang=lang,
+            state={"settings": {"onboarding_completed": False}},
+            before=DEPENDENCIES,
+        )
+        out = result.value
+        assert out["step"] == 1 and result.called("first_experience_dependencies")
+        assert (out["mpv"], out["before"], out["after"]) == (
+            out["texts"]["installed"],
+            out["texts"]["missing"],
+            out["texts"]["installed"],
+        )
+        [[options]] = result.calls_of("install_first_experience_dependencies")
+        assert options["install_jiten_mpv"] is True and options["jiten_api_key"] == "jiten-key"
+        assert options["mpv_study_plugin"] == "jiten"
+        assert result.called("open_developer_tools_settings")
+        assert out["installToast"].endswith(out["ready"])
+        assert out["blocked"]["step"] == 1 and out["blocked"]["toast"].endswith(out["blocked"]["expected"])
+        assert out["stepAfter"] == 2

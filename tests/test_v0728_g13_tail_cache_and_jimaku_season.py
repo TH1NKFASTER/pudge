@@ -12,8 +12,12 @@ from pudge.subtitles.timeline_alignment import _suppress_false_tail_jump_from_du
 def test_g13_explicit_season_hint_handles_s2_and_roman_sequel() -> None:
     assert explicit_season_hint("暗殺教室.S02E01.WEBRip.ja.srt", "Ansatsu Kyoushitsu") == 2
     assert explicit_season_hint("Ansatsu Kyoushitsu S2 - E01 - [TV].srt", "Ansatsu Kyoushitsu") == 2
-    assert explicit_season_hint("[Kamigami] Ansatsu Kyoushitsu II [01][BD][JPN].ass", "Ansatsu Kyoushitsu") == 2
-    assert explicit_season_hint("[Kamigami] Ansatsu Kyoushitsu [01][BD][JPN].ass", "Ansatsu Kyoushitsu") is None
+    assert (
+        explicit_season_hint("[Kamigami] Ansatsu Kyoushitsu II [01][BD][JPN].ass", "Ansatsu Kyoushitsu") == 2
+    )
+    assert (
+        explicit_season_hint("[Kamigami] Ansatsu Kyoushitsu [01][BD][JPN].ass", "Ansatsu Kyoushitsu") is None
+    )
 
 
 def test_g13_rank_files_marks_explicit_wrong_season_as_hard_reject() -> None:
@@ -22,7 +26,9 @@ def test_g13_rank_files_marks_explicit_wrong_season_as_hard_reject() -> None:
     correct = JimakuFile("ok", "[Kamigami] Ansatsu Kyoushitsu [01][BD][JPN].ass", 1, "")
     wrong_roman = JimakuFile("bad1", "[Kamigami] Ansatsu Kyoushitsu II [01][BD][JPN].ass", 1, "")
     wrong_tag = JimakuFile("bad2", "Ansatsu Kyoushitsu S2 - E01 - [TV].srt", 1, "")
-    ranked = client.rank_files([wrong_roman, correct, wrong_tag], identity, Path("Assassination Classroom S01E01.mkv"))
+    ranked = client.rank_files(
+        [wrong_roman, correct, wrong_tag], identity, Path("Assassination Classroom S01E01.mkv")
+    )
     by_name = {row.name: row for row in ranked}
     assert "hard_reject_reason" not in by_name[correct.name].details
     for item in (wrong_roman, wrong_tag):
@@ -35,10 +41,7 @@ def test_g13_duration_anchor_guard_catches_sparse_but_decisive_lara_shape() -> N
     # 51 disputed source cues, but only 11 have a duration twin at the old clock.
     # This mirrors the real Sayonara Lara E04 shape that v6.15 missed at 11/51.
     source = [(1263.0 + i * 2.1, 1263.9 + i * 2.1 + (i % 3) * 0.1, f"cue {i}") for i in range(51)]
-    reference = [
-        (source[i][0] + 0.03, source[i][1] + 0.04, f"old {i}")
-        for i in range(11)
-    ]
+    reference = [(source[i][0] + 0.03, source[i][1] + 0.04, f"old {i}") for i in range(11)]
     # Add unrelated reference activity so the denominator remains 51 while no
     # duration anchors support the proposed +82 second clock.
     reference += [(1270.0 + i * 1.7, 1270.3 + i * 1.7, f"noise {i}") for i in range(40)]
@@ -59,7 +62,9 @@ def test_g13_duration_anchor_guard_catches_sparse_but_decisive_lara_shape() -> N
 
 def test_g13_tail_cache_migration_requeues_only_weak_positive_tail(monkeypatch) -> None:
     video = Path("/tmp/episode.mkv")
-    episode = SimpleNamespace(subtitle_path=Path("/tmp/final.srt"), video_path=video, media_id=177637, episode=4)
+    episode = SimpleNamespace(
+        subtitle_path=Path("/tmp/final.srt"), video_path=video, media_id=177637, episode=4
+    )
 
     class FakeDB:
         def __init__(self) -> None:
@@ -93,7 +98,10 @@ def test_g13_tail_cache_migration_requeues_only_weak_positive_tail(monkeypatch) 
             self.invalidated.append(args)
 
     invalidated_pipeline = []
-    monkeypatch.setattr("pudge.manager.invalidate_final_pipeline_result", lambda path, config: invalidated_pipeline.append(path))
+    monkeypatch.setattr(
+        "pudge.manager.invalidate_final_pipeline_result",
+        lambda path, config: invalidated_pipeline.append(path),
+    )
     manager = AnimeManager.__new__(AnimeManager)
     manager.db = FakeDB()
     manager.config = SimpleNamespace()

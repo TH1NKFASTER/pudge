@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+import json
+import logging
+import os
+import threading
 import time
 
 import httpx
@@ -9,6 +14,7 @@ from ..filename import normalize_title, title_similarity
 from ..branding import APP_SLUG
 from ..models import AniListAnime, VideoIdentity
 from ..manager_models import LibraryAnime
+from ..i18n import err
 
 
 QUERY = """
@@ -131,9 +137,6 @@ query ($mediaId: Int!) {
 """
 
 
-
-
-
 FULL_RELATION_GRAPH_QUERY = """
 query ($ids: [Int]) {
   Page(page: 1, perPage: 50) {
@@ -229,8 +232,6 @@ query ($userId: Int!) {
   }
 }
 """
-
-
 
 
 LIBRARY_FALLBACK_QUERY = """
@@ -366,6 +367,102 @@ class AniListHTTPError(AniListError):
         self.status_code = int(status_code)
 
 
+# --------------------------------------------------------------------------
+# Rate limiting shared by the window, the agent and CLI processes.
+#
+# AniList counts requests per minute on its side and reports what is left in
+# X-RateLimit-Remaining, so that header is the shared counter: when it runs low
+# every caller slows down, and a 429's Retry-After is written to disk so other
+# processes wait instead of hitting the block too.
+_LOGGER = logging.getLogger(__name__)
+_RATE_LIMIT_DIR: Path | None = None
+_RATE_LIMIT_LOCK = threading.Lock()
+_PROCESS_COOLDOWN_UNTIL = 0.0
+ANILIST_MAX_INLINE_WAIT_SECONDS = 65.0
+ANILIST_LOW_REMAINING = 5
+
+
+def configure_rate_limit_dir(cache_dir: Path | str | None) -> None:
+    """Share AniList 429 cool-downs between processes through ``cache_dir``."""
+    global _RATE_LIMIT_DIR
+    _RATE_LIMIT_DIR = Path(cache_dir).expanduser() / "anilist-api" if cache_dir else None
+
+
+def _cooldown_file() -> Path | None:
+    return _RATE_LIMIT_DIR / "rate-limit.json" if _RATE_LIMIT_DIR is not None else None
+
+
+def _cooldown_remaining(now: float | None = None) -> float:
+    moment = time.time() if now is None else float(now)
+    until = _PROCESS_COOLDOWN_UNTIL
+    marker = _cooldown_file()
+    if marker is not None:
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            until = max(until, float(payload.get("until") or 0.0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return max(0.0, until - moment)
+
+
+def _set_cooldown(seconds: float, *, status: int) -> float:
+    global _PROCESS_COOLDOWN_UNTIL
+    seconds = max(1.0, min(3600.0, float(seconds)))
+    until = time.time() + seconds
+    with _RATE_LIMIT_LOCK:
+        _PROCESS_COOLDOWN_UNTIL = max(_PROCESS_COOLDOWN_UNTIL, until)
+    marker = _cooldown_file()
+    if marker is not None:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            temporary = marker.with_name(f"{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            temporary.write_text(json.dumps({"until": until, "status": int(status)}), encoding="utf-8")
+            temporary.replace(marker)
+        except OSError as exc:
+            _LOGGER.warning("FALLBACK step=anilist.rate_limit reason=marker_write_failed error=%r", exc)
+    return seconds
+
+
+def _retry_after_seconds(value: str, default: float = 60.0) -> float:
+    try:
+        return max(1.0, min(3600.0, float(str(value or "").strip())))
+    except ValueError:
+        return default
+
+
+def _header_int(headers: Any, name: str) -> int | None:
+    try:
+        value = headers.get(name)
+        return int(str(value).strip()) if value is not None and str(value).strip() else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _wait_for_cooldown() -> None:
+    wait = _cooldown_remaining()
+    if wait <= 0:
+        return
+    if wait > ANILIST_MAX_INLINE_WAIT_SECONDS:
+        minutes = max(1, int((wait + 59) // 60))
+        raise AniListHTTPError(err("anilist.rateLimited", minutes=minutes), status_code=429)
+    _LOGGER.info("WAIT step=anilist.rate_limit wait_s=%.1f", wait)
+    time.sleep(wait)
+
+
+def _pace_after(response: Any) -> None:
+    """Slow down while AniList reports few requests left in this minute."""
+    headers = getattr(response, "headers", None)
+    remaining = _header_int(headers, "X-RateLimit-Remaining")
+    if remaining is None or remaining > ANILIST_LOW_REMAINING:
+        return
+    limit = max(1, _header_int(headers, "X-RateLimit-Limit") or 90)
+    if remaining <= 0:
+        # The next request would be refused: let a few of this minute's requests age out.
+        _set_cooldown(10 * 60.0 / limit, status=200)
+        return
+    time.sleep(60.0 / limit)
+
+
 def _as_title_list(media: dict[str, Any]) -> list[str]:
     title = media.get("title") or {}
     values = [title.get("romaji"), title.get("english"), title.get("native"), title.get("userPreferred")]
@@ -427,7 +524,6 @@ def _parent_matches_root_franchise(
     return any(term in alias for term in parent_terms for alias in root_compact)
 
 
-
 def _as_date_string(value: Any) -> str | None:
     """Preserve AniList partial dates (year or year-month).
 
@@ -456,9 +552,8 @@ def _as_date_string(value: Any) -> str | None:
     return f"{year:04d}-{month:02d}-{day:02d}"
 
 
-
 def _primary_studio(media: dict[str, Any]) -> str:
-    nodes = ((media.get("studios") or {}).get("nodes") or [])
+    nodes = (media.get("studios") or {}).get("nodes") or []
     valid = [node for node in nodes if isinstance(node, dict) and node.get("name")]
     for node in valid:
         if node.get("isAnimationStudio") is True:
@@ -471,9 +566,7 @@ def _relation_watched(node: dict[str, Any]) -> tuple[str, int, bool]:
     list_status = str(entry.get("status") or "").upper()
     progress = int(entry.get("progress") or 0)
     episodes = int(node["episodes"]) if node.get("episodes") else None
-    watched = list_status in {"COMPLETED", "REPEATING"} or bool(
-        episodes and progress >= episodes
-    )
+    watched = list_status in {"COMPLETED", "REPEATING"} or bool(episodes and progress >= episodes)
     return list_status, progress, watched
 
 
@@ -518,7 +611,7 @@ def _as_direct_relations(
     """Return anime relation links with one additional relation depth."""
     result: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
-    edges = ((media.get("relations") or {}).get("edges") or [])
+    edges = (media.get("relations") or {}).get("edges") or []
     for edge in edges:
         if not isinstance(edge, dict):
             continue
@@ -550,6 +643,7 @@ def _as_direct_relations(
         )
     )
     return result
+
 
 def _overlay_relation_list_entries(
     relations: list[dict[str, Any]],
@@ -613,6 +707,7 @@ class AniListClient:
         )
         self.last_library_warning = ""
         self.last_library_used_fallback = False
+        self.last_list_entries: dict[int, dict[str, Any]] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -620,46 +715,65 @@ class AniListClient:
     def _post(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         transient_statuses = {500, 502, 503, 504}
         last_error: Exception | None = None
-        for attempt in range(2):
+        rate_limited_retries = 0
+        attempt = 0
+        while attempt < 2:
+            _wait_for_cooldown()
             try:
                 response = self.client.post(
                     self.endpoint,
                     json={"query": query, "variables": variables or {}},
                 )
+                if int(getattr(response, "status_code", 200) or 200) == 429:
+                    seconds = _set_cooldown(
+                        _retry_after_seconds(response.headers.get("Retry-After", "")),
+                        status=429,
+                    )
+                    _LOGGER.warning("RATE_LIMIT step=anilist.http status=429 retry_after_s=%.0f", seconds)
+                    if rate_limited_retries == 0 and seconds <= ANILIST_MAX_INLINE_WAIT_SECONDS:
+                        rate_limited_retries += 1
+                        continue
+                    raise AniListHTTPError(
+                        err("anilist.rateLimited", minutes=max(1, int((seconds + 59) // 60))),
+                        status_code=429,
+                    )
+                _pace_after(response)
                 response.raise_for_status()
                 payload = response.json()
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 status = int(exc.response.status_code)
                 if status in transient_statuses and attempt == 0:
+                    attempt += 1
                     time.sleep(0.25)
                     continue
                 raise AniListHTTPError(
-                    f"Ошибка AniList: HTTP {status} для {self.endpoint}",
+                    err("anilist.http", status=status, endpoint=self.endpoint),
                     status_code=status,
                 ) from exc
             except httpx.RequestError as exc:
                 last_error = exc
                 if attempt == 0:
+                    attempt += 1
                     time.sleep(0.25)
                     continue
-                raise AniListError(f"Ошибка AniList: {exc}") from exc
+                raise AniListError(err("anilist", error=exc)) from exc
             except ValueError as exc:
-                raise AniListError(f"Ошибка AniList: некорректный JSON: {exc}") from exc
+                raise AniListError(err("anilist.invalidJson", error=exc)) from exc
 
             if payload.get("errors"):
-                raise AniListError(f"AniList вернул ошибку: {payload['errors']}")
+                raise AniListError(err("anilist.returnedError", error=payload["errors"]))
             data = payload.get("data")
             if not isinstance(data, dict):
-                raise AniListError("AniList вернул ответ без data")
+                raise AniListError(err("anilist.noData"))
             return data
 
-        raise AniListError(f"Ошибка AniList: {last_error}")
+        raise AniListError(err("anilist", error=last_error))
 
     def viewer(self) -> dict[str, Any]:
         viewer = self._post(VIEWER_QUERY).get("Viewer")
         if not isinstance(viewer, dict):
-            raise AniListError("Не удалось определить пользователя AniList")
+            raise AniListError(err("anilist.viewerUnknown"))
         return viewer
 
     def related_media_addition_notifications(
@@ -693,15 +807,9 @@ class AniListClient:
                     "title": titles[0] if titles else str(row.get("mediaId")),
                     "context": str(row.get("context") or ""),
                     "created_at": int(row.get("createdAt") or 0),
-                    "cover": str(
-                        cover.get("extraLarge")
-                        or cover.get("large")
-                        or cover.get("medium")
-                        or ""
-                    ),
+                    "cover": str(cover.get("extraLarge") or cover.get("large") or cover.get("medium") or ""),
                     "site_url": str(
-                        media.get("siteUrl")
-                        or f"https://anilist.co/anime/{int(row['mediaId'])}"
+                        media.get("siteUrl") or f"https://anilist.co/anime/{int(row['mediaId'])}"
                     ),
                     "media_status": str(media.get("status") or ""),
                     "format": str(media.get("format") or ""),
@@ -710,7 +818,6 @@ class AniListClient:
                 }
             )
         return result
-
 
     def library(self, *, include_relations: bool = True) -> list[LibraryAnime]:
         viewer = self.viewer()
@@ -728,10 +835,7 @@ class AniListClient:
                 if exc.status_code < 500:
                     raise
                 self.last_library_used_fallback = True
-                self.last_library_warning = (
-                    "AniList вернул HTTP 500 на расширенный запрос; "
-                    "использован упрощённый запрос, данные графа оставлены из кэша"
-                )
+                self.last_library_warning = err("anilist.extendedQueryFallback")
                 data = self._post(
                     LIBRARY_FALLBACK_QUERY,
                     {"userId": int(viewer["id"])},
@@ -750,6 +854,9 @@ class AniListClient:
                     "progress": int(entry.get("progress") or 0),
                     "episodes": int(media["episodes"]) if media.get("episodes") else None,
                 }
+        # Every list entry (Completed, Repeating, Paused ... too), for callers
+        # that keep local episodes of titles outside Watching/Planning.
+        self.last_list_entries = list_entries
 
         result: list[LibraryAnime] = []
         for group in groups:
@@ -772,7 +879,9 @@ class AniListClient:
                         title=(titles[0] if titles else str(media["id"])),
                         titles=titles,
                         synonyms=[str(x) for x in (media.get("synonyms") or []) if x],
-                        cover_url=str(cover.get("extraLarge") or cover.get("large") or cover.get("medium") or ""),
+                        cover_url=str(
+                            cover.get("extraLarge") or cover.get("large") or cover.get("medium") or ""
+                        ),
                         site_url=str(media.get("siteUrl") or f"https://anilist.co/anime/{media['id']}"),
                         status=entry_status,
                         progress=int(entry.get("progress") or 0),
@@ -786,9 +895,7 @@ class AniListClient:
                         mean_score=int(media["meanScore"]) if media.get("meanScore") is not None else None,
                         user_score=float(entry["score"]) if entry.get("score") is not None else None,
                         duration=int(media["duration"]) if media.get("duration") is not None else None,
-                        next_airing_episode=(
-                            int(airing["episode"]) if airing.get("episode") else None
-                        ),
+                        next_airing_episode=(int(airing["episode"]) if airing.get("episode") else None),
                         next_airing_at=int(airing["airingAt"]) if airing.get("airingAt") else None,
                         relations=relations,
                     )
@@ -802,7 +909,7 @@ class AniListClient:
 
     def search(self, identity: VideoIdentity) -> list[AniListAnime]:
         data = self._post(QUERY, {"search": identity.title})
-        media_items = ((data.get("Page") or {}).get("media") or [])
+        media_items = (data.get("Page") or {}).get("media") or []
         result: list[AniListAnime] = []
         for media in media_items:
             titles = _as_title_list(media)
@@ -821,14 +928,14 @@ class AniListClient:
     def get_anime(self, media_id: int) -> AniListAnime:
         media = self._post(LIST_ENTRY_QUERY, {"mediaId": media_id}).get("Media")
         if not isinstance(media, dict):
-            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+            raise AniListError(err("anilist.animeNotFound", mediaId=media_id))
         return _as_anime(media, score=1000.0)
 
     def library_anime(self, media_id: int) -> LibraryAnime:
         """Fetch one anime with enough list/airing metadata for download decisions."""
         media = self._post(LIST_ENTRY_QUERY, {"mediaId": int(media_id)}).get("Media")
         if not isinstance(media, dict):
-            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+            raise AniListError(err("anilist.animeNotFound", mediaId=media_id))
         titles = _as_title_list(media)
         cover = media.get("coverImage") or {}
         entry = media.get("mediaListEntry") or {}
@@ -866,7 +973,6 @@ class AniListClient:
         if not isinstance(schedule, dict) or not schedule.get("airingAt"):
             return None
         return int(schedule["airingAt"])
-
 
     def full_relation_graph(
         self,
@@ -931,7 +1037,7 @@ class AniListClient:
                 payload.pop("relation_type", None)
                 nodes[current_id] = payload
 
-                relation_edges = ((media.get("relations") or {}).get("edges") or [])
+                relation_edges = (media.get("relations") or {}).get("edges") or []
                 # Alternative versions are useful as leaf nodes, but following
                 # their own prequel/sequel trees merges a second watch order
                 # into the selected franchise.  Only the selected root may
@@ -1009,7 +1115,7 @@ class AniListClient:
                 pending.clear()
 
         if root_id not in nodes:
-            raise AniListError(f"AniList relation graph has no anime #{root_id}")
+            raise AniListError(err("anilist.graphMissingRoot", rootId=root_id))
 
         nodes_list = sorted(
             nodes.values(),
@@ -1034,15 +1140,13 @@ class AniListClient:
             "partial": False,
         }
 
-    def get_anime_with_relations(
-        self, media_id: int
-    ) -> tuple[AniListAnime, list[tuple[str, AniListAnime]]]:
+    def get_anime_with_relations(self, media_id: int) -> tuple[AniListAnime, list[tuple[str, AniListAnime]]]:
         media = self._post(RELATIONS_QUERY, {"mediaId": media_id}).get("Media")
         if not isinstance(media, dict):
-            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+            raise AniListError(err("anilist.animeNotFound", mediaId=media_id))
 
         relations: list[tuple[str, AniListAnime]] = []
-        edges = ((media.get("relations") or {}).get("edges") or [])
+        edges = (media.get("relations") or {}).get("edges") or []
         for edge in edges:
             node = edge.get("node") if isinstance(edge, dict) else None
             relation_type = str((edge or {}).get("relationType") or "")
@@ -1061,11 +1165,9 @@ class AniListClient:
         response without relation data.  This focused query is deliberately
         small enough to restore the card graph for newly added entries.
         """
-        media = self._post(DIRECT_RELATIONS_QUERY, {"mediaId": int(media_id)}).get(
-            "Media"
-        )
+        media = self._post(DIRECT_RELATIONS_QUERY, {"mediaId": int(media_id)}).get("Media")
         if not isinstance(media, dict):
-            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+            raise AniListError(err("anilist.animeNotFound", mediaId=media_id))
         return _as_direct_relations(media)
 
     def resolve_absolute_episode(
@@ -1093,9 +1195,7 @@ class AniListClient:
                 (title_similarity(left, right) for left in source_names for right in candidate_names),
                 default=0.0,
             )
-            year_gap = abs(
-                (candidate.season_year or 9999) - (source.season_year or 9999)
-            )
+            year_gap = abs((candidate.season_year or 9999) - (source.season_year or 9999))
             return continuity, -float(year_gap), -candidate.id
 
         # Recover the beginning of a split-cour arc. A predecessor with at
@@ -1213,9 +1313,7 @@ class AniListClient:
             # (366 episodes) must not be added to Thousand-Year Blood War.
             episode_cap = max(100, int(start.episodes or 0) * 4)
             counted = (candidate.format or "").upper() in counted_formats
-            if continuity < 35.0 or (
-                counted and int(candidate.episodes or 0) > episode_cap
-            ):
+            if continuity < 35.0 or (counted and int(candidate.episodes or 0) > episode_cap):
                 break
             if counted:
                 total += int(candidate.episodes or 0)
@@ -1251,7 +1349,7 @@ class AniListClient:
                 return entry
             raise
         if not isinstance(saved, dict):
-            raise AniListError("AniList не вернул обновлённую запись списка")
+            raise AniListError(err("anilist.noUpdatedEntry"))
         return saved
 
     def set_progress(self, media_id: int, progress: int, status: str | None = None) -> dict[str, Any]:
@@ -1263,7 +1361,7 @@ class AniListClient:
         allowed = {"CURRENT", "PLANNING", "COMPLETED", "DROPPED", "PAUSED", "REPEATING"}
         status = str(status or "").strip().upper()
         if status not in allowed:
-            raise AniListError(f"Недопустимый статус AniList: {status}")
+            raise AniListError(err("anilist.invalidStatus", status=status))
         try:
             saved = self._post(
                 SAVE_STATUS_MUTATION,
@@ -1277,13 +1375,13 @@ class AniListClient:
                 return entry
             raise
         if not isinstance(saved, dict):
-            raise AniListError("AniList не вернул обновлённую запись списка")
+            raise AniListError(err("anilist.noUpdatedEntry"))
         return saved
 
     def set_score(self, media_id: int, score: float) -> dict[str, Any]:
         value = float(score)
         if value < 1 or value > 10:
-            raise AniListError("Оценка AniList должна быть от 1 до 10")
+            raise AniListError(err("anilist.scoreRange"))
         try:
             saved = self._post(
                 SAVE_SCORE_MUTATION,
@@ -1298,7 +1396,7 @@ class AniListClient:
                 return entry
             raise
         if not isinstance(saved, dict):
-            raise AniListError("AniList не вернул сохранённую оценку")
+            raise AniListError(err("anilist.noSavedScore"))
         return saved
 
     def delete_list_entry(self, media_id: int) -> bool:
@@ -1329,11 +1427,11 @@ class AniListClient:
         complete_rewatching_final: bool = True,
     ) -> dict[str, Any]:
         if progress < 1:
-            raise AniListError("Номер серии для AniList должен быть положительным")
+            raise AniListError(err("anilist.episodeNotPositive"))
 
         media = self._post(LIST_ENTRY_QUERY, {"mediaId": media_id}).get("Media")
         if not isinstance(media, dict):
-            raise AniListError(f"Аниме AniList id={media_id} не найдено")
+            raise AniListError(err("anilist.animeNotFound", mediaId=media_id))
 
         entry = media.get("mediaListEntry")
         current_progress = int((entry or {}).get("progress") or 0)

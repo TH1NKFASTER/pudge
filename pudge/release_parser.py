@@ -9,6 +9,9 @@ codecs, checksum, type) plus *safety* decisions made once for every caller:
   an extra (NCOP/NCED/PV/...) or a special (SP) gives ``episode=None`` — never
   ``12.5 -> 12``, ``01-12 -> 1`` or ``v2 -> 2``.
 * ``episode_range`` keeps an explicit span; ``raw_episodes`` keeps the text.
+* ``double_episode_span`` accepts exactly one kind of span as playable: two
+  consecutive regular episodes in one file (``- 01-02``, ``- 05 ~ 06``,
+  ``S01E01-E02``), never a pack.
 
 ``anitopy`` is the pure-Python port of the original C++ Anitomy (MPL-2.0, no
 compiled code, so it installs identically on arm64 and x86_64).  When it is
@@ -34,8 +37,21 @@ PARSER_VERSION = "anitomy-adapter-1"
 
 # Anitomy ``anime_type`` values that are not numbered story episodes.
 EXTRA_TYPES = {
-    "ncop", "nced", "op", "ed", "opening", "ending", "pv", "preview", "cm",
-    "menu", "trailer", "teaser", "commercial", "promo", "cd",
+    "ncop",
+    "nced",
+    "op",
+    "ed",
+    "opening",
+    "ending",
+    "pv",
+    "preview",
+    "cm",
+    "menu",
+    "trailer",
+    "teaser",
+    "commercial",
+    "promo",
+    "cd",
 }
 SPECIAL_TYPES = {"sp", "special", "specials", "sps", "omake", "picture drama", "recap"}
 _RANGE_TAIL_RE = re.compile(r"^\s*[~\-–—]\s*0*(\d{1,4})\b")
@@ -113,7 +129,7 @@ def _legacy_only(name: str, warnings: list[str]) -> ParsedRelease:
     )
 
 
-@lru_cache(maxsize=8192)
+@lru_cache(maxsize=1024)  # ~1 KB per entry; 8192 held ~8 MB after a search
 def parse_release_name(name: str) -> ParsedRelease:
     text = unicodedata.normalize("NFC", str(name or "")).strip()
     warnings: list[str] = []
@@ -225,3 +241,47 @@ def parse_release_name(name: str) -> ParsedRelease:
         warnings=tuple(warnings),
         explicit_episode=explicit,
     )
+
+
+_BATCH_WORDS_RE = re.compile(r"(?i)\b(batch|complete|全集|全話|season\s*pack|vol(?:ume)?)\b")
+# Cheap pre-check so library reads do not parse every single-episode name.
+_DOUBLE_HINT_RE = re.compile(r"(?i)\d(?:v\d+)?\s*(?:[-~–—+&・]|and)\s*E?\d")
+
+
+@lru_cache(maxsize=512)
+def double_episode_span(name: str) -> tuple[int, int] | None:
+    """``(n, n + 1)`` when the name is two consecutive episodes in one release.
+
+    Both the parser and an explicit marker must agree: ``Show - 01-02``,
+    ``Show - 05 ~ 06``, ``Show (01-02)`` or ``S01E01-E02``. A bare
+    ``Show 2 - 03`` (sequel title + episode) is one episode, and packs,
+    specials, extras, fractional numbers and season 0 are never doubles.
+    """
+    text = unicodedata.normalize("NFC", str(name or "")).strip()
+    if not _DOUBLE_HINT_RE.search(text):
+        return None
+    parsed = parse_release_name(text)
+    span = parsed.episode_range
+    if span is None or span[1] != span[0] + 1 or span[0] < 1:
+        return None
+    if (
+        parsed.fractional
+        or parsed.special
+        or parsed.extra
+        or parsed.season == 0
+        or len(parsed.raw_episodes) > 2
+    ):
+        return None
+    if _BATCH_WORDS_RE.search(text):
+        return None
+    a, b = (rf"0*{value}(?:v\d+)?" for value in span)
+    marker = (
+        rf"(?:^|\s)[-–—]\s*{a}\s*(?:[-~–—+&]|and)\s*{b}(?=$|[\s\[(._\]])",
+        rf"[\[(]\s*{a}\s*[-~–—+&]\s*{b}\s*[\])]",
+        rf"(?i)\bS\d{{1,2}}E{a}\s*-?\s*E?{b}(?!\d)",
+        rf"(?i)\bEp(?:isodes?)?\.?\s*{a}\s*[-~–—+&]\s*{b}(?!\d)",
+        rf"第\s*{a}\s*[-~–—+&・]\s*{b}\s*[話回]",
+    )
+    if not any(re.search(pattern, text) for pattern in marker):
+        return None
+    return int(span[0]), int(span[1])

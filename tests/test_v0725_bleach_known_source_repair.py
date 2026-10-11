@@ -122,9 +122,10 @@ def test_selected_v63_bleach_nanako_is_requeued_once_for_source_repair(
         "1\n00:00:33,082 --> 00:00:38,053\nふさわしい力だ。\n",
         encoding="utf-8",
     )
-    raw = cfg.paths.cache_dir / "jimaku" / (
-        "[NanakoRaws] Bleach Sennen Kessen-hen S01E45 "
-        "(TVA TV 1080p HEVC AAC).srt"
+    raw = (
+        cfg.paths.cache_dir
+        / "jimaku"
+        / ("[NanakoRaws] Bleach Sennen Kessen-hen S01E45 (TVA TV 1080p HEVC AAC).srt")
     )
     raw.parent.mkdir(parents=True, exist_ok=True)
     raw.write_text("raw", encoding="utf-8")

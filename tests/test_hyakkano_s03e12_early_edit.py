@@ -5,6 +5,7 @@ at 62.095 (12.979 s gap). Coarse timeline windows find -22 s then -32 s with a
 transition near ~97.5 s. Forward-only monotonic repair used to drag the switch
 to ~482 s (cues 1..133 on -22 s).
 """
+
 from __future__ import annotations
 
 from pudge.subtitles.timeline_alignment import _offset_for_time, _stabilize_decreasing_boundaries
@@ -57,15 +58,15 @@ def _check(boundaries, segments, cues) -> None:
 def test_decreasing_jump_anchors_to_real_edit_gap_with_reference() -> None:
     cues = _cues()
     reference = sorted(_truth(start) + 0.15 for start, _end, _text in cues)
-    segments, boundaries, diagnostics = _stabilize_decreasing_boundaries(
-        cues, _segments(), [97.5], reference
-    )
+    segments, boundaries, diagnostics = _stabilize_decreasing_boundaries(cues, _segments(), [97.5], reference)
     _check(boundaries, segments, cues)
     applied = [row for row in diagnostics if row.get("applied")]
     assert applied and applied[0]["reason"] == "decreasing_boundary_anchored_to_wide_source_gap"
     assert applied[0]["direction"] == "backward"
     assert applied[0]["mapped_gap_seconds"] > 0.3
-    assert not any(row.get("reason") == "decreasing_boundary_extended_for_monotonicity" for row in diagnostics)
+    assert not any(
+        row.get("reason") == "decreasing_boundary_extended_for_monotonicity" for row in diagnostics
+    )
 
 
 def test_decreasing_jump_anchors_backward_without_reference() -> None:
@@ -88,6 +89,7 @@ def test_reference_can_prefer_forward_gap_when_it_is_the_real_edit() -> None:
 
 # --- STT transition safety: gap must absorb the jump, not be >= 30 s --------
 
+
 def _write_srt(path, cues) -> None:
     def ts(value: float) -> str:
         ms = int(round(value * 1000))
@@ -108,7 +110,10 @@ def _stt_shape(tmp_path, post_shift: float):
     _write_srt(source, cues)
     _write_srt(
         aligned,
-        [(a + (-22.0 if a < 55.0 else post_shift), b + (-22.0 if a < 55.0 else post_shift), t) for a, b, t in cues],
+        [
+            (a + (-22.0 if a < 55.0 else post_shift), b + (-22.0 if a < 55.0 else post_shift), t)
+            for a, b, t in cues
+        ],
     )
     return _stt_alass_transition_safety(source, aligned)
 
@@ -132,10 +137,16 @@ def test_stt_transition_larger_than_gap_is_not_supported(tmp_path) -> None:
 
 # --- Fusion: constant STT map + local STT transition keep the piecewise timeline
 
+
 def _timeline_result() -> dict:
     return {
         "timeline_boundaries": [
-            {"source_time": 55.606, "left_offset_seconds": -22.0, "right_offset_seconds": -32.0, "jump_seconds": -10.0}
+            {
+                "source_time": 55.606,
+                "left_offset_seconds": -22.0,
+                "right_offset_seconds": -32.0,
+                "jump_seconds": -10.0,
+            }
         ],
         "timeline_validation": {
             "after": {"f1": 0.86},
@@ -155,11 +166,23 @@ def _speech_result(**overrides) -> dict:
             "reason": "text_clock_safety_gate_failed",
             "transition_safety": {
                 "transitions": [
-                    {"cue_index": 4, "source_time": 62.095, "jump_seconds": -11.811,
-                     "nearby_gap_seconds": 12.979, "nearby_gap_time": 55.605, "gap_supported": False},
+                    {
+                        "cue_index": 4,
+                        "source_time": 62.095,
+                        "jump_seconds": -11.811,
+                        "nearby_gap_seconds": 12.979,
+                        "nearby_gap_time": 55.605,
+                        "gap_supported": False,
+                    },
                     # unrelated noisy late transition stays irrelevant
-                    {"cue_index": 300, "source_time": 1100.0, "jump_seconds": 9.0,
-                     "nearby_gap_seconds": 0.4, "nearby_gap_time": 1100.2, "gap_supported": False},
+                    {
+                        "cue_index": 300,
+                        "source_time": 1100.0,
+                        "jump_seconds": 9.0,
+                        "nearby_gap_seconds": 0.4,
+                        "nearby_gap_time": 1100.2,
+                        "gap_supported": False,
+                    },
                 ]
             },
         },
@@ -181,9 +204,37 @@ def test_fusion_refuses_without_matching_local_evidence() -> None:
     from pudge.syncing import _speech_confirms_gap_anchored_timeline_edit as fuse
 
     base = _speech_result()
-    no_local = _speech_result(stt_text_alignment={"transition_safety": {"transitions": base["stt_text_alignment"]["transition_safety"]["transitions"][1:]}})
-    far = _speech_result(stt_text_alignment={"transition_safety": {"transitions": [dict(base["stt_text_alignment"]["transition_safety"]["transitions"][0], nearby_gap_time=150.0)]}})
-    too_big = _speech_result(stt_text_alignment={"transition_safety": {"transitions": [dict(base["stt_text_alignment"]["transition_safety"]["transitions"][0], nearby_gap_seconds=11.0)]}})
+    no_local = _speech_result(
+        stt_text_alignment={
+            "transition_safety": {
+                "transitions": base["stt_text_alignment"]["transition_safety"]["transitions"][1:]
+            }
+        }
+    )
+    far = _speech_result(
+        stt_text_alignment={
+            "transition_safety": {
+                "transitions": [
+                    dict(
+                        base["stt_text_alignment"]["transition_safety"]["transitions"][0],
+                        nearby_gap_time=150.0,
+                    )
+                ]
+            }
+        }
+    )
+    too_big = _speech_result(
+        stt_text_alignment={
+            "transition_safety": {
+                "transitions": [
+                    dict(
+                        base["stt_text_alignment"]["transition_safety"]["transitions"][0],
+                        nearby_gap_seconds=11.0,
+                    )
+                ]
+            }
+        }
+    )
     cases = {
         "speech_map_not_constant": _speech_result(alass_distinct_shifts=3),
         "speech_disagrees_with_post_clock": _speech_result(offset_seconds=-22.1),
@@ -200,6 +251,7 @@ def test_fusion_refuses_without_matching_local_evidence() -> None:
 
 
 # --- Test D: a constant global map cannot be A while the early edit is unresolved
+
 
 def _incident_final_result(**overrides) -> dict:
     result = {
@@ -233,7 +285,8 @@ def test_resolved_early_edit_keeps_a() -> None:
 
     scaffolded = _incident_final_result(embedded_opening_clock_scaffold={"applied": True})
     piecewise = _incident_final_result(
-        engine="embedded-reference+timeline", alass_distinct_shifts=None,
+        engine="embedded-reference+timeline",
+        alass_distinct_shifts=None,
         embedded_timeline_audio_verification={"accepted": True},
     )
     no_risk = _incident_final_result(timeline_early_edit_audio_verification={"required": False})
@@ -271,7 +324,10 @@ def _fixture_files(tmp_path, *, prefix_delta: float = 0.0, gap_squeeze: float = 
         aligned.append((start, end, text))
     reference = [tuple(row) for row in data["reference"]]
     if gap_squeeze:
-        reference = [(s - gap_squeeze if s > 28.0 else s, e - gap_squeeze if s > 28.0 else e, t) for s, e, t in reference]
+        reference = [
+            (s - gap_squeeze if s > 28.0 else s, e - gap_squeeze if s > 28.0 else e, t)
+            for s, e, t in reference
+        ]
     a = tmp_path / "aligned.srt"
     r = tmp_path / "reference.srt"
     _write_srt(a, aligned)

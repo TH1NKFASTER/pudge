@@ -9,6 +9,9 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryEpisode
 from pudge.providers.qbittorrent import QBittorrentClient
 from pudge.subtitle_formats import clean_srt_for_playback
+from css_support import css_rules
+from source_policy import source
+from tests.i18n_support import en, has_text, ru
 
 
 def _srt(text: str = "日本語") -> str:
@@ -25,10 +28,10 @@ def _cfg(tmp_path: Path) -> AppConfig:
 
 
 def test_v0672_version() -> None:
-    root = Path(__file__).parents[1]
-    expected = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    # policy: the release version is declared in pyproject.toml and announced in the README.
+    expected = tomllib.loads(source("pyproject.toml"))["project"]["version"]
     assert __version__ == expected
-    assert f"Current version: **{expected}**." in (root / "README.md").read_text(encoding="utf-8")
+    assert f"Current version: **{expected}**." in source("README.md")
 
 
 def test_alignment_generation_uses_history_when_old_sync_source_was_pruned(
@@ -177,28 +180,71 @@ def test_manager_repairs_missingfiles_after_brand_rename(tmp_path: Path) -> None
     assert client.rechecks == ["bleach"]
 
 
-def test_ln_cards_and_settings_match_v0672_ui() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
+def test_ln_card_body_is_a_column_with_actions_at_the_bottom() -> None:
+    # Cards of different heights keep their buttons on one line at the bottom.
+    rules = css_rules("index.html")
+    body = rules.declarations(".ln-card-body")
+    assert (body["display"], body["flex-direction"], body["min-width"]) == ("flex", "column", "0")
+    actions = rules.declarations(".ln-card-actions")
+    assert (actions["display"], actions["flex-wrap"], actions["margin-top"], actions["gap"]) == (
+        "flex",
+        "wrap",
+        "auto",
+        "6px",
+    )
+    # The linked cover opening AniList: tests/test_v0700_reading_library_polish_local.py.
 
-    assert ".ln-card-body{display:flex;min-width:0;flex-direction:column}" in html
-    assert ".ln-card-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}" in html
-    assert 'data-ln-anilist-url="${escapeHtml(anilistUrl)}"' in html
-    assert "https://anilist.co/manga/${Number(book.anilist_id)}" in html
-    assert "await pywebview.api.open_url(target.dataset.lnAnilistUrl)" in html
 
-    assert 'data-ln-action="nyaa"' not in html
-    assert 'id="lnAutoNyaa"' not in html
-    assert "Run auto Nyaa" not in html
-    assert 'id="s_ln_auto_download"' in html
-    assert 'id="s_ln_nyaa_category"' not in html
-
-    settings_block = html.split('<input id="s_anilist_enabled"', 1)[1].split(
-        '<div class="setting-block" data-settings-category="essential"><h3>${ui.lang===\'ru\'?\'Jiten / JPDB\'', 1
-    )[0]
-    assert "action.anilistDocs" not in settings_block
-    assert html.count("https://docs.anilist.co/guide/auth/") == 1
-
-    assert "Allow LLM subtitle verification (expensive)" in html
-    assert "Light Novel translation" in html
-    assert "Разрешить LLM-проверку субтитров (дорого)" in html
-    assert "перевода в читалке ранобэ" in html
+def test_light_novels_have_no_nyaa_volume_search_and_settings_keep_auto_download(page) -> None:
+    assert not has_text("Run auto Nyaa") and not has_text("Run auto Nyaa", "ru")
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('lightnovels', true); await __tick(100);
+            await __fire('#lightNovelsContent [data-ln-book="6"]', 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent');
+            const out = {actions: [...document.querySelectorAll('[data-ln-action], [data-ln-context-action]')].map(n => n.dataset.lnAction || n.dataset.lnContextAction),
+                         autoNyaa: Boolean($('lnAutoNyaa')), text: __text('#lightnovels')};
+            setPage('settings', true); await __tick(50);
+            const auto = $('s_ln_auto_download');
+            out.settings = {auto: auto?.type, autoLabel: auto?.closest('label').innerText, expected: t('settings.lnAutoNyaa'),
+                            category: auto?.closest('[data-settings-category]').dataset.settingsCategory, nyaaCategory: Boolean($('s_ln_nyaa_category'))};
+            // AniList: credentials only, no separate link to AniList's authentication guide.
+            const anilist = $('s_anilist_enabled').closest('.setting-block');
+            out.anilist = {guideLinks: [...anilist.querySelectorAll('a, button, [data-url]')].filter(n =>
+                              /docs\.anilist\.co/.test(n.getAttribute('href') || n.dataset.url || '') || n.innerText === PudgeI18n.t('action.anilistDocs')).length};
+            const semantic = $('s_subtitle_semantic_checks');
+            out.semantic = {type: semantic.type, label: semantic.closest('label').innerText, expected: PudgeI18n.t('ui.allowLlmSubtitleVerificationExpensive')};
+            await __input('#s_ln_auto_download', true);
+            await __click('#saveSettings'); await __tick(10);
+            return out;
+            """,
+            lang=lang,
+            api={
+                "light_novel_state": {
+                    "version": 1,
+                    "settings": {},
+                    "books": [{"id": 6, "title": "Novel", "volume": 3}],
+                }
+            },
+            before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+        )
+        out = result.value
+        assert "nyaa" not in out["actions"] and out["autoNyaa"] is False
+        assert "Run auto Nyaa" not in out["text"]
+        assert out["settings"] == {
+            "auto": "checkbox",
+            "autoLabel": out["settings"]["expected"],
+            "expected": out["settings"]["expected"],
+            "category": "advanced",
+            "nyaaCategory": False,
+        }
+        assert out["anilist"] == {"guideLinks": 0}
+        assert (
+            out["semantic"]["type"] == "checkbox" and out["semantic"]["label"] == out["semantic"]["expected"]
+        )
+        [[values]] = result.calls_of("save_settings")
+        assert values["ln_auto_download_nyaa"] is True
+    assert en("ui.allowLlmSubtitleVerificationExpensive") == "Allow LLM subtitle verification (expensive)"
+    assert ru("ui.allowLlmSubtitleVerificationExpensive") == "Разрешить LLM-проверку субтитров (дорого)"
+    assert "Light Novel translation" in en("settings.llmOptional")
+    assert "перевода в читалке ранобэ" in ru("settings.llmOptional")

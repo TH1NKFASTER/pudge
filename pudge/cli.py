@@ -16,10 +16,12 @@ from pathlib import Path
 
 from .anilist_tracking import (
     TrackingPayload,
+    clear_pending_progress,
     create_tracking_file,
     load_mapping,
     mapping_key,
     parse_anilist_id,
+    queue_pending_progress,
     read_tracking_file,
     save_mapping,
     update_tracking_media,
@@ -44,6 +46,7 @@ from .media import MediaProbeError, TEXT_CODECS, find_embedded_japanese_subtitle
 from .models import AniListAnime, JimakuEntry, SubtitleCandidate, VideoIdentity
 from .ocr import OCRConversionError, OCRUnavailableError, image_subtitle_to_srt
 from .foreground import clear_foreground, mark_foreground
+from .i18n import catalog_path, err, message, t, tn
 from .pipeline_cache import (
     final_pipeline_cache_available,
     invalidate_final_pipeline_result,
@@ -53,55 +56,97 @@ from .pipeline_cache import (
 from .player import build_mpv_command, run_mpv
 from .runtime import python_executable
 from .providers.anilist import AniListClient, AniListError
-from .providers.jimaku import JimakuClient, JimakuError, find_7zip, materialize_jimaku_files
+from .providers.jimaku import (
+    JimakuClient,
+    JimakuError,
+    JimakuKeyRejected,
+    find_7zip,
+    materialize_jimaku_files,
+)
 from .subtitle_formats import clean_srt_for_playback, convert_to_plain_srt
 from .subtitles.discovery import content_fingerprint, deduplicate_candidates
 from .subtitles.jobs import SubtitleJobReporter
 from .subtitles.models import SubtitleJobStage
 from .subtitles.validation import quality_from_result
-from .subtitles.pipeline import (
-    optimize_candidates,
-    optimize_subtitle,
-    subtitle_quality_accepted,
-)
+
+
+# The subtitle-alignment stack (pudge.syncing, timeline alignment) is only
+# needed when a subtitle is prepared, not by the playback wrapper or the
+# translation helpers mpv starts per episode (~8 MB per process).
+def optimize_candidates(*args, **kwargs):
+    from .subtitles.pipeline import optimize_candidates as run
+
+    return run(*args, **kwargs)
+
+
+def optimize_subtitle(*args, **kwargs):
+    from .subtitles.pipeline import optimize_subtitle as run
+
+    return run(*args, **kwargs)
+
+
+def subtitle_quality_accepted(*args, **kwargs):
+    from .subtitles.pipeline import subtitle_quality_accepted as run
+
+    return run(*args, **kwargs)
+
+
 from .subtitles.source_repairs import apply_known_source_repair
 
 
-
 VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts", ".wmv",
-    ".flv", ".ogv", ".mpeg", ".mpg", ".mpv", ".3gp",
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".wmv",
+    ".flv",
+    ".ogv",
+    ".mpeg",
+    ".mpg",
+    ".mpv",
+    ".3gp",
 }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_CLI,
-        description="Запускает mpv и автоматически подбирает японские субтитры.",
+        description="Starts mpv and automatically picks Japanese subtitles.",
     )
-    parser.add_argument("videos", nargs="*", type=Path, help="Видео-файл или несколько файлов")
-    parser.add_argument("--sub", type=Path, help="Явно заданный файл субтитров")
-    parser.add_argument("--offline", action="store_true", help="Не использовать AniList и Jimaku")
-    parser.add_argument("--no-sync", action="store_true", help="Не исправлять тайминг")
-    parser.add_argument("--resync", action="store_true", help="Не использовать кэш ретайминга")
-    parser.add_argument("--force-search", action="store_true", help="Искать внешние субтитры даже при встроенных японских")
-    parser.add_argument("--dry-run", action="store_true", help="Показать итоговую команду mpv, но не запускать")
+    parser.add_argument("videos", nargs="*", type=Path, help="One or more video files")
+    parser.add_argument("--sub", type=Path, help="Use this subtitle file")
+    parser.add_argument("--offline", action="store_true", help="Do not use AniList and Jimaku")
+    parser.add_argument("--no-sync", action="store_true", help="Do not fix the timing")
+    parser.add_argument("--resync", action="store_true", help="Ignore the retiming cache")
+    parser.add_argument(
+        "--force-search",
+        action="store_true",
+        help="Search external subtitles even when embedded Japanese ones exist",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the final mpv command without running it"
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--no-anilist-progress",
         action="store_true",
-        help="Не обновлять прогресс AniList для этого запуска",
+        help="Do not update AniList progress for this run",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=Path(os.environ.get("PUDGE_CONFIG", str(DEFAULT_CONFIG_PATH))),
     )
-    parser.add_argument("--init-config", action="store_true", help="Создать конфиг и выйти")
-    parser.add_argument("--doctor", action="store_true", help="Проверить зависимости и настройки")
-    parser.add_argument("--settings", action="store_true", help="Открыть расширенные настройки")
-    parser.add_argument("--app", action="store_true", help=f"Открыть приложение {APP_NAME}")
-    parser.add_argument("--agent-once", action="store_true", help="Однократно запустить фоновый агент")
+    parser.add_argument("--init-config", action="store_true", help="Create a config and exit")
+    parser.add_argument("--doctor", action="store_true", help="Check dependencies and settings")
+    parser.add_argument("--app", action="store_true", help=f"Open the {APP_NAME} app")
+    parser.add_argument("--agent-once", action="store_true", help="Run the background agent once")
     parser.add_argument("--prepare-only", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--fast-play", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--embedded-sid", type=int, help=argparse.SUPPRESS)
@@ -114,13 +159,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--media-episodes", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--media-format", default="", help=argparse.SUPPRESS)
     parser.add_argument("--episode-hint", type=int, help=argparse.SUPPRESS)
+    # Two episodes in one file (audit 17А): the last episode and where it starts.
+    parser.add_argument("--episode-end-hint", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--part-boundary", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--part", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--skip-airing-lookup", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--previous-candidate-outcome", default="unknown", help=argparse.SUPPRESS)
     parser.add_argument("--previous-candidate-fingerprint", default="", help=argparse.SUPPRESS)
     parser.add_argument(
         "--anilist-correct",
         metavar="ID_OR_URL",
-        help="Закрепить AniList ID за аниме из указанного видео",
+        help="Pin an AniList ID to the anime of the given video",
     )
     parser.add_argument("--anilist-action", choices=["update", "correct"], help=argparse.SUPPRESS)
     parser.add_argument("--tracking-file", type=Path, help=argparse.SUPPRESS)
@@ -140,6 +189,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subtitle-prewarm-from", type=float, default=0.0, help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-study-text", default="", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-study-context", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-time", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--subtitle-study-secondary", default="", help=argparse.SUPPRESS)
     parser.add_argument("--subtitle-study-media-id", type=int, help=argparse.SUPPRESS)
     return parser
 
@@ -346,8 +398,6 @@ def _resolve_anilist(
         client.close()
 
 
-
-
 def _episode_airing_at(
     anime: AniListAnime | None,
     identity: VideoIdentity,
@@ -376,7 +426,7 @@ def _episode_airing_at(
         airing_at = client.episode_airing_at(anime.id, identity.episode)
     except AniListError as exc:
         if verbose:
-            print(f"AniList: дата выхода серии недоступна: {exc}")
+            print(f"AniList: episode air date unavailable: {exc}")
         return None
     finally:
         client.close()
@@ -390,10 +440,11 @@ def _episode_airing_at(
         pass
     if verbose and airing_at:
         print(
-            f"AniList: серия {identity.episode} вышла "
+            f"AniList: episode {identity.episode} aired "
             f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(airing_at))}"
         )
     return airing_at
+
 
 def _library_anilist_hint(video: Path, config: AppConfig) -> AniListAnime | None:
     """Reuse the authoritative AniList identity already stored by the app.
@@ -412,7 +463,11 @@ def _library_anilist_hint(video: Path, config: AppConfig) -> AniListAnime | None
         anime = db.get_anime(int(episode.media_id))
         if anime is None:
             return None
-        titles = list(dict.fromkeys([str(anime.title or "").strip(), *[str(v).strip() for v in anime.titles if str(v).strip()]]))
+        titles = list(
+            dict.fromkeys(
+                [str(anime.title or "").strip(), *[str(v).strip() for v in anime.titles if str(v).strip()]]
+            )
+        )
         titles = [value for value in titles if value]
         return AniListAnime(
             id=int(anime.media_id),
@@ -438,7 +493,7 @@ def _resolve_tracking_anilist(
     library_hint = _library_anilist_hint(video, config)
     if library_hint is not None:
         if verbose:
-            print(f"AniList: сопоставление из Library id={library_hint.id}, titles={library_hint.titles}")
+            print(f"AniList: match from Library id={library_hint.id}, titles={library_hint.titles}")
         save_mapping(
             config.paths.cache_dir,
             key,
@@ -449,7 +504,7 @@ def _resolve_tracking_anilist(
     cached = load_mapping(config.paths.cache_dir, key)
     if cached is not None:
         if verbose:
-            print(f"AniList: сопоставление из кэша id={cached.id}, titles={cached.titles}")
+            print(f"AniList: match from cache id={cached.id}, titles={cached.titles}")
         return cached, key
 
     anime = _resolve_anilist(
@@ -499,37 +554,42 @@ def _run_playback_save(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
-def _osd(config: AppConfig, english: str, russian: str) -> str:
-    return russian if config.ui.language == "ru" else english
+def _log_anilist_progress(media_id: int, episode: int, outcome: str, **details: object) -> None:
+    """One runtime-log line per AniList progress update from the mpv tracker."""
+    try:
+        logger = configure_logging()
+        extra = "".join(f" {key}={value!r}" for key, value in details.items())
+        logger.info(
+            "RESULT step=anilist.progress_update media_id=%s episode=%s outcome=%s%s",
+            media_id,
+            episode,
+            outcome,
+            extra,
+        )
+    except Exception:  # noqa: BLE001 - logging never blocks counting
+        pass
 
 
 def _run_anilist_action(args: argparse.Namespace, config: AppConfig) -> int:
     if args.tracking_file is None:
-        print("Ошибка: tracking file не задан", file=sys.stderr)
+        print("Error: tracking file is not set", file=sys.stderr)
         return 2
     try:
         payload = read_tracking_file(args.tracking_file.expanduser())
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        print(f"Ошибка чтения tracking file: {exc}", file=sys.stderr)
+        print(f"Error reading the tracking file: {exc}", file=sys.stderr)
         return 2
 
+    lang = config.ui.language
     if not config.anilist.access_token:
-        print("OSD:" + _osd(
-            config,
-            "AniList access token is not configured",
-            "AniList access token не задан",
-        ))
+        print("OSD:" + t("osd.anilistTokenMissing", lang=lang))
         return 1
 
     client = AniListClient(config.anilist.endpoint, access_token=config.anilist.access_token)
     try:
         if args.anilist_action == "correct":
             if not args.anilist_id:
-                print("OSD:" + _osd(
-                    config,
-                    "Enter an AniList ID or URL",
-                    "Нужен AniList ID или URL",
-                ))
+                print("OSD:" + t("osd.anilistIdRequired", lang=lang))
                 return 2
             media_id = parse_anilist_id(args.anilist_id)
             anime = client.get_anime(media_id)
@@ -543,62 +603,121 @@ def _run_anilist_action(args: argparse.Namespace, config: AppConfig) -> int:
             updated_payload = update_tracking_media(args.tracking_file, anime)
             title = anime.titles[0] if anime.titles else str(media_id)
             print(f"ANILIST_ID:{media_id}")
-            print("OSD:" + _osd(
-                config,
-                f"AniList match corrected: {title} (id={media_id})",
-                f"AniList исправлен: {title} (id={media_id})",
-            ))
+            print("OSD:" + t("osd.anilistCorrected", lang=lang, title=title, id=media_id))
             if updated_payload.episode > (anime.episodes or updated_payload.episode):
-                print("OSD:" + _osd(
-                    config,
-                    "Warning: episode number exceeds the AniList episode count",
-                    "Предупреждение: номер серии больше числа серий AniList",
-                ))
+                print("OSD:" + t("osd.episodeExceedsAnilistCount", lang=lang))
             return 0
 
+        episode_end = getattr(payload, "episode_end", None)
+        part_boundary = getattr(payload, "part_boundary", None)
+        double = episode_end is not None and episode_end == payload.episode + 1
+        part_one = double and int(getattr(args, "part", 0) or 0) == 1
+        target_episode = episode_end if double and not part_one else payload.episode
+        part_key = f"double_episode_part_one:{Path(payload.video).expanduser()}"
         if not args.manual and config.playback.enabled:
             evidence = Database(config.library.database_path).playback_evidence(Path(payload.video))
             duration = float(evidence.get("duration") or 0.0)
             active = float(evidence.get("active_seconds") or 0.0)
             required = max(180.0, duration * 0.65) if duration > 0 else 300.0
+            if double and duration > 0:
+                boundary = part_boundary if part_boundary and 0 < part_boundary < duration else duration / 2
+                if part_one:
+                    required = max(180.0, boundary * 0.65)
+                else:
+                    # The second episode needs 65 % of its own half on top of
+                    # what was already counted for the first one (audit 17А).
+                    database = Database(config.library.database_path)
+                    counted = database.get_state(part_key, "")
+                    anime_row = database.get_anime(payload.media_id)
+                    second_half = max(180.0, (duration - boundary) * 0.65)
+                    if counted:
+                        required = float(counted) + second_half
+                    elif anime_row is not None and int(anime_row.progress or 0) >= payload.episode:
+                        required = second_half
             if active + 0.5 < required:
                 print("ANILIST_DEFERRED:1")
-                print("OSD:" + _osd(
-                    config,
-                    (
-                        "AniList: not counted — actually watched "
-                        f"{active / 60:.1f} min of the required {required / 60:.1f} min"
-                    ),
-                    (
-                        "AniList: серия не засчитана — реально просмотрено "
-                        f"{active / 60:.1f} мин из необходимых {required / 60:.1f}"
-                    ),
-                ))
+                print(
+                    "OSD:"
+                    + t(
+                        "osd.anilistNotCounted",
+                        lang=lang,
+                        active=f"{active / 60:.1f}",
+                        required=f"{required / 60:.1f}",
+                    )
+                )
                 return 3
 
-        result = client.update_progress(
-            payload.media_id,
-            payload.episode,
-            payload.total_episodes,
-            add_if_missing=config.anilist.add_if_missing,
-            update_when_rewatching=config.anilist.update_when_rewatching,
-            completed_to_rewatching_on_episode_one=(
-                config.anilist.completed_to_rewatching_on_episode_one
-            ),
-            complete_current_final=config.anilist.complete_current_final,
-            complete_rewatching_final=config.anilist.complete_rewatching_final,
-        )
-        reason = str(result.get("reason") or "")
-        counted_locally = bool(result.get("updated")) or reason == "already_at_or_above"
-        if counted_locally:
+        # Queued before AniList is asked: if the request fails, or mpv closes
+        # and kills this helper, the next list refresh still counts the episode.
+        pending_db: Database | None = None
+        try:
+            pending_db = Database(config.library.database_path)
+            queue_pending_progress(
+                pending_db,
+                media_id=payload.media_id,
+                episode=target_episode,
+                total_episodes=payload.total_episodes,
+                video=payload.video,
+                part_one=part_one,
+            )
+        except Exception as pending_exc:  # noqa: BLE001 - the update itself still runs
+            pending_db = None
+            print(f"AniList pending queue warning: {pending_exc}", file=sys.stderr)
+        try:
+            result = client.update_progress(
+                payload.media_id,
+                target_episode,
+                payload.total_episodes,
+                add_if_missing=config.anilist.add_if_missing,
+                update_when_rewatching=config.anilist.update_when_rewatching,
+                completed_to_rewatching_on_episode_one=(
+                    config.anilist.completed_to_rewatching_on_episode_one
+                ),
+                complete_current_final=config.anilist.complete_current_final,
+                complete_rewatching_final=config.anilist.complete_rewatching_final,
+            )
+        except AniListError as exc:
+            _log_anilist_progress(payload.media_id, target_episode, "queued", error=str(exc))
+            if pending_db is None:
+                raise
+            print("OSD:" + t("osd.anilistQueued", lang=lang, error=message(str(exc), lang)))
+            print(str(exc), file=sys.stderr)
+            return 0
+        if pending_db is not None:
             try:
-                scheduled = Database(config.library.database_path).schedule_cleanup(
+                clear_pending_progress(pending_db, payload.media_id, target_episode)
+            except Exception as pending_exc:  # noqa: BLE001
+                print(f"AniList pending queue warning: {pending_exc}", file=sys.stderr)
+        reason = str(result.get("reason") or "")
+        _log_anilist_progress(
+            payload.media_id,
+            target_episode,
+            reason or ("updated" if result.get("updated") else "unchanged"),
+            progress=result.get("progress"),
+        )
+        counted_locally = bool(result.get("updated")) or reason == "already_at_or_above"
+        if counted_locally and part_one:
+            # Episode one of a two-episode file: progress only; the file stays
+            # until episode two is watched.
+            try:
+                database = Database(config.library.database_path)
+                database.raise_anime_progress(payload.media_id, payload.episode)
+                evidence = database.playback_evidence(Path(payload.video))
+                database.set_state(part_key, f"{float(evidence.get('active_seconds') or 0.0):.1f}")
+            except Exception as part_exc:  # noqa: BLE001 - AniList is already updated
+                print(f"AniList part progress warning: {part_exc}", file=sys.stderr)
+        elif counted_locally:
+            try:
+                cleanup_db = Database(config.library.database_path)
+                scheduled = cleanup_db.schedule_cleanup(
                     Path(payload.video),
                     config.agent.delete_after_watched_hours,
                     list_status=str(result.get("status") or ""),
                     media_id=payload.media_id,
-                    episode=payload.episode,
+                    episode=target_episode,
                 )
+                if double:
+                    cleanup_db.delete_state(part_key)
                 if not scheduled:
                     print(
                         "AniList cleanup queue warning: local episode row was not found",
@@ -607,49 +726,23 @@ def _run_anilist_action(args: argparse.Namespace, config: AppConfig) -> int:
             except Exception as cleanup_exc:
                 print(f"AniList cleanup queue warning: {cleanup_exc}", file=sys.stderr)
 
-        if result.get("updated"):
-            print("OSD:" + _osd(
-                config,
-                "Entry counted",
-                "Серия засчитана",
-            ))
+        if result.get("updated") and double:
+            print("OSD:" + t("status.episodeCounted", lang=lang, episode=target_episode))
+        elif result.get("updated"):
+            print("OSD:" + t("osd.entryCounted", lang=lang))
         elif reason == "already_at_or_above":
-            print("OSD:" + _osd(
-                config,
-                f"AniList: progress is already {result.get('progress')}",
-                f"AniList: прогресс уже {result.get('progress')}",
-            ))
+            print("OSD:" + t("osd.anilistProgressAlready", lang=lang, progress=str(result.get("progress"))))
         elif reason == "not_on_list":
-            print("OSD:" + _osd(
-                config,
-                "AniList: title is not on your list; automatic adding is disabled",
-                "AniList: аниме не в списке; автодобавление отключено",
-            ))
+            print("OSD:" + t("osd.anilistNotOnList", lang=lang))
         elif reason == "rewatching_disabled":
-            print("OSD:" + _osd(
-                config,
-                "AniList: rewatch progress updates are disabled",
-                "AniList: обновление повторного просмотра отключено",
-            ))
+            print("OSD:" + t("osd.anilistRewatchDisabled", lang=lang))
         elif reason == "status_not_modifiable":
-            print("OSD:" + _osd(
-                config,
-                f"AniList: status {result.get('status') or '-'} was not changed",
-                f"AniList: статус {result.get('status') or '-'} не изменён",
-            ))
+            print("OSD:" + t("osd.anilistStatusUnchanged", lang=lang, status=result.get("status") or "-"))
         else:
-            print("OSD:" + _osd(
-                config,
-                "AniList: no update is needed",
-                "AniList: обновление не требуется",
-            ))
+            print("OSD:" + t("osd.anilistNoUpdateNeeded", lang=lang))
         return 0
     except (AniListError, ValueError) as exc:
-        print("OSD:" + _osd(
-            config,
-            f"AniList error: {exc}",
-            f"AniList: ошибка: {exc}",
-        ))
+        print("OSD:" + t("osd.anilistError", lang=lang, error=message(str(exc), lang)))
         print(str(exc), file=sys.stderr)
         return 1
     finally:
@@ -662,7 +755,7 @@ def _correct_anilist_mapping(
     config: AppConfig,
 ) -> int:
     if not config.anilist.access_token:
-        print("Ошибка: для проверки AniList ID нужен access token", file=sys.stderr)
+        print(t("cli.anilistCorrectNeedsToken"), file=sys.stderr)
         return 1
     video = video.expanduser().resolve()
     identity = parse_anime_filename(video.name)
@@ -678,13 +771,14 @@ def _correct_anilist_mapping(
             ttl_hours=config.anilist.mapping_cache_hours,
         )
     except (AniListError, ValueError) as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
+        print(t("error.generic", error=message(str(exc))), file=sys.stderr)
         return 1
     finally:
         client.close()
     title = anime.titles[0] if anime.titles else str(anime.id)
-    print(f"AniList-сопоставление сохранено: {title} (id={anime.id})")
+    print(t("cli.anilistMappingSaved", title=title, id=anime.id))
     return 0
+
 
 def _cached_relative_tracking_episode(
     anime: AniListAnime, absolute_episode: int, config: AppConfig
@@ -696,6 +790,7 @@ def _cached_relative_tracking_episode(
         None,
         allow_network=False,
     )
+
 
 def _tracking_episode_from_hint(
     anime: AniListAnime, episode_hint: int, config: AppConfig, logger
@@ -723,7 +818,9 @@ def _tracking_episode_from_hint(
     if relative is not None:
         logger.info(
             "RESULT step=anilist.tracking_episode media_id=%s absolute=%s relative=%s source=cache",
-            anime.id, episode_hint, relative,
+            anime.id,
+            episode_hint,
+            relative,
         )
         return anime, relative
 
@@ -733,7 +830,9 @@ def _tracking_episode_from_hint(
     except (AniListError, OSError, ValueError) as exc:
         logger.info(
             "SKIP step=anilist.tracking_episode media_id=%s absolute=%s reason=%r",
-            anime.id, episode_hint, exc,
+            anime.id,
+            episode_hint,
+            exc,
         )
         return None
     finally:
@@ -745,7 +844,10 @@ def _tracking_episode_from_hint(
         return None
     logger.info(
         "RESULT step=anilist.tracking_episode media_id=%s target_media_id=%s absolute=%s relative=%s source=anilist",
-        anime.id, target.id, episode_hint, relative,
+        anime.id,
+        target.id,
+        episode_hint,
+        relative,
     )
     return target, int(relative)
 
@@ -797,6 +899,7 @@ def _cached_relation_graph_episode_offset(
         return None
     return int(result.offset) if result.offset else None
 
+
 def _jimaku_episode_aliases(
     anime: AniListAnime | None,
     requested_episode: int | None,
@@ -830,6 +933,7 @@ def _jimaku_episode_aliases(
         allow_network=True,
     )
 
+
 def _authoritative_online_identity(
     identity: VideoIdentity,
     episode_hint: int | None,
@@ -853,7 +957,7 @@ def _find_online_subtitles(
     skip_airing_lookup: bool = False,
 ) -> list[SubtitleCandidate]:
     if not config.jimaku.api_key:
-        print("Jimaku: API key не задан, интернет-поиск пропущен")
+        print(t("cli.jimakuKeyMissing"))
         return []
 
     logger = configure_logging()
@@ -871,9 +975,7 @@ def _find_online_subtitles(
         logger,
     )
     jimaku_identity = (
-        replace(identity, episode=None)
-        if is_movie and identity.episode is not None
-        else identity
+        replace(identity, episode=None) if is_movie and identity.episode is not None else identity
     )
     airing_identity = identity
     if (
@@ -896,8 +998,13 @@ def _find_online_subtitles(
     logger.info(
         "START step=jimaku.lookup video=%s title=%r episode=%s requested_episode=%s "
         "media_format=%s anilist_id=%s expected_airing_at=%s",
-        video.name, identity.title, identity.episode, requested_episode,
-        anime.format if anime else None, anime.id if anime else None, expected_airing_at,
+        video.name,
+        identity.title,
+        identity.episode,
+        requested_episode,
+        anime.format if anime else None,
+        anime.id if anime else None,
+        expected_airing_at,
     )
 
     jimaku = JimakuClient(
@@ -908,9 +1015,7 @@ def _find_online_subtitles(
     try:
         entries_by_id = jimaku.search_entries(anilist_id=anime.id) if anime else []
         exact_id_entries = [
-            entry
-            for entry in entries_by_id
-            if anime is not None and entry.anilist_id == anime.id
+            entry for entry in entries_by_id if anime is not None and entry.anilist_id == anime.id
         ]
 
         def identity_exact_entry(entry: JimakuEntry) -> bool:
@@ -929,8 +1034,7 @@ def _find_online_subtitles(
             and any(entry.anilist_id == anime.id for entry in exact_id_entries)
         )
         id_matches_identity = (
-            any(identity_exact_entry(entry) for entry in exact_id_entries)
-            or explicit_season_exact_id
+            any(identity_exact_entry(entry) for entry in exact_id_entries) or explicit_season_exact_id
         )
         if explicit_season_exact_id and exact_id_entries:
             logger.info(
@@ -941,11 +1045,19 @@ def _find_online_subtitles(
                 anime.id if anime else None,
                 [(entry.id, entry.anilist_id, entry.name) for entry in exact_id_entries],
             )
+        # A one-episode work only. ONA/OVA/TV_SHORT seasons with several
+        # episodes (Tensei Shitara Ken Deshita 2nd Season is a 12-episode ONA)
+        # are ordinary numbered series: their prequel's Jimaku entry must not
+        # pass as a "single special" and supply S01E02 for S02E02.
         single_work = bool(
             anime is not None
             and (
                 anime.episodes == 1
-                or (anime.format or "").upper() in {"OVA", "ONA", "SPECIAL", "TV_SHORT"}
+                or (
+                    anime.episodes is None
+                    and requested_episode in {None, 1}
+                    and (anime.format or "").upper() in {"OVA", "ONA", "SPECIAL", "TV_SHORT"}
+                )
             )
         )
 
@@ -956,8 +1068,7 @@ def _find_online_subtitles(
             # are the season boundary: a generic franchise title such as Re:Zero
             # must not let S01E12 satisfy S04E12/absolute episode 78.
             return bool(
-                identity_exact_entry(entry)
-                and (requested_episode is None or is_movie or single_work)
+                identity_exact_entry(entry) and (requested_episode is None or is_movie or single_work)
             )
 
         entries_by_name = []
@@ -985,9 +1096,7 @@ def _find_online_subtitles(
                 len(exact_id_entries),
             )
         deduplicated = {entry.id: entry for entry in [*entries_by_id, *entries_by_name]}
-        identity_exact_entries = [
-            entry for entry in deduplicated.values() if identity_exact_entry(entry)
-        ]
+        identity_exact_entries = [entry for entry in deduplicated.values() if identity_exact_entry(entry)]
         if (
             any(identity_title_overrides_anilist_conflict(entry) for entry in identity_exact_entries)
             and exact_id_entries
@@ -999,14 +1108,13 @@ def _find_online_subtitles(
             # over the conflicting ID result, without any per-anime hardcode.
             conflicting_ids = {entry.id for entry in exact_id_entries}
             deduplicated = {
-                entry_id: entry
-                for entry_id, entry in deduplicated.items()
-                if entry_id not in conflicting_ids
+                entry_id: entry for entry_id, entry in deduplicated.items() if entry_id not in conflicting_ids
             }
             logger.info(
                 "OVERRIDE step=jimaku.entries video=%s reason=exact_identity_title_over_conflicting_anilist "
                 "requested_anilist_id=%s removed_entries=%s exact_entries=%s",
-                video.name, anime.id if anime else None,
+                video.name,
+                anime.id if anime else None,
                 sorted(conflicting_ids),
                 [(entry.id, entry.anilist_id, entry.name) for entry in identity_exact_entries],
             )
@@ -1031,31 +1139,27 @@ def _find_online_subtitles(
         pinned_entries = [
             entry
             for entry in ranked_entries
-            if (
-                anime is not None
-                and entry.anilist_id is not None
-                and int(entry.anilist_id) == int(anime.id)
-            )
+            if (anime is not None and entry.anilist_id is not None and int(entry.anilist_id) == int(anime.id))
             or authoritative_title_entry(entry)
         ]
-        entries = list(
-            {
-                entry.id: entry
-                for entry in [*pinned_entries, *ranked_entries]
-            }.values()
-        )
+        entries = list({entry.id: entry for entry in [*pinned_entries, *ranked_entries]}.values())
         entry_limit = max(4, len(pinned_entries))
         logger.info(
             "RESULT step=jimaku.entries video=%s by_id=%s by_name=%s deduplicated=%s ranked=%s pinned=%s limit=%s "
             "id_entries=%s name_entries=%s",
-            video.name, len(entries_by_id), len(entries_by_name), len(deduplicated), len(entries),
-            [(entry.id, entry.anilist_id, entry.name) for entry in pinned_entries], entry_limit,
+            video.name,
+            len(entries_by_id),
+            len(entries_by_name),
+            len(deduplicated),
+            len(entries),
+            [(entry.id, entry.anilist_id, entry.name) for entry in pinned_entries],
+            entry_limit,
             [(entry.id, entry.anilist_id, entry.name) for entry in entries_by_id],
             [(entry.id, entry.anilist_id, entry.name) for entry in entries_by_name],
         )
         if not entries:
             logger.info("REJECT step=jimaku.lookup video=%s reason=no_entries", video.name)
-            print("Jimaku: подходящее аниме не найдено")
+            print(t("cli.jimakuNoAnime"))
             return []
 
         candidates: list[SubtitleCandidate] = []
@@ -1064,12 +1168,14 @@ def _find_online_subtitles(
         for entry in entries[:entry_limit]:
             logger.info(
                 "CANDIDATE step=jimaku.entry video=%s entry_id=%s anilist_id=%s name=%r",
-                video.name, entry.id, entry.anilist_id, entry.name,
+                video.name,
+                entry.id,
+                entry.anilist_id,
+                entry.name,
             )
-            if (
-                _jimaku_entry_anilist_conflicts(entry, anime)
-                and not identity_title_overrides_anilist_conflict(entry)
-            ):
+            if _jimaku_entry_anilist_conflicts(
+                entry, anime
+            ) and not identity_title_overrides_anilist_conflict(entry):
                 logger.info(
                     "REJECT step=jimaku.entry video=%s entry_id=%s reason=explicit_anilist_mismatch "
                     "entry_anilist_id=%s requested_anilist_id=%s name=%r",
@@ -1106,27 +1212,33 @@ def _find_online_subtitles(
             for item in files:
                 logger.info(
                     "CANDIDATE step=jimaku.file video=%s entry_id=%s score=%.1f min_score=%.1f parsed_episode=%s episode_match=%s title_similarity=%s overlap=%s format_bonus=%s airing_sanity=%s name=%r",
-                    video.name, entry.id, item.score, config.matching.jimaku_min_score,
-                    item.details.get("parsed_episode"), item.details.get("episode_match"),
-                    item.details.get("title_similarity"), item.details.get("release_token_overlap"),
-                    item.details.get("format_bonus"), item.details.get("airing_sanity"), item.name,
+                    video.name,
+                    entry.id,
+                    item.score,
+                    config.matching.jimaku_min_score,
+                    item.details.get("parsed_episode"),
+                    item.details.get("episode_match"),
+                    item.details.get("title_similarity"),
+                    item.details.get("release_token_overlap"),
+                    item.details.get("format_bonus"),
+                    item.details.get("airing_sanity"),
+                    item.name,
                 )
                 if str(item.details.get("airing_sanity", "")).startswith("before_airing") and verbose:
-                    print(
-                        f"    Jimaku penalty: {item.name} загружен раньше выхода "
-                        f"серии на AniList"
-                    )
+                    print(f"    Jimaku penalty: {item.name} was uploaded before the episode aired on AniList")
                 hard_reject_reason = str(item.details.get("hard_reject_reason") or "").strip()
                 if hard_reject_reason:
                     logger.info(
                         "REJECT step=jimaku.file video=%s entry_id=%s reason=%s score=%.1f name=%r",
-                        video.name, entry.id, hard_reject_reason, item.score, item.name,
+                        video.name,
+                        entry.id,
+                        hard_reject_reason,
+                        item.score,
+                        item.name,
                     )
                     continue
                 exact_anilist_entry = bool(
-                    anime is not None
-                    and entry.anilist_id is not None
-                    and entry.anilist_id == anime.id
+                    anime is not None and entry.anilist_id is not None and entry.anilist_id == anime.id
                 )
                 reference_names = [identity.title]
                 if anime is not None:
@@ -1145,20 +1257,16 @@ def _find_online_subtitles(
                     if normalize_title(left) and normalize_title(right)
                 )
                 exact_single_work = bool(single_work and exact_title_entry)
-                exact_episodeless_title_entry = bool(
-                    requested_episode is None and identity_exact_title_entry
-                )
+                exact_episodeless_title_entry = bool(requested_episode is None and identity_exact_title_entry)
                 exact_work_entry = bool(
                     exact_anilist_entry or exact_single_work or exact_episodeless_title_entry
                 )
                 if (
-                    (single_work and exact_work_entry and requested_episode in {None, 1})
-                    or exact_episodeless_title_entry
-                ):
+                    single_work and exact_work_entry and requested_episode in {None, 1}
+                ) or exact_episodeless_title_entry:
                     item.details["episode_match"] = "exact"
                 exact_anilist_episode = bool(
-                    exact_work_entry
-                    and item.details.get("episode_match") in {"exact", "absolute", "range"}
+                    exact_work_entry and item.details.get("episode_match") in {"exact", "absolute", "range"}
                 )
                 exact_anilist_movie = bool(exact_anilist_entry and is_movie)
                 # An exact AniList-linked one-episode special is strong enough
@@ -1171,10 +1279,18 @@ def _find_online_subtitles(
                     "DECISION step=jimaku.match video=%s entry_id=%s exact_anilist=%s "
                     "exact_title=%s identity_exact_title=%s single_work=%s exact_work=%s "
                     "single_special=%s requested_episode=%s parsed_episode=%s episode_match=%s score=%.1f",
-                    video.name, entry.id, exact_anilist_entry, exact_title_entry,
-                    identity_exact_title_entry, single_work, exact_work_entry, exact_single_special,
-                    requested_episode, item.details.get("parsed_episode"),
-                    item.details.get("episode_match"), item.score,
+                    video.name,
+                    entry.id,
+                    exact_anilist_entry,
+                    exact_title_entry,
+                    identity_exact_title_entry,
+                    single_work,
+                    exact_work_entry,
+                    exact_single_special,
+                    requested_episode,
+                    item.details.get("parsed_episode"),
+                    item.details.get("episode_match"),
+                    item.score,
                 )
                 if (
                     item.score < config.matching.jimaku_min_score
@@ -1184,13 +1300,21 @@ def _find_online_subtitles(
                 ):
                     logger.info(
                         "REJECT step=jimaku.file video=%s entry_id=%s reason=score_below_threshold score=%.1f min_score=%.1f name=%r",
-                        video.name, entry.id, item.score, config.matching.jimaku_min_score, item.name,
+                        video.name,
+                        entry.id,
+                        item.score,
+                        config.matching.jimaku_min_score,
+                        item.name,
                     )
                     continue
                 if item.score < config.matching.jimaku_min_score and exact_anilist_episode:
                     logger.info(
                         "OVERRIDE step=jimaku.file video=%s entry_id=%s reason=exact_anilist_episode score=%.1f min_score=%.1f name=%r",
-                        video.name, entry.id, item.score, config.matching.jimaku_min_score, item.name,
+                        video.name,
+                        entry.id,
+                        item.score,
+                        config.matching.jimaku_min_score,
+                        item.name,
                     )
                 if item.score < config.matching.jimaku_min_score and exact_anilist_movie:
                     original_score = item.score
@@ -1203,8 +1327,12 @@ def _find_online_subtitles(
                     logger.info(
                         "OVERRIDE step=jimaku.file video=%s entry_id=%s reason=exact_anilist_movie "
                         "score=%.1f promoted_score=%.1f min_score=%.1f name=%r",
-                        video.name, entry.id, original_score, item.score,
-                        config.matching.jimaku_min_score, item.name,
+                        video.name,
+                        entry.id,
+                        original_score,
+                        item.score,
+                        config.matching.jimaku_min_score,
+                        item.name,
                     )
                 if item.score < config.matching.jimaku_min_score and exact_single_special:
                     original_score = item.score
@@ -1214,13 +1342,19 @@ def _find_online_subtitles(
                     logger.info(
                         "OVERRIDE step=jimaku.file video=%s entry_id=%s reason=exact_single_special_title "
                         "score=%.1f promoted_score=%.1f min_score=%.1f name=%r",
-                        video.name, entry.id, original_score, item.score,
-                        config.matching.jimaku_min_score, item.name,
+                        video.name,
+                        entry.id,
+                        original_score,
+                        item.score,
+                        config.matching.jimaku_min_score,
+                        item.name,
                     )
                 if item.url in seen_urls:
                     logger.info(
                         "REJECT step=jimaku.file video=%s entry_id=%s reason=duplicate_url name=%r",
-                        video.name, entry.id, item.name,
+                        video.name,
+                        entry.id,
+                        item.name,
                     )
                     continue
                 seen_urls.add(item.url)
@@ -1239,7 +1373,9 @@ def _find_online_subtitles(
                 if not materialized:
                     logger.info(
                         "REJECT step=jimaku.file video=%s entry_id=%s reason=no_japanese_or_extract_failed name=%r",
-                        video.name, entry.id, item.name,
+                        video.name,
+                        entry.id,
+                        item.name,
                     )
                 for candidate in materialized:
                     candidate.details.update(
@@ -1264,8 +1400,12 @@ def _find_online_subtitles(
                     candidates.append(candidate)
                     logger.info(
                         "ACCEPT step=jimaku.candidate video=%s entry_id=%s score=%.1f episode=%s name=%r path=%r",
-                        video.name, entry.id, candidate.score, candidate.episode,
-                        candidate.name, str(candidate.path),
+                        video.name,
+                        entry.id,
+                        candidate.score,
+                        candidate.episode,
+                        candidate.name,
+                        str(candidate.path),
                     )
                     if not config.matching.evaluate_all_jimaku:
                         print(f"Jimaku entry: {entry.name} (id={entry.id})")
@@ -1280,13 +1420,25 @@ def _find_online_subtitles(
         candidates.sort(key=lambda item: item.score, reverse=True)
         if not candidates:
             logger.info("REJECT step=jimaku.lookup video=%s reason=no_accepted_candidates", video.name)
-            print("Jimaku: файл нужной серии не найден с достаточной уверенностью")
+            print(t("cli.jimakuNoConfidentFile"))
         else:
             logger.info(
                 "RESULT step=jimaku.lookup video=%s accepted=%s best_score=%.1f best_name=%r",
-                video.name, len(candidates), candidates[0].score, candidates[0].name,
+                video.name,
+                len(candidates),
+                candidates[0].score,
+                candidates[0].name,
             )
         return candidates
+    except JimakuKeyRejected as exc:
+        # Jimaku refuses the key itself (an ended shared key, a revoked or mistyped personal
+        # one): nothing can come from Jimaku now. Local and embedded subtitles still count;
+        # the window explains it and offers to set a personal key.
+        logger.warning(
+            "SKIP step=jimaku.lookup video=%s reason=key_rejected status=%s", video.name, exc.status_code
+        )
+        print(t("cli.jimakuKeyRejected"))
+        return []
     finally:
         jimaku.close()
 
@@ -1294,12 +1446,12 @@ def _find_online_subtitles(
 def _validate_explicit_subtitle(path: Path) -> Path:
     path = path.expanduser().resolve()
     if not path.is_file():
-        raise RuntimeError(f"Файл субтитров не найден: {path}")
+        raise RuntimeError(err("cli.subtitleFileNotFound", path=path))
     suffix = path.suffix.casefold()
     if suffix in TEXT_SUBTITLE_EXTENSIONS and not is_japanese_subtitle(path):
-        print("Предупреждение: явно заданные субтитры не распознаны как японские")
+        print(t("cli.explicitSubtitleNotJapanese"))
     elif suffix not in TEXT_SUBTITLE_EXTENSIONS | IMAGE_SUBTITLE_EXTENSIONS:
-        print("Предупреждение: необычный формат субтитров; решение оставлено mpv")
+        print(t("cli.unusualSubtitleFormat"))
     return path
 
 
@@ -1311,7 +1463,7 @@ def _print_sync_result(path: Path, result: dict[str, object]) -> None:
     if score is not None:
         suffix += f", score={score}"
     if reason == "cached":
-        print(f"Синхронизация: использую кэшированный файл {path}{suffix}")
+        print(t("cli.syncCached", path=path, details=suffix))
     elif reason == "applied":
         offset = result.get("offset_seconds")
         scale = result.get("framerate_scale_factor")
@@ -1321,7 +1473,7 @@ def _print_sync_result(path: Path, result: dict[str, object]) -> None:
         if scale is not None:
             timing_parts.append(f"scale={scale}")
         timing = (", ".join(timing_parts) + ", ") if timing_parts else ""
-        print(f"Синхронизация применена: {timing}{suffix.lstrip(', ')}")
+        print(t("cli.syncApplied", details=f"{timing}{suffix.lstrip(', ')}"))
         diagnostics = result.get("segment_diagnostics")
         if (
             isinstance(diagnostics, dict)
@@ -1330,88 +1482,89 @@ def _print_sync_result(path: Path, result: dict[str, object]) -> None:
         ):
             offsets = []
             for item in diagnostics.get("segments", []):
-                if (
-                    isinstance(item, dict)
-                    and item.get("successful")
-                    and not item.get("boundary_hit")
-                ):
+                if isinstance(item, dict) and item.get("successful") and not item.get("boundary_hit"):
                     offsets.append(f"{item.get('label')}={item.get('offset_seconds')}s")
             if offsets:
-                print("Локальная проверка: " + ", ".join(offsets))
+                print(t("cli.syncLocalCheck", offsets=", ".join(offsets)))
         elif isinstance(diagnostics, dict) and diagnostics.get("available"):
             print(
-                "Локальная проверка проигнорирована как ненадёжная: "
-                f"{diagnostics.get('quality_reason', 'неоднозначная корреляция')}"
+                t(
+                    "cli.syncLocalCheckIgnored",
+                    reason=diagnostics.get("quality_reason", t("cli.ambiguousCorrelation")),
+                )
             )
     elif reason == "quality_offset_exceeded":
         print(
-            "Синхронизация отклонена: найденный offset "
-            f"{result.get('offset_seconds')}s превышает безопасный порог "
-            f"{result.get('quality_max_offset_seconds')}s"
+            t(
+                "cli.syncOffsetRejected",
+                offset=str(result.get("offset_seconds")),
+                limit=str(result.get("quality_max_offset_seconds")),
+            )
         )
     elif reason == "ffsubsync_missing":
-        print("Синхронизация пропущена: ffsubsync не установлен")
+        print(t("cli.syncFfsubsyncMissing"))
     elif reason == "alass_missing":
-        print("ALASS не установлен; использую результат ffsubsync")
+        print(t("cli.alassMissing"))
     elif reason == "unsupported_format":
-        print("Синхронизация пропущена: формат не поддерживается")
+        print(t("cli.syncUnsupportedFormat"))
     elif reason == "disabled":
-        print("Синхронизация отключена в настройках")
+        print(t("cli.syncDisabled"))
     else:
         detail = f": {result.get('error')}" if result.get("error") else ""
-        print(f"Синхронизация не выполнена ({reason}){detail}")
+        print(t("cli.syncNotDone", reason=reason, detail=detail))
 
     runs = result.get("final_timing_runs")
     if isinstance(runs, list) and runs:
-        print("Итоговые участки тайминга: " + json.dumps(runs, ensure_ascii=False))
+        print("Final timing runs: " + json.dumps(runs, ensure_ascii=False))
     embedded_failure = result.get("embedded_reference_failure_reason")
     if embedded_failure:
         detail = result.get("embedded_reference_failure_error")
         suffix = f": {detail}" if detail else ""
-        print(
-            "Английский эталон был принят LLM, но прямой ALASS не сработал "
-            f"({embedded_failure}){suffix}"
-        )
+        print(t("cli.englishReferenceAlassFailed", reason=embedded_failure, detail=suffix))
 
     validation = result.get("timing_reference_validation")
     if isinstance(validation, dict):
-        state = "принят" if validation.get("accepted") else "отклонён"
+        state = "accepted" if validation.get("accepted") else "rejected"
         print(
-            "LLM-проверка английского эталона: "
+            "LLM check of the English reference: "
             f"{state}, similarity={validation.get('similarity', '-')}, "
-            f"совпало {validation.get('matched_samples', '-')}/"
-            f"{validation.get('total_samples', '-')} групп, "
+            f"matched {validation.get('matched_samples', '-')}/"
+            f"{validation.get('total_samples', '-')} groups, "
             f"reason={validation.get('reason', '-')}"
         )
     if result.get("selection_reason") == "embedded_timing_reference":
         print(
-            "Тайминг выровнен по встроенной субтитровой дорожке: "
-            f"{result.get('timing_reference_language') or '-'} / "
-            f"{result.get('timing_reference_title') or '-'}"
+            t(
+                "cli.alignedToEmbeddedTrack",
+                language=result.get("timing_reference_language") or "-",
+                title=result.get("timing_reference_title") or "-",
+            )
         )
     elif result.get("selection_reason") == "pgs_onset_reference":
         before = result.get("onset_before")
         after = result.get("onset_after")
         print(
-            "SUP выровнен по появлениям картинок и встроенной дорожке: "
-            f"{result.get('timing_reference_language') or '-'} / "
-            f"{result.get('timing_reference_title') or '-'}"
+            t(
+                "cli.supAlignedToEmbeddedTrack",
+                language=result.get("timing_reference_language") or "-",
+                title=result.get("timing_reference_title") or "-",
+            )
         )
         if isinstance(before, dict) and isinstance(after, dict):
             print(
-                "Совпадение начал реплик: "
+                "Cue start match: "
                 f"{before.get('coverage', '-')}→{after.get('coverage', '-')}, "
-                f"совпало {after.get('matched', '-')}/"
+                f"matched {after.get('matched', '-')}/"
                 f"{min(int(after.get('candidate_count', 0)), int(after.get('reference_count', 0)))}"
             )
         baseline_activity = result.get("baseline_reference_activity")
         reference_activity = result.get("reference_activity")
         if isinstance(baseline_activity, dict) and isinstance(reference_activity, dict):
             print(
-                "Сравнение с эталоном: "
-                f"начало {baseline_activity.get('start', '-')}→{reference_activity.get('start', '-')}, "
-                f"середина {baseline_activity.get('middle', '-')}→{reference_activity.get('middle', '-')}, "
-                f"конец {baseline_activity.get('end', '-')}→{reference_activity.get('end', '-')}"
+                "Reference comparison: "
+                f"start {baseline_activity.get('start', '-')}→{reference_activity.get('start', '-')}, "
+                f"middle {baseline_activity.get('middle', '-')}→{reference_activity.get('middle', '-')}, "
+                f"end {baseline_activity.get('end', '-')}→{reference_activity.get('end', '-')}"
             )
 
 
@@ -1437,6 +1590,162 @@ def _sync_one(
     )
 
 
+def _double_episode_span_from_args(args: argparse.Namespace) -> tuple[int, int] | None:
+    first = getattr(args, "episode_hint", None)
+    last = getattr(args, "episode_end_hint", None)
+    if first is None or last is None or int(last) != int(first) + 1 or int(first) < 1:
+        return None
+    return int(first), int(last)
+
+
+def _double_episode_candidates(
+    video: Path,
+    identity: VideoIdentity,
+    episode: int,
+    args: argparse.Namespace,
+    config: AppConfig,
+    llm: OllamaClient | None,
+    anime: AniListAnime | None,
+) -> list[SubtitleCandidate]:
+    """Text subtitles for one episode of a two-episode file (local files named for it, Jimaku)."""
+    episode_identity = replace(identity, episode=int(episode))
+    local = [
+        candidate
+        for candidate in find_local_subtitles(
+            video=video,
+            identity=episode_identity,
+            subtitle_dirs=config.paths.subtitle_dirs,
+            cache_dir=config.paths.cache_dir,
+            max_files=config.paths.max_scanned_files,
+            prefer_srt=config.matching.prefer_srt,
+            verbose=args.verbose,
+        )
+        if candidate.score >= config.matching.local_min_score
+        and parse_anime_filename(candidate.path.name).episode == int(episode)
+    ]
+    online: list[SubtitleCandidate] = []
+    if not args.offline:
+        online = _find_online_subtitles(
+            video,
+            episode_identity,
+            config,
+            llm,
+            args.verbose,
+            anime_hint=anime,
+            skip_airing_lookup=args.skip_airing_lookup,
+        )
+    candidates, _duplicates = _deduplicate_subtitle_candidates(
+        [*local, *online],
+        config.paths.cache_dir,
+        ffmpeg_path=config.tools.ffmpeg,
+    )
+    return [
+        candidate for candidate in candidates if candidate.path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
+    ]
+
+
+def _prepare_double_episode_subtitles(
+    video: Path,
+    identity: VideoIdentity,
+    span: tuple[int, int],
+    args: argparse.Namespace,
+    config: AppConfig,
+    llm: OllamaClient | None,
+    anime: AniListAnime | None,
+    logger,
+):
+    """Align each episode of a two-episode file on its own half and join them (audit 17А).
+
+    Returns ``(subtitle, alignment, boundary)`` or an ``int`` exit code when
+    the candidate set is unchanged since the last failed attempt.
+    """
+    from .double_episode import cut_audio_part, prepare_double_episode, work_dir_for
+    from .syncing import _probe_duration
+
+    first, second = span
+    print(t("cli.doubleEpisodeSearching", first=first, second=second))
+    first_candidates = _double_episode_candidates(video, identity, first, args, config, llm, anime)
+    second_candidates = _double_episode_candidates(video, identity, second, args, config, llm, anime)
+    fingerprint = _subtitle_candidate_set_fingerprint([*first_candidates, *second_candidates])
+    print(f"SUBTITLE_CANDIDATE_FINGERPRINT={fingerprint}")
+    print(f"SUBTITLE_CANDIDATE_COUNT={len(first_candidates) + len(second_candidates)}")
+    from .subtitles.verification import unchanged_candidates_can_skip
+
+    previous = str(getattr(args, "previous_candidate_fingerprint", "") or "").strip()
+    if (
+        args.prepare_only
+        and unchanged_candidates_can_skip(
+            previous, fingerprint, getattr(args, "previous_candidate_outcome", "unknown")
+        )
+        and not args.force_search
+        and not args.resync
+    ):
+        print(t("cli.candidatesUnchanged"))
+        print("PREPARE_STATUS=waiting_unchanged_candidates")
+        return 4
+    logger.info(
+        "START step=double_episode.prepare video=%s episodes=%s-%s first_candidates=%s second_candidates=%s",
+        video.name,
+        first,
+        second,
+        len(first_candidates),
+        len(second_candidates),
+    )
+    if not config.sync.enabled or args.no_sync:
+        return None, {"reason": "double_episode_needs_sync"}, None
+
+    def align(part: Path, candidates: list[SubtitleCandidate]):
+        return optimize_candidates(
+            part,
+            candidates,
+            config.paths.cache_dir,
+            config.sync,
+            ffmpeg_path=config.tools.ffmpeg,
+            ffprobe_path=config.tools.ffprobe,
+            alass_path=config.tools.alass,
+            force=args.resync,
+            verbose=args.verbose,
+            prefer_srt=config.matching.prefer_srt,
+            srt_tolerance_ratio=config.matching.srt_alignment_tolerance_ratio,
+            srt_tolerance_absolute=config.matching.srt_alignment_tolerance_absolute,
+            llm=llm,
+            validate_embedded_reference_with_llm=config.llm.validate_embedded_reference,
+        )
+
+    def to_srt(path: Path) -> Path | None:
+        converted, _result = convert_to_plain_srt(
+            path,
+            config.paths.cache_dir,
+            ffmpeg_path=config.tools.ffmpeg,
+            force=False,
+            verbose=args.verbose,
+        )
+        return converted if converted.suffix.casefold() == ".srt" else None
+
+    try:
+        result = prepare_double_episode(
+            video,
+            first_candidates,
+            second_candidates,
+            duration=float(_probe_duration(video, config.tools.ffprobe) or 0.0),
+            work_dir=work_dir_for(video, config.paths.cache_dir),
+            cut=lambda source, start, end, output: cut_audio_part(
+                config.tools.ffmpeg, source, start, end, output
+            ),
+            align=align,
+            to_srt=to_srt,
+            logger=logger,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        logger.warning("FAIL step=double_episode.prepare video=%s error=%r", video.name, str(exc))
+        return None, {"reason": "double_episode_error", "error": str(exc)}, None
+    if result.subtitle is None:
+        print(t("cli.doubleEpisodeNotBuilt", reason=result.reason))
+        return None, {**result.alignment, "reason": result.reason}, None
+    print(t("cli.doubleEpisodeBuilt", path=result.subtitle, seconds=f"{result.boundary:.0f}"))
+    return result.subtitle, result.alignment, result.boundary
+
+
 def process_video(
     video: Path,
     args: argparse.Namespace,
@@ -1445,7 +1754,7 @@ def process_video(
 ) -> int:
     video = video.expanduser().resolve()
     if not video.is_file():
-        raise RuntimeError(f"Видео не найдено: {video}")
+        raise RuntimeError(err("cli.videoNotFound", path=video))
     logger = configure_logging()
     pipeline_timer = StageTimer(logger, video=video.name)
     reporter = SubtitleJobReporter.from_environment()
@@ -1455,7 +1764,7 @@ def process_video(
     if args.resync:
         invalidate_final_pipeline_result(video, config)
     if video.suffix.casefold() not in VIDEO_EXTENSIONS:
-        print(f"Предупреждение: расширение {video.suffix or '(нет)'} необычно, пробую открыть через mpv")
+        print(t("cli.unusualExtension", extension=video.suffix or t("cli.noExtension")))
 
     identity = parse_anime_filename(video.name)
     if llm is not None and (identity.episode is None or len(identity.title) < 4):
@@ -1480,44 +1789,41 @@ def process_video(
         tracking_anime = anime_hint
         tracking_mapping_key = mapping_key(video, identity)
         if args.episode_hint is not None:
-            resolved_hint = _tracking_episode_from_hint(
-                anime_hint, args.episode_hint, config, logger
-            )
+            resolved_hint = _tracking_episode_from_hint(anime_hint, args.episode_hint, config, logger)
             if resolved_hint is not None:
                 tracking_anime, tracking_episode = resolved_hint
             else:
                 tracking_episode = None
                 print(
-                    f"AniList: номер серии {args.episode_hint} не помещается в "
-                    f"entry из {anime_hint.episodes or '?'} серий; трекер отключён "
-                    "для защиты прогресса"
+                    tn(
+                        "cli.anilistEpisodeOutOfRange",
+                        anime_hint.episodes or "?",
+                        episode=args.episode_hint,
+                    )
                 )
         else:
             tracking_episode = _anilist_episode(identity, anime_hint)
         title = tracking_anime.titles[0] if tracking_anime.titles else str(tracking_anime.id)
-        print(
-            f"AniList: использую подготовленное сопоставление {title!r} "
-            f"(id={anime_hint.id})"
-        )
+        print(t("cli.anilistUsingPrepared", title=repr(title), id=anime_hint.id))
         if tracking_episode is not None:
             print(
-                f"AniList: после {config.anilist.watched_threshold * 100:.1f}% "
-                f"обновлю до серии {tracking_episode}"
+                t(
+                    "cli.anilistWillUpdate",
+                    percent=f"{config.anilist.watched_threshold * 100:.1f}",
+                    episode=tracking_episode,
+                )
             )
     elif args.offline:
-        print("AniList: отключён для этого запуска (--offline)")
+        print(t("cli.anilistOffline"))
     elif args.no_anilist_progress:
-        print("AniList: обновление прогресса отключено для этого запуска")
+        print(t("cli.anilistProgressDisabled"))
     elif not config.anilist.enabled:
-        print("AniList: интеграция отключена в настройках")
+        print(t("cli.anilistIntegrationDisabled"))
     elif not config.anilist.access_token:
-        print("AniList: access token не задан; трекер и горячие клавиши отключены")
+        print(t("cli.anilistTokenMissing"))
     else:
         if not config.anilist.auto_update_progress:
-            print(
-                "AniList: автоматическое засчитывание выключено; "
-                "загружаю ручные команды Ctrl+A / Ctrl+B / C"
-            )
+            print(t("cli.anilistAutoCountOff"))
 
         tracking_anime, tracking_mapping_key = _resolve_tracking_anilist(
             video, identity, config, llm, args.verbose
@@ -1530,44 +1836,38 @@ def process_video(
                 and tracking_anime.episodes is not None
                 and identity.episode > tracking_anime.episodes
             ):
-                local_aliases = _jimaku_episode_aliases(
-                    tracking_anime, identity.episode, config, logger
-                )
+                local_aliases = _jimaku_episode_aliases(tracking_anime, identity.episode, config, logger)
                 local_relative = next(
-                    (
-                        value
-                        for value in local_aliases
-                        if 1 <= value <= int(tracking_anime.episodes or 0)
-                    ),
+                    (value for value in local_aliases if 1 <= value <= int(tracking_anime.episodes or 0)),
                     None,
                 )
                 if local_relative is not None:
                     tracking_episode = int(local_relative)
-                    title = (
-                        tracking_anime.titles[0]
-                        if tracking_anime.titles
-                        else str(tracking_anime.id)
-                    )
+                    title = tracking_anime.titles[0] if tracking_anime.titles else str(tracking_anime.id)
                     print(
-                        f"AniList: абсолютная серия {identity.episode} → "
-                        f"{title!r}, серия {tracking_episode} "
-                        "(локальный кэш нумерации)"
+                        t(
+                            "cli.anilistAbsoluteLocal",
+                            absolute=identity.episode,
+                            title=repr(title),
+                            episode=tracking_episode,
+                        )
                     )
                 else:
                     print(
-                        f"AniList: абсолютная серия {identity.episode} больше "
-                        f"{tracking_anime.episodes}; ищу нужный cour по цепочке SEQUEL…"
+                        t(
+                            "cli.anilistAbsoluteSearching",
+                            absolute=identity.episode,
+                            episodes=tracking_anime.episodes,
+                        )
                     )
                     client = AniListClient(
                         config.anilist.endpoint,
                         access_token=config.anilist.access_token,
                     )
                     try:
-                        resolved = client.resolve_absolute_episode(
-                            tracking_anime, identity.episode
-                        )
+                        resolved = client.resolve_absolute_episode(tracking_anime, identity.episode)
                     except AniListError as exc:
-                        print(f"AniList: не удалось разобрать абсолютную нумерацию: {exc}")
+                        print(t("cli.anilistAbsoluteFailed", error=message(str(exc))))
                         resolved = None
                     finally:
                         client.close()
@@ -1575,52 +1875,41 @@ def process_video(
                     if resolved is not None:
                         tracking_anime, tracking_episode, chain = resolved
                         chain_text = " → ".join(
-                            (item.titles[0] if item.titles else str(item.id))
-                            for item in chain
+                            (item.titles[0] if item.titles else str(item.id)) for item in chain
                         )
                         target_title = (
-                            tracking_anime.titles[0]
-                            if tracking_anime.titles
-                            else str(tracking_anime.id)
+                            tracking_anime.titles[0] if tracking_anime.titles else str(tracking_anime.id)
                         )
                         print(
-                            f"AniList: абсолютная серия {identity.episode} → "
-                            f"{target_title!r}, серия {tracking_episode}"
+                            t(
+                                "cli.anilistAbsoluteResolved",
+                                absolute=identity.episode,
+                                title=repr(target_title),
+                                episode=tracking_episode,
+                            )
                         )
                         if args.verbose:
                             print(f"AniList cour chain: {chain_text}")
 
             if tracking_episode is None:
-                print(
-                    "AniList: не удалось определить запись/cour и относительный "
-                    "номер серии; трекер для этого запуска отключён"
-                )
+                print(t("cli.anilistNoEntry"))
             else:
-                title = (
-                    tracking_anime.titles[0]
-                    if tracking_anime.titles
-                    else str(tracking_anime.id)
-                )
+                title = tracking_anime.titles[0] if tracking_anime.titles else str(tracking_anime.id)
                 if tracking_auto:
                     percent = config.anilist.watched_threshold * 100
                     print(
-                        f"AniList: после {percent:.1f}% обновлю {title!r} "
-                        f"до серии {tracking_episode}"
+                        t(
+                            "cli.anilistWillUpdateTitle",
+                            percent=f"{percent:.1f}",
+                            title=repr(title),
+                            episode=tracking_episode,
+                        )
                     )
                 else:
-                    print(
-                        f"AniList: ручной режим для {title!r}, "
-                        f"серия {tracking_episode}"
-                    )
-                print(
-                    "AniList hotkeys: Ctrl+A — засчитать, "
-                    "Ctrl+B — открыть, C — исправить"
-                )
+                    print(t("cli.anilistManualFor", title=repr(title), episode=tracking_episode))
+                print(t("cli.anilistHotkeys"))
         else:
-            print(
-                "AniList: не удалось сопоставить файл с записью; "
-                "трекер для этого запуска отключён"
-            )
+            print(t("cli.anilistNoMatch"))
 
     pipeline_timer.mark("anilist_tracking")
 
@@ -1645,11 +1934,7 @@ def process_video(
         and not args.fast_play
         and not args.text_only
     )
-    cached_pipeline = (
-        load_final_pipeline_result(video, config)
-        if pipeline_cache_allowed
-        else None
-    )
+    cached_pipeline = load_final_pipeline_result(video, config) if pipeline_cache_allowed else None
 
     if cached_pipeline is not None:
         cached_subtitle = str(cached_pipeline.get("subtitle") or "").strip()
@@ -1660,7 +1945,7 @@ def process_video(
         pipeline_cache_hit = True
         selected_source = "pipeline_cache"
         generated_by_ocr = str(cached_pipeline.get("source") or "").casefold() == "ocr"
-        print(f"Готовый результат из кэша: {subtitle or f'встроенный sid={subtitle_id}'}")
+        print(t("cli.cachedResult", subtitle=subtitle or t("cli.embeddedSid", sid=subtitle_id)))
         logger.info(
             "RESULT step=pipeline.final_cache video=%s cache=hit subtitle=%s embedded_sid=%s",
             video.name,
@@ -1673,7 +1958,7 @@ def process_video(
         selected_source = "manual"
         if args.fast_play:
             already_synced = True
-            print(f"Подготовленные субтитры: {subtitle}")
+            print(t("cli.preparedSubtitles", path=subtitle))
     elif args.prepared_bitmap_sub is not None:
         subtitle = _validate_explicit_subtitle(args.prepared_bitmap_sub)
         if subtitle.suffix.casefold() not in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}:
@@ -1683,14 +1968,12 @@ def process_video(
         # preparation attempt. Re-synchronizing that file would compound the
         # timing correction; v38 feeds it directly into OCR instead.
         already_synced = True
-        logger.info(
-            "CACHE step=subtitle.prepared_bitmap video=%s path=%s", video.name, subtitle
-        )
+        logger.info("CACHE step=subtitle.prepared_bitmap video=%s path=%s", video.name, subtitle)
         pipeline_timer.mark("prepared_bitmap_cache", cache="hit")
     elif args.embedded_sid is not None:
         subtitle_id = int(args.embedded_sid)
         selected_source = "embedded"
-        print(f"Подготовленная встроенная японская дорожка: sid={subtitle_id}")
+        print(t("cli.preparedEmbeddedTrack", sid=subtitle_id))
     elif not args.force_search:
         try:
             embedded_candidates = find_embedded_japanese_subtitles(
@@ -1720,22 +2003,52 @@ def process_video(
             subtitle_id = embedded_text.subtitle_id
             selected_source = "embedded"
             print(
-                f"Встроенные японские текстовые субтитры: sid={embedded_text.subtitle_id}, "
-                f"codec={embedded_text.codec}, lang={embedded_text.language or '-'}, "
-                f"title={embedded_text.title or '-'}"
+                t(
+                    "cli.embeddedTextSubtitles",
+                    sid=embedded_text.subtitle_id,
+                    codec=embedded_text.codec,
+                    language=embedded_text.language or "-",
+                    title=embedded_text.title or "-",
+                )
             )
         elif embedded_bitmap_fallback is not None:
             print(
-                f"Найдены только встроенные японские графические субтитры: "
-                f"sid={embedded_bitmap_fallback.subtitle_id}, "
-                f"codec={embedded_bitmap_fallback.codec}. "
-                "Сначала ищу текстовый вариант локально и на Jimaku…"
+                t(
+                    "cli.embeddedImageOnly",
+                    sid=embedded_bitmap_fallback.subtitle_id,
+                    codec=embedded_bitmap_fallback.codec,
+                )
             )
 
     if not pipeline_cache_hit:
         pipeline_timer.mark("embedded_probe")
 
-    if subtitle is None and subtitle_id is None and not args.fast_play:
+    double_span = _double_episode_span_from_args(args)
+    double_boundary: float | None = None
+    double_handled = False
+    if double_span is not None and subtitle is None and subtitle_id is None and not args.fast_play:
+        # Never align one episode's subtitles to the whole two-episode file.
+        double_handled = True
+        outcome = _prepare_double_episode_subtitles(
+            video,
+            identity,
+            double_span,
+            args,
+            config,
+            llm,
+            anime_hint or tracking_anime,
+            logger,
+        )
+        if isinstance(outcome, int):
+            return outcome
+        subtitle, double_alignment, double_boundary = outcome
+        alignment_result = dict(double_alignment or {})
+        if subtitle is not None:
+            already_synced = True
+            selected_source = "double-episode"
+        pipeline_timer.mark("double_episode", ready=subtitle is not None)
+
+    if subtitle is None and subtitle_id is None and not args.fast_play and not double_handled:
         candidates: list[SubtitleCandidate] = []
         local_candidates = find_local_subtitles(
             video=video,
@@ -1747,9 +2060,7 @@ def process_video(
             verbose=args.verbose,
         )
         candidates.extend(
-            candidate
-            for candidate in local_candidates
-            if candidate.score >= config.matching.local_min_score
+            candidate for candidate in local_candidates if candidate.score >= config.matching.local_min_score
         )
 
         # When the manager invokes subtitle preparation it already knows the
@@ -1758,14 +2069,15 @@ def process_video(
         # matching on the raw filename identity, but give Jimaku the
         # authoritative episode so its alias resolver can include both 7 and 19.
         authoritative_anime = anime_hint or tracking_anime
-        online_identity = _authoritative_online_identity(
-            identity, args.episode_hint, authoritative_anime
-        )
+        online_identity = _authoritative_online_identity(identity, args.episode_hint, authoritative_anime)
         if online_identity is not identity:
             logger.info(
                 "RESULT step=jimaku.authoritative_episode video=%s filename_episode=%s "
                 "media_episode=%s anilist_id=%s",
-                video.name, identity.episode, online_identity.episode, authoritative_anime.id,
+                video.name,
+                identity.episode,
+                online_identity.episode,
+                authoritative_anime.id,
             )
 
         # When full comparison is enabled, a merely acceptable local subtitle
@@ -1834,7 +2146,7 @@ def process_video(
         elif bitmap_candidates:
             candidates = bitmap_candidates
         if content_duplicates and args.verbose:
-            print(f"  Удалены дубликаты SRT/ASS по содержимому: {content_duplicates}")
+            print(f"  Removed SRT/ASS duplicates by content: {content_duplicates}")
         pipeline_timer.mark(
             "candidate_discovery",
             candidates=len(candidates),
@@ -1847,9 +2159,14 @@ def process_video(
             getattr(args, "previous_candidate_fingerprint", "") or ""
         ).strip()
         from .subtitles.verification import unchanged_candidates_can_skip
+
         if (
             args.prepare_only
-            and unchanged_candidates_can_skip(previous_candidate_fingerprint, candidate_fingerprint, getattr(args, "previous_candidate_outcome", "unknown"))
+            and unchanged_candidates_can_skip(
+                previous_candidate_fingerprint,
+                candidate_fingerprint,
+                getattr(args, "previous_candidate_outcome", "unknown"),
+            )
             and not args.force_search
             and not args.resync
             and args.sub is None
@@ -1860,7 +2177,7 @@ def process_video(
                 candidate_fingerprint[:12],
                 len(candidate_fingerprint_inputs),
             )
-            print("Subtitle candidates unchanged; expensive alignment skipped")
+            print(t("cli.candidatesUnchanged"))
             print("PREPARE_STATUS=waiting_unchanged_candidates")
             return 4
 
@@ -1875,7 +2192,7 @@ def process_video(
                 video=video.name,
                 candidates=len(candidates),
             )
-            print(f"Сравниваю тайминг {len(candidates)} доступных вариантов…")
+            print(tn("cli.comparingCandidates", len(candidates)))
             best, optimized_path, result = optimize_candidates(
                 video,
                 candidates,
@@ -1899,7 +2216,7 @@ def process_video(
                 selected_source = best.source
                 subtitle = optimized_path
                 already_synced = True
-                print(f"Выбран вариант: {best.name} ({best.source})")
+                print(t("cli.selectedCandidate", name=best.name, source=best.source))
                 if best.source == "jimaku":
                     print(
                         f"Jimaku entry: {best.details.get('entry_name', '-')} "
@@ -1908,12 +2225,20 @@ def process_video(
                 _print_sync_result(subtitle, result)
             elif result.get("candidate_quality_accepted") is False:
                 print(
-                    "Субтитры отклонены проверкой качества: "
-                    f"{result.get('candidate_quality_reason', 'низкая уверенность')}"
+                    t(
+                        "cli.qualityRejected",
+                        reason=message(
+                            str(result.get("candidate_quality_reason", err("sync.lowConfidence")))
+                        ),
+                    )
                 )
-            if subtitle is None and candidates and all(
-                candidate.path.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
-                for candidate in candidates
+            if (
+                subtitle is None
+                and candidates
+                and all(
+                    candidate.path.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
+                    for candidate in candidates
+                )
             ):
                 chosen = _choose_with_optional_llm(
                     candidates,
@@ -1926,7 +2251,7 @@ def process_video(
                     selected_candidate = chosen
                     selected_source = chosen.source
                     subtitle = chosen.path
-                    print(f"Графические субтитры-кандидат: {subtitle}")
+                    print(t("cli.imageCandidate", path=subtitle))
         else:
             chosen = _choose_with_optional_llm(
                 candidates,
@@ -1944,17 +2269,13 @@ def process_video(
                         f"Jimaku entry: {chosen.details.get('entry_name', '-')} "
                         f"(id={chosen.details.get('entry_id', '-')})"
                     )
-                    print(f"Скачаны субтитры: {subtitle}")
+                    print(t("cli.downloadedSubtitles", path=subtitle))
                 else:
-                    print(f"Локальные субтитры: {subtitle} (score={chosen.score:.1f})")
+                    print(t("cli.localSubtitles", path=subtitle, score=f"{chosen.score:.1f}"))
 
         raw_unsynced_candidate = _confident_raw_unsynced_candidate(
             candidates,
-            expected_episode=(
-                int(args.episode_hint)
-                if args.episode_hint is not None
-                else identity.episode
-            ),
+            expected_episode=(int(args.episode_hint) if args.episode_hint is not None else identity.episode),
             manually_selected=bool(args.sub is not None),
             minimum_score=max(
                 float(config.matching.local_min_score),
@@ -1967,7 +2288,7 @@ def process_video(
 
     if subtitle is not None and not args.no_sync and not already_synced:
         reporter.update(SubtitleJobStage.ALIGNING, video=video.name, candidates=1)
-        print("Синхронизация: анализирую аудио и тайминги…")
+        print(t("cli.syncAnalyzing"))
         candidate_path = subtitle
         synchronized_path, result = _sync_one(video, subtitle, args, config, llm)
         alignment_result = dict(result)
@@ -1982,23 +2303,17 @@ def process_video(
             )
         reporter.update(SubtitleJobStage.VALIDATING, video=video.name)
         _print_sync_result(synchronized_path, result)
-        is_bitmap_candidate = candidate_path.suffix.casefold() in (
-            IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
-        )
+        is_bitmap_candidate = candidate_path.suffix.casefold() in (IMAGE_SUBTITLE_EXTENSIONS | {".pgs"})
         if is_bitmap_candidate:
             # OCR can still use the original PGS when optional onset-based
             # synchronization has no suitable embedded text reference.
             accepted = True
-            subtitle = (
-                synchronized_path
-                if bool(result.get("sync_was_successful"))
-                else candidate_path
-            )
+            subtitle = synchronized_path if bool(result.get("sync_was_successful")) else candidate_path
         else:
             accepted, quality_reason = subtitle_quality_accepted(result)
             subtitle = synchronized_path
             if not accepted:
-                print(f"Субтитры {candidate_path.name} отклонены: {quality_reason}")
+                print(t("cli.candidateRejected", name=candidate_path.name, reason=message(quality_reason)))
                 subtitle = None
         pipeline_timer.mark("single_candidate_sync", accepted=accepted)
 
@@ -2007,10 +2322,7 @@ def process_video(
         selected_source = bitmap_candidate_fallback.source
         subtitle = bitmap_candidate_fallback.path
         already_synced = False
-        print(
-            "Текстовые варианты не прошли проверку; "
-            f"использую графический fallback: {subtitle}"
-        )
+        print(t("cli.usingImageFallback", path=subtitle))
         if not args.no_sync:
             reporter.update(SubtitleJobStage.ALIGNING, video=video.name, candidates=1)
             synchronized_path, result = _sync_one(video, subtitle, args, config, llm)
@@ -2022,8 +2334,7 @@ def process_video(
     if config.matching.ocr_image_subtitles and not args.fast_play and not args.text_only:
         image_path = (
             subtitle
-            if subtitle is not None
-            and subtitle.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
+            if subtitle is not None and subtitle.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS | {".pgs"}
             else None
         )
         embedded_stream_index = (
@@ -2035,7 +2346,7 @@ def process_video(
             else None
         )
         if image_path is not None or embedded_stream_index is not None:
-            print("OCR: преобразую графические японские субтитры в SRT заранее…")
+            print(t("cli.ocrStarting"))
             try:
                 ocr_subtitle, ocr_result = image_subtitle_to_srt(
                     video,
@@ -2044,11 +2355,11 @@ def process_video(
                     embedded_stream_index=embedded_stream_index,
                     embedded_codec=(
                         embedded_bitmap_fallback.codec
-                        if embedded_stream_index is not None
-                        and embedded_bitmap_fallback is not None
+                        if embedded_stream_index is not None and embedded_bitmap_fallback is not None
                         else None
                     ),
                     ffmpeg_path=config.tools.ffmpeg,
+                    ffprobe_path=config.tools.ffprobe,
                     force=args.resync,
                 )
             except (OCRUnavailableError, OCRConversionError, OSError, ValueError) as exc:
@@ -2071,20 +2382,17 @@ def process_video(
                 subtitle_id = None
                 embedded_bitmap_fallback = None
                 already_synced = True
-                print(
-                    f"OCR завершён: {ocr_subtitle} "
-                    f"({ocr_result.get('cue_count', 0)} реплик)"
-                )
+                print(tn("cli.ocrDone", ocr_result.get("cue_count", 0), path=ocr_subtitle))
                 pipeline_timer.mark(
                     "subtitle_ocr",
                     reason=ocr_result.get("reason"),
                     cues=ocr_result.get("cue_count", 0),
                 )
             else:
-                reason = ocr_result.get('error', ocr_result.get('reason', 'unknown'))
+                reason = ocr_result.get("error", ocr_result.get("reason", "unknown"))
                 if ocr_subtitle is not None and not ocr_accepted:
                     reason = "quality_review:" + ",".join(ocr_quality.get("warnings", []))
-                print("OCR не создал надёжные текстовые субтитры: " + str(reason))
+                print(t("cli.ocrFailed", reason=str(reason)))
 
     if (
         subtitle is not None
@@ -2101,11 +2409,13 @@ def process_video(
         )
         if converted != subtitle:
             subtitle = converted
-            print(f"ASS/SSA преобразован в обычный SRT: {subtitle}")
+            print(t("cli.assConverted", path=subtitle))
         else:
             print(
-                "Не удалось преобразовать ASS/SSA в SRT: "
-                f"{conversion_result.get('error', conversion_result.get('reason'))}"
+                t(
+                    "cli.assConversionFailed",
+                    error=message(str(conversion_result.get("error", conversion_result.get("reason")))),
+                )
             )
         pipeline_timer.mark("subtitle_conversion", reason=conversion_result.get("reason"))
 
@@ -2136,7 +2446,7 @@ def process_video(
                 subtitle,
             )
             if not args.prepare_only:
-                print("Исправлен известный неполный источник японских субтитров")
+                print(t("cli.knownSourceRepaired"))
 
     if subtitle is not None and subtitle.suffix.casefold() == ".srt":
         reporter.update(SubtitleJobStage.SELECTING, video=video.name)
@@ -2149,9 +2459,9 @@ def process_video(
         if cleaned_subtitle != subtitle:
             subtitle = cleaned_subtitle
             if not args.fast_play:
-                print(f"SRT очищен для mpv: {subtitle}")
+                print(t("cli.srtCleaned", path=subtitle))
         elif args.verbose and cleanup_result.get("reason") not in {"already_clean", "cached"}:
-            print(f"Очистка SRT пропущена: {cleanup_result.get('reason')}")
+            print(f"SRT cleanup skipped: {cleanup_result.get('reason')}")
         configure_logging().info(
             "RESULT step=subtitle.playback_clean source=%s output=%s reason=%s cues=%s conflicts=%s",
             source_subtitle,
@@ -2169,20 +2479,21 @@ def process_video(
     if subtitle is None and subtitle_id is None and embedded_bitmap_fallback is not None:
         selected_source = "embedded_bitmap"
         subtitle_id = embedded_bitmap_fallback.subtitle_id
-        print(
-            "Текстовые японские субтитры не найдены; "
-            f"использую встроенную графическую дорожку sid={subtitle_id}, "
-            f"codec={embedded_bitmap_fallback.codec}"
-        )
+        print(t("cli.usingEmbeddedImageTrack", sid=subtitle_id, codec=embedded_bitmap_fallback.codec))
 
     if subtitle is None and subtitle_id is None:
         if args.prepare_only:
             from .subtitles.verification import verification_failure
+
             failure = verification_failure(alignment_result)
             if failure and (failure["retryable"] or raw_unsynced_candidate is None):
-                metadata = {"alignment": alignment_result, "verification_failure": failure, "quality": {"accepted": False, "reason": failure["reason"]}}
+                metadata = {
+                    "alignment": alignment_result,
+                    "verification_failure": failure,
+                    "quality": {"accepted": False, "reason": failure["reason"]},
+                }
                 reporter.update(SubtitleJobStage.WAITING_VERIFICATION, video=video.name, **failure)
-                print("Проверка японской речи не завершена: " + failure["reason"])
+                print(t("cli.speechCheckIncomplete", reason=failure["reason"]))
                 print("PREPARED_SUBTITLE_META=" + json.dumps(metadata, ensure_ascii=False, default=str))
                 print("PREPARE_STATUS=waiting_verification")
                 return 4
@@ -2201,25 +2512,16 @@ def process_video(
                 if failure:
                     metadata["verification_failure"] = failure
                 reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
-                print(
-                    "Субтитры уверенно относятся к этой серии, но автоматический "
-                    "тайминг не прошёл проверку"
-                )
-                print(
-                    "PREPARED_RAW_SUBTITLE="
-                    + str(raw_unsynced_candidate.path)
-                )
-                print(
-                    "PREPARED_SUBTITLE_META="
-                    + json.dumps(metadata, ensure_ascii=False, default=str)
-                )
+                print(t("cli.confidentButUnsynced"))
+                print("PREPARED_RAW_SUBTITLE=" + str(raw_unsynced_candidate.path))
+                print("PREPARED_SUBTITLE_META=" + json.dumps(metadata, ensure_ascii=False, default=str))
                 print("PREPARE_STATUS=couldnt_sync")
                 return 4
             reporter.update(SubtitleJobStage.WAITING_SOURCE, video=video.name)
-            print("Японские субтитры пока не найдены")
+            print(t("cli.subtitlesNotFoundYet"))
             print("PREPARE_STATUS=waiting_subtitles")
             return 4
-        print("Японские субтитры не найдены; mpv будет запущен без добавленного файла")
+        print(t("cli.subtitlesNotFound"))
 
     selected_image_subtitle = bool(
         (subtitle is not None and subtitle.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS)
@@ -2267,8 +2569,7 @@ def process_video(
                 "reason": "embedded_exact_video_clock",
             }
         quality_accepted = bool(
-            not selected_image_subtitle
-            and (subtitle is not None or subtitle_id is not None)
+            not selected_image_subtitle and (subtitle is not None or subtitle_id is not None)
         )
         quality_reason = str(
             quality_input.get("candidate_quality_reason")
@@ -2282,7 +2583,9 @@ def process_video(
         )
         metadata = {
             "source": selected_source or (selected_candidate.source if selected_candidate else ""),
-            "name": selected_candidate.name if selected_candidate else (subtitle.name if subtitle else "embedded" if subtitle_id is not None else ""),
+            "name": selected_candidate.name
+            if selected_candidate
+            else (subtitle.name if subtitle else "embedded" if subtitle_id is not None else ""),
             # The public score is final prepared quality. Filename ranking is
             # retained only as discovery evidence and never drives upgrades.
             "score": quality.score,
@@ -2307,12 +2610,11 @@ def process_video(
             if subtitle is not None:
                 print(f"PREPARED_SUBTITLE={subtitle}")
             elif embedded_bitmap_fallback is not None:
-                print(
-                    f"PREPARED_EMBEDDED_SID="
-                    f"{subtitle_id or embedded_bitmap_fallback.subtitle_id}"
-                )
+                print(f"PREPARED_EMBEDDED_SID={subtitle_id or embedded_bitmap_fallback.subtitle_id}")
             print("PREPARE_STATUS=waiting_text_subtitles")
             return 4
+        if double_boundary is not None:
+            print(f"PREPARED_PART_BOUNDARY={double_boundary:.3f}")
         print(f"PREPARED_SUBTITLE={subtitle or ''}")
         if subtitle_id is not None:
             print(f"PREPARED_EMBEDDED_SID={subtitle_id}")
@@ -2326,13 +2628,13 @@ def process_video(
         return 0
 
     tracking_file: Path | None = None
-    tracker_script: Path | None = Path(
-        str(files("pudge").joinpath("mpv_scripts/pudge_anilist.lua"))
-    )
+    tracker_script: Path | None = Path(str(files("pudge").joinpath("mpv_scripts/pudge_anilist.lua")))
     tracker_env: dict[str, str] = {
         "PUDGE_PYTHON": python_executable(),
         "PUDGE_CONFIG": str(config.config_path),
         "PUDGE_UI_LANGUAGE": config.ui.language,
+        # The mpv scripts read their OSD texts from the interface catalog.
+        "PUDGE_LOCALE_FILE": str(catalog_path(config.ui.language)),
         "PUDGE_APP_NAME": APP_NAME,
         "PUDGE_PLAYBACK_ENABLED": "1" if config.playback.enabled else "0",
         "PUDGE_PLAYBACK_VIDEO": str(video),
@@ -2340,12 +2642,27 @@ def process_video(
         "PUDGE_SHORTCUT_MARK_WATCHED": config.shortcuts.mpv_mark_watched,
         "PUDGE_SHORTCUT_TRANSLATE_SUBTITLE": config.shortcuts.mpv_translate_subtitle,
         "PUDGE_SHORTCUT_EXPLAIN_SUBTITLE": config.shortcuts.mpv_explain_subtitle,
-        "PUDGE_LLM_CONFIGURED": "1" if config.llm.enabled and config.llm.base_url and config.llm.model else "0",
+        "PUDGE_LLM_CONFIGURED": "1"
+        if config.llm.enabled and config.llm.base_url and config.llm.model
+        else "0",
         "PUDGE_SUBTITLE_PATH": str(subtitle or ""),
     }
     if tracking_anime is not None and tracking_episode is not None and config.anilist.access_token:
         threshold = max(0.1, min(0.99, config.anilist.watched_threshold))
         title = tracking_anime.titles[0] if tracking_anime.titles else str(tracking_anime.id)
+        tracking_episode_end: int | None = None
+        tracking_boundary: float | None = None
+        double_hint = _double_episode_span_from_args(args)
+        if double_hint is not None and anime_hint is not None:
+            resolved_end = _tracking_episode_from_hint(anime_hint, double_hint[1], config, logger)
+            if (
+                resolved_end is not None
+                and resolved_end[0].id == tracking_anime.id
+                and resolved_end[1] == tracking_episode + 1
+            ):
+                tracking_episode_end = resolved_end[1]
+                boundary_value = getattr(args, "part_boundary", None)
+                tracking_boundary = float(boundary_value) if boundary_value and boundary_value > 0 else None
         tracking_file = create_tracking_file(
             config.paths.cache_dir,
             TrackingPayload(
@@ -2356,29 +2673,41 @@ def process_video(
                 total_episodes=tracking_anime.episodes,
                 threshold=threshold,
                 mapping_key=tracking_mapping_key,
+                episode_end=tracking_episode_end,
+                part_boundary=tracking_boundary,
             ),
         )
-        tracker_env.update({
-            "PUDGE_ANILIST_TRACKING_FILE": str(tracking_file),
-            "PUDGE_ANILIST_THRESHOLD": str(threshold),
-            "PUDGE_ANILIST_MAX_REMAINING_MINUTES": str(max(0.0, config.anilist.watched_max_remaining_minutes)),
-            "PUDGE_ANILIST_MEDIA_ID": str(tracking_anime.id),
-            "PUDGE_ANILIST_TITLE": title,
-            "PUDGE_ANILIST_AUTO_UPDATE": "1" if tracking_auto else "0",
-            "PUDGE_PYTHON": python_executable(),
-            "PUDGE_CONFIG": str(config.config_path),
-        })
+        tracker_env.update(
+            {
+                "PUDGE_ANILIST_TRACKING_FILE": str(tracking_file),
+                "PUDGE_ANILIST_THRESHOLD": str(threshold),
+                "PUDGE_ANILIST_MAX_REMAINING_MINUTES": str(
+                    max(0.0, config.anilist.watched_max_remaining_minutes)
+                ),
+                "PUDGE_ANILIST_MEDIA_ID": str(tracking_anime.id),
+                "PUDGE_ANILIST_TITLE": title,
+                "PUDGE_ANILIST_AUTO_UPDATE": "1" if tracking_auto else "0",
+                "PUDGE_PYTHON": python_executable(),
+                "PUDGE_CONFIG": str(config.config_path),
+            }
+        )
+        if tracking_episode_end is not None:
+            # Episode one of a two-episode file counts where episode two starts
+            # (half the file when subtitles have not found the boundary).
+            tracker_env["PUDGE_ANILIST_PART_BOUNDARY"] = (
+                f"{tracking_boundary:.3f}" if tracking_boundary is not None else "half"
+            )
 
     # OP/ED skip button: only already detected segments; never analyse here.
     segments_file: Path | None = None
     skip_scripts: list[Path] = []
     if getattr(config.playback, "skip_segments_enabled", True):
         skip_scripts.append(Path(str(files("pudge").joinpath("mpv_scripts/pudge_skip_segments.lua"))))
-        tracker_env.update({
-            "PUDGE_SHORTCUT_SKIP_SEGMENT": config.shortcuts.mpv_skip_segment,
-            "PUDGE_AUTO_SKIP_INTRO": "1" if config.playback.auto_skip_intro else "0",
-            "PUDGE_AUTO_SKIP_OUTRO": "1" if config.playback.auto_skip_outro else "0",
-        })
+        tracker_env.update(
+            {
+                "PUDGE_SHORTCUT_SKIP_SEGMENT": config.shortcuts.mpv_skip_segment,
+            }
+        )
         if not args.dry_run:
             try:
                 from .intro_skipper import write_playback_session
@@ -2414,22 +2743,29 @@ def process_video(
             # Explicit loading keeps all ordinary user scripts while ensuring
             # JitenMPV and jpdb-mpv-plugin never run together in Pudge's mpv.
             mpv_extra_args.append("--load-scripts=no")
-            mpv_extra_args.extend(
-                f"--script={path}" for path in study_plan["scripts"]
-            )
+            mpv_extra_args.extend(f"--script={path}" for path in study_plan["scripts"])
     except (OSError, ValueError):
         # Playback remains available if a third-party plugin is being changed
         # on disk while the command is constructed.
         pass
     if args.start_at and args.start_at > 0:
         mpv_extra_args.append(f"--start={max(0.0, float(args.start_at)):.3f}")
-    if args.fullscreen and not any(arg in {"--fs", "--fullscreen"} or arg.startswith("--fs=") for arg in mpv_extra_args):
+    # No spatial audio: surround is downmixed by mpv (an explicit --audio-channels wins).
+    if getattr(config.playback, "stereo_downmix", False) and not any(
+        arg.startswith("--audio-channels") for arg in mpv_extra_args
+    ):
+        mpv_extra_args.append("--audio-channels=stereo")
+    if args.fullscreen and not any(
+        arg in {"--fs", "--fullscreen"} or arg.startswith("--fs=") for arg in mpv_extra_args
+    ):
         mpv_extra_args.append("--fs")
 
     import tempfile
     import secrets
+
     ipc_socket = Path(tempfile.gettempdir()) / f"pudge-mpv-{secrets.token_hex(10)}.sock"
     from .mpv_assistant import llm_configured
+
     tracker_env["PUDGE_LLM_CONFIGURED"] = "1" if llm_configured(config) else "0"
     command = build_mpv_command(
         config.tools.mpv,
@@ -2503,6 +2839,7 @@ def doctor(config: AppConfig) -> int:
 
     try:
         import ffsubsync  # noqa: F401
+
         print("ffsubsync: ok")
     except ImportError:
         print("ffsubsync: missing")
@@ -2511,10 +2848,14 @@ def doctor(config: AppConfig) -> int:
     alass = shutil.which(config.tools.alass) if "/" not in config.tools.alass else config.tools.alass
     if not alass and config.tools.alass in {"alass", "alass-cli"}:
         alass = shutil.which("alass-cli") or shutil.which("alass")
-    print(f"alass: {alass or config.tools.alass} ({'ok' if alass else 'missing; auto fallback to ffsubsync'})")
+    print(
+        f"alass: {alass or config.tools.alass} ({'ok' if alass else 'missing; auto fallback to ffsubsync'})"
+    )
 
     sevenzip = find_7zip()
-    print(f"7-Zip: {sevenzip or 'missing'} ({'ok' if sevenzip else 'missing; .7z/.rar Jimaku archives unavailable'})")
+    print(
+        f"7-Zip: {sevenzip or 'missing'} ({'ok' if sevenzip else 'missing; .7z/.rar Jimaku archives unavailable'})"
+    )
 
     print(f"Jimaku API key: {'set' if config.jimaku.api_key else 'missing'}")
     print(
@@ -2527,6 +2868,7 @@ def doctor(config: AppConfig) -> int:
     print(f"Library: {config.library.root_dir} ({'ok' if config.library.root_dir.exists() else 'missing'})")
     try:
         from .database import Database
+
         Database(config.library.database_path)
         print(f"Database: {config.library.database_path} (ok)")
     except Exception as exc:
@@ -2550,6 +2892,7 @@ def doctor(config: AppConfig) -> int:
     if config.qbittorrent.enabled or config.aria2.enabled:
         try:
             from .manager import AnimeManager
+
             manager = AnimeManager(config)
             client = manager.qbt_client()
             try:
@@ -2574,15 +2917,24 @@ def doctor(config: AppConfig) -> int:
 
 
 def _repair_episode_identity(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog=f"{APP_CLI} repair-episode-identity", description="Review a local file identity repair, then explicitly apply the saved plan. Close playback before applying.")
+    parser = argparse.ArgumentParser(
+        prog=f"{APP_CLI} repair-episode-identity",
+        description="Review a local file identity repair, then explicitly apply the saved plan. Close playback before applying.",
+    )
     parser.add_argument("--database", type=Path, required=True)
-    parser.add_argument("--apply-plan", type=Path, help="Apply a previously reviewed JSON plan; creates a database backup")
+    parser.add_argument(
+        "--apply-plan", type=Path, help="Apply a previously reviewed JSON plan; creates a database backup"
+    )
     parser.add_argument("--plan-file", type=Path, help="Write a read-only repair plan for review")
     parser.add_argument("--video", type=Path)
     parser.add_argument("--torrent-hash")
     for name in ("media-id", "expected-media-episode", "media-episode", "release-episode"):
         parser.add_argument("--" + name, type=int)
-    parser.add_argument("--migrate-history", action="store_true", help="Relabel the single watch-history entry of this file to the corrected episode (shown in the plan)")
+    parser.add_argument(
+        "--migrate-history",
+        action="store_true",
+        help="Relabel the single watch-history entry of this file to the corrected episode (shown in the plan)",
+    )
     args = parser.parse_args(argv)
     database_path = args.database.expanduser().resolve()
     try:
@@ -2594,15 +2946,42 @@ def _repair_episode_identity(argv: list[str]) -> int:
                 raise ValueError("Open the current app once to migrate this database before repairing")
         db = Database(database_path, initialize=False)
         if args.apply_plan:
-            if args.plan_file or args.video or args.torrent_hash or args.migrate_history or any(getattr(args, name) is not None for name in ("media_id", "expected_media_episode", "media_episode", "release_episode")):
+            if (
+                args.plan_file
+                or args.video
+                or args.torrent_hash
+                or args.migrate_history
+                or any(
+                    getattr(args, name) is not None
+                    for name in ("media_id", "expected_media_episode", "media_episode", "release_episode")
+                )
+            ):
                 parser.error("--apply-plan must be used without dry-run parameters")
             plan = json.loads(args.apply_plan.read_text(encoding="utf-8"))
             result = db.apply_episode_identity_repair(plan)
         else:
-            required = ("plan_file", "video", "torrent_hash", "media_id", "expected_media_episode", "media_episode", "release_episode")
+            required = (
+                "plan_file",
+                "video",
+                "torrent_hash",
+                "media_id",
+                "expected_media_episode",
+                "media_episode",
+                "release_episode",
+            )
             if any(getattr(args, name) is None for name in required):
-                parser.error("dry-run requires --plan-file, --video, --torrent-hash and all episode identity parameters")
-            result = db.plan_episode_identity_repair(args.torrent_hash, args.video, media_id=args.media_id, expected_media_episode=args.expected_media_episode, media_episode=args.media_episode, release_episode=args.release_episode, migrate_history=args.migrate_history)
+                parser.error(
+                    "dry-run requires --plan-file, --video, --torrent-hash and all episode identity parameters"
+                )
+            result = db.plan_episode_identity_repair(
+                args.torrent_hash,
+                args.video,
+                media_id=args.media_id,
+                expected_media_episode=args.expected_media_episode,
+                media_episode=args.media_episode,
+                release_episode=args.release_episode,
+                migrate_history=args.migrate_history,
+            )
             # A reviewed plan must not be silently overwritten by a fresh snapshot.
             with args.plan_file.open("x", encoding="utf-8") as stream:
                 json.dump(result, stream, ensure_ascii=False, indent=2)
@@ -2614,45 +2993,8 @@ def _repair_episode_identity(argv: list[str]) -> int:
         return 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    command_args = list(sys.argv[1:] if argv is None else argv)
-    if command_args and command_args[0] == "repair-episode-identity":
-        return _repair_episode_identity(command_args[1:])
-    parser = build_parser()
-    args = parser.parse_args(argv)
-
-    if args.init_config:
-        path = write_default_config(args.config)
-        print(path)
-        return 0
-
-    config = load_config(args.config)
-    if args.export_episode_debug:
-        if args.playback_video is None:
-            print("Episode debug export requires --playback-video", file=sys.stderr)
-            return 1
-        from .debug_snapshot import DebugSnapshotService
-        from .manager import AnimeManager
-
-        video = args.playback_video.expanduser().resolve()
-        manager = AnimeManager(config)
-        episode = manager.db.episode_by_path(video)
-        if episode is None or episode.media_id is None:
-            print(f"Episode is not present in the local library: {video}", file=sys.stderr)
-            return 1
-        payload = DebugSnapshotService(
-            manager, cache_dir=config.paths.cache_dir
-        ).snapshot(episode.media_id, episode.media_episode)
-        target = debug_log_dir() / (
-            f"pudge-debug-{int(episode.media_id)}"
-            f"-ep{episode.media_episode if episode.media_episode is not None else 'movie'}"
-            f"-{int(time.time())}.json"
-        )
-        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        if sys.platform == "darwin":
-            subprocess.run(["open", "-R", str(target)], check=False)
-        print(f"PUDGE_EPISODE_DEBUG={target}")
-        return 0
+def _run_mpv_helper(args: argparse.Namespace, config: AppConfig) -> int:
+    """Subtitle prewarm / translation, playback save and AniList count started by mpv."""
     if args.subtitle_prewarm_file:
         from .mpv_study import SubtitleStudyApi
 
@@ -2662,9 +3004,7 @@ def main(argv: list[str] | None = None) -> int:
                     os.nice(10)
                 except OSError:
                     pass
-            result = SubtitleStudyApi(
-                config, media_id=args.subtitle_study_media_id
-            ).prewarm_file(
+            result = SubtitleStudyApi(config, media_id=args.subtitle_study_media_id).prewarm_file(
                 args.subtitle_prewarm_file,
                 start_seconds=args.subtitle_prewarm_from,
                 ipc_socket=args.subtitle_prewarm_ipc or None,
@@ -2678,9 +3018,13 @@ def main(argv: list[str] | None = None) -> int:
         from .mpv_study import SubtitleStudyApi
 
         try:
-            result = SubtitleStudyApi(
-                config, media_id=args.subtitle_study_media_id
-            ).translate(args.subtitle_study_text, args.subtitle_study_context)
+            result = SubtitleStudyApi(config, media_id=args.subtitle_study_media_id).translate_visible(
+                args.subtitle_study_text,
+                args.subtitle_study_context,
+                subtitle_path=args.subtitle_study_file,
+                position=args.subtitle_study_time,
+                secondary=args.subtitle_study_secondary,
+            )
         except Exception as exc:
             print(f"Subtitle translation failed: {exc}", file=sys.stderr)
             return 1
@@ -2688,30 +3032,90 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.playback_save:
         return _run_playback_save(args, config)
+    return _run_anilist_action(args, config)
+
+
+def main(argv: list[str] | None = None) -> int:
+    from .process_priority import lower_if_requested
+
+    lower_if_requested()
+    command_args = list(sys.argv[1:] if argv is None else argv)
+    if command_args and command_args[0] == "repair-episode-identity":
+        return _repair_episode_identity(command_args[1:])
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.init_config:
+        path = write_default_config(args.config)
+        print(path)
+        return 0
+
+    config = load_config(args.config)
+    from .providers.anilist import configure_rate_limit_dir
+
+    configure_rate_limit_dir(getattr(getattr(config, "paths", None), "cache_dir", None))
+    if args.export_episode_debug:
+        if args.playback_video is None:
+            print("Episode debug export requires --playback-video", file=sys.stderr)
+            return 1
+        from .debug_snapshot import DebugSnapshotService
+        from .manager import AnimeManager
+
+        video = args.playback_video.expanduser().resolve()
+        manager = AnimeManager(config)
+        episode = manager.db.episode_by_path(video)
+        if episode is None or episode.media_id is None:
+            print(f"Episode is not present in the local library: {video}", file=sys.stderr)
+            return 1
+        payload = DebugSnapshotService(manager, cache_dir=config.paths.cache_dir).snapshot(
+            episode.media_id, episode.media_episode
+        )
+        target = debug_log_dir() / (
+            f"pudge-debug-{int(episode.media_id)}"
+            f"-ep{episode.media_episode if episode.media_episode is not None else 'movie'}"
+            f"-{int(time.time())}.json"
+        )
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", str(target)], check=False)
+        print(f"PUDGE_EPISODE_DEBUG={target}")
+        return 0
+    if args.subtitle_prewarm_file or args.subtitle_translate or args.playback_save or args.anilist_action:
+        # mpv's helpers open the library directly: wait while the app restores a
+        # backup over it (see restore_guard).
+        from .restore_guard import RestoreInProgress, database_use
+
+        try:
+            with database_use(config.library.database_path):
+                return _run_mpv_helper(args, config)
+        except RestoreInProgress as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     if args.app:
         from .app_ui import launch_app
+
         return launch_app(args.config)
     if args.agent_once:
         from .manager import AnimeManager
+
         stats = AnimeManager(config).run_once()
         print(", ".join(f"{key}={value}" for key, value in stats.items()))
         return 0
-    if args.anilist_action:
-        return _run_anilist_action(args, config)
     if args.anilist_correct:
         if len(args.videos) != 1:
-            parser.error("для --anilist-correct укажите ровно один видео-файл")
+            parser.error("--anilist-correct needs exactly one video file")
         return _correct_anilist_mapping(args.videos[0], args.anilist_correct, config)
-    if args.settings:
-        from .settings_ui import launch_settings
-        return launch_settings(args.config)
     if args.doctor:
         return doctor(config)
     if not args.videos:
         from .app_ui import launch_app
+
         return launch_app(args.config)
 
     background_prepare = os.environ.get("PUDGE_BACKGROUND_PREPARE") == "1"
+    # Subtitle candidates may be checked 2-3 at a time in this process's children
+    # (only on mains power; see syncing._candidate_evaluation_workers).
+    os.environ.setdefault("PUDGE_CANDIDATE_PROCESSES", "auto")
     # A manual ``--prepare-only`` is foreground work too: the user is waiting
     # for this exact episode. Only manager-spawned workers carry the explicit
     # background marker and are allowed to run without claiming priority.
@@ -2720,8 +3124,7 @@ def main(argv: list[str] | None = None) -> int:
 
     llm: OllamaClient | None = None
     all_videos_have_final_cache = bool(args.videos) and all(
-        final_pipeline_cache_available(video.expanduser().resolve(), config)
-        for video in args.videos
+        final_pipeline_cache_available(video.expanduser().resolve(), config) for video in args.videos
     )
     cache_shortcut_allowed = (
         not args.resync
@@ -2742,7 +3145,7 @@ def main(argv: list[str] | None = None) -> int:
             llm = candidate
         else:
             candidate.close()
-            print("LLM включена, но API или выбранная модель недоступны; продолжаю без LLM")
+            print(t("cli.llmUnavailable"))
     elif cache_shortcut_allowed and all_videos_have_final_cache and config.llm.enabled:
         configure_logging().info("SKIP step=llm.available reason=all_videos_final_cache")
 
@@ -2752,7 +3155,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 exit_code = process_video(video, args, config, llm)
             except (RuntimeError, JimakuError, KeyboardInterrupt) as exc:
-                print(f"Ошибка: {exc}", file=sys.stderr)
+                print(t("error.generic", error=exc), file=sys.stderr)
                 exit_code = 1
             if exit_code != 0:
                 break

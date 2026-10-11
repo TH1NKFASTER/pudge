@@ -27,8 +27,22 @@ from .media import (
 
 
 VIDEO_EXTENSIONS = {
-    ".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts",
-    ".wmv", ".flv", ".ogv", ".mpeg", ".mpg", ".mpv", ".3gp",
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".ts",
+    ".m2ts",
+    ".mts",
+    ".wmv",
+    ".flv",
+    ".ogv",
+    ".mpeg",
+    ".mpg",
+    ".mpv",
+    ".3gp",
 }
 SUB_EXTENSIONS = (".srt", ".ass", ".ssa", ".vtt", ".sup")
 
@@ -118,8 +132,7 @@ def sidecar_subtitle(video: Path) -> Path | None:
     text_candidates = [
         path
         for path in candidates
-        if path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS
-        and is_japanese_subtitle(path)
+        if path.suffix.casefold() in TEXT_SUBTITLE_EXTENSIONS and is_japanese_subtitle(path)
     ]
     if text_candidates:
         return text_candidates[0]
@@ -128,12 +141,10 @@ def sidecar_subtitle(video: Path) -> Path | None:
         path
         for path in candidates
         if path.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
-        and not (
-            has_negative_language_marker(path.name)
-            and not has_japanese_marker(path.name)
-        )
+        and not (has_negative_language_marker(path.name) and not has_japanese_marker(path.name))
     ]
     return bitmap_candidates[0] if bitmap_candidates else None
+
 
 def japanese_subtitle_details(
     video: Path,
@@ -153,9 +164,7 @@ def japanese_subtitle_details(
         sidecar = sidecar_subtitle(video)
         if sidecar is not None:
             source = (
-                "external_bitmap"
-                if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
-                else "external"
+                "external_bitmap" if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS else "external"
             )
             return source, sidecar.resolve(), None
     try:
@@ -179,6 +188,7 @@ def japanese_subtitle_details(
     if embedded_bitmap is not None:
         return "embedded_bitmap", None, embedded_bitmap.subtitle_id
     return "none", None, None
+
 
 def japanese_subtitle_source(
     video: Path,
@@ -257,6 +267,7 @@ def scan_library(
         return False
 
     result: list[LibraryEpisode] = []
+    folder_matches: dict[tuple[Path, int], LibraryAnime | None] = {}
     for path in iterator:
         if not path.is_file() or path.suffix.casefold() not in VIDEO_EXTENSIONS:
             continue
@@ -285,7 +296,12 @@ def scan_library(
         # anime library, but short arbitrary filenames such as ``uma.mp4`` can
         # otherwise partially match titles such as ``Azumanga``.
         if anime is None and not require_anime_match:
-            anime = parent_folder_anime(path, root, anime_list)
+            # The folder match depends only on the folder chain and the anime
+            # list (which only grows during the scan): fuzzy-match each folder once.
+            folder_key = (resolved.parent, len(anime_list))
+            if folder_key not in folder_matches:
+                folder_matches[folder_key] = parent_folder_anime(path, root, anime_list)
+            anime = folder_matches[folder_key]
         if anime is None and not require_anime_match:
             anime = match_anime(identity.title, anime_list)
             # Managed-library filenames are generally trustworthy, but movie/OVA
@@ -357,8 +373,7 @@ def scan_library(
         if existing is not None and existing.subtitle_path is not None:
             try:
                 existing_external_valid = (
-                    existing.subtitle_path.is_file()
-                    and existing.subtitle_path.stat().st_size > 0
+                    existing.subtitle_path.is_file() and existing.subtitle_path.stat().st_size > 0
                 )
             except OSError:
                 existing_external_valid = False
@@ -401,9 +416,7 @@ def scan_library(
             subtitle = existing.subtitle_path
             embedded_subtitle_id = existing.embedded_subtitle_id
             if existing.state == "waiting_text_subtitles":
-                subtitle_source = (
-                    "external_bitmap" if subtitle is not None else "embedded_bitmap"
-                )
+                subtitle_source = "external_bitmap" if subtitle is not None else "embedded_bitmap"
             elif existing.state == "couldnt_sync":
                 subtitle_source = "raw_unsynced"
             else:
@@ -412,17 +425,13 @@ def scan_library(
             subtitle = sidecar.resolve()
             embedded_subtitle_id = None
             subtitle_source = (
-                "external_bitmap"
-                if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS
-                else "external"
+                "external_bitmap" if sidecar.suffix.casefold() in IMAGE_SUBTITLE_EXTENSIONS else "external"
             )
         elif cached_pipeline is not None:
             cached_subtitle = str(cached_pipeline.get("subtitle") or "").strip()
             subtitle = Path(cached_subtitle).resolve() if cached_subtitle else None
             raw_subtitle_id = cached_pipeline.get("subtitle_id")
-            embedded_subtitle_id = (
-                int(raw_subtitle_id) if raw_subtitle_id is not None else None
-            )
+            embedded_subtitle_id = int(raw_subtitle_id) if raw_subtitle_id is not None else None
             subtitle_source = "external" if subtitle is not None else "embedded"
         elif (
             existing is not None
@@ -474,7 +483,9 @@ def scan_library(
             torrent_hash=(
                 existing_download.torrent_hash
                 if existing_has_managed_download and existing_download is not None
-                else existing.torrent_hash if existing is not None else ""
+                else existing.torrent_hash
+                if existing is not None
+                else ""
             ),
         )
         db.upsert_episode(item)

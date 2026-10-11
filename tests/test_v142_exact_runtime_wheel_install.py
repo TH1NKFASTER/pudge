@@ -1,35 +1,53 @@
-from pathlib import Path
+"""The installed runtime is exactly the wheel being installed, even for the same version
+number, and a development build never picks up a stale build/ folder (behaviour; audit 71Б
+rewrite: install.sh runs with stand-ins, tests/t71g01_support.py)."""
 
-ROOT = Path(__file__).resolve().parents[1]
-INSTALL = (ROOT / "install.sh").read_text(encoding="utf-8")
+from __future__ import annotations
 
-
-def test_update_removes_existing_package_before_same_version_wheel_install() -> None:
-    assert 'INSTALL_SITE_PACKAGES="$("$VENV_DIR/bin/python"' in INSTALL
-    assert 'rm -rf "$INSTALL_SITE_PACKAGES/pudge" "$INSTALL_SITE_PACKAGES"/pudge-*.dist-info(N)' in INSTALL
-    assert 'pip install --no-cache-dir --no-deps "$WHEEL_PATH"' in INSTALL
+from t71g01_support import release_history, source_history, tree, wheel_files
 
 
-def test_installer_verifies_runtime_bytes_against_exact_wheel() -> None:
-    assert 'with zipfile.ZipFile(wheel) as archive:' in INSTALL
-    assert 'installed.read_bytes() != archive.read(name)' in INSTALL
-    assert 'stale runtime file after wheel install' in INSTALL
+def test_same_version_update_replaces_the_whole_package() -> None:
+    # pip treats a wheel of the installed version as already installed; the installer removes
+    # the old package first. A module dropped from the new build must not stay importable.
+    history = release_history()
+    sim, update = history.sim, history.steps["update"]
+    assert (
+        "pudge/old_module.py" in update.runtime_before
+        and "pudge-9.8.7.dist-info/METADATA" in update.runtime_before
+    )
+    assert update.runtime_after == wheel_files(
+        history.projects["9.8.7-patched"] / "pudge-9.8.7-py3-none-any.whl"
+    )
+    # The scheduled agent is stopped before the package disappears for a moment.
+    result = update.result
+    assert result.index("launchctl", "bootout") < result.index("pip", "install", "--no-cache-dir")
+    bootout = result.calls("launchctl")[0]
+    assert (bootout[0], bootout[2]) == ("bootout", str(sim.agent_plist))
 
 
-def test_old_force_reinstall_only_path_is_gone() -> None:
-    assert 'pip install --force-reinstall --no-deps "$WHEEL_PATH"' not in INSTALL
+def test_installer_compares_the_installed_files_with_the_wheel() -> None:
+    stale = release_history().steps["stale"]
+    assert stale.result.returncode != 0
+    assert "Installer error: stale runtime file after wheel install: " in stale.result.output
+    assert (
+        stale.result.output.split("stale runtime file after wheel install: ", 1)[1]
+        .split()[0]
+        .endswith("/pudge/web/app.js")
+    )
+    # Nothing past the check ran: the app and the records are as before.
+    assert not stale.result.calls("clang") and stale.app_after == stale.app_before
+    assert stale.records["installed-version.txt"] == "9.8.6\n"
 
 
-def test_current_tree_wheel_isolates_stale_project_build_directory() -> None:
-    assert 'SOURCE_BUILD_BACKUP="$WHEEL_BUILD_DIR/project-build-before-wheel"' in INSTALL
-    assert '/bin/mv "$PROJECT_DIR/build" "$SOURCE_BUILD_BACKUP"' in INSTALL
-    assert 'SOURCE_BUILD_ISOLATED=1' in INSTALL
-    assert 'restore_source_build' in INSTALL
-    assert 'rm -rf "$PROJECT_DIR/build"' in INSTALL
-
-
-def test_build_directory_is_restored_before_wheel_temp_cleanup() -> None:
-    cleanup = INSTALL.index('cleanup_install() {')
-    restore = INSTALL.index('restore_source_build', cleanup)
-    wheel_cleanup = INSTALL.index('rm -rf "$WHEEL_BUILD_DIR"', cleanup)
-    assert restore < wheel_cleanup
+def test_current_tree_wheel_does_not_use_a_stale_build_folder() -> None:
+    history = source_history()
+    sim, checkout, steps = history.sim, history.projects["checkout"], history.steps
+    install = steps["install"]
+    assert install.result.returncode == 0, install.result.output
+    assert install.runtime_after["pudge/web/app.js"] == b"// Pudge 9.8.7 work in progress\n"
+    # The developer's build/ folder is back as it was after both installs (the second one's
+    # wheel build failed), and no temporary wheel folder is left.
+    assert steps["wheel_fails"].result.returncode != 0
+    assert tree(checkout / "build") == {"lib/pudge/web/app.js": b"// stale build output\n"}
+    assert list(sim.tmp.iterdir()) == []

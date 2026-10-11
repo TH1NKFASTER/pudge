@@ -3,14 +3,18 @@
 (() => {
   let pendingResolve = null;
   let pendingDanger = false;
+  let pendingChoice = false;
 
   const finish = value => {
     const backdrop = document.getElementById('pudgeConfirmBackdrop');
     if (backdrop) backdrop.classList.remove('open');
     const resolve = pendingResolve;
+    const choice = pendingChoice;
     pendingResolve = null;
     pendingDanger = false;
-    if (resolve) resolve(Boolean(value));
+    pendingChoice = false;
+    // A dialog with a choice resolves to the chosen value (null when cancelled).
+    if (resolve) resolve(choice ? (value ? document.getElementById('pudgeConfirmChoice').value : null) : Boolean(value));
   };
 
   const ensureDialog = () => {
@@ -26,9 +30,13 @@
       .pudge-confirm-head img{width:42px;height:42px;object-fit:contain;flex:0 0 auto;filter:drop-shadow(0 0 8px rgba(118,219,255,.28))}
       .pudge-confirm-head strong{font-size:16px}
       .pudge-confirm-message{margin:0;color:#dbe7f6;font-size:14px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}
+      .pudge-confirm-choice{display:grid;gap:6px;color:#dbe7f6;font-size:13px}
+      .pudge-confirm-choice[hidden]{display:none}
+      .pudge-confirm-choice select{width:100%}
       .pudge-confirm-actions{display:flex;justify-content:flex-end;gap:8px}
       .pudge-confirm-actions button{min-width:92px}
-      .pudge-confirm-actions .confirm{background:#6f8cff;border-color:#6f8cff;color:white}
+      .pudge-confirm-actions button[hidden]{display:none}
+      .pudge-confirm-actions .confirm{background:#4a68e0;border-color:#4a68e0;color:white}
       .pudge-confirm-actions .confirm.danger{background:#b42336;border-color:#ff6b7d;color:#fff}
       .pudge-confirm-actions .confirm.danger:hover{background:#cf2d43}
     `;
@@ -44,9 +52,10 @@
           <strong id="pudgeConfirmTitle">Pudge</strong>
         </div>
         <p id="pudgeConfirmMessage" class="pudge-confirm-message"></p>
+        <label class="pudge-confirm-choice" id="pudgeConfirmChoiceRow" hidden><span id="pudgeConfirmChoiceLabel"></span><select id="pudgeConfirmChoice"></select></label>
         <div class="pudge-confirm-actions">
-          <button type="button" data-pudge-confirm="cancel">Cancel</button>
-          <button type="button" class="confirm" data-pudge-confirm="ok">Confirm</button>
+          <button type="button" data-pudge-confirm="cancel">${PudgeI18n.t('action.cancel')}</button>
+          <button type="button" class="confirm" data-pudge-confirm="ok">${PudgeI18n.t('ui.confirm')}</button>
         </div>
       </div>
     `;
@@ -87,19 +96,36 @@
     }
 
     const backdrop = ensureDialog();
-    const lang = String(window.ui?.lang || document.documentElement.lang || 'en').toLowerCase();
     const danger = Boolean(options?.danger);
     document.getElementById('pudgeConfirmMessage').textContent = String(message ?? '');
     document.getElementById('pudgeConfirmTitle').textContent = String(options?.title || 'Pudge');
 
     const cancel = backdrop.querySelector('[data-pudge-confirm="cancel"]');
     const ok = backdrop.querySelector('[data-pudge-confirm="ok"]');
-    cancel.textContent = lang.startsWith('ru') ? 'Отмена' : 'Cancel';
-    ok.textContent = String(options?.confirmText || (lang.startsWith('ru') ? 'Подтвердить' : 'Confirm'));
+    cancel.textContent = PudgeI18n.t('action.cancel');
+    // A notice (options.alert) has only the OK button.
+    cancel.hidden = Boolean(options?.alert);
+    ok.textContent = String(options?.confirmText || PudgeI18n.t('ui.confirm'));
     ok.classList.toggle('danger', danger);
+    const choice = options?.choice && Array.isArray(options.choice.options) ? options.choice : null;
+    const choiceRow = document.getElementById('pudgeConfirmChoiceRow');
+    const select = document.getElementById('pudgeConfirmChoice');
+    choiceRow.hidden = !choice;
+    select.replaceChildren();
+    if (choice) {
+      document.getElementById('pudgeConfirmChoiceLabel').textContent = String(choice.label || '');
+      for (const item of choice.options) {
+        const option = document.createElement('option');
+        option.value = String(item.value);
+        option.textContent = String(item.label ?? item.value);
+        select.appendChild(option);
+      }
+      select.value = String(choice.value ?? '');
+    }
 
     pendingResolve = resolve;
     pendingDanger = danger;
+    pendingChoice = Boolean(choice);
     backdrop.classList.add('open');
     requestAnimationFrame(() => ok.focus());
   });

@@ -8,6 +8,8 @@ from pudge.anilist_tracking import TrackingPayload, create_tracking_file
 from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.manager_models import LibraryAnime, LibraryEpisode
+from test_anilist_lua import of, tracker
+from tests.lua_harness import needs_lua
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -51,9 +53,7 @@ def test_finished_short_video_keeps_duration_for_watch_evidence(tmp_path: Path) 
     assert episode.playback_duration == 360.0
 
 
-def test_short_planned_special_auto_completes_and_updates_local_card(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_short_planned_special_auto_completes_and_updates_local_card(tmp_path: Path, monkeypatch) -> None:
     cfg = _config(tmp_path)
     video = tmp_path / "Short Special.mkv"
     video.write_bytes(b"video")
@@ -120,8 +120,33 @@ def test_short_planned_special_auto_completes_and_updates_local_card(
     assert episode.delete_after is not None
 
 
-def test_mpv_samples_active_watch_time_every_second() -> None:
-    source = Path("pudge/mpv_scripts/pudge_anilist.lua").read_text(encoding="utf-8")
-    assert "local active_timer = nil" in source
-    assert "mp.add_periodic_timer(1.0, accumulate_active_time)" in source
-    assert "if active_timer then active_timer:stop() end" in source
+@needs_lua
+def test_mpv_samples_active_watch_time_every_second(tmp_path: Path) -> None:
+    # Active time was sampled only at the 30 s saves with each sample capped at 5 s:
+    # real watching was undercounted six times and short movies never completed.
+    env = {
+        "PUDGE_PLAYBACK_ENABLED": "1",
+        "PUDGE_PLAYBACK_VIDEO": "/media/Movie.mkv",
+        "PUDGE_PLAYBACK_INTERVAL": "30",
+    }
+    log = tracker(
+        tmp_path,
+        """
+        sim.set('duration', 600); sim.set('time-pos', 0)
+        sim.fire('file-loaded')
+        sim.play(61)
+        sim.fire('end-file')
+        sim.play(100)                       -- nothing is playing any more
+        sim.fire('shutdown')
+        sim.fire('file-loaded')             -- the next file samples again
+        sim.play(31)
+    """,
+        env,
+    )
+    saves = of(log, "subprocess", "--playback-save")
+    active = [float(save.split("--playback-active-seconds ", 1)[1].split()[0]) for save in saves]
+    assert len(active) == 5
+    assert all(29 < seconds < 31 for seconds in active[:2])  # the periodic saves at 30 s and 60 s
+    assert active[2] < 2  # end-file: the second since the last save
+    assert active[3] <= 5  # shutdown after 100 idle seconds
+    assert 29 < active[4] < 31

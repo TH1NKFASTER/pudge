@@ -20,6 +20,8 @@ recursive = true
 cover_cache_dir = "~/Library/Caches/pudge/covers"
 disk_limit_enabled = true
 disk_limit_gb = 500.0
+# Free space kept on the download disk; 0 = automatic (max(20 GB, 5 % of the disk)).
+disk_free_reserve_gb = 0.0
 
 [nyaa]
 enabled = true
@@ -86,23 +88,20 @@ keep_batch_until_completed = true
 enabled = true
 rewind_seconds = 15.0
 save_interval_seconds = 30.0
-# Detect openings/endings locally from the audio of finished episodes
-# (background, only when nothing else runs; needs FFmpeg).
-intro_detection_enabled = true
-# Skip button in mpv while a detected opening/ending plays (manual by default).
+# Skip button in mpv for the first seconds of an opening/ending. While it is
+# on, Pudge detects openings/endings locally from the audio of finished
+# episodes (background, only when nothing else runs; needs FFmpeg).
 skip_segments_enabled = true
-auto_skip_intro = false
-auto_skip_outro = false
+# Play 5.1/7.1 audio as stereo in mpv. macOS renders surround audio spatially
+# in AirPods even with Spatial Audio off in Control Center.
+stereo_downmix = false
 
 [shortcuts]
-app_watching = "Cmd+1"
-app_planning = "Cmd+2"
-app_library = "Cmd+3"
-app_settings = "Cmd+4"
-app_planning_search = "Cmd+F"
 mpv_mark_watched = "Ctrl+a"
 # Skip the opening/ending; bound only while the skip button is visible.
 mpv_skip_segment = "Tab"
+# System-wide shortcut for the Screen text panel (OCR of the game window); "" turns it off.
+screen_text_toggle = "Meta+Alt+Shift+v"
 
 [diagnostics]
 energy_monitoring_enabled = true
@@ -112,18 +111,13 @@ energy_sample_seconds = 30.0
 manual_energy_saving = false
 auto_battery_energy_saving = true
 
-[companion]
-# Disabled until a companion client is paired. Keep 127.0.0.1 for local-only
-# development; use 0.0.0.0 only on a trusted LAN.
-enabled = false
-bind_host = "127.0.0.1"
-port = 47821
-pairing_ttl_seconds = 300.0
-max_events_per_request = 500
-
 [tools]
 mpv = "mpv"
-manga_ocr_backend = "pudge"
+# Manga OCR runs Mokuro. Optional: Python of an existing Mokuro environment
+# (empty = the one installed from Settings).
+manga_mokuro_python = ""
+# OCR library manga in the background (mains power, Pudge window not in front).
+manga_background_ocr = false
 ffmpeg = "ffmpeg"
 ffprobe = "ffprobe"
 alass = "alass"

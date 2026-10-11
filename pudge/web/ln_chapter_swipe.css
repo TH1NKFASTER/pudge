@@ -1,0 +1,30 @@
+/* LN reader: overscroll past the chapter edge to open the next / previous chapter. */
+.ln-chapter-swipe{position:fixed;z-index:9040;overflow:hidden;pointer-events:none;--ln-swipe-shift:0px;--ln-swipe-progress:0}
+.ln-chapter-swipe[hidden]{display:none}
+.ln-chapter-swipe-indicator{position:absolute;display:flex;align-items:center;gap:9px;box-sizing:border-box;max-width:min(460px,calc(100% - 32px));padding:6px 14px 6px 6px;border:1px solid rgba(133,171,216,.35);border-radius:999px;background:rgba(14,27,44,.92);color:#dfe8f5;font:600 12px/1.3 -apple-system,BlinkMacSystemFont,"Hiragino Sans",sans-serif;box-shadow:0 10px 30px rgba(0,0,0,.4);white-space:nowrap}
+.ln-chapter-swipe-chip{flex:0 0 auto;display:grid;place-items:center;width:38px;height:38px;border-radius:50%;background:conic-gradient(var(--accent) calc(var(--ln-swipe-progress) * 360deg),rgba(133,171,216,.22) 0)}
+.ln-chapter-swipe-arrow{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#0e1b2c;font-size:17px;font-weight:800;transition:background .12s ease,color .12s ease}
+.ln-chapter-swipe.ready .ln-chapter-swipe-arrow{background:var(--accent);color:#fff}
+.ln-chapter-swipe.edge .ln-chapter-swipe-chip{display:none}
+.ln-chapter-swipe.edge .ln-chapter-swipe-indicator{padding:8px 14px}
+.ln-chapter-swipe-label{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.ln-chapter-swipe[data-side="bottom"] .ln-chapter-swipe-indicator{left:50%;top:100%;transform:translate(-50%,calc(-1 * var(--ln-swipe-shift)))}
+.ln-chapter-swipe[data-side="top"] .ln-chapter-swipe-indicator{left:50%;bottom:100%;transform:translate(-50%,var(--ln-swipe-shift))}
+/* Sideways (vertical text, pages) the chip stays inside the reader box at its edge, vertically
+   centred: it moves in 16 px and fades in as it fills, so the whole label is always visible. */
+.ln-chapter-swipe[data-side="left"] .ln-chapter-swipe-indicator{top:50%;left:16px;opacity:calc(.35 + .65 * var(--ln-swipe-progress));transform:translate(calc((var(--ln-swipe-progress) - 1) * 16px),-50%)}
+.ln-chapter-swipe[data-side="right"] .ln-chapter-swipe-indicator{top:50%;right:16px;opacity:calc(.35 + .65 * var(--ln-swipe-progress));transform:translate(calc((1 - var(--ln-swipe-progress)) * 16px),-50%)}
+.ln-chapter-swipe.springing .ln-chapter-swipe-indicator{transition:transform .2s cubic-bezier(.2,.9,.3,1.2),opacity .2s ease}
+/* The page slides away from the side the next chapter comes from, and the new one slides in from it. */
+#lnReader.ln-chapter-swipe-out{transition:transform .2s ease-in,opacity .2s ease-in;opacity:0}
+#lnReader.ln-chapter-swipe-out[data-ln-swipe-side="bottom"]{transform:translateY(-96px)}
+#lnReader.ln-chapter-swipe-out[data-ln-swipe-side="top"]{transform:translateY(96px)}
+#lnReader.ln-chapter-swipe-out[data-ln-swipe-side="left"]{transform:translateX(96px)}
+#lnReader.ln-chapter-swipe-out[data-ln-swipe-side="right"]{transform:translateX(-96px)}
+#lnReader.ln-chapter-swipe-in{transition:none;opacity:0}
+#lnReader.ln-chapter-swipe-in[data-ln-swipe-side="bottom"]{transform:translateY(96px)}
+#lnReader.ln-chapter-swipe-in[data-ln-swipe-side="top"]{transform:translateY(-96px)}
+#lnReader.ln-chapter-swipe-in[data-ln-swipe-side="left"]{transform:translateX(-96px)}
+#lnReader.ln-chapter-swipe-in[data-ln-swipe-side="right"]{transform:translateX(96px)}
+#lnReader.ln-chapter-swipe-settle{transition:transform .2s ease-out,opacity .2s ease-out}
+@media (prefers-reduced-motion:reduce){.ln-chapter-swipe-indicator,#lnReader.ln-chapter-swipe-out,#lnReader.ln-chapter-swipe-settle{transition:none!important}}

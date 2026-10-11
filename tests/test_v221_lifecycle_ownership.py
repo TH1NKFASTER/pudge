@@ -1,22 +1,15 @@
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
-import threading
-import time
-import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from PIL import Image
 
-from pudge import manga as manga_module
 from pudge.config import AppConfig
 from pudge.database import Database
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
-from pudge.manga import MangaService
 from pudge.task_supervisor import TaskSupervisor
 from pudge.web_app import WebAppApi
 from pudge.work_scheduler import WorkPriority, WorkScheduler
@@ -128,9 +121,7 @@ def test_stale_subtitle_owner_cannot_commit_over_fresh_generation(tmp_path: Path
     assert db.episode_by_path(video).subtitle_path == fresh_subtitle
 
 
-def test_manager_ready_commit_carries_claim_generation_and_owner(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_manager_ready_commit_carries_claim_generation_and_owner(tmp_path: Path, monkeypatch) -> None:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -141,9 +132,7 @@ def test_manager_ready_commit_carries_claim_generation_and_owner(
     prepared = tmp_path / "prepared.srt"
     video.write_bytes(b"video")
     prepared.write_text("subtitle", encoding="utf-8")
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=42, title="Example", episodes=1, format="TV")
-    )
+    manager.db.upsert_anime(LibraryAnime(media_id=42, title="Example", episodes=1, format="TV"))
     manager.db.upsert_episode(
         LibraryEpisode(
             media_id=42,
@@ -221,118 +210,3 @@ def test_task_supervisor_drains_verbose_child_without_pipe_deadlock() -> None:
         assert supervisor._processes == {}
     finally:
         supervisor.shutdown()
-
-
-class _Lease:
-    def release(self) -> None:
-        return None
-
-
-class _YieldScheduler:
-    def __init__(self) -> None:
-        self.yield_now = False
-        self.yield_after_first = True
-
-    def wait_until_background(self, **_kwargs) -> bool:
-        return True
-
-    def acquire_heavy(self, *_args, **_kwargs):
-        return _Lease()
-
-    def should_yield_to_higher_priority(self, _priority) -> bool:
-        return self.yield_now
-
-
-def test_volume_ocr_preemption_checkpoints_completed_pages_and_resumes(
-    tmp_path: Path, monkeypatch
-) -> None:
-    db = Database(tmp_path / "library.sqlite3")
-    archive = tmp_path / "book.cbz"
-    with zipfile.ZipFile(archive, "w") as zf:
-        for index in range(2):
-            image_path = tmp_path / f"{index}.png"
-            Image.new("RGB", (24, 24), "white").save(image_path)
-            zf.write(image_path, arcname=f"{index}.png")
-    now = time.time()
-    with db.connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO manga_books(path,title,page_count,position,reading_direction,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (str(archive), "Book", 2, 0, "rtl", now, now),
-        )
-        book_id = int(cursor.lastrowid)
-
-    scheduler = _YieldScheduler()
-    service = MangaService(db, cache_dir=tmp_path / "cache", work_scheduler=scheduler)
-    monkeypatch.setattr(service, "ocr_available", lambda **_kwargs: True)
-    monkeypatch.setattr(service, "_vision_text_regions", lambda _image: [])
-    manifests: list[list[int]] = []
-
-    class FakePopen:
-        def __init__(self, command, **_kwargs):
-            self.command = list(command)
-            self.returncode = None
-            manifest_path = Path(self.command[-4])
-            output_path = Path(self.command[-3])
-            progress_path = Path(self.command[-2])
-            stop_path = Path(self.command[-1])
-            pages = json.loads(manifest_path.read_text(encoding="utf-8"))["pages"]
-            manifests.append([int(item["page_index"]) for item in pages])
-
-            def run() -> None:
-                output_path.write_text("", encoding="utf-8")
-                with output_path.open("a", encoding="utf-8") as output:
-                    for done, item in enumerate(pages, start=1):
-                        page_index = int(item["page_index"])
-                        output.write(json.dumps({"page_index": page_index, "regions": []}) + "\n")
-                        output.flush()
-                        progress_path.write_text(
-                            json.dumps({"done": done, "total": len(pages), "page_index": page_index}),
-                            encoding="utf-8",
-                        )
-                        if scheduler.yield_after_first and done == 1:
-                            scheduler.yield_now = True
-                        deadline = time.monotonic() + 2
-                        while scheduler.yield_after_first and done == 1 and not stop_path.exists():
-                            if time.monotonic() >= deadline:
-                                self.returncode = 2
-                                return
-                            time.sleep(0.01)
-                        if stop_path.exists():
-                            self.returncode = 75
-                            return
-                self.returncode = 0
-
-            self.thread = threading.Thread(target=run, daemon=True)
-            self.thread.start()
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self, timeout=None):
-            self.thread.join(timeout)
-            if self.thread.is_alive():
-                raise subprocess.TimeoutExpired(self.command, timeout)
-            return self.returncode
-
-        def terminate(self):
-            self.returncode = -15
-
-        def kill(self):
-            self.returncode = -9
-
-    monkeypatch.setattr(manga_module.subprocess, "Popen", FakePopen)
-
-    first = service.ocr_book(book_id)
-    assert first["preempted"] is True
-    assert first["cached_pages"] == 1
-    assert first["complete"] is False
-    assert manifests == [[0, 1]]
-
-    scheduler.yield_now = False
-    scheduler.yield_after_first = False
-    second = service.ocr_book(book_id)
-    assert second["ok"] is True
-    assert second["complete"] is True
-    assert second["cached_pages"] == 2
-    assert manifests == [[0, 1], [1]]

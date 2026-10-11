@@ -9,9 +9,13 @@ def normalize_torrent_state(raw: str) -> str:
     state = str(raw or "").strip().casefold()
     if state in {"paused", "stopped", "pauseddl", "pausedup", "stoppeddl", "stoppedup"}:
         return "paused"
-    if state in {"queued", "waiting", "queueddl", "queuedup"}:
+    # qBittorrent *UP states belong to a finished download that is seeding (or
+    # waiting to seed); they are never "waiting for the download".
+    if state in {"stalledup", "queuedup"}:
+        return "seeding"
+    if state in {"queued", "waiting", "queueddl"}:
         return "queued"
-    if state in {"stalled", "stalleddl", "stalledup"}:
+    if state in {"stalled", "stalleddl"}:
         return "stalled"
     if state in {"checking", "checkingdl", "checkingup", "checkingresumdata", "moving", "allocating"}:
         return "checking"

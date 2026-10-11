@@ -13,6 +13,7 @@ from pudge.database import LATEST_SCHEMA_VERSION, Database
 from pudge.providers.nyaa import SCORE_FORMULA_VERSION, score_context_key, seadex_fingerprint
 from pudge.providers.seadex import SeaDexRecommendation
 
+from tests.i18n_support import en, ru
 from tests.test_manager import _upgrade_manager, _upgrade_release
 
 
@@ -109,7 +110,9 @@ def _run(manager, monkeypatch, releases, caplog) -> list[str]:
     added: list[str] = []
     monkeypatch.setattr(manager, "search_releases", lambda *a, **k: list(releases))
     monkeypatch.setattr(
-        manager, "add_release", lambda _media_id, release, **_kwargs: added.append(release.info_hash)
+        manager,
+        "add_release",
+        lambda _media_id, release, **_kwargs: added.append(release.info_hash) or True,
     )
     manager.logger.addHandler(caplog.handler)
     manager.logger.setLevel(logging.INFO)
@@ -174,10 +177,19 @@ def test_add_release_records_context(tmp_path: Path) -> None:
     manager = _upgrade_manager(tmp_path)
     release = _stamp(_upgrade_release("c" * 40, 120.0), "ctx-9")
     manager.db.record_release(
-        release.info_hash, 700, 5, release.title, release.score,
-        score_formula=release.score_formula, score_context=release.score_context,
+        release.info_hash,
+        700,
+        5,
+        release.title,
+        release.score,
+        score_formula=release.score_formula,
+        score_context=release.score_context,
     )
-    assert manager.db.release_score_record(700, 5, release.info_hash) == (120.0, SCORE_FORMULA_VERSION, "ctx-9")
+    assert manager.db.release_score_record(700, 5, release.info_hash) == (
+        120.0,
+        SCORE_FORMULA_VERSION,
+        "ctx-9",
+    )
 
 
 class _FakeSeaDex:
@@ -200,13 +212,43 @@ def test_automatic_seadex_lookup_is_cache_only(tmp_path: Path, monkeypatch) -> N
     assert manager._seadex_for_search(700, automatic=True) is None
 
 
-def test_release_card_shows_seadex_label_only_for_exact_match() -> None:
-    html = (Path(__file__).resolve().parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "function releaseSeadexBadge(r)" in html
-    assert "reasons.includes('seadex-exact')" in html
-    assert "${releaseSeadexBadge(r)}<strong" in html
-    assert "'release.seadexPreferred':'Рекомендован SeaDex'" in html
-    assert "'release.seadexPreferred':'SeaDex recommended'" in html
+def test_release_card_shows_seadex_label_only_for_exact_match(page) -> None:
+    assert ru("release.seadexPreferred") == "Рекомендован SeaDex"
+    assert en("release.seadexPreferred") == "SeaDex recommended"
+    releases = [
+        {"title": "Best", "reasons": ["seadex-exact", "seadex-preferred", "seadex-bonus=60"]},
+        {"title": "Alt", "reasons": ["seadex-exact", "seadex-alternative", "seadex-bonus=40"]},
+        {
+            "title": "Same group only",
+            "reasons": ["seadex-alternative", "seadex-group"],
+        },  # not this exact torrent
+        {"title": "Plain", "reasons": []},
+    ]
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            await openRelease(7, 3, false);
+            const label = row => { const first = row.querySelector('.release-main').firstElementChild;
+                                   return first.matches('.release-seadex') ? first.textContent : null; };
+            return {rows: [...document.querySelectorAll('#modalBody .release-row')].map(row => [row.querySelector('strong').textContent, label(row)]),
+                    texts: [t('release.seadexPreferred'), t('release.seadexAlternative')]};
+            """,
+            lang=lang,
+            api={
+                "search_releases": [
+                    {**release, "seeders": 5, "downloads": 9, "size_text": "1 GiB", "group": "G"}
+                    for release in releases
+                ]
+            },
+        )
+        preferred, alternative = result.value["texts"]
+        # The label sits before the release title.
+        assert result.value["rows"] == [
+            ["Best", preferred],
+            ["Alt", alternative],
+            ["Same group only", None],
+            ["Plain", None],
+        ]
 
 
 def test_search_results_are_stamped_with_one_context(tmp_path: Path, monkeypatch) -> None:

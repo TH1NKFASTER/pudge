@@ -1,4 +1,5 @@
 """Unified torrent UI must distinguish cached metadata from observed traffic."""
+
 from __future__ import annotations
 
 import logging
@@ -59,6 +60,7 @@ const fixed=1900000000;
 const now=()=>fixed;
 const sandbox={Date:{now:()=>fixed*1000},console};
 vm.createContext(sandbox);
+require(require('node:path').resolve('tests/js/i18n_prelude.cjs')).loadI18n(sandbox,'pudge/web');
 vm.runInContext(helper,sandbox);
 const state=(raw,progress=.4)=>({state:raw,progress});
 assert.equal(sandbox.torrentUiState(state('queuedDL'),true),'waiting');
@@ -77,7 +79,9 @@ assert.equal(sandbox.torrentSnapshotFresh({enabled:true,observed_at:fixed-2}, {e
 assert.equal(sandbox.torrentSnapshotFresh({enabled:true,observed_at:fixed-2}, {enabled:true,stale:false,updated_at:fixed},true,fixed),true);
 const elements={};
 sandbox.$=id=>elements[id]??(elements[id]={innerHTML:'',classList:{contains:()=>true}});
-sandbox.t=(key)=>key;
+// index.html's own t()/tn() over the catalogs (audit 68Б).
+sandbox.document={getElementById:()=>null};
+vm.runInContext(html.slice(html.indexOf('function appName(){'),html.indexOf('\n',html.indexOf('function tn(key,'))),sandbox);
 sandbox.escapeHtml=value=>String(value??'');
 sandbox.torrentRate=value=>`${value} B/s`;
 sandbox.torrentBytes=value=>`${value} bytes`;
@@ -107,7 +111,6 @@ assert.equal(sandbox.compactDownloadStatus({state:'pausedDL',progress:.4}),'Paus
 assert.equal(sandbox.compactDownloadStatus({state:'downloading',progress:.4}),'40%');
 // A downloadable Home card labels only a currently observed active transfer.
 sandbox.cover=()=>'';
-sandbox.t=(key,args)=>key==='label.downloading'?`Downloading: ${args.progress}%`:key;
 vm.runInContext(slice('function downloadAvailableHomeCard(a){','function caughtUpHomeCard(a){'),sandbox);
 const cardData={media_id:42,title:'Sample',download:{state:'downloading',progress:.4,name:'Sample'}};
 let card=sandbox.downloadAvailableHomeCard(cardData);

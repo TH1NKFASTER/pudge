@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .word_states import WORD_STATE_PRIORITY, canonical_state, normalized_word_state
+
 JPDB_PARSER_SCHEMA = "jpdb-v1"
 JPDB_POSITION_ENCODING = "utf16"
 JPDB_TOKEN_FIELDS = ["vocabulary_index", "position", "length", "furigana"]
@@ -186,18 +188,13 @@ def convert_parse_result(paragraphs: list[str], result: Any) -> dict[str, Any]:
 
 
 def normalized_jpdb_state(states: list[str], in_deck: bool) -> str:
+    """jpdb card state as one of Pudge's nine word states (Jiten's priority):
+    learning -> young, known -> mature, never-forget -> mastered, failed -> due."""
     lowered = {str(state).casefold() for state in states}
     if not in_deck and not lowered:
-        return "new"
-    if "blacklisted" in lowered:
-        return "blacklisted"
-    if lowered & {"due", "failed"}:
-        return "due"
-    if lowered & {"known", "never-forget"}:
-        return "known"
-    if "learning" in lowered:
-        return "learning"
-    if "new" in lowered:
-        return "new"
-    # suspended / locked / unrecognized states are not guessed into new/known.
+        return "not_in_deck"
+    names = {canonical_state(state) for state in lowered}
+    if names & set(WORD_STATE_PRIORITY) or "new" in names:
+        return normalized_word_state(sorted(names), in_deck=True)
+    # locked / unrecognized states are not guessed into new/known.
     return "unknown"

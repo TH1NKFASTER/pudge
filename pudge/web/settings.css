@@ -8,3 +8,13 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
 
 .jiten-devtools-callout{grid-column:1/-1}
+
+/* Collapsible groups indent their content one level from their summary (nested groups
+   cumulatively): the content is padded in, the summary pulled back to the group's edge. */
+#settingsContent details{--settings-indent:18px;padding-inline-start:var(--settings-indent)}
+#settingsContent details.setting-block{padding-inline-start:calc(16px + var(--settings-indent))}
+#settingsContent details details.setting-block{padding-inline-start:var(--settings-indent)}
+#settingsContent details>summary{margin-inline-start:calc(-1 * var(--settings-indent))}
+/* A grid inside a group that spans a settings grid (grade keys) keeps its controls in the
+   outer grid's control column: its label column is shorter by the indent. */
+@media (min-width:901px){#settingsContent .form-grid>details .form-grid{grid-template-columns:minmax(calc(190px - var(--settings-indent)),calc(28% - .72 * var(--settings-indent))) minmax(0,1fr)}}

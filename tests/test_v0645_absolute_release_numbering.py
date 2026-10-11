@@ -124,10 +124,34 @@ def test_release_episode_context_uses_cached_relation_graph_without_anilist(tmp_
         "root_id": 5,
         "nodes": [
             {"media_id": 1, "title": "BLEACH", "format": "TV", "episodes": 366, "start_date": "2004-10-05"},
-            {"media_id": 2, "title": "BLEACH: Sennen Kessen-hen", "format": "TV", "episodes": 13, "start_date": "2022-10-11"},
-            {"media_id": 3, "title": "BLEACH: Sennen Kessen-hen - Ketsubetsu-tan", "format": "TV", "episodes": 13, "start_date": "2023-07-08"},
-            {"media_id": 4, "title": "BLEACH: Sennen Kessen-hen - Soukoku-tan", "format": "TV", "episodes": 14, "start_date": "2024-10-05"},
-            {"media_id": 5, "title": "BLEACH: Sennen Kessen-hen - Kashin-tan", "format": "TV", "episodes": 10, "start_date": "2026-07-25"},
+            {
+                "media_id": 2,
+                "title": "BLEACH: Sennen Kessen-hen",
+                "format": "TV",
+                "episodes": 13,
+                "start_date": "2022-10-11",
+            },
+            {
+                "media_id": 3,
+                "title": "BLEACH: Sennen Kessen-hen - Ketsubetsu-tan",
+                "format": "TV",
+                "episodes": 13,
+                "start_date": "2023-07-08",
+            },
+            {
+                "media_id": 4,
+                "title": "BLEACH: Sennen Kessen-hen - Soukoku-tan",
+                "format": "TV",
+                "episodes": 14,
+                "start_date": "2024-10-05",
+            },
+            {
+                "media_id": 5,
+                "title": "BLEACH: Sennen Kessen-hen - Kashin-tan",
+                "format": "TV",
+                "episodes": 10,
+                "start_date": "2026-07-25",
+            },
         ],
         "edges": [
             {"source": 1, "target": 2, "relation_type": "SEQUEL"},
@@ -216,6 +240,7 @@ def test_jojo_stage_accepts_s06e02_as_absolute_episode_two() -> None:
         (2,),
     )
 
+
 def test_jojo_real_graph_limits_release_numbering_to_steel_ball_run() -> None:
     """The related Stone Ocean arc has a separate release numbering scale."""
     from pudge.episode_numbering import episode_numbering_from_graph
@@ -285,7 +310,13 @@ def test_normal_previous_season_does_not_create_near_stage_alias() -> None:
         "root_id": 2,
         "nodes": [
             {"media_id": 1, "title": "Example Show", "format": "TV", "episodes": 12, "season_year": 2025},
-            {"media_id": 2, "title": "Example Show Season 2", "format": "TV", "episodes": 12, "season_year": 2026},
+            {
+                "media_id": 2,
+                "title": "Example Show Season 2",
+                "format": "TV",
+                "episodes": 12,
+                "season_year": 2026,
+            },
         ],
         "edges": [
             {"source": 1, "target": 2, "relation_type": "SEQUEL"},
@@ -425,7 +456,6 @@ def test_jojo_real_anilist_stage_title_searches_bare_series_alias_before_number_
     assert ranked
     assert ranked[0].title == release.title
     assert "absolute-ep=2" in ranked[0].reasons
-
 
 
 def test_jojo_toons_hub_stage_release_survives_relation_root_negative_title() -> None:

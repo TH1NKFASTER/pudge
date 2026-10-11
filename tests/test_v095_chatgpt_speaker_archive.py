@@ -1,3 +1,5 @@
+"""Speaker markup archive for ChatGPT, character voices without an LLM (behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
 import json
@@ -9,6 +11,7 @@ import pytest
 import pudge.web_app as web_app_module
 from pudge.config import AppConfig, write_config
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en
 
 
 def _api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebAppApi:
@@ -42,10 +45,16 @@ def _insert_volume(api: WebAppApi, tmp_path: Path, *, title: str, volume: int, t
     return book_id
 
 
-def test_export_is_one_series_archive_with_all_local_volumes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_is_one_series_archive_with_all_local_volumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _api(tmp_path, monkeypatch)
-    first = _insert_volume(api, tmp_path, title="Series Vol. 1", volume=1, text="地の文。「一巻の台詞」続き。")
-    second = _insert_volume(api, tmp_path, title="Series Vol. 2", volume=2, text="地の文。「二巻の台詞」続き。")
+    first = _insert_volume(
+        api, tmp_path, title="Series Vol. 1", volume=1, text="地の文。「一巻の台詞」続き。"
+    )
+    second = _insert_volume(
+        api, tmp_path, title="Series Vol. 2", volume=2, text="地の文。「二巻の台詞」続き。"
+    )
 
     result = api.export_light_novel_speaker_markup(first)
     archive = Path(result["path"])
@@ -156,9 +165,7 @@ def test_import_rejects_changed_source_hash(tmp_path: Path, monkeypatch: pytest.
         "books": [
             {
                 "book_id": book_id,
-                "chapters": [
-                    {"chapter_index": 0, "source_sha256": "wrong", "assignments": []}
-                ],
+                "chapters": [{"chapter_index": 0, "source_sha256": "wrong", "assignments": []}],
             }
         ],
     }
@@ -168,11 +175,28 @@ def test_import_rejects_changed_source_hash(tmp_path: Path, monkeypatch: pytest.
         api.import_light_novel_speaker_markup(book_id, str(path))
 
 
-def test_v95_archive_backend_and_manual_character_voices_remain_available_without_llm_gate() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
+def test_character_voices_need_irodori_but_not_an_llm(page) -> None:
+    # Voices come from imported speaker markup (the ChatGPT archive) too: the switch must not
+    # wait for an LLM to be configured.
+    assert en("ui.differentCharacterVoices") == "Different character voices"
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('settings'); await __tick(100);
+            const box = $('s_ln_character_voices');
+            const view = () => ({disabled: box.disabled, reason: box.closest('[data-tooltip]')?.dataset.tooltip || ''});
+            const out = {label: box.closest('label').innerText.trim(), off: view()};
+            await __input('#s_ln_audiobook_provider', 'irodori'); out.irodori = view();
+            out.llm = $('s_llm_enabled').checked;
+            out.expected = {label: PudgeI18n.t('ui.differentCharacterVoices'), reason: PudgeI18n.t('ui.availableOnlyWithIrodori')};
+            return out;
+            """,
+            lang=lang,
+            state={"settings": {"llm_enabled": False}},
+        )
+        out = result.value
+        assert out["label"] == out["expected"]["label"]
+        assert out["off"] == {"disabled": True, "reason": out["expected"]["reason"]}
+        assert out["llm"] is False and out["irodori"] == {"disabled": False, "reason": ""}
     assert hasattr(WebAppApi, "export_light_novel_speaker_markup")
     assert hasattr(WebAppApi, "import_light_novel_speaker_markup")
-    assert "Different character voices" in html
-    availability = html.split("function syncConditionalSettings", 1)[1].split("function collectSettings", 1)[0]
-    assert "s_ln_character_voices'),audiobookProvider==='irodori'" in availability
-    assert "s_ln_character_voices'),audiobookProvider==='irodori'&&enabled('s_llm_enabled')" not in availability

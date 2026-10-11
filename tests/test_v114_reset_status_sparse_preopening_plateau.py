@@ -33,9 +33,7 @@ def test_reset_progress_does_not_create_watching_status_for_new_anime(
             progress=0,
         )
     )
-    db.upsert_episode(
-        LibraryEpisode(99114, "New Anime", 1, video, state="local")
-    )
+    db.upsert_episode(LibraryEpisode(99114, "New Anime", 1, video, state="local"))
     db.record_playback(video, 120.0, 1400.0, active_seconds=60.0)
 
     api = _api_for_database(db)
@@ -84,10 +82,7 @@ def test_reset_progress_preserves_planning_status(tmp_path: Path) -> None:
 
 def _write_reference(path: Path, starts: list[float]) -> None:
     write_srt(
-        [
-            (start, start + 0.8, f"line {index}")
-            for index, start in enumerate(starts, start=1)
-        ],
+        [(start, start + 0.8, f"line {index}") for index, start in enumerate(starts, start=1)],
         path,
     )
 

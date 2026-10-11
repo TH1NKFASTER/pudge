@@ -79,15 +79,20 @@ def test_generic_collection_volume_selection_requires_series_path() -> None:
 def test_search_discovers_series_inside_generic_audiobook_collection(monkeypatch) -> None:
     import pudge.web_app as web_app
 
-    payload = _bencode({
-        b"info": {
-            b"name": b"TMW Japanese Audiobooks Collection",
-            b"files": [
-                {b"length": 100, b"path": ["Other Series", "[02] 別作品II [B000].m4b"]},
-                {b"length": 200, b"path": ["[支倉 凍砂]", "狼と香辛料", "[02] 狼と香辛料II [B0C58KN4W9].m4b"]},
-            ],
+    payload = _bencode(
+        {
+            b"info": {
+                b"name": b"TMW Japanese Audiobooks Collection",
+                b"files": [
+                    {b"length": 100, b"path": ["Other Series", "[02] 別作品II [B000].m4b"]},
+                    {
+                        b"length": 200,
+                        b"path": ["[支倉 凍砂]", "狼と香辛料", "[02] 狼と香辛料II [B0C58KN4W9].m4b"],
+                    },
+                ],
+            }
         }
-    })
+    )
 
     class FakeNyaaClient:
         queries: list[str] = []
@@ -122,12 +127,14 @@ def test_search_discovers_series_inside_generic_audiobook_collection(monkeypatch
     monkeypatch.setattr(web_app, "NyaaClient", FakeNyaaClient)
     api = object.__new__(web_app.WebAppApi)
     api.light_novels = FakeLightNovels()
-    api.config = SimpleNamespace(nyaa=SimpleNamespace(
-        base_url="https://nyaa.invalid",
-        proxy_mode="direct",
-        proxy_url="",
-        pre_search_command="",
-    ))
+    api.config = SimpleNamespace(
+        nyaa=SimpleNamespace(
+            base_url="https://nyaa.invalid",
+            proxy_mode="direct",
+            proxy_url="",
+            pre_search_command="",
+        )
+    )
     api.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
 
     result = api.light_novel_search_audiobook_nyaa(42)
@@ -135,7 +142,5 @@ def test_search_discovers_series_inside_generic_audiobook_collection(monkeypatch
     assert len(result["matches"]) == 1
     match = result["matches"][0]
     assert match["generic_collection"] is True
-    assert match["selected_files"] == [
-        "[支倉 凍砂]/狼と香辛料/[02] 狼と香辛料II [B0C58KN4W9].m4b"
-    ]
+    assert match["selected_files"] == ["[支倉 凍砂]/狼と香辛料/[02] 狼と香辛料II [B0C58KN4W9].m4b"]
     assert any("Japanese Audiobooks Collection" in q for q in FakeNyaaClient.queries)

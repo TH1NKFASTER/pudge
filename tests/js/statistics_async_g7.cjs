@@ -1,7 +1,9 @@
 'use strict';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const path = require('node:path');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 
 const elements = new Map();
 const periods = ['7d', '30d', 'year', 'all', 'custom'].map(value => ({dataset:{statsPeriod:value}, classList:{toggle(){}}}));
@@ -36,9 +38,9 @@ const api={
   consumption_statistics_delete_history(){return Promise.resolve({ok:true});},
 };
 const window={pywebview:{api},addEventListener(){},pudgeConfirm(){return Promise.resolve(true)},toast(){}};
-vm.runInNewContext(fs.readFileSync(process.argv[2],'utf8'), {
-  window,document,setInterval(){},performance:{now:()=>0},console,
-}, {filename:'statistics.js'});
+const context=vm.createContext({window,document,setInterval(){},performance:{now:()=>0},console});
+loadI18n(context, path.dirname(process.argv[2]));
+vm.runInContext(fs.readFileSync(process.argv[2],'utf8'), context, {filename:'statistics.js'});
 const stats=window.PudgeStatistics;
 const body=elements.get('statsBody');
 function payload(n,rows=[],total=rows.length){return {summary:{total_seconds:n,active_days:1,sessions:1},days:[],breakdown:{},works:[],journal:rows,journal_total:total,media_options:[],timezone:{label:'local'}};}

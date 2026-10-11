@@ -52,7 +52,11 @@ def test_ln_audiobook_search_uses_audio_category_and_qbt_metadata_fallback(monke
             fallback_calls.append(release.info_hash)
             return [
                 {"index": 0, "name": "[支倉 凍砂]/狼と香辛料/[01] 狼と香辛料I.m4b", "size": 100},
-                {"index": 1, "name": "[支倉 凍砂]/狼と香辛料/[02] 狼と香辛料II [B0C58KN4W9].m4b", "size": 200},
+                {
+                    "index": 1,
+                    "name": "[支倉 凍砂]/狼と香辛料/[02] 狼と香辛料II [B0C58KN4W9].m4b",
+                    "size": 200,
+                },
             ]
 
         def close(self) -> None:

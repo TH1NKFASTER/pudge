@@ -1,17 +1,34 @@
+"""The window's backend (WebAppApi) and the anime pages of the window (behaviour; audit 71Б
+rewrite: window checks run the real index.html in node, tests/page_harness.py fixture `page`)."""
+
 from __future__ import annotations
 
+import json
+import sys
+import threading
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
+from css_support import css_rules
 from desktop_isolation import patch_webapp_popen
 
+from pudge import web_app
+from pudge.branding import APP_BUNDLE_ID, APP_NAME
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
-from pudge.manager_models import LibraryAnime
+from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.web_app import WebAppApi, _start_asset_server
+from tests.i18n_support import catalog, en, has_text, ru
 
 
-def make_api(tmp_path: Path) -> WebAppApi:
+def _downloaded(api):
+    """The Ready grouping behind Home (no longer sent to the window as "downloaded")."""
+    return api._downloaded_payloads({anime.media_id: anime for anime in api.manager.db.anime_list()})
+
+
+def _write_config(tmp_path: Path) -> Path:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -19,7 +36,11 @@ def make_api(tmp_path: Path) -> WebAppApi:
     cfg.paths.cache_dir = tmp_path / "cache"
     cfg.library.root_dir = tmp_path / "library"
     write_config(cfg, cfg.config_path)
-    return WebAppApi(cfg.config_path)
+    return cfg.config_path
+
+
+def make_api(tmp_path: Path) -> WebAppApi:
+    return WebAppApi(_write_config(tmp_path))
 
 
 def test_get_state_reads_local_database_only(tmp_path: Path) -> None:
@@ -75,8 +96,7 @@ def test_changed_anilist_credentials_refresh_automatically(
     monkeypatch.setattr(
         AnimeManager,
         "refresh_anilist_cache",
-        lambda self: calls.append(self.config.anilist.access_token)
-        or {"anime": 3, "covers": 3},
+        lambda self: calls.append(self.config.anilist.access_token) or {"anime": 3, "covers": 3},
     )
 
     first = api.save_settings(
@@ -110,16 +130,97 @@ def test_asset_server_serves_web_ui(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
 
-    assert "pudge" in html
-    assert "plannedFilter" in html
-    assert "-webkit-overflow-scrolling:touch" in html
+    # The window page, with the app name and the session values filled in.
+    assert 'id="plannedFilter"' in html
+    assert "__APP_NAME__" not in html and "__PUDGE_HTTP_TOKEN__" not in html
+    # Pages scroll with momentum.
+    assert css_rules("index.html").get(".page-scroll", "-webkit-overflow-scrolling") == "touch"
 
 
-def test_planned_filters_match_actual_anilist_media_status() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "const isFinished=a=>String(a.media_status||'').trim().toUpperCase()==='FINISHED'" in html
-    assert "if(filter==='finished')items=items.filter(isFinished)" in html
-    assert "if(filter==='unfinished')items=items.filter(a=>!isFinished(a))" in html
+# Planning: AniList's media_status comes as it is ("FINISHED", sometimes padded or lower case).
+PLANNED = [
+    {
+        "media_id": 1,
+        "title": "Finished Show",
+        "media_status": " finished ",
+        "episodes": 12,
+        "progress": 0,
+        "released_episodes": 12,
+    },
+    {
+        "media_id": 2,
+        "title": "Airing Behind",
+        "media_status": "RELEASING",
+        "episodes": 12,
+        "progress": 0,
+        "released_episodes": 4,
+        "outdated": True,
+        "next_episode": 1,
+        "missing_count": 4,
+    },
+    {
+        "media_id": 3,
+        "title": "Announced",
+        "media_status": "NOT_YET_RELEASED",
+        "episodes": 12,
+        "progress": 0,
+        "released_episodes": 2,
+        "next_airing_episode": 3,
+        "remaining_seconds": 3600,
+    },
+]
+PLANNING_PAGE = r"""
+setPage('planned', true); await __tick(50);
+const card = id => document.querySelector(`#plannedContent .anime-card[data-media-id="${id}"]`);
+const shown = () => [...document.querySelectorAll('#plannedContent .anime-card')].filter(node => node.checkVisibility()).map(node => node.dataset.title);
+const menu = async id => {
+  await __fire(`#plannedContent .anime-card[data-media-id="${id}"] .anime-title`, 'contextmenu', {button: 2, clientX: 40, clientY: 40}, 'MouseEvent');
+  await __tick(10);
+  const actions = [...document.querySelectorAll('#contextMenu.open [data-context-action]')].map(node => node.dataset.contextAction);
+  hideContextMenu();
+  return actions;
+};
+const out = {
+  all: shown(),
+  text: Object.fromEntries([1, 2, 3].map(id => [id, card(id).innerText])),
+  download: Object.fromEntries([1, 2, 3].map(id => [id, Boolean(card(id).querySelector('[data-action="planning-episodes-auto-card"]'))])),
+  outdated: [1, 2, 3].filter(id => card(id).classList.contains('outdated')),
+  menus: {released: await menu(1), announced: await menu(3)},
+  texts: {watched: t('label.watched'), missing: t('label.localMissing', {episode: 1}), upToDate: t('label.upToDate')},
+};
+await __input('#plannedFilter', 'finished'); out.finished = shown();
+await __input('#plannedFilter', 'unfinished'); out.unfinished = shown();
+await __input('#plannedFilter', 'all');
+await __fire('#plannedContent .anime-card[data-media-id="1"] .anime-title', 'contextmenu', {button: 2, clientX: 40, clientY: 40}, 'MouseEvent');
+await __click('#contextMenu [data-context-action="watching"]'); await __tick(20);
+return out;
+"""
+
+
+def test_planning_filters_and_unreleased_cards(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            PLANNING_PAGE,
+            lang=lang,
+            state={"planned": PLANNED},
+            api={"move_planned_to_watching": {"ok": True, "download_pending": False}},
+        )
+        out, texts = result.value, result.value["texts"]
+        assert out["all"] == ["Airing Behind", "Announced", "Finished Show"]
+        # "Finished only" follows AniList's status whatever its spelling.
+        assert out["finished"] == ["Finished Show"]
+        assert out["unfinished"] == ["Airing Behind", "Announced"]
+        # An announced anime has nothing to watch or download yet: no progress line, no
+        # download button, no "move to Watching" / "download without watching".
+        assert texts["watched"] in out["text"]["1"] and texts["watched"] not in out["text"]["3"]
+        assert out["download"] == {"1": True, "2": True, "3": False}
+        assert {"watching", "download-only"} <= set(out["menus"]["released"])
+        assert not {"watching", "download-only"} & set(out["menus"]["announced"])
+        # A Planning card is not a library card: no "next episode has no local file", no freshness line.
+        assert out["outdated"] == [2]
+        assert not any(texts["missing"] in text or texts["upToDate"] in text for text in out["text"].values())
+        assert result.calls_of("move_planned_to_watching") == [[1]]
+    assert css_rules("index.html").get(".anime-card.outdated .stripe", "background") == "var(--pink)"
 
 
 def test_qbt_test_uses_unsaved_form_values(tmp_path: Path, monkeypatch) -> None:
@@ -190,12 +291,111 @@ def test_play_deduplicates_same_video(tmp_path: Path, monkeypatch) -> None:
     assert api.play_status(str(video))["status"] == "starting"
 
 
-def test_web_ui_has_play_progress_and_nyaa_socks_preset() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "play_status" in html
-    assert "Запускаю…" in html
-    assert "socks5://[::1]:1080" in html
-    assert "Прокси применяется только к запросам pudge в Nyaa" in html
+# A ready final episode on Home. The player starts, runs, counts the episode, then closes.
+SHOW = {
+    "media_id": 9,
+    "title": "Show",
+    "site_url": "https://anilist.co/anime/9",
+    "ready_episodes": [12],
+    "is_final_episode": True,
+    "local": {"video_path": "/v/Show - 12.mkv", "episode": 12, "state": "ready"},
+}
+PLAYER = r"""
+const base = __api.get_state;
+window.__counted = false;
+__api.get_state = __api.get_state_fast = () => {
+  const state = base();
+  if (window.__counted) state.home = {...state.home, new_ready: [], caught_up: [{...SHOW, progress: 12}]};
+  return state;
+};
+const counted = {status: 'running', watched: true, episode: 12, final_episode: true, rating_prompted: false, media_id: 9, title: 'Show'};
+const answers = [{status: 'starting'}, {status: 'running'}, counted, {...counted, status: 'exited'}];
+let polls = 0;
+__api.play_status = async () => { const answer = answers[Math.min(polls++, answers.length - 1)]; if (answer.watched) window.__counted = true; return answer; };
+""".replace("SHOW", json.dumps(SHOW))
+
+
+def test_playing_shows_progress_counts_the_episode_and_asks_for_the_final_rating(page) -> None:
+    assert ru("action.starting") == "Запускаю…"
+    assert ru("status.episodeCounted", episode=5) == "Серия 5 засчитана"
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            const card = () => document.querySelector('#currentContent [data-path="/v/Show - 12.mkv"]');
+            const look = () => ({starting: card()?.classList.contains('play-starting') ?? null, running: card()?.classList.contains('play-running') ?? null,
+                                 label: card()?.dataset.startingLabel ?? null});
+            await __click('#currentContent .downloaded-card');
+            await __tick(10);
+            const out = {clicked: look()};
+            await __tick(900); out.starting = look();
+            await __tick(900); out.running = look();
+            await __tick(2000);
+            out.counted = {status: __text('#status'), home: __text('#currentContent'), modal: __visible('#modalBackdrop')};
+            await __tick(2000);
+            out.closed = {modal: __visible('#modalBackdrop'), title: __text('#modalTitle')};
+            out.texts = {starting: t('action.starting'), counted: t('status.episodeCounted', {episode: 12}), caughtUp: t('section.caughtUp'),
+                         rate: t('modal.rateFinal', {title: 'Show'})};
+            return out;
+            """,
+            lang=lang,
+            state={"home": {"new_ready": [SHOW]}},
+            api={"play": {"ok": True}, "final_sequel_option": {"ok": True, "sequel": None}},
+            before=PLAYER,
+        )
+        out, texts = result.value, result.value["texts"]
+        assert result.calls_of("play") == [["/v/Show - 12.mkv", False, False, False]]
+        # The card says "Starting…" over the cover until the player runs.
+        assert out["clicked"] == {"starting": True, "running": False, "label": texts["starting"]}
+        assert out["starting"]["starting"] is True
+        assert out["running"]["running"] is True and out["running"]["starting"] is False
+        # Once the episode counts, Home is reloaded at once (the show moved to Caught up) and the status says so.
+        assert out["counted"]["status"] == texts["counted"]
+        assert texts["caughtUp"] in out["counted"]["home"] and out["counted"]["modal"] is False
+        # The final episode's rating opens when the player closes.
+        assert out["closed"] == {"modal": True, "title": texts["rate"]}
+        assert len(result.calls_of("play_status")) == 4
+    assert (
+        css_rules("index.html").get(".airing-card.play-starting::after", "content")
+        == "attr(data-starting-label)"
+    )
+
+
+# The proxy fields of Settings: only Nyaa searches use them; one button fills in a local SOCKS proxy.
+NYAA_SETTINGS = r"""
+setPage('settings'); await __tick(20);
+const block = $('presetNyaaSocks').closest('.setting-block');
+const out = {hint: block.innerText.includes(t('help.nyaa'))};
+await __click('#presetNyaaSocks'); await __tick(10);
+out.fields = {mode: $('s_proxy_mode').value, url: $('s_proxy_url').value};
+out.toast = __toasts().at(-1); out.expected = t('toast.socksPreset');
+await __input('#s_notifications', false);
+await __click('#saveSettings'); await __tick(50);
+return out;
+"""
+
+
+def test_settings_offer_a_local_socks_proxy_for_nyaa_and_save_notifications(page) -> None:
+    # The hint is the effective text of the old duplicated 'help.nyaa' entry.
+    assert en("help.nyaa") == "Only Nyaa searches use the proxy selected here."
+    assert "только для поиска на Nyaa" in ru("help.nyaa")
+    for lang in ("en", "ru"):
+        result = page.run(
+            NYAA_SETTINGS,
+            lang=lang,
+            state={"settings": {"nyaa_enabled": True, "proxy_mode": "direct", "proxy_url": ""}},
+            api={"save_settings": {"ok": True}},
+        )
+        out = result.value
+        assert out["hint"] is True
+        assert out["fields"] == {"mode": "proxy_only", "url": "socks5://[::1]:1080"}
+        assert out["toast"] == out["expected"]
+        [[saved]] = result.calls_of("save_settings")
+        assert (saved["proxy_mode"], saved["proxy_url"], saved["nyaa_enabled"]) == (
+            "proxy_only",
+            "socks5://[::1]:1080",
+            True,
+        )
+        assert saved["notifications_enabled"] is False
 
 
 def test_web_state_reports_ready_without_sidecar_as_embedded(tmp_path: Path) -> None:
@@ -215,17 +415,9 @@ def test_web_state_reports_ready_without_sidecar_as_embedded(tmp_path: Path) -> 
         )
     )
 
-    episode = api.get_state()["episodes"][0]
-    assert episode["subtitle"] is True
+    # Episodes reach the window once, inside the library groups.
+    episode = api.get_state()["library"][0]["episodes"][0]
     assert episode["subtitle_source"] == "embedded"
-
-
-def test_not_yet_released_cards_hide_progress_and_freshness() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "const unreleased=a.media_status==='NOT_YET_RELEASED'" in html
-    assert "const progress=unreleased?'':`<div class=\"meta\">${t('label.watched')}:" in html
-    assert "const freshness=planned||unreleased?'':a.outdated?" in html
-    assert "<article class=\"anime-card ${a.outdated?'outdated':''}" in html
 
 
 def test_refresh_local_does_not_sync_anilist(tmp_path: Path, monkeypatch) -> None:
@@ -284,59 +476,55 @@ def test_manual_anilist_sync_can_run_again(tmp_path: Path, monkeypatch) -> None:
     assert calls == 2
 
 
-def test_refresh_button_is_reset_after_each_local_refresh() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "localRefreshing:false" in html
-    assert "ui.localRefreshing=false" in html
-    assert "effectivePrioritySubtitleDueCount()>0" in html
-    assert "status.subtitleCheckingBackground" in html
+# Refresh can run again after each refresh, and a queued priority subtitle check shows
+# "checking subtitles in the background": test_v0666_single_refresh_subtitle_queue.py
+# (test_ui_keeps_background_subtitle_status_without_locking_refresh).
+# The one-shot foil animation of watchable covers: test_v0655_requested_features.py.
 
 
-def test_watchable_anime_cards_have_polychrome_gloss() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "function isWatchable(a)" in html
-    assert "polychrome-flow" in html
-    assert "cover-shell.polychrome" in html
-    assert "cover(a,'airing-cover',true)" in html
-    assert ".anime-card.watchable" not in html
+LANGUAGE = r"""
+const out = {lang: document.documentElement.lang, nav: __text('.nav [data-page="current"]'),
+             logo: {src: document.querySelector('.sidebar .logo img')?.getAttribute('src'), shown: __visible('.sidebar .logo img')}};
+if (SWITCH) {
+  setPage('settings'); await __tick(20);
+  out.languages = [...$('s_language').options].map(option => [option.value, option.textContent]);
+  await __input('#s_language', 'ru');
+  await __click('#saveSettings'); await __tick(50);
+  out.saved = {lang: document.documentElement.lang, nav: __text('.nav [data-page="current"]')};
+}
+return out;
+"""
 
 
-def test_not_yet_released_planned_card_has_no_download_button() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "a.media_status==='NOT_YET_RELEASED'?'':`<button data-action=\"release\"" in html
-
-
-def test_web_ui_defaults_to_english_and_offers_russian() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert '<html lang="en">' in html
-    assert "'nav.current':'Anime'" in html
-    assert "'nav.current':'Аниме'" in html
-    assert '<option value="ru">Русский</option>' in html
-
-
-def test_web_ui_has_polychrome_a_logo_and_stronger_cover_foil() -> None:
+def test_window_starts_in_english_and_switches_to_russian(page) -> None:
+    assert en("nav.current") == "Anime"
+    assert ru("nav.current") == "Аниме"
     root = Path(__file__).parents[1] / "pudge"
-    html = (root / "web" / "index.html").read_text(encoding="utf-8")
-    assert (root / "assets" / "app-icon.png").is_file()
-    assert (root / "web" / "app-logo.png").is_file()
-    assert 'src="app-logo.png"' in html
-    assert 'opacity:.9' in html
-    assert '0 0 34px rgba(255,84,208,.24)' in html
+    assert (root / "assets" / "app-icon.png").is_file() and (root / "web" / "app-logo.png").is_file()
+    # Before the backend answers, the window is English, with the Pudge logo.
+    before = page.run(LANGUAGE.replace("SWITCH", "false"), ready=False).value
+    assert before == {"lang": "en", "nav": "Anime", "logo": {"src": "app-logo.png", "shown": True}}
+    result = page.run(
+        LANGUAGE.replace("SWITCH", "true"),
+        lang="en",
+        before="__api.save_settings = async values => ({settings: {...__api.get_state().settings, language: values.language}});",
+    )
+    out = result.value
+    assert out["languages"] == [["en", "English"], ["ru", "Русский"]]
+    assert result.calls_of("save_settings")[0][0]["language"] == "ru"
+    assert out["saved"] == {"lang": "ru", "nav": "Аниме"}
+    assert page.run(LANGUAGE.replace("SWITCH", "false"), lang="ru").value["nav"] == "Аниме"
 
 
-def test_startup_workflow_uses_adaptive_energy_efficient_polling() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "startup_maintenance" in html
-    assert "poll_downloads_and_subtitles" in html
-    assert "foregroundPollDelay" in html
-    assert "document.hidden" in html
-    assert "120000" in html
-    assert "60000" in html
-    assert "20000" in html
-    assert "5000" in html
-    assert "2000" in html
-    assert "adaptiveDownloadPollDelay" in html
-    assert "subtitle_jobs.some" not in html
+def test_foil_covers_shine_stronger() -> None:
+    rules = css_rules("index.html")
+    assert rules.get(".cover-shell.polychrome::before", "opacity") == ".9"
+    assert "0 0 34px rgba(255,84,208,.24)" in rules.get(".cover-shell.polychrome", "box-shadow")
+
+
+# Energy-efficient polling (15 s in front, 2 min behind, adaptive while downloading, no fast
+# polling for subtitle jobs that are not due): test_v0560_inactive_window_energy.py,
+# test_v0643_adaptive_download_polling.py.
 
 
 def test_save_settings_persists_selected_language(tmp_path: Path) -> None:
@@ -377,11 +565,7 @@ def test_startup_maintenance_runs_once_and_refreshes_new_torrents(tmp_path: Path
     assert calls == {"run": 1, "sync": 1}
 
 
-
-
-def test_startup_maintenance_keeps_download_sync_idle_when_torrents_off(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_startup_maintenance_keeps_download_sync_idle_when_torrents_off(tmp_path: Path, monkeypatch) -> None:
     api = make_api(tmp_path)
     api.config.qbittorrent.enabled = True
     assert api.config.nyaa.torrents_enabled is False
@@ -402,7 +586,10 @@ def test_startup_maintenance_keeps_download_sync_idle_when_torrents_off(
     assert "downloads_after_auto" not in status["stats"]
     assert calls["sync"] == 0
 
-def test_foreground_poll_checks_downloads_without_running_heavy_subtitles(tmp_path: Path, monkeypatch) -> None:
+
+def test_foreground_poll_checks_downloads_without_running_heavy_subtitles(
+    tmp_path: Path, monkeypatch
+) -> None:
     api = make_api(tmp_path)
     calls = []
     monkeypatch.setattr(api.manager, "sync_downloads", lambda: calls.append("downloads") or 2)
@@ -416,7 +603,6 @@ def test_foreground_poll_checks_downloads_without_running_heavy_subtitles(tmp_pa
 
     assert calls == ["downloads"]
     assert result["stats"] == {"downloads": 2, "subs": 0}
-
 
 
 def test_startup_status_uses_cached_storage_while_running(tmp_path: Path, monkeypatch) -> None:
@@ -453,43 +639,264 @@ def test_asset_server_serves_logo(tmp_path: Path) -> None:
     assert content.startswith(b"\x89PNG")
 
 
-def test_startup_syncs_anilist_before_background_maintenance() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    sequence = html[html.index("async function startupSequence"):html.index("async function loadState")]
-    assert sequence.index("syncAniList(true)") < sequence.index("startup_maintenance")
-    assert "setTimeout(pollStartupMaintenance,3000)" in html
-    assert "setTimeout(pollForegroundWork,1000)" in sequence
+# The AniList sync answers when the test says so; the background maintenance status fails
+# once (busy), then runs, then finishes.
+STARTUP = """
+__api.startup_sync_anilist = () => new Promise(resolve => { window.__finishSync = () => resolve({skipped: true}); });
+__api.startup_maintenance = async () => ({running: true, state: __api.get_state()});
+let checks = 0;
+__api.startup_maintenance_status = async () => {
+  if (++checks === 1) throw new Error('busy');
+  return {running: checks < 3, error: '', state: __api.get_state()};
+};
+"""
+STARTUP_CALLS = (
+    "startup_sync_anilist",
+    "startup_maintenance",
+    "startup_maintenance_status",
+    "poll_downloads_and_subtitles",
+)
 
 
-def test_web_ui_exposes_timing_diagnostics() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="openDiagnosticsPage"' in html
-    assert 'id="diagnostics" class="page"' in html
-    assert "get_recent_logs" in html
-    assert "open_log_folder" in html
-    assert "duration_ms" in html
+def test_startup_syncs_anilist_before_the_background_maintenance(page) -> None:
+    result = page.run(
+        """
+        await __tick(2000);                      // AniList is slow today
+        const waiting = __apiCalls.filter(call => call.name === 'startup_maintenance').length;
+        window.__finishSync();
+        await __tick(10000);
+        return {waiting, calls: __apiCalls.filter(call => NAMES.includes(call.name)).map(call => [call.name, call.at])};
+        """.replace("NAMES", json.dumps(STARTUP_CALLS)),
+        before=STARTUP,
+    )
+    assert result.value["waiting"] == 0
+    assert result.value["calls"] == [
+        ["startup_sync_anilist", 0],
+        ["startup_maintenance", 2000],  # only after the sync finished
+        ["startup_maintenance_status", 2500],  # fails ...
+        ["poll_downloads_and_subtitles", 3000],  # the foreground work starts a second after the maintenance
+        ["startup_maintenance_status", 5500],  # ... so the next check waits 3 s
+        ["startup_maintenance_status", 6500],
+    ]
 
 
-def test_runtime_icon_is_applied_to_cocoa_process() -> None:
-    source = (Path(__file__).parents[1] / "pudge" / "web_app.py").read_text(encoding="utf-8")
-    assert "setApplicationIconImage_" in source
-    assert "webview.start(" in source
-    assert "on_started," in source
-    assert "icon=str(runtime_icon) if runtime_icon.is_file() else None" in source
-    assert 'assets" / "app-icon.png"' in source
+def test_settings_open_the_diagnostics_page_with_recent_logs(page) -> None:
+    assert "duration_ms" in en("help.diagnostics") and "duration_ms" in ru("help.diagnostics")
+    lines = ["12:00:01 START step=nyaa.search", "12:00:02 DONE step=nyaa.search duration_ms=812"]
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('settings'); await __tick(20);
+            const out = {inMaintenance: Boolean(document.querySelector('#settingsMaintenance #openDiagnosticsPage')),
+                         nav: [...document.querySelectorAll('.nav [data-page]')].map(button => button.dataset.page)};
+            await __click('#openDiagnosticsPage'); await __tick(20);
+            Object.assign(out, {page: ui.page, shown: __visible('#diagnostics'), settings: __visible('#settings'),
+                                help: __text('#diagnostics p.subtle'), path: __text('#logPath'), log: $('logOutput').textContent,
+                                expectedHelp: t('help.diagnostics')});
+            await __click('#refreshLogs'); await __tick(20);
+            await __click('#openLogs'); await __tick(20);
+            return out;
+            """,
+            lang=lang,
+            api={
+                "get_recent_logs": {"path": "/Users/me/Library/Logs/pudge/pudge.log", "lines": lines},
+                "open_log_folder": {"ok": True},
+            },
+        )
+        out = result.value
+        # Reached from Settings → Maintenance only; the sidebar has no Diagnostics page.
+        assert out["inMaintenance"] is True and "diagnostics" not in out["nav"]
+        assert (out["page"], out["shown"], out["settings"]) == ("diagnostics", True, False)
+        assert out["help"] == out["expectedHelp"]
+        assert out["path"] == "/Users/me/Library/Logs/pudge/pudge.log"
+        assert out["log"] == "\n".join(lines)
+        assert result.calls_of("get_recent_logs") == [[400], [400]]
+        assert result.calls_of("open_log_folder") == [[]]
 
 
-def test_macos_runtime_identity_sets_process_name_in_source() -> None:
-    source = Path(__file__).parents[1].joinpath("pudge/web_app.py").read_text(encoding="utf-8")
-    assert 'setProcessName_(APP_NAME)' in source
-    assert 'setObject_forKey_(APP_NAME, "CFBundleDisplayName")' in source
+class _Cocoa:
+    """Stand-ins for AppKit / Foundation / PyObjCTools that record what Pudge asks Cocoa to do."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.events: list[tuple] = []
+        self.info: dict[str, str] = {}
+        self.main_thread_queue: list = []
+        self.fullscreen = True
+        self.window = SimpleNamespace(
+            styleMask=lambda: (1 << 14) if self.fullscreen else 0,
+            toggleFullScreen_=lambda sender: self.events.append(("toggle fullscreen", _on_main_thread())),
+        )
+        application = SimpleNamespace(
+            setActivationPolicy_=lambda policy: self.events.append(("activation policy", policy)),
+            setApplicationIconImage_=lambda image: self.events.append(
+                ("icon", image.path, _on_main_thread())
+            ),
+            keyWindow=lambda: self.window,
+            mainWindow=lambda: None,
+        )
+        appkit = ModuleType("AppKit")
+        appkit.NSApplicationActivationPolicyRegular = 0
+        appkit.NSWindowStyleMaskFullScreen = 1 << 14
+        appkit.NSApplication = SimpleNamespace(
+            sharedApplication=lambda: self.events.append(("NSApplication",)) or application
+        )
+        appkit.NSImage = SimpleNamespace(
+            alloc=lambda: SimpleNamespace(initWithContentsOfFile_=lambda path: SimpleNamespace(path=path))
+        )
+        foundation = ModuleType("Foundation")
+        foundation.NSProcessInfo = SimpleNamespace(
+            processInfo=lambda: SimpleNamespace(
+                setProcessName_=lambda name: self.events.append(("process name", name))
+            )
+        )
+        foundation.NSBundle = SimpleNamespace(
+            mainBundle=lambda: SimpleNamespace(
+                infoDictionary=lambda: SimpleNamespace(
+                    setObject_forKey_=lambda value, key: self.info.__setitem__(key, value)
+                )
+            )
+        )
+        pyobjctools = ModuleType("PyObjCTools")
+        pyobjctools.AppHelper = SimpleNamespace(
+            callAfter=lambda function, *args: self.main_thread_queue.append((function, args))
+        )
+        for name, module in (("AppKit", appkit), ("Foundation", foundation), ("PyObjCTools", pyobjctools)):
+            monkeypatch.setitem(sys.modules, name, module)
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+    def run_main_thread_queue(self) -> None:
+        queue, self.main_thread_queue = self.main_thread_queue, []
+        for function, args in queue:
+            function(*args)
 
 
-def test_installer_sets_bundle_display_name() -> None:
-    source = Path(__file__).parents[1].joinpath("install.sh").read_text(encoding="utf-8")
-    assert "<key>CFBundleDisplayName</key><string>$APP_NAME</string>" in source
-    assert "<key>CFBundleIdentifier</key><string>$APP_BUNDLE_ID</string>" in source
-    assert "<key>CFBundleExecutable</key><string>$APP_NAME</string>" in source
+def _on_main_thread() -> bool:
+    return threading.current_thread() is threading.main_thread()
+
+
+def _in_worker_thread(function):
+    """Call `function` the way pywebview calls the API: from a worker thread."""
+    result: list = []
+    worker = threading.Thread(target=lambda: result.append(function()))
+    worker.start()
+    worker.join(5)
+    return result[0]
+
+
+RUNTIME_ICON = Path(web_app.__file__).resolve().parent / "assets" / "app-icon.png"
+
+
+def test_macos_runtime_identity_names_the_process_and_sets_the_icon(monkeypatch) -> None:
+    # Homebrew's interpreter would show up as "Python" with a rocket icon in the Dock and Cmd+Tab.
+    cocoa = _Cocoa(monkeypatch)
+    assert RUNTIME_ICON.is_file()
+    assert web_app._set_macos_runtime_identity() is True
+    assert cocoa.events == [
+        ("process name", APP_NAME),
+        ("NSApplication",),
+        ("activation policy", 0),
+        ("icon", str(RUNTIME_ICON), True),
+    ]
+    assert cocoa.info == {
+        "CFBundleName": APP_NAME,
+        "CFBundleDisplayName": APP_NAME,
+        "CFBundleIdentifier": APP_BUNDLE_ID,
+    }
+    # From another thread, the icon is handed to Cocoa's main thread.
+    cocoa.events.clear()
+    assert _in_worker_thread(web_app._set_macos_runtime_identity) is True
+    assert ("icon", str(RUNTIME_ICON), False) not in cocoa.events and len(cocoa.main_thread_queue) == 1
+    cocoa.run_main_thread_queue()
+    assert cocoa.events[-1] == ("icon", str(RUNTIME_ICON), True)
+
+
+class _Event(list):
+    def __iadd__(self, handler):
+        self.append(handler)
+        return self
+
+
+def test_launch_starts_pywebview_with_the_pudge_icon_and_renames_after_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from pudge import logging_utils, single_instance
+
+    events: list = []
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(web_app, "_INSTANCE_LOCK", None)
+    monkeypatch.setattr(logging_utils, "set_log_rotation_owner", lambda owner: None)
+    monkeypatch.setattr(web_app, "_set_macos_runtime_identity", lambda: events.append("identity") or True)
+    monkeypatch.setattr(
+        web_app, "request_notification_permission", lambda timeout: {"supported": False, "granted": False}
+    )
+    monkeypatch.setattr(
+        single_instance, "acquire", lambda: SimpleNamespace(serve_focus_requests=lambda callback: None)
+    )
+    monkeypatch.setattr(
+        web_app,
+        "_start_asset_server",
+        lambda api: (SimpleNamespace(shutdown=lambda: None, server_close=lambda: None), "http://127.0.0.1:9"),
+    )
+    monkeypatch.setattr(web_app, "_install_macos_app_delegate_proxy", lambda api, lifecycle: True)
+
+    def create_window(title, **kwargs):
+        events.append("window")
+        return SimpleNamespace(
+            uid="main",
+            native=None,
+            events=SimpleNamespace(closing=_Event(), shown=_Event(), loaded=_Event(), before_show=_Event()),
+        )
+
+    def start(on_started, **kwargs):
+        events.append(("start", kwargs))
+        on_started()  # pywebview has created NSApplication
+
+    monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=create_window, start=start))
+    assert web_app.launch_web_app(_write_config(tmp_path)) == 0
+    # Named before Cocoa starts, again once the API exists, and again after pywebview's start.
+    assert events == [
+        "identity",
+        "identity",
+        "window",
+        ("start", {"gui": "cocoa", "debug": False, "icon": str(RUNTIME_ICON)}),
+        "identity",
+    ]
+
+
+def test_escape_leaves_fullscreen_on_the_cocoa_main_thread(monkeypatch) -> None:
+    # AppKit's toggleFullScreen_ from pywebview's worker thread crashed macOS
+    # ("Must only be used from the main thread").
+    cocoa = _Cocoa(monkeypatch)
+    timers: list = []
+
+    class Timer:
+        def __init__(self, delay, function):
+            self.delay, self.function, self.daemon = delay, function, False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(web_app.threading, "Timer", Timer)
+    api = WebAppApi.__new__(WebAppApi)
+    api._fullscreen_exit_lock = threading.Lock()
+    api._fullscreen_exit_pending = False
+    api.logger = SimpleNamespace(exception=lambda *args, **kwargs: None)
+
+    assert _in_worker_thread(api.exit_fullscreen) == {"ok": True, "exited": True, "scheduled": True}
+    # A second Escape during the transition does not start another one.
+    assert _in_worker_thread(api.exit_fullscreen)["pending"] is True
+    assert cocoa.events == [] and len(cocoa.main_thread_queue) == 1
+    cocoa.run_main_thread_queue()
+    assert cocoa.events == [("NSApplication",), ("toggle fullscreen", True)]
+    # The guard is released 1.5 s later; a window that is no longer fullscreen is left alone.
+    assert timers[-1].delay == 1.5
+    timers[-1].function()
+    cocoa.events.clear()
+    cocoa.fullscreen = False
+    assert _in_worker_thread(api.exit_fullscreen)["scheduled"] is True
+    cocoa.run_main_thread_queue()
+    assert ("toggle fullscreen", True) not in cocoa.events
 
 
 def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, monkeypatch) -> None:
@@ -545,13 +952,6 @@ def test_play_uses_precomputed_subtitle_and_cached_media_hint(tmp_path: Path, mo
     assert command[command.index("--episode-hint") + 1] == "5"
 
 
-def test_up_to_date_card_hides_missing_next_episode_message() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "!planned&&a.outdated?`<div class=\"subtle\">${t('label.localMissing'" in html
-
-
 def test_marking_episode_watched_updates_cached_progress_and_list_status(tmp_path: Path) -> None:
     from pudge.manager_models import LibraryEpisode
 
@@ -595,9 +995,7 @@ def test_play_status_reports_watched_episode_and_cached_progress(tmp_path: Path)
     api = make_api(tmp_path)
     video = (tmp_path / "episode-03.mkv").resolve()
     video.write_bytes(b"video")
-    api.manager.db.upsert_anime(
-        LibraryAnime(media_id=700, title="Live Update", status="CURRENT", progress=2)
-    )
+    api.manager.db.upsert_anime(LibraryAnime(media_id=700, title="Live Update", status="CURRENT", progress=2))
     api.manager.db.upsert_episode(
         LibraryEpisode(
             media_id=700,
@@ -617,33 +1015,29 @@ def test_play_status_reports_watched_episode_and_cached_progress(tmp_path: Path)
     assert status["list_status"] == "CURRENT"
 
 
-def test_play_monitor_refreshes_cards_when_episode_is_counted() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "if(status.watched&&!watchedReported)" in html
-    assert "ui.state=await pywebview.api.get_state();renderDataPages()" in html
-    assert "status.episodeCounted" in html
-    assert "Смотрю: серия {episode} засчитана" in html
+def test_installed_app_bundle_is_named_pudge_and_tells_pudge_its_python() -> None:
+    # install.sh runs with stand-ins for the macOS tools (tests/t71g01_support.py). The launcher
+    # it builds with clang embeds Python (Py_InitializeFromConfig / Py_RunMain, run_module
+    # pudge.app_entry, no exec of python, no PyInstaller/osacompile app):
+    # test_v074_thin_launcher_runtime_paths.py, test_v0731_ui_cache_native_identity.py.
+    from t71g01_support import launcher_main, plist, release_history
+
+    sim = release_history().sim
+    info = plist(sim.app / "Contents/Info.plist")
+    assert (
+        info["CFBundleName"],
+        info["CFBundleDisplayName"],
+        info["CFBundleExecutable"],
+        info["CFBundleIdentifier"],
+    ) == (APP_NAME, APP_NAME, APP_NAME, APP_BUNDLE_ID)
+    assert (sim.app / "Contents/MacOS" / APP_NAME).is_file()
+    # Pudge runs inside the app executable, so helpers it starts need the managed venv's Python.
+    main = launcher_main(sim)
+    assert f'const char *python = "{sim.venv}/bin/python";' in main
+    assert 'setenv("PUDGE_PYTHON", python, 1);' in main
 
 
-def test_installer_builds_real_native_named_app_bundle() -> None:
-    source = Path(__file__).parents[1].joinpath("install.sh").read_text(encoding="utf-8")
-    assert "/usr/bin/clang" in source
-    assert "Py_InitializeFromConfig(&config)" in source
-    assert 'PyConfig_SetString(&config, &config.run_module, L"pudge.app_entry")' in source
-    assert "return Py_RunMain();" in source
-    assert "execv(python" not in source
-    assert "<key>CFBundleExecutable</key><string>$APP_NAME</string>" in source
-    assert "PUDGE_PYTHON" in source
-    assert "PyInstaller" not in source
-    assert "osacompile" not in source
-
-
-
-def test_play_does_not_use_stale_subtitle_from_non_ready_episode(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_play_does_not_use_stale_subtitle_from_non_ready_episode(tmp_path: Path, monkeypatch) -> None:
     from pudge.manager_models import LibraryEpisode
 
     api = make_api(tmp_path)
@@ -701,7 +1095,7 @@ def test_home_state_groups_ready_downloaded_episodes(tmp_path: Path) -> None:
             )
         )
 
-    downloaded = api.get_state()["downloaded"]
+    downloaded = _downloaded(api)
 
     assert len(downloaded) == 1
     assert downloaded[0]["title"] == "Odd Taxi"
@@ -748,7 +1142,7 @@ def test_anilist_progress_hides_late_download_from_ready_and_continue(
     api.manager.db.record_playback(videos[6], 600, 1_400, 60)
 
     state = api.get_state()
-    downloaded = next(item for item in state["downloaded"] if item["media_id"] == 200637)
+    downloaded = next(item for item in _downloaded(api) if item["media_id"] == 200637)
     library = next(item for item in state["library"] if item["media_id"] == 200637)
     library_states = {item["episode"]: item["state"] for item in library["episodes"]}
 
@@ -778,27 +1172,166 @@ def test_anilist_progress_hides_late_download_from_ready_and_continue(
         )
     )
     rolled_back = api.get_state()
-    downloaded_after_rollback = next(
-        item for item in rolled_back["downloaded"] if item["media_id"] == 200637
-    )
+    downloaded_after_rollback = next(item for item in _downloaded(api) if item["media_id"] == 200637)
     assert downloaded_after_rollback["ready_episodes"] == [6, 7]
-    assert any(
-        item["episode"] == 6 for item in rolled_back["home"]["continue_watching"]
-    )
+    assert any(item["episode"] == 6 for item in rolled_back["home"]["continue_watching"])
 
 
-def test_current_page_uses_actionable_home_sections_without_all_anime() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
+def _home_library(tmp_path: Path) -> dict:
+    """get_state() of a library with something in every Home section (the real payload)."""
+    api = make_api(tmp_path)
+    db = api.manager.db
+    later = 2_000_000_000
+
+    def anime(media_id: int, title: str, **fields) -> None:
+        fields = {"status": "CURRENT", "episodes": 12, **fields}
+        db.upsert_anime(LibraryAnime(media_id=media_id, title=title, **fields))
+
+    def episode(media_id: int, title: str, number: int, state: str = "ready") -> Path:
+        video = tmp_path / f"{title} - {number:02d}.mkv"
+        video.write_bytes(b"video")
+        db.upsert_episode(
+            LibraryEpisode(media_id=media_id, title=title, episode=number, video_path=video, state=state)
+        )
+        return video
+
+    anime(
+        1, "Airing Ranges", progress=1, media_status="RELEASING", next_airing_episode=7, next_airing_at=later
     )
-    assert "section.newReady':'Новые серии готовы" in html
-    assert "section.completedReady':'Завершённые и готовые" in html
-    assert "section.waitingPreparation':'Ждём подготовку" in html
-    assert "section.caughtUp':'Всё просмотрено" in html
-    assert "home.dropped||[]" in html
-    assert "section.dropped" in html
-    assert "section.allAnime" not in html
-    assert "Все аниме" not in html
+    for number in (2, 3, 5):
+        episode(1, "Airing Ranges", number)
+    anime(
+        2,
+        "Complete Show",
+        progress=0,
+        episodes=4,
+        media_status="FINISHED",
+        end_date=(date.today() - timedelta(days=60)).isoformat(),
+    )
+    for number in (1, 2, 3, 4):
+        episode(2, "Complete Show", number)
+    anime(3, "Finale", progress=11, media_status="FINISHED", end_date=date.today().isoformat())
+    episode(3, "Finale", 12)
+    anime(
+        4, "Airing Waiting", progress=2, media_status="RELEASING", next_airing_episode=5, next_airing_at=later
+    )
+    episode(4, "Airing Waiting", 3, "waiting_subtitles")
+    anime(5, "Caught Up", progress=4, media_status="RELEASING", next_airing_episode=5, next_airing_at=later)
+    anime(6, "Resumed", progress=0, media_status="RELEASING", next_airing_episode=3, next_airing_at=later)
+    db.record_playback(episode(6, "Resumed", 1), 120, 1400)
+    anime(7, "Dropped Show", status="DROPPED", progress=3)
+    episode(7, "Dropped Show", 4)
+    db.schedule_anime_cleanup(7, 2)
+    return json.loads(json.dumps(api.get_state(), default=str))
+
+
+HOME = r"""
+setPage('current', true); renderCurrent();
+await __tick(600);                                  // the overflow-title pass runs at 120 and 500 ms
+const root = $('currentContent');
+const card = title => root.querySelector(`article[data-title="${title}"]`);
+const status = title => card(title).querySelector('.airing-state').innerText;
+return {
+  order: [...root.children].map(node => node.dataset.homeSection || node.dataset.homeGroup),
+  readyGroup: [...root.querySelectorAll('[data-home-group="ready"] > [data-home-section]')].map(node => node.dataset.homeSection),
+  headings: [...root.querySelectorAll('[data-home-section] > h2')].map(node => node.innerText),
+  cards: Object.fromEntries([...root.querySelectorAll('[data-home-section]')].map(section =>
+    [section.dataset.homeSection, [...section.querySelectorAll('article')].map(node => node.dataset.title)])),
+  status: {ranges: status('Airing Ranges'), all: status('Complete Show'), finale: status('Finale'), waiting: status('Airing Waiting')},
+  foil: Object.fromEntries([...root.querySelectorAll('article')].map(node => [node.dataset.title, Boolean(node.querySelector('.cover-shell.polychrome'))])),
+  readyTitles: [...root.querySelectorAll('.downloaded-card')].map(node => ({
+    card: node.getAttribute('title'), hover: node.querySelectorAll('.hover-title').length,
+    full: node.querySelector('strong').dataset.fullTitle, native: node.querySelector('strong').getAttribute('title'), title: node.dataset.title})),
+  page: __text('#current'),
+  expected: {
+    headings: ['section.continueWatching', 'section.newReady', 'section.completedReady', 'section.waitingPreparation',
+               'section.caughtUp', 'section.deletingSoon'].map(key => t(key)),
+    ranges: t('label.readyEpisodes', {episodes: '2-3,5'}), all: t('label.readyAll'),
+    finale: `${t('label.episode')} 12 • ${t('label.final')}`, waiting: t('label.waitingSubs'),
+  },
+};
+"""
+
+
+def test_home_shows_actionable_sections_with_compact_ready_cards(tmp_path: Path, page) -> None:
+    for key, text in (
+        ("section.newReady", "Новые серии готовы"),
+        ("section.completedReady", "Завершённые и готовые"),
+        ("section.waitingPreparation", "Ждём подготовку"),
+        ("section.caughtUp", "Всё просмотрено"),
+    ):
+        assert ru(key) == text
+    assert ru("label.readyAll") == "Готово всё"
+    assert en("label.waitingSubs") == "Waiting for subs" and ru("label.waitingSubs") == "Ждём субтитры"
+    # The old "All anime" list is gone from Home and from the catalogs.
+    assert "section.allAnime" not in catalog("en") and not has_text("Все аниме", "ru")
+    state = _home_library(tmp_path)
+    for lang in ("en", "ru"):
+        out = page.run(
+            HOME, lang=lang, state={**state, "settings": {**state["settings"], "language": lang}}
+        ).value
+        # Continue watching first, the two ready sections side by side in one group, then the rest.
+        assert out["order"] == [
+            "section.continueWatching",
+            "ready",
+            "section.waitingPreparation",
+            "section.caughtUp",
+            "section.deletingSoon",
+        ]
+        assert out["readyGroup"] == ["section.newReady", "section.completedReady"]
+        assert out["headings"] == out["expected"]["headings"]
+        assert out["cards"] == {
+            "section.continueWatching": ["Resumed"],
+            "section.newReady": ["Airing Ranges", "Finale"],
+            "section.completedReady": ["Complete Show"],
+            "section.waitingPreparation": ["Airing Waiting"],
+            "section.caughtUp": ["Caught Up"],
+            "section.deletingSoon": ["Dropped Show"],
+        }
+        # Ready episodes as ranges, "all ready" for a complete season, the final episode marked.
+        expected = out["expected"]
+        assert out["status"] == {
+            "ranges": expected["ranges"],
+            "all": expected["all"],
+            "finale": expected["finale"],
+            "waiting": expected["waiting"],
+        }
+        # Only what can be watched now has the foil cover.
+        assert out["foil"] == {
+            "Resumed": True,
+            "Airing Ranges": True,
+            "Finale": True,
+            "Complete Show": True,
+            "Airing Waiting": False,
+            "Caught Up": False,
+            "Dropped Show": False,
+        }
+        # One title, no second hover copy: no native tooltip on the card or its title, no hover-title overlay.
+        for ready in out["readyTitles"]:
+            assert ready == {
+                "card": None,
+                "hover": 0,
+                "full": ready["title"],
+                "native": None,
+                "title": ready["title"],
+            }
+        assert "Все аниме" not in out["page"]
+    # Two ready columns when the window is wide, one when narrow; one-line statuses.
+    rules = css_rules("index.html")
+    assert rules.get(".ready-sections", "display") == "grid"
+    assert (
+        rules.get(".ready-sections", "grid-template-columns")
+        == "repeat(auto-fit,minmax(min(560px,100%),1fr))"
+    )
+    status_line = rules.declarations(".airing-state")
+    assert (status_line["white-space"], status_line["overflow"], status_line["text-overflow"]) == (
+        "nowrap",
+        "hidden",
+        "ellipsis",
+    )
+    # The foil is on the cover only, not on the whole card.
+    assert not [selector for selector in rules.selectors() if ".watchable" in selector]
+
 
 def test_home_state_marks_all_downloaded_episodes_ready(tmp_path: Path) -> None:
     from pudge.manager_models import LibraryEpisode
@@ -826,34 +1359,11 @@ def test_home_state_marks_all_downloaded_episodes_ready(tmp_path: Path) -> None:
             )
         )
 
-    downloaded = api.get_state()["downloaded"]
+    downloaded = _downloaded(api)
 
     assert downloaded[0]["ready_episodes"] == [1, 2, 3, 4]
     assert downloaded[0]["total_episodes"] == 4
     assert downloaded[0]["all_episodes_ready"] is True
-
-
-def test_downloaded_episode_text_uses_ranges_and_all_ready_label() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "function formatEpisodeRanges(values)" in html
-    assert "`${start}-${end}`" in html
-    assert "ranges.join(',')" in html
-    assert "if(a.all_episodes_ready)return `${t('label.readyAll')}${finalSuffix}`" in html
-    assert "'label.readyAll':'Готово всё'" in html
-
-def test_ready_home_cards_do_not_duplicate_title_on_hover() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    ready_template = html.split("function readyHomeCard(a){", 1)[1].split(
-        "function waitingHomeCard", 1
-    )[0]
-    assert 'downloaded-card" title=' not in ready_template
-    assert '<div class="hover-title">${escapeHtml(a.title)}</div>' not in ready_template
-    assert '<strong data-full-title="${escapeHtml(a.title)}" title="${escapeHtml(a.title)}">${escapeHtml(a.title)}</strong>' in ready_template
-
 
 
 def test_home_sections_group_airing_finished_waiting_and_caught_up(tmp_path: Path) -> None:
@@ -1014,17 +1524,61 @@ def test_onboarding_can_be_completed_and_skipped(tmp_path: Path) -> None:
     assert skipped["settings"]["onboarding_completed"] is True
 
 
-def test_web_settings_prioritize_integrations_and_offer_rerunnable_guide() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "section.essential" in html
-    assert "section.additional" in html
-    assert "runSetupGuide" in html
-    assert "onboardingSkip" in html
-    assert "https://jimaku.cc/account" in html
-    assert "https://jimaku.cc/profile" not in html
-    assert "https://jimaku.cc/api/docs" not in html
-    assert "https://anilist.co/settings/developer" in html
-    assert "if(ui.state.settings.onboarding_completed)void startupSequence();else showOnboarding(false);" in html
+FIRST_START = {
+    "state": {"settings": {"onboarding_completed": False}},
+    "api": {
+        "first_experience_dependencies": {"mpv": {"installed": True}, "ffmpeg": {"installed": True}},
+        "open_url": {"ok": True},
+    },
+    "before": "__api.skip_onboarding = async () => ({settings: {...__api.get_state().settings, onboarding_completed: true}});",
+}
+
+
+def test_first_start_opens_the_setup_guide_which_recommends_anilist_and_can_be_skipped(page) -> None:
+    assert en("section.essential") == "Essential setup" and ru("section.essential") == "Основная настройка"
+    assert (
+        en("section.additional") == "Additional settings"
+        and ru("section.additional") == "Дополнительные настройки"
+    )
+    assert en("onboarding.anilistTitle") == "Connect AniList (strongly advised)"
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            await __tick(50);
+            const out = {open: $('onboardingBackdrop').classList.contains('open'),
+                         started: __apiCalls.filter(call => ['startup_sync_anilist', 'startup_maintenance'].includes(call.name)).length};
+            while (ui.onboardingStep < 3) { await __click('#onboardingNext'); await __tick(20); }
+            out.heading = __text('#onboardingBody h3'); out.expected = t('onboarding.anilistTitle');
+            out.toggle = $('o_anilist_enabled').closest('label').matches('.onboarding-toggle');
+            await __input('#o_anilist_enabled', true);
+            await __click('#o_anilist_flow [data-url="https://anilist.co/settings/developer"]'); await __tick(10);
+            out.skipLabel = __text('#onboardingSkip'); out.expectedSkip = t('action.skipSetup');
+            await __click('#onboardingSkip'); await __tick(50);
+            out.closed = !$('onboardingBackdrop').classList.contains('open');
+            out.toasts = __toasts(); out.skipped = t('onboarding.skipped');
+            return out;
+            """,
+            lang=lang,
+            **FIRST_START,
+        )
+        out = result.value
+        # The first start shows the guide and does nothing else until it is finished or skipped.
+        assert out["open"] is True and out["started"] == 0
+        assert out["heading"] == out["expected"]
+        assert out["toggle"] is True
+        assert result.calls_of("open_url") == [["https://anilist.co/settings/developer"]]
+        assert out["skipLabel"] == out["expectedSkip"]
+        assert out["closed"] is True and out["skipped"] in out["toasts"]
+        names = [call["name"] for call in result.calls]
+        assert (
+            names.index("skip_onboarding")
+            < names.index("startup_sync_anilist")
+            < names.index("startup_maintenance")
+        )
+    # Switches sit on the left of their labels.
+    assert css_rules("index.html").get(".onboarding-toggle", "justify-content") == "flex-start"
+    # Re-running the guide from Settings: test_patch_e_ui.py (runSetupGuide); the Jimaku key page
+    # (jimaku.cc/account, not /profile or /api/docs): test_v072_followup_ln_credentials_progress.py.
 
 
 def test_final_pipeline_cache_schema_bumped_for_cold_open_fix(tmp_path: Path, monkeypatch) -> None:
@@ -1040,7 +1594,6 @@ def test_final_pipeline_cache_schema_bumped_for_cold_open_fix(tmp_path: Path, mo
     assert pipeline_cache.load_final_pipeline_result(video, config) is not None
     monkeypatch.setattr(pipeline_cache, "_CACHE_SCHEMA", current)
     assert pipeline_cache.load_final_pipeline_result(video, config) is None
-
 
 
 def test_library_payload_groups_episodes_and_uses_cover(tmp_path: Path) -> None:
@@ -1065,9 +1618,7 @@ def test_library_payload_groups_episodes_and_uses_cover(tmp_path: Path) -> None:
     for episode in (1, 2, 3):
         video = tmp_path / f"Grouped Anime - {episode:02d}.mkv"
         video.write_bytes(b"video")
-        api.manager.db.upsert_episode(
-            LibraryEpisode(123, "Grouped Anime", episode, video, state="ready")
-        )
+        api.manager.db.upsert_episode(LibraryEpisode(123, "Grouped Anime", episode, video, state="ready"))
 
     state = api.get_state()
 
@@ -1080,53 +1631,124 @@ def test_library_payload_groups_episodes_and_uses_cover(tmp_path: Path) -> None:
     assert group["episodes"][0]["filename"] == "Grouped Anime - 01.mkv"
 
 
-def test_library_page_is_removed_from_web_ui() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'data-page="library"' not in html
-    assert '<section id="library"' not in html
-    assert 'function renderLibrary()' not in html
+def test_optional_integration_fields_follow_their_switches(page) -> None:
+    # Settings are one flat list (no "Additional settings" wrapper): test_settings_flatten_additional.py;
+    # the LLM fields and the "why disabled" hover: test_v0104_settings_ux_cleanup.py.
+    for lang in ("en", "ru"):
+        out = page.run(
+            """
+            setPage('settings'); await __tick(20);
+            const reason = id => $(id).closest('[data-tooltip]')?.dataset.tooltip || '';
+            const look = () => ({anilist: [$('s_anilist_client').disabled, reason('s_anilist_client')],
+                                 qbt: [$('s_qbt_url').disabled, reason('s_qbt_url')]});
+            const out = {off: look(), texts: {anilist: PudgeI18n.t('ui.enableAnilistFirst'), qbt: PudgeI18n.t('ui.enableQbittorrentFirst')}};
+            await __input('#s_anilist_enabled', true);
+            await __input('#s_qbt_enabled', true);
+            out.on = look();
+            return out;
+            """,
+            lang=lang,
+            state={"settings": {"anilist_enabled": False, "qbt_enabled": False}},
+        ).value
+        assert out["off"] == {"anilist": [True, out["texts"]["anilist"]], "qbt": [True, out["texts"]["qbt"]]}
+        assert out["on"] == {"anilist": [False, ""], "qbt": [False, ""]}
 
 
-def test_settings_are_flat_and_optional_fields_are_conditional() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'class="settings-flat"' in html
-    assert 'id="settings-anilist-fields"' in html
-    assert 'id="settings-llm-fields"' in html
-    assert 'id="settings-qbt-fields"' in html
-    assert "syncConditionalSettings()" in html
-    assert '<details class="advanced-settings">' not in html
+SIDEBAR = r"""
+await __tick(100);                                   // the start-up refresh is over
+let finish;
+__api.refresh_local = () => new Promise(resolve => { finish = () => resolve({state: __api.get_state(), stats: {}}); });
+const button = () => ({disabled: $('refreshAll').disabled, label: __text('#refreshAll'),
+                       spinner: Boolean($('refreshAll').querySelector('.spinner')), title: $('refreshAll').getAttribute('title')});
+const out = {
+  pages: [...document.querySelectorAll('.nav [data-page]')].map(node => node.dataset.page),
+  removed: ['library', 'downloads', 'diagnostics', 'librarySort', 'pageRefresh'].filter(id => document.getElementById(id) && !document.getElementById(id).matches('#diagnostics.page')),
+  refreshButtons: document.querySelectorAll('#refreshAll').length,
+  idle: {...button(), status: __visible('#status')},
+};
+await __click('#refreshAll'); await __tick(10);
+out.refreshing = {...button(), status: __visible('#status'), statusText: __text('#status')};
+finish(); await __tick(50);
+out.done = {...button(), status: __visible('#status')};
+out.texts = {refresh: t('action.refresh'), refreshing: t('action.refreshing'), status: t('status.refreshing')};
+return out;
+"""
 
 
-def test_onboarding_uses_left_aligned_toggles_and_recommends_anilist() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "Connect AniList (strongly advised)" in html
-    assert 'class="onboarding-toggle"' in html
-    assert 'id="o_anilist_fields"' in html
+def test_sidebar_has_one_refresh_button_that_shows_progress(page) -> None:
+    assert en("action.refreshing") == "Refreshing…"
+    assert ru("action.refreshing") == "Обновление…"
+    for lang in ("en", "ru"):
+        out = page.run(SIDEBAR, lang=lang).value
+        texts = out["texts"]
+        # No Library, Downloads or Diagnostics pages in the sidebar (Diagnostics opens from Settings),
+        # no Library sort control, no second refresh button on the pages.
+        assert not {"library", "downloads", "diagnostics"} & set(out["pages"])
+        assert out["removed"] == [] and out["refreshButtons"] == 1
+        # Idle: no status line under the buttons.
+        assert out["idle"] == {
+            "disabled": False,
+            "label": texts["refresh"],
+            "spinner": False,
+            "title": None,
+            "status": False,
+        }
+        # While refreshing: disabled, a spinner with "Refreshing…", the status as its tooltip and below it.
+        assert out["refreshing"] == {
+            "disabled": True,
+            "label": texts["refreshing"],
+            "spinner": True,
+            "title": texts["status"],
+            "status": True,
+            "statusText": texts["status"],
+        }
+        assert out["done"] == out["idle"]
 
 
-def test_web_ui_final_rating_context_menu_and_compact_navigation() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "label.final" in html
-    assert "showScoreModal" in html
-    assert "data-context-action=\"drop\"" in html
-    assert "data-context-action=\"watching\"" in html
-    assert 'data-page="downloads"' not in html
-    assert 'id="settingsMaintenance"' in html
-    assert "openDiagnosticsPage" in html
-    assert 'data-page="diagnostics"' not in html
-    assert html.count('id="refreshAll"') == 1
-    assert 'id="pageRefresh"' not in html
+WATCHING_MENU = r"""
+setPage('current', true); renderCurrent(); await __tick(20);
+await __fire('#currentContent .waiting-card strong', 'contextmenu', {button: 2, clientX: 40, clientY: 40}, 'MouseEvent');
+await __tick(10);
+const out = {actions: [...document.querySelectorAll('#contextMenu.open [data-context-action]')].map(node => node.dataset.contextAction)};
+await __click('#contextMenu [data-context-action="score"]'); await __tick(20);
+out.scoreTitle = __text('#modalTitle'); out.expectedScore = t('modal.setScore');
+await __click('#modalBackdrop [data-action="close-modal"]'); await __tick(20);
+await __fire('#currentContent .waiting-card strong', 'contextmenu', {button: 2, clientX: 40, clientY: 40}, 'MouseEvent');
+await __click('#contextMenu [data-context-action="delete-files"]'); await __tick(20);
+out.confirm = __text('#pudgeConfirmMessage'); out.expectedConfirm = t('confirm.deleteAnimeFiles') + '\n' + t('confirm.deleteAnimeFilesNoRedownload');
+await __click('[data-pudge-confirm="ok"]'); await __tick(50);
+out.toasts = __toasts(); out.dropped = t('toast.animeFilesDeleted', {status: t('anilistStatus.current')});
+return out;
+"""
 
 
-def test_sidebar_status_is_hidden_and_refresh_button_shows_progress() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="status" class="status" hidden' in html
-    assert "'action.refreshing':'Refreshing…'" in html
-    assert "'action.refreshing':'Обновление…'" in html
-    assert 'button.disabled=active' in html
-    assert 'button.innerHTML=`<span class=\"spinner\" aria-hidden=\"true\"></span><span>${label}</span>`' in html
-    assert 'button.title=t(statusKey)' in html
-    assert "setLocalRefreshUi(true,'status.refreshing')" in html
+def test_watching_card_menu_scores_and_deletes_the_anime(page) -> None:
+    show = {
+        "media_id": 4,
+        "list_status": "CURRENT",
+        "title": "Airing Waiting",
+        "site_url": "https://anilist.co/anime/4",
+        "next_episode": 3,
+        "local": {"video_path": "/v/Airing Waiting - 03.mkv", "episode": 3, "state": "waiting_subtitles"},
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            WATCHING_MENU,
+            lang=lang,
+            state={"current": [show], "home": {"waiting": [show]}},
+            api={
+                "drop_anime": {"ok": True, "state": {"home": {}}},
+                "final_sequel_option": {"ok": True, "sequel": None},
+            },
+        )
+        out = result.value
+        # Watching titles can be scored and (with a downloaded episode) deleted;
+        # "move to Watching" is for Planning only.
+        assert {"score", "delete-files"} <= set(out["actions"]) and "watching" not in out["actions"]
+        assert out["scoreTitle"] == out["expectedScore"]
+        assert out["confirm"] == out["expectedConfirm"]
+        assert result.calls_of("drop_anime") == [[4, "CURRENT"]]
+        assert out["dropped"] in out["toasts"]
 
 
 def test_drop_group_contains_only_local_pending_files(tmp_path: Path) -> None:
@@ -1175,55 +1797,103 @@ def test_play_status_requests_final_rating_once(tmp_path: Path) -> None:
     assert second["rating_prompted"] is True
 
 
-def test_ready_sections_are_responsive_and_statuses_are_compact() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'class="ready-sections"' in html
-    assert ".ready-sections { display:grid" in html
-    assert "'label.waitingSubs':'Waiting for subs'" in html
-    assert "'label.waitingSubs':'Ждём субтитры'" in html
-    assert "white-space:nowrap; overflow:hidden; text-overflow:ellipsis" in html
+def test_only_cut_off_titles_show_the_full_title_on_hover(page) -> None:
+    # WKWebView shows native `title` tooltips late and for every title; Pudge removes them and
+    # shows its own tooltip, only for titles that do not fit.
+    planned = [
+        {
+            "media_id": 1,
+            "title": "A title far too long for its card",
+            "media_status": "FINISHED",
+            "episodes": 12,
+            "progress": 0,
+        },
+        {"media_id": 2, "title": "Short", "media_status": "FINISHED", "episodes": 12, "progress": 0},
+    ]
+    result = page.run(
+        """
+        setPage('planned', true); await __tick(50);
+        const title = id => `#plannedContent .anime-card[data-media-id="${id}"] .anime-title`;
+        Object.assign(document.querySelector(title(1)), {clientWidth: 120, clientHeight: 20, scrollWidth: 400, scrollHeight: 20});
+        Object.assign(document.querySelector(title(2)), {clientWidth: 120, clientHeight: 20, scrollWidth: 120, scrollHeight: 20});
+        await __tick(600);
+        const tip = () => ({shown: $('titleTooltip').classList.contains('show'), text: $('titleTooltip').textContent});
+        const out = {native: [1, 2].map(id => document.querySelector(title(id)).getAttribute('title'))};
+        await __fire(title(1), 'mouseover', {}, 'MouseEvent'); out.long = tip();
+        await __fire(title(1), 'mouseout', {}, 'MouseEvent'); out.left = tip();
+        await __fire(title(2), 'mouseover', {}, 'MouseEvent'); out.short = tip();
+        return out;
+        """,
+        state={"planned": planned},
+    )
+    out = result.value
+    assert out["native"] == [None, None]
+    assert out["long"] == {"shown": True, "text": "A title far too long for its card"}
+    assert out["left"]["shown"] is False
+    assert out["short"]["shown"] is False
+    rules = css_rules("index.html")
+    assert (rules.get(".title-tooltip", "opacity"), rules.get(".title-tooltip.show", "opacity")) == ("0", "1")
 
 
-def test_library_sort_controls_are_removed_with_library_page() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="librarySort"' not in html
-    assert 'ui.librarySort' not in html
+SCORE_WHEEL = r"""
+const queue = [];                                   // Math.random answers, in order
+Math.random = () => queue.length ? queue.shift() : 0.5;
+const look = () => ({value: __text('#modalBody .random-score-value'), use: $('modalBody').querySelector('[data-action="score-anime"]').disabled,
+                     useLabel: __text('#modalBody [data-action="score-anime"]'), reroll: $('modalBody').querySelector('[data-action="reroll-score"]').disabled});
+queue.push(0.001, 0.5, 0.5);                        // score 1
+showScoreModal({media_id: 9, title: 'Show'}, false, null);
+const out = {title: __text('#modalTitle')};
+let shownAt = null;
+for (let ms = 10; ms <= 1500 && shownAt == null; ms += 10) { await __tick(10); if (ms === 500) out.spinning = look(); if (look().value) shownAt = ms; }
+out.first = {...look(), shownAt};
+queue.push(0.001, 0.999, 0.5, 0.5);                 // score 1 again (not allowed), then 10
+await __click('#modalBody [data-action="reroll-score"]');
+out.rerolling = look();
+await __tick(1000);
+out.second = look();
+await __click('#modalBody [data-action="score-anime"]'); await __tick(20);
+out.open = __visible('#modalBackdrop');
+out.texts = {title: t('modal.setScore'), use1: t('action.useGeneratedScore', {score: 1}), use10: t('action.useGeneratedScore', {score: 10}),
+             saved: t('toast.scoreSaved')};
+out.toasts = __toasts();
+// How likely each score is: the pick sweeps the whole range in 480 even steps.
+const counts = Array(10).fill(0);
+for (let i = 0; i < 480; i++) { queue.push((i + 0.5) / 480, 0.5); counts[chooseWheelResult(null).score - 1]++; }
+out.counts = counts;
+return out;
+"""
 
 
-def test_escape_fullscreen_is_dispatched_to_cocoa_main_thread() -> None:
-    source = (Path(__file__).parents[1] / "pudge" / "web_app.py").read_text(encoding="utf-8")
-    assert "AppHelper.callAfter(self._exit_fullscreen_on_main_thread)" in source
-    assert "self._fullscreen_exit_pending" in source
-    assert "native_window.toggleFullScreen_(None)" in source
-
-
-def test_overflow_titles_use_custom_webview_tooltip() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'id="titleTooltip"' in html
-    assert "function titleIsClipped(el)" in html
-    assert "probe=el.cloneNode(true)" in html
-    assert "function showTitleTooltip(el)" in html
-    assert "document.addEventListener('mouseover'" in html
-    assert "document.addEventListener('mouseout'" in html
-    assert "el.dataset.titleClipped=clipped?'1':'0'" in html
-
-
-def test_score_modal_uses_weighted_one_second_fortune_wheel() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "const SCORE_WHEEL_WEIGHTS=[1,2,4,7,10,10,7,4,2,1]" in html
-    assert "function chooseWheelResult(previous=null)" in html
-    assert "function spinScoreWheel(c)" in html
-    assert 'data-action="reroll-score"' in html
-    assert 'data-action="score-anime"' in html
-    assert "setTimeout(()=>{" in html
-    assert "},1000);" in html
-    assert "Array.from({length:10}" not in html
-
-
-def test_unreleased_planning_menu_hides_move_to_watching() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "const unreleased=String(a.media_status||'').trim().toUpperCase()==='NOT_YET_RELEASED'" in html
-    assert "const watchingAction=unreleased?'':" in html
+def test_score_wheel_spins_one_second_weighted_toward_the_middle(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            SCORE_WHEEL,
+            lang=lang,
+            api={"set_anilist_score": {"ok": True}, "final_sequel_option": {"ok": True, "sequel": None}},
+        )
+        out, texts = result.value, result.value["texts"]
+        assert out["title"] == texts["title"]
+        # While the wheel turns there is nothing to save and no second spin.
+        assert (
+            out["spinning"]["use"] is True
+            and out["spinning"]["reroll"] is True
+            and out["spinning"]["value"] == ""
+        )
+        # The result shows after one second (the spin starts on the next frame).
+        assert 1000 < out["first"]["shownAt"] <= 1050
+        assert out["first"] == {
+            "value": "1",
+            "use": False,
+            "useLabel": texts["use1"],
+            "reroll": False,
+            "shownAt": out["first"]["shownAt"],
+        }
+        # Spinning again works at once (no cooldown after a result) and never repeats the last score.
+        assert out["rerolling"]["use"] is True and out["rerolling"]["value"] == ""
+        assert out["second"] == {"value": "10", "use": False, "useLabel": texts["use10"], "reroll": False}
+        assert result.calls_of("set_anilist_score") == [[9, 10, None]]
+        assert out["open"] is False and texts["saved"] in out["toasts"]
+        assert out["counts"] == [10, 20, 40, 70, 100, 100, 70, 40, 20, 10]
 
 
 def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -> None:
@@ -1240,21 +1910,44 @@ def test_external_subtitle_reveals_file_in_finder(tmp_path: Path, monkeypatch) -
     assert calls == [["open", "-R", str(subtitle.resolve())]]
 
 
-def test_library_external_subtitle_has_filename_tooltip_and_reveal_action() -> None:
-    web_dir = Path(__file__).parents[1] / "pudge" / "web"
-    html = (web_dir / "index.html").read_text(encoding="utf-8")
-    library = (web_dir / "library.js").read_text(encoding="utf-8")
-    assert 'data-action="reveal-subtitle"' in library
-    assert "e.subtitle_filename||revealPath" in library
-    assert "pywebview.api.reveal_subtitle_file(target.dataset.path)" in html
-    assert ".library-subtitle.external-link" in html
-
-
-def test_score_wheel_has_no_extra_post_result_cooldown() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "rerollReadyAt" not in html
-    assert "scheduleScoreRerollUnlock" not in html
-    assert "c.generatedScore=result.score;c.lastScore=result.score;c.spinning=false" in html
+def test_library_row_names_the_external_subtitle_file_and_reveals_it(page) -> None:
+    # Which rows reveal what (and the reveal_subtitle_file calls): test_v0616_graph_subtitle_settings.py.
+    rows = [
+        {
+            "episode": 3,
+            "state": "ready",
+            "subtitle_source": "external",
+            "subtitle_path": "/s/Show - 03.ja.ass",
+            "subtitle_filename": "Show - 03.ja.ass",
+            "video_path": "/v/03.mkv",
+            "filename": "03.mkv",
+        },
+        {
+            "episode": 4,
+            "state": "ready",
+            "subtitle_source": "external",
+            "subtitle_path": "/s/04.srt",
+            "video_path": "/v/04.mkv",
+            "filename": "04.mkv",
+        },
+    ]
+    result = page.run(
+        """
+        const box = document.createElement('div');
+        box.innerHTML = ROWS.map(libraryEpisodeRow).join('');
+        document.body.appendChild(box);
+        const links = [...box.querySelectorAll('.library-subtitle')];
+        const out = {tooltips: links.map(link => link.getAttribute('title')), labels: links.map(link => link.innerText), expected: t('subtitle.external')};
+        links[0].click(); await __flush();
+        return out;
+        """.replace("ROWS", json.dumps(rows)),
+    )
+    out = result.value
+    assert out["tooltips"] == ["Show - 03.ja.ass", "/s/04.srt"]  # the file name, else the path
+    assert out["labels"] == [out["expected"], out["expected"]]
+    assert result.calls_of("reveal_subtitle_file") == [["/s/Show - 03.ja.ass"]]
+    # Shown as a link.
+    assert css_rules("index.html").get(".library-subtitle.external-link", "cursor") == "pointer"
 
 
 def test_save_settings_persists_notifications_toggle(tmp_path: Path) -> None:
@@ -1264,12 +1957,6 @@ def test_save_settings_persists_notifications_toggle(tmp_path: Path) -> None:
 
     assert result["settings"]["notifications_enabled"] is False
     assert api.config.ui.notifications_enabled is False
-
-
-def test_settings_ui_contains_notifications_toggle() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "s_notifications" in html
-    assert "notifications_enabled:c('s_notifications')" in html
 
 
 def test_home_moves_resumable_ready_anime_to_continue_watching(tmp_path: Path) -> None:
@@ -1304,15 +1991,6 @@ def test_home_moves_resumable_ready_anime_to_continue_watching(tmp_path: Path) -
 
     assert home["new_ready"] == []
     assert [item["media_id"] for item in home["continue_watching"]] == [anime.media_id]
-
-
-def test_continue_watching_renders_before_ready_sections() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text()
-    render_start = html.index("function renderCurrent()")
-    render_end = html.index("function buildPlannedOnce()", render_start)
-    render_current = html[render_start:render_end]
-
-    assert render_current.index("section.continueWatching") < render_current.index("readySections?")
 
 
 def test_poll_planned_release_discovery_exposes_backend_offers(tmp_path: Path) -> None:

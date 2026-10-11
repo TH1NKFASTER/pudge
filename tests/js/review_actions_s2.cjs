@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {loadI18n} = require('./i18n_prelude.cjs');
 
 const WEB = process.argv[2];
 
@@ -147,6 +148,7 @@ context.globalThis = context;
 Object.assign(window, {document});
 vm.createContext(context);
 vm.runInContext('const ui={state:{settings:{}}};',context);
+loadI18n(context, WEB);
 for (const name of ['review_actions.js', 'reading_tools.js', 'review_gate.js']) {
   vm.runInContext(fs.readFileSync(path.join(WEB, name), 'utf8'), context, {filename: name});
 }

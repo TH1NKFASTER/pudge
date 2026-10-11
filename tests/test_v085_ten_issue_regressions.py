@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 import time
@@ -15,6 +16,8 @@ from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode, NyaaRelease
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en, ru
+from tests.lua_harness import ANILIST, needs_lua, run_mpv_scenario
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -262,7 +265,7 @@ def test_resume_within_two_minutes_has_no_rewind(tmp_path: Path, monkeypatch, di
     assert command[command.index("--start-at") + 1] == "321.500"
 
 
-def test_active_mpv_registry_is_restored_after_webapp_restart(tmp_path: Path, monkeypatch) -> None:
+def test_active_mpv_registry_is_restored_after_webapp_restart(tmp_path: Path, monkeypatch, page) -> None:
     api = make_api(tmp_path)
     video = (tmp_path / "open.mkv").resolve()
     video.write_bytes(b"video")
@@ -281,18 +284,109 @@ def test_active_mpv_registry_is_restored_after_webapp_restart(tmp_path: Path, mo
 
     monkeypatch.setattr("pudge.web_app.os.kill", lambda pid, signal: None)
     reopened = WebAppApi(api.config.config_path)
-    active = reopened.get_state()["active_playbacks"]
+    state = json.loads(json.dumps(reopened.get_state(), default=str))
+    active = state["active_playbacks"]
 
     assert any(item["video_path"] == str(video) and item["pid"] == 79123 for item in active)
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "hydrateActivePlaybacks(ui.state)" in html
-    assert "monitorPlay(path)" in html
+
+    # The reopened window keeps watching that mpv: it polls its status, refuses a second
+    # player for the same file, and allows playing again once mpv has closed.
+    result = page.run(
+        r"""
+        window.__mpv = {status: 'running'};
+        __api.play_status = async () => window.__mpv;
+        await __tick(2500);
+        const polled = __apiCalls.filter(call => call.name === 'play_status').map(call => call.args[0]);
+        await startPlay(VIDEO);
+        const second = {toasts: __toasts(), open: t('toast.videoOpen')};
+        window.__mpv = {status: 'exited', exit_code: 0};
+        await __tick(2500);
+        await startPlay(VIDEO);
+        return {polled, second};
+        """.replace("VIDEO", json.dumps(str(video))),
+        state=state,
+        api={"play": {"status": "starting"}},
+    )
+    out = result.value
+    assert out["polled"] and set(out["polled"]) == {str(video)}
+    assert out["second"]["open"] in out["second"]["toasts"]
+    assert [call[0] for call in result.calls_of("play")] == [str(video)]  # only after mpv closed
 
 
-def test_mpv_has_cmd_shift_l_episode_debug_export() -> None:
-    root = Path(__file__).parents[1]
-    lua = (root / "pudge" / "mpv_scripts" / "pudge_anilist.lua").read_text(encoding="utf-8")
-    cli = (root / "pudge" / "cli.py").read_text(encoding="utf-8")
-    assert "Meta+Shift+l" in lua
-    assert "--export-episode-debug" in lua
-    assert 'subprocess.run(["open", "-R", str(target)]' in cli
+# Cmd+Shift+L in mpv: the episode's debug snapshot is exported and shown in Finder.
+EXPORT_KEY = """
+sim.press('Meta+Shift+l')
+for _, row in ipairs(sim.log) do
+    if row.kind == 'osd' then print('OSD:' .. row.value) end
+    if row.kind == 'subprocess' and row.value:find('pudge.cli', 1, true) then print('RUN:' .. row.value) end
+end
+"""
+
+
+@needs_lua
+def test_mpv_cmd_shift_l_exports_the_episode_debug_snapshot(tmp_path: Path) -> None:
+    for language, text in (("en", en), ("ru", ru)):
+        out = run_mpv_scenario(
+            tmp_path,
+            EXPORT_KEY,
+            scripts=[ANILIST],
+            language=language,
+            env={
+                "PUDGE_PYTHON": "python3",
+                "PUDGE_CONFIG": "/cfg/config.toml",
+                "PUDGE_PLAYBACK_VIDEO": "/media/Show - 05.mkv",
+            },
+        )
+        runs = [line[4:] for line in out.splitlines() if line.startswith("RUN:")]
+        assert runs == [
+            "python3 -m pudge.cli --export-episode-debug --playback-video /media/Show - 05.mkv --config /cfg/config.toml"
+        ]
+        osd = [line[4:] for line in out.splitlines() if line.startswith("OSD:")]
+        assert osd == [text("osd.exportingEpisodeLogs"), text("osd.episodeLogsExported")]
+    # A file Pudge did not start has no library episode to export.
+    out = run_mpv_scenario(tmp_path, EXPORT_KEY, scripts=[ANILIST], env={"PUDGE_PYTHON": "python3"})
+    assert "RUN:" not in out
+    assert f"OSD:{en('osd.debugExportUnavailable')}" in out
+
+
+def test_episode_debug_export_writes_snapshot_to_debug_logs_and_reveals_it(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from pudge import cli
+
+    api = make_api(tmp_path)
+    api.manager.db.upsert_anime(LibraryAnime(media_id=79001, title="Sayonara Lara", episodes=12))
+    video = (tmp_path / "Lara - 03.mkv").resolve()
+    video.write_bytes(b"video")
+    api.manager.db.upsert_episode(
+        LibraryEpisode(media_id=79001, title="Sayonara Lara", episode=3, video_path=video, state="ready")
+    )
+    logs = tmp_path / "debug-logs"
+    logs.mkdir()
+    revealed: list[list[str]] = []
+    monkeypatch.setattr(cli, "debug_log_dir", lambda: logs)
+    monkeypatch.setattr(cli.sys, "platform", "darwin")
+    # Only the CLI's own subprocess calls are captured (other threads keep the real ones).
+    monkeypatch.setattr(
+        cli,
+        "subprocess",
+        SimpleNamespace(**{**vars(subprocess), "run": lambda command, **_kwargs: revealed.append(command)}),
+    )
+
+    assert (
+        cli.main(
+            [
+                "--export-episode-debug",
+                "--playback-video",
+                str(video),
+                "--config",
+                str(api.config.config_path),
+            ]
+        )
+        == 0
+    )
+
+    [snapshot] = list(logs.glob("pudge-debug-79001-ep3-*.json"))
+    assert json.loads(snapshot.read_text(encoding="utf-8"))
+    assert revealed == [["open", "-R", str(snapshot)]]
+    assert f"PUDGE_EPISODE_DEBUG={snapshot}" in capsys.readouterr().out

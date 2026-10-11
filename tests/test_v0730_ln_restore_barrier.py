@@ -46,7 +46,7 @@ def test_ln_close_waits_for_transaction_before_restore_can_replace_file(tmp_path
     assert entered.wait(1)
     closer.start()
     try:
-        assert not finished.wait(.05), "Database replacement must wait for its active writer"
+        assert not finished.wait(0.05), "Database replacement must wait for its active writer"
     finally:
         release.set()
         worker.join(2)

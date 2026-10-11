@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,18 +56,16 @@ class PathsConfig:
     max_scanned_files: int = 8000
 
 
-
-
 @dataclass(slots=True)
 class LibraryConfig:
     root_dir: Path = field(default_factory=lambda: DEFAULT_LIBRARY_DIR)
-    database_path: Path = field(
-        default_factory=lambda: DEFAULT_DATABASE_PATH
-    )
+    database_path: Path = field(default_factory=lambda: DEFAULT_DATABASE_PATH)
     recursive: bool = True
     cover_cache_dir: Path = field(default_factory=lambda: DEFAULT_CACHE_DIR / "covers")
     disk_limit_enabled: bool = True
     disk_limit_gb: float = 500.0
+    # Kept free on the download volume; 0 = automatic (max(20 GB, 5 % of the volume)).
+    disk_free_reserve_gb: float = 0.0
 
 
 @dataclass(slots=True)
@@ -88,20 +87,14 @@ class NyaaConfig:
     min_release_score: float = 72.0
     min_seeders: int = 1
     preferred_resolution: str = "1080p"
-    preferred_video_codecs: list[str] = field(
-        default_factory=lambda: ["HEVC", "AV1", "AVC"]
-    )
-    preferred_sources: list[str] = field(
-        default_factory=lambda: ["BluRay", "WEB-DL", "WEBRip"]
-    )
+    preferred_video_codecs: list[str] = field(default_factory=lambda: ["HEVC", "AV1", "AVC"])
+    preferred_sources: list[str] = field(default_factory=lambda: ["BluRay", "WEB-DL", "WEBRip"])
     require_japanese_audio: bool = True
     avoid_upscaled: bool = True
     trusted_groups: list[str] = field(
         default_factory=lambda: ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
     )
-    preferred_groups: list[str] = field(
-        default_factory=lambda: ["EMBER", "Judas", "Anime Time"]
-    )
+    preferred_groups: list[str] = field(default_factory=lambda: ["EMBER", "Judas", "Anime Time"])
     blocked_groups: list[str] = field(default_factory=list)
     episode_min_size_mb: int = 250
     episode_max_size_mb: int = 3500
@@ -163,12 +156,13 @@ class PlaybackConfig:
     enabled: bool = True
     rewind_seconds: float = 15.0
     save_interval_seconds: float = 30.0
-    # Local OP/ED detection from audio fingerprints (background, low priority).
-    intro_detection_enabled: bool = True
-    # Skip button in mpv for detected OP/ED; automatic skipping is opt-in.
+    # Skip button in mpv for OP/ED. Local OP/ED detection from audio
+    # fingerprints (background, low priority) runs only while it is on.
+    # The old intro_detection_enabled / auto_skip_* keys are ignored.
     skip_segments_enabled: bool = True
-    auto_skip_intro: bool = False
-    auto_skip_outro: bool = False
+    # mpv plays surround (5.1/7.1) audio as stereo. macOS renders multichannel
+    # audio spatially in AirPods even with Spatial Audio off in Control Center.
+    stereo_downmix: bool = False
 
 
 _RESERVED_MPV_SHORTCUTS = {"ctrl+a", "ctrl+t", "meta+shift+l"}
@@ -192,6 +186,8 @@ class ShortcutsConfig:
     mpv_explain_subtitle: str = "Ctrl+Shift+t"
     # Active only while the skip button is visible (inside an OP/ED).
     mpv_skip_segment: str = "Tab"
+    # System-wide: opens/closes the Screen text panel (OCR of the game window).
+    screen_text_toggle: str = "Meta+Alt+Shift+v"
 
 
 @dataclass(slots=True)
@@ -207,18 +203,14 @@ class PowerConfig:
 
 
 @dataclass(slots=True)
-class CompanionConfig:
-    enabled: bool = False
-    bind_host: str = "127.0.0.1"
-    port: int = 47821
-    pairing_ttl_seconds: float = 300.0
-    max_events_per_request: int = 500
-
-
-@dataclass(slots=True)
 class ToolsConfig:
     mpv: str = "mpv"
-    manga_ocr_backend: str = "pudge"
+    # Optional Python of an existing Mokuro environment (e.g. a Mokuro venv).
+    # Empty: use the Mokuro environment pudge installs from Settings.
+    manga_mokuro_python: str = ""
+    # OCR manga volumes of the library in the background, on mains power and
+    # only while the Pudge window is not in front.
+    manga_background_ocr: bool = False
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
     alass: str = "alass"
@@ -353,7 +345,6 @@ class AppConfig:
     shortcuts: ShortcutsConfig = field(default_factory=ShortcutsConfig)
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
     power: PowerConfig = field(default_factory=PowerConfig)
-    companion: CompanionConfig = field(default_factory=CompanionConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     jimaku: JimakuConfig = field(default_factory=JimakuConfig)
     anilist: AniListConfig = field(default_factory=AniListConfig)
@@ -367,10 +358,72 @@ def _expand_path(value: str | Path) -> Path:
     return Path(value).expanduser().resolve()
 
 
+_TRUE_WORDS = {"true", "yes", "on", "1"}
+_FALSE_WORDS = {"false", "no", "off", "0", ""}
+CONFIG_WARNINGS: list[str] = []
+
+
+def _config_warning(message: str) -> None:
+    CONFIG_WARNINGS.append(message)
+    import logging
+
+    logging.getLogger("pudge.config").warning("CONFIG %s", message)
+
+
+class _TypedSection(dict):
+    """A config section whose ``get`` returns the default's type.
+
+    A typo ("12O"), a quoted boolean ("false") or a wrong type in config.toml
+    gives a warning and the default instead of a crash (or of "false" reading
+    as True) at startup.
+    """
+
+    def __init__(self, values: dict[str, Any], name: str) -> None:
+        super().__init__(values)
+        self.section_name = name
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key not in self:
+            return default
+        value = dict.__getitem__(self, key)
+        if isinstance(default, bool):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and value in (0, 1):
+                return bool(value)
+            word = str(value).strip().casefold()
+            if word in _TRUE_WORDS:
+                return True
+            if word in _FALSE_WORDS:
+                return False
+        elif isinstance(default, int):
+            if isinstance(value, bool):
+                pass
+            elif isinstance(value, int):
+                return value
+            else:
+                try:
+                    number = float(str(value).strip())
+                    if number.is_integer():
+                        return int(number)
+                except ValueError:
+                    pass
+        elif isinstance(default, float):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            try:
+                return float(str(value).strip())
+            except ValueError:
+                pass
+        else:
+            return value
+        _config_warning(f"[{self.section_name}] {key} = {value!r} is not valid; using {default!r}")
+        return default
+
+
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
     value = data.get(name, {})
-    return value if isinstance(value, dict) else {}
-
+    return _TypedSection(value if isinstance(value, dict) else {}, name)
 
 
 def _load_subtitle_dirs(paths: dict[str, Any]) -> list[Path]:
@@ -412,13 +465,90 @@ def _load_watched_media_dirs(paths: dict[str, Any]) -> list[Path]:
     # once and write it back under watched_media_dirs on the next save.
     return legacy
 
-def load_config(path: Path | None = None) -> AppConfig:
+
+# Set by load_config when config.toml cannot be read as TOML: the app then
+# starts with default settings in Safe Mode and says which line is broken.
+# {"path", "line", "column", "message", "copy"}; empty when the file is fine.
+CONFIG_LOAD_ERROR: dict[str, Any] = {}
+
+
+def _keep_broken_config_copy(config_path: Path, data: bytes) -> Path | None:
+    """``config.toml.bad-<time>``: one copy per broken content (helpers load the config often)."""
+    try:
+        for existing in sorted(config_path.parent.glob(config_path.name + ".bad-*")):
+            try:
+                if existing.read_bytes() == data:
+                    return existing
+            except OSError:
+                continue
+        copy = config_path.with_name(f"{config_path.name}.bad-{time.strftime('%Y%m%d-%H%M%S')}")
+        copy.write_bytes(data)
+        copy.chmod(0o600)
+        return copy
+    except OSError:
+        return None
+
+
+def _parse_config_bytes(config_path: Path, data: bytes) -> dict[str, Any]:
+    """The parsed config, or {} (defaults) with CONFIG_LOAD_ERROR set when it is not valid TOML."""
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        line, column, message = data[: exc.start].count(b"\n") + 1, 0, "not UTF-8 text"
+    except tomllib.TOMLDecodeError as exc:
+        text = str(exc)
+        position = re.search(r"\s*\(at line (\d+), column (\d+)\)\s*$", text)
+        line, column = (int(position.group(1)), int(position.group(2))) if position else (0, 0)
+        message = text[: position.start()] if position else text
+    copy = _keep_broken_config_copy(config_path, data)
+    CONFIG_LOAD_ERROR.update(
+        {
+            "path": str(config_path),
+            "line": line,
+            "column": column,
+            "message": message.strip()[:200],
+            "copy": str(copy or ""),
+        }
+    )
+    import logging
+
+    logging.getLogger("pudge.config").error(
+        "CONFIG unreadable path=%s line=%s column=%s error=%r copy=%s; using default settings",
+        config_path,
+        line,
+        column,
+        message,
+        copy or "",
+    )
+    # Only the interface language is taken from the broken file, so the
+    # Safe Mode notice is in the user's language.
+    language = re.search(rb'(?m)^\s*language\s*=\s*"(en|ru)"', data)
+    return {"ui": {"language": language.group(1).decode()}} if language else {}
+
+
+def load_config(
+    path: Path | None = None,
+    *,
+    resolve_secrets: bool = True,
+    apply_language: bool = True,
+    recover_invalid: bool = True,
+) -> AppConfig:
+    """Read the config; ``resolve_secrets=False`` skips the Keychain (cheap checks).
+
+    A file that is not valid TOML gives the default settings (see
+    CONFIG_LOAD_ERROR) unless ``recover_invalid=False``, which raises.
+    """
+    CONFIG_WARNINGS.clear()
+    CONFIG_LOAD_ERROR.clear()
     config_path = Path(path or DEFAULT_CONFIG_PATH).expanduser()
-    use_keychain = config_path.resolve() == DEFAULT_CONFIG_PATH.expanduser().resolve()
+    use_keychain = resolve_secrets and config_path.resolve() == DEFAULT_CONFIG_PATH.expanduser().resolve()
     raw: dict[str, Any] = {}
     if config_path.exists():
-        with config_path.open("rb") as fh:
-            raw = tomllib.load(fh)
+        data = config_path.read_bytes()
+        if recover_invalid:
+            raw = _parse_config_bytes(config_path, data)
+        else:
+            raw = tomllib.loads(data.decode("utf-8"))
 
     ui = _section(raw, "ui")
     paths = _section(raw, "paths")
@@ -428,9 +558,9 @@ def load_config(path: Path | None = None) -> AppConfig:
     aria2 = _section(raw, "aria2")
     agent = _section(raw, "agent")
     power = _section(raw, "power")
+    diagnostics = _section(raw, "diagnostics")
     playback = _section(raw, "playback")
     shortcuts = _section(raw, "shortcuts")
-    companion = _section(raw, "companion")
     tools = _section(raw, "tools")
     jimaku = _section(raw, "jimaku")
     anilist = _section(raw, "anilist")
@@ -438,15 +568,22 @@ def load_config(path: Path | None = None) -> AppConfig:
     llm_profiles = {}
     for protocol, profile in (llm.get("profiles") or {}).items():
         if protocol in {"ollama", "openai"} and isinstance(profile, dict):
-            llm_profiles[protocol] = {"url":str(profile.get("url") or ""), "model":str(profile.get("model") or ""),
-                "api_key":_SECRET_STORE.resolve("llm-profile-"+protocol,profile.get("api_key", ""),use_keychain=use_keychain)}
+            llm_profiles[protocol] = {
+                "url": str(profile.get("url") or ""),
+                "model": str(profile.get("model") or ""),
+                "api_key": _SECRET_STORE.resolve(
+                    "llm-profile-" + protocol, profile.get("api_key", ""), use_keychain=use_keychain
+                ),
+            }
 
     matching = _section(raw, "matching")
     sync = _section(raw, "sync")
 
     cfg = AppConfig(
         ui=UIConfig(
-            language=str(ui.get("language", "en")).lower() if str(ui.get("language", "en")).lower() in {"en", "ru"} else "en",
+            language=str(ui.get("language", "en")).lower()
+            if str(ui.get("language", "en")).lower() in {"en", "ru"}
+            else "en",
             onboarding_completed=bool(ui.get("onboarding_completed", False)),
             escape_exits_fullscreen=bool(ui.get("escape_exits_fullscreen", True)),
             notifications_enabled=bool(ui.get("notifications_enabled", True)),
@@ -471,15 +608,12 @@ def load_config(path: Path | None = None) -> AppConfig:
         ),
         library=LibraryConfig(
             root_dir=_expand_path(library.get("root_dir", DEFAULT_LIBRARY_DIR)),
-            database_path=_expand_path(
-                library.get("database_path", DEFAULT_DATABASE_PATH)
-            ),
+            database_path=_expand_path(library.get("database_path", DEFAULT_DATABASE_PATH)),
             recursive=bool(library.get("recursive", True)),
-            cover_cache_dir=_expand_path(
-                library.get("cover_cache_dir", DEFAULT_CACHE_DIR / "covers")
-            ),
+            cover_cache_dir=_expand_path(library.get("cover_cache_dir", DEFAULT_CACHE_DIR / "covers")),
             disk_limit_enabled=bool(library.get("disk_limit_enabled", True)),
             disk_limit_gb=max(0.0, float(library.get("disk_limit_gb", 500.0))),
+            disk_free_reserve_gb=max(0.0, float(library.get("disk_free_reserve_gb", 0.0))),
         ),
         nyaa=NyaaConfig(
             enabled=bool(nyaa.get("enabled", True)),
@@ -497,20 +631,17 @@ def load_config(path: Path | None = None) -> AppConfig:
             min_release_score=float(nyaa.get("min_release_score", 72.0)),
             min_seeders=int(nyaa.get("min_seeders", 1)),
             preferred_resolution=str(nyaa.get("preferred_resolution", "1080p")),
-            preferred_video_codecs=[str(x) for x in nyaa.get(
-                "preferred_video_codecs", ["HEVC", "AV1", "AVC"]
-            )],
-            preferred_sources=[str(x) for x in nyaa.get(
-                "preferred_sources", ["BluRay", "WEB-DL", "WEBRip"]
-            )],
+            preferred_video_codecs=[
+                str(x) for x in nyaa.get("preferred_video_codecs", ["HEVC", "AV1", "AVC"])
+            ],
+            preferred_sources=[str(x) for x in nyaa.get("preferred_sources", ["BluRay", "WEB-DL", "WEBRip"])],
             require_japanese_audio=True,
             avoid_upscaled=True,
-            trusted_groups=[str(x) for x in nyaa.get(
-                "trusted_groups", ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"]
-            )],
-            preferred_groups=[str(x) for x in nyaa.get(
-                "preferred_groups", ["EMBER", "Judas", "Anime Time"]
-            )],
+            trusted_groups=[
+                str(x)
+                for x in nyaa.get("trusted_groups", ["Erai-raws", "SubsPlease", "NanakoRaws", "shincaps"])
+            ],
+            preferred_groups=[str(x) for x in nyaa.get("preferred_groups", ["EMBER", "Judas", "Anime Time"])],
             blocked_groups=[str(x) for x in nyaa.get("blocked_groups", [])],
             episode_min_size_mb=int(nyaa.get("episode_min_size_mb", 250)),
             episode_max_size_mb=int(nyaa.get("episode_max_size_mb", 3500)),
@@ -574,36 +705,30 @@ def load_config(path: Path | None = None) -> AppConfig:
             enabled=True,
             rewind_seconds=10.0,
             save_interval_seconds=max(10.0, float(playback.get("save_interval_seconds", 30.0))),
-            intro_detection_enabled=bool(playback.get("intro_detection_enabled", True)),
             skip_segments_enabled=bool(playback.get("skip_segments_enabled", True)),
-            auto_skip_intro=bool(playback.get("auto_skip_intro", False)),
-            auto_skip_outro=bool(playback.get("auto_skip_outro", False)),
+            stereo_downmix=bool(playback.get("stereo_downmix", False)),
         ),
         shortcuts=ShortcutsConfig(
             mpv_mark_watched=str(shortcuts.get("mpv_mark_watched", "Ctrl+a")).strip(),
             mpv_explain_subtitle=str(shortcuts.get("mpv_explain_subtitle", "Ctrl+Shift+t")).strip(),
             mpv_translate_subtitle=str(shortcuts.get("mpv_translate_subtitle", "Ctrl+t")).strip(),
             mpv_skip_segment=_skip_shortcut(shortcuts.get("mpv_skip_segment", "Tab")),
+            screen_text_toggle=str(shortcuts.get("screen_text_toggle", "Meta+Alt+Shift+v")).strip(),
         ),
         diagnostics=DiagnosticsConfig(
-            # Always-on, low-overhead diagnostics. Kept out of Settings UI.
-            energy_monitoring_enabled=True,
-            energy_sample_seconds=30.0,
+            # Low-overhead energy diagnostics, on by default; kept out of the
+            # Settings UI, but the [diagnostics] section of config.toml is honoured.
+            energy_monitoring_enabled=bool(diagnostics.get("energy_monitoring_enabled", True)),
+            energy_sample_seconds=max(10.0, min(3600.0, diagnostics.get("energy_sample_seconds", 30.0))),
         ),
         power=PowerConfig(
             manual_energy_saving=bool(power.get("manual_energy_saving", False)),
             auto_battery_energy_saving=bool(power.get("auto_battery_energy_saving", True)),
         ),
-        companion=CompanionConfig(
-            enabled=bool(companion.get("enabled", False)),
-            bind_host=str(companion.get("bind_host", "127.0.0.1")).strip() or "127.0.0.1",
-            port=max(1024, min(65535, int(companion.get("port", 47821)))),
-            pairing_ttl_seconds=max(30.0, float(companion.get("pairing_ttl_seconds", 300.0))),
-            max_events_per_request=max(1, min(2000, int(companion.get("max_events_per_request", 500)))),
-        ),
         tools=ToolsConfig(
             mpv=str(tools.get("mpv", "mpv")),
-            manga_ocr_backend=(lambda v: v if v in {"pudge", "mokuro"} else "pudge")(str(tools.get("manga_ocr_backend", "pudge")).strip().casefold()),
+            manga_mokuro_python=str(tools.get("manga_mokuro_python", "") or "").strip(),
+            manga_background_ocr=bool(tools.get("manga_background_ocr", False)),
             ffmpeg=str(tools.get("ffmpeg", "ffmpeg")),
             ffprobe=str(tools.get("ffprobe", "ffprobe")),
             alass=str(tools.get("alass", "alass")),
@@ -654,8 +779,12 @@ def load_config(path: Path | None = None) -> AppConfig:
             provider=str(llm.get("provider", "ollama")).strip().lower() or "ollama",
             base_url=str(llm.get("base_url", "http://127.0.0.1:11434")).rstrip("/"),
             api_key=_SECRET_STORE.resolve(
-                "llm-profile-"+str(llm.get("provider", "ollama")) if str(llm.get("provider", "ollama")) in llm_profiles else "llm-api-key",
-                llm_profiles.get(str(llm.get("provider", "ollama")), {}).get("api_key", llm.get("api_key", "")),
+                "llm-profile-" + str(llm.get("provider", "ollama"))
+                if str(llm.get("provider", "ollama")) in llm_profiles
+                else "llm-api-key",
+                llm_profiles.get(str(llm.get("provider", "ollama")), {}).get(
+                    "api_key", llm.get("api_key", "")
+                ),
                 env="PUDGE_LLM_API_KEY",
                 use_keychain=use_keychain,
             ),
@@ -665,7 +794,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             keep_alive=str(llm.get("keep_alive", "10m")),
             temperature=float(llm.get("temperature", 0.0)),
             reasoning_effort=str(llm.get("reasoning_effort", "low")).strip().lower() or "low",
-            assistant_reasoning_effort=str(llm.get("assistant_reasoning_effort", "low")).strip().lower() or "low",
+            assistant_reasoning_effort=str(llm.get("assistant_reasoning_effort", "low")).strip().lower()
+            or "low",
             num_ctx=int(llm.get("num_ctx", 8192)),
             timeout_seconds=float(llm.get("timeout_seconds", 90.0)),
             validate_embedded_reference=bool(llm.get("subtitle_semantic_checks", False)),
@@ -728,23 +858,26 @@ def load_config(path: Path | None = None) -> AppConfig:
             pgs_onset_min_improvement=float(sync.get("pgs_onset_min_improvement", 0.08)),
             use_container_chapters=True,
             japanese_stt_fallback=True,
-            japanese_stt_model=str(
-                sync.get("japanese_stt_model", "mlx-community/whisper-tiny")
-            ).strip() or "mlx-community/whisper-tiny",
-            japanese_stt_timeout_seconds=max(
-                60.0, float(sync.get("japanese_stt_timeout_seconds", 600.0))
-            ),
-            japanese_stt_min_activity=max(
-                0.0, min(1.0, float(sync.get("japanese_stt_min_activity", 0.55)))
-            ),
+            japanese_stt_model=str(sync.get("japanese_stt_model", "mlx-community/whisper-tiny")).strip()
+            or "mlx-community/whisper-tiny",
+            japanese_stt_timeout_seconds=max(60.0, float(sync.get("japanese_stt_timeout_seconds", 600.0))),
+            japanese_stt_min_activity=max(0.0, min(1.0, float(sync.get("japanese_stt_min_activity", 0.55)))),
         ),
         config_path=config_path,
     )
+    if CONFIG_LOAD_ERROR:
+        # The file exists, so this is not a first run: no onboarding that would
+        # write defaults over the user's (broken) settings.
+        cfg.ui.onboarding_completed = True
     cfg.paths.cache_dir.mkdir(parents=True, exist_ok=True)
     cfg.library.root_dir.mkdir(parents=True, exist_ok=True)
     cfg.library.database_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.library.cover_cache_dir.mkdir(parents=True, exist_ok=True)
     apply_jimaku_trial(cfg)
+    if apply_language:
+        from .i18n import set_language
+
+        set_language(cfg.ui.language)  # console, mpv and notification texts (audit 68Б)
     return cfg
 
 
@@ -760,14 +893,11 @@ def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
 
 
-
 def _atomic_config_text_write(destination: Path, text: str) -> Path:
     """Replace config.toml atomically, serialized with narrow hot-path updates."""
     destination = destination.expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(
-        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     with _CONFIG_FILE_LOCK:
         try:
             temporary.write_text(text, encoding="utf-8")
@@ -825,14 +955,16 @@ def write_torrents_enabled(
                 newline = "\r\n" if any(line.endswith("\r\n") for line in lines) else "\n"
                 lines.insert(section_start + 1, replacement + newline)
             else:
-                newline = "\r\n" if lines[key_index].endswith("\r\n") else ("\n" if lines[key_index].endswith("\n") else "")
+                newline = (
+                    "\r\n"
+                    if lines[key_index].endswith("\r\n")
+                    else ("\n" if lines[key_index].endswith("\n") else "")
+                )
                 indent = lines[key_index][: len(lines[key_index]) - len(lines[key_index].lstrip())]
                 lines[key_index] = indent + replacement + newline
             updated = "".join(lines)
 
-        temporary = destination.with_name(
-            f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             temporary.write_text(updated, encoding="utf-8")
             temporary.chmod(0o600)
@@ -841,6 +973,7 @@ def write_torrents_enabled(
         finally:
             temporary.unlink(missing_ok=True)
     return destination
+
 
 def write_config(config: AppConfig, destination: Path | None = None) -> Path:
     destination = (destination or config.config_path or DEFAULT_CONFIG_PATH).expanduser()
@@ -864,15 +997,24 @@ def write_config(config: AppConfig, destination: Path | None = None) -> Path:
         "llm-api-key", config.llm.api_key, use_keychain=use_keychain
     )
     profiles = dict(config.llm.profiles)
-    profiles[config.llm.provider] = {"url":config.llm.base_url,"model":config.llm.model,"api_key":config.llm.api_key}
+    profiles[config.llm.provider] = {
+        "url": config.llm.base_url,
+        "model": config.llm.model,
+        "api_key": config.llm.api_key,
+    }
     profile_sections = []
     for protocol, profile in profiles.items():
-        if protocol not in {"ollama", "openai"}: continue
+        if protocol not in {"ollama", "openai"}:
+            continue
         key = str(profile.get("api_key") or "")
-        persisted = _SECRET_STORE.persisted_config_value("llm-profile-"+protocol,key,use_keychain=use_keychain)
-        profile_sections.append(f"[llm.profiles.{protocol}]\nurl = {_toml_string(profile.get('url',''))}\nmodel = {_toml_string(profile.get('model',''))}\napi_key = {_toml_string(persisted)}\n")
+        persisted = _SECRET_STORE.persisted_config_value(
+            "llm-profile-" + protocol, key, use_keychain=use_keychain
+        )
+        profile_sections.append(
+            f"[llm.profiles.{protocol}]\nurl = {_toml_string(profile.get('url', ''))}\nmodel = {_toml_string(profile.get('model', ''))}\napi_key = {_toml_string(persisted)}\n"
+        )
     profile_text = "\n".join(profile_sections)
-    text = f'''[ui]
+    text = f"""[ui]
 language = {_toml_string(config.ui.language)}
 onboarding_completed = {_toml_bool(config.ui.onboarding_completed)}
 escape_exits_fullscreen = {_toml_bool(config.ui.escape_exits_fullscreen)}
@@ -903,6 +1045,7 @@ recursive = {_toml_bool(config.library.recursive)}
 cover_cache_dir = {_toml_string(config.library.cover_cache_dir)}
 disk_limit_enabled = {_toml_bool(config.library.disk_limit_enabled)}
 disk_limit_gb = {config.library.disk_limit_gb}
+disk_free_reserve_gb = {config.library.disk_free_reserve_gb}
 
 [nyaa]
 enabled = {_toml_bool(config.nyaa.enabled)}
@@ -976,16 +1119,15 @@ keep_batch_until_completed = {_toml_bool(config.agent.keep_batch_until_completed
 enabled = {_toml_bool(config.playback.enabled)}
 rewind_seconds = {config.playback.rewind_seconds}
 save_interval_seconds = {config.playback.save_interval_seconds}
-intro_detection_enabled = {_toml_bool(config.playback.intro_detection_enabled)}
 skip_segments_enabled = {_toml_bool(config.playback.skip_segments_enabled)}
-auto_skip_intro = {_toml_bool(config.playback.auto_skip_intro)}
-auto_skip_outro = {_toml_bool(config.playback.auto_skip_outro)}
+stereo_downmix = {_toml_bool(config.playback.stereo_downmix)}
 
 [shortcuts]
 mpv_mark_watched = {_toml_string(config.shortcuts.mpv_mark_watched)}
 mpv_explain_subtitle = {_toml_string(config.shortcuts.mpv_explain_subtitle)}
 mpv_translate_subtitle = {_toml_string(config.shortcuts.mpv_translate_subtitle)}
 mpv_skip_segment = {_toml_string(config.shortcuts.mpv_skip_segment)}
+screen_text_toggle = {_toml_string(config.shortcuts.screen_text_toggle)}
 
 [diagnostics]
 energy_monitoring_enabled = {_toml_bool(config.diagnostics.energy_monitoring_enabled)}
@@ -995,16 +1137,10 @@ energy_sample_seconds = {config.diagnostics.energy_sample_seconds}
 manual_energy_saving = {_toml_bool(config.power.manual_energy_saving)}
 auto_battery_energy_saving = {_toml_bool(config.power.auto_battery_energy_saving)}
 
-[companion]
-enabled = {_toml_bool(config.companion.enabled)}
-bind_host = {_toml_string(config.companion.bind_host)}
-port = {config.companion.port}
-pairing_ttl_seconds = {config.companion.pairing_ttl_seconds}
-max_events_per_request = {config.companion.max_events_per_request}
-
 [tools]
 mpv = {_toml_string(config.tools.mpv)}
-manga_ocr_backend = {_toml_string(config.tools.manga_ocr_backend)}
+manga_mokuro_python = {_toml_string(config.tools.manga_mokuro_python)}
+manga_background_ocr = {_toml_bool(config.tools.manga_background_ocr)}
 ffmpeg = {_toml_string(config.tools.ffmpeg)}
 ffprobe = {_toml_string(config.tools.ffprobe)}
 alass = {_toml_string(config.tools.alass)}
@@ -1097,7 +1233,7 @@ japanese_stt_fallback = {_toml_bool(config.sync.japanese_stt_fallback)}
 japanese_stt_model = {_toml_string(config.sync.japanese_stt_model)}
 japanese_stt_timeout_seconds = {config.sync.japanese_stt_timeout_seconds}
 japanese_stt_min_activity = {config.sync.japanese_stt_min_activity}
-'''
+"""
     return _atomic_config_text_write(destination, text)
 
 

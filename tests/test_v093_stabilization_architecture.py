@@ -53,7 +53,12 @@ def test_episode_numbering_crosses_side_work_without_counting_it() -> None:
         {"media_id": 1, "title": "Tensei Shitara Slime Datta Ken", "episodes": 24, "format": "TV"},
         {"media_id": 2, "title": "Tensei Shitara Slime Datta Ken Coleus", "episodes": 3, "format": "OVA"},
         {"media_id": 3, "title": "Tensei Shitara Slime Datta Ken 2nd Season", "episodes": 12, "format": "TV"},
-        {"media_id": 4, "title": "Tensei Shitara Slime Datta Ken 2nd Season Part 2", "episodes": 12, "format": "TV"},
+        {
+            "media_id": 4,
+            "title": "Tensei Shitara Slime Datta Ken 2nd Season Part 2",
+            "episodes": 12,
+            "format": "TV",
+        },
         {"media_id": 5, "title": "Tensei Shitara Slime Datta Ken 3rd Season", "episodes": 24, "format": "TV"},
         {"media_id": 6, "title": "Tensei Shitara Slime Datta Ken 4th Season", "episodes": 24, "format": "TV"},
     ]

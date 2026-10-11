@@ -56,8 +56,7 @@ def test_movie_archive_file_gets_confidence_without_episode_number(tmp_path: Pat
     item = JimakuFile(
         url="https://example.test/movie.sup.7z",
         name=(
-            "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025."
-            "1080p.BDRip.AAC5.1.10bits.x265-Rapta.sup.7z"
+            "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025.1080p.BDRip.AAC5.1.10bits.x265-Rapta.sup.7z"
         ),
         size=1,
         last_modified="",
@@ -70,8 +69,7 @@ def test_movie_archive_file_gets_confidence_without_episode_number(tmp_path: Pat
             title="Demon Slayer: Kimetsu no Yaiba - Infinity Castle",
             year=2025,
         ),
-        tmp_path
-        / "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025.1080p.CR.WEB-DL.mkv",
+        tmp_path / "Demon.Slayer.Kimetsu.no.Yaiba.Infinity.Castle.2025.1080p.CR.WEB-DL.mkv",
     )
 
     assert ranked[0].score >= 45
@@ -86,11 +84,11 @@ def test_7z_archive_exposes_sup_subtitle(tmp_path: Path, monkeypatch):
     tool = tmp_path / "7zz"
     tool.write_text(
         "#!/bin/sh\n"
-        "for arg in \"$@\"; do\n"
-        "  case \"$arg\" in -o*) out=${arg#-o} ;; esac\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in -o*) out=${arg#-o} ;; esac\n'
         "done\n"
-        "mkdir -p \"$out\"\n"
-        "cp \"$FAKE_7Z_PAYLOAD\" \"$out/Infinity Castle Japanese.sup\"\n",
+        'mkdir -p "$out"\n'
+        'cp "$FAKE_7Z_PAYLOAD" "$out/Infinity Castle Japanese.sup"\n',
         encoding="utf-8",
     )
     tool.chmod(0o755)
@@ -163,7 +161,8 @@ def test_files_for_episode_falls_back_to_unfiltered_entry_files():
     result = JimakuClient.files_for_episode(client, 42, 5)  # type: ignore[arg-type]
 
     assert result == [target]
-    assert client.calls == [5, None]
+    # Audit 21B: the full list first; the server filter only because it is sparse.
+    assert client.calls == [None, 5]
 
 
 def test_carameliser_atx_exact_episode_survives_airing_date_penalty(tmp_path: Path):
@@ -214,15 +213,13 @@ def test_jimaku_rank_exposes_diagnostic_score_components(tmp_path: Path):
     assert "release_token_overlap" in details
 
 
-
 def test_files_for_episode_rejects_explicit_range_outside_requested_episode():
     from pudge.providers.jimaku import JimakuClient
 
     wrong_pack = JimakuFile(
         url="https://example.test/mushoku-01-02.srt",
         name=(
-            "[shincaps] Mushoku Tensei III ~Isekai Ittara Honki Dasu~ "
-            "- 01-02 (AT-X 1440x1080 MPEG2 AAC).srt"
+            "[shincaps] Mushoku Tensei III ~Isekai Ittara Honki Dasu~ - 01-02 (AT-X 1440x1080 MPEG2 AAC).srt"
         ),
         size=123,
         last_modified="",
@@ -244,8 +241,7 @@ def test_jimaku_rank_hard_rejects_explicit_range_outside_episode(tmp_path: Path)
     wrong_pack = JimakuFile(
         url="https://example.test/mushoku-01-02.srt",
         name=(
-            "[shincaps] Mushoku Tensei III ~Isekai Ittara Honki Dasu~ "
-            "- 01-02 (AT-X 1440x1080 MPEG2 AAC).srt"
+            "[shincaps] Mushoku Tensei III ~Isekai Ittara Honki Dasu~ - 01-02 (AT-X 1440x1080 MPEG2 AAC).srt"
         ),
         size=123,
         last_modified="",
@@ -302,4 +298,5 @@ def test_files_for_episode_expands_sparse_server_results_to_all_entry_variants()
     result = JimakuClient.files_for_episode(client, 308, 2)  # type: ignore[arg-type]
 
     assert {item.url for item in result} == {netflix.url, amazon.url, bluray.url}
-    assert client.calls == [2, None]
+    # Three files for the episode in the full list: no per-episode request.
+    assert client.calls == [None]

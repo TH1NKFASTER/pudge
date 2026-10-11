@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -11,13 +13,71 @@ import httpx
 
 from ..branding import APP_NAME, APP_SLUG, LEGACY_APP_SLUGS
 from ..manager_models import DownloadItem, NyaaRelease
+from ..i18n import err
+
+
+_VIDEO_SUFFIXES = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".ts", ".m2ts", ".mts"}
 
 
 class QBittorrentError(RuntimeError):
     pass
 
 
+def connection_failed(exc: BaseException | None) -> bool:
+    """Whether *exc* (or what caused it) means the Web UI could not be reached at all."""
+    for _ in range(6):
+        if exc is None:
+            return False
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+class _SessionClient(httpx.Client):
+    """httpx client that logs in again once when the Web UI session expired.
+
+    qBittorrent drops an idle SID cookie (403). A long-lived client would
+    otherwise fail every call after that until it is recreated.
+    """
+
+    def __init__(self, *args: Any, relogin: Any = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._relogin = relogin
+
+    def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        response = super().send(request, **kwargs)
+        if (
+            response.status_code != 403
+            or self._relogin is None
+            or request.url.path.endswith("/api/v2/auth/login")
+        ):
+            return response
+        try:
+            content = request.read()
+        except Exception:  # noqa: BLE001 - a streamed body cannot be replayed
+            return response
+        if not self._relogin():
+            return response
+        response.close()
+        retry = self.build_request(
+            request.method,
+            request.url,
+            headers={key: value for key, value in request.headers.items() if key.casefold() != "cookie"},
+            content=content,
+        )
+        return super().send(retry, **kwargs)
+
+
 class QBittorrentClient:
+    # A failed search for a local Web UI (lsof plus a dozen HTTP probes) is
+    # remembered per configured address for a few minutes. With qBittorrent
+    # closed, status polls and Torrent Off used to repeat it on every call.
+    # A call that may launch qBittorrent (adding a torrent) still searches.
+    DISCOVERY_RETRY_SECONDS = 180.0
+    _discovery_failed_at: dict[str, float] = {}
+    _discovery_lock = threading.Lock()
+
     def __init__(
         self,
         base_url: str,
@@ -38,9 +98,18 @@ class QBittorrentClient:
         self.auto_start_app = auto_start_app
         self.verify_tls = verify_tls
         self.timeout = timeout
+        # A shared, long-lived client (one per backend in the manager) ignores
+        # callers' close(); start_policy decides per call whether a closed
+        # qBittorrent may be launched (adding a torrent: yes; status polls: no).
+        self._shared = False
+        self.start_policy: Any = None
         self.client = self._new_client(self.base_url)
         self._authenticated = bool(self.api_key)
         self._version: str | None = None
+        self._configured_url = self.base_url
+        # True once a call failed because the Web UI could not be reached.
+        self.unreachable = False
+        self._hook_prepared_at = 0.0
 
     @property
     def backend_name(self) -> str:
@@ -63,13 +132,24 @@ class QBittorrentClient:
         return headers
 
     def _new_client(self, base_url: str) -> httpx.Client:
-        return httpx.Client(
+        return _SessionClient(
             base_url=base_url,
             timeout=self.timeout,
             follow_redirects=True,
             verify=self.verify_tls,
             headers=self._headers(base_url),
+            relogin=self._relogin_after_403,
         )
+
+    def _relogin_after_403(self) -> bool:
+        if self.api_key:
+            return False
+        self._authenticated = False
+        try:
+            self.login()
+        except QBittorrentError:
+            return False
+        return True
 
     def _switch_base_url(self, base_url: str) -> None:
         base_url = self._normalize_url(base_url)
@@ -82,11 +162,26 @@ class QBittorrentClient:
         self._version = None
 
     def close(self) -> None:
+        if self._shared:
+            return
         self.client.close()
+
+    def close_shared(self) -> None:
+        """Really close a shared client (settings changed or the app quits)."""
+        self.client.close()
+
+    def _may_start_app(self) -> bool:
+        if not self.auto_start_app:
+            return False
+        policy = self.start_policy
+        return bool(policy()) if callable(policy) else True
 
     def _run_hook(self) -> None:
         if not self.pre_download_command:
             return
+        prepared, self._hook_prepared_at = self._hook_prepared_at, 0.0
+        if prepared and time.monotonic() - prepared < 60.0:
+            return  # prepare_network_start() has just run it.
         completed = subprocess.run(
             self.pre_download_command,
             shell=True,
@@ -97,7 +192,7 @@ class QBittorrentClient:
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
-            raise QBittorrentError(f"Команда VPN перед скачиванием завершилась с ошибкой: {detail}")
+            raise QBittorrentError(err("manager.vpnCommandFailed", error=detail))
 
     @staticmethod
     def _mac_config_paths() -> tuple[Path, ...]:
@@ -157,7 +252,13 @@ class QBittorrentClient:
 
     def _probe(self, base_url: str) -> tuple[bool, str]:
         try:
-            with self._new_client(base_url) as client:
+            with httpx.Client(
+                base_url=base_url,
+                timeout=self.timeout,
+                follow_redirects=True,
+                verify=self.verify_tls,
+                headers=self._headers(base_url),
+            ) as client:
                 response = client.get("/api/v2/app/version", timeout=min(self.timeout, 2.5))
         except httpx.HTTPError:
             return False, ""
@@ -175,30 +276,52 @@ class QBittorrentClient:
                 return candidate
         return None
 
+    def _discovery_recently_failed(self) -> bool:
+        with self._discovery_lock:
+            failed_at = self._discovery_failed_at.get(self._configured_url)
+        return failed_at is not None and 0 <= time.monotonic() - failed_at < self.DISCOVERY_RETRY_SECONDS
+
+    def _remember_discovery(self, *, found: bool) -> None:
+        with self._discovery_lock:
+            if found:
+                self._discovery_failed_at.pop(self._configured_url, None)
+            else:
+                self._discovery_failed_at[self._configured_url] = time.monotonic()
+
     def _recover_connection(self) -> bool:
-        if self.auto_start_app:
+        if self._may_start_app():
             subprocess.run(["open", "-gja", "qBittorrent"], check=False)
             # qBittorrent can take several seconds to expose WebUI after launch.
             for delay in (1.0, 1.5, 2.5, 3.0):
                 time.sleep(delay)
                 detected = self._discover_local_webui()
                 if detected:
+                    self._remember_discovery(found=True)
                     self._switch_base_url(detected)
                     return True
+        elif self._discovery_recently_failed():
+            return False
         detected = self._discover_local_webui()
+        self._remember_discovery(found=bool(detected))
         if detected:
             self._switch_base_url(detected)
             return True
         return False
 
     def _connection_error(self, exc: Exception) -> QBittorrentError:
-        return QBittorrentError(
-            "qBittorrent установлен, но Web UI API не отвечает по адресу "
-            f"{self.base_url}. Откройте qBittorrent → Settings → Web UI, включите "
-            f"«Web User Interface (Remote control)» и укажите в {APP_NAME} тот же порт. "
-            "API key отвечает только за авторизацию и сам Web UI не запускает. "
-            f"Техническая ошибка: {exc}"
-        )
+        self.unreachable = True
+        return QBittorrentError(err("qbt.webUiNotResponding", url=self.base_url, app=APP_NAME, error=exc))
+
+    def prepare_network_start(self, *, hook: bool) -> None:
+        """Run the slow part of a start before it is admitted: the pre-download
+        hook (up to 90 s) and reaching, or launching, qBittorrent. The caller then
+        takes the shared Torrent Off lock only for the RPC that starts traffic;
+        that call's own hook run is skipped.
+        """
+        if hook and self.pre_download_command:
+            self._run_hook()
+            self._hook_prepared_at = time.monotonic()
+        self.login()
 
     def login(self) -> None:
         if self._authenticated:
@@ -219,13 +342,14 @@ class QBittorrentClient:
             except httpx.HTTPError as second_exc:
                 raise self._connection_error(second_exc) from second_exc
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"qBittorrent Web API недоступен: {exc}") from exc
+            raise QBittorrentError(err("qbt.apiUnavailable", error=exc)) from exc
+        self.unreachable = False
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise QBittorrentError(f"qBittorrent не принял логин: HTTP {response.status_code}") from exc
+            raise QBittorrentError(err("qbt.loginRejectedHttp", status=response.status_code)) from exc
         if response.text.strip() != "Ok.":
-            raise QBittorrentError(f"qBittorrent не принял логин: {response.text.strip()}")
+            raise QBittorrentError(err("qbt.loginRejected", response=response.text.strip()))
         self._authenticated = True
 
     def version(self) -> str:
@@ -242,18 +366,13 @@ class QBittorrentClient:
             except httpx.HTTPError as second_exc:
                 raise self._connection_error(second_exc) from second_exc
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось получить версию qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.versionFailed", error=exc)) from exc
         if response.status_code == 403 and self.api_key:
-            raise QBittorrentError(
-                "qBittorrent найден, но API key отклонён. Проверьте, что ключ создан в "
-                "qBittorrent 5.2 → Settings → Web UI → API keys и вставлен полностью."
-            )
+            raise QBittorrentError(err("qbt.apiKeyRejected"))
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise QBittorrentError(
-                f"Не удалось получить версию qBittorrent: HTTP {response.status_code}"
-            ) from exc
+            raise QBittorrentError(err("qbt.versionHttp", status=response.status_code)) from exc
         self._version = response.text.strip()
         return self._version
 
@@ -280,7 +399,7 @@ class QBittorrentClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise QBittorrentError(f"Не удалось получить категории qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.categoriesFailed", error=exc)) from exc
         return dict(payload) if isinstance(payload, dict) else {}
 
     def tags(self) -> set[str]:
@@ -290,7 +409,7 @@ class QBittorrentClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise QBittorrentError(f"Не удалось получить теги qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.tagsFailed", error=exc)) from exc
         if not isinstance(payload, list):
             return set()
         return {str(value).strip() for value in payload if str(value).strip()}
@@ -307,7 +426,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось снять теги qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.untagFailed", error=exc)) from exc
 
     def delete_tags(self, tags: list[str] | set[str]) -> int:
         clean = [str(tag).strip() for tag in tags if str(tag).strip()]
@@ -321,7 +440,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось удалить теги qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.deleteTagsFailed", error=exc)) from exc
         return len(clean)
 
     def cleanup_tags(self) -> dict[str, int]:
@@ -330,14 +449,8 @@ class QBittorrentClient:
         removed_score = 0
         used: set[str] = set()
         for item in items:
-            item_tags = {
-                str(tag).strip()
-                for tag in item.raw.get("_tag_set", [])
-                if str(tag).strip()
-            }
-            score_tags = {
-                tag for tag in item_tags if tag.casefold().startswith("score:")
-            }
+            item_tags = {str(tag).strip() for tag in item.raw.get("_tag_set", []) if str(tag).strip()}
+            score_tags = {tag for tag in item_tags if tag.casefold().startswith("score:")}
             if score_tags:
                 self.remove_tags(item.torrent_hash, score_tags)
                 removed_score += len(score_tags)
@@ -367,9 +480,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(
-                f"Не удалось создать категорию qBittorrent '{category}': {exc}"
-            ) from exc
+            raise QBittorrentError(err("qbt.createCategoryFailed", category=category, error=exc)) from exc
 
     def _torrent_by_hash(self, info_hash: str) -> dict[str, Any] | None:
         value = info_hash.strip().lower()
@@ -422,18 +533,14 @@ class QBittorrentClient:
                 response.raise_for_status()
             clean_tags = [tag.strip() for tag in tags if tag.strip()]
             existing = self._torrent_by_hash(torrent_hash) or {}
-            old_tags = [
-                tag.strip()
-                for tag in str(existing.get("tags") or "").split(",")
-                if tag.strip()
-            ]
+            old_tags = [tag.strip() for tag in str(existing.get("tags") or "").split(",") if tag.strip()]
             legacy_app_tags = {value.casefold() for value in LEGACY_APP_SLUGS}
             obsolete = [
                 tag
                 for tag in old_tags
-                if tag.casefold().startswith((
-                    "anilist-", "anilist:", "episode-", "anime:", "episode:", "score:"
-                ))
+                if tag.casefold().startswith(
+                    ("anilist-", "anilist:", "episode-", "anime:", "episode:", "score:")
+                )
                 or tag.casefold() in {"batch", "series pack"}
                 or tag.casefold() in legacy_app_tags
                 or tag.casefold() == APP_SLUG.casefold()
@@ -466,9 +573,7 @@ class QBittorrentClient:
                 )
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(
-                f"Торрент добавлен, но не удалось назначить категорию/теги: {exc}"
-            ) from exc
+            raise QBittorrentError(err("qbt.labelFailed", error=exc)) from exc
 
     def set_metadata(
         self,
@@ -495,9 +600,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(
-                f"Не удалось обновить путь торрента qBittorrent: {exc}"
-            ) from exc
+            raise QBittorrentError(err("qbt.setLocationFailed", error=exc)) from exc
 
     def recheck(self, torrent_hash: str) -> None:
         value = str(torrent_hash or "").strip()
@@ -511,7 +614,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось перепроверить торрент qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.recheckFailed", error=exc)) from exc
 
     def add_release(
         self,
@@ -550,7 +653,7 @@ class QBittorrentClient:
         try:
             response = self.client.post("/api/v2/torrents/add", data=payload)
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось добавить торрент: {exc}") from exc
+            raise QBittorrentError(err("qbt.addFailed", error=exc)) from exc
 
         if response.status_code == 409:
             # qBittorrent may report Conflict for an already present torrent.
@@ -564,20 +667,17 @@ class QBittorrentClient:
                     self._set_category_and_tags(torrent_hash, category=category, tags=tags)
                     return torrent_hash
             detail = response.text.strip()
-            suffix = f" Ответ qBittorrent: {detail}" if detail and detail != "Conflict" else ""
-            raise QBittorrentError(
-                "qBittorrent не добавил торрент (409 Conflict). Торрент не найден среди "
-                "существующих; возможны некорректная magnet-ссылка или недоступная папка "
-                f"загрузки: {target}.{suffix}"
-            )
+            suffix = err("qbt.responseSuffix", response=detail) if detail and detail != "Conflict" else ""
+            raise QBittorrentError(err("qbt.addConflict", target=target, response=suffix))
 
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             detail = response.text.strip()
             raise QBittorrentError(
-                f"Не удалось добавить торрент: HTTP {response.status_code}"
-                + (f" — {detail}" if detail else "")
+                err(
+                    "qbt.addFailed", error=f"HTTP {response.status_code}" + (f" — {detail}" if detail else "")
+                )
             ) from exc
 
         torrent_ids: list[str] = []
@@ -587,23 +687,14 @@ class QBittorrentClient:
             except ValueError:
                 result = None
             if isinstance(result, dict):
-                torrent_ids = [
-                    str(value)
-                    for value in (result.get("added_torrent_ids") or [])
-                    if value
-                ]
+                torrent_ids = [str(value) for value in (result.get("added_torrent_ids") or []) if value]
                 success_count = int(result.get("success_count") or 0)
                 pending_count = int(result.get("pending_count") or 0)
                 failure_count = int(result.get("failure_count") or 0)
                 if success_count == 0 and pending_count == 0 and failure_count > 0:
-                    raise QBittorrentError(
-                        "qBittorrent принял запрос, но не смог добавить торрент "
-                        f"(failure_count={failure_count})"
-                    )
+                    raise QBittorrentError(err("qbt.addRejected", failures=failure_count))
             elif response.text.strip() not in {"Ok.", ""}:
-                raise QBittorrentError(
-                    f"qBittorrent вернул неожиданный ответ: {response.text.strip()}"
-                )
+                raise QBittorrentError(err("qbt.unexpectedResponse", response=response.text.strip()))
 
         torrent_hash = torrent_ids[0] if torrent_ids else release.info_hash
         if torrent_hash:
@@ -665,15 +756,11 @@ class QBittorrentClient:
                 except ValueError:
                     result = None
                 if isinstance(result, dict):
-                    ids = [
-                        str(value)
-                        for value in (result.get("added_torrent_ids") or [])
-                        if value
-                    ]
+                    ids = [str(value) for value in (result.get("added_torrent_ids") or []) if value]
                     if ids:
                         added_hash = ids[0]
             if not added_hash:
-                raise QBittorrentError("qBittorrent did not return a torrent hash for metadata inspection")
+                raise QBittorrentError(err("qbt.noMetadataHash"))
 
             deadline = time.monotonic() + max(1.0, float(metadata_timeout))
             while time.monotonic() < deadline:
@@ -683,13 +770,17 @@ class QBittorrentClient:
                 time.sleep(0.25)
             return []
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось получить metadata торрента через qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.metadataFailed", error=exc)) from exc
         finally:
             if added_by_us and added_hash:
                 try:
                     self.delete(added_hash, delete_files=True)
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - metadata probe cleanup is best effort
+                    logging.getLogger(__name__).warning(
+                        "WARN step=qbittorrent.metadata_probe_cleanup hash=%s error=%r",
+                        added_hash,
+                        exc,
+                    )
 
     def start(self, torrent_hash: str) -> None:
         """Explicitly start/resume a torrent after adding it.
@@ -709,7 +800,7 @@ class QBittorrentClient:
                 response = self.client.post("/api/v2/torrents/resume", data=payload)
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось запустить торрент: {exc}") from exc
+            raise QBittorrentError(err("qbt.startFailed", error=exc)) from exc
 
     def pause(self, torrent_hash: str) -> None:
         """Stop downloading and seeding while retaining the torrent and files."""
@@ -724,7 +815,7 @@ class QBittorrentClient:
                 response = self.client.post("/api/v2/torrents/pause", data=payload)
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось остановить торрент: {exc}") from exc
+            raise QBittorrentError(err("qbt.stopFailed", error=exc)) from exc
 
     def torrents(self, *, category: str = "") -> list[DownloadItem]:
         self.login()
@@ -734,7 +825,7 @@ class QBittorrentClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise QBittorrentError(f"Не удалось получить загрузки qBittorrent: {exc}") from exc
+            raise QBittorrentError(err("qbt.listFailed", error=exc)) from exc
         result: list[DownloadItem] = []
         for item in payload if isinstance(payload, list) else []:
             tags = {value.strip() for value in str(item.get("tags") or "").split(",") if value.strip()}
@@ -779,6 +870,11 @@ class QBittorrentClient:
             if release_score_tag is not None:
                 raw["_release_score_tag"] = release_score_tag
             raw["_tag_set"] = sorted(tags, key=str.casefold)
+            tagged_batch = any(tag.casefold() in {"batch", "series pack"} for tag in tags)
+            # A single-file torrent (content_path is the video itself) is one episode, whatever it was requested as.
+            single_video = Path(str(item.get("content_path") or "")).suffix.casefold() in _VIDEO_SUFFIXES
+            if tagged_batch and single_video:
+                raw["single_video_file"] = True
             result.append(
                 DownloadItem(
                     torrent_hash=str(item.get("hash") or ""),
@@ -789,7 +885,7 @@ class QBittorrentClient:
                     content_path=str(item.get("content_path") or ""),
                     media_id=media_id,
                     episode=episode,
-                    is_batch=any(tag.casefold() in {"batch", "series pack"} for tag in tags),
+                    is_batch=tagged_batch and not single_video,
                     added_on=int(item.get("added_on") or 0),
                     completed_on=int(item.get("completion_on") or 0),
                     raw=raw,
@@ -804,7 +900,7 @@ class QBittorrentClient:
             response.raise_for_status()
             payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise QBittorrentError(f"Не удалось получить файлы торрента: {exc}") from exc
+            raise QBittorrentError(err("qbt.filesFailed", error=exc)) from exc
         return list(payload) if isinstance(payload, list) else []
 
     def set_file_priority(
@@ -830,7 +926,7 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось выбрать файлы торрента: {exc}") from exc
+            raise QBittorrentError(err("qbt.selectFilesFailed", error=exc)) from exc
 
     def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
         self.login()
@@ -841,4 +937,4 @@ class QBittorrentClient:
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise QBittorrentError(f"Не удалось удалить торрент: {exc}") from exc
+            raise QBittorrentError(err("qbt.deleteFailed", error=exc)) from exc

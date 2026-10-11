@@ -29,9 +29,7 @@ def test_post_opening_gap_reacquires_dominant_later_clock_inside_silence() -> No
     # Before the opening the source master is about 32.75s late. After the
     # long opening gap it is about 43s late. This is the shape from the real
     # Otomege S2E7 failure, where a weak -36s bridge delayed the correct clock.
-    reference_cues = [
-        (start - 32.75, end - 32.75, text) for start, end, text in pre
-    ] + [
+    reference_cues = [(start - 32.75, end - 32.75, text) for start, end, text in pre] + [
         (start - 43.0, end - 43.0, text) for start, end, text in post
     ]
     source_onsets = [start for start, _end, _text in source_cues]

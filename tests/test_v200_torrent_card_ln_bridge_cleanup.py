@@ -1,6 +1,10 @@
-from __future__ import annotations
+"""Listen together: a clock segment the backend stretched over a pause runs on the wall
+clock, in the backend and in the reader (behaviour; audit 71Б rewrite).
 
-from pathlib import Path
+The torrent switch of v2.00 (one HTTP request per click, owned by one handler):
+test_torrent_toggle_ui.py."""
+
+from __future__ import annotations
 
 import pytest
 
@@ -8,10 +12,6 @@ from pudge.reading_audio_alignment import (
     audio_position_for_light_novel_offset,
     light_novel_position_for_audio,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "pudge" / "web" / "index.html"
 
 
 def _wall_clock_bridge_alignment() -> dict:
@@ -64,40 +64,17 @@ def test_pause_stretched_bridge_inverse_seek_uses_same_wall_clock() -> None:
     assert position > 14090.30
 
 
-def test_frontend_does_not_apply_vad_ratio_to_marked_wall_clock_bridge() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    path_fn = html.split("function lnPairedAnchorPath", 1)[1].split(
-        "function lnPairedOffsetAtTime", 1
-    )[0]
-    offset_fn = html.split("function lnPairedOffsetAtTime", 1)[1].split(
-        "function lnPairedResetWordProgress", 1
-    )[0]
-    # Plan §7: LN delegates source-offset math to the shared PudgePairedAudioClock
-    # (paired_audio_clock.js), which applies the activity clock per anchor segment.
-    import json
-    import subprocess
-
-    assert "PudgePairedAudioClock?.pathFor" in path_fn
-    assert "shared.offsetAtTime(state||{},Number(time))" in offset_fn
-    clock = (ROOT / "pudge" / "web" / "paired_audio_clock.js").read_text(encoding="utf-8")
-    assert "right.wall_clock_from_previous !== true" in clock
-    # Marked wall-clock bridge: linear; unmarked segment: follows VAD activity.
-    script = clock + "\n" + (
-        "function lnPairedAnchorPath" + path_fn + "function lnPairedOffsetAtTime" + offset_fn
-    ) + """
-const activity=[{start:0,end:1}];
-const bridge={anchor_window:{activity_clock:true,activity,path:[{time:0,offset:0},{time:4,offset:8,wall_clock_from_previous:true}]}};
-const vad={anchor_window:{activity_clock:true,activity,path:[{time:0,offset:0},{time:4,offset:8}]}};
-console.log(JSON.stringify([lnPairedOffsetAtTime(bridge,2),lnPairedOffsetAtTime(vad,2)]));
-"""
-    out = json.loads(subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout)
-    assert out == pytest.approx([4, 8])
-
-
-def test_torrent_cleanup_keeps_single_capture_http_owner() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    button = html.split('id="torrentToggleButton"', 1)[1].split('</button>', 1)[0]
-    assert "onclick=" not in button
-    assert html.count("async function torrentToggleHttpCapture(){") == 1
-    assert html.count("torrentHttpJson('/api/torrents/enabled'") == 1
-    assert "torrentToggleGeneration" not in html
+def test_reader_does_not_squeeze_a_wall_clock_bridge_into_speech_activity(page) -> None:
+    # Speech only in the first second of a 4 s segment of 8 characters: an ordinary
+    # segment runs its text during that second (activity clock); a segment the backend
+    # marked as a wall-clock bridge (stretched over a pause) runs linearly over all 4 s.
+    result = page.run(
+        r"""
+        const activity = [{start: 0, end: 1}];
+        const segment = mark => ({anchor_window: {activity_clock: true, activity,
+          path: [{time: 0, offset: 0}, {time: 4, offset: 8, ...(mark ? {wall_clock_from_previous: true} : {})}]}});
+        const at = state => [0.5, 1, 2, 3].map(time => lnPairedOffsetAtTime(state, time));
+        return {bridge: at(segment(true)), speech: at(segment(false))};
+        """
+    )
+    assert result.value == {"bridge": pytest.approx([1, 2, 4, 6]), "speech": pytest.approx([4, 8, 8, 8])}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 
+from pudge import i18n
 from pudge.cli import _jimaku_episode_aliases
 from pudge.config import AppConfig
 from pudge.models import AniListAnime
@@ -45,7 +46,8 @@ def test_otome_exact_jimaku_episode_survives_single_bad_title_card_sample():
         _quality_result(activity=0.8352, matched=1, score=103.0, exact_title=True, cues=351)
     )
     assert accepted is True
-    assert "точная серия AniList/Jimaku" in reason
+    assert "exact AniList/Jimaku episode" in reason
+    assert "точная серия AniList/Jimaku" in i18n.message(reason, "ru")
 
 
 def test_bleach_exact_absolute_episode_rejects_unstable_audio_clock():
@@ -53,19 +55,16 @@ def test_bleach_exact_absolute_episode_rejects_unstable_audio_clock():
     # clock is still about 4.5 seconds wrong.  The multi-window validator also
     # reports full-range oscillation and large jumps, so identity must not
     # override the timing failure.
-    result = _quality_result(
-        activity=0.6793, matched=2, score=98.4, exact_title=False, cues=276
-    )
+    result = _quality_result(activity=0.6793, matched=2, score=98.4, exact_title=False, cues=276)
     result["segment_diagnostics"] = {
         "available": True,
         "reliable": False,
-        "quality_reason": (
-            "too_many_boundary_hits,full_range_oscillation,too_many_large_jumps"
-        ),
+        "quality_reason": ("too_many_boundary_hits,full_range_oscillation,too_many_large_jumps"),
     }
     accepted, reason = subtitle_quality_accepted(result)
     assert accepted is False
-    assert "тайминг нестабилен" in reason
+    assert "selected timing is unstable" in reason
+    assert "тайминг нестабилен" in i18n.message(reason, "ru")
 
 
 def test_exact_episode_still_rejects_weak_clock_and_semantics():
@@ -98,9 +97,7 @@ def test_bleach_absolute_jimaku_alias_is_mapped_back_to_current_cour(tmp_path):
     assert aliases == (3,)
 
 
-
 def test_rejected_alass_tries_constant_offset_before_audio(tmp_path, monkeypatch):
-    from pathlib import Path
 
     from pudge.config import SyncConfig
     from pudge.subtitle_formats import write_srt

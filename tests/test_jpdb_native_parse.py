@@ -17,7 +17,19 @@ from pudge.light_novels import LightNovelError, LightNovelService
 
 def _vocab(vid: int, sid: int, spelling: str, reading: str, state: Any = None) -> list[Any]:
     # Order = JPDB_VOCABULARY_FIELDS
-    return [vid, sid, sid, spelling, reading, 100, [f"meaning of {spelling}"], state, 7 if state else None, None, ["n"]]
+    return [
+        vid,
+        sid,
+        sid,
+        spelling,
+        reading,
+        100,
+        [f"meaning of {spelling}"],
+        state,
+        7 if state else None,
+        None,
+        ["n"],
+    ]
 
 
 # Shapes below mirror a live jpdb /parse response (utf16 encoding, 2026-09-27).
@@ -31,7 +43,14 @@ RESULT = {
     "tokens": [
         [[0, 2, 1, [["猫", "ねこ"]]], [1, 3, 1, None], [2, 4, 3, [["生", "い"], "き", "る"]]],
         [[3, 0, 2, [["今日", "きょう"]]], [4, 2, 1, None], [3, 3, 2, [["今日", "きょう"]]], [5, 5, 1, None]],
-        [[6, 0, 3, None], [1, 3, 1, None], [7, 4, 2, [["鳴", "な"], "く"]], [8, 7, 3, None], [4, 10, 1, None], [9, 11, 2, [["黒", "くろ"], "い"]]],
+        [
+            [6, 0, 3, None],
+            [1, 3, 1, None],
+            [7, 4, 2, [["鳴", "な"], "く"]],
+            [8, 7, 3, None],
+            [4, 10, 1, None],
+            [9, 11, 2, [["黒", "くろ"], "い"]],
+        ],
         [[10, 0, 6, None]],
     ],
     "vocabulary": [
@@ -114,16 +133,19 @@ def test_utf16_slice_rejects_split_surrogates() -> None:
 @pytest.mark.parametrize(
     ("states", "in_deck", "expected"),
     [
-        ([], False, "new"),
+        # Jiten's nine states and priority: learning -> young, known -> mature,
+        # never-forget -> mastered, failed -> due; a word outside every deck: not_in_deck.
+        ([], False, "not_in_deck"),
         (["new"], True, "new"),
-        (["learning"], True, "learning"),
-        (["known"], True, "known"),
-        (["redundant", "known"], True, "known"),
-        (["never-forget"], True, "known"),
+        (["learning"], True, "young"),
+        (["known"], True, "mature"),
+        (["redundant", "known"], True, "redundant"),
+        (["never-forget"], True, "mastered"),
         (["due"], True, "due"),
+        (["known", "due"], True, "due"),  # Due wins over every other state
         (["failed"], True, "due"),
         (["blacklisted"], True, "blacklisted"),
-        (["suspended"], True, "unknown"),
+        (["suspended", "learning"], True, "suspended"),
         (["locked", "new"], True, "new"),
         ([], True, "unknown"),
     ],
@@ -170,19 +192,17 @@ def test_jpdb_backend_parses_selection_natively_without_jiten(
     assert token["idNamespace"] == "jpdb"
     assert token["reviewable"] is True
     assert (token["wordId"], token["readingIndex"]) == (1467640, 1827755855)
-    assert token["card"]["normalizedState"] == "known"
+    assert token["card"]["normalizedState"] == "mature"  # jpdb known
     assert token["card"]["knowledgeStatus"] == "cached_parse_state"
     by_surface = {t["surface"]: t for t in payload["tokens"][0]}
-    assert by_surface["生きる"]["card"]["normalizedState"] == "learning"
+    assert by_surface["生きる"]["card"]["normalizedState"] == "young"  # jpdb learning
 
     again = service.parse_study_text("😀猫が生きる😀")
     assert again["tokens"] == payload["tokens"]
     assert len(calls) == 1  # persisted cache, no second request
 
 
-def test_jpdb_parse_cache_is_isolated_per_account(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_jpdb_parse_cache_is_isolated_per_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     calls: list[tuple[str, Any]] = []
     monkeypatch.setattr(service, "_jpdb_request", _fake_jpdb(calls))
@@ -226,9 +246,12 @@ def test_jiten_backend_and_jiten_only_callers_keep_jiten_parse(
     parsed = service.jiten_preparse("猫")
     assert parsed.get("parseProvider", "jiten") == "jiten"
     assert jiten_calls == ["reader/parse"]
-    assert service._cached_parse(
-        __import__("hashlib").sha256(("study-v1\0猫").encode()).hexdigest(), provider="jpdb"
-    ) is None
+    assert (
+        service._cached_parse(
+            __import__("hashlib").sha256(("study-v1\0猫").encode()).hexdigest(), provider="jpdb"
+        )
+        is None
+    )
 
 
 def test_jpdb_native_token_reviews_with_its_own_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -251,8 +274,13 @@ def test_jpdb_native_token_reviews_with_its_own_ids(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr("pudge.review_providers.httpx.post", fake_post)
     result = service.study_action(
-        "jpdb", "review", token["wordId"], token["readingIndex"],
-        grade="okay", attempt_id="a1", id_namespace=token["idNamespace"],
+        "jpdb",
+        "review",
+        token["wordId"],
+        token["readingIndex"],
+        grade="okay",
+        attempt_id="a1",
+        id_namespace=token["idNamespace"],
     )
     assert result["outcome"] == "confirmed"
     assert sent == [{"vid": 1467640, "sid": 1827755855, "grade": "okay"}]
@@ -306,11 +334,15 @@ def test_account_switch_between_batches_never_pollutes_other_account(
     assert service._cached_parse("h-switch", scope=service._parse_scope("jpdb")) is None
 
 
-def test_parse_refuses_to_start_when_scope_and_token_disagree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_parse_refuses_to_start_when_scope_and_token_disagree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     service = _service(tmp_path)
     service.save_settings({"jpdb_api_token": "tok-a", "study_backend": "jpdb"})
     scope_a = service._parse_scope("jpdb")
     service.save_settings({"jpdb_api_token": "tok-b"})  # switched while waiting for a slot
-    monkeypatch.setattr(service, "_jpdb_request", lambda *a, **k: pytest.fail("no request with a mismatched token"))
+    monkeypatch.setattr(
+        service, "_jpdb_request", lambda *a, **k: pytest.fail("no request with a mismatched token")
+    )
     with pytest.raises(LightNovelError, match="account changed"):
         service._parse_text_jpdb("今日は今日で", "h2", scope_a, interactive=True)

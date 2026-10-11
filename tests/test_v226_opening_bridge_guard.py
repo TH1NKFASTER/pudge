@@ -12,15 +12,9 @@ from pudge.subtitles.timeline_alignment import (
 def _slime_shape():
     # Synthetic timing shape from the real debug: dense pre-OP dialogue, a
     # ~106s subtitle silence for the OP, then dense post-OP dialogue.
-    source_cues = [
-        (float(start), float(start) + 2.0, f"pre-{start}")
-        for start in range(20, 352, 6)
-    ]
+    source_cues = [(float(start), float(start) + 2.0, f"pre-{start}") for start in range(20, 352, 6)]
     source_cues.append((354.12, 356.122, "last-pre"))
-    source_cues.extend(
-        (float(start), float(start) + 2.0, f"post-{start}")
-        for start in range(462, 1400, 6)
-    )
+    source_cues.extend((float(start), float(start) + 2.0, f"post-{start}") for start in range(462, 1400, 6))
     segments = [
         {
             "offset_seconds": -32.0,
@@ -162,10 +156,7 @@ def test_slime_style_bridge_collapses_without_clean_subtitle_gap() -> None:
     # Some subtitle releases keep OP/sign/title cues, so parse_srt no longer
     # exposes a >=45s clean silence even though the local onset path still has
     # the same weak -92s two-window excursion.
-    source_cues.extend(
-        (float(start), float(start) + 1.5, f"op-{start}")
-        for start in range(360, 462, 12)
-    )
+    source_cues.extend((float(start), float(start) + 1.5, f"op-{start}") for start in range(360, 462, 12))
     source_cues.sort(key=lambda row: row[0])
 
     fixed_segments, fixed_boundaries, guard = _suppress_weak_opening_bridge_excursion(
@@ -186,10 +177,7 @@ def test_slime_style_bridge_collapses_without_clean_subtitle_gap() -> None:
 
 def test_structural_fallback_requires_dominant_post_clock() -> None:
     source_cues, segments, boundaries, edge_hints = _slime_shape()
-    source_cues.extend(
-        (float(start), float(start) + 1.5, f"op-{start}")
-        for start in range(360, 462, 12)
-    )
+    source_cues.extend((float(start), float(start) + 1.5, f"op-{start}") for start in range(360, 462, 12))
     source_cues.sort(key=lambda row: row[0])
     segments[2] = dict(segments[2], support=8)
 
@@ -242,9 +230,7 @@ def test_slime_real_path_sandwich_is_removed_before_segmentation() -> None:
         _path_window(825.3, -41.0),
     ]
 
-    fixed_path, guard = _suppress_weak_opening_path_excursion(
-        source_cues, path, edge_hints
-    )
+    fixed_path, guard = _suppress_weak_opening_path_excursion(source_cues, path, edge_hints)
 
     assert guard["applied"] is True
     assert guard["reason"] == "weak_opening_path_excursion"
@@ -262,10 +248,7 @@ def test_slime_real_path_sandwich_is_removed_before_segmentation() -> None:
 
 def test_opening_path_sandwich_requires_real_long_gap() -> None:
     source_cues, _segments_unused, _boundaries, edge_hints = _slime_shape()
-    source_cues = [
-        (float(start), float(start) + 2.0, f"cue-{start}")
-        for start in range(20, 1400, 6)
-    ]
+    source_cues = [(float(start), float(start) + 2.0, f"cue-{start}") for start in range(20, 1400, 6)]
     path = [
         _path_window(69.3, -31.0),
         _path_window(141.3, -32.0),
@@ -283,9 +266,7 @@ def test_opening_path_sandwich_requires_real_long_gap() -> None:
         _path_window(825.3, -41.0),
     ]
 
-    fixed_path, guard = _suppress_weak_opening_path_excursion(
-        source_cues, path, edge_hints
-    )
+    fixed_path, guard = _suppress_weak_opening_path_excursion(source_cues, path, edge_hints)
 
     assert guard["applied"] is False
     assert guard["reason"] == "no_long_early_gap"
@@ -311,17 +292,15 @@ def test_repaired_opening_path_anchors_clock_switch_inside_the_same_long_gap() -
         _path_window(825.3, -41.0),
     ]
 
-    fixed_path, path_guard = _suppress_weak_opening_path_excursion(
-        source_cues, path, edge_hints
-    )
+    fixed_path, path_guard = _suppress_weak_opening_path_excursion(source_cues, path, edge_hints)
     assert path_guard["applied"] is True
 
     clustered = _segments(fixed_path)
     # This is the bad boundary shape from the v8.10.7 real debug: generic
     # fixed-offset crossover chose an early point, then monotonic repair pushed
     # it only as far as ~298s.  The actual OP subtitle silence is ~356..462s.
-    anchored_segments, anchored_boundaries, anchor = (
-        _anchor_opening_path_gap_boundary(clustered, [190.0], path_guard)
+    anchored_segments, anchored_boundaries, anchor = _anchor_opening_path_gap_boundary(
+        clustered, [190.0], path_guard
     )
 
     assert anchor["applied"] is True
@@ -367,9 +346,7 @@ def test_opening_gap_anchor_does_not_move_an_already_safe_boundary() -> None:
         _path_window(789.3, -41.0),
         _path_window(825.3, -41.0),
     ]
-    fixed_path, path_guard = _suppress_weak_opening_path_excursion(
-        source_cues, path, edge_hints
-    )
+    fixed_path, path_guard = _suppress_weak_opening_path_excursion(source_cues, path, edge_hints)
     clustered = _segments(fixed_path)
     existing = float(path_guard["gap_midpoint_seconds"])
 
@@ -449,9 +426,7 @@ def test_opening_preclock_holdout_recenters_only_preopening_plateau() -> None:
         "new_source_time": 409.192,
     }
 
-    refined, diagnostics = _refine_opening_preclock_from_holdout(
-        segments, boundaries, holdout, anchor
-    )
+    refined, diagnostics = _refine_opening_preclock_from_holdout(segments, boundaries, holdout, anchor)
 
     assert diagnostics["applied"] is True
     assert diagnostics["reason"] == "opening_preclock_holdout_recenter"

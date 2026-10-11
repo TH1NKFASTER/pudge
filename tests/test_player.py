@@ -9,6 +9,7 @@ from pudge.player import build_mpv_command, run_mpv
 def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path, monkeypatch, platform):
     monkeypatch.setattr("pudge.player.sys.platform", platform)
     monkeypatch.setattr("pudge.player.mpv_supports_option", lambda *_args: True)
+    monkeypatch.setattr("pudge.player._user_mpv_config_mentions", lambda _option: False)
     socket_path = tmp_path / "mpv.sock"
     command = build_mpv_command(
         "mpv",
@@ -24,6 +25,7 @@ def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path
         "--pause",
         *(["--macos-app-activation-policy=accessory"] if platform == "darwin" else []),
         "--idle=no",
+        *(["--hwdec=videotoolbox"] if platform == "darwin" else []),
         "--keep-open=no",
         "--sub-fix-timing=no",
         "--secondary-sid=no",
@@ -39,6 +41,7 @@ def test_build_mpv_command_adds_ipc_socket_before_video_separator(tmp_path: Path
 def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path, monkeypatch, platform):
     monkeypatch.setattr("pudge.player.sys.platform", platform)
     monkeypatch.setattr("pudge.player.mpv_supports_option", lambda *_args: True)
+    monkeypatch.setattr("pudge.player._user_mpv_config_mentions", lambda _option: False)
     script = tmp_path / "pudge_anilist.lua"
     command = build_mpv_command(
         "mpv",
@@ -53,6 +56,7 @@ def test_build_mpv_command_adds_native_anilist_script(tmp_path: Path, monkeypatc
         "mpv",
         *(["--macos-app-activation-policy=accessory"] if platform == "darwin" else []),
         "--idle=no",
+        *(["--hwdec=videotoolbox"] if platform == "darwin" else []),
         "--keep-open=no",
         "--sub-fix-timing=no",
         "--secondary-sid=no",
@@ -93,7 +97,6 @@ def test_build_mpv_command_respects_explicit_sub_fix_timing():
     assert "--sub-fix-timing=no" not in command
 
 
-
 def test_build_mpv_command_respects_explicit_secondary_subtitle_options():
     command = build_mpv_command(
         "mpv",
@@ -107,6 +110,7 @@ def test_build_mpv_command_respects_explicit_secondary_subtitle_options():
     assert "--secondary-sid=no" not in command
     assert command.count("--secondary-sub-visibility=yes") == 1
     assert "--secondary-sub-visibility=no" not in command
+
 
 def test_run_mpv_focus_uses_direct_process_and_waits(monkeypatch):
     calls = []
@@ -123,10 +127,33 @@ def test_run_mpv_focus_uses_direct_process_and_waits(monkeypatch):
 
     # The PID is invented: never inspect or signal the host's process tree.
     monkeypatch.setattr("pudge.process_cleanup.process_snapshot", lambda: {})
-    monkeypatch.setattr("pudge.player.subprocess.Popen", lambda command, env=None: calls.append(command) or FakeProcess())
+    monkeypatch.setattr(
+        "pudge.player.subprocess.Popen", lambda command, env=None: calls.append(command) or FakeProcess()
+    )
     monkeypatch.setattr("pudge.player._focus_mpv_process", lambda pid: calls.append(["focus", str(pid)]))
 
     result = run_mpv(["mpv", "--fs", "--", "episode.mkv"], focus=True)
 
     assert result == 0
     assert calls == [["mpv", "--fs", "--", "episode.mkv"], ["focus", "4321"], ["wait", "4321"]]
+
+
+def test_hardware_decoding_respects_the_users_choice(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("pudge.player.sys.platform", "darwin")
+    monkeypatch.setattr("pudge.player.mpv_supports_option", lambda _mpv, option: option == "hwdec")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("MPV_HOME", raising=False)
+    video = Path("episode.mkv")
+    assert "--hwdec=videotoolbox" in build_mpv_command("mpv", video, None, None, [])
+    assert build_mpv_command("mpv", video, None, None, ["--hwdec=no"]).count("--hwdec=no") == 1
+    assert "--hwdec=videotoolbox" not in build_mpv_command("mpv", video, None, None, ["--hwdec=no"])
+    conf = tmp_path / "config" / "mpv" / "mpv.conf"
+    conf.parent.mkdir(parents=True)
+    conf.write_text("# hwdec=auto would be a comment\nprofile=gpu-hq\n", encoding="utf-8")
+    assert "--hwdec=videotoolbox" in build_mpv_command("mpv", video, None, None, [])
+    conf.write_text("[anime]\nhwdec = no\n", encoding="utf-8")
+    assert "--hwdec=videotoolbox" not in build_mpv_command("mpv", video, None, None, [])
+    monkeypatch.setattr("pudge.player.sys.platform", "linux")
+    conf.unlink()
+    assert not any(arg.startswith("--hwdec") for arg in build_mpv_command("mpv", video, None, None, []))

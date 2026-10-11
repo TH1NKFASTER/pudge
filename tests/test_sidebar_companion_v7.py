@@ -27,11 +27,16 @@ def test_float_is_singleton_and_closing_does_not_touch_transport(monkeypatch, pl
     monkeypatch.setattr(sys, "platform", platform)
     calls = []
     shown = []
-    monkeypatch.setitem(sys.modules, "PyObjCTools", SimpleNamespace(AppHelper=SimpleNamespace(callAfter=lambda *args: None)))
+    monkeypatch.setitem(
+        sys.modules, "PyObjCTools", SimpleNamespace(AppHelper=SimpleNamespace(callAfter=lambda *args: None))
+    )
 
     def create(title, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(events=SimpleNamespace(closed=Event(), shown=Event(), loaded=Event()), show=lambda: shown.append(True))
+        return SimpleNamespace(
+            events=SimpleNamespace(closed=Event(), shown=Event(), loaded=Event()),
+            show=lambda: shown.append(True),
+        )
 
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=create))
     # No transport object at all: opening/closing must not ask for one.
@@ -62,10 +67,17 @@ def test_float_spaces_changes_are_dispatched_to_cocoa_main_thread(monkeypatch):
     monkeypatch.setattr("pudge.audiobook_panel.promote_to_panel", lambda window: window.native)
     pending = []
     changes = []
-    native = SimpleNamespace(collectionBehavior=lambda: 128, setCollectionBehavior_=changes.append,
-                             setLevel_=lambda value: None, setHidesOnDeactivate_=lambda value: None,
-                             orderFrontRegardless=lambda: None, styleMask=lambda: 128)
-    window = SimpleNamespace(native=native, events=SimpleNamespace(closed=Event(), shown=Event(), loaded=Event()))
+    native = SimpleNamespace(
+        collectionBehavior=lambda: 128,
+        setCollectionBehavior_=changes.append,
+        setLevel_=lambda value: None,
+        setHidesOnDeactivate_=lambda value: None,
+        orderFrontRegardless=lambda: None,
+        styleMask=lambda: 128,
+    )
+    window = SimpleNamespace(
+        native=native, events=SimpleNamespace(closed=Event(), shown=Event(), loaded=Event())
+    )
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setitem(sys.modules, "webview", SimpleNamespace(create_window=lambda *args, **kwargs: window))
     monkeypatch.setitem(
@@ -82,10 +94,14 @@ def test_float_spaces_changes_are_dispatched_to_cocoa_main_thread(monkeypatch):
             NSWindowCollectionBehaviorCanJoinAllSpaces=1,
             NSWindowCollectionBehaviorFullScreenAuxiliary=256,
             NSWindowCollectionBehaviorFullScreenPrimary=128,
-            NSStatusWindowLevel=25, NSScreenSaverWindowLevel=1000, NSWindowStyleMaskNonactivatingPanel=128,
+            NSStatusWindowLevel=25,
+            NSScreenSaverWindowLevel=1000,
+            NSWindowStyleMaskNonactivatingPanel=128,
         ),
     )
-    controller = AudiobookFloatWindow(SimpleNamespace(asset_base="http://127.0.0.1", logger=SimpleNamespace(info=lambda *args: None)))
+    controller = AudiobookFloatWindow(
+        SimpleNamespace(asset_base="http://127.0.0.1", logger=SimpleNamespace(info=lambda *args: None))
+    )
     controller.show()
     window.events.shown.handlers[0]()
     assert changes == [] and len(pending) == 2

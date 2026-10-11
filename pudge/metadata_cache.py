@@ -45,9 +45,7 @@ class MetadataCache:
     def put(self, key: object, value: Any) -> None:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(
-            f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-        )
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             temporary.write_text(
                 json.dumps(

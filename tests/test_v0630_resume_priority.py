@@ -50,12 +50,46 @@ def test_mid_episode_resume_card_wins_over_ready_section(tmp_path: Path) -> None
     assert home["continue_watching"][0]["resume_start"] == 424.643
 
 
-def test_player_exit_refreshes_mid_episode_state() -> None:
-    html = (
-        Path(__file__).parents[1] / "pudge" / "web" / "index.html"
-    ).read_text(encoding="utf-8")
+SHOW = {
+    "media_id": 7,
+    "title": "Show",
+    "episodes": 12,
+    "next_episode": 3,
+    "progress": 2,
+    "site_url": "https://anilist.co/anime/7",
+    "ready_episodes": [3],
+    "local": {"episode": 3, "state": "ready", "video_path": "/v/s3.mkv", "subtitle_path": "/v/s3.ja.srt"},
+}
+# mpv runs until window.__exited; the user stopped mid-episode (not counted as watched) and
+# the backend's Home then lists the episode under Continue watching.
+PLAYER = r"""
+const base = __api.get_state;
+__api.get_state = __api.get_state_fast = async () => {
+  const state = await base();
+  if (window.__exited) state.home = {...state.home, new_ready: [],
+    continue_watching: [{...state.home.new_ready[0], episode: 3, video_path: '/v/s3.mkv', resume_start: 424.6, progress_percent: 30}]};
+  return state;
+};
+__api.play = async () => ({ok: true, status: 'starting'});
+__api.play_status = async () => (window.__exited ? {status: 'exited', watched: false, episode: 3} : {status: 'running', episode: 3});
+"""
 
-    assert (
-        "setPathPlayState(path,'idle');if(!watchedReported){"
-        "ui.state=await pywebview.api.get_state();renderDataPages();}"
-    ) in html
+
+def test_player_exit_refreshes_mid_episode_state(page) -> None:
+    result = page.run(
+        r"""
+        const sections = () => [...document.querySelectorAll('#currentContent [data-home-section]')].map(n => n.dataset.homeSection);
+        await __click('#currentContent [data-play-path="/v/s3.mkv"]'); await __tick(1000);
+        const playing = sections();
+        window.__exited = true;
+        await __tick(3000);
+        return {playing, after: sections(), card: __text('#currentContent [data-home-section="section.continueWatching"]'),
+                resume: t('label.continueEpisode', {episode: 3, time: formatClock(424.6)})};
+        """,
+        state={"home": {"new_ready": [SHOW]}},
+        before=PLAYER,
+    )
+    out = result.value
+    # Home moves the episode to Continue watching as soon as mpv closes.
+    assert out["playing"] == ["section.newReady"] and out["after"] == ["section.continueWatching"]
+    assert out["resume"] in out["card"]

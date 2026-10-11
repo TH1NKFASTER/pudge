@@ -1,0 +1,15 @@
+:root{color-scheme:dark;--muted:#9aabc1;--accent:#4a68e0;--accent-text:#8aa2ff;--ln-reader-bg:#0b1420;--ln-reader-fg:#dce7f6}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:#0b1420;color:#dce7f6;font:13px/1.5 -apple-system,BlinkMacSystemFont,sans-serif}
+button{font:inherit;color:inherit;background:#132237;border:1px solid #334862;border-radius:6px;cursor:pointer}button:hover{background:#22344b}button:disabled{opacity:.4;cursor:default}[hidden]{display:none!important}
+.screen-text{height:100%;display:flex;flex-direction:column;gap:6px;padding:8px}
+.screen-text-head{display:flex;align-items:center;gap:6px;min-height:24px}
+.screen-text-status{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font-size:12px}
+.screen-text-status.paused{color:#f4bd63}
+#screenTextRefresh{width:26px;height:24px;padding:0;line-height:1}
+.screen-text-body{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;padding:8px 10px;border:1px solid #2a3c55;border-radius:8px;background:#0f1b2a;font-family:var(--ln-font-family,"Hiragino Mincho ProN","Yu Mincho",serif);font-size:17px;line-height:1.75;user-select:text;-webkit-user-select:text}
+.screen-text-body p{margin:0 0 6px}
+.screen-text-problem{padding:8px;border-radius:8px;background:#3b2630;color:#ffd5d5}
+.screen-text-problem button{margin-top:6px}
+#floatError{position:fixed;bottom:10px;left:10px;right:10px;padding:8px;border-radius:8px;background:#3b2630;color:#ffd5d5;z-index:15000}
+.screen-text-hint{position:relative;padding:6px 28px 6px 8px;border-radius:8px;background:#1a2a40;color:var(--muted);font-size:12px}.screen-text-hint .screen-text-hint-close{position:absolute;top:2px;right:2px;margin:0;min-width:24px;min-height:24px;padding:0 6px;border:0;background:transparent;color:var(--muted);font-size:16px;line-height:1;cursor:pointer}
+.screen-text-hint button{margin-top:4px}

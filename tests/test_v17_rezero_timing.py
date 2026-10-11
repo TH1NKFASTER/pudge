@@ -198,7 +198,7 @@ def test_upgrade_requeues_only_old_weak_opening_signature_once(tmp_path):
     assert manager._requeue_shared_opening_timeline_upgrade() == 1
     row = manager.db.episode_by_path(video)
     assert row.subtitle_path is None and row.state == "waiting_subtitles"
-    assert video.read_bytes() == b"video" and subtitle.exists()
+    assert video.is_file() and video.stat().st_size == len(b"video") and subtitle.exists()  # nothing deleted
     assert manager._requeue_shared_opening_timeline_upgrade() == 0
     manager.db.upsert_episode(
         LibraryEpisode(

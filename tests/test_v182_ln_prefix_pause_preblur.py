@@ -1,6 +1,12 @@
-from __future__ import annotations
+"""v1.82: the comma pause after a recovered chapter opening, also when the cache has pause
+anchors elsewhere (behaviour; audit 71Б rewrite).
 
-from pathlib import Path
+Covered elsewhere: spoiler blur is a CSS filter over the same eagerly loaded <img> with a
+"Show illustration" label, no canvas copies, revealed by a click anywhere on the picture,
+test_v141_ln_blur_scroll_open_alignment_perf.py::
+test_blurred_illustration_is_the_eager_image_itself_clipped_by_its_frame."""
+
+from __future__ import annotations
 
 from pudge.reading_audio_alignment import (
     _punctuation_boundaries,
@@ -8,10 +14,6 @@ from pudge.reading_audio_alignment import (
     chapter_audio_text,
     light_novel_position_for_audio,
 )
-
-
-ROOT = Path(__file__).resolve().parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
 
 
 def _real_v181_second_act_shape(*, stored_pause_count: int) -> dict:
@@ -76,22 +78,4 @@ def test_recovered_prefix_pause_is_restored_even_when_cache_has_other_pause_anch
     assert resumed is not None
     assert abs(float(resumed["chapter_char_offset_exact"]) - 11.0) < 1e-6
 
-    assert abs(
-        float(audio_position_for_light_novel_offset(alignment, 1, 11) or 0.0)
-        - 6859.3
-    ) < 1e-6
-
-
-def test_spoiler_blur_uses_ttsu_style_same_img_and_plain_css_filter() -> None:
-    html = HTML.read_text(encoding="utf-8")
-
-    assert ".ln-reader.blur-images .ln-inline-image:not(.revealed) img{filter:blur(44px);cursor:pointer}" in html
-    assert "ln-inline-image-spoiler-label" in html
-    assert "function lnBuildInlineBlurPreview(img)" not in html
-    assert "canvas.className='ln-inline-image-blur-preview'" not in html
-    assert "canvas.className='ln-inline-image-raster'" not in html
-    assert "contain:paint" not in html.split(".ln-inline-image-frame{", 1)[1].split("}", 1)[0]
-    assert "translateZ(0)" not in html.split(".ln-inline-image-frame{", 1)[1].split("}", 1)[0]
-
-    assert "const figure=event.target.closest?.('#lnReader .ln-inline-image');if(!figure)return;" in html
-    assert "const image=figure.querySelector('img');if(!image)return;" in html
+    assert abs(float(audio_position_for_light_novel_offset(alignment, 1, 11) or 0.0) - 6859.3) < 1e-6

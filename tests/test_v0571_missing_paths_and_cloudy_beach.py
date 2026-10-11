@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 
 from pudge.cli import _find_online_subtitles
@@ -62,6 +63,14 @@ def test_deleted_torrent_and_video_no_longer_block_missing_episode_search(
     monkeypatch.setattr(manager, "qbt_client", lambda: FakeQbt())
 
     manager.sync_downloads()
+    # Seen missing once: kept (its drive may be briefly away).
+    assert manager._last_missing_episode_rows == 0
+    assert manager.db.episode_by_path(missing_video) is not None
+
+    real_time = time.time
+    # Still missing once "Delete hours after watching" (24 by default) has passed.
+    monkeypatch.setattr(time, "time", lambda: real_time() + (cfg.agent.delete_after_watched_hours + 1) * 3600)
+    manager.sync_downloads()
 
     assert manager._last_missing_episode_rows == 1
     assert manager.db.has_episode(77, 5) is False
@@ -102,8 +111,7 @@ def test_cloudy_beach_exact_title_overrides_conflicting_parent_anilist_entry(
     cfg = config_for(tmp_path)
     cfg.jimaku.api_key = "token"
     video = (
-        tmp_path
-        / "[Erai-raws] Shibou Yuugi de Meshi wo Kuu - 44-Cloudy Beach "
+        tmp_path / "[Erai-raws] Shibou Yuugi de Meshi wo Kuu - 44-Cloudy Beach "
         "[1080p NF WEB-DL AVC AAC][JPN][E88A3655].mkv"
     )
     video.write_bytes(b"video")

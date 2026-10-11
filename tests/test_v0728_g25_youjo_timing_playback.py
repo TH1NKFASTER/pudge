@@ -36,9 +36,7 @@ def test_youjo_style_decreasing_clock_reanchors_to_real_source_gap() -> None:
         },
     ]
 
-    _segments, boundaries, diagnostics = _stabilize_decreasing_boundaries(
-        cues, segments, [101.5]
-    )
+    _segments, boundaries, diagnostics = _stabilize_decreasing_boundaries(cues, segments, [101.5])
 
     assert boundaries == [(77.678 + 94.561) / 2.0]
     assert diagnostics == [
@@ -71,16 +69,15 @@ def test_playback_cleaner_keeps_japanese_han_only_lines(tmp_path: Path) -> None:
         for index in range(1, 11)
     )
     source.write_text(
-        normal
-        + "11\n00:02:04,405 --> 00:02:08,409\n"
+        normal + "11\n00:02:04,405 --> 00:02:08,409\n"
         "出発前\nルーデルドルフ閣下が　こちらを。\n\n"
         "12\n00:03:29,590 --> 00:03:32,660\n"
         "敵爆撃機より\n魔導反応感知！\n\n",
         encoding="utf-8",
     )
 
-    cleaned, result = clean_srt_for_playback(source, tmp_path / "cache", force=True)
-    payload = cleaned.read_text(encoding="utf-8")
+    cleaned_output, result = clean_srt_for_playback(source, tmp_path / "cache", force=True)
+    payload = cleaned_output.read_text(encoding="utf-8")
 
     assert "出発前" in payload
     assert "ルーデルドルフ閣下が" in payload
@@ -100,8 +97,8 @@ def test_playback_cleaner_still_removes_obvious_inline_chinese(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    cleaned, result = clean_srt_for_playback(source, tmp_path / "cache", force=True)
-    payload = cleaned.read_text(encoding="utf-8")
+    cleaned_output, result = clean_srt_for_playback(source, tmp_path / "cache", force=True)
+    payload = cleaned_output.read_text(encoding="utf-8")
 
     assert "这是中文翻译台词" not in payload
     assert "我们继续说话" not in payload

@@ -1,10 +1,16 @@
 """Operational speech verification failures, separate from candidate rejection."""
+
 from collections.abc import Mapping
 
 REASONS = {
-    "stt_reference_unavailable", "stt_timeout", "stt_unavailable",
-    "audio_extract_failed", "japanese_audio_stream_unavailable",
-    "stt_invalid_result", "stt_too_few_segments", "stt_disabled",
+    "stt_reference_unavailable",
+    "stt_timeout",
+    "stt_unavailable",
+    "audio_extract_failed",
+    "japanese_audio_stream_unavailable",
+    "stt_invalid_result",
+    "stt_too_few_segments",
+    "stt_disabled",
     "stt_worker_failed",
 }
 
@@ -14,6 +20,7 @@ def verification_failure(result):
     if not isinstance(result, Mapping):
         return None
     found = []
+
     def visit(value):
         if isinstance(value, Mapping):
             reason = str(value.get("reason") or "")
@@ -25,11 +32,19 @@ def verification_failure(result):
         elif isinstance(value, list):
             for nested in value:
                 visit(nested)
+
     visit(result)
     if not found:
         return None
-    reason, error = next((row for row in found if row[0] != "stt_reference_unavailable"), next((row for row in reversed(found) if row[1]), found[0]))
-    return {"reason": reason, "retryable": reason not in {"japanese_audio_stream_unavailable", "stt_disabled", "stt_unavailable"}, "error": error}
+    reason, error = next(
+        (row for row in found if row[0] != "stt_reference_unavailable"),
+        next((row for row in reversed(found) if row[1]), found[0]),
+    )
+    return {
+        "reason": reason,
+        "retryable": reason not in {"japanese_audio_stream_unavailable", "stt_disabled", "stt_unavailable"},
+        "error": error,
+    }
 
 
 def annotate_verification(result):

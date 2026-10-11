@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * data: blob:; media-src * data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title data-i18n="screenText.windowTitle">Pudge · Screen text</title>
+  <link rel="stylesheet" href="reading_tools.css">
+  <link rel="stylesheet" href="screen_text.css">
+</head>
+<body>
+  <main class="screen-text">
+    <div class="screen-text-head">
+      <span id="screenTextStatus" class="screen-text-status" role="status"></span>
+      <button id="screenTextRefresh" type="button" data-i18n-title="screenText.refresh" data-i18n-aria-label="screenText.refresh">↻</button>
+    </div>
+    <div id="screenTextBody" class="screen-text-body" data-pudge-study-hover data-pudge-translate-root></div>
+    <div id="screenTextProblem" class="screen-text-problem" hidden></div>
+    <div id="screenTextHint" class="screen-text-hint" hidden><span data-i18n="screenText.allowHint"></span> <button id="screenTextAllow" type="button" data-i18n="vn.openScreenRecordingSettings"></button><button id="screenTextHintClose" class="screen-text-hint-close" type="button" aria-label="Close" data-i18n-aria-label="action.close">×</button></div>
+  </main>
+  <div id="floatError" role="status" hidden></div>
+  <script src="locales.en.js"></script>
+  <script src="locales.ru.js"></script>
+  <script src="i18n.js"></script>
+  <script src="review_actions.js"></script>
+  <script src="screen_text.js"></script>
+  <script src="reading_tools.js"></script>
+</body>
+</html>

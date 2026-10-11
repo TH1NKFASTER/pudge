@@ -78,10 +78,7 @@ def literature_franchise_metadata(items: list[dict[str, Any]]) -> dict[int, dict
         if len(component) <= 1:
             continue
 
-        indegree = {
-            media_id: len(incoming.get(media_id, set()) & component)
-            for media_id in component
-        }
+        indegree = {media_id: len(incoming.get(media_id, set()) & component) for media_id in component}
         ready = sorted(
             (media_id for media_id, degree in indegree.items() if degree == 0),
             key=lambda media_id: _sort_key(by_media[media_id], media_id),

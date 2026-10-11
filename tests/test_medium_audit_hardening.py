@@ -14,7 +14,10 @@ from pudge.light_novels import LightNovelError, LightNovelService
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem
 import importlib.util
-_batch_spec = importlib.util.spec_from_file_location("pudge_release_batch", Path(__file__).resolve().parents[1] / ".github/release/run_test_batch.py")
+
+_batch_spec = importlib.util.spec_from_file_location(
+    "pudge_release_batch", Path(__file__).resolve().parents[1] / ".github/release/run_test_batch.py"
+)
 run_test_batch = importlib.util.module_from_spec(_batch_spec)
 _batch_spec.loader.exec_module(run_test_batch)
 
@@ -83,12 +86,8 @@ def test_parse_same_hash_is_single_flight_and_reuses_cache(
     monkeypatch.setattr(service, "_jiten_request", fake_request)
     results: list[dict] = []
 
-    first = threading.Thread(
-        target=lambda: results.append(service._parse_text("同じ本文", "same-hash"))
-    )
-    second = threading.Thread(
-        target=lambda: results.append(service._parse_text("同じ本文", "same-hash"))
-    )
+    first = threading.Thread(target=lambda: results.append(service._parse_text("同じ本文", "same-hash")))
+    second = threading.Thread(target=lambda: results.append(service._parse_text("同じ本文", "same-hash")))
     first.start()
     assert started.wait(1)
     second.start()
@@ -215,25 +214,31 @@ def test_download_intent_revision_and_hash_reject_stale_updates_and_completion()
 
     first = store.begin(10, 3, False, [old], backend="aria2")
     assert first["revision"] == 1
-    assert store.update(
-        10,
-        3,
-        False,
-        state="downloading",
-        selected=old,
-        expected_revision=1,
-    ) is not None
+    assert (
+        store.update(
+            10,
+            3,
+            False,
+            state="downloading",
+            selected=old,
+            expected_revision=1,
+        )
+        is not None
+    )
 
     second = store.begin(10, 3, False, [new], backend="aria2")
     assert second["revision"] == 2
-    assert store.update(
-        10,
-        3,
-        False,
-        state="downloading",
-        selected=old,
-        expected_revision=1,
-    ) is None
+    assert (
+        store.update(
+            10,
+            3,
+            False,
+            state="downloading",
+            selected=old,
+            expected_revision=1,
+        )
+        is None
+    )
     assert store.complete_if_present(10, 3, False, expected_hash="OLDHASH") is False
 
     current = store.get(10, 3, False)
@@ -242,14 +247,17 @@ def test_download_intent_revision_and_hash_reject_stale_updates_and_completion()
     assert current["state"] == "selecting"
     assert current["selected_hash"] == ""
 
-    assert store.update(
-        10,
-        3,
-        False,
-        state="downloading",
-        selected=new,
-        expected_revision=2,
-    ) is not None
+    assert (
+        store.update(
+            10,
+            3,
+            False,
+            state="downloading",
+            selected=new,
+            expected_revision=2,
+        )
+        is not None
+    )
     assert store.complete_if_present(10, 3, False, expected_hash="OLDHASH") is False
     assert store.complete_if_present(10, 3, False, expected_hash="NEWHASH") is True
 

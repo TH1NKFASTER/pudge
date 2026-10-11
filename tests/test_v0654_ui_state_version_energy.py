@@ -31,8 +31,12 @@ def test_playback_heartbeat_does_not_bump_ui_state_version(tmp_path: Path) -> No
     video = tmp_path / "Movie.mkv"
     video.write_bytes(b"video")
     db.upsert_episode(LibraryEpisode(media_id=2, title="Movie", episode=1, video_path=video, state="ready"))
+    # Entering Continue watching changes Home once (tests/test_fix_continue_watching_snapshot.py);
+    # the heartbeats that follow do not.
+    db.record_playback(video, 120.0, 6000.0, active_seconds=1.0)
     before = _version(db)
 
-    db.record_playback(video, 120.0, 6000.0, active_seconds=1.0)
+    db.record_playback(video, 150.0, 6000.0, active_seconds=1.0)
+    db.record_playback(video, 180.0, 6000.0, active_seconds=1.0)
 
     assert _version(db) == before

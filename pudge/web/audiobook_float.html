@@ -1,10 +1,11 @@
 <!doctype html>
 <html lang="en">
 <head>
-<link rel="stylesheet" href="cover_preview.css">
   <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * data: blob:; media-src * data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'">
+<link rel="stylesheet" href="cover_preview.css">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Pudge · Audiobook</title>
+  <title data-i18n="float.title">Pudge · Audiobook</title>
   <link rel="stylesheet" href="reading_tools.css">
   <link rel="stylesheet" href="sidebar_companion.css">
   <link rel="stylesheet" href="audiobook_float.css">
@@ -14,9 +15,11 @@
     <div class="sidebar-content"></div>
     <div class="sidebar-bottom" hidden></div>
   </aside>
-  <p id="floatEmpty" hidden></p>
+  <p id="floatEmpty" data-i18n="float.startListening" hidden></p>
   <div id="floatError" role="status" hidden></div>
-  <script src="ui_localization.js"></script>
+  <script src="locales.en.js"></script>
+  <script src="locales.ru.js"></script>
+  <script src="i18n.js"></script>
   <script src="audiobook_float.js"></script>
   <script src="reading_tools.js"></script>
   <script src="paired_audio_clock.js"></script>

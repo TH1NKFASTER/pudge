@@ -7,17 +7,17 @@ from pudge.config import AppConfig
 from pudge.models import AniListAnime, JimakuEntry, VideoIdentity
 
 
-def test_settings_renderer_declares_payload_before_reading_version() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    start = html.index("function renderSettings(){")
-    end = html.index("function fillSettings", start)
-    function = html[start:end]
-
-    declaration = "const s=ui.state.settings||{};"
-    version_read = "escapeHtml(s.version||'—')"
-    assert declaration in function
-    assert version_read in function
-    assert function.index(declaration) < function.index(version_read)
+def test_settings_show_the_app_version(page) -> None:
+    # v0.5.82: the renderer read the version before declaring the settings payload,
+    # so Settings failed to render (an empty page).
+    for lang in ("en", "ru"):
+        result = page.run(
+            "return {header: __text('#settingsContent .settings-header p'), label: t('settings.version')}",
+            lang=lang,
+            state={"settings": {"version": "0.6.29"}},
+        )
+        assert result.value["header"].startswith(f"{result.value['label']}: 0.6.29")
+        assert not [line for line in result.console if "ui.render.fail" in line]
 
 
 def test_explicit_season_keeps_exact_anilist_jimaku_entry(tmp_path: Path, monkeypatch) -> None:

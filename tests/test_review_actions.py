@@ -18,6 +18,7 @@ from pudge.review_actions import (
     resolve_wire_grade,
 )
 from pudge.review_providers import JITEN_API_BASE, JPDB_API_BASE
+from tests.i18n_support import I18N_SCRIPTS, WEB, en, ru
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -25,8 +26,11 @@ EXPECTED = {
     ("jiten", "native"): [("again", "again"), ("hard", "hard"), ("good", "good"), ("easy", "easy")],
     ("jiten", "binary"): [("fail", "again"), ("pass", "good")],
     ("jpdb", "native"): [
-        ("nothing", "nothing"), ("something", "something"), ("hard", "hard"),
-        ("okay", "okay"), ("easy", "easy"),
+        ("nothing", "nothing"),
+        ("something", "something"),
+        ("hard", "hard"),
+        ("okay", "okay"),
+        ("easy", "easy"),
     ],
     ("jpdb", "binary"): [("fail", "fail"), ("pass", "pass")],
 }
@@ -95,7 +99,11 @@ def test_conflicts_only_inside_one_active_profile() -> None:
 def test_effective_bindings_and_payload_use_defaults_and_overrides() -> None:
     shortcuts = {"jpdb:native:nothing": "z", "jpdb:native:easy": ""}
     assert effective_bindings("jpdb", "native", shortcuts) == {
-        "nothing": "z", "something": "2", "hard": "3", "okay": "4", "easy": "",
+        "nothing": "z",
+        "something": "2",
+        "hard": "3",
+        "okay": "4",
+        "easy": "",
     }
     payload = action_set_payload("jpdb", "binary", shortcuts)
     assert [a["id"] for a in payload["actions"]] == ["fail", "pass"]
@@ -105,7 +113,8 @@ def test_effective_bindings_and_payload_use_defaults_and_overrides() -> None:
 def test_js_default_table_mirrors_python() -> None:
     script = (
         "globalThis.document={documentElement:{lang:'en'}};"
-        f"require({json.dumps(str(ROOT / 'pudge/web/review_actions.js'))});"
+        + "".join(f"require({json.dumps(str(WEB / name))});" for name in I18N_SCRIPTS)
+        + f"require({json.dumps(str(ROOT / 'pudge/web/review_actions.js'))});"
         "process.stdout.write(JSON.stringify(globalThis.PudgeReviewActions.DEFAULT_SETS));"
     )
     result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=15, check=False)
@@ -115,12 +124,30 @@ def test_js_default_table_mirrors_python() -> None:
         assert js[f"{provider}:{mode}"] == [
             [a.id, a.wire, a.label_en, a.label_ru, a.tone, a.default_key] for a in actions
         ]
+    # Labels are real catalog texts in both languages, not keys.
+    assert [a.label_en for a in actions_for("jpdb", "native")] == [
+        "Nothing",
+        "Something",
+        "Hard",
+        "Okay",
+        "Easy",
+    ]
+    assert [a.label_en for a in actions_for("jiten", "binary")] == ["Fail", "Pass"]
+    assert all(a.label_ru and a.label_ru != a.label_en for k in EXPECTED for a in actions_for(*k))
+    assert (
+        en("review.action.again") == "Again"
+        and ru("review.action.again") == actions_for("jiten", "native")[0].label_ru
+    )
 
 
 def test_review_actions_js_behaviour() -> None:
     result = subprocess.run(
         ["node", str(ROOT / "tests/js/review_actions_s2.cjs"), str(ROOT / "pudge/web")],
-        cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "review actions S2: PASS" in result.stdout
@@ -139,10 +166,12 @@ def _service(tmp_path: Path) -> LightNovelService:
 def test_mode_and_all_profiles_persist_across_restart(tmp_path: Path) -> None:
     service = _service(tmp_path)
     assert service.settings_payload()["review_mode"] == "native"  # default keeps old workflow
-    service.save_settings({
-        "review_mode": "binary",
-        "review_shortcuts": json.dumps({"jiten:binary:fail": "f", "jpdb:native:easy": "e"}),
-    })
+    service.save_settings(
+        {
+            "review_mode": "binary",
+            "review_shortcuts": json.dumps({"jiten:binary:fail": "f", "jpdb:native:easy": "e"}),
+        }
+    )
     reopened = LightNovelService(service.config).settings_payload()
     assert reopened["review_mode"] == "binary"
     assert reopened["review_shortcuts"] == {"jiten:binary:fail": "f", "jpdb:native:easy": "e"}
@@ -191,9 +220,14 @@ def test_review_payload_per_provider_and_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend, mode, action, expected
 ) -> None:
     service = _service(tmp_path)
-    service.save_settings({
-        "jiten_api_key": "jk", "jpdb_api_token": "jt", "study_backend": backend, "review_mode": mode,
-    })
+    service.save_settings(
+        {
+            "jiten_api_key": "jk",
+            "jpdb_api_token": "jt",
+            "study_backend": backend,
+            "review_mode": mode,
+        }
+    )
     sent: list[tuple[str, dict]] = []
 
     def fake_post(url, *, headers, json, timeout):
@@ -201,7 +235,9 @@ def test_review_payload_per_provider_and_mode(
         return _Response({"success": True})
 
     monkeypatch.setattr("pudge.review_providers.httpx.post", fake_post)
-    result = service.study_action(backend, "review", 11, 22, grade=action, attempt_id="a1", id_namespace=backend)
+    result = service.study_action(
+        backend, "review", 11, 22, grade=action, attempt_id="a1", id_namespace=backend
+    )
     assert result["outcome"] == "confirmed"
     assert len(sent) == 1
     url, body = sent[0]
@@ -210,10 +246,17 @@ def test_review_payload_per_provider_and_mode(
         assert body[key] == value
 
 
-@pytest.mark.parametrize(("backend", "mode", "action"), [("jiten", "binary", "hard"), ("jpdb", "binary", "okay"), ("jpdb", "native", "good")])
-def test_hidden_action_never_reaches_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend, mode, action) -> None:
+@pytest.mark.parametrize(
+    ("backend", "mode", "action"),
+    [("jiten", "binary", "hard"), ("jpdb", "binary", "okay"), ("jpdb", "native", "good")],
+)
+def test_hidden_action_never_reaches_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend, mode, action
+) -> None:
     service = _service(tmp_path)
-    service.save_settings({"jiten_api_key": "jk", "jpdb_api_token": "jt", "study_backend": backend, "review_mode": mode})
+    service.save_settings(
+        {"jiten_api_key": "jk", "jpdb_api_token": "jt", "study_backend": backend, "review_mode": mode}
+    )
     monkeypatch.setattr("pudge.review_providers.httpx.post", lambda *a, **k: pytest.fail("must not send"))
     with pytest.raises(LightNovelError, match="not available"):
         service.study_action(backend, "review", 11, 22, grade=action, attempt_id="a1", id_namespace=backend)

@@ -1,0 +1,94 @@
+/* Statistics page. One column that never grows past the page: a wide table or chart scrolls
+   inside its own panel, the filter row and tabs wrap, cards reflow by the space they get. */
+.stats-shell{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;min-width:0}
+.stats-shell>*{min-width:0}
+.stats-filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel);min-width:0}
+.stats-filterbar>*{min-width:0;max-width:100%}
+.stats-filterbar .spacer{flex:1 1 0}
+.stats-filterbar select,.stats-filterbar input{min-height:34px;max-width:100%}
+.stats-filterbar .pudge-select{max-width:min(320px,100%)}
+#statsCustomDates:not([hidden]){display:inline-flex;gap:6px;flex-wrap:wrap}
+.stats-periods,.stats-tabs{display:flex;gap:6px;flex-wrap:wrap;min-width:0}
+.stats-periods button.active,.stats-tabs button.active{background:var(--accent);color:white;border-color:transparent}
+.stats-tabs{padding:0 2px}
+#statsStatus{overflow-wrap:anywhere}
+
+.stats-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr));gap:10px}
+.stats-card{min-width:0;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow-wrap:anywhere}
+.stats-card strong{display:block;font-size:24px;margin-top:5px}
+.stats-muted{color:var(--muted);font-size:12px}
+.stats-note{overflow-wrap:anywhere}
+
+/* Stats cards: compact cards under the chart. */
+.stats-highlights{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(190px,100%),1fr));gap:8px}
+.stats-highlight{min-width:0;display:grid;gap:3px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.stats-highlight>span{color:var(--muted);font-size:11px;letter-spacing:.02em}
+.stats-highlight>strong{font-size:17px;line-height:1.25;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stats-highlight>small{color:var(--muted);font-size:11px;overflow-wrap:anywhere}
+.stats-highlight-wide{grid-column:span 2}
+.stats-highlight-wide>small{display:flex;align-items:center}
+@media(max-width:700px){.stats-highlight-wide{grid-column:auto}}
+
+/* Daily bars, each split into blocks by content type (fixed colour per type). */
+.stats-chart{display:grid;grid-template-columns:repeat(var(--stats-columns,1),minmax(20px,1fr));align-items:end;gap:5px;min-height:220px;padding:16px 10px 26px;border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow-x:auto;overflow-y:hidden}
+.stats-bar-wrap{min-width:20px;width:100%;height:180px;display:flex;align-items:end;position:relative}
+.stats-bar{width:100%;min-height:2px;display:flex;flex-direction:column-reverse;padding:0;border:0;border-radius:4px 4px 0 0;overflow:hidden;background:transparent;cursor:pointer}
+.stats-bar:hover{background:transparent;filter:brightness(1.15)}
+.stats-bar:focus-visible{outline:2px solid var(--accent-text);outline-offset:2px}
+.stats-seg{display:block;flex:0 0 auto;width:100%;min-height:2px;box-sizing:border-box;background:var(--stats-kind,#8a9bb3)}
+.stats-seg+.stats-seg{border-bottom:2px solid var(--panel)}
+.stats-bar-wrap small{position:absolute;top:184px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--muted);white-space:nowrap}
+.stats-swatch{display:inline-block;width:9px;height:9px;margin-right:6px;border-radius:2px;background:var(--stats-kind,#8a9bb3);vertical-align:0}
+/* Content-type colours (validated for the dark panel: adjacent pairs stay apart for colour-blind readers). */
+[data-stats-kind]{--stats-kind:#8a9bb3}
+[data-stats-kind="anime"]{--stats-kind:#3987e5}
+[data-stats-kind="light_novel"]{--stats-kind:#d95926}
+[data-stats-kind="manga"]{--stats-kind:#199e70}
+[data-stats-kind="audiobook"]{--stats-kind:#c98500}
+[data-stats-kind="visual_novel"]{--stats-kind:#d55181}
+[data-stats-kind="light_novel+audiobook"]{--stats-kind:#008300}
+[data-stats-kind="simultaneous"]{--stats-kind:#9085e9}
+[data-stats-kind="review"]{--stats-kind:#e66767}
+
+.stats-calendar{display:grid;grid-template-columns:repeat(18,minmax(0,1fr));gap:4px;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+.stats-day{aspect-ratio:1;border:1px solid color-mix(in srgb,var(--line) 70%,transparent);border-radius:3px;background:color-mix(in srgb,var(--accent) calc(var(--heat)*80%),var(--panel));cursor:pointer;min-width:0;padding:0}
+
+.stats-breakdown{display:flex;gap:8px;flex-wrap:wrap}
+.stats-chip{max-width:100%;padding:5px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px;overflow-wrap:anywhere}
+.stats-legend .stats-chip{display:inline-flex;align-items:center;background:transparent;color:var(--text);font-size:12px;line-height:1.3;cursor:pointer;transition:opacity .12s ease,border-color .12s ease}
+.stats-legend .stats-chip:hover,.stats-legend .stats-chip:focus-visible{background:var(--panel2);border-color:var(--stats-kind)}
+.stats-legend .stats-chip[aria-pressed="true"]{border-color:var(--stats-kind);background:var(--panel2)}
+.stats-legend .stats-chip.stats-chip-dim{opacity:.45}
+/* A legend chip hovered, focused or picked: only that type's blocks stay (same scale). */
+.stats-seg.stats-seg-hidden{display:none}
+.stats-chart[data-stats-focus] .stats-seg{border-bottom:0;border-radius:4px 4px 0 0}
+
+/* Works and Journal: the table scrolls inside its panel, never the page. */
+.stats-panel{min-width:0;max-width:100%;border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:auto}
+.stats-table{width:100%;border-collapse:collapse}
+.stats-table th,.stats-table td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.stats-table th{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+.stats-table td{white-space:normal;overflow-wrap:break-word}
+.stats-table td.stats-title{min-width:160px;overflow-wrap:anywhere}
+.stats-table td button{white-space:nowrap}
+.stats-table tr.excluded{opacity:.55;text-decoration:line-through}
+.stats-actions{display:flex;gap:6px;flex-wrap:wrap}
+.stats-empty{padding:30px;text-align:center;color:var(--muted)}
+
+.stats-modal-backdrop{position:fixed;inset:0;z-index:10040;background:rgba(0,0,0,.58);display:flex;align-items:center;justify-content:center;padding:24px}
+.stats-modal{width:min(520px,94vw);max-height:90vh;overflow:auto;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;display:grid;gap:12px}
+.stats-modal label{display:grid;gap:5px}
+.stats-modal footer{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.stats-modal input,.stats-modal select,.stats-modal textarea{width:100%}
+.stats-danger{color:#ff7878}
+
+/* Narrow window (the sidebar takes 220 px): every table row becomes a small card with labelled fields. */
+@media(max-width:1000px){
+  .stats-calendar{grid-template-columns:repeat(12,minmax(0,1fr))}
+  .stats-table thead{display:none}
+  .stats-table,.stats-table tbody{display:block}
+  .stats-table tr{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px 12px;padding:10px 12px;border-bottom:1px solid var(--line)}
+  .stats-table td{display:block;padding:0;border:0}
+  .stats-table td.stats-title{grid-column:1/-1;order:-1;min-width:0;font-weight:650}
+  .stats-table td[data-label]::before{content:attr(data-label);display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+}

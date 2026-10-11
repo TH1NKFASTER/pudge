@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -10,31 +9,25 @@ ROOT = Path(__file__).parents[1]
 WEB = ROOT / "pudge" / "web"
 
 
-class _Assets(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.ids: set[str] = set()
-        self.scripts: list[str] = []
-        self.styles: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        values = dict(attrs)
-        if values.get("id"):
-            self.ids.add(str(values["id"]))
-        if tag == "script" and values.get("src"):
-            self.scripts.append(str(values["src"]))
-        if tag == "link" and values.get("rel") == "stylesheet" and values.get("href"):
-            self.styles.append(str(values["href"]))
-
-
-def test_web_pages_and_external_modules_are_wired() -> None:
-    parser = _Assets()
-    parser.feed((WEB / "index.html").read_text(encoding="utf-8"))
-    assert {"current", "lightnovels", "manga", "audiobooks", "planned", "settings"} <= parser.ids
-    assert {"settings.js", "media.js", "debug.js"} <= set(parser.scripts)
-    assert {"settings.css", "media.css", "debug.css"} <= set(parser.styles)
-    for asset in parser.scripts + parser.styles:
-        assert (WEB / asset).is_file()
+def test_web_pages_and_external_modules_are_wired(page) -> None:
+    # The page harness fails on a missing or broken <script src>; stylesheets it skips
+    # silently, so their files are checked here.
+    result = page.run(
+        """
+        return {
+          pages: ['current', 'lightnovels', 'manga', 'audiobooks', 'planned', 'settings'].filter(id => document.getElementById(id)?.classList.contains('page')),
+          modules: {settings: typeof window.PudgeSettings?.enhance, media: typeof window.PudgeMedia?.loadManga, debug: typeof window.PudgeDebug?.open},
+          settingsTabs: document.querySelectorAll('#settingsContent .settings-categories [data-settings-category]').length,
+          stylesheets: [...document.querySelectorAll('link[rel="stylesheet"]')].map(link => link.getAttribute('href')),
+        };
+        """
+    )
+    out = result.value
+    assert out["pages"] == ["current", "lightnovels", "manga", "audiobooks", "planned", "settings"]
+    assert out["modules"] == {"settings": "function", "media": "function", "debug": "function"}
+    assert out["settingsTabs"] == 5
+    assert {"settings.css", "media.css", "debug.css"} <= set(out["stylesheets"])
+    assert [href for href in out["stylesheets"] if not (WEB / href).is_file()] == []
 
 
 def test_external_javascript_has_real_syntax_check() -> None:
@@ -45,8 +38,26 @@ def test_external_javascript_has_real_syntax_check() -> None:
         subprocess.run([node, "--check", str(script)], check=True, capture_output=True, text=True)
 
 
-def test_activity_remains_intentionally_hidden() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert 'data-page="downloads"' not in html
-    assert 'data-page="diagnostics"' not in html
-    assert "section.needsAction" in html
+def test_activity_pages_stay_hidden_and_problems_surface_on_home(page) -> None:
+    # No Downloads / Diagnostics pages in the sidebar; a title that needs the user
+    # shows up under "Action required" on Home and its button opens the setting.
+    item = {"media_id": 5, "title": "Needs Jimaku", "action_code": "configure_jimaku"}
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            const nav = [...document.querySelectorAll('.nav [data-page]')].map(button => button.dataset.page);
+            const section = document.querySelector('#current [data-home-section="section.needsAction"]');
+            const out = {nav, title: section?.querySelector('.section-title')?.innerText, expected: t('section.needsAction'),
+                         button: section?.querySelector('[data-action="open-needs-action"]')?.innerText, configure: PudgeI18n.t('ui.configureJimaku')};
+            await __click('#current [data-action="open-needs-action"]');
+            await __tick(50);
+            return {...out, page: ui.page, focused: document.activeElement?.id};
+            """,
+            lang=lang,
+            state={"home": {"needs_action": [item]}},
+        )
+        out = result.value
+        assert "downloads" not in out["nav"] and "diagnostics" not in out["nav"]
+        assert out["title"] == out["expected"]
+        assert out["button"] == out["configure"]
+        assert out["page"] == "settings" and out["focused"] == "s_jimaku"

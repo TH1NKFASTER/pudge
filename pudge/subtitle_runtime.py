@@ -102,7 +102,6 @@ def _probe_embedded(
     return int(candidate.subtitle_id), int(candidate.stream_index), str(candidate.codec or "")
 
 
-
 def _explicit_subtitle_rebuild_active(database: Database, video_path: Path) -> bool:
     """True while an explicit Fresh/Debug rebuild owns this video's selection.
 
@@ -121,6 +120,7 @@ def _explicit_subtitle_rebuild_active(database: Database, video_path: Path) -> b
         except Exception:
             continue
     return False
+
 
 def resolve_episode_subtitle(
     database: Database,
@@ -224,7 +224,12 @@ def repair_episode_subtitle(
             return False
         state = str(row["state"] or "local")
         next_state = state
-        if selection.is_text and state in {"local", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
+        if selection.is_text and state in {
+            "local",
+            "waiting_subtitles",
+            "waiting_text_subtitles",
+            "couldnt_sync",
+        }:
             next_state = "ready"
         changed = (
             str(row["subtitle_path"] or "") != str(path_value or "")

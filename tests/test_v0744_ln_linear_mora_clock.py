@@ -1,8 +1,11 @@
-from __future__ import annotations
+"""Listen together: the text clock is linear between alignment anchors, in the backend and
+in the reader's highlight (behaviour; audit 71Б rewrite).
 
-import re
-import subprocess
-from pathlib import Path
+The reader runs in node (tests/page_harness.py); tests/t71g21_support.py has the book read
+together with its audiobook. The reader side of the anchor windows (v0.7.45) and of
+punctuation pauses (v0.7.50) is covered here as well."""
+
+from __future__ import annotations
 
 import pytest
 
@@ -11,22 +14,7 @@ from pudge.reading_audio_alignment import (
     audio_position_for_light_novel_offset,
     light_novel_position_for_audio,
 )
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge/web/index.html"
-
-
-def _shared_offsets(state: dict, times: list[float]) -> list[float]:
-    """Evaluate the shared PudgePairedAudioClock (LN and sidebar use the same math)."""
-    import json
-    script = (
-        "const vm=require('vm'),fs=require('fs');const c={performance:{now:()=>0}};c.globalThis=c;vm.createContext(c);"
-        f"vm.runInContext(fs.readFileSync({json.dumps(str(ROOT / 'pudge/web/paired_audio_clock.js'))},'utf8'),c);"
-        f"const s={json.dumps(state)};console.log(JSON.stringify({json.dumps(times)}.map(t=>c.PudgePairedAudioClock.offsetAtTime(s,t))));"
-    )
-    out = subprocess.run(["node", "-e", script], check=True, capture_output=True, text=True).stdout
-    return json.loads(out)
+from t71g21_support import READER, paired
 
 
 def _alignment() -> dict[str, object]:
@@ -98,46 +86,92 @@ def test_progress_seek_uses_the_same_linear_clock() -> None:
     assert audio_position_for_light_novel(_alignment(), 1, 0.7) == 17.0
 
 
-def test_frontend_uses_wall_clock_ratio_and_immediate_word_switch() -> None:
-    source = HTML.read_text(encoding="utf-8")
+def test_shared_clock_maps_audio_time_to_text_offsets(page) -> None:
+    # The reader and the sidebar use PudgePairedAudioClock for the anchor window.
+    result = page.run(
+        r"""
+        const offsets = (path, times, state = {}) => times.map(t => PudgePairedAudioClock.offsetAtTime({...state, anchor_window: {path}}, t));
+        return {
+          linear: offsets([{time: 10, offset: 0}, {time: 14, offset: 40}, {time: 20, offset: 100}], [10, 11, 13, 14, 17, 20]),
+          // Several anchors ahead of the audio position (the backend sends more than one poll's worth).
+          lookahead: offsets([{time: 0, offset: 0}, {time: 1, offset: 10}, {time: 3, offset: 12}], [0.5, 1, 2, 3]),
+          // A punctuation pause: equal offsets hold the clock until speech resumes.
+          pause: offsets([{time: 0, offset: 0}, {time: 1, offset: 5}, {time: 3, offset: 5}, {time: 4, offset: 9}], [1.5, 2.9, 3.5]),
+          // A path that runs backwards is not used: the backend's exact offset is.
+          backwards: offsets([{time: 0, offset: 9}, {time: 2, offset: 3}], [1], {chapter_char_offset_exact: 42}),
+        };
+        """
+    )
+    assert result.value["linear"] == pytest.approx([0, 10, 30, 40, 70, 100])
+    assert result.value["lookahead"] == pytest.approx([5, 10, 11, 12])
+    assert result.value["pause"] == pytest.approx([5, 5, 7])
+    assert result.value["backwards"] == pytest.approx([42])
 
-    assert "function lnPairedAnchorPath(anchor)" in source
-    # Plan §7: LN delegates the piecewise-linear anchor clock to the shared
-    # PudgePairedAudioClock (no DOM mora re-timing); assert the behaviour.
-    assert "return shared.offsetAtTime(state||{},Number(time));" in source
-    assert "function lnPairedWeightedPosition(" not in source
-    state = {"anchor_window": {"path": [{"time": 10, "offset": 0}, {"time": 14, "offset": 40}, {"time": 20, "offset": 100}]}}
-    assert _shared_offsets(state, [10, 11, 13, 14, 17, 20]) == pytest.approx([0, 10, 30, 40, 70, 100])
-    assert "speechActive=lnPairedSpeechActive(anchor,estimatedTime)" not in source
-    assert "speechActive=lnPairedSpeechActive(anchor,position)" not in source
-    assert "renderLnPairedPosition(renderState,estimatedOffset,{speechActive:true,previewOffset})" in source
-    assert "{reason:'poll',speechActive:true,previewOffset}" in source
-    assert "until:performance.now()+34" not in source
-    assert "ui.lnPairedResumeTarget!==null" in source
-    assert "ui.lnPairedResumeTarget!==undefined" in source
+
+def test_reader_highlight_follows_the_anchor_clock(page) -> None:
+    """While the audiobook plays, the highlight shows the anchor clock's text offset: one
+    character per second, then a fast stretch, a punctuation pause that holds it, and a
+    slower stretch. Inside a word the progress is linear in time even when its morae are
+    uneven (話し, 話 = はな: the reader used to re-time words by their morae)."""
+    result = page.run(
+        READER
+        + r"""
+        AUDIO.path = [{time: 100, offset: 0}, {time: 102, offset: 2}, {time: 102.5, offset: 5.9},
+                      {time: 104, offset: 5.9}, {time: 106, offset: 10}];
+        await openReader();
+        const samples = [];
+        for (const t of [101, 102.25, 103, 103.9, 104.29, 105]) { await untilAudio(t); samples.push({word: current(), offset: shown()}); }
+        return {samples, weights: wordEls()[3].dataset.lnAudioWeights};
+        """,
+        **paired(playing=True),
+    )
+    samples = result.value["samples"]
+    assert result.value["weights"] == "2,1"
+    assert [sample["word"] for sample in samples] == [0, 1, 2, 2, 3, 3]
+    # Paints follow the clock every ~33 ms, so a sample may lag that much behind it.
+    assert samples[0]["offset"] == pytest.approx(1.0, abs=0.06)
+    assert samples[1]["offset"] == pytest.approx(3.95, abs=0.35)
+    assert [samples[2]["offset"], samples[3]["offset"]] == pytest.approx([5.9, 5.9])
+    assert samples[4]["offset"] == pytest.approx(6.5, abs=0.1)
+    assert samples[5]["offset"] == pytest.approx(7.95, abs=0.1)
 
 
-def test_inline_javascript_parses() -> None:
-    source = HTML.read_text(encoding="utf-8")
-    scripts = [
-        match.group(2)
-        for match in re.finditer(
-            r"<script([^>]*)>(.*?)</script>",
-            source,
-            flags=re.I | re.S,
-        )
-        if not re.search(r"\bsrc\s*=", match.group(1), flags=re.I)
-    ]
-    assert scripts
+def test_highlight_moves_to_the_next_word_at_once(page) -> None:
+    # The paint that crosses into the next word shows it; the previous word is complete.
+    # (A switch used to be held for 34 ms with the old word at 100 %.)
+    result = page.run(
+        READER
+        + r"""
+        await openReader();
+        const before = paintAt(1.9, 101.9);
+        const after = paintAt(2.05, 101.93);
+        return {before, after, words: words().slice(0, 2)};
+        """,
+        **paired(playing=False),
+    )
+    assert result.value["before"]["word"] == 0
+    assert result.value["after"] == {"word": 1, "offset": pytest.approx(2.05)}
+    first, second = result.value["words"]
+    assert (
+        first["current"] is False
+        and first["progress"] == "100%"
+        and "ln-paired-word-done" in first["classes"]
+    )
+    assert second["current"] is True
 
-    for index, script in enumerate(scripts):
-        path = ROOT / f".pudge-v0744-linear-clock-inline-{index}.js"
-        path.write_text(script, encoding="utf-8")
-        try:
-            subprocess.run(
-                ["node", "--check", str(path)],
-                cwd=ROOT,
-                check=True,
-            )
-        finally:
-            path.unlink(missing_ok=True)
+
+def test_highlight_stays_with_the_voice_after_a_speed_change_elsewhere(page) -> None:
+    result = page.run(
+        READER
+        + r"""
+        await openReader();
+        await untilAudio(101.1);                           // between two polls
+        setAudio({speed: 2});
+        const samples = [];
+        for (const t of [102.6, 103.4, 104.6]) { await untilAudio(t); samples.push([shown(), t - 100]); }
+        return samples;
+        """,
+        **paired(playing=True),
+    )
+    # The highlight may trail the voice by one paint (~0.07 s of audio at 2×), never lead it.
+    assert all(expected - 0.08 <= shown <= expected + 0.01 for shown, expected in result.value)

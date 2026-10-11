@@ -5,6 +5,7 @@ import html
 import hashlib
 import http.server
 import json
+import logging
 import os
 import platform
 import re
@@ -18,20 +19,22 @@ import threading
 import time
 import unicodedata
 import webbrowser
+import weakref
 import zipfile
 import httpx
 from rapidfuzz import fuzz
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, is_dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from . import __version__
+from . import __version__, js_bridge
 from .build_identity import build_identity
-from .app_session import mark_app_running, mark_app_stopped, set_app_window_active
+from .app_session import app_session_window_active, mark_app_running, mark_app_stopped, set_app_window_active
 from .cache_management import cleanup_segment_audio_cache
 from .audiobooks import (
     AUDIOBOOK_EXTENSIONS,
@@ -41,13 +44,15 @@ from .audiobooks import (
     audiobook_series_path_matches,
 )
 from .audiobook_float import AudiobookFloatWindow
-from .backup import create_backup, restore_backup
+from .global_hotkey import GlobalShortcut
+from .screen_text import ScreenTextPanel
+from .backup import create_backup, make_daily_snapshot, restore_backup, restore_database_snapshot
 from .branding import APP_BUNDLE_ID, APP_NAME, APP_SLUG, DATA_DIR
 from .cache_registry import CacheRegistry
-from .config import load_config, write_config, write_torrents_enabled
-from .companion_streaming import CompanionStreamingService
+from .config import _skip_shortcut, load_config, write_config, write_torrents_enabled
 from .consumption import ConsumptionLedger
 from .consumption_statistics import ConsumptionStatistics
+from .consumption_words import WordUnits, pairs_of
 from .debug_snapshot import DebugSnapshotService
 from .diagnostics import DebugBundleBuilder, DiagnosticRecorder
 from .energy_diagnostics import ENERGY_LOG_PATH, EnergyDiagnosticsMonitor
@@ -69,33 +74,52 @@ from .first_experience import (
     mpv_study_status,
     update_jiten_mpv as update_jiten_mpv_release,
 )
-from .jimaku_trial import apply_jimaku_trial
+from .jimaku_trial import (
+    apply_jimaku_trial,
+    check_jimaku_api_key,
+    clear_jimaku_key_rejection,
+    jimaku_key_fingerprint,
+    jimaku_key_problem,
+    mark_jimaku_key_notice_seen,
+)
 from .job_center import JobCenter
 from .language import IMAGE_SUBTITLE_EXTENSIONS
-from .ui_localization import ui_text
+from .i18n import err, t, tn
 from .light_novels import LightNovelError, LightNovelService
 from .llm import OllamaClient, list_models
 from .library import VIDEO_EXTENSIONS
-from .logging_utils import DEFAULT_LOG_PATH, cleanup_debug_logs, configure_logging, debug_log_dir, tail_log, timed_step
+from .logging_utils import (
+    DEFAULT_LOG_PATH,
+    cleanup_debug_logs,
+    configure_logging,
+    debug_log_dir,
+    tail_log,
+    timed_step,
+)
 from .maintenance_lock import maintenance_lock
 from .manager import AnimeManager
 from .manager_models import LibraryAnime, NyaaRelease
 from .manga import MangaService
+from .manga_mokuro_session import close_all as close_mokuro_sessions
 from .metadata_cache import MetadataCache
-from .mobile_sync import MobileSyncService
-from .mobile_sync_http import start_mobile_sync_server
 from .notifications import send_native_notification
 from .permissions import request_folder_access, request_notification_permission
 from .providers.anilist import AniListClient
 from .providers.aria2 import Aria2Client
 from .providers.nyaa import NyaaClient
-from .providers.qbittorrent import QBittorrentClient
+from .providers.anilist import configure_rate_limit_dir as configure_anilist_rate_limit_dir
+from .providers.qbittorrent import QBittorrentClient, connection_failed
 from .runtime import python_executable
 from .review_gate import EpisodeReviewIdentity, ReviewGateStore, review_card_key
-from .review_episode_due import build_episode_due_review_cards, resolve_episode_review_subtitle
+from .review_episode_due import (
+    build_episode_due_review_cards,
+    episode_cue_words,
+    resolve_episode_review_subtitle,
+)
 from .review_actions import action_set_payload, normalize_shortcuts, resolve_wire_grade
 from .review_providers import ReviewOutcomeUnknown
 from .safe_mode import SafeModeController
+from .word_states import word_state_group
 from .secrets_store import keep_masked_secret, masked_secret
 from .subtitle_runtime import repair_episode_subtitle, resolve_episode_subtitle
 from .torrent_observation import normalize_torrent_state
@@ -105,10 +129,10 @@ from .uninstall import build_uninstall_plan, launch_uninstaller
 from .updater import AppUpdater
 from .visual_novels import VisualNovelError, VisualNovelService
 from .work_scheduler import WorkPriority
-from .web_controllers import CompanionController, DiagnosticsController
+from .ui_push import StateVersionWatcher, TorrentTrafficMonitor, UiPush
+from .web_controllers import DiagnosticsController
 from .web_state import UIStateSnapshotCache
-
-
+from .web_app_iphone import IPhoneApiMixin
 
 
 def _disable_torrents_for_startup(config: Any) -> bool:
@@ -117,6 +141,7 @@ def _disable_torrents_for_startup(config: Any) -> bool:
     config.nyaa.torrents_enabled = False
     return previous
 
+
 def _plain_anilist_description(value: Any) -> str:
     text = str(value or "")
     text = re.sub(r"(?i)<br\s*/?>|</p\s*>|</li\s*>", "\n", text)
@@ -124,7 +149,6 @@ def _plain_anilist_description(value: Any) -> str:
     text = html.unescape(text).replace("\xa0", " ")
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line)
-
 
 
 # pudge-ui-v0.7.23-global-search-recent-v1
@@ -137,21 +161,120 @@ def _global_search_normalize(value: Any) -> str:
 
 
 _KANA_ROMAJI = {
-    "きゃ":"kya","きゅ":"kyu","きょ":"kyo","しゃ":"sha","しゅ":"shu","しょ":"sho",
-    "ちゃ":"cha","ちゅ":"chu","ちょ":"cho","にゃ":"nya","にゅ":"nyu","にょ":"nyo",
-    "ひゃ":"hya","ひゅ":"hyu","ひょ":"hyo","みゃ":"mya","みゅ":"myu","みょ":"myo",
-    "りゃ":"rya","りゅ":"ryu","りょ":"ryo","ぎゃ":"gya","ぎゅ":"gyu","ぎょ":"gyo",
-    "じゃ":"ja","じゅ":"ju","じょ":"jo","びゃ":"bya","びゅ":"byu","びょ":"byo",
-    "ぴゃ":"pya","ぴゅ":"pyu","ぴょ":"pyo","てぃ":"ti","でぃ":"di","ふぁ":"fa",
-    "ふぃ":"fi","ふぇ":"fe","ふぉ":"fo","うぃ":"wi","うぇ":"we","うぉ":"wo",
-    "あ":"a","い":"i","う":"u","え":"e","お":"o","か":"ka","き":"ki","く":"ku","け":"ke","こ":"ko",
-    "さ":"sa","し":"shi","す":"su","せ":"se","そ":"so","た":"ta","ち":"chi","つ":"tsu","て":"te","と":"to",
-    "な":"na","に":"ni","ぬ":"nu","ね":"ne","の":"no","は":"ha","ひ":"hi","ふ":"fu","へ":"he","ほ":"ho",
-    "ま":"ma","み":"mi","む":"mu","め":"me","も":"mo","や":"ya","ゆ":"yu","よ":"yo",
-    "ら":"ra","り":"ri","る":"ru","れ":"re","ろ":"ro","わ":"wa","を":"o","ん":"n",
-    "が":"ga","ぎ":"gi","ぐ":"gu","げ":"ge","ご":"go","ざ":"za","じ":"ji","ず":"zu","ぜ":"ze","ぞ":"zo",
-    "だ":"da","ぢ":"ji","づ":"zu","で":"de","ど":"do","ば":"ba","び":"bi","ぶ":"bu","べ":"be","ぼ":"bo",
-    "ぱ":"pa","ぴ":"pi","ぷ":"pu","ぺ":"pe","ぽ":"po","ゔ":"vu",
+    "きゃ": "kya",
+    "きゅ": "kyu",
+    "きょ": "kyo",
+    "しゃ": "sha",
+    "しゅ": "shu",
+    "しょ": "sho",
+    "ちゃ": "cha",
+    "ちゅ": "chu",
+    "ちょ": "cho",
+    "にゃ": "nya",
+    "にゅ": "nyu",
+    "にょ": "nyo",
+    "ひゃ": "hya",
+    "ひゅ": "hyu",
+    "ひょ": "hyo",
+    "みゃ": "mya",
+    "みゅ": "myu",
+    "みょ": "myo",
+    "りゃ": "rya",
+    "りゅ": "ryu",
+    "りょ": "ryo",
+    "ぎゃ": "gya",
+    "ぎゅ": "gyu",
+    "ぎょ": "gyo",
+    "じゃ": "ja",
+    "じゅ": "ju",
+    "じょ": "jo",
+    "びゃ": "bya",
+    "びゅ": "byu",
+    "びょ": "byo",
+    "ぴゃ": "pya",
+    "ぴゅ": "pyu",
+    "ぴょ": "pyo",
+    "てぃ": "ti",
+    "でぃ": "di",
+    "ふぁ": "fa",
+    "ふぃ": "fi",
+    "ふぇ": "fe",
+    "ふぉ": "fo",
+    "うぃ": "wi",
+    "うぇ": "we",
+    "うぉ": "wo",
+    "あ": "a",
+    "い": "i",
+    "う": "u",
+    "え": "e",
+    "お": "o",
+    "か": "ka",
+    "き": "ki",
+    "く": "ku",
+    "け": "ke",
+    "こ": "ko",
+    "さ": "sa",
+    "し": "shi",
+    "す": "su",
+    "せ": "se",
+    "そ": "so",
+    "た": "ta",
+    "ち": "chi",
+    "つ": "tsu",
+    "て": "te",
+    "と": "to",
+    "な": "na",
+    "に": "ni",
+    "ぬ": "nu",
+    "ね": "ne",
+    "の": "no",
+    "は": "ha",
+    "ひ": "hi",
+    "ふ": "fu",
+    "へ": "he",
+    "ほ": "ho",
+    "ま": "ma",
+    "み": "mi",
+    "む": "mu",
+    "め": "me",
+    "も": "mo",
+    "や": "ya",
+    "ゆ": "yu",
+    "よ": "yo",
+    "ら": "ra",
+    "り": "ri",
+    "る": "ru",
+    "れ": "re",
+    "ろ": "ro",
+    "わ": "wa",
+    "を": "o",
+    "ん": "n",
+    "が": "ga",
+    "ぎ": "gi",
+    "ぐ": "gu",
+    "げ": "ge",
+    "ご": "go",
+    "ざ": "za",
+    "じ": "ji",
+    "ず": "zu",
+    "ぜ": "ze",
+    "ぞ": "zo",
+    "だ": "da",
+    "ぢ": "ji",
+    "づ": "zu",
+    "で": "de",
+    "ど": "do",
+    "ば": "ba",
+    "び": "bi",
+    "ぶ": "bu",
+    "べ": "be",
+    "ぼ": "bo",
+    "ぱ": "pa",
+    "ぴ": "pi",
+    "ぷ": "pu",
+    "ぺ": "pe",
+    "ぽ": "po",
+    "ゔ": "vu",
 }
 
 
@@ -165,8 +288,10 @@ def _kana_to_romaji(value: Any) -> str:
     while i < len(text):
         ch = text[i]
         if ch == "っ":
-            geminate = True; i += 1; continue
-        pair = text[i:i+2]
+            geminate = True
+            i += 1
+            continue
+        pair = text[i : i + 2]
         roma = _KANA_ROMAJI.get(pair)
         if roma is not None:
             i += 2
@@ -177,13 +302,15 @@ def _kana_to_romaji(value: Any) -> str:
             if ch == "ー" and out:
                 last = out[-1]
                 vowel = next((v for v in reversed(last) if v in "aeiou"), "")
-                if vowel: out.append(vowel)
+                if vowel:
+                    out.append(vowel)
             elif ch.isalnum():
                 out.append(ch.casefold())
             continue
         if geminate and roma:
             consonant = "t" if roma.startswith("ch") else "s" if roma.startswith("sh") else roma[0]
-            if consonant not in "aeioun": out.append(consonant)
+            if consonant not in "aeioun":
+                out.append(consonant)
         geminate = False
         out.append(roma)
     return "".join(out)
@@ -233,25 +360,137 @@ def _global_search_score(
     return best_score, best_name
 
 
-_MEDIA_IDENTITY_ANILIST_KINDS = frozenset({
-    "novel",
-    "light_novel",
-    "ln",
-    "audiobook",
-    "manga",
-})
+_MEDIA_IDENTITY_ANILIST_KINDS = frozenset(
+    {
+        "novel",
+        "light_novel",
+        "ln",
+        "audiobook",
+        "manga",
+    }
+)
 
 
 def _media_identity_anilist_kind(kind: str) -> str:
     normalized = str(kind or "").strip().lower()
     if normalized == "visual_novel":
-        raise ValueError("AniList identity is not supported for visual novels")
+        raise ValueError(err("web.vnIdentityUnsupported"))
     if normalized not in _MEDIA_IDENTITY_ANILIST_KINDS:
-        raise ValueError(f"Unsupported AniList media identity kind: {normalized or '<empty>'}")
+        raise ValueError(err("web.identityKindUnsupported", kind=normalized or "<empty>"))
     return normalized
 
 
-class WebAppApi:
+# Irodori-TTS-Server is a third-party project without releases. Install and repair put the
+# commit recorded as last good on the Mac (DATA_DIR/optional/irodori-tts-server/last-good.json:
+# the last install, or the last Update that passed its check); without one, a fresh install
+# takes IRODORI_TTS_COMMIT when set, else the project's main branch. Update Irodori follows
+# main, starts the updated server once and goes back to the last good commit when it does not
+# answer. The commit installed is logged ("RESULT step=irodori.install revision=...") and shown
+# in Settings. An install made before last-good.json existed has its commit recorded the first
+# time Settings read its status. Fresh installs take the commit audiobook generation was
+# checked with (to pin another: install, check audiobook generation, put its full revision here).
+IRODORI_TTS_REPOSITORY = "https://github.com/Aratako/Irodori-TTS-Server.git"
+IRODORI_TTS_COMMIT = "61012c760f22f7b4a6c21c5c5f8f9e148120b6f9"
+IRODORI_UPDATE_CHECK_SECONDS = 10 * 60
+
+
+class _IrodoriUpdateCheckFailed(RuntimeError):
+    """The updated Irodori server did not start or answer: Update goes back to the last good commit."""
+
+    def __init__(self, reason: str, revision: str) -> None:
+        super().__init__(reason)
+        self.revision = revision
+
+
+# Mokuro's tested set: the exact packages (pip freeze) of a Mokuro environment that worked.
+# Install and repair run `pip install mokuro==<its version> -c <set>`. Settings → Update Mokuro
+# installs the newest Mokuro into a separate environment, switches to it only when it passes
+# its check, and records its set (DATA_DIR/optional/mokuro-ocr/working-set.txt), which later
+# installs and repairs use instead of the shipped one.
+MOKURO_TESTED_SET = Path(__file__).resolve().parent / "assets" / "mokuro-constraints.txt"
+MOKURO_WARMUP = (
+    "from mokuro import __version__; from mokuro.manga_page_ocr import MangaPageOcr; "
+    "MangaPageOcr(); print('Mokuro '+__version__+' models ready')"
+)
+MOKURO_UPDATE_CHECK_SECONDS = 30 * 60
+# Update Mokuro builds a new environment only when one of these has a newer release.
+MOKURO_KEY_PACKAGES = ("mokuro", "manga-ocr")
+_PINNED_REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;#]+)$")
+
+
+def _release_is_newer(latest: str, installed: str) -> bool:
+    """`latest` (from the package index) is a newer release than `installed`."""
+    if not latest or latest == installed:
+        return False
+    parts = [re.match(r"\d+(?:\.\d+)*", value or "") for value in (latest, installed)]
+    if parts[0] and parts[1]:
+        new = tuple(int(n) for n in parts[0].group(0).split("."))
+        old = tuple(int(n) for n in parts[1].group(0).split("."))
+        if new != old:
+            return new > old
+    return True
+
+
+def _pinned_lines(text: str) -> list[str]:
+    """The `name==version` lines of a pip freeze or constraints file (others are left out)."""
+    return [line.strip() for line in str(text or "").splitlines() if _PINNED_REQUIREMENT.match(line.strip())]
+
+
+def _pinned_packages(text: str) -> dict[str, str]:
+    """{normalized name: version} of a pip freeze or constraints file."""
+    packages: dict[str, str] = {}
+    for line in _pinned_lines(text):
+        match = _PINNED_REQUIREMENT.match(line)
+        if match:
+            packages[re.sub(r"[-_.]+", "-", match.group(1)).lower()] = match.group(2)
+    return packages
+
+
+# Stop signals of running word-stats jobs, so a process can stop them all at exit.
+_STATISTICS_WORD_STOPS: "weakref.WeakSet[threading.Event]" = weakref.WeakSet()
+
+
+def stop_statistics_word_jobs() -> None:
+    """Stop every word-stats job of this process (used by test teardown)."""
+    for stop in list(_STATISTICS_WORD_STOPS):
+        stop.set()
+
+
+_PYTHON_INTERPRETER_NAME = re.compile(r"python(?:\d+(?:\.\d+)?)?(?:\.exe)?", re.IGNORECASE)
+
+
+def _python_environment_interpreter(path: Path) -> bool:
+    """A Python interpreter of a virtual or conda environment (<env>/bin/python ...)."""
+    try:
+        if not path.is_absolute() or not path.is_file() or not os.access(path, os.X_OK):
+            return False
+        if not _PYTHON_INTERPRETER_NAME.fullmatch(path.name):
+            return False
+        if not _PYTHON_INTERPRETER_NAME.fullmatch(path.resolve().name):
+            return False
+        root = path.parent.parent if path.parent.name in {"bin", "Scripts"} else path.parent
+        return (root / "pyvenv.cfg").is_file() or (root / "conda-meta").is_dir()
+    except OSError:
+        return False
+
+
+def _adopt_config_values(target: Any, source: Any) -> None:
+    """Copy a freshly loaded config into the live one, keeping every object's identity.
+
+    Services hold the config object (some hold one of its sections), so they see
+    saved settings without being rebuilt.
+    """
+    for item in fields(source):
+        fresh = getattr(source, item.name)
+        current = getattr(target, item.name, None)
+        if is_dataclass(fresh) and type(current) is type(fresh):
+            for part in fields(fresh):
+                setattr(current, part.name, getattr(fresh, part.name))
+        else:
+            setattr(target, item.name, fresh)
+
+
+class WebAppApi(IPhoneApiMixin):
     """Local bridge used by the WKWebView application.
 
     Read methods only access SQLite and the filesystem. AniList is synchronized
@@ -264,6 +503,19 @@ class WebAppApi:
         self.config_path = config_path.expanduser()
         self.config = load_config(self.config_path)
         self.logger = configure_logging()
+        from .config import CONFIG_LOAD_ERROR, CONFIG_WARNINGS
+
+        for message in list(CONFIG_WARNINGS):
+            self.logger.warning("CONFIG %s", message)
+        config_error = dict(CONFIG_LOAD_ERROR)
+        if config_error:
+            self.logger.error(
+                "EVENT app.config_unreadable line=%s column=%s error=%r copy=%s; safe mode with default settings",
+                config_error.get("line"),
+                config_error.get("column"),
+                config_error.get("message"),
+                config_error.get("copy"),
+            )
         self._close_lock = threading.RLock()
         self._close_completed = False
         self._closing = False
@@ -283,6 +535,7 @@ class WebAppApi:
         self.safe_mode = SafeModeController(
             self.config.paths.cache_dir,
             self.config.library.database_path,
+            config_error=config_error,
         )
         self.safe_mode.begin()
         mark_app_running()
@@ -298,21 +551,25 @@ class WebAppApi:
                 float(cache_cleanup.get("removed_bytes") or 0) / (1024 * 1024),
                 float(cache_cleanup.get("remaining_bytes") or 0) / (1024 * 1024),
             )
+        configure_anilist_rate_limit_dir(self.config.paths.cache_dir)
         self.manager = AnimeManager(self.config, log=self.logger.info)
         self._background_quiet_lock = threading.Lock()
         self._background_quiet_done = False
-        self._quiesce_qbittorrent(reason="startup")
-        self.companion_base_url = ""
-        self._companion_server: Any | None = None
-        self._companion_thread: threading.Thread | None = None
+        self._start_startup_qbittorrent_quiet()
+        threading.Thread(
+            target=self._start_torrent_app_on_launch,
+            name=f"{APP_SLUG}-qbittorrent-launch",
+            daemon=True,
+        ).start()
         self._configure_database_services()
         self.light_novels = LightNovelService(self.config, logger=self.logger)
         self.manga = MangaService(
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
-            python=python_executable(),
             work_scheduler=self.manager.work_scheduler,
+            mokuro_python=self.config.tools.manga_mokuro_python,
         )
+        self.manga.asset_base = str(getattr(self, "asset_base", "") or "")
         self.audiobooks = AudiobookService(
             self.manager.db,
             ffprobe=self.config.tools.ffprobe,
@@ -326,11 +583,13 @@ class WebAppApi:
             work_scheduler=self.manager.work_scheduler,
         )
         self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
+        self._configure_iphone()
         if not self.safe_mode.active:
             self.task_supervisor.start(
                 name="audiobook-stt-resume",
                 target=self.audiobooks.resume_pending_transcriptions,
             )
+            self._start_daily_snapshots()
         self._ui_state_cache = UIStateSnapshotCache()
         # Torrent traffic is a dedicated session state.  Generic settings
         # snapshots must never be able to roll a user's explicit On/Off click
@@ -355,10 +614,25 @@ class WebAppApi:
         self._vn_title_id = ""
         self._consumption_runtime_last_audio: dict[int, dict[str, float | bool]] = {}
         self._consumption_runtime_last_vn: dict[str, float | bool | int] = {}
+        # Change notices to the window (audit 45А); started once the page asks for them.
+        self._ui_push_hub = UiPush(lambda: getattr(self, "window", None), logger=self.logger)
+        self._state_watcher = StateVersionWatcher(
+            self.ui_state_versions, self._ui_push_hub, logger=self.logger
+        )
+        self._torrent_monitor = TorrentTrafficMonitor(
+            self.torrent_traffic_status, self._ui_push_hub, logger=self.logger
+        )
+        self._pushed_audio_players: tuple[int, ...] = ()
         if not self.safe_mode.active:
             self.task_supervisor.start(
                 name="consumption-runtime-recorder",
                 target=self._consumption_runtime_loop,
+                pass_cancel_event=True,
+            )
+            self._manga_background_ocr_tried: dict[int, float] = {}
+            self.task_supervisor.start(
+                name="manga-background-ocr",
+                target=self._manga_background_ocr_loop,
                 pass_cancel_event=True,
             )
         self._planning_search_cache = MetadataCache(
@@ -380,16 +654,28 @@ class WebAppApi:
         self._ln_audiobook_download_jobs: dict[int, dict[str, Any]] = {}
         self._ln_audiobook_recovery_lock = threading.Lock()
         self._ln_audiobook_last_recovery_at = 0.0
-        self.app_updater = AppUpdater(logger=self.logger, before_install=self._prepare_update_shutdown, request_quit=self._quit_after_update)
+        self.app_updater = AppUpdater(
+            logger=self.logger,
+            before_install=self._prepare_update_shutdown,
+            request_quit=self._quit_after_update,
+        )
         self.debug_snapshots = DebugSnapshotService(
             self.manager,
             cache_dir=self.config.paths.cache_dir,
             runtime_log_path=DEFAULT_LOG_PATH,
         )
 
-        self.logger.info("APP session_start version=%s build=%s installed_at=%s platform=%s", __version__, build_identity()["display"], build_identity().get("installed_at", ""), platform.platform())
+        self.logger.info(
+            "APP session_start version=%s build=%s installed_at=%s platform=%s",
+            __version__,
+            build_identity()["display"],
+            build_identity().get("installed_at", ""),
+            platform.platform(),
+        )
         self.window: Any | None = None
         self._audiobook_float = AudiobookFloatWindow(self)
+        self._screen_text = ScreenTextPanel(self)
+        self._screen_text_shortcut = GlobalShortcut(self.screen_text_toggle, logger=self.logger)
         self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
         self._macos_window_lifecycle: _MacWindowLifecycle | None = None
         self._macos_app_delegate_proxy: Any | None = None
@@ -489,6 +775,7 @@ class WebAppApi:
         self._irodori_server_process: subprocess.Popen[Any] | None = None
         # Managed Irodori belongs to this Pudge process and must not survive it.
         import atexit
+
         atexit.register(self._stop_managed_irodori_server)
         self._irodori_remote_revision_cache = ""
         self._irodori_remote_revision_checked_at = 0.0
@@ -513,47 +800,210 @@ class WebAppApi:
         self.energy_monitor = EnergyDiagnosticsMonitor(
             interval_seconds=self.config.diagnostics.energy_sample_seconds,
             logger=self.logger,
+            on_battery=lambda: self.manager.work_scheduler.power_snapshot().get("on_battery"),
         )
         self._ensure_energy_monitor(reason="startup")
+        threading.Thread(
+            target=self._remove_web_companion_leftovers, name=f"{APP_SLUG}-companion-cleanup", daemon=True
+        ).start()
         if not self.safe_mode.active:
             self._start_scheduled_agent()
             self.jiten_state_prefetch()
+            self.statistics_words_start(delay=90.0)
 
     def _configure_database_services(self) -> None:
         """Rebind small controllers whenever configuration replaces the database."""
 
-        previous_streaming = getattr(self, "companion_streaming", None)
-        if previous_streaming is not None:
-            previous_streaming.close()
         self.cache_registry = CacheRegistry(self.manager.db, self.config.paths.cache_dir)
         self.diagnostics = DiagnosticRecorder(self.manager.db)
         self.debug_bundle_builder = DebugBundleBuilder(self.manager.db, self.diagnostics)
-        self.mobile_sync = MobileSyncService(
-            self.manager.db,
-            pairing_ttl_seconds=self.config.companion.pairing_ttl_seconds,
-            max_events_per_request=self.config.companion.max_events_per_request,
-        )
         self.consumption = ConsumptionLedger(self.manager.db, logger=self.logger)
-        self.consumption_statistics = ConsumptionStatistics(self.manager.db, logger=self.logger)
-        self.companion_streaming = CompanionStreamingService(
+        self.consumption_statistics = ConsumptionStatistics(
             self.manager.db,
-            cache_dir=self.config.paths.cache_dir,
-            ffmpeg=self.config.tools.ffmpeg,
-            ffprobe=self.config.tools.ffprobe,
             logger=self.logger,
-            work_scheduler=self.manager.work_scheduler,
-            task_supervisor=self.task_supervisor,
-            cache_registry=self.cache_registry,
-        )
-        self.companion_controller = CompanionController(
-            self.mobile_sync,
-            self.companion_streaming,
+            ln_words=self._statistics_ln_words,
+            count_words=True,
+            on_words_pending=self.statistics_words_start,
         )
         self.diagnostics_controller = DiagnosticsController(
             self.debug_bundle_builder,
             lambda media_id, episode: self.debug_snapshots.snapshot(media_id, episode),
         )
         self.job_center = JobCenter(self.manager.db)
+
+    def _statistics_ln_words(self, text_hash: str) -> list[tuple[int, int, int]] | None:
+        service = getattr(self, "light_novels", None)
+        return service.chapter_word_positions(text_hash) if service is not None else None
+
+    # Statistics words: background parsing of what was watched and read ----------------
+    STATISTICS_WORDS_PAUSE_SECONDS = 0.5
+
+    def statistics_words_start(self, delay: float = 0.0) -> dict[str, Any]:
+        """Start the job that parses consumed text for word stats (no-op while it runs)."""
+        lock = self.__dict__.setdefault("_statistics_words_lock", threading.Lock())
+        with lock:
+            thread = getattr(self, "_statistics_words_thread", None)
+            if thread is not None and thread.is_alive():
+                return {"started": False, "reason": "running"}
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._statistics_words_worker,
+                args=(stop, float(delay)),
+                name=f"{APP_SLUG}-statistics-words",
+                daemon=True,
+            )
+            self._statistics_words_stop = stop
+            _STATISTICS_WORD_STOPS.add(stop)
+            self._statistics_words_thread = thread
+            self._statistics_words_state = {"running": True, "paused": ""}
+            thread.start()
+        return {"started": True}
+
+    def _statistics_record_vn_lines(self, session_id: str, transcript: list[Any]) -> None:
+        """Keep the lines a VN capture read (the capture remembers only the last 200)."""
+        last_session, last_id = getattr(self, "_statistics_vn_last_line", ("", 0))
+        floor = int(last_id) if last_session == session_id else 0
+        fresh = [line for line in transcript if isinstance(line, dict) and int(line.get("id") or 0) > floor]
+        if not fresh:
+            return
+        try:
+            self.consumption_statistics.word_units.record_vn_lines(session_id, fresh)
+        except Exception as exc:  # noqa: BLE001 - statistics must never stop the capture
+            self.logger.warning("FAIL statistics.vn_lines error=%r", str(exc)[:200])
+            return
+        self._statistics_vn_last_line = (session_id, max(int(line.get("id") or 0) for line in fresh))
+
+    def statistics_words_state(self) -> dict[str, Any]:
+        thread = getattr(self, "_statistics_words_thread", None)
+        state = dict(getattr(self, "_statistics_words_state", None) or {"running": False, "paused": ""})
+        state["running"] = bool(thread is not None and thread.is_alive() and state.get("running"))
+        return state
+
+    def _statistics_words_worker(self, stop: threading.Event, delay: float = 0.0) -> None:
+        units = WordUnits(self.manager.db)
+        done = missing = 0
+        memo: dict[Any, Any] = {}
+        try:
+            if delay > 0 and stop.wait(delay):
+                return
+            now = time.monotonic()
+            if now - float(getattr(self, "_statistics_words_backfilled", -1e9)) >= 1800.0:
+                # History (also what was watched or read before this feature, or on the
+                # iPhone) is queued at most every half hour; parsing below is what costs.
+                self._statistics_words_backfilled = now
+                units.enqueue(units.backfill_units())
+            while not stop.is_set():
+                reason = self.manager.work_scheduler.background_wait_reason()
+                if reason:
+                    # Energy saving, heat or the player in front: stop and pick up again on
+                    # the next look at Statistics (or the next periodic check).
+                    self._statistics_words_state = {"running": False, "paused": str(reason)}
+                    self.logger.info("EVENT statistics.words paused reason=%s done=%s", reason, done)
+                    return
+                batch = units.due(10)
+                if not batch:
+                    break
+                for unit in batch:
+                    if stop.is_set():
+                        return
+                    if self._statistics_word_unit(units, unit, memo):
+                        done += 1
+                    else:
+                        missing += 1
+                    stop.wait(self.STATISTICS_WORDS_PAUSE_SECONDS)
+            self._statistics_words_state = {"running": False, "paused": ""}
+            if done or missing:
+                self.logger.info("DONE statistics.words parsed=%s without_text=%s", done, missing)
+        except Exception as exc:  # noqa: BLE001 - the job tries again later
+            self._statistics_words_state = {"running": False, "paused": ""}
+            if stop.is_set():
+                return  # closing: the database may already be gone
+            self.logger.warning("FAIL statistics.words error=%r", str(exc)[:300])
+
+    def statistics_words_stop(self, timeout: float = 0.0) -> None:
+        """Stop the word-stats job (on close); it picks up again on the next start."""
+        stop = getattr(self, "_statistics_words_stop", None)
+        if isinstance(stop, threading.Event):
+            stop.set()
+        thread = getattr(self, "_statistics_words_thread", None)
+        if timeout > 0 and thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    def _statistics_word_unit(self, units: WordUnits, unit: dict[str, Any], memo: dict[Any, Any]) -> bool:
+        key, kind, source = unit["key"], unit["kind"], unit["source"]
+        try:
+            if kind == "anime":
+                words: Any = {"cues": self._statistics_episode_cues(str(source.get("media_uuid") or ""))}
+            elif kind == "manga":
+                words = {"words": self._statistics_manga_page_words(source, memo)}
+            elif kind == "visual_novel":
+                parsed = self.light_novels.jiten_preparse(str(source.get("text") or ""), interactive=False)
+                words = {"words": pairs_of(parsed.get("tokens") or [])}
+            elif kind == "light_novel":
+                if not self.light_novels.parse_chapter_for_statistics(str(source.get("chapter_key") or "")):
+                    raise FileNotFoundError("chapter is not in the library")
+                words = {}
+            else:
+                raise ValueError(f"unknown kind {kind}")
+        except Exception as exc:  # noqa: BLE001 - no text (yet) or Jiten unavailable: try later
+            units.mark_missing(key, f"{type(exc).__name__}: {exc}", attempts=int(unit.get("attempts") or 0))
+            self.logger.debug("SKIP step=statistics.words unit=%s error=%r", key[:60], str(exc)[:200])
+            return False
+        units.store(key, words)
+        return True
+
+    def _statistics_episode_cues(self, media_uuid: str) -> list[list[Any]]:
+        with self.manager.db.connect() as conn:
+            paths = [
+                str(row["alias_value"])
+                for row in conn.execute(
+                    "SELECT alias_value FROM consumption_media_aliases WHERE media_uuid=? AND alias_type='video_path'",
+                    (media_uuid,),
+                ).fetchall()
+            ]
+        for path in paths:
+            episode = self.manager.db.episode_by_path(Path(path))
+            if episode is None:
+                continue
+            subtitle_path, _meta = resolve_episode_review_subtitle(
+                video_path=Path(episode.video_path),
+                subtitle_path=getattr(episode, "subtitle_path", None),
+                embedded_subtitle_id=getattr(episode, "embedded_subtitle_id", None),
+                cache_dir=self.config.paths.cache_dir,
+                ffmpeg_path=self.config.tools.ffmpeg,
+                ffprobe_path=self.config.tools.ffprobe,
+            )
+            return episode_cue_words(self.light_novels, subtitle_path, self.config.paths.cache_dir)
+        raise FileNotFoundError("episode is not in the library")
+
+    def _statistics_manga_page_words(
+        self, source: dict[str, Any], memo: dict[Any, Any]
+    ) -> list[tuple[int, int]]:
+        media_uuid = str(source.get("media_uuid") or "")
+        with self.manager.db.connect() as conn:
+            row = conn.execute(
+                "SELECT current_library_kind,current_library_id FROM consumption_media WHERE media_uuid=?",
+                (media_uuid,),
+            ).fetchone()
+        if row is None or str(row["current_library_kind"]) != "manga":
+            raise FileNotFoundError("volume is not in the library")
+        book_id = int(row["current_library_id"])
+        page_index = int(source.get("page_index") or 0)
+        if ("ocr", book_id) not in memo:
+            texts: dict[int, list[str]] = {}
+            # Small-print boxes are left out: their OCR is often invented text.
+            for page, text in self.manga.cached_region_texts(book_id, include_unreliable=False):
+                texts.setdefault(int(page), []).append(" ".join(str(text).split()))
+            memo[("ocr", book_id)] = (self.manga._completed_ocr_pages(book_id), texts)
+        completed, texts = memo[("ocr", book_id)]
+        if page_index not in completed:
+            raise FileNotFoundError("page has no OCR yet")
+        pairs: list[tuple[int, int]] = []
+        for text in texts.get(page_index, []):
+            pairs.extend(
+                pairs_of(self.light_novels.jiten_preparse(text, interactive=False).get("tokens") or [])
+            )
+        return pairs
 
     def _ensure_energy_monitor(self, *, reason: str) -> None:
         """Keep low-overhead energy diagnostics alive, including Safe Mode.
@@ -643,26 +1093,24 @@ class WebAppApi:
         client = None
         try:
             client = Aria2Client(
-            enabled=True,
-            binary=aria.binary,
-            rpc_port=aria.rpc_port,
-            state_dir=state_dir,
-            pre_download_command=self.config.qbittorrent.pre_download_command,
-            paused_on_add=aria.paused_on_add,
-            auto_start=False,
-            source_proxy_mode=self.config.nyaa.proxy_mode,
-            source_proxy_url=self.config.nyaa.proxy_url,
-            seed_mode=aria.seed_mode,
-            seed_ratio=aria.seed_ratio,
-            seed_time_minutes=aria.seed_time_minutes,
-            upload_limit_kib=aria.upload_limit_kib,
-            vpn_interface=aria.vpn_interface,
-            vpn_kill_switch=aria.vpn_kill_switch,
+                enabled=True,
+                binary=aria.binary,
+                rpc_port=aria.rpc_port,
+                state_dir=state_dir,
+                pre_download_command=self.config.qbittorrent.pre_download_command,
+                paused_on_add=aria.paused_on_add,
+                auto_start=False,
+                source_proxy_mode=self.config.nyaa.proxy_mode,
+                source_proxy_url=self.config.nyaa.proxy_url,
+                seed_mode=aria.seed_mode,
+                seed_ratio=aria.seed_ratio,
+                seed_time_minutes=aria.seed_time_minutes,
+                upload_limit_kib=aria.upload_limit_kib,
+                vpn_interface=aria.vpn_interface,
+                vpn_kill_switch=aria.vpn_kill_switch,
             )
             stopped = bool(client.shutdown(save_session=True))
-            self.logger.info(
-                "EVENT torrent.aria2_quiet reason=%s stopped=%s", reason, stopped
-            )
+            self.logger.info("EVENT torrent.aria2_quiet reason=%s stopped=%s", reason, stopped)
             return stopped
         except Exception as exc:
             self.logger.warning(
@@ -677,7 +1125,10 @@ class WebAppApi:
 
     @staticmethod
     def _pudge_owned_qbittorrent_row(
-        row: Any, *, owned_hashes: set[str], category: str,
+        row: Any,
+        *,
+        owned_hashes: set[str],
+        category: str,
     ) -> bool:
         raw = dict(getattr(row, "raw", {}) or {})
         tags = {tag.strip().casefold() for tag in str(raw.get("tags") or "").split(",")}
@@ -687,12 +1138,15 @@ class WebAppApi:
             or APP_SLUG.casefold() in tags
         )
 
-    def _quiesce_qbittorrent(self, *, reason: str) -> int:
+    def _quiesce_qbittorrent(self, *, reason: str, still_wanted: Any = None) -> int:
         """Pause persisted and live Pudge-owned hashes, including audiobooks.
 
         A just-added audiobook may not yet be in the anime downloads table.
-        Query the existing qBittorrent process with auto-start disabled, and
-        keep pausing other hashes even if one read or stop RPC fails.
+        Query the existing qBittorrent process with auto-start disabled and stop
+        every hash in one ``torrents/stop`` call. A qBittorrent that cannot be
+        reached is not asked again for each hash (each attempt used to rerun the
+        Web UI search, or wait out a NAS timeout). ``still_wanted`` is checked
+        right before the stop call (a newer Torrent On cancels it).
         """
         qbt = self.config.qbittorrent
         if not qbt.enabled or not hasattr(self, "manager"):
@@ -701,7 +1155,10 @@ class WebAppApi:
         paused = 0
         try:
             client = QBittorrentClient(
-                qbt.base_url, qbt.username, qbt.password, qbt.api_key,
+                qbt.base_url,
+                qbt.username,
+                qbt.password,
+                qbt.api_key,
                 verify_tls=qbt.verify_tls,
                 pre_download_command=qbt.pre_download_command,
                 auto_start_app=False,
@@ -716,45 +1173,94 @@ class WebAppApi:
             except Exception as exc:
                 self.logger.warning(
                     "FALLBACK step=torrent.qbittorrent_local_hashes reason=%s error_type=%s",
-                    reason, type(exc).__name__,
+                    reason,
+                    type(exc).__name__,
                 )
             try:
                 live = client.torrents(category="")
                 category = str(qbt.category or "").strip().casefold()
                 for row in live:
                     if self._pudge_owned_qbittorrent_row(
-                        row, owned_hashes=hashes, category=category,
+                        row,
+                        owned_hashes=hashes,
+                        category=category,
                     ):
                         torrent_hash = str(getattr(row, "torrent_hash", "") or "").strip().casefold()
                         if torrent_hash:
                             hashes.add(torrent_hash)
             except Exception as exc:
+                if bool(getattr(client, "unreachable", False)) or connection_failed(exc):
+                    # Nothing can transfer through a qBittorrent that is not
+                    # running (or not reachable); a stop call would fail the same way.
+                    self.logger.info(
+                        "SKIP step=torrent.qbittorrent_quiet reason=%s unreachable=true hashes=%s",
+                        reason,
+                        len(hashes),
+                    )
+                    return 0
                 self.logger.warning(
                     "FALLBACK step=torrent.qbittorrent_live_hashes reason=%s error_type=%s",
-                    reason, type(exc).__name__,
+                    reason,
+                    type(exc).__name__,
                 )
-            for torrent_hash in sorted(hashes):
+            if hashes and (still_wanted is None or still_wanted()):
+                ordered = sorted(hashes)
                 try:
-                    client.pause(torrent_hash)
-                    paused += 1
+                    # qBittorrent takes several hashes separated by "|".
+                    client.pause("|".join(ordered))
+                    paused = len(ordered)
                 except Exception as exc:
                     self.logger.warning(
-                        "FALLBACK step=torrent.qbittorrent_pause reason=%s hash=%s error_type=%s",
-                        reason, torrent_hash, type(exc).__name__,
+                        "FALLBACK step=torrent.qbittorrent_pause reason=%s hashes=%s error_type=%s",
+                        reason,
+                        len(ordered),
+                        type(exc).__name__,
                     )
         except Exception as exc:
             self.logger.warning(
                 "FALLBACK step=torrent.qbittorrent_quiet reason=%s error_type=%s",
-                reason, type(exc).__name__,
+                reason,
+                type(exc).__name__,
             )
         finally:
             if client is not None:
                 client.close()
         if paused:
-            self.logger.info(
-                "EVENT torrent.qbittorrent_quiet reason=%s paused=%s", reason, paused
-            )
+            self.logger.info("EVENT torrent.qbittorrent_quiet reason=%s paused=%s", reason, paused)
         return paused
+
+    def _start_startup_qbittorrent_quiet(self) -> None:
+        """Pause Pudge's qBittorrent torrents after launch without delaying the window.
+
+        The window opens first (the page reports ready, or 10 s pass); a Torrent
+        On clicked before this runs wins over it.
+        """
+        qbt = getattr(self.config, "qbittorrent", None)
+        if not getattr(qbt, "enabled", False):
+            return
+        generation = int(getattr(self, "_torrent_toggle_generation", 0))
+        window_ready = self._startup_quiet_window_ready = threading.Event()
+
+        def still_wanted() -> bool:
+            with self._torrent_state_guard():
+                return int(getattr(self, "_torrent_toggle_generation", 0)) == generation and not (
+                    self._torrent_enabled_state()
+                )
+
+        def run() -> None:
+            window_ready.wait(self.STARTUP_QUIET_FALLBACK_SECONDS)
+            if getattr(self, "_closing", False):
+                return
+            with self._torrent_quiesce_guard():
+                if still_wanted():
+                    self._quiesce_qbittorrent(reason="startup", still_wanted=still_wanted)
+
+        thread = threading.Thread(target=run, name=f"{APP_SLUG}-qbittorrent-startup-quiet", daemon=True)
+        self._startup_quiet_thread = thread
+        thread.start()
+
+    # The startup pause of Pudge's torrents waits for the page to report ready, at most this long.
+    STARTUP_QUIET_FALLBACK_SECONDS = 10.0
 
     def _quiesce_torrent_backends(self, *, reason: str) -> dict[str, Any]:
         return {
@@ -774,8 +1280,13 @@ class WebAppApi:
         client = None
         try:
             client = QBittorrentClient(
-                qbt.base_url, qbt.username, qbt.password, qbt.api_key,
-                verify_tls=qbt.verify_tls, auto_start_app=False, timeout=2.0,
+                qbt.base_url,
+                qbt.username,
+                qbt.password,
+                qbt.api_key,
+                verify_tls=qbt.verify_tls,
+                auto_start_app=False,
+                timeout=2.0,
             )
             owned = {
                 str(getattr(item, "torrent_hash", "") or "").strip().casefold()
@@ -786,12 +1297,16 @@ class WebAppApi:
             for row in client.torrents(category=""):
                 raw = dict(getattr(row, "raw", {}) or {})
                 if not self._pudge_owned_qbittorrent_row(
-                    row, owned_hashes=owned, category=category,
+                    row,
+                    owned_hashes=owned,
+                    category=category,
                 ):
                     continue
-                if (normalize_torrent_state(getattr(row, "state", "")) != "paused"
-                        or self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed") > 0
-                        or self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed") > 0):
+                if (
+                    normalize_torrent_state(getattr(row, "state", "")) != "paused"
+                    or self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed") > 0
+                    or self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed") > 0
+                ):
                     return False, None
                 paused += 1
             return True, paused
@@ -820,8 +1335,12 @@ class WebAppApi:
         client = None
         try:
             client = Aria2Client(
-                enabled=True, binary=aria.binary, rpc_port=aria.rpc_port,
-                state_dir=state_dir, auto_start=False, timeout=1.5,
+                enabled=True,
+                binary=aria.binary,
+                rpc_port=aria.rpc_port,
+                state_dir=state_dir,
+                auto_start=False,
+                timeout=1.5,
             )
             if client._probe():
                 return False
@@ -869,6 +1388,31 @@ class WebAppApi:
         verified = False
         paused: int | None = None
         observed_at: float | None = None
+        if evidence.get("generation") == generation and evidence.get("stopping"):
+            # The Off worker is still stopping the backends: do not probe them meanwhile.
+            result = {
+                "enabled": False,
+                "desired_enabled": False,
+                "generation": generation,
+                "transition": "stopping",
+                "download_speed": None,
+                "upload_speed": None,
+                "active": None,
+                "waiting": None,
+                "paused": None,
+                "updated_at": None,
+                "observed_at": None,
+                "stale": True,
+                "observed_state": "unknown",
+                "backend_errors": [],
+            }
+            with self._torrent_state_guard():
+                if int(getattr(self, "_torrent_toggle_generation", 0)) == generation and not (
+                    self._torrent_enabled_state() and self._downloads_configured()
+                ):
+                    self._last_torrent_traffic = result
+                    return dict(result)
+            return self.torrent_traffic_status()
         if evidence.get("generation") == generation:
             last = float(evidence.get("checked_at") or 0)
             if last > 0 and 0 <= now - last < 10:
@@ -889,17 +1433,23 @@ class WebAppApi:
                 observed_at = now if verified else None
                 paused = qbt_paused if verified else None
                 with self._torrent_state_guard():
-                    if (int(getattr(self, "_torrent_toggle_generation", 0)) == generation
-                            and not (self._torrent_enabled_state() and self._downloads_configured())):
+                    if int(getattr(self, "_torrent_toggle_generation", 0)) == generation and not (
+                        self._torrent_enabled_state() and self._downloads_configured()
+                    ):
                         self._torrent_off_evidence = {
-                            **evidence, "checked_at": now, "verified": verified,
-                            "paused": paused, "backend_errors": backend_errors,
+                            **evidence,
+                            "checked_at": now,
+                            "verified": verified,
+                            "paused": paused,
+                            "backend_errors": backend_errors,
                         }
                     else:
                         # Never publish a past Off poll after a newer On/Off.
                         return self.torrent_traffic_status()
         result = {
-            "enabled": False, "desired_enabled": False, "generation": generation,
+            "enabled": False,
+            "desired_enabled": False,
+            "generation": generation,
             "transition": "off_confirmed" if verified else "unconfirmed",
             "download_speed": 0 if verified else None,
             "upload_speed": 0 if verified else None,
@@ -913,8 +1463,9 @@ class WebAppApi:
             "backend_errors": backend_errors,
         }
         with self._torrent_state_guard():
-            if (int(getattr(self, "_torrent_toggle_generation", 0)) == generation
-                    and not (self._torrent_enabled_state() and self._downloads_configured())):
+            if int(getattr(self, "_torrent_toggle_generation", 0)) == generation and not (
+                self._torrent_enabled_state() and self._downloads_configured()
+            ):
                 self._last_torrent_traffic = result
                 return dict(result)
         return self.torrent_traffic_status()
@@ -947,9 +1498,18 @@ class WebAppApi:
             for event in getattr(self, "_manga_ocr_cancel_events", {}).values():
                 event.set()
             threads = [
-                thread for thread in getattr(self, "_manga_book_ocr_threads", {}).values()
+                thread
+                for thread in getattr(self, "_manga_book_ocr_threads", {}).values()
                 if thread.is_alive() and thread is not threading.current_thread()
             ]
+        interrupt = getattr(getattr(self, "manga", None), "interrupt_mokuro", None)
+        if threads and callable(interrupt):
+            # Do not wait for the page in progress (up to minutes while the
+            # models load): stop the workers; finished pages are already saved.
+            try:
+                interrupt()
+            except Exception:
+                pass
         deadline = time.monotonic() + max(0.0, float(timeout))
         for thread in threads:
             thread.join(max(0.0, deadline - time.monotonic()))
@@ -968,11 +1528,21 @@ class WebAppApi:
             if isinstance(thread, threading.Thread) and thread.is_alive():
                 blockers.append(thread)
         with self._irodori_tts_lock:
-            blockers.extend(
-                thread for thread in self._irodori_tts_threads.values()
-                if thread.is_alive()
-            )
+            blockers.extend(thread for thread in self._irodori_tts_threads.values() if thread.is_alive())
         return sorted({thread.name for thread in blockers})
+
+    def _reset_review_gate_services(self) -> None:
+        """Review-gate state bound to the current Database (after restore or settings reload)."""
+        with self._review_gate_lock:
+            self._review_gate_store = ReviewGateStore(self.manager.db)
+            self._review_gate_candidates = {}
+            self._review_gate_pending = set()
+            self._review_gate_prefetch_cards = []
+            self._review_gate_prefetch_account_key = ""
+            self._review_gate_prefetch_session_id = ""
+            for name in ("_content_review_service", "_review_gate_due_store", "_review_gate_due_targets"):
+                if hasattr(self, name):
+                    delattr(self, name)
 
     def _reload_runtime_services_after_restore(self) -> None:
         self.config = load_config(self.config_path)
@@ -982,9 +1552,10 @@ class WebAppApi:
         self.manga = MangaService(
             self.manager.db,
             cache_dir=self.config.paths.cache_dir,
-            python=python_executable(),
             work_scheduler=self.manager.work_scheduler,
+            mokuro_python=self.config.tools.manga_mokuro_python,
         )
+        self.manga.asset_base = str(getattr(self, "asset_base", "") or "")
         self.audiobooks = AudiobookService(
             self.manager.db,
             ffprobe=self.config.tools.ffprobe,
@@ -998,6 +1569,7 @@ class WebAppApi:
             work_scheduler=self.manager.work_scheduler,
         )
         self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
+        self._configure_iphone()
         self._ui_state_cache.invalidate()
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
@@ -1010,16 +1582,7 @@ class WebAppApi:
             runtime_log_path=DEFAULT_LOG_PATH,
         )
 
-        with self._review_gate_lock:
-            self._review_gate_store = ReviewGateStore(self.manager.db)
-            self._review_gate_candidates = {}
-            self._review_gate_pending = set()
-            self._review_gate_prefetch_cards = []
-            self._review_gate_prefetch_account_key = ""
-            self._review_gate_prefetch_session_id = ""
-            for name in ("_content_review_service", "_review_gate_due_store", "_review_gate_due_targets"):
-                if hasattr(self, name):
-                    delattr(self, name)
+        self._reset_review_gate_services()
         self._last_storage_status = None
 
     def close(self) -> None:
@@ -1043,7 +1606,9 @@ class WebAppApi:
                     failures.append(name)
                     self.logger.warning("FAIL step=app.shutdown.%s error=%r", name, str(exc))
                     return None
-                self.logger.info("RESULT step=app.shutdown.%s duration_ms=%.1f", name, (time.monotonic()-at)*1000)
+                self.logger.info(
+                    "RESULT step=app.shutdown.%s duration_ms=%.1f", name, (time.monotonic() - at) * 1000
+                )
                 return result
 
             # Capture ownership before stopping coordinators can orphan workers.
@@ -1058,6 +1623,8 @@ class WebAppApi:
             supervisor = getattr(self, "task_supervisor", None)
             if callable(getattr(supervisor, "suspend", None)):
                 step("stop_admission", supervisor.suspend)
+            # Nothing may call into the window once it starts closing.
+            step("ui_push", self._stop_ui_push)
             # Silence audio first; slower joins and network cleanup follow.
             audiobook_close = getattr(self.audiobooks, "close", None)
             if callable(audiobook_close):
@@ -1069,19 +1636,23 @@ class WebAppApi:
             cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
             if isinstance(cancel, threading.Event):
                 cancel.set()
+            step("statistics_words", lambda: self.statistics_words_stop(timeout=1.0))
             prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
             if isinstance(prefetch, threading.Thread) and prefetch.is_alive():
                 step("jiten_prefetch", lambda: prefetch.join(timeout=2.0))
-            step("companion_server", self._stop_companion_server)
-            streaming = getattr(self, "companion_streaming", None)
-            if streaming is not None:
-                step("streaming", streaming.close)
+            step("iphone_server", self._stop_iphone_server)
             step("energy", self.energy_monitor.stop)
             manga_lingering = list(step("manga", lambda: self._quiesce_manga_ocr(timeout=3.0)) or [])
             step("visual_novel", self.visual_novel_stop)
+            if getattr(self, "_screen_text", None) is not None:
+                step("screen_text", self._screen_text.close)
             if getattr(self, "_irodori_server_lock", None) is not None:
                 step("tts_server", self._stop_managed_irodori_server)
-            supervisor_lingering = list(step("tasks", lambda: supervisor.shutdown(timeout=3.0)) or []) if supervisor is not None else []
+            supervisor_lingering = (
+                list(step("tasks", lambda: supervisor.shutdown(timeout=3.0)) or [])
+                if supervisor is not None
+                else []
+            )
             config = getattr(self, "config", None)
             cache_dir = getattr(getattr(config, "paths", None), "cache_dir", None)
             if cache_dir is not None:
@@ -1097,8 +1668,13 @@ class WebAppApi:
             self._shutdown_failures = failures
             self._shutdown_lingering = lingering
             self._close_completed = True
-            self.logger.info("EVENT app.shutdown_complete pid=%s duration_ms=%.1f failures=%s lingering=%s",
-                             os.getpid(), (time.monotonic()-started)*1000, failures, lingering)
+            self.logger.info(
+                "EVENT app.shutdown_complete pid=%s duration_ms=%.1f failures=%s lingering=%s",
+                os.getpid(),
+                (time.monotonic() - started) * 1000,
+                failures,
+                lingering,
+            )
 
     def _prepare_update_shutdown(self) -> None:
         # The installer has not spawned yet. Keep every service usable if
@@ -1106,21 +1682,23 @@ class WebAppApi:
         # Cancellable warm-up work must not block an update the user asked for.
         cancel = getattr(self, "_jiten_state_prefetch_cancel_event", None)
         prefetch = getattr(self, "_jiten_state_prefetch_thread", None)
-        if isinstance(cancel, threading.Event) and isinstance(prefetch, threading.Thread) and prefetch.is_alive():
+        if (
+            isinstance(cancel, threading.Event)
+            and isinstance(prefetch, threading.Thread)
+            and prefetch.is_alive()
+        ):
             cancel.set()
             prefetch.join(timeout=3.0)
         blockers = self._restore_background_blockers()
         if blockers:
-            raise RuntimeError(
-                "Background work is still active (" + ", ".join(blockers) + "); retry the update when it finishes"
-            )
+            raise RuntimeError(err("web.updateBackgroundActive", tasks=", ".join(blockers)))
         self._stop_scheduled_agent()
         supervisor = self.task_supervisor
         try:
             lingering = supervisor.quiesce(timeout=3.0)
             lingering.extend(self._quiesce_manga_ocr(timeout=3.0))
             if lingering:
-                raise RuntimeError("Background tasks did not quiesce; update paused before installation")
+                raise RuntimeError(err("web.updateQuiesceFailed"))
         finally:
             supervisor.resume()
             self._start_scheduled_agent()
@@ -1128,10 +1706,14 @@ class WebAppApi:
     def _preserve_playback_processes(self, tree: Any) -> None:
         # Anime launchers run in their own session and own mpv's final save.
         # A GUI quit detaches them; their own lifecycle still cleans helpers.
-        roots = [process.pid for process in list(getattr(self, "_play_processes", {}).values())
-                 if process.poll() is None]
-        roots.extend(int(row["pid"]) for row in list(getattr(self, "_play_registry", {}).values())
-                     if row.get("pid"))
+        roots = [
+            process.pid
+            for process in list(getattr(self, "_play_processes", {}).values())
+            if process.poll() is None
+        ]
+        roots.extend(
+            int(row["pid"]) for row in list(getattr(self, "_play_registry", {}).values()) if row.get("pid")
+        )
         # A launched update installer waits for this process to exit and then
         # installs; quitting must never kill it as a leftover child.
         installer_pid = getattr(getattr(self, "app_updater", None), "installer_pid", None)
@@ -1146,6 +1728,7 @@ class WebAppApi:
         if sys.platform == "darwin":
             from AppKit import NSApplication
             from PyObjCTools import AppHelper
+
             AppHelper.callAfter(NSApplication.sharedApplication().terminate_, None)
         elif self.window is not None:
             self.window.destroy()
@@ -1166,7 +1749,7 @@ class WebAppApi:
         """Start a detached cleanup process, then close the application."""
 
         if sys.platform != "darwin":
-            raise RuntimeError("The built-in uninstaller is available only on macOS")
+            raise RuntimeError(err("web.uninstallMacOnly"))
         plan = build_uninstall_plan(
             config_path=self.config_path,
             cache_dir=self.config.paths.cache_dir,
@@ -1180,143 +1763,6 @@ class WebAppApi:
         close_timer.start()
         return {"ok": True, "target_count": len(plan.targets)}
 
-    @staticmethod
-    def _companion_lan_host() -> str:
-        candidates: list[str] = []
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                sock.connect(("1.1.1.1", 80))
-                candidates.append(str(sock.getsockname()[0]))
-            finally:
-                sock.close()
-        except OSError:
-            pass
-        try:
-            candidates.extend(
-                str(item[4][0])
-                for item in socket.getaddrinfo(
-                    socket.gethostname(),
-                    None,
-                    family=socket.AF_INET,
-                    type=socket.SOCK_STREAM,
-                )
-            )
-        except OSError:
-            pass
-        for host in candidates:
-            if host and host != "0.0.0.0" and not host.startswith("127."):
-                return host
-        return "127.0.0.1"
-
-    def _companion_effective_base_url(self) -> str:
-        server = getattr(self, "_companion_server", None)
-        if server is not None:
-            host, port = server.server_address
-            host = str(host)
-            if host in {"0.0.0.0", "::"}:
-                host = self._companion_lan_host()
-            return f"http://{host}:{int(port)}"
-        raw = str(self.companion_base_url or "")
-        if raw and "0.0.0.0" not in raw:
-            return raw
-        return ""
-
-    def _start_companion_server(self) -> None:
-        if self._companion_server is not None:
-            return
-        server, thread = start_mobile_sync_server(
-            self.mobile_sync,
-            host=self.config.companion.bind_host,
-            port=self.config.companion.port,
-            streaming=self.companion_streaming,
-            study_parser=self.light_novels.parse_study_text,
-            logger=self.logger,
-        )
-        self._companion_server = server
-        self._companion_thread = thread
-        host, port = server.server_address
-        self.companion_base_url = f"http://{host}:{int(port)}"
-
-    def _stop_companion_server(self) -> None:
-        server = getattr(self, "_companion_server", None)
-        if server is None:
-            return
-        server.shutdown()
-        if not server.wait_for_requests(timeout=5.0):
-            if not getattr(self, "_closing", False):
-                thread = threading.Thread(target=server.serve_forever, name="pudge-companion-api", daemon=True)
-                self._companion_thread = thread
-                thread.start()
-                raise RuntimeError("Companion requests did not quiesce; retry restore after they finish")
-            server.server_close()
-            raise RuntimeError("Companion requests did not finish during shutdown")
-        server.server_close()
-        self._companion_server = None
-        self._companion_thread = None
-        self.companion_base_url = ""
-
-    def companion_enable_lan(self) -> dict[str, Any]:
-        cfg = self.config.companion
-        previous_enabled = bool(cfg.enabled)
-        previous_host = str(cfg.bind_host)
-        if self._companion_server is not None:
-            bound_host = str(self._companion_server.server_address[0])
-            if bound_host not in {"0.0.0.0", "::"}:
-                self._stop_companion_server()
-        cfg.enabled = True
-        cfg.bind_host = "0.0.0.0"
-        write_config(self.config, self.config_path)
-        try:
-            self._start_companion_server()
-        except OSError:
-            cfg.enabled = previous_enabled
-            cfg.bind_host = previous_host
-            write_config(self.config, self.config_path)
-            raise
-        return self.companion_status()
-
-    def companion_disable(self) -> dict[str, Any]:
-        self._stop_companion_server()
-        self.config.companion.enabled = False
-        write_config(self.config, self.config_path)
-        return self.companion_status()
-
-    def companion_status(self) -> dict[str, Any]:
-        return self.companion_controller.status(
-            self.config.companion,
-            self._companion_effective_base_url(),
-        )
-
-    def companion_start_pairing(self) -> dict[str, Any]:
-        if not self.config.companion.enabled or self._companion_server is None:
-            self.companion_enable_lan()
-        payload = self.mobile_sync.start_pairing()
-        base_url = self._companion_effective_base_url()
-        payload["base_url"] = base_url
-        payload["companion_url"] = (
-            f"{base_url}/companion/?pair={quote(str(payload['pairing_token']))}"
-            if base_url
-            else ""
-        )
-        return payload
-
-    def companion_revoke_device(self, device_id: str) -> dict[str, Any]:
-        return self.companion_controller.revoke(str(device_id or ""))
-
-    def companion_sync_conflicts(self, limit: int = 100) -> dict[str, Any]:
-        return self.companion_controller.conflicts(limit=int(limit))
-
-    def companion_resolve_sync_conflict(
-        self, conflict_id: int, resolution: str = "local"
-    ) -> dict[str, Any]:
-        return self.companion_controller.resolve_conflict(
-            int(conflict_id), str(resolution)
-        )
-
-    def companion_library_snapshot(self) -> dict[str, Any]:
-        return self.mobile_sync.library_snapshot()
-
     def _consumption_runtime_loop(self, cancel_event: threading.Event) -> None:
         """Record background audio and VN runtime in bounded monotonic chunks."""
         poll_seconds = 5.0
@@ -1328,6 +1774,15 @@ class WebAppApi:
             except Exception as exc:
                 observations = []
                 self.logger.debug("SKIP consumption.audio_runtime error=%r", str(exc))
+            # The sidebar stops asking while nothing plays; tell it when a player
+            # appears, pauses, resumes or ends (started here, in the reader, the
+            # float or from the iPhone).
+            players = tuple(
+                sorted((int(item.get("book_id") or 0), bool(item.get("active"))) for item in observations)
+            )
+            if players != getattr(self, "_pushed_audio_players", ()):
+                self._pushed_audio_players = players
+                self._push_ui("audio", {"players": [list(item) for item in players]})
             seen: set[int] = set()
             for observation in observations:
                 book_id = int(observation.get("book_id") or 0)
@@ -1357,8 +1812,11 @@ class WebAppApi:
                                 "FAIL consumption.audio_runtime book_id=%s error=%r", book_id, str(exc)
                             )
                 self._consumption_runtime_last_audio[book_id] = {
-                    "monotonic": monotonic_now, "wall": wall_now, "position": position,
-                    "speed": speed, "active": active,
+                    "monotonic": monotonic_now,
+                    "wall": wall_now,
+                    "position": position,
+                    "speed": speed,
+                    "active": active,
                 }
             for book_id in list(self._consumption_runtime_last_audio):
                 if book_id not in seen:
@@ -1370,58 +1828,115 @@ class WebAppApi:
             except Exception:
                 vn_state = {}
             running = bool(vn_state.get("running")) and bool(session_id)
-            previous_vn = self._consumption_runtime_last_vn if self._consumption_runtime_last_vn.get("session_id") == session_id else {}
+            if running:
+                self._statistics_record_vn_lines(session_id, vn_state.get("transcript") or [])
+            if (
+                monotonic_now - float(self.__dict__.setdefault("_statistics_words_checked", monotonic_now))
+                >= 1800.0
+            ):
+                # New watching and reading is parsed while its subtitles/OCR are still here.
+                self._statistics_words_checked = monotonic_now
+                if not self.safe_mode.active:
+                    self.statistics_words_start()
+            previous_vn = (
+                self._consumption_runtime_last_vn
+                if self._consumption_runtime_last_vn.get("session_id") == session_id
+                else {}
+            )
             if running and previous_vn and bool(previous_vn.get("running")):
                 mono_delta = monotonic_now - float(previous_vn.get("monotonic") or monotonic_now)
                 wall_delta = wall_now - float(previous_vn.get("wall") or wall_now)
                 if 0.05 <= mono_delta <= 15.0 and abs(wall_delta - mono_delta) <= 2.5:
                     try:
                         self.consumption.record_vn_runtime(
-                            session_id, active_seconds=mono_delta,
+                            session_id,
+                            active_seconds=mono_delta,
                             capture_count=int(vn_state.get("capture_count") or 0),
                         )
                     except Exception as exc:
                         self.logger.warning("FAIL consumption.vn_runtime error=%r", str(exc))
-            self._consumption_runtime_last_vn = {
-                "session_id": session_id, "monotonic": monotonic_now, "wall": wall_now,
-                "running": running, "capture_count": int(vn_state.get("capture_count") or 0),
-            } if session_id else {}
+            self._consumption_runtime_last_vn = (
+                {
+                    "session_id": session_id,
+                    "monotonic": monotonic_now,
+                    "wall": wall_now,
+                    "running": running,
+                    "capture_count": int(vn_state.get("capture_count") or 0),
+                }
+                if session_id
+                else {}
+            )
             cancel_event.wait(poll_seconds)
 
     def consumption_reader_observation(
-        self, kind: str, local_id: int, active_seconds: float,
-        locator_start: dict[str, Any] | None = None, locator_end: dict[str, Any] | None = None,
+        self,
+        kind: str,
+        local_id: int,
+        active_seconds: float,
+        locator_start: dict[str, Any] | None = None,
+        locator_end: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         seconds = max(0.0, min(15.0, float(active_seconds or 0.0)))
         results = self.consumption.record_reader_activity(
-            kind=str(kind or ""), local_id=int(local_id), active_seconds=seconds,
-            locator_start=locator_start or {}, locator_end=locator_end or {},
+            kind=str(kind or ""),
+            local_id=int(local_id),
+            active_seconds=seconds,
+            locator_start=locator_start or {},
+            locator_end=locator_end or {},
             payload=payload or {},
         )
         return {"ok": True, "events": len(results)}
 
-    def consumption_statistics_query(self, scope: dict[str, Any] | None = None, limit: int = 200, offset: int = 0) -> dict[str, Any]:
-        return self.consumption_statistics.query(scope or {}, journal_limit=int(limit), journal_offset=int(offset))
+    def consumption_statistics_query(
+        self, scope: dict[str, Any] | None = None, limit: int = 200, offset: int = 0
+    ) -> dict[str, Any]:
+        result = self.consumption_statistics.query(
+            scope or {}, journal_limit=int(limit), journal_offset=int(offset)
+        )
+        words = (result.get("highlights") or {}).get("words")
+        if isinstance(words, dict):
+            words["job"] = self.statistics_words_state()
+        return result
 
     def consumption_statistics_correct(
-        self, target_type: str, target_id: str, expected_revision: int = 0,
-        excluded: bool = False, start_utc: float | None = None, end_utc: float | None = None,
-        duration_seconds: float | None = None, reason: str = "",
+        self,
+        target_type: str,
+        target_id: str,
+        expected_revision: int = 0,
+        excluded: bool = False,
+        start_utc: float | None = None,
+        end_utc: float | None = None,
+        duration_seconds: float | None = None,
+        reason: str = "",
     ) -> dict[str, Any]:
         return self.consumption_statistics.correction(
-            target_type=target_type, target_id=target_id, expected_revision=int(expected_revision),
-            excluded=bool(excluded), start_utc=start_utc, end_utc=end_utc,
-            duration_seconds=duration_seconds, reason=reason,
+            target_type=target_type,
+            target_id=target_id,
+            expected_revision=int(expected_revision),
+            excluded=bool(excluded),
+            start_utc=start_utc,
+            end_utc=end_utc,
+            duration_seconds=duration_seconds,
+            reason=reason,
         )
 
     def consumption_statistics_add_manual(
-        self, kind: str, duration_seconds: float, started_at_utc: float | None = None,
-        media_uuid: str = "", title: str = "", note: str = "",
+        self,
+        kind: str,
+        duration_seconds: float,
+        started_at_utc: float | None = None,
+        media_uuid: str = "",
+        title: str = "",
+        note: str = "",
     ) -> dict[str, Any]:
         return self.consumption_statistics.add_manual(
-            kind=kind, duration_seconds=float(duration_seconds), started_at_utc=started_at_utc,
-            media_uuid=media_uuid, title=title, note=note,
+            kind=kind,
+            duration_seconds=float(duration_seconds),
+            started_at_utc=started_at_utc,
+            media_uuid=media_uuid,
+            title=title,
+            note=note,
         )
 
     def consumption_statistics_export(self, scope: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1449,7 +1964,11 @@ class WebAppApi:
         started = time.perf_counter()
         rows = self.visual_novels.windows()
         self._vn_windows_cache = (now, [dict(row) for row in rows])
-        self.logger.info("TIMING step=vn.windows duration_ms=%.1f windows=%s", (time.perf_counter() - started) * 1000.0, len(rows))
+        self.logger.info(
+            "TIMING step=vn.windows duration_ms=%.1f windows=%s",
+            (time.perf_counter() - started) * 1000.0,
+            len(rows),
+        )
         return rows
 
     def _prewarm_visual_novel_windows(self) -> None:
@@ -1488,10 +2007,15 @@ class WebAppApi:
             finally:
                 self._vn_consumption_session_id = ""
         try:
-            state = (self.visual_novels.start_with_picker(str(title or "")) if use_system_picker
-                     else self.visual_novels.start(int(window_id), str(title or "")))
+            state = (
+                self.visual_novels.start_with_picker(str(title or ""))
+                if use_system_picker
+                else self.visual_novels.start(int(window_id), str(title or ""))
+            )
         except VisualNovelError as exc:
-            self.logger.warning("EVENT vn.start_failed code=%s picker=%s error=%s", exc.code, use_system_picker, exc)
+            self.logger.warning(
+                "EVENT vn.start_failed code=%s picker=%s error=%s", exc.code, use_system_picker, exc
+            )
             if exc.code == "cancelled":
                 return {**self.visual_novels.state(), "selection_cancelled": True}
             raise
@@ -1510,7 +2034,9 @@ class WebAppApi:
             self._vn_title_id = str(capture["vn_title_id"])
             self.logger.info(
                 "EVENT consumption.vn_start vn_title_id=%s session_id=%s window_id=%s generation=%s",
-                self._vn_title_id, self._vn_consumption_session_id, int(window_id),
+                self._vn_title_id,
+                self._vn_consumption_session_id,
+                int(window_id),
                 int(state.get("generation") or 0),
             )
         except Exception as exc:
@@ -1536,7 +2062,8 @@ class WebAppApi:
                     consumption.end_vn_capture(session_id)
                     self.logger.info(
                         "EVENT consumption.vn_stop vn_title_id=%s session_id=%s",
-                        str(getattr(self, "_vn_title_id", "") or ""), session_id,
+                        str(getattr(self, "_vn_title_id", "") or ""),
+                        session_id,
                     )
             finally:
                 self._vn_consumption_session_id = ""
@@ -1554,17 +2081,110 @@ class WebAppApi:
     def visual_novel_parse(self, text: str) -> dict[str, Any]:
         return self.light_novels.parse_study_text(str(text or ""))
 
+    def start_global_shortcuts(self) -> None:
+        """(Re)register the system-wide Screen text shortcut from the settings."""
+        if sys.platform != "darwin":
+            return
+        try:
+            self._screen_text_shortcut.apply(self.config.shortcuts.screen_text_toggle)
+        except Exception as exc:  # noqa: BLE001 - the app works without the shortcut
+            self.logger.warning("FALLBACK hotkey.apply error=%r", str(exc))
+
+    def screen_text_toggle(self) -> dict[str, Any]:
+        """The global shortcut: open the Screen text panel, or close it when open."""
+        return self._screen_text.toggle()
+
+    def screen_text_state(self) -> dict[str, Any]:
+        return self._screen_text.state()
+
+    def screen_text_refresh(self) -> dict[str, Any]:
+        return self._screen_text.refresh()
+
+    def screen_text_dismiss_hint(self) -> dict[str, Any]:
+        return self._screen_text.dismiss_hint()
+
+    def screen_text_fit(
+        self, width: float = 0, height: float = 0, inner_width: float = 0, inner_height: float = 0
+    ) -> dict[str, Any]:
+        return self._screen_text.fit(width, height, inner_width, inner_height)
+
+    def _screen_text_settings_changed(self) -> None:
+        panel = getattr(self, "_screen_text", None)
+        if panel is not None:
+            panel.settings_changed()
+
+    def screen_text_settings(self) -> dict[str, Any]:
+        cfg = self.config
+        ln = self.light_novels.settings_payload()
+        return {
+            "language": cfg.ui.language,
+            "study_backend": str(ln.get("study_backend") or "jiten"),
+            # Word cards open like in the light novel reader (on hover or by its triggers).
+            "study_card_mode": str(ln.get("study_card_mode") or "button"),
+            "study_card_triggers": list(ln.get("study_card_triggers") or ["MouseLeft"]),
+            "llm_enabled": cfg.llm.enabled,
+            "llm_provider": cfg.llm.provider,
+            "llm_url": cfg.llm.base_url,
+            "llm_model": cfg.llm.model,
+            "llm_api_key": masked_secret(cfg.llm.api_key),
+        }
+
+    def visual_novel_changed(self) -> None:
+        """A capture started or stopped outside the Visual novels page (the shortcut)."""
+        window = getattr(self, "window", None)
+        if window is None:
+            return
+        script = "window.PudgeVisualNovels?.refresh?.()"
+        runner = getattr(window, "run_js", None)
+        if callable(runner):
+            runner(script)
+        else:
+            window.evaluate_js(script)
+
+    def screen_recording_status(self) -> dict[str, Any]:
+        """Preflight only: never shows the macOS permission prompt."""
+        return {"allowed": self.visual_novels._screen_recording_access()}
+
+    def screen_recording_request_access(self) -> dict[str, Any]:
+        """The Allow button: ask macOS once ever (lists Pudge in Screen Recording), then open the pane.
+
+        Only a user's click gets here; later clicks only open System Settings.
+        """
+        allowed = self.visual_novels._screen_recording_access()
+        marker = self.config.paths.cache_dir / "screen-recording-requested"
+        requested = False
+        if allowed is False and not marker.exists():
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(str(time.time()), encoding="utf-8")
+            try:
+                import Quartz  # type: ignore
+
+                request = getattr(Quartz, "CGRequestScreenCaptureAccess", None)
+                if request is not None:
+                    request()
+                    requested = True
+            except Exception as exc:
+                self.logger.warning("FALLBACK screen_recording.request error=%r", str(exc))
+        self.logger.info("EVENT screen_recording.allow_clicked preflight=%s requested=%s", allowed, requested)
+        if sys.platform == "darwin":
+            self.open_screen_recording_settings()
+        return {"ok": True, "allowed": allowed, "requested": requested}
+
     def open_screen_recording_settings(self) -> dict[str, Any]:
-        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+        subprocess.Popen(
+            ["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]
+        )
         return {"ok": True}
 
     def open_developer_tools_settings(self) -> dict[str, Any]:
         if sys.platform != "darwin":
             return {"ok": False, "supported": False}
-        subprocess.Popen([
-            "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTool",
-        ])
+        subprocess.Popen(
+            [
+                "open",
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_DeveloperTool",
+            ]
+        )
         mpv = dependency_status(
             mpv=self.config.tools.mpv,
             ffmpeg=self.config.tools.ffmpeg,
@@ -1579,6 +2199,40 @@ class WebAppApi:
     def set_window(self, window: Any) -> None:
         self.window = window
 
+    def ui_push_ready(self) -> dict[str, Any]:
+        """The page installed window.PudgePush: from now on Python reports changes itself."""
+        hub = getattr(self, "_ui_push_hub", None)
+        if hub is None:
+            return {"ok": False}
+        hub.ready()
+        startup_quiet = getattr(self, "_startup_quiet_window_ready", None)
+        if startup_quiet is not None:
+            startup_quiet.set()
+        self._state_watcher.start()
+        self._torrent_monitor.start()
+        self.logger.info("EVENT ui.push_ready topics=versions,torrents,audio")
+        return {"ok": True, "topics": ["versions", "torrents", "audio"]}
+
+    def _push_ui(self, topic: str, payload: Any = None) -> None:
+        hub = getattr(self, "_ui_push_hub", None)
+        if hub is not None and hub.live:
+            hub.post(topic, payload)
+
+    def _torrent_changed(self, delay: float = 1.5) -> None:
+        """Pudge changed a torrent: show the new traffic soon instead of at the idle pace."""
+        monitor = getattr(self, "_torrent_monitor", None)
+        if monitor is not None:
+            monitor.wake(delay)
+
+    def _stop_ui_push(self) -> None:
+        for name in ("_state_watcher", "_torrent_monitor"):
+            loop = getattr(self, name, None)
+            if loop is not None:
+                loop.stop(timeout=2.0)
+        hub = getattr(self, "_ui_push_hub", None)
+        if hub is not None:
+            hub.close(timeout=2.0)
+
     def set_window_activity(self, active: bool) -> dict[str, Any]:
         """Publish interactive-window state for the scheduled agent.
 
@@ -1587,6 +2241,10 @@ class WebAppApi:
         heavy maintenance while the user is actively navigating Pudge.
         """
 
+        for name in ("_state_watcher", "_torrent_monitor"):
+            loop = getattr(self, name, None)
+            if loop is not None:
+                loop.set_active(bool(active))
         updated = set_app_window_active(bool(active))
         return {"ok": True, "active": bool(active), "updated": bool(updated)}
 
@@ -1686,11 +2344,64 @@ class WebAppApi:
     def _remaining(target: int | None) -> int | None:
         return max(0, int(target) - int(time.time())) if target else None
 
+    COVER_LIST_WIDTH = 240
+
     def _cover_uri(self, anime: LibraryAnime) -> str:
+        """List-size cover (a ~240 px copy next to the cached one); the preview
+        derives the full image from the ``.list.jpg`` name."""
         path = self.manager.cached_cover_path(anime)
         if path is None or not self.asset_base:
             return ""
+        thumb = path.with_name(path.name + ".list.jpg")
+        try:
+            if thumb.stat().st_mtime >= path.stat().st_mtime:
+                return f"{self.asset_base}/covers/{quote(thumb.name)}"
+        except OSError:
+            pass
+        self._queue_cover_thumbnail(path, thumb)
         return f"{self.asset_base}/covers/{quote(path.name)}"
+
+    def _queue_cover_thumbnail(self, source: Path, target: Path) -> None:
+        lock = self.__dict__.setdefault("_cover_thumb_lock", threading.Lock())
+        with lock:
+            queue = self.__dict__.setdefault("_cover_thumb_queue", {})
+            queue[str(target)] = source
+            if self.__dict__.get("_cover_thumb_running"):
+                return
+            self._cover_thumb_running = True
+        threading.Thread(
+            target=self._cover_thumbnail_worker, name=f"{APP_SLUG}-cover-thumbs", daemon=True
+        ).start()
+
+    def _cover_thumbnail_worker(self) -> None:
+        """Make list-size covers once: WebKit decodes ~4x fewer pixels per card."""
+        made = 0
+        while True:
+            with self._cover_thumb_lock:
+                queue = self._cover_thumb_queue
+                if not queue:
+                    self._cover_thumb_running = False
+                    break
+                target_name, source = queue.popitem()
+            target = Path(target_name)
+            try:
+                from PIL import Image
+
+                with Image.open(source) as image:
+                    image = image.convert("RGB")
+                    if image.width > self.COVER_LIST_WIDTH:
+                        height = max(1, round(image.height * self.COVER_LIST_WIDTH / image.width))
+                        image = image.resize((self.COVER_LIST_WIDTH, height), Image.LANCZOS)
+                    temporary = target.with_name(target.name + ".tmp")
+                    image.save(temporary, "JPEG", quality=85, optimize=True)
+                temporary.replace(target)
+                made += 1
+            except Exception as exc:  # noqa: BLE001 - the full cover keeps working
+                self.logger.info(
+                    "SKIP step=cover.list_thumbnail source=%s error=%r", source.name, str(exc)[:200]
+                )
+        if made:
+            self.logger.info("RESULT step=cover.list_thumbnails made=%s", made)
 
     @staticmethod
     def _relation_level(
@@ -1751,9 +2462,7 @@ class WebAppApi:
         return None
 
     @classmethod
-    def _release_key(
-        cls, item: LibraryAnime | dict[str, Any]
-    ) -> tuple[int, int, int, int] | None:
+    def _release_key(cls, item: LibraryAnime | dict[str, Any]) -> tuple[int, int, int, int] | None:
         bounds = cls._release_bounds(item)
         if bounds is None:
             return None
@@ -1767,9 +2476,7 @@ class WebAppApi:
         return (earliest[0], 7, 1, media_id)
 
     @classmethod
-    def _release_direction(
-        cls, root: LibraryAnime, item: dict[str, Any]
-    ) -> int | None:
+    def _release_direction(cls, root: LibraryAnime, item: dict[str, Any]) -> int | None:
         root_bounds = cls._release_bounds(root)
         item_bounds = cls._release_bounds(item)
         if root_bounds is None or item_bounds is None:
@@ -1807,7 +2514,7 @@ class WebAppApi:
     def _relation_stages(items: list[dict[str, Any]], *, before: bool) -> list[list[dict[str, Any]]]:
         if before:
             selected = items[-4:]
-            stages = [selected[max(0, len(selected) - 4):max(0, len(selected) - 2)], selected[-2:]]
+            stages = [selected[max(0, len(selected) - 4) : max(0, len(selected) - 2)], selected[-2:]]
         else:
             selected = items[:4]
             stages = [selected[:2], selected[2:4]]
@@ -1860,8 +2567,12 @@ class WebAppApi:
                         item_key = self._release_key(item)
                         if item_key is not None:
                             (before if item_key < root_key else after).append(item)
-                before.sort(key=lambda item: self._release_key(item) or (0, 0, 0, int(item.get("media_id") or 0)))
-                after.sort(key=lambda item: self._release_key(item) or (9999, 12, 31, int(item.get("media_id") or 0)))
+                before.sort(
+                    key=lambda item: self._release_key(item) or (0, 0, 0, int(item.get("media_id") or 0))
+                )
+                after.sort(
+                    key=lambda item: self._release_key(item) or (9999, 12, 31, int(item.get("media_id") or 0))
+                )
                 if before or after:
                     return {
                         "current": current,
@@ -1876,28 +2587,16 @@ class WebAppApi:
         direct_prequels_full = self._relation_level(
             anime.relations, "PREQUEL", excluded={root_id}, limit=None
         )
-        direct_sequels_full = self._relation_level(
-            anime.relations, "SEQUEL", excluded={root_id}, limit=None
-        )
+        direct_sequels_full = self._relation_level(anime.relations, "SEQUEL", excluded={root_id}, limit=None)
 
-        prequel_children = [
-            child
-            for item in direct_prequels_full
-            for child in (item.get("relations") or [])
-        ]
-        sequel_children = [
-            child
-            for item in direct_sequels_full
-            for child in (item.get("relations") or [])
-        ]
+        prequel_children = [child for item in direct_prequels_full for child in (item.get("relations") or [])]
+        sequel_children = [child for item in direct_sequels_full for child in (item.get("relations") or [])]
         prequel_ids = {root_id, *(int(item["media_id"]) for item in direct_prequels_full)}
         sequel_ids = {root_id, *(int(item["media_id"]) for item in direct_sequels_full)}
         second_prequels_full = self._relation_level(
             prequel_children, "PREQUEL", excluded=prequel_ids, limit=None
         )
-        second_sequels_full = self._relation_level(
-            sequel_children, "SEQUEL", excluded=sequel_ids, limit=None
-        )
+        second_sequels_full = self._relation_level(sequel_children, "SEQUEL", excluded=sequel_ids, limit=None)
         direct_prequels = direct_prequels_full[:2]
         direct_sequels = direct_sequels_full[:2]
         second_prequels = second_prequels_full[:2]
@@ -1934,9 +2633,7 @@ class WebAppApi:
             self._episode_offset_cache[int(anime.media_id)] = offset
         return offset
 
-    def _display_episode_number(
-        self, anime: LibraryAnime | None, episode: int | None
-    ) -> int | None:
+    def _display_episode_number(self, anime: LibraryAnime | None, episode: int | None) -> int | None:
         if episode is None:
             return None
         value = int(episode)
@@ -1951,9 +2648,7 @@ class WebAppApi:
             return relative
         return value
 
-    def _watched_on_anilist(
-        self, anime: LibraryAnime | None, episode: int | None
-    ) -> bool:
+    def _watched_on_anilist(self, anime: LibraryAnime | None, episode: int | None) -> bool:
         if anime is None:
             return False
         return watched_by_anilist_progress(
@@ -1963,18 +2658,25 @@ class WebAppApi:
             media_format=anime.format,
         )
 
-    def _local_episode_for_relative(
-        self, anime: LibraryAnime, relative_episode: int | None
-    ):
+    def _local_episode_for_relative(self, anime: LibraryAnime, relative_episode: int | None):
         exact = self.manager.db.ready_episode(anime.media_id, relative_episode)
         if exact is not None and not AnimeManager._library_path_is_ignored(exact.video_path):
             return exact
         for item in self.manager.db.episodes(anime.media_id):
-            if item.state not in {"ready", "local", "watched", "waiting_subtitles", "waiting_text_subtitles", "couldnt_sync"}:
+            if item.state not in {
+                "ready",
+                "local",
+                "watched",
+                "waiting_subtitles",
+                "waiting_text_subtitles",
+                "couldnt_sync",
+            }:
                 continue
             if AnimeManager._library_path_is_ignored(item.video_path):
                 continue
-            if relative_episode is None or self._display_episode_number(anime, item.episode) == int(relative_episode):
+            if relative_episode is None or self._display_episode_number(anime, item.episode) == int(
+                relative_episode
+            ):
                 return item
         return None
 
@@ -2058,12 +2760,12 @@ class WebAppApi:
 
     def _personal_schedule_episode_order(self, anime: LibraryAnime) -> tuple[list[int], str]:
         if str(anime.format or "").upper() == "MOVIE":
-            return [], "Movies do not use episodic weekly schedules."
+            return [], err("web.scheduleMovie")
         if str(anime.media_status or "").upper() != "FINISHED":
-            return [], "Weekly personal schedules are available for fully released anime."
+            return [], err("web.scheduleNotFinished")
         total = int(anime.episodes or 0)
         if total < 2:
-            return [], "A known episodic order is required."
+            return [], err("web.scheduleNeedsOrder")
         mapped: set[int] = set()
         for item in self.manager.db.episodes(anime.media_id):
             display = self._display_episode_number(anime, item.episode)
@@ -2071,7 +2773,7 @@ class WebAppApi:
                 continue
             value = int(display)
             if value < 1 or value > total:
-                return [], "Local episode numbering does not match AniList; fix the match first."
+                return [], err("web.scheduleNumberingMismatch")
             mapped.add(value)
         # AniList provides the canonical sequential episode count for ordinary
         # episodic titles. Local rows are used as a guard against absolute/special
@@ -2088,9 +2790,17 @@ class WebAppApi:
             local_state = "ready"
         if not japanese_subtitles_required and local_state != "watched":
             local_state = "ready"
-        if local_state == "ready" and japanese_subtitles_required and not self._ready_subtitle_is_usable(local):
+        if (
+            local_state == "ready"
+            and japanese_subtitles_required
+            and not self._ready_subtitle_is_usable(local)
+        ):
             local_state = "waiting_subtitles"
-        if local_state == "ready" and str(local.subtitle_origin or "").casefold() == "ocr" and not self.config.matching.ocr_counts_as_ready:
+        if (
+            local_state == "ready"
+            and str(local.subtitle_origin or "").casefold() == "ocr"
+            and not self.config.matching.ocr_counts_as_ready
+        ):
             local_state = "waiting_text_subtitles"
         return local_state
 
@@ -2161,7 +2871,9 @@ class WebAppApi:
             payload["ready_count"] = len(ready)
         return payload
 
-    def _apply_personal_schedule_to_payload(self, anime: LibraryAnime, payload: dict[str, Any]) -> dict[str, Any]:
+    def _apply_personal_schedule_to_payload(
+        self, anime: LibraryAnime, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         snapshot = self._personal_schedule_snapshot(anime)
         payload["personal_schedule"] = snapshot
         if not snapshot.get("enabled"):
@@ -2179,9 +2891,13 @@ class WebAppApi:
                     "video_path": str(local.video_path),
                     "subtitle_path": str(local.subtitle_path) if local.subtitle_path else "",
                     "subtitle_source": (
-                        "image" if state == "waiting_text_subtitles" and (local.subtitle_path is not None or local.embedded_subtitle_id is not None)
-                        else "external" if local.subtitle_path
-                        else "embedded" if state in {"ready", "watched"} and local.embedded_subtitle_id is not None
+                        "image"
+                        if state == "waiting_text_subtitles"
+                        and (local.subtitle_path is not None or local.embedded_subtitle_id is not None)
+                        else "external"
+                        if local.subtitle_path
+                        else "embedded"
+                        if state in {"ready", "watched"} and local.embedded_subtitle_id is not None
                         else "none"
                     ),
                     "subtitle_origin": str(local.subtitle_origin or ""),
@@ -2194,7 +2910,21 @@ class WebAppApi:
         payload["remaining_seconds"] = self._remaining(snapshot.get("next_unlock_at"))
         return payload
 
-    def _anime_payload(self, anime: LibraryAnime) -> dict[str, Any]:
+    def _redownload_blocked_count(self, media_id: int) -> int:
+        """Episodes deleted from the anime menu that automatic downloading skips."""
+        blocked = getattr(self.manager.db, "redownload_blocked", None)
+        return len(blocked(int(media_id))) if callable(blocked) else 0
+
+    def _local_file_count(self, media_id: int) -> int:
+        """Downloaded episode files of a title (the menu offers Delete instead of Drop)."""
+        return sum(
+            1
+            for item in self.manager.db.episodes(int(media_id))
+            if item.video_path.is_file() and not AnimeManager._library_path_is_ignored(item.video_path)
+        )
+
+    def _anime_payload(self, anime: LibraryAnime, *, relations: bool = True) -> dict[str, Any]:
+        """One anime card. Only Planning cards draw the relation tree; others skip it."""
         japanese_subtitles_required = self.manager.japanese_subtitles_required(anime.media_id)
         released = anime.released_episodes
         outdated = bool(released and released > anime.progress)
@@ -2243,6 +2973,7 @@ class WebAppApi:
             "titles": list(anime.titles),
             "synonyms": list(anime.synonyms),
             "cover": self._cover_uri(anime),
+            "cover_remote": anime.cover_url or "",
             "site_url": anime.site_url,
             "list_status": anime.status,
             "media_status": anime.media_status or "",
@@ -2257,7 +2988,7 @@ class WebAppApi:
             "season_year": anime.season_year,
             "start_date": anime.start_date,
             "studio": anime.studio,
-            "relations": self._relation_payload(anime),
+            "relations": self._relation_payload(anime) if relations else {},
             "next_episode": anime.next_episode,
             "is_final_episode": bool(anime.episodes and anime.next_episode >= anime.episodes),
             "released_episodes": released,
@@ -2268,6 +2999,8 @@ class WebAppApi:
             "remaining_seconds": self._remaining(anime.next_airing_at),
             "queue_next_count": next_queue_count,
             "queue_franchise_available": franchise_queue_available,
+            "local_count": self._local_file_count(anime.media_id),
+            "redownload_blocked": self._redownload_blocked_count(anime.media_id),
             "local": (
                 {
                     "episode": self._display_episode_number(anime, local.episode),
@@ -2282,10 +3015,7 @@ class WebAppApi:
                         else "external"
                         if local.subtitle_path
                         else "embedded"
-                        if (
-                            local_state in {"ready", "watched"}
-                            and local.embedded_subtitle_id is not None
-                        )
+                        if (local_state in {"ready", "watched"} and local.embedded_subtitle_id is not None)
                         else "none"
                     ),
                     "subtitle_origin": str(local.subtitle_origin or ""),
@@ -2297,6 +3027,7 @@ class WebAppApi:
             ),
         }
         return self._apply_personal_schedule_to_payload(anime, payload)
+
     def _continue_payloads(
         self,
         anime_by_id: dict[int, LibraryAnime],
@@ -2318,10 +3049,15 @@ class WebAppApi:
                 if schedule is not None and schedule.enabled:
                     display_episode = self._display_episode_number(anime, item.episode)
                     next_item = next((row for row in schedule.items if row.watched_at is None), None)
-                    if display_episode is None or next_item is None or int(display_episode) != int(next_item.episode) or not next_item.unlocked:
+                    if (
+                        display_episode is None
+                        or next_item is None
+                        or int(display_episode) != int(next_item.episode)
+                        or not next_item.unlocked
+                    ):
                         continue
                     schedule_item = next_item
-            if schedule_item is None and self._watched_on_anilist(anime, item.episode):
+            if schedule_item is None and self._watched_on_anilist(anime, item.last_episode):
                 continue
             position = float(item.playback_position or 0.0)
             duration = float(item.playback_duration or 0.0)
@@ -2332,6 +3068,7 @@ class WebAppApi:
                     "site_url": anime.site_url if anime is not None else "",
                     "media_status": anime.media_status if anime is not None else "",
                     "cover": self._cover_uri(anime) if anime is not None else "",
+                    "cover_remote": (anime.cover_url or "") if anime is not None else "",
                     "episode": self._display_episode_number(anime, item.episode),
                     "is_movie": bool(anime is not None and str(anime.format or "").upper() == "MOVIE"),
                     "video_path": str(item.video_path),
@@ -2356,6 +3093,7 @@ class WebAppApi:
         """Group local episodes by anime for the compact Library page."""
         groups: dict[tuple[str, object], dict[str, Any]] = {}
         incomplete = self.manager.incomplete_download_paths()
+        watched_roots = tuple(path.expanduser().resolve() for path in self.config.paths.download_dirs)
         for item in self.manager.db.episodes():
             if self.manager._path_within(item.video_path, incomplete):
                 continue
@@ -2366,33 +3104,33 @@ class WebAppApi:
                 key = ("title", item.title.casefold())
 
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
-            group = groups.setdefault(
-                key,
-                {
+            group = groups.get(key)
+            # Built once per title: the schedule snapshot and cover are not free.
+            if group is None:
+                group = groups[key] = {
                     "media_id": item.media_id,
                     "title": anime.title if anime is not None else item.title,
                     "cover": self._cover_uri(anime) if anime is not None else "",
+                    "cover_remote": (anime.cover_url or "") if anime is not None else "",
                     "site_url": anime.site_url if anime is not None else "",
                     "media_status": anime.media_status if anime is not None else "",
                     "list_status": anime.status if anime is not None else "",
-                    "personal_schedule": self._personal_schedule_snapshot(anime) if anime is not None else {"eligible": False, "enabled": False},
+                    "personal_schedule": self._personal_schedule_snapshot(anime)
+                    if anime is not None
+                    else {"eligible": False, "enabled": False},
                     "total_episodes": anime.episodes if anime is not None else None,
                     "episode_duration_minutes": anime.duration if anime is not None else None,
                     "watched_folder": False,
                     "episodes": [],
-                },
-            )
+                }
             try:
                 size_bytes = item.video_path.stat().st_size if item.video_path.is_file() else 0
             except OSError:
                 size_bytes = 0
-            if self.manager._path_within(
-                item.video_path,
-                tuple(path.expanduser().resolve() for path in self.config.paths.download_dirs),
-            ):
+            if self.manager._path_within(item.video_path, watched_roots):
                 group["watched_folder"] = True
             effective_state = item.state
-            if self._watched_on_anilist(anime, item.episode):
+            if self._watched_on_anilist(anime, item.last_episode):
                 effective_state = "watched"
             if effective_state == "ready" and (
                 str(item.subtitle_origin or "").casefold() == "bitmap"
@@ -2443,12 +3181,8 @@ class WebAppApi:
                 )
             )
             group["episode_count"] = len(group["episodes"])
-            group["ready_count"] = sum(
-                1 for item in group["episodes"] if item["state"] == "ready"
-            )
-            group["watched_count"] = sum(
-                1 for item in group["episodes"] if item["state"] == "watched"
-            )
+            group["ready_count"] = sum(1 for item in group["episodes"] if item["state"] == "ready")
+            group["watched_count"] = sum(1 for item in group["episodes"] if item["state"] == "watched")
             group["waiting_count"] = sum(
                 1
                 for item in group["episodes"]
@@ -2481,8 +3215,7 @@ class WebAppApi:
         for item in self.manager.db.episodes():
             anime = anime_by_id.get(item.media_id) if item.media_id is not None else None
             subtitle_optional = bool(
-                item.media_id is not None
-                and not self.manager.japanese_subtitles_required(item.media_id)
+                item.media_id is not None and not self.manager.japanese_subtitles_required(item.media_id)
             )
             if (
                 (item.state != "ready" and not subtitle_optional)
@@ -2499,7 +3232,7 @@ class WebAppApi:
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
                 or AnimeManager._library_path_is_ignored(item.video_path)
-                or self._watched_on_anilist(anime, item.episode)
+                or self._watched_on_anilist(anime, item.last_episode)
             ):
                 continue
             key: tuple[str, object]
@@ -2507,7 +3240,15 @@ class WebAppApi:
                 key = ("media", int(item.media_id))
             else:
                 key = ("title", item.title.casefold())
-            groups.setdefault(key, {}).setdefault(item.episode, item)
+            episode_map = groups.setdefault(key, {})
+            if item.media_episode_end is not None:
+                # A two-episode file is ready for both numbers, until its
+                # first episode is counted (audit 17А).
+                if not self._watched_on_anilist(anime, item.episode):
+                    episode_map.setdefault(item.episode, item)
+                episode_map.setdefault(item.media_episode_end, item)
+            else:
+                episode_map.setdefault(item.episode, item)
             titles[key] = item.title
             media_ids[key] = item.media_id
 
@@ -2525,16 +3266,16 @@ class WebAppApi:
                 {self._display_episode_number(anime, value) for value in stored_episodes},
                 key=lambda value: (value is None, value if value is not None else 10**9),
             )
-            display_first_episode = self._display_episode_number(anime, first.episode)
+            display_first_episode = self._display_episode_number(anime, stored_episodes[0])
             payloads.append(
                 {
                     "media_id": media_id,
                     "japanese_subtitles_required": (
-                        self.manager.japanese_subtitles_required(media_id)
-                        if media_id is not None else True
+                        self.manager.japanese_subtitles_required(media_id) if media_id is not None else True
                     ),
                     "title": title,
                     "cover": self._cover_uri(anime) if anime is not None else "",
+                    "cover_remote": (anime.cover_url or "") if anime is not None else "",
                     "site_url": anime.site_url if anime is not None else "",
                     "ready_episodes": episodes,
                     "ready_count": len(episodes),
@@ -2559,11 +3300,18 @@ class WebAppApi:
                     ),
                     "local": {
                         "episode": display_first_episode,
+                        "episode_end": (
+                            self._display_episode_number(anime, first.media_episode_end)
+                            if first.media_episode_end is not None
+                            else None
+                        ),
                         "video_path": str(first.video_path),
                         "subtitle_path": str(first.subtitle_path) if first.subtitle_path else "",
                         "subtitle_source": (
-                            "external" if first.subtitle_path
-                            else "embedded" if first.embedded_subtitle_id is not None
+                            "external"
+                            if first.subtitle_path
+                            else "embedded"
+                            if first.embedded_subtitle_id is not None
                             else "none"
                         ),
                         "original_state": str(first.state or ""),
@@ -2607,7 +3355,7 @@ class WebAppApi:
                 or not item.video_path.is_file()
                 or self.manager._path_within(item.video_path, incomplete)
                 or AnimeManager._library_path_is_ignored(item.video_path)
-                or self._watched_on_anilist(anime, item.episode)
+                or self._watched_on_anilist(anime, item.last_episode)
             ):
                 continue
             key = (
@@ -2628,6 +3376,7 @@ class WebAppApi:
                     "media_id": item.media_id,
                     "title": anime.title if anime is not None else item.title,
                     "cover": self._cover_uri(anime) if anime is not None else "",
+                    "cover_remote": (anime.cover_url or "") if anime is not None else "",
                     "site_url": anime.site_url if anime is not None else "",
                     "next_episode": episode,
                     "episodes": anime.episodes if anime is not None else None,
@@ -2645,7 +3394,9 @@ class WebAppApi:
                             "image"
                             if item.state == "waiting_text_subtitles"
                             and (item.subtitle_path is not None or item.embedded_subtitle_id is not None)
-                            else "external" if item.subtitle_path else "none"
+                            else "external"
+                            if item.subtitle_path
+                            else "none"
                         ),
                         "state": (
                             "waiting_text_subtitles"
@@ -2683,8 +3434,7 @@ class WebAppApi:
     ) -> list[int]:
         release_sorted = sorted(
             media_ids,
-            key=lambda media_id: self._release_key(anime_by_id[media_id])
-            or (9999, 12, 31, media_id),
+            key=lambda media_id: self._release_key(anime_by_id[media_id]) or (9999, 12, 31, media_id),
         )
         if self.config.anilist.relations_by_release_date:
             return release_sorted
@@ -2784,11 +3534,14 @@ class WebAppApi:
 
         if not candidate:
             candidate = re.split(r"\s*[:：|]\s*|\s+[–—-]\s+", titles[0], maxsplit=1)[0].strip()
-            candidate = re.sub(
-                r"(?i)\b(?:season|movie|film|part|episode|ova|ona|special)\b.*$",
-                "",
-                candidate,
-            ).strip(" :-–—") or titles[0]
+            candidate = (
+                re.sub(
+                    r"(?i)\b(?:season|movie|film|part|episode|ova|ona|special)\b.*$",
+                    "",
+                    candidate,
+                ).strip(" :-–—")
+                or titles[0]
+            )
 
         if len(candidate.split()) == 1 and not candidate.casefold().endswith("series"):
             candidate = f"{candidate} Series"
@@ -2814,9 +3567,7 @@ class WebAppApi:
         # franchise card alive when the first entry becomes watched and only one
         # ready entry remains: the card immediately advances to the next work.
         all_single_ids = {
-            media_id
-            for media_id, anime in anime_by_id.items()
-            if int(anime.episodes or 0) == 1
+            media_id for media_id, anime in anime_by_id.items() if int(anime.episodes or 0) == 1
         }
         adjacency: dict[int, set[int]] = {media_id: set() for media_id in all_single_ids}
         for media_id in all_single_ids:
@@ -2847,12 +3598,8 @@ class WebAppApi:
             if len(visible_component) < 2:
                 continue
 
-            ordered_full_ids = self._order_single_episode_component(
-                full_component, anime_by_id
-            )
-            ordered_visible_ids = [
-                item_id for item_id in ordered_full_ids if item_id in visible_component
-            ]
+            ordered_full_ids = self._order_single_episode_component(full_component, anime_by_id)
+            ordered_visible_ids = [item_id for item_id in ordered_full_ids if item_id in visible_component]
             if not ordered_visible_ids:
                 continue
             grouped_ids.update(visible_component)
@@ -2863,9 +3610,7 @@ class WebAppApi:
                 "media_ids": ordered_visible_ids,
                 "series_media_ids": ordered_full_ids,
                 "title": self._series_group_title(ordered_full_ids, anime_by_id),
-                "order_mode": (
-                    "release" if self.config.anilist.relations_by_release_date else "anilist"
-                ),
+                "order_mode": ("release" if self.config.anilist.relations_by_release_date else "anilist"),
             }
 
         result: list[dict[str, Any]] = []
@@ -2890,9 +3635,7 @@ class WebAppApi:
         return ("title", str(item.get("title") or "").strip().casefold())
 
     @staticmethod
-    def _download_shadowed_by_local(
-        card: dict[str, Any], download: dict[str, Any]
-    ) -> bool:
+    def _download_shadowed_by_local(card: dict[str, Any], download: dict[str, Any]) -> bool:
         # A completed local episode wins over stale transport metadata.
         if bool(download.get("is_batch")):
             return False
@@ -2945,11 +3688,17 @@ class WebAppApi:
             "caught_up",
             "dropped",
         )
-        seen: set[tuple[str, object]] = set()
+        # Files scheduled for deletion win over every other group: the title
+        # shows only under "Deleting soon" (with Keep) until they are gone.
+        deleting = [item for item in sections.get("dropped", []) if item.get("delete_at")]
+        seen: set[tuple[str, object]] = {cls._home_item_identity(item) for item in deleting}
         for key in priority:
             unique: list[dict[str, Any]] = []
             for item in sections.get(key, []):
                 identity = cls._home_item_identity(item)
+                if key == "dropped" and item.get("delete_at"):
+                    unique.append(item)
+                    continue
                 if identity in seen:
                     continue
                 seen.add(identity)
@@ -3028,10 +3777,7 @@ class WebAppApi:
 
             media_id = int(item.media_id)
             previous = latest.get(media_id)
-            if (
-                previous is None
-                or watched_at > float(previous.watched_at or 0.0)
-            ):
+            if previous is None or watched_at > float(previous.watched_at or 0.0):
                 latest[media_id] = item
 
         rows: list[dict[str, Any]] = []
@@ -3043,13 +3789,9 @@ class WebAppApi:
 
             position = max(0.0, float(item.playback_position or 0.0))
             duration = max(0.0, float(item.playback_duration or 0.0))
-            progress = (
-                round(max(0.0, min(100.0, position / duration * 100.0)), 2)
-                if duration > 0.0
-                else None
-            )
+            progress = round(max(0.0, min(100.0, position / duration * 100.0)), 2) if duration > 0.0 else None
             episode = item.media_episode if item.media_episode is not None else item.episode
-            payload = self._anime_payload(anime)
+            payload = self._anime_payload(anime, relations=False)
             payload.update(
                 {
                     "episode": episode,
@@ -3063,11 +3805,7 @@ class WebAppApi:
                         "episode": episode,
                         "state": "watched",
                         "video_path": str(item.video_path),
-                        "subtitle_path": (
-                            str(item.subtitle_path)
-                            if item.subtitle_path is not None
-                            else ""
-                        ),
+                        "subtitle_path": (str(item.subtitle_path) if item.subtitle_path is not None else ""),
                         "subtitle_source": (
                             "external"
                             if item.subtitle_path is not None
@@ -3114,9 +3852,7 @@ class WebAppApi:
             )
         }
         ready_by_media = {
-            int(item["media_id"]): item
-            for item in downloaded
-            if item.get("media_id") is not None
+            int(item["media_id"]): item for item in downloaded if item.get("media_id") is not None
         }
         handled_media: set[int] = set()
         downloads_by_media: dict[int, Any] = {}
@@ -3138,6 +3874,7 @@ class WebAppApi:
                     return exact
             fallback = downloads_by_media.get(int(media_id))
             return fallback if fallback is not None and fallback.is_batch else None
+
         sections: dict[str, list[dict[str, Any]]] = {
             "continue_watching": self._continue_payloads(anime_by_id),
             "needs_action": [],
@@ -3158,11 +3895,15 @@ class WebAppApi:
             schedule = active_schedules.get(int(anime.media_id))
             if schedule is None:
                 return False
-            card = self._anime_payload(anime)
-            snapshot = card.get("personal_schedule") if isinstance(card.get("personal_schedule"), dict) else {}
+            card = self._anime_payload(anime, relations=False)
+            snapshot = (
+                card.get("personal_schedule") if isinstance(card.get("personal_schedule"), dict) else {}
+            )
             status = str(snapshot.get("status") or "")
             if status == "new_ready" and isinstance(card.get("local"), dict):
-                card["ready_episodes"] = list(snapshot.get("ready_episodes") or [int(snapshot["next_episode"])])
+                card["ready_episodes"] = list(
+                    snapshot.get("ready_episodes") or [int(snapshot["next_episode"])]
+                )
                 card["ready_count"] = len(card["ready_episodes"])
                 card["all_episodes_ready"] = False
                 sections["new_ready"].append(card)
@@ -3172,7 +3913,11 @@ class WebAppApi:
                 download = home_download(anime.media_id, snapshot.get("next_episode"))
                 if download is not None:
                     raw_state = str(download.state or "")
-                    effective_state = raw_state if download_complete(download) or self._torrent_enabled_state() else "paused"
+                    effective_state = (
+                        raw_state
+                        if download_complete(download) or self._torrent_enabled_state()
+                        else "paused"
+                    )
                     card["download"] = {
                         "torrent_hash": download.torrent_hash,
                         "name": download.name,
@@ -3199,7 +3944,7 @@ class WebAppApi:
                 # it as a Ready/Waiting actionable home card. This also contains
                 # damage from a stale false auto-import association.
                 continue
-            base = self._anime_payload(anime)
+            base = self._anime_payload(anime, relations=False)
             ready = ready_by_media.get(anime.media_id)
             ready_episodes = set(ready.get("ready_episodes", [])) if ready else set()
             next_is_ready = anime.next_episode in ready_episodes
@@ -3228,14 +3973,11 @@ class WebAppApi:
                     sections["caught_up"].append(base)
             elif next_is_ready:
                 sections["completed_ready"].append(card)
-            elif (
-                anime.media_status not in {"RELEASING", "NOT_YET_RELEASED"}
-                and (anime.episodes is None or anime.progress < anime.episodes)
+            elif anime.media_status not in {"RELEASING", "NOT_YET_RELEASED"} and (
+                anime.episodes is None or anime.progress < anime.episodes
             ):
                 local_state = str(
-                    (base.get("local") or {}).get("state")
-                    if isinstance(base.get("local"), dict)
-                    else ""
+                    (base.get("local") or {}).get("state") if isinstance(base.get("local"), dict) else ""
                 )
                 if local_state in {
                     "local",
@@ -3301,7 +4043,7 @@ class WebAppApi:
                     # Never skip the nearest unwatched episode merely because a
                     # later local episode is Ready. This applies to FINISHED /
                     # PLANNING titles too, not only currently airing anime.
-                    sections["waiting"].append(self._anime_payload(anime))
+                    sections["waiting"].append(self._anime_payload(anime, relations=False))
             else:
                 sections["completed_ready"].append(item)
 
@@ -3326,14 +4068,20 @@ class WebAppApi:
             else:
                 sections["waiting"].append(item)
 
-        for anime in self.manager.db.anime_list(("DROPPED",)):
+        pending_ids = self.manager.db.pending_deletion_media_ids()
+        dropped_ids = {int(anime.media_id) for anime in self.manager.db.anime_list(("DROPPED",))}
+        for media_id in sorted(dropped_ids | pending_ids):
+            anime = anime_by_id.get(media_id) or self.manager.db.get_anime(media_id)
+            if anime is None:
+                continue
             local_items = [
-                item for item in self.manager.db.episodes(anime.media_id)
+                item
+                for item in self.manager.db.episodes(anime.media_id)
                 if item.video_path.is_file() and not AnimeManager._library_path_is_ignored(item.video_path)
             ]
             if not local_items:
                 continue
-            card = self._anime_payload(anime)
+            card = self._anime_payload(anime, relations=False)
             delete_at = max((item.delete_after or 0.0) for item in local_items) or None
             card["delete_at"] = delete_at
             card["delete_remaining_seconds"] = self._remaining(int(delete_at)) if delete_at else None
@@ -3364,9 +4112,7 @@ class WebAppApi:
         )
         sections["dropped"].sort(key=lambda item: str(item["title"]).casefold())
         sections = self._deduplicate_home_sections(sections)
-        sections["completed_ready"] = self._group_completed_ready(
-            sections["completed_ready"], anime_by_id
-        )
+        sections["completed_ready"] = self._group_completed_ready(sections["completed_ready"], anime_by_id)
         for rows in sections.values():
             for card in rows:
                 try:
@@ -3449,7 +4195,7 @@ class WebAppApi:
             "ok": False,
             "enabled": False,
             "blocked_by_global_off": True,
-            "error": "Enable torrents before resuming a download",
+            "error": err("web.enableTorrentsToResume"),
         }
 
     def _torrent_start_guard(self) -> threading.RLock:
@@ -3465,6 +4211,20 @@ class WebAppApi:
             if guard is None:
                 guard = threading.RLock()
                 self._torrent_start_lock = guard
+            return guard
+
+    def _torrent_quiesce_guard(self) -> threading.RLock:
+        """Serialize backend quiescing (startup, Off) with an On follow-up's resume.
+
+        Acquire it before the start guard when both are needed; quiescing never
+        holds the start guard while it waits for this one.
+        """
+        state_lock = self._torrent_state_guard()
+        with state_lock:
+            guard = getattr(self, "_torrent_quiesce_lock", None)
+            if guard is None:
+                guard = threading.RLock()
+                self._torrent_quiesce_lock = guard
             return guard
 
     def _bump_ui_state_version(self) -> str:
@@ -3548,7 +4308,9 @@ class WebAppApi:
             "review_gate_manga_all_due": cfg.ui.review_gate_manga_all_due,
             "review_gate_manga_count": cfg.ui.review_gate_manga_count,
             "sidebar_review_interval": cfg.ui.sidebar_review_interval,
-            "review_gate_all_due_episode_words": bool(getattr(cfg.ui, "review_gate_all_due_episode_words", False)),
+            "review_gate_all_due_episode_words": bool(
+                getattr(cfg.ui, "review_gate_all_due_episode_words", False)
+            ),
             "library_root": str(cfg.library.root_dir),
             "watched_folders": "\n".join(str(path) for path in cfg.paths.download_dirs),
             "subtitle_folders": "\n".join(str(path) for path in cfg.paths.subtitle_dirs),
@@ -3596,7 +4358,9 @@ class WebAppApi:
             "aria2_upload_limit_kib": cfg.aria2.upload_limit_kib,
             "aria2_vpn_interface": cfg.aria2.vpn_interface,
             "aria2_vpn_kill_switch": cfg.aria2.vpn_kill_switch,
-            "torrent_backend": self.manager.torrent_backend_name() if callable(getattr(self.manager, "torrent_backend_name", None)) and self._downloads_configured() else "disabled",
+            "torrent_backend": self.manager.torrent_backend_name()
+            if callable(getattr(self.manager, "torrent_backend_name", None)) and self._downloads_configured()
+            else "disabled",
             "download_hook": cfg.qbittorrent.pre_download_command,
             "agent_enabled": cfg.agent.enabled,
             "agent_poll": cfg.agent.poll_minutes,
@@ -3614,9 +4378,10 @@ class WebAppApi:
             "jimaku_api_key": masked_secret(cfg.jimaku.personal_api_key),
             "jimaku_trial_active": cfg.jimaku.trial_active,
             "jimaku_trial_expires_at": cfg.jimaku.trial_expires_at,
-            "jimaku_trial_remaining_seconds": max(
-                0, int(cfg.jimaku.trial_expires_at - time.time())
-            ) if cfg.jimaku.trial_active else 0,
+            "jimaku_trial_remaining_seconds": max(0, int(cfg.jimaku.trial_expires_at - time.time()))
+            if cfg.jimaku.trial_active
+            else 0,
+            "jimaku_key_problem": jimaku_key_problem(cfg),
             "ocr_image_subtitles": cfg.matching.ocr_image_subtitles,
             "ocr_counts_as_ready": cfg.matching.ocr_counts_as_ready,
             "auto_upgrade_subtitles": cfg.matching.auto_upgrade_subtitles,
@@ -3625,7 +4390,14 @@ class WebAppApi:
             "max_subtitle_upgrade_checks_per_run": cfg.matching.max_subtitle_upgrade_checks_per_run,
             "llm_enabled": cfg.llm.enabled,
             "llm_provider": cfg.llm.provider,
-            "llm_profiles": {protocol:{"url":profile.get("url", ""),"model":profile.get("model", ""),"key":masked_secret(profile.get("api_key", ""))} for protocol,profile in cfg.llm.profiles.items()},
+            "llm_profiles": {
+                protocol: {
+                    "url": profile.get("url", ""),
+                    "model": profile.get("model", ""),
+                    "key": masked_secret(profile.get("api_key", "")),
+                }
+                for protocol, profile in cfg.llm.profiles.items()
+            },
             "llm_url": cfg.llm.base_url,
             "llm_api_key": masked_secret(cfg.llm.api_key),
             "llm_model": cfg.llm.model,
@@ -3638,8 +4410,19 @@ class WebAppApi:
             "shortcut_mpv_mark_watched": cfg.shortcuts.mpv_mark_watched,
             "shortcut_mpv_translate_subtitle": cfg.shortcuts.mpv_translate_subtitle,
             "shortcut_mpv_explain_subtitle": cfg.shortcuts.mpv_explain_subtitle,
+            "shortcut_mpv_skip_segment": cfg.shortcuts.mpv_skip_segment,
+            "shortcut_screen_text": cfg.shortcuts.screen_text_toggle,
+            "screen_recording_allowed": self.visual_novels._screen_recording_access()
+            if getattr(self, "visual_novels", None) is not None
+            else None,
+            "shortcut_screen_text_status": self._screen_text_shortcut.status()
+            if getattr(self, "_screen_text_shortcut", None) is not None
+            else {},
+            "skip_segments_enabled": cfg.playback.skip_segments_enabled,
+            "stereo_downmix": cfg.playback.stereo_downmix,
             "mpv_study_plugin": cfg.tools.mpv_study_plugin,
-            "manga_ocr_backend": cfg.tools.manga_ocr_backend,
+            "manga_mokuro_python": cfg.tools.manga_mokuro_python,
+            "manga_background_ocr": cfg.tools.manga_background_ocr,
             "mpv_study_plugins": study_plugins,
             "energy_monitoring_enabled": cfg.diagnostics.energy_monitoring_enabled,
             "energy_sample_seconds": cfg.diagnostics.energy_sample_seconds,
@@ -3655,7 +4438,14 @@ class WebAppApi:
 
     def _storage_payload(self, *, refresh: bool) -> dict[str, int | float | bool]:
         now = time.monotonic()
-        if refresh or self._last_storage_status is None or now - getattr(self, "_last_storage_checked_at", 0.0) >= 30.0:
+        if (
+            refresh
+            or self._last_storage_status is None
+            or now - getattr(self, "_last_storage_checked_at", 0.0) >= 30.0
+        ):
+            invalidate = getattr(self.manager, "invalidate_storage_snapshot", None)
+            if refresh and callable(invalidate):
+                invalidate()
             self._last_storage_status = self.manager.storage_status()
             self._last_storage_checked_at = now
         return dict(self._last_storage_status)
@@ -3677,15 +4467,9 @@ class WebAppApi:
         anime_by_id: dict[int, Any],
     ) -> dict[str, Any]:
         raw = dict(getattr(item, "raw", {}) or {})
-        anime = (
-            anime_by_id.get(int(item.media_id))
-            if item.media_id is not None
-            else None
-        )
+        anime = anime_by_id.get(int(item.media_id)) if item.media_id is not None else None
         total = self._download_number(raw, "total_size", "size", "totalLength")
-        downloaded = self._download_number(
-            raw, "downloaded", "completed_length", "completedLength"
-        )
+        downloaded = self._download_number(raw, "downloaded", "completed_length", "completedLength")
         if total and not downloaded:
             downloaded = min(total, round(total * float(item.progress or 0)))
         speed = self._download_number(raw, "dlspeed", "download_speed", "downloadSpeed")
@@ -3699,13 +4483,9 @@ class WebAppApi:
         listed_seeders = self._download_number(raw, "listed_seeders")
         listed_leechers = self._download_number(raw, "listed_leechers")
         leechers = self._download_number(raw, "num_leechs", "num_leechers")
-        connections = self._download_number(
-            raw, "num_connections", "connections", "num_incomplete"
-        )
+        connections = self._download_number(raw, "num_connections", "connections", "num_incomplete")
         peers = max(leechers, max(0, connections - seeders))
-        backends = [
-            str(value) for value in raw.get("_backends", []) if str(value).strip()
-        ]
+        backends = [str(value) for value in raw.get("_backends", []) if str(value).strip()]
         primary_backend = str(raw.get("backend") or self.manager.torrent_backend_name())
         state = str(getattr(item, "state", "") or "")
         effective_state = state
@@ -3763,9 +4543,7 @@ class WebAppApi:
         planned_anime = [anime for anime in all_anime if anime.status == "PLANNING"]
         anime_by_id = {anime.media_id: anime for anime in all_anime}
         download_rows = self.manager.db.downloads()
-        downloads = [
-            self._download_payload(item, anime_by_id) for item in download_rows
-        ]
+        downloads = [self._download_payload(item, anime_by_id) for item in download_rows]
         download_by_media: dict[int, dict[str, Any]] = {}
         download_by_episode: dict[tuple[int, int], dict[str, Any]] = {}
 
@@ -3807,13 +4585,10 @@ class WebAppApi:
             for item in self._downloaded_payloads(anime_by_id)
             if item.get("media_id") is not None
         }
-        current = [self._anime_payload(a) for a in current_anime]
+        current = [self._anime_payload(a, relations=False) for a in current_anime]
         for payload in current:
             download = download_for_episode(int(payload["media_id"]), payload.get("next_episode"))
-            if (
-                download is not None
-                and not self._download_shadowed_by_local(payload, download)
-            ):
+            if download is not None and not self._download_shadowed_by_local(payload, download):
                 payload["download"] = download
         planned = []
         for anime in planned_anime:
@@ -3826,36 +4601,15 @@ class WebAppApi:
                 if payload.get("local") is None:
                     payload["local"] = ready.get("local")
             download = download_for_episode(int(anime.media_id), payload.get("next_episode"))
-            if (
-                download is not None
-                and not self._download_shadowed_by_local(payload, download)
-            ):
+            if download is not None and not self._download_shadowed_by_local(payload, download):
                 payload["download"] = download
             payload["planning_download_hidden"] = self._planning_download_button_hidden(
                 anime,
                 downloads=download_rows,
             )
             planned.append(payload)
-        episodes = [
-            {
-                "media_id": item.media_id,
-                "title": item.title,
-                "episode": item.episode,
-                "video_path": str(item.video_path),
-                "subtitle": bool(item.subtitle_path) or item.state in {"ready", "watched"},
-                "subtitle_source": (
-                    "external"
-                    if item.subtitle_path
-                    else "embedded"
-                    if item.state in {"ready", "watched"}
-                    else "none"
-                ),
-                "state": item.state,
-                "playback_position": item.playback_position,
-                "playback_duration": item.playback_duration,
-            }
-            for item in self.manager.db.episodes()
-        ]
+        # Episodes reach the window once, inside "library" (the flat "episodes"
+        # copy and the unused "downloaded" list are gone from this payload).
         home = self._home_sections(current_anime, anime_by_id)
         home["recently_watched"] = self._recently_watched_payloads(anime_by_id)
 
@@ -3900,7 +4654,7 @@ class WebAppApi:
             download = download_for_episode(media_id, anime.next_episode)
             if download is None:
                 continue
-            card = self._anime_payload(anime)
+            card = self._anime_payload(anime, relations=False)
             card["download"] = download
             home.setdefault("waiting", []).append(card)
             represented.add(media_id)
@@ -3916,40 +4670,37 @@ class WebAppApi:
                 progress = json.loads(str(row["progress_json"] or "{}"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 progress = {}
-            jobs.append({
-                "video": Path(video_path).name,
-                "video_path": video_path,
-                "media_id": media_id,
-                "anime_title": (
-                    str(anime.title)
-                    if anime is not None
-                    else episode_title_by_path.get(video_path, "")
-                ),
-                "episode": int(row["episode"]) if row["episode"] is not None else None,
-                "state": str(row["state"] or "pending"),
-                "stage": str(row["stage"] or "queued"),
-                "action_code": str(row["action_code"] or ""),
-                "heartbeat_at": float(row["heartbeat_at"] or 0),
-                "progress": progress if isinstance(progress, dict) else {},
-                "attempts": int(row["attempts"] or 0),
-                "priority": int(row["priority"] or 0),
-                "next_check": float(row["next_check"] or 0),
-                "error": str(row["last_error"] or ""),
-            })
+            jobs.append(
+                {
+                    "video": Path(video_path).name,
+                    "video_path": video_path,
+                    "media_id": media_id,
+                    "anime_title": (
+                        str(anime.title) if anime is not None else episode_title_by_path.get(video_path, "")
+                    ),
+                    "episode": int(row["episode"]) if row["episode"] is not None else None,
+                    "state": str(row["state"] or "pending"),
+                    "stage": str(row["stage"] or "queued"),
+                    "action_code": str(row["action_code"] or ""),
+                    "heartbeat_at": float(row["heartbeat_at"] or 0),
+                    "progress": progress if isinstance(progress, dict) else {},
+                    "attempts": int(row["attempts"] or 0),
+                    "priority": int(row["priority"] or 0),
+                    "next_check": float(row["next_check"] or 0),
+                    "error": str(row["last_error"] or ""),
+                }
+            )
         return {
             "branding": {"name": APP_NAME, "slug": APP_SLUG, "bundle_id": APP_BUNDLE_ID},
             "current": current,
             "planned": planned,
-            "downloaded": self._downloaded_payloads(anime_by_id),
             "home": home,
-            "episodes": episodes,
             "library": self._library_payloads(anime_by_id),
             "downloads": downloads,
             "torrent_waiting_count": sum(
                 1
                 for item in downloads
-                if str(item.get("state") or "").casefold()
-                in {"waiting", "queued", "stalled"}
+                if str(item.get("state") or "").casefold() in {"waiting", "queued", "stalled"}
             ),
             "subtitle_jobs": jobs,
             "release_upgrades": self.manager.db.upgrade_jobs(limit=50),
@@ -4030,15 +4781,11 @@ class WebAppApi:
                 observed_at = time.time()
             except Exception as exc:
                 warning = str(exc)
-        anime_by_id = {
-            anime.media_id: anime for anime in self.manager.db.anime_list()
-        }
+        anime_by_id = {anime.media_id: anime for anime in self.manager.db.anime_list()}
         rows = self.manager.db.downloads()
         if media_id is not None:
             rows = [
-                item
-                for item in rows
-                if item.media_id is not None and int(item.media_id) == int(media_id)
+                item for item in rows if item.media_id is not None and int(item.media_id) == int(media_id)
             ]
         network_guard: dict[str, Any] = dict(getattr(self, "_last_network_guard", {}) or {})
         if refresh and self.config.aria2.enabled:
@@ -4054,9 +4801,7 @@ class WebAppApi:
             "backend": self.manager.torrent_backend_name() if self._downloads_configured() else "disabled",
             "enabled": self._downloads_enabled(),
             "configured": self._downloads_configured(),
-            "downloads": [
-                self._download_payload(item, anime_by_id) for item in rows
-            ],
+            "downloads": [self._download_payload(item, anime_by_id) for item in rows],
             "storage": self._storage_payload(refresh=False),
             "network_guard": network_guard,
             "warning": warning,
@@ -4078,18 +4823,36 @@ class WebAppApi:
             if previous.get("enabled") is True:
                 return previous
             return {
-                "enabled": True, "download_speed": None, "upload_speed": None,
-                "active": None, "waiting": None, "paused": None,
-                "updated_at": None, "observed_at": None, "stale": True,
-                "observed_state": "unknown", "backend_errors": [],
+                "enabled": True,
+                "download_speed": None,
+                "upload_speed": None,
+                "active": None,
+                "waiting": None,
+                "paused": None,
+                "updated_at": None,
+                "observed_at": None,
+                "stale": True,
+                "observed_state": "unknown",
+                "backend_errors": [],
             }
         try:
             down = up = active = waiting = paused = 0
-            counts = {name: 0 for name in (
-                "downloading", "queued", "stalled", "paused", "checking",
-                "seeding", "complete", "error", "unknown"
-            )}
+            counts = {
+                name: 0
+                for name in (
+                    "downloading",
+                    "queued",
+                    "stalled",
+                    "paused",
+                    "checking",
+                    "seeding",
+                    "complete",
+                    "error",
+                    "unknown",
+                )
+            }
             backend_errors: list[str] = []
+            live_downloads: dict[str, dict[str, Any]] = {}
             observed = 0
             try:
                 clients = self.manager.torrent_clients()
@@ -4106,6 +4869,12 @@ class WebAppApi:
                         active += max(0, int(stats.get("active") or 0))
                         waiting += max(0, int(stats.get("waiting") or 0))
                         paused += max(0, int(stats.get("paused") or 0))
+                        live_progress = getattr(client, "live_progress", None)
+                        if callable(live_progress) and int(stats.get("active") or 0) > 0:
+                            try:
+                                live_downloads.update(live_progress() or {})
+                            except Exception as exc:
+                                self.logger.debug("Torrent live progress skipped: %s", exc)
                     else:
                         rows = client.torrents(category=self.config.qbittorrent.category)
                         for row in rows:
@@ -4114,6 +4883,18 @@ class WebAppApi:
                             up += self._download_number(raw, "upspeed", "upload_speed", "uploadSpeed")
                             state = normalize_torrent_state(getattr(row, "state", ""))
                             counts[state] += 1
+                            row_hash = str(getattr(row, "torrent_hash", "") or "").strip().lower()
+                            row_total = self._download_number(raw, "size", "total_size", "totalLength")
+                            if row_hash and row_total > 0:
+                                row_progress = max(0.0, min(1.0, float(getattr(row, "progress", 0) or 0)))
+                                live_downloads[row_hash] = {
+                                    "progress": row_progress,
+                                    "downloaded_bytes": int(row_total * row_progress),
+                                    "total_bytes": row_total,
+                                    "download_speed": self._download_number(
+                                        raw, "dlspeed", "download_speed", "downloadSpeed"
+                                    ),
+                                }
                             if state in {"downloading", "seeding"}:
                                 active += 1
                             elif state in {"queued", "stalled"}:
@@ -4128,8 +4909,7 @@ class WebAppApi:
                     # "Download status unavailable".  Do not start aria2 from
                     # this read-only status path.
                     aria_absent = bool(
-                        backend == "aria2"
-                        and self._observe_aria2_stopped(shutdown_confirmed=False)
+                        backend == "aria2" and self._observe_aria2_stopped(shutdown_confirmed=False)
                     )
                     if aria_absent:
                         observed += 1
@@ -4155,6 +4935,7 @@ class WebAppApi:
                 "observed_state": "unknown" if stale else "observed",
                 "backend_errors": backend_errors,
                 "counts": counts,
+                "live_downloads": {} if stale else live_downloads,
             }
             # An On poll started before a newer Off must not publish observed
             # rates or re-enable the toggle after the Off transition.
@@ -4164,10 +4945,17 @@ class WebAppApi:
                 # On -> Off -> On can happen while one old poll is in flight.
                 # Its rates belong to a superseded session, even if On again.
                 result.update(
-                    download_speed=None, upload_speed=None,
-                    active=None, waiting=None, paused=None, counts=None,
-                    updated_at=None, observed_at=None,
-                    stale=True, observed_state="unknown",
+                    download_speed=None,
+                    upload_speed=None,
+                    active=None,
+                    waiting=None,
+                    paused=None,
+                    counts=None,
+                    live_downloads={},
+                    updated_at=None,
+                    observed_at=None,
+                    stale=True,
+                    observed_state="unknown",
                 )
                 return result
             self._last_torrent_traffic = result
@@ -4213,9 +5001,7 @@ class WebAppApi:
                         continue
                     raw = dict(getattr(item, "raw", {}) or {})
                     declared = {
-                        str(value).casefold()
-                        for value in raw.get("_backends", [])
-                        if str(value).strip()
+                        str(value).casefold() for value in raw.get("_backends", []) if str(value).strip()
                     }
                     primary = str(raw.get("backend") or "").casefold()
                     if declared and str(backend).casefold() not in declared:
@@ -4246,12 +5032,12 @@ class WebAppApi:
             try:
                 self._bump_ui_state_version()
             except Exception as exc:
-                self.logger.warning(
-                    "RETRY step=torrent.toggle_ui_version error=%r", str(exc)
-                )
+                self.logger.warning("RETRY step=torrent.toggle_ui_version error=%r", str(exc))
             # The Off toggle publishes its intent before waiting for this lock;
             # once Off completes, no old On task may resume or discover jobs.
-            with self._torrent_start_guard():
+            # A quiesce still pausing torrents (startup, an earlier Off)
+            # finishes first, so it cannot pause what this On resumes.
+            with self._torrent_quiesce_guard(), self._torrent_start_guard():
                 current_generation = int(getattr(self, "_torrent_toggle_generation", 0))
                 current = generation is None or generation == current_generation
                 if current and self._torrent_enabled_state():
@@ -4281,6 +5067,7 @@ class WebAppApi:
 
     def set_torrents_enabled(self, enabled: bool) -> dict[str, Any]:
         requested = bool(enabled)
+        self._torrent_changed()
         lock = self._torrent_state_guard()
         with lock:
             previous = bool(self._torrent_session_enabled)
@@ -4308,22 +5095,11 @@ class WebAppApi:
         if logger is not None:
             logger.info(
                 "EVENT torrent.toggle_transition source=request previous=%s desired=%s effective=%s ui_version=%s",
-                previous, requested, requested, ui_version,
+                previous,
+                requested,
+                requested,
+                ui_version,
             )
-
-        quiet_result: dict[str, Any] = {}
-        if not requested:
-            # A resume that began before Off finishes first; then quiesce it.
-            # A delayed On worker rechecks desired state after this guard.
-            with self._torrent_start_guard():
-                shared = self._torrent_shared_admission()
-                if shared is not None:
-                    with shared.locked():
-                        shared.publish(False)
-                        if not self._torrent_enabled_state():
-                            quiet_result = self._quiesce_torrent_backends(reason="toggle_off")
-                elif not self._torrent_enabled_state():
-                    quiet_result = self._quiesce_torrent_backends(reason="toggle_off")
 
         try:
             with lock:
@@ -4357,26 +5133,42 @@ class WebAppApi:
             if logger is not None:
                 logger.error(
                     "FAIL torrent.toggle_transition source=persist desired=%s restored=%s error=%r",
-                    requested, previous, str(exc),
+                    requested,
+                    previous,
+                    str(exc),
                 )
             raise
 
+        stopping = False
         if not requested and not persisted:
             with lock:
-                if (self._torrent_toggle_generation == generation
-                        and not self._torrent_session_enabled):
+                if self._torrent_toggle_generation == generation and not self._torrent_session_enabled:
+                    # Off is acknowledged at once; publishing it to the agent and
+                    # stopping the backends (one RPC each, which can wait on an
+                    # in-flight start or a NAS timeout) continue in the background.
                     self._torrent_off_evidence = {
                         "generation": generation,
-                        "aria2_shutdown_confirmed": bool(quiet_result.get("aria2_stopped", False)),
+                        "stopping": True,
                         "checked_at": 0.0,
                     }
+                    stopping = True
+            if stopping:
+                thread = threading.Thread(
+                    target=self._torrent_off_quiet,
+                    args=(generation,),
+                    name=f"{APP_SLUG}-torrent-off",
+                    daemon=True,
+                )
+                self._torrent_off_quiet_thread = thread
+                thread.start()
         with lock:
             if self._torrent_toggle_generation == generation:
                 self._torrent_ui_version_pending = False
         if logger is not None:
             logger.info(
                 "EVENT torrent.toggle_transition source=persist desired=%s effective=%s",
-                requested, persisted,
+                requested,
+                persisted,
             )
         # On becomes visible to the background agent only after its config
         # was persisted, and only if a newer Off did not supersede this click.
@@ -4386,8 +5178,10 @@ class WebAppApi:
                 if shared is not None:
                     with shared.locked():
                         with lock:
-                            if (self._torrent_toggle_generation == generation
-                                    and self._torrent_session_enabled):
+                            if (
+                                self._torrent_toggle_generation == generation
+                                and self._torrent_session_enabled
+                            ):
                                 shared.publish(True)
         scheduled = False
         if requested and persisted and self._downloads_configured():
@@ -4406,12 +5200,16 @@ class WebAppApi:
                     if logger is not None:
                         logger.warning(
                             "RETRY step=torrent.toggle_schedule desired=%s error=%r",
-                            requested, str(exc),
+                            requested,
+                            str(exc),
                         )
         if logger is not None:
             logger.info(
                 "EVENT torrent.toggle requested=%s persisted=%s ui_version=%s search_scheduled=%s",
-                requested, persisted, ui_version, scheduled,
+                requested,
+                persisted,
+                ui_version,
+                scheduled,
             )
         return {
             "enabled": persisted,
@@ -4423,12 +5221,60 @@ class WebAppApi:
             # carries no observed backend waiting count.
             "waiting": None,
             "pending_intents": self.manager.download_intents.waiting_count(),
-            # Off acknowledgement carries intent; read-only status polling
-            # subsequently confirms whether backend traffic really stopped.
-            "transition": "unconfirmed" if not persisted else "enabled",
-            "aria2_stopped": bool(quiet_result.get("aria2_stopped", False)),
-            "qbittorrent_paused": int(quiet_result.get("qbittorrent_paused", 0) or 0),
+            # Off acknowledgement carries intent; the backends are still being
+            # stopped, and read-only status polling then confirms it.
+            "transition": "enabled" if persisted else ("stopping" if stopping else "unconfirmed"),
+            "aria2_stopped": None,
+            "qbittorrent_paused": None,
         }
+
+    def _torrent_off_current(self, generation: int) -> bool:
+        with self._torrent_state_guard():
+            return int(getattr(self, "_torrent_toggle_generation", 0)) == generation and not bool(
+                self._torrent_enabled_state()
+            )
+
+    def _torrent_off_quiet(self, generation: int) -> None:
+        """Publish Off to other processes and stop the backends (Torrent Off's background half)."""
+        result: dict[str, Any] = {}
+        try:
+            # A resume that began before Off finishes first; then quiesce it.
+            # A delayed On worker rechecks desired state after this guard.
+            with self._torrent_start_guard():
+                if not self._torrent_off_current(generation):
+                    return
+                shared = self._torrent_shared_admission()
+                if shared is not None:
+                    with shared.locked():
+                        if not self._torrent_off_current(generation):
+                            return
+                        shared.publish(False)
+            with self._torrent_quiesce_guard():
+                if self._torrent_off_current(generation):
+                    result = self._quiesce_torrent_backends(reason="toggle_off")
+        except Exception as exc:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.warning("FALLBACK step=torrent.toggle_off_quiet error=%r", str(exc))
+        finally:
+            with self._torrent_state_guard():
+                evidence = dict(getattr(self, "_torrent_off_evidence", {}) or {})
+                if evidence.get("generation") == generation and self._torrent_off_current(generation):
+                    self._torrent_off_evidence = {
+                        "generation": generation,
+                        "aria2_shutdown_confirmed": bool(result.get("aria2_stopped", False)),
+                        "checked_at": 0.0,
+                    }
+            # Show the observed result now instead of at the idle pace.
+            self._torrent_changed(0.2)
+
+    def _wait_torrent_off_quiet(self, timeout: float = 10.0) -> bool:
+        """Wait for the background half of the latest Torrent Off (tests, shutdown)."""
+        thread = getattr(self, "_torrent_off_quiet_thread", None)
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
     def torrent_download_action(
         self,
@@ -4440,24 +5286,50 @@ class WebAppApi:
         # Acquiring clients can launch aria2/qBittorrent. Keep the admission
         # guard until the side effect is complete, not just until a boolean
         # was checked, so Off cannot race with a delayed resume/reconnect.
+        self._torrent_changed()
         if str(action or "").strip().casefold() in {"resume", "reconnect"}:
             with self._torrent_start_guard():
                 shared = self._torrent_shared_admission()
                 if shared is not None:
                     with shared.locked():
-                        if not self._torrent_enabled_state() or not shared.enabled(fallback=self._torrent_enabled_state()):
+                        if not self._torrent_enabled_state() or not shared.enabled(
+                            fallback=self._torrent_enabled_state()
+                        ):
                             return self._torrent_off_action_response()
-                        return self._torrent_download_action_impl(
-                            torrent_hash, action, delete_files=delete_files, backend=backend
-                        )
+                        with self._torrent_app_start_allowed():
+                            return self._torrent_download_action_impl(
+                                torrent_hash, action, delete_files=delete_files, backend=backend
+                            )
                 if not self._torrent_enabled_state():
                     return self._torrent_off_action_response()
-                return self._torrent_download_action_impl(
-                    torrent_hash, action, delete_files=delete_files, backend=backend
-                )
+                with self._torrent_app_start_allowed():
+                    return self._torrent_download_action_impl(
+                        torrent_hash, action, delete_files=delete_files, backend=backend
+                    )
         return self._torrent_download_action_impl(
             torrent_hash, action, delete_files=delete_files, backend=backend
         )
+
+    def _torrent_app_start_allowed(self):
+        """A user's resume/reconnect may launch a closed qBittorrent; polls may not."""
+        allow = getattr(getattr(self, "manager", None), "allow_torrent_app_start", None)
+        return allow() if callable(allow) else contextlib.nullcontext()
+
+    def _start_torrent_app_on_launch(self) -> None:
+        """Launch qBittorrent once when Pudge starts (status polls no longer do)."""
+        qbt = self.config.qbittorrent
+        if sys.platform != "darwin" or not (qbt.enabled and qbt.auto_start_app):
+            return
+        try:
+            if not self.manager.downloads_enabled():
+                return
+            with self.manager.allow_torrent_app_start():
+                client = self.manager.qbt_client()
+                login = getattr(client, "login", None)
+                if callable(login):
+                    login()
+        except Exception as exc:  # noqa: BLE001 - qBittorrent is optional at launch
+            self.logger.info("SKIP step=torrent.qbittorrent_launch reason=%r", str(exc)[:300])
 
     def _torrent_download_action_impl(
         self,
@@ -4499,13 +5371,11 @@ class WebAppApi:
             None,
         )
         if known is None:
-            raise ValueError("Download is not managed by Pudge")
+            raise ValueError(err("web.downloadNotManaged"))
         if command not in {"pause", "resume", "reconnect", "remove"}:
-            raise ValueError("Unknown download action")
+            raise ValueError(err("web.unknownDownloadAction"))
         known_backends = [
-            str(name).casefold()
-            for name in (known.raw or {}).get("_backends", [])
-            if str(name).strip()
+            str(name).casefold() for name in (known.raw or {}).get("_backends", []) if str(name).strip()
         ]
         if len(known_backends) > 1:
             backend_hint = ""
@@ -4513,7 +5383,8 @@ class WebAppApi:
             backend_hint = str((known.raw or {}).get("backend") or "").casefold()
         clients = self.manager.torrent_clients()
         selected = [
-            (name, client) for name, client in clients
+            (name, client)
+            for name, client in clients
             if (
                 (known_backends and name in known_backends)
                 or (not known_backends and (not backend_hint or name == backend_hint))
@@ -4522,7 +5393,7 @@ class WebAppApi:
         if not selected:
             for _name, client in clients:
                 client.close()
-            raise ValueError("Torrent backend is no longer enabled")
+            raise ValueError(err("web.torrentBackendDisabled"))
         try:
             for name, client in selected:
                 if command == "pause":
@@ -4532,7 +5403,7 @@ class WebAppApi:
                 elif command == "reconnect":
                     reconnect = getattr(client, "reconnect", None)
                     if not callable(reconnect):
-                        raise ValueError("Reconnect is available for the built-in torrent client")
+                        raise ValueError(err("web.reconnectBuiltinOnly"))
                     reconnect(value)
                 else:
                     client.delete(value, delete_files=bool(delete_files))
@@ -4594,7 +5465,13 @@ class WebAppApi:
 
     def scan_watched_media_folders(self) -> dict[str, int]:
         """Cheap first-pass import of mixed watched folders before Refresh work."""
-        stats = {"light_novels": 0, "manga": 0, "audiobooks": 0, "files_seen": 0, "light_novels_skipped_non_japanese": 0}
+        stats = {
+            "light_novels": 0,
+            "manga": 0,
+            "audiobooks": 0,
+            "files_seen": 0,
+            "light_novels_skipped_non_japanese": 0,
+        }
         roots: list[Path] = []
         limit = max(1, int(self.config.paths.max_scanned_files or 8000))
         for configured in self.config.paths.download_dirs:
@@ -4644,7 +5521,9 @@ class WebAppApi:
                     self._mark_watched_import(kind, path, signature)
                     stats[kind] += 1
                 except Exception as exc:
-                    self.logger.debug("Watched media import skipped kind=%s path=%s error=%s", kind, path, exc)
+                    self.logger.debug(
+                        "Watched media import skipped kind=%s path=%s error=%s", kind, path, exc
+                    )
 
             audio_by_parent: dict[Path, list[Path]] = {}
             for path in candidates:
@@ -4687,7 +5566,9 @@ class WebAppApi:
                 local_video_rows: int | None = None
                 try:
                     with timed_step(self.logger, "library.scan_local", priority="first"):
-                        local_video_rows = len(self.manager.scan_library(reuse_unchanged=True, user_requested=True))
+                        local_video_rows = len(
+                            self.manager.scan_library(reuse_unchanged=True, user_requested=True)
+                        )
                 except Exception as exc:
                     self.logger.warning("Watched video scan skipped: %s", exc)
 
@@ -4704,9 +5585,7 @@ class WebAppApi:
                 # Manual Refresh must remain interactive even if the launch agent
                 # is currently aligning subtitles. Release discovery runs now;
                 # expensive subtitle preparation is queued separately.
-                stats = self.manager.run_interactive_refresh(
-                    pre_scanned_library_count=local_video_rows
-                )
+                stats = self.manager.run_interactive_refresh(pre_scanned_library_count=local_video_rows)
                 reconcile_ready = getattr(self.manager, "reconcile_prepared_subtitle_rows", None)
                 repaired_ready = int(reconcile_ready() or 0) if callable(reconcile_ready) else 0
                 if repaired_ready:
@@ -4760,9 +5639,7 @@ class WebAppApi:
         # Backwards-compatible alias. This no longer contacts AniList.
         return self.refresh_local()
 
-    def set_anime_japanese_subtitles_required(
-        self, media_id: int, required: bool
-    ) -> dict[str, Any]:
+    def set_anime_japanese_subtitles_required(self, media_id: int, required: bool) -> dict[str, Any]:
         value = self.manager.set_japanese_subtitles_required(int(media_id), bool(required))
         return {
             "media_id": int(media_id),
@@ -4794,10 +5671,7 @@ class WebAppApi:
             if path.is_file():
                 fresh_jobs.append(row)
 
-        preferred_paths = tuple(
-            Path(str(row["video_path"])).expanduser().resolve()
-            for row in fresh_jobs
-        )
+        preferred_paths = tuple(Path(str(row["video_path"])).expanduser().resolve() for row in fresh_jobs)
         processed = 0
         queued = False
         if preferred_paths:
@@ -4921,7 +5795,11 @@ class WebAppApi:
                 )
                 self._startup_maintenance_thread = thread
                 thread.start()
-                if sys.platform == "darwin" and self.manager.work_scheduler.background_wait_reason() is None and not getattr(self, "_vn_prewarm_started", False):
+                if (
+                    sys.platform == "darwin"
+                    and self.manager.work_scheduler.background_wait_reason() is None
+                    and not getattr(self, "_vn_prewarm_started", False)
+                ):
                     # First PyObjC/Quartz import costs seconds; do it off the tab click.
                     self._vn_prewarm_started = True
                     threading.Thread(
@@ -4976,7 +5854,9 @@ class WebAppApi:
         }
 
     def poll_downloads_and_subtitles(
-        self, known_ui_state_version: str = "", has_active_downloads: bool = True,
+        self,
+        known_ui_state_version: str = "",
+        has_active_downloads: bool = True,
         window_active: bool = True,
     ) -> dict[str, Any]:
         """Coalesce expensive work; never await subtitle preparation on the bridge."""
@@ -4986,14 +5866,17 @@ class WebAppApi:
         with lock:
             worker = getattr(self, "_download_poll_worker", None)
             if worker is None or not worker.is_alive():
+
                 def run() -> None:
                     try:
                         result = self._poll_downloads_and_subtitles_sync(
-                            known_ui_state_version, has_active_downloads, window_active)
+                            known_ui_state_version, has_active_downloads, window_active
+                        )
                         self._download_poll_result = result.get("stats", {})
                     except Exception as exc:
                         self.logger.exception("foreground.worker failed: %s", exc)
                         self._download_poll_result = {"error": str(exc)}
+
                 worker = threading.Thread(target=run, name="pudge-download-subtitles", daemon=True)
                 self._download_poll_worker = worker
                 worker.start()
@@ -5001,10 +5884,41 @@ class WebAppApi:
             hint = self.manager.db.subtitle_job_poll_hint()
         except Exception:
             hint = {}
-        return {"skipped": False, "running": worker.is_alive(),
-                "stats": dict(getattr(self, "_download_poll_result", {})),
-                "subtitle_poll_hint": hint,
-                **self._foreground_poll_state_payload(known_ui_state_version)}
+        return {
+            "skipped": False,
+            "running": worker.is_alive(),
+            "stats": dict(getattr(self, "_download_poll_result", {})),
+            "subtitle_poll_hint": hint,
+            **self._foreground_poll_state_payload(known_ui_state_version),
+        }
+
+    FOREGROUND_POLL_SUMMARY_SECONDS = 300.0
+
+    def _note_foreground_poll(self, elapsed_ms: float, stats: dict[str, Any], window_active: bool) -> None:
+        """Count foreground polls; log one INFO summary at most every 5 minutes."""
+        summary = getattr(self, "_foreground_poll_summary", None)
+        now = time.monotonic()
+        if summary is None:
+            summary = {"since": now, "polls": 0, "total_ms": 0.0, "max_ms": 0.0, "qbittorrent_syncs": 0}
+            self._foreground_poll_summary = summary
+        summary["polls"] += 1
+        summary["total_ms"] += float(elapsed_ms)
+        summary["max_ms"] = max(float(summary["max_ms"]), float(elapsed_ms))
+        if "qbittorrent_throttled" not in stats:
+            summary["qbittorrent_syncs"] += 1
+        if now - float(summary["since"]) < self.FOREGROUND_POLL_SUMMARY_SECONDS:
+            return
+        self.logger.info(
+            "SUMMARY step=foreground.poll polls=%s seconds=%.0f avg_ms=%.1f max_ms=%.1f "
+            "qbittorrent_syncs=%s window_active=%s",
+            summary["polls"],
+            now - float(summary["since"]),
+            float(summary["total_ms"]) / max(1, int(summary["polls"])),
+            float(summary["max_ms"]),
+            summary["qbittorrent_syncs"],
+            bool(window_active),
+        )
+        self._foreground_poll_summary = None
 
     def _poll_downloads_and_subtitles_sync(
         self,
@@ -5047,8 +5961,10 @@ class WebAppApi:
                 **self._foreground_poll_state_payload(known_ui_state_version),
             }
         stats = {"downloads": 0, "subs": 0}
+        poll_started = time.perf_counter()
         try:
-            with timed_step(self.logger, "foreground.poll", mode="downloads-only"):
+            # Polls run up to every 2 s: START/DONE are DEBUG, with an INFO summary every 5 minutes.
+            with timed_step(self.logger, "foreground.poll", level=logging.DEBUG, mode="downloads-only"):
                 try:
                     self.manager.reconcile_completed_download_rows()
                     self.manager.reconcile_prepared_subtitle_rows()
@@ -5062,7 +5978,7 @@ class WebAppApi:
                         # User-visible active downloads retain the old cadence.
                         qbt_interval = 15.0 if bool(has_active_downloads) else 60.0
                         if now_mono - last_qbt >= qbt_interval:
-                            with timed_step(self.logger, "foreground.qbittorrent"):
+                            with timed_step(self.logger, "foreground.qbittorrent", level=logging.DEBUG):
                                 stats["downloads"] = self.manager.sync_downloads()
                             self._last_foreground_qbt_sync = time.monotonic()
                             completed_paths = self.manager.last_completed_video_paths
@@ -5088,9 +6004,7 @@ class WebAppApi:
                         # stale frontend state.  Manual Refresh still performs an
                         # immediate full inbox scan through AnimeManager.run_once().
                         inbox_interval = 30.0 if bool(window_active) else 120.0
-                        last_inbox = float(
-                            getattr(self, "_last_foreground_subtitle_inbox_scan", 0.0) or 0.0
-                        )
+                        last_inbox = float(getattr(self, "_last_foreground_subtitle_inbox_scan", 0.0) or 0.0)
                         inbox: dict[str, Any] = {"requeued": 0}
                         if now_mono - last_inbox >= inbox_interval:
                             inbox = self.manager.scan_subtitle_inbox()
@@ -5171,20 +6085,14 @@ class WebAppApi:
                         # Tag cleanup is maintenance, not a status poll.  Run it
                         # after an actual qBittorrent sync or at a low fixed cadence.
                         tag_interval = 60.0 if bool(window_active) else 120.0
-                        last_tags = float(
-                            getattr(self, "_last_foreground_qbt_tag_cleanup", 0.0) or 0.0
-                        )
-                        if maintenance_acquired and (
-                            qbt_synced or now_mono - last_tags >= tag_interval
-                        ):
-                            with timed_step(self.logger, "foreground.qbittorrent_tag_cleanup"):
+                        last_tags = float(getattr(self, "_last_foreground_qbt_tag_cleanup", 0.0) or 0.0)
+                        if maintenance_acquired and (qbt_synced or now_mono - last_tags >= tag_interval):
+                            with timed_step(
+                                self.logger, "foreground.qbittorrent_tag_cleanup", level=logging.DEBUG
+                            ):
                                 tag_stats = self.manager.cleanup_qbittorrent_tags()
                                 stats.update(
-                                    {
-                                        key: value
-                                        for key, value in tag_stats.items()
-                                        if int(value or 0) > 0
-                                    }
+                                    {key: value for key, value in tag_stats.items() if int(value or 0) > 0}
                                 )
                             self._last_foreground_qbt_tag_cleanup = time.monotonic()
                         else:
@@ -5206,6 +6114,7 @@ class WebAppApi:
                             stats["downloads_after_auto"] = self.manager.sync_downloads()
                 except Exception as exc:
                     self.manager.log(str(exc))
+            self._note_foreground_poll((time.perf_counter() - poll_started) * 1000, stats, window_active)
             # Foreground polling is frequent and already mutates ui_state_version
             # whenever meaningful state changes. Reuse the versioned snapshot on
             # no-op polls instead of running reconciliation and rebuilding the full
@@ -5245,7 +6154,8 @@ class WebAppApi:
             if path.is_dir():
                 try:
                     audio_files = [
-                        item for item in path.iterdir()
+                        item
+                        for item in path.iterdir()
                         if item.is_file() and item.suffix.casefold() in AUDIOBOOK_EXTENSIONS
                     ]
                     # pudge-v0.7.23-nested-manga-drop-v1
@@ -5257,7 +6167,16 @@ class WebAppApi:
                 if audio_files:
                     try:
                         book = self.audiobooks.import_folder(path)
-                        record("audiobook", "audiobooks", {"id": int(book["id"]), "title": str(book.get("title") or path.name), "book": book}, path)
+                        record(
+                            "audiobook",
+                            "audiobooks",
+                            {
+                                "id": int(book["id"]),
+                                "title": str(book.get("title") or path.name),
+                                "book": book,
+                            },
+                            path,
+                        )
                     except Exception as exc:
                         errors.append(f"{path.name}: {exc}")
                 if images:
@@ -5280,16 +6199,19 @@ class WebAppApi:
                         },
                         path,
                     )
+
                     def link_later(book_id: int = int(book["id"])) -> None:
                         try:
                             self.audiobooks.auto_link_light_novel(book_id)
                         except Exception as exc:
-                            self.logger.debug("Dropped LN audio auto-link skipped book_id=%s error=%s", book_id, exc)
+                            self.logger.debug(
+                                "Dropped LN audio auto-link skipped book_id=%s error=%s", book_id, exc
+                            )
                         irodori = self.light_novels.settings()
                         if (
                             irodori.irodori_tts_enabled
                             and irodori.irodori_tts_auto_generate
-                    and self.manager.work_scheduler.background_wait_reason() is None
+                            and self.manager.work_scheduler.background_wait_reason() is None
                             and self.manager.work_scheduler.background_wait_reason() is None
                             and self._audiobook_link_kind(book_id) == "none"
                         ):
@@ -5301,17 +6223,28 @@ class WebAppApi:
                                     book_id,
                                     exc,
                                 )
+
                     timer = threading.Timer(1.5, link_later)
                     timer.daemon = True
                     timer.start()
                 elif suffix in {".cbz", ".zip"}:
                     book = self.manga.import_file(path)
-                    record("manga", "manga", {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book}, path)
+                    record(
+                        "manga",
+                        "manga",
+                        {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book},
+                        path,
+                    )
                 elif suffix in image_extensions:
                     image_paths.append(path)
                 elif suffix in AUDIOBOOK_EXTENSIONS:
                     book = self.audiobooks.import_file(path)
-                    record("audiobook", "audiobooks", {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book}, path)
+                    record(
+                        "audiobook",
+                        "audiobooks",
+                        {"id": int(book["id"]), "title": str(book.get("title") or path.stem), "book": book},
+                        path,
+                    )
                 elif suffix in VIDEO_EXTENSIONS:
                     episode = self.manager.import_local_video(path)
                     record(
@@ -5335,7 +6268,8 @@ class WebAppApi:
                 books = self.manga.import_image_groups(image_paths)
                 for book in books:
                     record(
-                        "manga", "manga",
+                        "manga",
+                        "manga",
                         {
                             "id": int(book["id"]),
                             "title": str(book.get("title") or "Dropped manga"),
@@ -5425,13 +6359,17 @@ class WebAppApi:
                 "current": 0.0,
                 "total": 0.0,
                 "output_dir": str(output_dir),
-                "message": "Audiobook generation interrupted",
+                "message": t("web.audiobookGenerationInterrupted"),
                 "updated_at": output_dir.stat().st_mtime,
             }
         return None
 
     def _audiobook_link_kind(self, book_id: int, link: dict[str, Any] | None = None) -> str:
-        link = link if link is not None else self.audiobooks.link_for_light_novel(int(book_id), include_alignment=False)
+        link = (
+            link
+            if link is not None
+            else self.audiobooks.link_for_light_novel(int(book_id), include_alignment=False)
+        )
         if not link:
             return "none"
         book = link.get("book") or {}
@@ -5477,7 +6415,9 @@ class WebAppApi:
                 "current": current,
                 "total": total,
                 "progress": progress,
-                "message": "Pausing…" if control == "pause_requested" else str(job.get("message") or ""),
+                "message": t("web.pausing")
+                if control == "pause_requested"
+                else str(job.get("message") or ""),
                 "error": str(job.get("error") or ""),
                 "mode": mode,
                 "resumable": False,
@@ -5497,7 +6437,7 @@ class WebAppApi:
                 "current": current,
                 "total": total,
                 "progress": progress,
-                "message": str(manifest.get("message") or "Audiobook generation can be resumed"),
+                "message": str(manifest.get("message") or t("web.audiobookGenerationResumable")),
                 "error": str(manifest.get("error") or ""),
                 "mode": str(manifest.get("mode") or "generate"),
                 "resumable": True,
@@ -5579,7 +6519,11 @@ class WebAppApi:
         state = self.manga.state()
         self._schedule_manga_mean_score_backfill(state)
         payload = self._manga_state_payload(state)
-        self.logger.info("TIMING step=manga.state duration_ms=%.1f books=%s", (time.perf_counter() - started) * 1000.0, len(state.get("books") or []))
+        self.logger.info(
+            "TIMING step=manga.state duration_ms=%.1f books=%s",
+            (time.perf_counter() - started) * 1000.0,
+            len(state.get("books") or []),
+        )
         return payload
 
     def _schedule_manga_mean_score_backfill(self, state: dict[str, Any]) -> None:
@@ -5587,7 +6531,9 @@ class WebAppApi:
             return
         attempted = set(getattr(self, "_manga_mean_score_attempted", set()))
         if not any(
-            book.get("anilist_id") and book.get("mean_score") is None and int(book["anilist_id"]) not in attempted
+            book.get("anilist_id")
+            and book.get("mean_score") is None
+            and int(book["anilist_id"]) not in attempted
             for book in state.get("books", [])
         ):
             return
@@ -5611,7 +6557,9 @@ class WebAppApi:
         ids = [target_id]
         try:
             with self.manager.db.connect() as conn:
-                selected = conn.execute("SELECT title,path FROM manga_books WHERE id=?", (target_id,)).fetchone()
+                selected = conn.execute(
+                    "SELECT title,path FROM manga_books WHERE id=?", (target_id,)
+                ).fetchone()
                 if selected is not None:
                     selected_key = MangaService.series_key(
                         str(selected["title"] or Path(str(selected["path"] or "")).stem)
@@ -5620,9 +6568,8 @@ class WebAppApi:
                     ids = [
                         int(row["id"])
                         for row in rows
-                        if MangaService.series_key(
-                            str(row["title"] or Path(str(row["path"] or "")).stem)
-                        ) == selected_key
+                        if MangaService.series_key(str(row["title"] or Path(str(row["path"] or "")).stem))
+                        == selected_key
                     ] or [target_id]
         except Exception:
             ids = [target_id]
@@ -5661,7 +6608,7 @@ class WebAppApi:
         for job_id in job_ids:
             try:
                 # Terminal now, so a restart never offers to resume a deleted book.
-                self.job_center.cancelled(job_id, message="Manga removed")
+                self.job_center.cancelled(job_id, message=t("web.mangaRemoved"))
             except Exception:
                 self.logger.exception("FAIL step=manga.delete.cancel_ocr job_id=%s", job_id)
 
@@ -5705,16 +6652,23 @@ class WebAppApi:
             rows.append(
                 {
                     "media_id": int(media.get("id")),
-                    "title": titles.get("userPreferred") or titles.get("romaji") or titles.get("native") or "",
+                    "title": titles.get("userPreferred")
+                    or titles.get("romaji")
+                    or titles.get("native")
+                    or "",
                     "format": media_format,
                     "chapters": media.get("chapters"),
                     "volumes": media.get("volumes"),
                     "media_status": media.get("status") or "",
-                    "mean_score": float(media.get("meanScore")) if media.get("meanScore") is not None else None,
+                    "mean_score": float(media.get("meanScore"))
+                    if media.get("meanScore") is not None
+                    else None,
                     "list_status": entry.get("status") or "",
                     "progress": entry.get("progress") or 0,
                     "user_score": float(entry.get("score")) if entry.get("score") is not None else None,
-                    "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "",
+                    "cover": (media.get("coverImage") or {}).get("extraLarge")
+                    or (media.get("coverImage") or {}).get("large")
+                    or "",
                     "site_url": media.get("siteUrl") or f"https://anilist.co/manga/{int(media.get('id'))}",
                 }
             )
@@ -5741,16 +6695,94 @@ class WebAppApi:
         book = self.manga.unbind_anilist(int(book_id))
         return {"book": book, "state": self._manga_state_payload()}
 
-    def _manga_ocr_backend(self) -> str:
-        config = getattr(self, "config", None)
-        tools = getattr(config, "tools", None)
-        backend = str(getattr(tools, "manga_ocr_backend", "pudge") or "pudge").strip().casefold()
-        return backend if backend in {"pudge", "mokuro"} else "pudge"
+    # pudge-manga-background-ocr-v1
+    def _manga_background_ocr_loop(self, cancel_event: threading.Event) -> None:
+        """Fill in OCR of library volumes while the user is away from Pudge."""
+        while not cancel_event.wait(60.0):
+            try:
+                book_id = self._manga_background_ocr_candidate()
+                if book_id is not None:
+                    self.logger.info("EVENT manga_background_ocr.start book_id=%s", book_id)
+                    self.start_manga_ocr_book(book_id, background=True)
+            except Exception:
+                self.logger.exception("FAIL step=manga_background_ocr.tick")
+
+    def _manga_background_ocr_blocked(self) -> str:
+        """Why library OCR may not run in the background right now ("" = it may).
+
+        Checked before a run and again before every page, so a run pauses as
+        soon as the window comes to the front, the Mac goes on battery or the
+        setting is turned off.
+        """
+        if not bool(getattr(getattr(self.config, "tools", None), "manga_background_ocr", False)):
+            return "setting_off"
+        if app_session_window_active():
+            return "window_active"
+        scheduler = getattr(getattr(self, "manager", None), "work_scheduler", None)
+        if scheduler is None:
+            return "no_scheduler"
+        try:
+            on_battery = scheduler.power_snapshot().get("on_battery")
+        except Exception:
+            on_battery = None
+        if on_battery is not False:
+            return "on_battery"  # on battery, or the power source is unknown
+        return ""
+
+    def _manga_background_ocr_candidate(self) -> int | None:
+        """The most recently used unfinished volume, when background OCR may run now."""
+        if self._manga_background_ocr_blocked():
+            return None
+        scheduler = getattr(getattr(self, "manager", None), "work_scheduler", None)
+        if scheduler is None or scheduler.background_wait_reason() is not None:
+            return None
+        if not self._manga_ocr_backend_available():
+            return None
+        with self._manga_book_ocr_lock:
+            if any(thread.is_alive() for thread in self._manga_book_ocr_threads.values()):
+                return None
+        tried = getattr(self, "_manga_background_ocr_tried", None)
+        if tried is None:
+            tried = self._manga_background_ocr_tried = {}
+        now = time.time()
+        with self.manga.db.connect() as conn:
+            ids = [
+                int(row["id"])
+                for row in conn.execute("SELECT id FROM manga_books ORDER BY updated_at DESC, id DESC")
+            ]
+        for book_id in ids:
+            # Finished volumes are remembered for a day and a volume that still
+            # has unreadable pages is retried twice a day at most, so an idle
+            # check does not read every volume's OCR status each minute.
+            if now - tried.get(book_id, 0.0) < 12 * 3600:
+                continue
+            try:
+                complete = bool(self.manga.ocr_cache_status(book_id).get("complete"))
+            except Exception:
+                continue
+            if complete:
+                tried[book_id] = now + 12 * 3600
+                continue
+            tried[book_id] = now
+            return book_id
+        return None
 
     def _mokuro_ocr_root(self) -> Path:
         return self.config.paths.cache_dir / "mokuro-ocr"
 
+    def _mokuro_external_python(self) -> Path | None:
+        """A user-provided Mokuro environment (Settings → Manga OCR), if it exists."""
+        config = getattr(self, "config", None)
+        configured = str(getattr(getattr(config, "tools", None), "manga_mokuro_python", "") or "").strip()
+        if not configured:
+            return None
+        path = Path(configured).expanduser()
+        return path if path.is_file() else None
+
     def _mokuro_ocr_python_path(self) -> Path:
+        external = self._mokuro_external_python()
+        if external is not None:
+            return external
         root = self._mokuro_ocr_root() / "venv"
         return root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
@@ -5760,46 +6792,96 @@ class WebAppApi:
     def _mokuro_ocr_marker_path(self) -> Path:
         return self._mokuro_ocr_root() / "model-ready.json"
 
-    def _manga_ocr_backend_available(self, *, refresh: bool = False) -> bool:
-        if self._manga_ocr_backend() == "mokuro":
-            return self._mokuro_ocr_python_path().is_file() and self._mokuro_ocr_marker_path().is_file()
-        return self.manga.ocr_available(refresh=refresh)
+    @staticmethod
+    def _mokuro_record_dir() -> Path:
+        # With Pudge's data, not in the cache: emptying the cache must not lose the working set.
+        return DATA_DIR / "optional" / "mokuro-ocr"
+
+    def _mokuro_working_set_path(self) -> Path:
+        return self._mokuro_record_dir() / "working-set.txt"
+
+    def _mokuro_update_record(self) -> dict[str, Any]:
+        try:
+            data = json.loads((self._mokuro_record_dir() / "update.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_mokuro_update_record(self, **values: Any) -> None:
+        path = self._mokuro_record_dir() / "update.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({**self._mokuro_update_record(), **values}, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _mokuro_tested_set(self) -> tuple[Path, dict[str, str]]:
+        """The package set Install and repair put on the Mac, as (constraints file, packages).
+
+        The set of the environment the last successful Update Mokuro switched to, else the
+        one Pudge ships.
+        """
+        for path in (self._mokuro_working_set_path(), MOKURO_TESTED_SET):
+            try:
+                packages = _pinned_packages(path.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if packages.get("mokuro"):
+                return path, packages
+        raise RuntimeError(err("setup.mokuroTestedSetMissing"))
+
+    def _write_mokuro_markers(self, python: Path, packages: dict[str, str], *, model: bool) -> None:
+        payload = {
+            "ready_at": time.time(),
+            "python": str(python),
+            "version": packages.get("mokuro", ""),
+            "manga_ocr": packages.get("manga-ocr", ""),
+        }
+        paths = [self._mokuro_ocr_package_marker_path()]
+        if model:
+            paths.append(self._mokuro_ocr_marker_path())
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _manga_ocr_backend_available(self) -> bool:
+        if self._mokuro_external_python() is not None:
+            return True
+        return self._mokuro_ocr_python_path().is_file() and self._mokuro_ocr_marker_path().is_file()
 
     def _manga_state_payload(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(state if state is not None else self.manga.state())
-        payload["ocr_backend"] = self._manga_ocr_backend()
         payload["ocr_available"] = self._manga_ocr_backend_available()
         return payload
 
-    def _manga_ocr_log_path(self, backend: str | None = None) -> Path:
-        selected = str(backend or self._manga_ocr_backend()).strip().casefold()
-        suffix = "mokuro-ocr-install" if selected == "mokuro" else "manga-ocr-install"
-        return DEFAULT_LOG_PATH.with_name(f"{APP_SLUG}-{suffix}.log")
-
-    def _manga_ocr_marker_path(self) -> Path:
-        return self.config.paths.cache_dir / "manga-ocr" / "model-ready.json"
+    def _manga_ocr_log_path(self) -> Path:
+        return DEFAULT_LOG_PATH.with_name(f"{APP_SLUG}-mokuro-ocr-install.log")
 
     def manga_ocr_status(self) -> dict[str, Any]:
-        backend = self._manga_ocr_backend()
+        backend = "mokuro"
         with self._manga_ocr_install_lock:
             state = dict(self._manga_ocr_install_state)
             thread = self._manga_ocr_install_thread
-            state_backend = str(state.get("backend") or "pudge").strip().casefold()
-            thread_backend = str(state.get("backend") or backend).strip().casefold()
-            running = bool(thread is not None and thread.is_alive() and thread_backend == backend)
-        if backend == "mokuro":
+            running = bool(thread is not None and thread.is_alive())
+        external = self._mokuro_external_python() is not None
+        marker: dict[str, Any] = {}
+        if external:
+            # An existing Mokuro environment chosen by the user is used as is.
+            installed = model_ready = True
+            state["external_python"] = str(self._mokuro_external_python())
+        else:
             python = self._mokuro_ocr_python_path()
             package_marker = self._mokuro_ocr_package_marker_path()
-            marker = self._mokuro_ocr_marker_path()
             installed = python.is_file() and package_marker.is_file()
-            model_ready = marker.is_file() and installed
-        else:
-            installed = self.manga.ocr_available(refresh=not running)
-            marker = self._manga_ocr_marker_path()
-            model_ready = marker.is_file()
+            model_ready = self._mokuro_ocr_marker_path().is_file() and installed
+            if installed:
+                try:
+                    marker = json.loads(package_marker.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    marker = {}
+                marker = marker if isinstance(marker, dict) else {}
         if running:
             state["running"] = True
-        elif state_backend == backend and state.get("state") == "failed":
+        elif state.get("state") == "failed":
             state["running"] = False
         elif installed and model_ready:
             state.update({"state": "ready", "running": False})
@@ -5807,11 +6889,17 @@ class WebAppApi:
             state.update({"state": "package_installed", "running": False})
         else:
             state.update({"state": "not_installed", "running": False, "detail": ""})
+        record = {} if external else self._mokuro_update_record()
         state["backend"] = backend
         state["installed"] = installed
         state["model_ready"] = model_ready
-        log_path = self._manga_ocr_log_path("mokuro") if backend == "mokuro" else self._manga_ocr_log_path()
-        state["log_path"] = str(log_path)
+        state["mokuro_version"] = str(marker.get("version") or "")
+        state["manga_ocr_version"] = str(marker.get("manga_ocr") or "")
+        state["last_checked_at"] = float(record.get("checked_at") or 0.0)
+        state["last_updated_at"] = float(record.get("updated_at") or 0.0)
+        # Update Mokuro: only Pudge's own environment, once it works.
+        state["updatable"] = bool(not external and installed and model_ready and not running)
+        state["log_path"] = str(self._manga_ocr_log_path())
         return state
 
     def _set_manga_ocr_install_state(self, state: str, detail: str = "") -> None:
@@ -5821,67 +6909,21 @@ class WebAppApi:
             if state in {"ready", "failed"}:
                 self._manga_ocr_install_state["finished_at"] = time.time()
 
-    def _run_manga_ocr_install(self) -> None:
-        log_path = self._manga_ocr_log_path()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        python = python_executable()
-        try:
-            with log_path.open("w", encoding="utf-8") as log:
-                self._set_manga_ocr_install_state("installing_package", "Installing manga-ocr and dependencies")
-                log.write(f"Python: {python}\n")
-                log.flush()
-                completed = subprocess.run(
-                    [python, "-m", "pip", "install", "manga-ocr>=0.1.14,<1"],
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                    timeout=30 * 60,
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(f"pip exited with code {completed.returncode}")
-                self.manga.invalidate_ocr_availability()
-                if not self.manga.ocr_available(refresh=True):
-                    raise RuntimeError("manga_ocr package is still unavailable after pip install")
-                self._set_manga_ocr_install_state("downloading_model", "Downloading and warming MangaOCR model")
-                log.write("\nPackage installed. Loading MangaOCR model...\n")
-                log.flush()
-                completed = subprocess.run(
-                    [
-                        python,
-                        "-c",
-                        "from manga_ocr import MangaOcr; MangaOcr(); print('MangaOCR model ready')",
-                    ],
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                    timeout=45 * 60,
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(f"model preload exited with code {completed.returncode}")
-                marker = self._manga_ocr_marker_path()
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text(
-                    json.dumps({"ready_at": time.time(), "python": python}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                self._set_manga_ocr_install_state("ready", "MangaOCR and model are ready")
-        except Exception as exc:
-            self.logger.exception("FAIL step=manga_ocr.install error=%r", str(exc))
-            self._set_manga_ocr_install_state("failed", str(exc))
-
     def _run_mokuro_ocr_install(self) -> None:
-        backend = "mokuro"
-        log_path = self._manga_ocr_log_path(backend)
+        log_path = self._manga_ocr_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         root = self._mokuro_ocr_root()
         venv_dir = root / "venv"
-        python = self._mokuro_ocr_python_path()
+        # Always the managed environment: never pip-install into a user's own Mokuro env.
+        python = venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         try:
             root.mkdir(parents=True, exist_ok=True)
             with log_path.open("w", encoding="utf-8") as log:
-                self._set_manga_ocr_install_state("installing_package", "Creating isolated Mokuro environment")
+                constraints, tested = self._mokuro_tested_set()
+                version = tested["mokuro"]
+                log.write(f"Tested set: {constraints} (Mokuro {version})\n")
+                log.flush()
+                self._set_manga_ocr_install_state("installing_package", t("web.creatingMokuroEnv"))
                 base_python = python_executable()
                 completed = subprocess.run(
                     [base_python, "-m", "venv", str(venv_dir)],
@@ -5892,9 +6934,19 @@ class WebAppApi:
                     timeout=10 * 60,
                 )
                 if completed.returncode != 0 or not python.is_file():
-                    raise RuntimeError(f"Mokuro venv creation failed with code {completed.returncode}")
+                    raise RuntimeError(err("setup.mokuroVenvFailed", code=completed.returncode))
                 completed = subprocess.run(
-                    [str(python), "-m", "pip", "install", "--upgrade", "pip", "mokuro==0.2.5"],
+                    [
+                        str(python),
+                        "-m",
+                        "pip",
+                        "install",
+                        "--upgrade",
+                        "pip",
+                        f"mokuro=={version}",
+                        "-c",
+                        str(constraints),
+                    ],
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -5902,22 +6954,13 @@ class WebAppApi:
                     timeout=45 * 60,
                 )
                 if completed.returncode != 0:
-                    raise RuntimeError(f"Mokuro install exited with code {completed.returncode}")
-                package_marker = self._mokuro_ocr_package_marker_path()
-                package_marker.write_text(
-                    json.dumps({"ready_at": time.time(), "python": str(python), "version": "0.2.5"}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                self._set_manga_ocr_install_state("downloading_model", "Downloading and warming Mokuro models")
+                    raise RuntimeError(err("setup.mokuroInstallExit", code=completed.returncode))
+                self._write_mokuro_markers(python, tested, model=False)
+                self._set_manga_ocr_install_state("downloading_model", t("web.warmingMokuro"))
                 log.write("\nPackage installed. Loading Mokuro detector and MangaOCR model...\n")
                 log.flush()
                 completed = subprocess.run(
-                    [
-                        str(python),
-                        "-c",
-                        "from mokuro import __version__; from mokuro.manga_page_ocr import MangaPageOcr; "
-                        "MangaPageOcr(); print('Mokuro '+__version__+' models ready')",
-                    ],
+                    [str(python), "-c", MOKURO_WARMUP],
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -5925,40 +6968,361 @@ class WebAppApi:
                     timeout=60 * 60,
                 )
                 if completed.returncode != 0:
-                    raise RuntimeError(f"Mokuro model preload exited with code {completed.returncode}")
-                marker = self._mokuro_ocr_marker_path()
-                marker.parent.mkdir(parents=True, exist_ok=True)
-                marker.write_text(
-                    json.dumps({"ready_at": time.time(), "python": str(python), "version": "0.2.5"}, ensure_ascii=False),
-                    encoding="utf-8",
+                    raise RuntimeError(err("setup.mokuroPreloadExit", code=completed.returncode))
+                self._write_mokuro_markers(python, tested, model=True)
+                self.logger.info(
+                    "RESULT step=mokuro_ocr.install version=%s manga_ocr=%s set=%s",
+                    version,
+                    tested.get("manga-ocr", "") or "unknown",
+                    "recorded" if constraints == self._mokuro_working_set_path() else "shipped",
                 )
-                self._set_manga_ocr_install_state("ready", "Mokuro and models are ready")
+                self._set_manga_ocr_install_state("ready", t("web.mokuroReady"))
         except Exception as exc:
             self.logger.exception("FAIL step=mokuro_ocr.install error=%r", str(exc))
             self._set_manga_ocr_install_state("failed", str(exc))
 
     def install_manga_ocr(self) -> dict[str, Any]:
-        backend = self._manga_ocr_backend()
+        return self._start_manga_ocr_install_job(
+            self._run_mokuro_ocr_install, "starting", t("web.installStarting", label="Mokuro")
+        )
+
+    def update_mokuro(self) -> dict[str, Any]:
+        """Settings → Update Mokuro: try the newest Mokuro, keep the working one if it fails."""
+        if self._mokuro_external_python() is not None:
+            raise RuntimeError(err("setup.mokuroUpdateOwnEnvironment"))
+        status = self.manga_ocr_status()
+        if not status.get("running") and not status.get("updatable"):
+            raise RuntimeError(err("setup.mokuroUpdateNotInstalled"))
+        return self._start_manga_ocr_install_job(
+            self._run_mokuro_ocr_update, "updating", t("web.mokuroUpdateStarting")
+        )
+
+    def _start_manga_ocr_install_job(self, target: Any, state: str, detail: str) -> dict[str, Any]:
+        """Install and Update share one background job: one of them runs at a time."""
         with self._manga_ocr_install_lock:
             thread = self._manga_ocr_install_thread
             already_running = bool(thread is not None and thread.is_alive())
             if not already_running:
-                label = "Mokuro" if backend == "mokuro" else "MangaOCR"
                 self._manga_ocr_install_state = {
-                    "state": "starting",
-                    "backend": backend,
-                    "detail": f"Starting {label} installation",
+                    "state": state,
+                    "backend": "mokuro",
+                    "detail": detail,
                     "started_at": time.time(),
                     "finished_at": 0.0,
                 }
                 thread = threading.Thread(
-                    target=self._run_mokuro_ocr_install if backend == "mokuro" else self._run_manga_ocr_install,
-                    name=f"{APP_SLUG}-{backend}-ocr-install",
+                    target=target,
+                    name=f"{APP_SLUG}-mokuro-ocr-install",
                     daemon=True,
                 )
                 self._manga_ocr_install_thread = thread
                 thread.start()
         return self.manga_ocr_status()
+
+    @staticmethod
+    def _mokuro_pip_freeze(python: Path, log: Any) -> str:
+        """The environment's packages as `name==version` lines (its working set)."""
+        completed = subprocess.run(
+            [str(python), "-m", "pip", "freeze"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5 * 60,
+        )
+        if completed.returncode != 0:
+            log.write(str(completed.stderr or ""))
+            raise RuntimeError(err("setup.mokuroFreezeFailed", code=completed.returncode))
+        lines = _pinned_lines(str(completed.stdout or ""))
+        return "\n".join(lines) + "\n" if lines else ""
+
+    @staticmethod
+    def _mokuro_newest_releases(python: Path, log: Any) -> tuple[dict[str, str], str]:
+        """({package: newest release on the package index}, "") for MOKURO_KEY_PACKAGES, or
+        ({}, why that could not be checked). Asked with the environment's own pip (its index)."""
+        newest: dict[str, str] = {}
+        for name in MOKURO_KEY_PACKAGES:
+            command = [
+                str(python),
+                "-m",
+                "pip",
+                "index",
+                "versions",
+                name,
+                "--disable-pip-version-check",
+                "--retries",
+                "1",
+                "--timeout",
+                "20",
+            ]
+            log.write("$ " + " ".join(command) + "\n")
+            log.flush()
+            try:
+                completed = subprocess.run(
+                    command, capture_output=True, text=True, check=False, timeout=2 * 60
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return {}, str(exc) or type(exc).__name__
+            stdout = str(completed.stdout or "")
+            output = stdout + str(completed.stderr or "")
+            log.write(output if output.endswith("\n") or not output else output + "\n")
+            log.flush()
+            # The answer starts with "mokuro (0.2.5)"; "LATEST: 0.2.5" follows for an installed one.
+            match = re.search(r"^\s*[A-Za-z0-9._-]+\s+\(([^()\s]+)\)\s*$", stdout, re.M) or re.search(
+                r"^\s*LATEST:\s*(\S+)", stdout, re.M
+            )
+            if completed.returncode != 0 or not match:
+                lines = [line.strip() for line in output.splitlines() if line.strip()]
+                errors = [line for line in lines if line.startswith("ERROR")]
+                reason = (errors or lines or [err("setup.mokuroCheckExit", code=completed.returncode)])[-1]
+                return {}, reason[-300:]
+            newest[name] = match.group(1)
+        return newest, ""
+
+    @staticmethod
+    def _mokuro_environment_problem(python: Path, log: Any) -> str:
+        """Why the Mokuro environment of `python` does not work ("" when it does).
+
+        Imports Mokuro, MangaOCR and torch, then loads Mokuro's models once (the
+        install's warm-up), each within a time limit.
+        """
+        checks = (
+            (
+                "import mokuro, manga_ocr, torch; "
+                "print('Imports work: Mokuro', mokuro.__version__, 'torch', torch.__version__)",
+                10 * 60,
+            ),
+            (MOKURO_WARMUP, MOKURO_UPDATE_CHECK_SECONDS),
+        )
+        for code, timeout in checks:
+            log.write(f"$ {python} -c {code}\n")
+            log.flush()
+            try:
+                completed = subprocess.run(
+                    [str(python), "-c", code],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return err("setup.mokuroCheckTimeout", minutes=timeout // 60)
+            output = f"{completed.stdout or ''}{completed.stderr or ''}"
+            log.write(output if output.endswith("\n") or not output else output + "\n")
+            log.flush()
+            if completed.returncode != 0:
+                lines = [line.strip() for line in output.splitlines() if line.strip()]
+                return lines[-1][-300:] if lines else err("setup.mokuroCheckExit", code=completed.returncode)
+        return ""
+
+    def _switch_mokuro_environment(self, staging: Path) -> None:
+        """Put the checked environment `staging` where the managed one is."""
+        root = self._mokuro_ocr_root()
+        current, previous = root / "venv", root / "venv-previous"
+        # No page is being read while the folders change; workers of the old environment
+        # exit and the next page starts one in the new one.
+        lock = getattr(getattr(self, "manga", None), "_ocr_lock", None)
+        if lock is not None and not lock.acquire(timeout=10 * 60):
+            raise RuntimeError(err("setup.mokuroBusy"))
+        try:
+            close_mokuro_sessions()
+            shutil.rmtree(previous, ignore_errors=True)
+            current.rename(previous)
+            try:
+                staging.rename(current)
+            except OSError:
+                previous.rename(current)
+                raise
+        finally:
+            if lock is not None:
+                lock.release()
+        shutil.rmtree(previous, ignore_errors=True)
+
+    def _run_mokuro_ocr_update(self) -> None:
+        log_path = self._manga_ocr_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        root = self._mokuro_ocr_root()
+        bin_python = "Scripts/python.exe" if os.name == "nt" else "bin/python"
+        current_python = root / "venv" / bin_python
+        staging = root / "venv-update"
+        staging_python = staging / bin_python
+        before = dict(self.manga_ocr_status())
+        old_version = str(before.get("mokuro_version") or "?")
+        try:
+            with log_path.open("a", encoding="utf-8") as log:
+                log.write(f"\n=== Update Mokuro ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n")
+                if not current_python.is_file() or not self._mokuro_ocr_marker_path().is_file():
+                    raise RuntimeError(err("setup.mokuroUpdateNotInstalled"))
+                # The working environment stays as it is until the new one has passed its check.
+                old_set = self._mokuro_pip_freeze(current_python, log)
+                old_packages = _pinned_packages(old_set)
+                old_version = old_packages.get("mokuro") or old_version
+                old_manga_ocr = old_packages.get("manga-ocr", "") or str(
+                    before.get("manga_ocr_version") or "?"
+                )
+                # A new environment only for a newer Mokuro or MangaOCR: other packages
+                # (certifi, regex …) change all the time and are no reason to switch.
+                self._set_manga_ocr_install_state("updating", t("web.mokuroUpdateLooking"))
+                newest, unchecked = self._mokuro_newest_releases(current_python, log)
+                if unchecked:
+                    self._write_mokuro_update_record(result="unchecked", error=unchecked)
+                    self.logger.warning(
+                        "FAIL step=mokuro.update reason=index_unavailable version=%s error=%r",
+                        old_version,
+                        unchecked,
+                    )
+                    self._set_manga_ocr_install_state(
+                        "ready", err("setup.mokuroUpdateUnchecked", kept=old_version, reason=unchecked)
+                    )
+                    return
+                newer = {
+                    name: version
+                    for name, version in newest.items()
+                    if _release_is_newer(version, old_packages.get(name, ""))
+                }
+                log.write(
+                    "Newest: "
+                    + ", ".join(f"{name} {version}" for name, version in newest.items())
+                    + (f"; newer: {', '.join(sorted(newer))}" if newer else "; nothing newer")
+                    + "\n"
+                )
+                if not newer:
+                    self._record_mokuro_working_set(old_set)
+                    self._write_mokuro_update_record(checked_at=time.time(), result="current", error="")
+                    self.logger.info(
+                        "RESULT step=mokuro.update result=current version=%s manga_ocr=%s",
+                        old_version,
+                        old_manga_ocr,
+                    )
+                    self._set_manga_ocr_install_state(
+                        "ready", t("web.mokuroNewestAlready", version=old_version, manga_ocr=old_manga_ocr)
+                    )
+                    return
+                shutil.rmtree(staging, ignore_errors=True)
+                self._set_manga_ocr_install_state("updating", t("web.mokuroUpdateInstalling"))
+                completed = subprocess.run(
+                    [python_executable(), "-m", "venv", str(staging)],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=10 * 60,
+                )
+                if completed.returncode != 0 or not staging_python.is_file():
+                    raise RuntimeError(err("setup.mokuroVenvFailed", code=completed.returncode))
+                command = [
+                    str(staging_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--upgrade",
+                    "pip",
+                    "mokuro",
+                    "manga-ocr",
+                ]
+                log.write("$ " + " ".join(command) + "\n")
+                log.flush()
+                completed = subprocess.run(
+                    command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                    timeout=45 * 60,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError(err("setup.mokuroInstallExit", code=completed.returncode))
+                new_set = self._mokuro_pip_freeze(staging_python, log)
+                new_packages = _pinned_packages(new_set)
+                new_version = new_packages.get("mokuro", "?")
+                now = time.time()
+                changed = sorted(
+                    f"{name} {old_packages.get(name, '-')}->{version}"
+                    for name, version in new_packages.items()
+                    if old_packages.get(name) != version
+                )
+                log.write("Changed: " + (", ".join(changed) or "nothing") + "\n")
+                key_changes = [
+                    (name, old_packages.get(name, "-"), new_packages[name])
+                    for name in MOKURO_KEY_PACKAGES
+                    if new_packages.get(name) and new_packages.get(name) != old_packages.get(name)
+                ]
+                if not key_changes:
+                    # The index named a newer release that pip did not install (e.g. it needs
+                    # another Python): the environment in use stays.
+                    shutil.rmtree(staging, ignore_errors=True)
+                    self._record_mokuro_working_set(old_set)
+                    self._write_mokuro_update_record(checked_at=now, result="current", error="")
+                    self.logger.info(
+                        "RESULT step=mokuro.update result=current version=%s manga_ocr=%s newest=%s",
+                        old_version,
+                        old_manga_ocr,
+                        ",".join(f"{name}={version}" for name, version in sorted(newer.items())),
+                    )
+                    self._set_manga_ocr_install_state(
+                        "ready", t("web.mokuroNewestAlready", version=old_version, manga_ocr=old_manga_ocr)
+                    )
+                    return
+                self._set_manga_ocr_install_state(
+                    "updating", t("web.mokuroUpdateChecking", version=new_version)
+                )
+                problem = self._mokuro_environment_problem(staging_python, log)
+                if problem:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    self._write_mokuro_update_record(checked_at=now, result="failed", error=problem)
+                    self.logger.warning(
+                        "FAIL step=mokuro.update reason=check_failed version=%s kept=%s error=%r",
+                        new_version,
+                        old_version,
+                        problem,
+                    )
+                    self._set_manga_ocr_install_state(
+                        "ready",
+                        err("setup.mokuroUpdateKept", version=new_version, kept=old_version, reason=problem),
+                    )
+                    return
+                self._switch_mokuro_environment(staging)
+                self._write_mokuro_markers(current_python, new_packages, model=True)
+                self._record_mokuro_working_set(new_set)
+                self._write_mokuro_update_record(checked_at=now, updated_at=now, result="updated", error="")
+                self.logger.info(
+                    "RESULT step=mokuro.update result=updated from=%s to=%s manga_ocr=%s torch=%s changed=%s",
+                    old_version,
+                    new_version,
+                    new_packages.get("manga-ocr", "unknown"),
+                    new_packages.get("torch", "unknown"),
+                    ",".join(f"{name}:{old}->{new}" for name, old, new in key_changes),
+                )
+                labels = {"mokuro": "Mokuro", "manga-ocr": "MangaOCR"}
+                self._set_manga_ocr_install_state(
+                    "ready",
+                    t(
+                        "web.mokuroUpdatedPackages",
+                        changes=", ".join(f"{labels[name]} {old} → {new}" for name, old, new in key_changes),
+                    ),
+                )
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            self.logger.exception("FAIL step=mokuro.update error=%r", str(exc))
+            with contextlib.suppress(OSError):
+                self._write_mokuro_update_record(checked_at=time.time(), result="failed", error=str(exc))
+            # The environment in use was not changed: it still works when it did before.
+            working = current_python.is_file() and self._mokuro_ocr_marker_path().is_file()
+            self._set_manga_ocr_install_state(
+                "ready" if working else "failed",
+                err("setup.mokuroUpdateFailed", kept=old_version, reason=str(exc)) if working else str(exc),
+            )
+
+    def _record_mokuro_working_set(self, packages: str) -> None:
+        """The set Install and repair use from now on: the environment in use."""
+        if not _pinned_packages(packages).get("mokuro"):
+            return
+        path = self._mokuro_working_set_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "# Mokuro environment that passed its check in Pudge (pip freeze); Install and repair use it.\n"
+            + packages,
+            encoding="utf-8",
+        )
 
     def manga_ocr_book_status(self, book_id: int) -> dict[str, Any]:
         book_id = int(book_id)
@@ -5984,9 +7348,7 @@ class WebAppApi:
         completed = max(0, min(total, int(cache.get("completed_pages") or 0)))
         try:
             live_processed = (
-                max(0, min(total, int(live_processed_raw)))
-                if live_processed_raw is not None
-                else completed
+                max(0, min(total, int(live_processed_raw))) if live_processed_raw is not None else completed
             )
         except (TypeError, ValueError):
             live_processed = completed
@@ -6009,8 +7371,7 @@ class WebAppApi:
             processing = 1 if pending > 0 and current_index is not None else 0
             queued = max(0, pending - processing)
         waiting_for_background = running and (
-            state_name == "queued"
-            or (state_name == "preparing" and current_index is None)
+            state_name == "queued" or (state_name == "preparing" and current_index is None)
         )
         if waiting_for_background:
             scheduler = getattr(self.manga, "work_scheduler", None)
@@ -6033,9 +7394,7 @@ class WebAppApi:
                 "current_page_index": current_index if processing else None,
                 "current_page": (current_index + 1) if processing and current_index is not None else None,
                 "wait_reason": wait_reason,
-                "page_state_consistent": (
-                    completed + queued + processing + failed + not_started == total
-                ),
+                "page_state_consistent": (completed + queued + processing + failed + not_started == total),
             }
         )
         return state
@@ -6053,37 +7412,22 @@ class WebAppApi:
                 previous_processed = max(
                     0, int(previous.get("processed_pages") or previous.get("cached_pages") or 0)
                 )
-                previous_prepared = max(
-                    previous_processed,
-                    int(previous.get("prepared_pages") or previous_processed),
-                )
-                if phase_name == "detecting":
-                    processed = previous_processed
-                    prepared = max(previous_prepared, int(done))
-                    cached = max(0, int(previous.get("cached_pages") or 0))
-                    state_name = "preparing"
-                else:
-                    processed = max(previous_processed, int(done))
-                    prepared = max(previous_prepared, processed)
-                    cached = int(done)
-                    state_name = "running"
+                processed = max(previous_processed, int(done))
                 self._manga_book_ocr_state[book_id] = {
-                    "state": state_name,
+                    "state": "running",
                     "phase": phase_name,
                     "running": True,
-                    "cached_pages": cached,
+                    "cached_pages": int(done),
                     "processed_pages": processed,
-                    "prepared_pages": prepared,
                     "total_pages": int(total),
                     "page_index": page_index,
                     "errors": [],
                 }
             self.logger.info(
-                "EVENT manga_ocr.progress book_id=%s phase=%s processed=%s prepared=%s total=%s current_page=%s",
+                "EVENT manga_ocr.progress book_id=%s phase=%s processed=%s total=%s current_page=%s",
                 book_id,
                 phase_name,
                 processed,
-                prepared,
                 int(total),
                 (int(page_index) + 1) if page_index is not None else None,
             )
@@ -6094,56 +7438,58 @@ class WebAppApi:
                     state="running",
                     current=done,
                     total=total,
-                    message=f"OCR page {min(total, done + 1)}/{total}",
+                    message=t("web.ocrPageProgress", page=min(total, done + 1), total=total),
                 )
 
         try:
             cancel_event = self._manga_ocr_cancel_events.get(book_id)
-            while True:
-                if self._manga_ocr_backend() == "mokuro":
-                    result = self.manga.ocr_book_mokuro(
-                        book_id,
-                        mokuro_python=self._mokuro_ocr_python_path(),
-                        progress=on_progress,
-                        cancelled=cancel_event.is_set if cancel_event is not None else None,
-                    )
-                else:
-                    result = self.manga.ocr_book(
-                        book_id,
-                        progress=on_progress,
-                        cancelled=cancel_event.is_set if cancel_event is not None else None,
-                    )
-                if not result.get("preempted"):
-                    break
-                self.logger.info(
-                    "YIELD step=manga_ocr.book book_id=%s reason=higher_priority_user_work cached=%s",
-                    book_id,
-                    result.get("cached_pages", 0),
-                )
-                with self._manga_book_ocr_lock:
-                    previous = dict(self._manga_book_ocr_state.get(book_id, {}))
-                    self._manga_book_ocr_state[book_id] = {
-                        **previous,
-                        **result,
-                        "state": "queued",
-                        "phase": "yielded",
-                        "running": True,
-                    }
+            pause_reason: list[str] = []
+
+            def background_run() -> bool:
+                return book_id in (getattr(self, "_manga_ocr_background_runs", None) or set())
+
+            def stop_requested() -> bool:
                 if cancel_event is not None and cancel_event.is_set():
-                    result = {**result, "cancelled": True, "preempted": False}
-                    break
-                time.sleep(0.05)
+                    return True
+                if background_run():
+                    # Background library OCR pauses before the next page as soon
+                    # as its conditions end; finished pages are kept.
+                    reason = self._manga_background_ocr_blocked()
+                    if reason:
+                        pause_reason[:] = [reason]
+                        return True
+                return False
+
+            result = self.manga.ocr_book_mokuro(
+                book_id,
+                mokuro_python=self._mokuro_ocr_python_path(),
+                progress=on_progress,
+                cancelled=stop_requested,
+                background=background_run(),
+            )
             if result.get("cancelled"):
+                paused = self._manga_ocr_pause_reason(book_id, pause_reason)
                 with self._manga_book_ocr_lock:
                     self._manga_book_ocr_state[book_id] = {
                         **result,
-                        "state": "cancelled",
+                        "state": "paused" if paused else "cancelled",
+                        "pause_reason": paused,
                         "running": False,
                         "errors": [],
                     }
                 job_id = self._manga_ocr_job_ids.get(book_id, "")
                 if job_id:
-                    self.job_center.cancelled(job_id)
+                    self.job_center.cancelled(
+                        job_id, message=t("web.jobPaused", reason=paused) if paused else t("ui.cancelled")
+                    )
+                if paused and background_run():
+                    # Give the background worker's memory back right away and
+                    # resume this volume on the next idle check.
+                    self.manga.interrupt_mokuro(background=True)
+                    (getattr(self, "_manga_background_ocr_tried", None) or {}).pop(book_id, None)
+                    self.logger.info(
+                        "EVENT manga_background_ocr.paused book_id=%s reason=%s", book_id, paused
+                    )
                 return
             region_texts = self.manga.cached_region_texts(book_id)
             parse_errors: list[str] = []
@@ -6183,7 +7529,9 @@ class WebAppApi:
             with self._manga_book_ocr_lock:
                 self._manga_book_ocr_state[book_id] = {
                     **result,
-                    "state": "ready" if result.get("complete") and not result.get("errors") and not parse_errors else "partial",
+                    "state": "ready"
+                    if result.get("complete") and not result.get("errors") and not parse_errors
+                    else "partial",
                     "running": False,
                     "parsed_regions": parsed_count,
                     "total_regions": len(region_texts),
@@ -6195,13 +7543,13 @@ class WebAppApi:
                 if all_errors or not result.get("complete"):
                     self.job_center.fail(
                         job_id,
-                        RuntimeError(str(all_errors[0]) if all_errors else "Manga OCR incomplete"),
-                        message="Manga OCR incomplete",
+                        RuntimeError(str(all_errors[0]) if all_errors else err("manga.ocrIncomplete")),
+                        message=t("web.mangaOcrIncomplete"),
                     )
                 else:
                     self.job_center.finish(
                         job_id,
-                        message="Manga OCR ready",
+                        message=t("web.mangaOcrReady"),
                         result={"book_id": book_id, "cached_pages": result.get("cached_pages", 0)},
                     )
         except Exception as exc:
@@ -6223,6 +7571,12 @@ class WebAppApi:
                 self.job_center.fail(job_id, exc)
         finally:
             self._manga_ocr_cancel_events.pop(book_id, None)
+            for name in ("_manga_ocr_background_runs", "_manga_ocr_auto_runs", "_manga_ocr_stop_reasons"):
+                container = getattr(self, name, None)
+                if isinstance(container, set):
+                    container.discard(book_id)
+                elif isinstance(container, dict):
+                    container.pop(book_id, None)
             # P10: a worker finishing after its book was deleted must not leave
             # a resurrected status/job entry behind.
             try:
@@ -6234,25 +7588,102 @@ class WebAppApi:
             except Exception:
                 pass
 
+    def _manga_auto_ocr_skip_reason(self, book_id: int) -> str:
+        scheduler = getattr(getattr(self, "manager", None), "work_scheduler", None)
+        try:
+            if scheduler is not None and scheduler.power_snapshot().get("on_battery") is True:
+                return "on_battery"
+        except Exception:
+            pass
+        status = self.manga.ocr_cache_status(int(book_id))
+        if (
+            int(status.get("total_pages") or 0)
+            and not status.get("complete")
+            and int(status.get("not_started_pages") or 0) <= 0
+        ):
+            return "only_failed_pages"  # retried with the toolbar button, not on every open
+        return ""
+
     def _run_serialized_manga_book_ocr(self, book_id: int) -> None:
-        # MangaOCR is a large model. Serializing volumes prevents two imports
-        # from holding separate model processes in memory at the same time.
+        # Mokuro's models are large. Serializing volumes prevents two runs from
+        # holding separate model processes in memory at the same time.
         with self._manga_ocr_run_lock:
             self._run_manga_book_ocr(int(book_id))
+
+    def _manga_ocr_pause_reason(self, book_id: int, background_reason: list[str]) -> str:
+        """Why a cancelled run is only paused ("" = a real cancel)."""
+        reasons = getattr(self, "_manga_ocr_stop_reasons", None) or {}
+        return str(reasons.get(book_id) or (background_reason[0] if background_reason else ""))
+
+    def _stop_manga_ocr_run(self, book_id: int, reason: str) -> bool:
+        """Stop one running volume OCR before its next page; finished pages stay."""
+        with self._manga_book_ocr_lock:
+            event = self._manga_ocr_cancel_events.get(int(book_id))
+            thread = self._manga_book_ocr_threads.get(int(book_id))
+            if event is None or thread is None or not thread.is_alive():
+                return False
+            reasons = getattr(self, "_manga_ocr_stop_reasons", None)
+            if reasons is None:
+                reasons = self._manga_ocr_stop_reasons = {}
+            reasons[int(book_id)] = str(reason)
+            event.set()
+        return True
+
+    def stop_manga_ocr_book(self, book_id: int, auto_only: bool = True) -> dict[str, Any]:
+        """The reader closed or moved to another volume: stop the OCR it started itself.
+
+        A volume OCR started with the toolbar button (or by import) keeps running.
+        """
+        book_id = int(book_id)
+        auto_runs = getattr(self, "_manga_ocr_auto_runs", None) or set()
+        if not auto_only or book_id in auto_runs:
+            if self._stop_manga_ocr_run(book_id, "reader_closed"):
+                self.logger.info("EVENT manga_ocr.stopped book_id=%s reason=reader_closed", book_id)
+        return self.manga_ocr_book_status(book_id)
 
     def start_manga_ocr_book(
         self,
         book_id: int,
         refresh: bool = False,
         attempt_of: str = "",
+        background: bool = False,
+        auto: bool = False,
     ) -> dict[str, Any]:
         book_id = int(book_id)
         if not self._manga_ocr_backend_available():
-            label = "Mokuro" if self._manga_ocr_backend() == "mokuro" else "MangaOCR"
-            raise RuntimeError(f"{label} OCR backend is not installed. Install it from Settings → Essential.")
+            raise RuntimeError(err("setup.ocrBackendMissing", label="Mokuro"))
+        if auto:
+            # Opening a volume fills in its OCR only on mains power and only
+            # while it has pages never tried; pages still read one by one as
+            # you turn them. The toolbar button always runs.
+            skip = self._manga_auto_ocr_skip_reason(book_id)
+            if skip:
+                return {**self.manga_ocr_book_status(book_id), "auto_skipped": skip}
+        if not background:
+            # The volume you open or start goes first: pause background library
+            # OCR and free its worker instead of queueing behind it.
+            for other in list(getattr(self, "_manga_ocr_background_runs", None) or set()):
+                if other != book_id and self._stop_manga_ocr_run(other, "user_volume"):
+                    self.manga.interrupt_mokuro(background=True)
+                    self.logger.info("EVENT manga_background_ocr.paused book_id=%s reason=user_volume", other)
         with self._manga_book_ocr_lock:
             thread = self._manga_book_ocr_threads.get(book_id)
+            auto_runs = getattr(self, "_manga_ocr_auto_runs", None)
+            if auto_runs is None:
+                auto_runs = self._manga_ocr_auto_runs = set()
+            if thread is not None and thread.is_alive():
+                if not auto:
+                    auto_runs.discard(book_id)  # an explicit start keeps it running
+                if not background:
+                    (getattr(self, "_manga_ocr_background_runs", None) or set()).discard(book_id)
             if thread is None or not thread.is_alive():
+                if auto:
+                    auto_runs.add(book_id)
+                else:
+                    auto_runs.discard(book_id)
+                stop_reasons = getattr(self, "_manga_ocr_stop_reasons", None)
+                if isinstance(stop_reasons, dict):
+                    stop_reasons.pop(book_id, None)
                 if bool(refresh):
                     self.manga.invalidate_region_cache(book_id)
                 self._manga_book_ocr_state[book_id] = {
@@ -6263,6 +7694,15 @@ class WebAppApi:
                 }
                 cancel_event = threading.Event()
                 self._manga_ocr_cancel_events[book_id] = cancel_event
+                # Background library OCR runs at low priority; volumes the user
+                # opens or starts share the reader's worker at normal priority.
+                background_runs = getattr(self, "_manga_ocr_background_runs", None)
+                if background_runs is None:
+                    background_runs = self._manga_ocr_background_runs = set()
+                if background:
+                    background_runs.add(book_id)
+                else:
+                    background_runs.discard(book_id)
                 try:
                     title = str(self.manga._book(book_id)["title"] or f"Manga {book_id}")
                 except Exception:
@@ -6292,14 +7732,14 @@ class WebAppApi:
     def import_nearby_mokuro(self, book_id: int) -> dict[str, Any]:
         book_id = int(book_id)
         if self.manga_ocr_book_status(book_id).get("running"):
-            raise RuntimeError("Stop the running volume OCR before importing Mokuro")
+            raise RuntimeError(err("manga.stopOcrBeforeMokuro"))
         return self.manga.import_nearby_mokuro(book_id)
 
     def choose_manga_mokuro(self, book_id: int) -> dict[str, Any]:
         """Use a native file picker; never accept untrusted browser-supplied paths."""
         book_id = int(book_id)
         if self.manga_ocr_book_status(book_id).get("running"):
-            raise RuntimeError("Stop the running volume OCR before importing Mokuro")
+            raise RuntimeError(err("manga.stopOcrBeforeMokuro"))
         if self.window is None:
             return {"cancelled": True}
         try:
@@ -6317,7 +7757,7 @@ class WebAppApi:
             return {"cancelled": True}
         chosen = result[0] if isinstance(result, (list, tuple)) else result
         if self.manga_ocr_book_status(book_id).get("running"):
-            raise RuntimeError("Volume OCR started during Mokuro selection; import was not performed")
+            raise RuntimeError(err("manga.ocrStartedDuringMokuro"))
         return {"cancelled": False, **self.manga.import_mokuro(book_id, Path(str(chosen)))}
 
     def choose_manga_file(self) -> dict[str, Any]:
@@ -6350,16 +7790,18 @@ class WebAppApi:
                     continue
                 previous = planned.get(archive)
                 if previous is not None and previous != path:
-                    errors.append(f"{path.name}: more than one Mokuro sidecar was selected for {archive.name}")
+                    errors.append(
+                        f"{path.name}: more than one Mokuro sidecar was selected for {archive.name}"
+                    )
                     continue
                 planned[archive] = path
             elif path.suffix.casefold() in {".cbz", ".zip"}:
                 planned.setdefault(path, None)
             else:
-                errors.append(f"{path.name}: unsupported manga file")
+                errors.append(err("manga.unsupportedFile", name=path.name))
         job_id = self.job_center.start(
             "import",
-            "Import manga",
+            t("web.jobImportManga"),
             payload={"media_kind": "manga", "paths": paths},
             total=max(1, len(planned)),
         )
@@ -6376,7 +7818,9 @@ class WebAppApi:
                 if explicit_mokuro is not None:
                     mokuro_attempted = True
                     self.manga.import_mokuro(
-                        int(book["id"]), explicit_mokuro, require_full_coverage=True,
+                        int(book["id"]),
+                        explicit_mokuro,
+                        require_full_coverage=True,
                     )
                 else:
                     nearby = self.manga.nearby_mokuro(int(book["id"]))
@@ -6392,7 +7836,7 @@ class WebAppApi:
                 state="running",
                 current=index,
                 total=max(1, len(planned)),
-                message=f"Imported {len(books)}/{max(1, len(planned))}",
+                message=t("web.importProgress", done=len(books), total=max(1, len(planned))),
             )
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
@@ -6400,11 +7844,11 @@ class WebAppApi:
         elif books:
             self.job_center.finish(
                 job_id,
-                message=f"Imported {len(books)}; errors {len(errors)}",
+                message=t("web.importedWithErrors", done=len(books), errors=len(errors)),
                 result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
             )
         else:
-            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
+            self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
         return {"cancelled": False, "books": books, "errors": errors, "state": self._manga_state_payload()}
 
     def choose_manga_folder(self) -> dict[str, Any]:
@@ -6427,7 +7871,7 @@ class WebAppApi:
         raw = result[0] if isinstance(result, (list, tuple)) else result
         source_root = Path(str(raw)).expanduser().resolve()
         if not source_root.is_dir():
-            return {"cancelled": False, "error": "Selected manga folder does not exist"}
+            return {"cancelled": False, "error": err("manga.folderMissing")}
 
         # pudge-v0.7.23-manga-folder-picker-v1
         image_paths = self.manga.discover_image_files(source_root, limit=50000)
@@ -6442,7 +7886,7 @@ class WebAppApi:
 
         job_id = self.job_center.start(
             "import",
-            "Import manga folder",
+            t("web.jobImportMangaFolder"),
             payload={
                 "media_kind": "manga_folder",
                 "paths": [str(source_root)],
@@ -6474,7 +7918,7 @@ class WebAppApi:
                     state="running",
                     current=current,
                     total=max(1, len(archive_paths) + 1),
-                    message=f"Imported {len(books)} manga books",
+                    message=tn("web.importedMangaBooks", len(books)),
                 )
 
             for archive in archive_paths:
@@ -6490,7 +7934,7 @@ class WebAppApi:
                     state="running",
                     current=current,
                     total=max(1, len(archive_paths) + (1 if image_paths else 0)),
-                    message=f"Imported {len(books)} manga books",
+                    message=tn("web.importedMangaBooks", len(books)),
                 )
         finally:
             self._import_cancel_events.pop(job_id, None)
@@ -6502,7 +7946,7 @@ class WebAppApi:
         if books:
             self.job_center.finish(
                 job_id,
-                message=f"Imported {len(books)} manga books; errors {len(errors)}",
+                message=tn("web.importedMangaBooksErrors", len(books), errors=len(errors)),
                 result={
                     "book_ids": [int(book["id"]) for book in books],
                     "errors": errors,
@@ -6510,7 +7954,7 @@ class WebAppApi:
                 },
             )
         else:
-            message = "No manga images or CBZ/ZIP archives found in the selected folder"
+            message = err("manga.folderEmpty")
             if errors:
                 message = " • ".join(errors)
             self.job_center.fail(job_id, message)
@@ -6575,7 +8019,9 @@ class WebAppApi:
             if logger is not None:
                 logger.warning(
                     "FAIL consumption.media_identity kind=%s local_id=%s error=%r",
-                    kind, int(local_id), str(exc),
+                    kind,
+                    int(local_id),
+                    str(exc),
                 )
         return None
 
@@ -6615,125 +8061,123 @@ class WebAppApi:
             cached_only=bool(cached_only),
         )
 
+    # pudge-manga-volume-words-v1
+    def manga_volume_words(self, book_id: int, limit: int = 40) -> dict[str, Any]:
+        """How much of a recognized volume you know, and its most frequent new words."""
+        book_id = int(book_id)
+        limit = max(1, min(200, int(limit or 40)))
+        backend = str(self.light_novels.settings().study_backend or "jiten").casefold()
+        # Paragraphs of small print are left out: their OCR is often invented text.
+        texts = [text for _page, text in self.manga.cached_region_texts(book_id, include_unreliable=False)]
+        if not texts:
+            return {"ok": False, "reason": "no_ocr"}
+        chunks: list[str] = []
+        current: list[str] = []
+        size = 0
+        for text in texts:
+            line = " ".join(str(text).split())
+            if size + len(line) + 1 > 15000 and current:
+                chunks.append("\n".join(current))
+                current, size = [], 0
+            current.append(line)
+            size += len(line) + 1
+        if current:
+            chunks.append("\n".join(current))
+        counts: dict[tuple[int, int], int] = {}
+        entries: dict[tuple[int, int], dict[str, Any]] = {}
+        for chunk in chunks:
+            try:
+                payload = self.light_novels.parse_study_text(chunk)
+            except Exception as exc:
+                return {"ok": False, "reason": "parse_failed", "detail": str(exc)[:300]}
+            for item in payload.get("vocabulary") or []:
+                if isinstance(item, dict):
+                    try:
+                        entries.setdefault((int(item["wordId"]), int(item["readingIndex"])), item)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            for paragraph in payload.get("tokens") or []:
+                for token in paragraph if isinstance(paragraph, list) else []:
+                    if not isinstance(token, dict):
+                        continue
+                    try:
+                        pair = (int(token["wordId"]), int(token["readingIndex"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    counts[pair] = counts.get(pair, 0) + 1
+        if not counts:
+            return {"ok": False, "reason": "no_words"}
+        states: dict[tuple[int, int], str] = {
+            pair: str(entry.get("normalizedState") or "unknown") for pair, entry in entries.items()
+        }
+        if backend == "jiten":
+            pairs = list(counts)
+            for start in range(0, len(pairs), 500):
+                try:
+                    rows = self.light_novels.jiten_live_states(pairs[start : start + 500], force=False)
+                except Exception:
+                    rows = []
+                for row in rows or []:
+                    if isinstance(row, dict) and row.get("wordId") is not None:
+                        try:
+                            states[(int(row["wordId"]), int(row["readingIndex"]))] = str(
+                                row.get("normalizedState") or "unknown"
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            continue
+        total = sum(counts.values())
+        by_state: dict[str, int] = {}
+        unique_by_state: dict[str, int] = {}
+        for pair, count in counts.items():
+            state = word_state_group(states.get(pair, "unknown"))
+            by_state[state] = by_state.get(state, 0) + count
+            unique_by_state[state] = unique_by_state.get(state, 0) + 1
+
+        def reading_of(entry: dict[str, Any]) -> str:
+            reading = str(entry.get("reading") or "")
+            # Bracket notation 漢字[かんじ]: keep only the kana.
+            return re.sub(r"[\u3400-\u9fff々〆ヶ]+\[([^\]]*)\]", r"\1", reading).replace(" ", "")
+
+        new_pairs = [pair for pair in counts if word_state_group(states.get(pair, "unknown")) == "new"]
+        new_pairs.sort(
+            key=lambda pair: (-counts[pair], int(entries.get(pair, {}).get("frequencyRank") or 10**9))
+        )
+        top = []
+        for pair in new_pairs[:limit]:
+            entry = entries.get(pair, {})
+            meanings = entry.get("meanings") or []
+            first = meanings[0] if isinstance(meanings, list) and meanings else ""
+            if isinstance(first, dict):
+                first = first.get("text") or first.get("meaning") or ""
+            top.append(
+                {
+                    "word_id": pair[0],
+                    "reading_index": pair[1],
+                    "spelling": str(entry.get("spelling") or ""),
+                    "reading": reading_of(entry),
+                    "meaning": str(first or "")[:120],
+                    "count": counts[pair],
+                    "frequency_rank": entry.get("frequencyRank"),
+                }
+            )
+        known = by_state.get("known", 0)
+        learning = by_state.get("learning", 0)
+        return {
+            "ok": True,
+            "backend": backend,
+            "tokens": total,
+            "unique_words": len(counts),
+            "known_share": round(known / total, 4) if total else 0.0,
+            "known_or_learning_share": round((known + learning) / total, 4) if total else 0.0,
+            "new_unique": unique_by_state.get("new", 0),
+            "unknown_state_unique": unique_by_state.get("unknown", 0),
+            "top_new": top,
+        }
+
     def manga_ocr_artifact(self, book_id: int) -> dict[str, Any]:
         return self.manga.ocr_artifact(int(book_id))
 
-    def manga_ocr_corrections(self, book_id: int) -> dict[str, Any]:
-        return self.manga.manual_ocr_corrections(int(book_id))
-
-    def manga_split_ocr_region(
-        self, book_id: int, page_index: int, source_ref: dict[str, Any],
-        parts: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return self.manga.split_manual_ocr_region(
-            int(book_id), int(page_index), dict(source_ref or {}),
-            [dict(item) for item in (parts or []) if isinstance(item, dict)],
-        )
-
-    def manga_unsplit_ocr_region(
-        self, book_id: int, addition_id: str,
-    ) -> dict[str, Any]:
-        return self.manga.unsplit_manual_ocr_region(int(book_id), str(addition_id))
-
-    def manga_merge_ocr_regions(
-        self, book_id: int, page_index: int, first_ref: dict[str, Any],
-        second_ref: dict[str, Any], text: str, orientation: str = "vertical",
-    ) -> dict[str, Any]:
-        return self.manga.merge_manual_ocr_regions(
-            int(book_id), int(page_index), dict(first_ref or {}), dict(second_ref or {}),
-            str(text), str(orientation),
-        )
-
-    def manga_unmerge_ocr_region(
-        self, book_id: int, addition_id: str,
-    ) -> dict[str, Any]:
-        return self.manga.unmerge_manual_ocr_region(int(book_id), str(addition_id))
-
-    def manga_add_ocr_region(
-        self, book_id: int, page_index: int, geometry: dict[str, Any],
-        text: str, orientation: str = "vertical",
-    ) -> dict[str, Any]:
-        return self.manga.add_manual_ocr_region(
-            int(book_id), int(page_index), dict(geometry or {}), str(text), str(orientation)
-        )
-
-    def manga_update_added_ocr_region(
-        self, book_id: int, addition_id: str, text: str | None = None,
-        geometry: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return self.manga.update_manual_ocr_region(
-            int(book_id), str(addition_id), text=text,
-            geometry=dict(geometry) if geometry is not None else None,
-        )
-
-    def manga_undo_added_ocr_region(
-        self, book_id: int, addition_id: str,
-    ) -> dict[str, Any]:
-        return self.manga.undo_manual_ocr_region(int(book_id), str(addition_id))
-
-    def manga_set_ocr_correction(
-        self, book_id: int, page_index: int, region_index: int, text: str
-    ) -> dict[str, Any]:
-        return self.manga.set_manual_ocr_correction(
-            int(book_id), int(page_index), int(region_index), str(text)
-        )
-
-    def manga_undo_ocr_correction(
-        self, book_id: int, page_index: int, region_index: int
-    ) -> dict[str, Any]:
-        return self.manga.undo_manual_ocr_correction(
-            int(book_id), int(page_index), int(region_index)
-        )
-
-    def manga_suppress_ocr_region(
-        self, book_id: int, page_index: int, region_index: int
-    ) -> dict[str, Any]:
-        return self.manga.suppress_manual_ocr_region(
-            int(book_id), int(page_index), int(region_index)
-        )
-
-    def manga_restore_ocr_region(
-        self, book_id: int, suppression_id: str
-    ) -> dict[str, Any]:
-        return self.manga.restore_manual_ocr_region(
-            int(book_id), str(suppression_id)
-        )
-
-    def manga_set_ocr_geometry(
-        self,
-        book_id: int,
-        page_index: int,
-        region_index: int,
-        geometry: dict[str, Any],
-    ) -> dict[str, Any]:
-        return self.manga.set_manual_ocr_geometry(
-            int(book_id), int(page_index), int(region_index), dict(geometry or {})
-        )
-
-    def manga_undo_ocr_geometry(
-        self, book_id: int, page_index: int, region_index: int
-    ) -> dict[str, Any]:
-        return self.manga.undo_manual_ocr_geometry(
-            int(book_id), int(page_index), int(region_index)
-        )
-
-    def manga_set_ocr_reading_order(
-        self, book_id: int, page_index: int, order: list[dict[str, Any]]
-    ) -> dict[str, Any]:
-        return self.manga.set_manual_ocr_reading_order(
-            int(book_id), int(page_index), list(order or [])
-        )
-
-    def manga_undo_ocr_reading_order(
-        self, book_id: int, page_index: int
-    ) -> dict[str, Any]:
-        return self.manga.undo_manual_ocr_reading_order(
-            int(book_id), int(page_index)
-        )
-
-    def manga_export_ocr_debug(
-        self, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def manga_export_ocr_debug(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         source = dict(payload) if isinstance(payload, dict) else {}
         book = source.get("book") if isinstance(source.get("book"), dict) else {}
         book_id = int(book.get("id") or 0)
@@ -6773,11 +8217,7 @@ class WebAppApi:
                 "image/gif": ".gif",
             }.get(mime, ".bin")
             image_name = f"page{extension}"
-            image_bytes = (
-                base64.b64decode(encoded)
-                if ";base64" in header
-                else encoded.encode("utf-8")
-            )
+            image_bytes = base64.b64decode(encoded) if ";base64" in header else encoded.encode("utf-8")
             (output_root / image_name).write_bytes(image_bytes)
 
         page_meta = {key: value for key, value in page.items() if key != "data_uri"}
@@ -6795,25 +8235,19 @@ class WebAppApi:
             encoding="utf-8",
         )
 
-        backend_regions = [
-            dict(item)
-            for item in backend.get("regions", [])
-            if isinstance(item, dict)
-        ]
+        backend_regions = [dict(item) for item in backend.get("regions", []) if isinstance(item, dict)]
         frames = source.get("frames") if isinstance(source.get("frames"), list) else []
         current_frame = next(
             (
                 item
                 for item in frames
-                if isinstance(item, dict)
-                and int(item.get("page_index") or -1) == page_index
+                if isinstance(item, dict) and int(item.get("page_index") or -1) == page_index
             ),
             frames[0] if frames and isinstance(frames[0], dict) else {},
         )
         frontend_regions = (
             current_frame.get("overlays")
-            if isinstance(current_frame, dict)
-            and isinstance(current_frame.get("overlays"), list)
+            if isinstance(current_frame, dict) and isinstance(current_frame.get("overlays"), list)
             else []
         )
 
@@ -6845,11 +8279,7 @@ class WebAppApi:
                 bump(by_detector, detector)
                 bump(by_source, region_source)
 
-                hypotheses = [
-                    dict(item)
-                    for item in region.get("hypotheses") or []
-                    if isinstance(item, dict)
-                ]
+                hypotheses = [dict(item) for item in region.get("hypotheses") or [] if isinstance(item, dict)]
                 hypothesis_texts = {
                     str(item.get("text") or "").strip()
                     for item in hypotheses
@@ -6951,7 +8381,7 @@ class WebAppApi:
                     f'<div class="box backend" title="{title}" '
                     f'style="left:{x * 100:.5f}%;top:{top * 100:.5f}%;'
                     f'width:{width * 100:.5f}%;height:{height * 100:.5f}%">'
-                    f'<b>B{index}</b></div>'
+                    f"<b>B{index}</b></div>"
                 )
             return "".join(rows)
 
@@ -6976,7 +8406,7 @@ class WebAppApi:
                     f'<div class="box frontend" title="{title}" '
                     f'style="left:{left * 100:.5f}%;top:{top * 100:.5f}%;'
                     f'width:{width * 100:.5f}%;height:{height * 100:.5f}%">'
-                    f'<b>F{overlay.get("region_index", index)}</b></div>'
+                    f"<b>F{overlay.get('region_index', index)}</b></div>"
                 )
             return "".join(rows)
 
@@ -7024,7 +8454,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "quality_suspect_count": int(quality["counts"]["suspect"]),
         }
 
-
     def audiobook_state(self) -> dict[str, Any]:
         # Tab activation reads display state only. Queueing missing metadata /
         # linked transcriptions is maintenance: at most once a minute, off the
@@ -7039,8 +8468,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 name=f"{APP_SLUG}-audiobook-queue-missing",
                 daemon=True,
             ).start()
-        self.logger.info("TIMING step=audiobook.state duration_ms=%.1f books=%s", (time.perf_counter() - started) * 1000.0, len(state.get("books") or []))
-        return state
+        self.logger.info(
+            "TIMING step=audiobook.state duration_ms=%.1f books=%s",
+            (time.perf_counter() - started) * 1000.0,
+            len(state.get("books") or []),
+        )
+        return self._iphone_audio_state(state)
 
     def sidebar_audio_state(self) -> dict[str, Any]:
         """Read only active players, without scanning the library or STT files."""
@@ -7080,15 +8513,25 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ln_book_id = int(data.get("ln_book_id") or 0)
             audiobook_id = int(data.get("audiobook_id") or 0)
         except (TypeError, ValueError):
-            return {"ok": False, "error": "Invalid reader context"}
+            return {"ok": False, "error": err("audiobook.invalidReaderContext")}
         floating = getattr(self, "_audiobook_float", None)
         if floating is None:
             return {"ok": True, "opened": False}
-        result = floating.reader_context(open=bool(data.get("open")), ln_book_id=ln_book_id,
-                                         audiobook_id=audiobook_id, generation=generation)
-        self.logger.info("audiobook.reader_context open=%s ln=%s audio=%s generation=%s stale=%s float_open=%s",
-                         bool(data.get("open")), ln_book_id, audiobook_id, generation,
-                         result.get("stale"), result.get("opened"))
+        result = floating.reader_context(
+            open=bool(data.get("open")),
+            ln_book_id=ln_book_id,
+            audiobook_id=audiobook_id,
+            generation=generation,
+        )
+        self.logger.info(
+            "audiobook.reader_context open=%s ln=%s audio=%s generation=%s stale=%s float_open=%s",
+            bool(data.get("open")),
+            ln_book_id,
+            audiobook_id,
+            generation,
+            result.get("stale"),
+            result.get("opened"),
+        )
         return result
 
     def audiobook_float_settings(self) -> dict[str, Any]:
@@ -7102,7 +8545,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             lifecycle.reopen()
         else:
             self.window.show()
-        script = "window.PudgeSidebarCompanion?.navigateAudio(" + json.dumps(action) + "," + str(int(book_id)) + ")"
+        script = (
+            "window.PudgeSidebarCompanion?.navigateAudio("
+            + json.dumps(action)
+            + ","
+            + str(int(book_id))
+            + ")"
+        )
         self.window.evaluate_js(script)
         return {"ok": True}
 
@@ -7115,7 +8564,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if interval is not None:
             value = str(interval)
             if value not in {"60000", "180000", "300000", "600000", "1800000", "continuous"}:
-                raise ValueError("Invalid sidebar review interval")
+                raise ValueError(err("review.invalidSidebarInterval"))
             self.config.ui.sidebar_review_interval = value
             write_config(self.config, self.config_path)
         return {"interval": self.config.ui.sidebar_review_interval}
@@ -7125,7 +8574,6 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.audiobooks.state(queue_missing=True)
         except Exception as exc:
             self.logger.warning("FAIL step=audiobook.queue_missing error=%r", str(exc))
-
 
     def _retry_import_worker(
         self,
@@ -7156,7 +8604,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         if (
                             irodori.irodori_tts_enabled
                             and irodori.irodori_tts_auto_generate
-                    and self.manager.work_scheduler.background_wait_reason() is None
+                            and self.manager.work_scheduler.background_wait_reason() is None
                             and self.manager.work_scheduler.background_wait_reason() is None
                             and self._audiobook_link_kind(int(book["id"])) == "none"
                         ):
@@ -7169,7 +8617,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     state="running",
                     current=index,
                     total=len(paths),
-                    message=f"Imported {imported}/{len(paths)}",
+                    message=t("web.importProgress", done=imported, total=len(paths)),
                 )
             if cancel_event.is_set():
                 self.job_center.cancelled(job_id)
@@ -7177,14 +8625,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if imported:
                 self.job_center.finish(
                     job_id,
-                    message=f"Imported {imported}; errors {len(errors)}",
+                    message=t("web.importedWithErrors", done=imported, errors=len(errors)),
                     result={"imported": imported, "errors": errors},
                 )
             else:
-                self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
+                self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
         finally:
             self._import_cancel_events.pop(job_id, None)
-
 
     def choose_audiobook_file(self) -> dict[str, Any]:
         if self.window is None:
@@ -7195,7 +8642,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=True,
-                file_types=("Audiobooks (*.m4b;*.m4a;*.mp3;*.aac;*.opus;*.ogg;*.flac;*.wav)",),
+                file_types=(
+                    f"{t('web.fileTypeAudiobooks')} (*.m4b;*.m4a;*.mp3;*.aac;*.opus;*.ogg;*.flac;*.wav)",
+                ),
             )
         except Exception as exc:
             return {"cancelled": True, "error": str(exc)}
@@ -7205,7 +8654,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         paths = [str(value) for value in selected]
         job_id = self.job_center.start(
             "import",
-            "Import audiobooks",
+            t("web.jobImportAudiobooks"),
             payload={"media_kind": "audiobook", "paths": paths},
             total=len(paths),
         )
@@ -7225,7 +8674,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="running",
                 current=index,
                 total=len(selected),
-                message=f"Imported {len(books)}/{len(selected)}",
+                message=t("web.importProgress", done=len(books), total=len(selected)),
             )
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
@@ -7233,11 +8682,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         elif books:
             self.job_center.finish(
                 job_id,
-                message=f"Imported {len(books)}; errors {len(errors)}",
+                message=t("web.importedWithErrors", done=len(books), errors=len(errors)),
                 result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
             )
         else:
-            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
+            self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
         return {"cancelled": False, "books": books, "errors": errors, "state": self.audiobooks.state()}
 
     def choose_audiobook_folder(self) -> dict[str, Any]:
@@ -7245,7 +8694,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"cancelled": True}
         try:
             import webview
-            result = self.window.create_file_dialog(webview.FOLDER_DIALOG, directory=str(Path.home()), allow_multiple=False)
+
+            result = self.window.create_file_dialog(
+                webview.FOLDER_DIALOG, directory=str(Path.home()), allow_multiple=False
+            )
         except Exception as exc:
             return {"cancelled": True, "error": str(exc)}
         if not result:
@@ -7258,7 +8710,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"cancelled": False, "error": str(exc), "state": self.audiobooks.state()}
         job_id = self.job_center.start(
             "import",
-            "Import audiobook folder",
+            t("web.jobImportAudiobookFolder"),
             payload={"media_kind": "audiobook_folder", "paths": [str(raw)]},
             total=max(1, len(targets)),
         )
@@ -7278,18 +8730,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="running",
                 current=index,
                 total=len(targets),
-                message=f"Imported {len(books)}/{len(targets)}",
+                message=t("web.importProgress", done=len(books), total=len(targets)),
             )
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
             self.job_center.cancelled(job_id)
             return {"cancelled": True, "books": books, "errors": errors, "state": self.audiobooks.state()}
         if not books:
-            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
-            return {"cancelled": False, "errors": errors, "error": " • ".join(errors) or "Import failed", "state": self.audiobooks.state()}
+            self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
+            return {
+                "cancelled": False,
+                "errors": errors,
+                "error": " • ".join(errors) or err("web.importFailed"),
+                "state": self.audiobooks.state(),
+            }
         self.job_center.finish(
             job_id,
-            message=f"Imported {len(books)} audiobook{'s' if len(books) != 1 else ''}",
+            message=tn("web.importedAudiobooks", len(books)),
             result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
         )
         payload = {"cancelled": False, "books": books, "errors": errors, "state": self.audiobooks.state()}
@@ -7298,7 +8755,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return payload
 
     def audiobook_play(self, book_id: int, start: float | None = None, speed: float = 1.0) -> dict[str, Any]:
-        result = self.audiobooks.play(int(book_id), None if start is None else float(start), float(speed or 1.0))
+        result = self.audiobooks.play(
+            int(book_id), None if start is None else float(start), float(speed or 1.0)
+        )
         media = self._consumption_media_ref("audiobook", int(book_id))
         if media is not None and isinstance(result, dict):
             result["media_uuid"] = media.media_uuid
@@ -7365,16 +8824,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.audiobooks.rename_bookmark(int(bookmark_id), str(title or ""))
 
     def audiobook_reorder_bookmarks(self, book_id: int, bookmark_ids: list[int]) -> dict[str, Any]:
-        result = self.audiobooks.reorder_bookmarks(
-            int(book_id), [int(value) for value in bookmark_ids]
-        )
+        result = self.audiobooks.reorder_bookmarks(int(book_id), [int(value) for value in bookmark_ids])
         return result
 
     def audiobook_reveal_source(self, book_id: int) -> dict[str, Any]:
         book = self.audiobooks.book(int(book_id))
         source = Path(str(book.get("path") or "")).expanduser()
         if not source.exists():
-            return {"ok": False, "error": "Audiobook source does not exist"}
+            return {"ok": False, "error": err("audiobook.sourceMissing")}
         if sys.platform == "darwin":
             if source.is_dir():
                 subprocess.Popen(["open", str(source.resolve())])
@@ -7401,8 +8858,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.consumption.detach_library_media(kind="audiobook", local_id=str(local_id))
         return result
 
-    def light_novel_audiobook_candidates(self, book_id: int, query: str = "", limit: int = 50) -> list[dict[str, Any]]:
-        return self.audiobooks.link_candidates_for_light_novel(int(book_id), str(query or ""), int(limit or 50))
+    def light_novel_audiobook_candidates(
+        self, book_id: int, query: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
+        return self.audiobooks.link_candidates_for_light_novel(
+            int(book_id), str(query or ""), int(limit or 50)
+        )
 
     def light_novel_link_audiobook(self, book_id: int, audiobook_id: int) -> dict[str, Any]:
         result = self.audiobooks.link_light_novel(int(book_id), int(audiobook_id))
@@ -7443,9 +8904,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def light_novel_paired_state(self, book_id: int) -> dict[str, Any]:
         return self.audiobooks.paired_state(int(book_id))
 
-    def light_novel_prepare_audio_alignment(
-        self, book_id: int, force: bool = False
-    ) -> dict[str, Any]:
+    def light_novel_prepare_audio_alignment(self, book_id: int, force: bool = False) -> dict[str, Any]:
         return self.audiobooks.prepare_alignment(int(book_id), force=bool(force))
 
     def light_novel_audio_alignment_report(self, book_id: int) -> dict[str, Any]:
@@ -7459,10 +8918,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             clear_transcription=bool(clear_transcription),
         )
 
-
-    def light_novel_export_audio_sync_trace(
-        self, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def light_novel_export_audio_sync_trace(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         source = dict(payload) if isinstance(payload, dict) else {}
         raw_events = source.get("events")
         events = (
@@ -7501,6 +8957,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.logger.info("EVENT review_card_ready_ms=%.1f", (time.perf_counter() - started) * 1000)
         return result
 
+    def study_words(self, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Cached dictionary cards of many words (the iPhone keeps them for offline use)."""
+        started = time.perf_counter()
+        result = self.light_novels.jiten_words_cached([dict(card or {}) for card in cards or []])
+        self.logger.info(
+            "EVENT iphone_words count=%d complete=%d ms=%.1f",
+            len(result),
+            sum(1 for card in result if card.get("dictionary_complete")),
+            (time.perf_counter() - started) * 1000,
+        )
+        return result
+
     def study_parse_text(self, text: str) -> dict[str, Any]:
         result = self.light_novels.parse_study_text(str(text or ""))
         if str(self.light_novels.settings().study_backend or "jiten") == "jiten":
@@ -7523,7 +8991,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def set_study_deck_preference(self, backend: str = "jiten", deck_id: Any = "") -> dict[str, Any]:
         value = str(deck_id or "").strip()
         if value and not value.isdigit() and len(value) > 64:
-            return {"ok": False, "message": "Invalid deck id"}
+            return {"ok": False, "message": err("review.invalidDeck")}
         self.manager.db.set_state(self._study_deck_key(backend), value)
         return {"ok": True, "deck_id": value}
 
@@ -7562,10 +9030,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     continue
             elif isinstance(row, dict):
                 try:
-                    pairs.append((
-                        int(row.get("word_id") or row.get("wordId") or 0),
-                        int(row.get("reading_index") if row.get("reading_index") is not None else row.get("readingIndex") or 0),
-                    ))
+                    pairs.append(
+                        (
+                            int(row.get("word_id") or row.get("wordId") or 0),
+                            int(
+                                row.get("reading_index")
+                                if row.get("reading_index") is not None
+                                else row.get("readingIndex") or 0
+                            ),
+                        )
+                    )
                 except (TypeError, ValueError):
                     continue
             if len(pairs) >= 500:
@@ -7650,6 +9124,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
         if not hasattr(self, "_review_gate_due_targets"):
             self._review_gate_due_targets = {}
+        if not hasattr(self, "_review_gate_unavailable"):
+            self._review_gate_unavailable = {}
         if not hasattr(self, "_review_gate_candidates"):
             self._review_gate_candidates = {}
         if not hasattr(self, "_review_gate_pending"):
@@ -7724,15 +9200,17 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     )
                     if not scheduled_target:
                         continue
-                if anime is not None and schedule is None and self._watched_on_anilist(anime, item.episode):
+                if (
+                    anime is not None
+                    and schedule is None
+                    and self._watched_on_anilist(anime, item.last_episode)
+                ):
                     continue
                 knows_subtitle_policy = hasattr(self.manager, "japanese_subtitles_required")
                 subtitle_optional = False
                 if knows_subtitle_policy:
                     try:
-                        subtitle_optional = not bool(
-                            self.manager.japanese_subtitles_required(media_id)
-                        )
+                        subtitle_optional = not bool(self.manager.japanese_subtitles_required(media_id))
                     except Exception:
                         subtitle_optional = False
                 effective_state = "ready" if scheduled_target and item.state == "watched" else item.state
@@ -7798,14 +9276,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "effective_target": min(
                 int(self._review_gate_prefetch_target_count or 0),
                 int(self._review_gate_prefetch_provider_available),
-            ) if self._review_gate_prefetch_provider_available is not None else int(self._review_gate_prefetch_target_count or 0),
+            )
+            if self._review_gate_prefetch_provider_available is not None
+            else int(self._review_gate_prefetch_target_count or 0),
             "session_id": self._review_gate_prefetch_session_id if cards else "",
             "fetched_at": float(self._review_gate_prefetch_fetched_at or 0.0),
             "age_seconds": age if self._review_gate_prefetch_fetched_at else None,
             "inflight": bool(thread is not None and thread.is_alive()),
-            "retry_after_seconds": max(
-                0.0, float(self._review_gate_prefetch_retry_at or 0.0) - time.time()
-            ),
+            "retry_after_seconds": max(0.0, float(self._review_gate_prefetch_retry_at or 0.0) - time.time()),
             "error": str(self._review_gate_prefetch_error or ""),
         }
 
@@ -7816,9 +9294,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             incoming = [card for card in (result.get("cards") or []) if isinstance(card, dict)]
             with self._review_gate_lock:
                 caps = self.light_novels.study_provider_capabilities("jiten")
-                current_account = (
-                    str(caps.get("account_key") or "") if bool(caps.get("configured")) else ""
-                )
+                current_account = str(caps.get("account_key") or "") if bool(caps.get("configured")) else ""
                 if current_account != account_key:
                     return []
                 if self._review_gate_prefetch_account_key not in {"", account_key}:
@@ -7871,7 +9347,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 available = len(merged)
                 if phase == "full":
                     provider_cap = self._review_gate_prefetch_provider_available
-                    effective_target = min(int(fetched_target), int(provider_cap)) if provider_cap is not None else int(fetched_target)
+                    effective_target = (
+                        min(int(fetched_target), int(provider_cap))
+                        if provider_cap is not None
+                        else int(fetched_target)
+                    )
                     if available >= effective_target:
                         self._review_gate_prefetch_no_progress = 0
                         self._review_gate_prefetch_retry_at = 0.0
@@ -7881,7 +9361,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         # find no new safe cards, retrying every minute only wakes
                         # the network/CPU without improving the warm pool. Keep
                         # force=True immediate for episode completion/refill.
-                        self._review_gate_prefetch_no_progress = min(4, int(self._review_gate_prefetch_no_progress or 0) + 1)
+                        self._review_gate_prefetch_no_progress = min(
+                            4, int(self._review_gate_prefetch_no_progress or 0) + 1
+                        )
                         delay = min(900.0, 120.0 * (2 ** (self._review_gate_prefetch_no_progress - 1)))
                         self._review_gate_prefetch_retry_at = time.time() + delay
                     else:
@@ -7905,8 +9387,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 same_account = self._review_gate_prefetch_account_key in {"", account_key}
                 trusted = set(self._review_gate_verified_keys) if same_account else set()
                 already_warm = bool(
-                    self._review_gate_prefetch_account_key == account_key
-                    and self._review_gate_prefetch_cards
+                    self._review_gate_prefetch_account_key == account_key and self._review_gate_prefetch_cards
                 )
                 existing_keys = {
                     str(card.get("pudgeCardKey") or "")
@@ -7987,7 +9468,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         backend = str(self.light_novels.settings().study_backend or "jiten").casefold()
         caps = self.light_novels.study_provider_capabilities(backend)
         account_key = str(caps.get("account_key") or "")
-        if backend != "jiten" or not bool(caps.get("configured")) or not bool(caps.get("strict_gate_supported")) or not account_key:
+        if (
+            backend != "jiten"
+            or not bool(caps.get("configured"))
+            or not bool(caps.get("strict_gate_supported"))
+            or not account_key
+        ):
             return {
                 "started": False,
                 "reason": str(caps.get("strict_gate_reason") or "unsupported"),
@@ -8015,7 +9501,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 # revalidated immediately before POST.
                 return {"started": False, "reason": "satisfied", **snapshot}
             if not force and time.time() < float(self._review_gate_prefetch_retry_at or 0.0):
-                return {"started": False, "reason": "backoff", **self._review_gate_prefetch_snapshot(account_key)}
+                return {
+                    "started": False,
+                    "reason": "backoff",
+                    **self._review_gate_prefetch_snapshot(account_key),
+                }
             fresh = (
                 self._review_gate_prefetch_account_key == account_key
                 and self._review_gate_prefetch_fetched_at > 0
@@ -8034,7 +9524,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             self._review_gate_prefetch_thread = thread
             thread.start()
-            return {"started": True, "reason": "scheduled", **self._review_gate_prefetch_snapshot(account_key)}
+            return {
+                "started": True,
+                "reason": "scheduled",
+                **self._review_gate_prefetch_snapshot(account_key),
+            }
 
     def _review_gate_cached_cards(
         self, account_key: str, *, exclude_keys: set[str]
@@ -8093,6 +9587,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         logical_episode = int(episode.episode) if episode.episode is not None else 0
         return EpisodeReviewIdentity(int(episode.media_id), logical_episode)
 
+    def _review_gate_mark_unavailable(self, video_path: str) -> None:
+        # The gate could not issue a review for this episode (provider down, nothing to
+        # ask): the play() that follows lets the episode through instead of reopening it.
+        self._ensure_review_gate_runtime()
+        self._review_gate_unavailable[self._play_key(video_path)] = time.monotonic()
+
     @staticmethod
     def _review_gate_scope(account_key: str, identity: EpisodeReviewIdentity) -> str:
         return f"{account_key}:{identity.logical_id}"
@@ -8111,7 +9611,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             path = Path(self._play_key(video_path))
             episode = self.manager.db.episode_by_path(path)
             if episode is None:
-                raise LightNovelError("Episode metadata is unavailable for review scanning.")
+                raise LightNovelError(err("review.episodeMetadataUnavailable"))
             subtitle_path, subtitle_meta = resolve_episode_review_subtitle(
                 video_path=Path(episode.video_path),
                 subtitle_path=getattr(episode, "subtitle_path", None),
@@ -8128,34 +9628,53 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             scanned["subtitle_source"] = str(subtitle_meta.get("source") or "")
             scanned["subtitle_path"] = str(subtitle_path)
-            cards = [
-                dict(card)
-                for card in (scanned.get("cards") or [])
-                if isinstance(card, dict)
-            ]
+            cards = [dict(card) for card in (scanned.get("cards") or []) if isinstance(card, dict)]
             scan_ms = round((time.perf_counter() - scan_started) * 1000.0, 1)
         except Exception as exc:
+            # Nothing can be issued (no subtitles, Jiten down or stale): the gate
+            # only blocks when it can actually give the review, so playback goes on.
             failed = dict(status)
             failed.update(
                 {
                     "cards": [],
                     "available": 0,
                     "issued": 0,
-                    "reason": "episode_due_scan_failed",
+                    "blocking": False,
+                    "granted": False,
+                    "reason": "review_unavailable",
                     "message": str(exc),
                     "candidate_fetch_ms": round((time.perf_counter() - begin_started) * 1000.0, 1),
                 }
             )
+            self.logger.warning(
+                "SKIP step=review_gate.episode_due media_id=%s episode=%s reason=review_unavailable error=%r",
+                identity.media_id,
+                identity.episode,
+                str(exc)[:300],
+            )
+            self._review_gate_mark_unavailable(video_path)
             return failed
 
+        current_keys = [
+            str(card.get("pudgeCardKey") or "") for card in cards if str(card.get("pudgeCardKey") or "")
+        ]
+        previous = self._review_gate_due_store.snapshot(account_key, identity)
+        if previous.get("unknown_card_keys"):
+            # An unknown outcome no longer due went through (or was reviewed in
+            # Jiten); one still due is issued again instead of blocking forever.
+            self._review_gate_due_store.settle(
+                account_key,
+                identity,
+                required=len(
+                    set(current_keys)
+                    | set(previous.get("confirmed_card_keys") or [])
+                    | set(previous.get("unknown_card_keys") or [])
+                ),
+                due_keys=set(current_keys),
+            )
         snapshot = self._review_gate_due_store.snapshot(account_key, identity)
         confirmed = list(snapshot.get("confirmed_card_keys") or [])
         unknown = list(snapshot.get("unknown_card_keys") or [])
-        current_keys = [
-            str(card.get("pudgeCardKey") or "")
-            for card in cards
-            if str(card.get("pudgeCardKey") or "")
-        ]
         target_keys = list(dict.fromkeys([*current_keys, *confirmed, *unknown]))
         required = len(target_keys)
         with self._review_gate_lock:
@@ -8163,22 +9682,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "required": required,
                 "keys": tuple(target_keys),
             }
-            progress = self._review_gate_due_store.status(
-                account_key, identity, required=required
-            )
+            progress = self._review_gate_due_store.status(account_key, identity, required=required)
             if progress.granted:
-                progress = self._review_gate_due_store.grant(
-                    account_key, identity, required=required
-                )
+                progress = self._review_gate_due_store.grant(account_key, identity, required=required)
             exclude = set(progress.confirmed_card_keys) | set(progress.unknown_card_keys)
-            visible = [
-                card for card in cards
-                if str(card.get("pudgeCardKey") or "") not in exclude
-            ]
+            visible = [card for card in cards if str(card.get("pudgeCardKey") or "") not in exclude]
             issued_keys = {
-                str(card.get("pudgeCardKey") or "")
-                for card in visible
-                if str(card.get("pudgeCardKey") or "")
+                str(card.get("pudgeCardKey") or "") for card in visible if str(card.get("pudgeCardKey") or "")
             }
             self._review_gate_candidates[scope] = issued_keys
 
@@ -8200,16 +9710,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "reason": "granted" if progress.granted else "episode_due_reviews_required",
         }
         if not progress.granted and not visible:
-            payload["message"] = (
-                "No reviewable due words remain for this episode."
-                if not progress.unknown_card_keys
-                else "A previous review outcome is unknown; this episode cannot be granted automatically."
+            message_key = (
+                "web.reviewNoDueWords" if not progress.unknown_card_keys else "web.reviewOutcomeUnknown"
             )
+            payload["message"] = t(message_key)
+            payload["message_en"] = t(message_key, lang="en")  # the iPhone app is English-only
         self.logger.info(
             "EVENT review_gate.episode_due media_id=%s episode=%s source=%s vocabulary=%s due=%s required=%s completed=%s issued=%s granted=%s duration_ms=%.1f",
-            identity.media_id, identity.episode, str(scanned.get("subtitle_source") or ""),
-            payload["episode_vocabulary_count"], payload["episode_due_count"],
-            progress.required, progress.completed, payload["issued"], progress.granted, payload["begin_ms"],
+            identity.media_id,
+            identity.episode,
+            str(scanned.get("subtitle_source") or ""),
+            payload["episode_vocabulary_count"],
+            payload["episode_due_count"],
+            progress.required,
+            progress.completed,
+            payload["issued"],
+            progress.granted,
+            payload["begin_ms"],
         )
         return payload
 
@@ -8255,7 +9772,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             payload["reason"] = f"{payload['provider']} credentials are not configured"
             return payload
         if not bool(caps.get("strict_gate_supported")):
-            payload["reason"] = str(caps.get("strict_gate_reason") or "provider does not support strict review gating")
+            payload["reason"] = str(
+                caps.get("strict_gate_reason") or "provider does not support strict review gating"
+            )
             return payload
         account_key = str(caps.get("account_key") or "")
         if not account_key:
@@ -8313,15 +9832,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "account_key": account_key,
                 "media_id": identity.media_id,
                 "episode": identity.episode,
-                "reason": "granted" if progress.granted else (
-                    "episode_due_reviews_required" if all_due_episode_words else "reviews_required"
-                ),
+                "reason": "granted"
+                if progress.granted
+                else ("episode_due_reviews_required" if all_due_episode_words else "reviews_required"),
             }
         )
         return payload
 
     def _content_reviews(self):
         from .content_review import ContentReviewService
+
         with self._review_gate_lock:
             if not hasattr(self, "_content_review_service"):
                 self._content_review_service = ContentReviewService(self)
@@ -8330,8 +9850,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def content_review_begin(self, kind: str, book_id: int, part: int) -> dict[str, Any]:
         return self._content_reviews().begin(str(kind), int(book_id), int(part))
 
-    def content_review_review(self, token: str, word_id: int, reading_index: int, grade: str, attempt_id: str) -> dict[str, Any]:
-        return self._content_reviews().review(token, int(word_id), int(reading_index), str(grade), str(attempt_id))
+    def content_review_review(
+        self, token: str, word_id: int, reading_index: int, grade: str, attempt_id: str
+    ) -> dict[str, Any]:
+        return self._content_reviews().review(
+            token, int(word_id), int(reading_index), str(grade), str(attempt_id)
+        )
 
     def content_review_undo(self, token: str, word_id: int, reading_index: int) -> dict[str, Any]:
         return self._content_reviews().undo(token, int(word_id), int(reading_index))
@@ -8342,7 +9866,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if context.get("pending_chapter") != int(chapter):
             return {"ok": False}
         status = self._content_reviews().begin("ln", int(context["ln_book_id"]), int(chapter))
-        if not status.get("granted"):
+        if not status.get("granted") and status.get("blocking", True):
             return {"ok": False}
         with self.audiobooks._lock:
             current = self.audiobooks._review_contexts.get(int(book_id), {})
@@ -8365,7 +9889,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         logging definitions/sentences from Jiten.
         """
         data = payload if isinstance(payload, dict) else {}
-        clean = lambda value, limit=120: re.sub(r"[\r\n\t]+", " " , str(value or ""))[:limit]
+        clean = lambda value, limit=120: re.sub(r"[\r\n\t]+", " ", str(value or ""))[:limit]
         self.logger.info(
             "EVENT review_gate.ui event=%s card=%s reason=%s grade=%s enabled=%s revealed=%s busy=%s authorizing=%s saving=%s queue=%s warm_queue=%s warm_total=%s warm_eligible=%s authorized=%s available=%s issued=%s prefetched=%s candidate_fetch_ms=%s duration_ms=%s outcome=%s completed=%s remaining=%s granted=%s error=%s",
             clean(data.get("event"), 64),
@@ -8403,16 +9927,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 status = self._review_gate_local_status(video_path)
                 if not status.get("blocking"):
                     return status
-            return self._review_gate_begin_episode_due(
-                video_path, status, begin_started=begin_started
-            )
+            return self._review_gate_begin_episode_due(video_path, status, begin_started=begin_started)
         with self._review_gate_lock:
             status = self._review_gate_local_status(video_path)
             if not status.get("blocking"):
                 return status
             identity = EpisodeReviewIdentity(int(status["media_id"]), int(status["episode"]))
             account_key = str(status["account_key"])
-            exclude = set(status.get("confirmed_card_keys") or []) | set(status.get("unknown_card_keys") or [])
+            exclude = set(status.get("confirmed_card_keys") or []) | set(
+                status.get("unknown_card_keys") or []
+            )
             cached_cards, cached_session_id, cache_age = self._review_gate_cached_cards(
                 account_key, exclude_keys=exclude
             )
@@ -8483,21 +10007,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._review_gate_prefetch_fetched_at = time.time()
             self._review_gate_prefetch_fetched_target = episode_target
             self._review_gate_verified_keys.update(
-                str(card.get("pudgeCardKey") or "")
-                for card in cards
-                if str(card.get("pudgeCardKey") or "")
+                str(card.get("pudgeCardKey") or "") for card in cards if str(card.get("pudgeCardKey") or "")
             )
             self._review_gate_prefetch_error = ""
-            visible = [
-                card for card in cards
-                if str(card.get("pudgeCardKey") or "") not in exclude
-            ]
+            visible = [card for card in cards if str(card.get("pudgeCardKey") or "") not in exclude]
             issue_count = max(1, min(len(visible), int(refreshed.get("remaining") or 1))) if visible else 0
             issued = [dict(card) for card in visible[:issue_count]]
             issued_keys = {
-                str(card.get("pudgeCardKey") or "")
-                for card in issued
-                if str(card.get("pudgeCardKey") or "")
+                str(card.get("pudgeCardKey") or "") for card in issued if str(card.get("pudgeCardKey") or "")
             }
             self._review_gate_candidates[scope] = issued_keys
             refreshed["cards"] = issued
@@ -8517,10 +10034,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 refreshed["begin_ms"],
             )
             if not issued:
-                refreshed["reason"] = "no_eligible_existing_reviews"
-                refreshed["message"] = (
-                    "Jiten returned no previously reviewed cards. New cards are never created by the gate."
-                )
+                # No card can be issued: the gate lets the episode through.
+                refreshed["reason"] = "review_unavailable"
+                refreshed["blocking"] = False
+                refreshed["granted"] = False
+                refreshed["message"] = t("web.reviewJitenNoCards")
+                refreshed["message_en"] = t("web.reviewJitenNoCards", lang="en")
+                self._review_gate_mark_unavailable(video_path)
             # Do not hold up this response for the desired x*y pool. Scheduling is
             # cheap; the worker performs provider I/O after the click path returns.
             if pool_target > episode_target:
@@ -8556,11 +10076,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         for row in card.get("deckOccurrences") or []:
             if not isinstance(row, dict):
                 continue
-            sources.extend([
-                str(row.get("originalTitle") or ""),
-                str(row.get("englishTitle") or ""),
-                str(row.get("romajiTitle") or ""),
-            ])
+            sources.extend(
+                [
+                    str(row.get("originalTitle") or ""),
+                    str(row.get("englishTitle") or ""),
+                    str(row.get("romajiTitle") or ""),
+                ]
+            )
         for source in sources:
             key = self._sidebar_review_title_key(source)
             if not key:
@@ -8571,8 +10093,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             # distinctive title before accepting containment to avoid tiny-title
             # false positives.
             if len(key) >= 6 and any(
-                len(title) >= 6 and (title in key or key in title)
-                for title in anime_titles
+                len(title) >= 6 and (title in key or key in title) for title in anime_titles
             ):
                 return True
         return False
@@ -8600,18 +10121,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         wanted = max(1, min(int(limit or 8), 16))
         sample = max(wanted, min(32, wanted * 3))
         excluded = {
-            key for key in (exclude_keys or [])[:256]
+            key
+            for key in (exclude_keys or [])[:256]
             if isinstance(key, str) and re.fullmatch(r"[1-9][0-9]*:[0-9]+", key)
         }
         settings = self.light_novels.settings()
         if not settings.jiten_api_key or settings.study_backend != "jiten":
             return {"ok": True, "configured": False, "cards": [], "card": None}
         try:
-            result = self.light_novels.strict_review_candidates(
-                required=sample, exclude_keys=excluded
-            )
+            result = self.light_novels.strict_review_candidates(required=sample, exclude_keys=excluded)
             cards = [
-                dict(card) for card in (result.get("cards") or [])
+                dict(card)
+                for card in (result.get("cards") or [])
                 if isinstance(card, dict)
                 and f"{card.get('wordId')}:{card.get('readingIndex')}" not in excluded
             ]
@@ -8647,7 +10168,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state = states_by_pair.get(pair, {})
                 age_rank = self._sidebar_review_age_rank(state)
                 card["pudgeSidebarAnimeSource"] = bool(anime)
-                card["pudgeSidebarAge"] = "newer" if age_rank == 0 else ("older" if age_rank == 1 else "other")
+                card["pudgeSidebarAge"] = (
+                    "newer" if age_rank == 0 else ("older" if age_rank == 1 else "other")
+                )
                 ranked.append(((0 if anime else 1, age_rank, order), card))
             ranked.sort(key=lambda item: item[0])
             selected = [card for _rank, card in ranked[:wanted]]
@@ -8681,23 +10204,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         result = self.light_novels.strict_review_submit(
             int(word_id), int(reading_index), wire_grade, attempt_id=str(attempt_id)
         )
-        self._sidebar_due_last_review = (
-            int(word_id), int(reading_index), time.monotonic()
-        )
+        self._sidebar_due_last_review = (int(word_id), int(reading_index), time.monotonic())
         return {"ok": True, "outcome": "confirmed", **(result if isinstance(result, dict) else {})}
 
     def sidebar_due_review_undo(self, word_id: int, reading_index: int) -> dict[str, Any]:
         """Undo only the immediately preceding sidebar review, for ten seconds."""
         marker = getattr(self, "_sidebar_due_last_review", None)
         if not isinstance(marker, tuple) or len(marker) != 3:
-            return {"ok": False, "outcome": "expired", "message": "No sidebar review is available to undo"}
+            return {"ok": False, "outcome": "expired", "message": err("review.noSidebarUndo")}
         previous_word, previous_reading, reviewed_at = marker
         if (
             int(previous_word) != int(word_id)
             or int(previous_reading) != int(reading_index)
             or time.monotonic() - float(reviewed_at) > 10.0
         ):
-            return {"ok": False, "outcome": "expired", "message": "Sidebar undo window expired"}
+            return {"ok": False, "outcome": "expired", "message": err("review.sidebarUndoExpired")}
         result = self.light_novels.strict_review_undo(int(word_id), int(reading_index))
         self._sidebar_due_last_review = None
         return {"ok": True, "outcome": "undone", **(result if isinstance(result, dict) else {})}
@@ -8733,22 +10254,28 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     **status,
                     "ok": False,
                     "outcome": "unknown",
-                    "message": "This card has an ambiguous previous attempt and cannot be retried automatically.",
+                    "message": err("review.ambiguousAttempt"),
                 }
             if card_key not in self._review_gate_candidates.get(scope, set()):
-                raise ValueError("Review card is stale or was not issued by the current gate batch")
+                raise ValueError(err("review.staleCard"))
             pending_key = f"{scope}:{card_key}"
             if pending_key in self._review_gate_pending:
                 self.logger.info(
                     "EVENT review_gate.submit_blocked media_id=%s episode=%s card=%s reason=pending",
-                    identity.media_id, identity.episode, card_key,
+                    identity.media_id,
+                    identity.episode,
+                    card_key,
                 )
                 return {**status, "ok": False, "outcome": "pending"}
             self._review_gate_pending.add(pending_key)
         submit_started = time.perf_counter()
         self.logger.info(
             "EVENT review_gate.submit_start media_id=%s episode=%s card=%s grade=%s attempt=%s",
-            identity.media_id, identity.episode, card_key, str(grade), str(attempt_id)[:80],
+            identity.media_id,
+            identity.episode,
+            card_key,
+            str(grade),
+            str(attempt_id)[:80],
         )
         try:
             result = self.light_novels.strict_review_submit(
@@ -8760,8 +10287,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except LightNovelError as exc:
             self.logger.info(
                 "EVENT review_gate.submit_error media_id=%s episode=%s card=%s outcome=rejected provider_ms=%.1f error=%s",
-                identity.media_id, identity.episode, card_key,
-                (time.perf_counter() - submit_started) * 1000.0, exc,
+                identity.media_id,
+                identity.episode,
+                card_key,
+                (time.perf_counter() - submit_started) * 1000.0,
+                exc,
             )
             # The provider deterministically rejected/reclassified the card (for example
             # it was suspended between batch issue and submit). Do not keep offering a
@@ -8790,8 +10320,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self._review_gate_refill_if_needed(account_key)
             self.logger.info(
                 "EVENT review_gate.submit_unknown media_id=%s episode=%s card=%s provider_ms=%.1f attempt=%s",
-                identity.media_id, identity.episode, card_key,
-                (time.perf_counter() - submit_started) * 1000.0, str(exc.attempt_id)[:80],
+                identity.media_id,
+                identity.episode,
+                card_key,
+                (time.perf_counter() - submit_started) * 1000.0,
+                str(exc.attempt_id)[:80],
             )
             return {
                 **updated,
@@ -8888,9 +10421,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "undo": result,
         }
 
-    def _study_manga_card_image(
-        self, media_context: dict[str, Any] | None
-    ) -> tuple[bytes | None, str]:
+    def _study_card_image(self, media_context: dict[str, Any] | None) -> tuple[bytes | None, str]:
+        """The card picture: the manga page, or the game frame a VN line was read from."""
+        context = media_context if isinstance(media_context, dict) else {}
+        if str(context.get("kind") or "").casefold() == "vn":
+            try:
+                frame_id = int(context.get("frame_id") or context.get("frameId") or 0)
+            except (TypeError, ValueError):
+                frame_id = 0
+            jpeg = self.visual_novels.frame_jpeg(frame_id) if frame_id > 0 else None
+            return (jpeg, f"pudge-vn-frame-{frame_id}.jpg") if jpeg else (None, "")
+        return self._study_manga_card_image(context)
+
+    def _study_manga_card_image(self, media_context: dict[str, Any] | None) -> tuple[bytes | None, str]:
         context = media_context if isinstance(media_context, dict) else {}
         if str(context.get("kind") or "").casefold() != "manga":
             return None, ""
@@ -8939,6 +10482,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         action = str(payload.get("action") or "review")
         media_image: bytes | None = None
         media_filename = ""
+        if backend.casefold() == "jiten" and action == "add":
+            # pudge-manga-add-card-page-v1: an explicit add from the manga reader
+            # carries the page, like a review that mines a new word does.
+            if payload.get("media_context") and str(payload.get("deck_id") or "").isdigit():
+                media_image, media_filename = self._study_card_image(payload.get("media_context"))
         if backend.casefold() == "jiten" and action == "review":
             media_context = payload.get("media_context")
             selected_deck = payload.get("deck_id")
@@ -8958,8 +10506,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     # optional preflight used for image compression failed.
                     should_prepare_media = False
             if should_prepare_media:
-                media_image, media_filename = self._study_manga_card_image(media_context)
-        return self.light_novels.study_action(
+                media_image, media_filename = self._study_card_image(media_context)
+        context = payload.get("media_context") if isinstance(payload.get("media_context"), dict) else {}
+        media_source = str(context.get("kind") or "manga").casefold() if payload.get("media_context") else ""
+        result = self.light_novels.study_action(
             backend,
             action,
             int(payload.get("word_id") or 0),
@@ -8971,7 +10521,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             id_namespace=str(payload.get("id_namespace") or ""),
             media_image=media_image,
             media_filename=media_filename,
+            media_source=media_source,
+            surface=str(payload.get("surface") or ""),
         )
+        if (
+            media_source == "vn"
+            and action == "add"
+            and isinstance(result, dict)
+            and result.get("ok") is not False
+        ):
+            # Jiten cards take the game picture (card media); JPDB cards cannot hold one.
+            note = ""
+            if backend.casefold() == "jpdb":
+                note = t("vn.jpdbNoCardImage")
+            elif not media_image and str(context.get("frame_id") or "0") not in {"", "0"}:
+                note = t("vn.cardImageGone")
+            if note:
+                result = {**result, "enrichment_warnings": [*(result.get("enrichment_warnings") or []), note]}
+        return result
 
     def translate_text(
         self,
@@ -8997,50 +10564,78 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def mpv_playback_save(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .playback_save import save_playback
+
         key = self._play_key(str(payload.get("video") or ""))
         with self._play_lock:
             process = self._play_processes.get(key)
             if getattr(self, "_closing", False) or process is None or process.poll() is not None:
-                return {"ok":False,"error":"Playback ended"}
-        save_playback(self.manager.db,Path(key),position=float(payload.get("position") or 0),
-                      duration=float(payload.get("duration") or 0),session=str(payload.get("session") or "")[:128],
-                      sequence=int(payload.get("sequence") or 0),active_total=float(payload.get("active_total") or 0),
-                      ledger=self.consumption)
-        return {"ok":True}
+                return {"ok": False, "error": err("web.playbackEnded")}
+        save_playback(
+            self.manager.db,
+            Path(key),
+            position=float(payload.get("position") or 0),
+            duration=float(payload.get("duration") or 0),
+            session=str(payload.get("session") or "")[:128],
+            sequence=int(payload.get("sequence") or 0),
+            active_total=float(payload.get("active_total") or 0),
+            ledger=self.consumption,
+        )
+        return {"ok": True}
 
     def mpv_assistant_snapshot(self) -> dict[str, Any]:
         from .mpv_assistant import llm_configured
-        return {"snapshot": dict(getattr(self, "_mpv_assistant_snapshot", {})),
-                "settings": {"language": self.config.ui.language, "llm_enabled": llm_configured(self.config),
-                             "llm_provider": self.config.llm.provider, "llm_url": self.config.llm.base_url,
-                             "llm_model": self.config.llm.model, "llm_api_key": "configured" if self.config.llm.api_key else ""}}
+
+        return {
+            "snapshot": dict(getattr(self, "_mpv_assistant_snapshot", {})),
+            "settings": {
+                "language": self.config.ui.language,
+                "llm_enabled": llm_configured(self.config),
+                "llm_provider": self.config.llm.provider,
+                "llm_url": self.config.llm.base_url,
+                "llm_model": self.config.llm.model,
+                "llm_api_key": "configured" if self.config.llm.api_key else "",
+            },
+        }
 
     def mpv_explain_subtitle(self, payload: dict[str, Any]) -> dict[str, Any]:
         from .mpv_assistant import MpvAssistantWindow, llm_configured
+
         if not llm_configured(self.config):
-            return {"ok": False, "error": "Configure the LLM in Settings"}
+            return {"ok": False, "error": err("web.llmNotConfigured")}
         key = self._play_key(str(payload.get("video") or ""))
         with self._play_lock:
             if key not in self._play_processes or self._play_processes[key].poll() is not None:
-                return {"ok": False, "error": "Playback ended"}
+                return {"ok": False, "error": err("web.playbackEnded")}
         text = str(payload.get("text") or "").strip()[:8192]
         if not text:
-            return {"ok": False, "error": "No current subtitle line"}
+            return {"ok": False, "error": err("web.noSubtitleLine")}
         episode = self.manager.db.episode_by_path(Path(key))
         anime = self.manager.db.get_anime(episode.media_id) if episode and episode.media_id else None
         context = str(payload.get("context") or "")[:24000]
         if episode and episode.media_id and hasattr(self, "light_novels"):
             service = self.light_novels
-            cached = service._character_cache.get({"media_id":int(episode.media_id),"schema":3},ttl_seconds=30*24*3600)
-            glossary = service._merge_character_glossary(int(episode.media_id),cached if isinstance(cached,list) else [])
+            cached = service._character_cache.get(
+                {"media_id": int(episode.media_id), "schema": 3}, ttl_seconds=30 * 24 * 3600
+            )
+            glossary = service._merge_character_glossary(
+                int(episode.media_id), cached if isinstance(cached, list) else []
+            )
             if glossary:
-                context += "\nCharacter glossary: " + json.dumps(glossary[:50],ensure_ascii=False)
+                context += "\nCharacter glossary: " + json.dumps(glossary[:50], ensure_ascii=False)
 
-        metadata = {"kind": "anime", "media_id": episode.media_id if episode else None,
-                    "episode": episode.media_episode if episode else None, "title": anime.title if anime else Path(key).stem,
-                    "position": float(payload.get("position") or 0)}
-        self._mpv_assistant_snapshot = {"text": text, "context": json.dumps(metadata, ensure_ascii=False) + "\n" + context,
-                                        "metadata": metadata, "request_id": secrets.token_hex(12)}
+        metadata = {
+            "kind": "anime",
+            "media_id": episode.media_id if episode else None,
+            "episode": episode.media_episode if episode else None,
+            "title": anime.title if anime else Path(key).stem,
+            "position": float(payload.get("position") or 0),
+        }
+        self._mpv_assistant_snapshot = {
+            "text": text,
+            "context": json.dumps(metadata, ensure_ascii=False) + "\n" + context,
+            "metadata": metadata,
+            "request_id": secrets.token_hex(12),
+        }
         with self._play_lock:
             if not hasattr(self, "_mpv_assistant_window"):
                 self._mpv_assistant_window = MpvAssistantWindow(self)
@@ -9075,11 +10670,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"cancelled": True}
         try:
             import webview
+
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 directory=str(Path.home()),
                 allow_multiple=True,
-                file_types=("Light novels (*.epub;*.txt)", "EPUB (*.epub)", "Text (*.txt)"),
+                file_types=(
+                    f"{t('web.fileTypeLightNovels')} (*.epub;*.txt)",
+                    "EPUB (*.epub)",
+                    f"{t('web.fileTypeText')} (*.txt)",
+                ),
             )
         except Exception as exc:
             return {"cancelled": True, "error": str(exc)}
@@ -9089,7 +10689,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         paths = [str(value) for value in selected]
         job_id = self.job_center.start(
             "import",
-            "Import Light Novels",
+            t("web.jobImportLightNovels"),
             payload={"media_kind": "light_novel", "paths": paths},
             total=len(paths),
         )
@@ -9119,7 +10719,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="running",
                 current=index,
                 total=len(selected),
-                message=f"Imported {len(books)}/{len(selected)}",
+                message=t("web.importProgress", done=len(books), total=len(selected)),
             )
         self._import_cancel_events.pop(job_id, None)
         if cancel_event.is_set():
@@ -9127,13 +10727,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         elif books:
             self.job_center.finish(
                 job_id,
-                message=f"Imported {len(books)}; errors {len(errors)}",
+                message=t("web.importedWithErrors", done=len(books), errors=len(errors)),
                 result={"book_ids": [int(book["id"]) for book in books], "errors": errors},
             )
         else:
-            self.job_center.fail(job_id, " • ".join(errors) or "Import failed")
+            self.job_center.fail(job_id, " • ".join(errors) or err("web.importFailed"))
         state = self.light_novels.state()
-        return {"cancelled": False, "books": books, "book": books[0] if books else None, "errors": errors, "state": state}
+        return {
+            "cancelled": False,
+            "books": books,
+            "book": books[0] if books else None,
+            "errors": errors,
+            "state": state,
+        }
 
     def light_novel_open(self, book_id: int) -> dict[str, Any]:
         started_at = time.monotonic()
@@ -9150,13 +10756,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # then emit the richer timing breakdown as a second record.
         self.logger.info(
             "LN open book=%s chapters=%s paired=%s elapsed=%.3fs",
-            book_id, len(book.get("chapters") or []), bool(book.get("paired_audio")),
+            book_id,
+            len(book.get("chapters") or []),
+            bool(book.get("paired_audio")),
             total_ms / 1000.0,
         )
         self.logger.info(
             "TIMING step=ln.open book=%s chapters=%s paired=%s metadata_ms=%.1f paired_audio_ms=%.1f total_ms=%.1f",
-            book_id, len(book.get("chapters") or []), bool(book.get("paired_audio")),
-            metadata_ms, audio_ms, total_ms,
+            book_id,
+            len(book.get("chapters") or []),
+            bool(book.get("paired_audio")),
+            metadata_ms,
+            audio_ms,
+            total_ms,
         )
         media = self._consumption_media_ref("light_novel", int(book_id))
         if media is not None:
@@ -9188,8 +10800,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.logger.warning("LN audio reader-parse alignment refresh schedule failed: %s", exc)
         self.logger.info(
             "TIMING step=ln.chapter book=%s chapter=%s parsing=%s tokens=%s response_ms=%.1f",
-            book_id, chapter_index, bool(payload.get("parsing")),
-            sum(len(row or []) for row in (payload.get("tokens") or [])), chapter_ms,
+            book_id,
+            chapter_index,
+            bool(payload.get("parsing")),
+            sum(len(row or []) for row in (payload.get("tokens") or [])),
+            chapter_ms,
         )
         return payload
 
@@ -9198,14 +10813,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         started_at = time.monotonic()
         payload = self.light_novels.chapter_parse_status(int(book_id), int(chapter_index))
         ready_payload = payload.get("payload") if isinstance(payload, dict) else None
-        if bool(payload.get("ready")) and isinstance(ready_payload, dict) and (ready_payload.get("tokens") or []):
+        if (
+            bool(payload.get("ready"))
+            and isinstance(ready_payload, dict)
+            and (ready_payload.get("tokens") or [])
+        ):
             try:
                 self._schedule_ln_reader_parse_alignment_refresh(int(book_id), int(chapter_index))
             except Exception as exc:
                 self.logger.warning("LN audio reader-parse alignment refresh schedule failed: %s", exc)
         self.logger.info(
             "TIMING step=ln.chapter_parse_status book=%s chapter=%s ready=%s response_ms=%.1f",
-            book_id, chapter_index, bool(payload.get("ready")),
+            book_id,
+            chapter_index,
+            bool(payload.get("ready")),
             (time.monotonic() - started_at) * 1000.0,
         )
         return payload
@@ -9273,7 +10894,35 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.consumption.detach_library_media(kind="light_novel", local_id=str(local_id))
         return result
 
-    def light_novel_bind_anilist(self, book_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
+    def library_set_metadata(
+        self, kind: str, item_id: int, volume: Any = None, series_title: str = ""
+    ) -> dict[str, Any]:
+        """Hand-made volume/series correction for a light novel, manga or audiobook.
+
+        An empty volume and an empty series title remove the correction.
+        """
+        kind = str(kind or "")
+        parsed_volume: int | None = None
+        if volume is not None and str(volume).strip():
+            try:
+                parsed_volume = int(str(volume).strip())
+            except ValueError:
+                return {"ok": False, "error": err("library.volumeNotNumber")}
+        services = {"ln": self.light_novels, "manga": self.manga, "audiobook": self.audiobooks}
+        service = services.get(kind)
+        if service is None:
+            return {"ok": False, "error": err("library.unknownLibrary")}
+        try:
+            item = service.set_metadata_override(
+                int(item_id), volume=parsed_volume, series_title=str(series_title or "")
+            )
+        except (ValueError, KeyError, LightNovelError) as exc:
+            return {"ok": False, "error": str(exc).strip("'\"")}
+        return {"ok": True, "item": item}
+
+    def light_novel_bind_anilist(
+        self, book_id: int, media_id: int, selection: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         result = self.light_novels.bind_anilist(
             int(book_id), int(media_id), selection if isinstance(selection, dict) else None
         )
@@ -9298,7 +10947,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def character_glossary(self, media_id: int) -> list[dict[str, str]]:
         return self.light_novels.character_glossary(int(media_id))
 
-    def save_character_glossary_override(self, media_id: int, source: str, preferred: str) -> list[dict[str, str]]:
+    def save_character_glossary_override(
+        self, media_id: int, source: str, preferred: str
+    ) -> list[dict[str, str]]:
         return self.light_novels.save_character_glossary_override(int(media_id), source, preferred)
 
     def delete_character_glossary_override(self, media_id: int, source: str) -> list[dict[str, str]]:
@@ -9355,11 +11006,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 canonical_by_id.setdefault(character_id, canonical)
         exported_character_profiles = {
             str(character_id): {
-                "name": str(global_profiles[character_id].get("name") or canonical_by_id.get(character_id, "")),
+                "name": str(
+                    global_profiles[character_id].get("name") or canonical_by_id.get(character_id, "")
+                ),
                 "caption": str(global_profiles[character_id].get("caption") or ""),
             }
             for character_id in sorted(known_character_ids)
-            if character_id in global_profiles and str(global_profiles[character_id].get("caption") or "").strip()
+            if character_id in global_profiles
+            and str(global_profiles[character_id].get("caption") or "").strip()
         }
 
         manifest_books: list[dict[str, Any]] = []
@@ -9464,10 +11118,30 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             zf.writestr("INSTRUCTIONS.md", instructions.encode("utf-8"))
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
-            zf.writestr("profiles.json", json.dumps({"schema": 2, "scope": "series-fallback", "profiles": profiles}, ensure_ascii=False, indent=2).encode("utf-8"))
-            zf.writestr("character_profiles.json", json.dumps({"schema": 1, "scope": "anilist-character", "characters": exported_character_profiles}, ensure_ascii=False, indent=2).encode("utf-8"))
-            zf.writestr("known_characters.json", json.dumps(known_characters, ensure_ascii=False, indent=2).encode("utf-8"))
-            zf.writestr("OUTPUT_TEMPLATE.json", json.dumps(output_template, ensure_ascii=False, indent=2).encode("utf-8"))
+            zf.writestr(
+                "profiles.json",
+                json.dumps(
+                    {"schema": 2, "scope": "series-fallback", "profiles": profiles},
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+            zf.writestr(
+                "character_profiles.json",
+                json.dumps(
+                    {"schema": 1, "scope": "anilist-character", "characters": exported_character_profiles},
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+            zf.writestr(
+                "known_characters.json",
+                json.dumps(known_characters, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
+            zf.writestr(
+                "OUTPUT_TEMPLATE.json",
+                json.dumps(output_template, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
             for rel, content in chapter_files.items():
                 zf.writestr(rel, content)
         if sys.platform == "darwin":
@@ -9491,13 +11165,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if path.suffix.lower() == ".json":
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
-                raise LightNovelError("Speaker annotation JSON must contain an object")
+                raise LightNovelError(err("ln.speakerJsonNotObject"))
             return payload
         if path.suffix.lower() != ".zip":
-            raise LightNovelError("Choose a Pudge speaker annotation .json or .zip file")
+            raise LightNovelError(err("ln.speakerFileChoose"))
         with zipfile.ZipFile(path, "r") as zf:
             candidates = [
-                name for name in zf.namelist()
+                name
+                for name in zf.namelist()
                 if Path(name).name.casefold() == "pudge-speaker-annotations.json"
             ]
             for name in candidates:
@@ -9507,16 +11182,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     continue
                 if isinstance(payload, dict) and payload.get("kind") == "pudge-speaker-annotations":
                     return payload
-        raise LightNovelError("ZIP does not contain pudge-speaker-annotations.json")
+        raise LightNovelError(err("ln.speakerZipMissingJson"))
 
     def import_light_novel_speaker_markup(self, book_id: int, path: str) -> dict[str, Any]:
         anchor, local_books = self._speaker_markup_series_books(int(book_id))
         expected_series_key = str(anchor.get("series_key") or f"book:{int(book_id)}")
         payload = self._read_speaker_annotations_file(Path(str(path)).expanduser())
         if int(payload.get("schema") or 0) != 1 or payload.get("kind") != "pudge-speaker-annotations":
-            raise LightNovelError("Unsupported Pudge speaker annotation schema")
+            raise LightNovelError(err("ln.speakerSchemaUnsupported"))
         if str(payload.get("series_key") or "") != expected_series_key:
-            raise LightNovelError("Speaker annotation archive belongs to a different LN series")
+            raise LightNovelError(err("ln.speakerOtherSeries"))
 
         local_by_id = {int(item["id"]): item for item in local_books}
         context = self._audiobook_speaker_cache_context(int(anchor["id"]))
@@ -9609,12 +11284,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             except (TypeError, ValueError):
                 continue
             if target_book_id not in local_by_id:
-                raise LightNovelError(f"Speaker markup references unavailable local volume book_id={target_book_id}")
+                raise LightNovelError(err("ln.speakerMissingVolume", bookId=target_book_id))
             source = self.light_novels.tts_source(target_book_id)
             chapters = {int(ch.get("index") or 0): ch for ch in source.get("chapters") or []}
             book_context = self._audiobook_speaker_cache_context(target_book_id)
             book_dir = Path(book_context["book_dir"])
-            for chapter_row in book_row.get("chapters", []) if isinstance(book_row.get("chapters"), list) else []:
+            for chapter_row in (
+                book_row.get("chapters", []) if isinstance(book_row.get("chapters"), list) else []
+            ):
                 if not isinstance(chapter_row, dict):
                     continue
                 try:
@@ -9624,19 +11301,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 chapter = chapters.get(chapter_index)
                 if chapter is None:
                     raise LightNovelError(
-                        f"Speaker markup chapter is not present locally: book_id={target_book_id} chapter={chapter_index}"
+                        err("ln.speakerMissingChapter", bookId=target_book_id, chapter=chapter_index)
                     )
                 chapter_text = str(chapter.get("text") or "")
                 digest = self._speaker_markup_chapter_digest(chapter_text)
                 if str(chapter_row.get("source_sha256") or "") != digest:
                     raise LightNovelError(
-                        f"LN text changed since export: book_id={target_book_id} chapter={chapter_index}. Export a fresh archive."
+                        err("ln.speakerTextChanged", bookId=target_book_id, chapter=chapter_index)
                     )
                 units = self._audiobook_voice_units(chapter_text)
                 assignable_ids = {int(unit["id"]) for unit in units}
                 assignments: list[dict[str, Any]] = []
                 seen_ids: set[int] = set()
-                for raw in chapter_row.get("assignments", []) if isinstance(chapter_row.get("assignments"), list) else []:
+                for raw in (
+                    chapter_row.get("assignments", [])
+                    if isinstance(chapter_row.get("assignments"), list)
+                    else []
+                ):
                     if not isinstance(raw, dict):
                         continue
                     try:
@@ -9690,7 +11371,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 imported_assignments += len(assignments)
 
         if imported_chapters <= 0:
-            raise LightNovelError("Speaker annotation file did not contain any matching chapters")
+            raise LightNovelError(err("ln.speakerNoMatches"))
         self._write_audiobook_speaker_profiles(
             profiles_path,
             profiles,
@@ -9716,11 +11397,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"cancelled": True}
         try:
             import webview
+
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 directory=str(Path.home() / "Downloads"),
                 allow_multiple=False,
-                file_types=("Pudge speaker markup (*.zip;*.json)", "ZIP (*.zip)", "JSON (*.json)"),
+                file_types=(
+                    f"{t('web.fileTypeSpeakerMarkup')} (*.zip;*.json)",
+                    "ZIP (*.zip)",
+                    "JSON (*.json)",
+                ),
             )
         except Exception as exc:
             return {"cancelled": True, "error": str(exc)}
@@ -9744,10 +11430,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if normalized == "manga":
             return self.manga._book(int(local_id))
         with self.manager.db.connect() as conn:
-            row = conn.execute("SELECT * FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id))).fetchone()
+            row = conn.execute(
+                "SELECT * FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id))
+            ).fetchone()
         return dict(row) if row is not None else {"kind": normalized, "local_id": int(local_id)}
 
-    def media_identity_bind(self, kind: str, local_id: int, media_id: int, selection: dict[str, Any] | None = None) -> dict[str, Any]:
+    def media_identity_bind(
+        self, kind: str, local_id: int, media_id: int, selection: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         normalized = _media_identity_anilist_kind(kind)
         item = dict(selection or {})
         if normalized in {"novel", "light_novel", "ln"}:
@@ -9760,7 +11450,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             conn.execute(
                 "INSERT INTO media_identities(kind,local_id,anilist_id,anilist_type,title,cover_url,site_url,updated_at) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(kind,local_id) DO UPDATE SET anilist_id=excluded.anilist_id,anilist_type=excluded.anilist_type,title=excluded.title,cover_url=excluded.cover_url,site_url=excluded.site_url,updated_at=excluded.updated_at",
-                (normalized, int(local_id), int(media_id), "ANIME" if item.get("media_kind") == "anime" else "MANGA", str(item.get("title") or ""), str(item.get("cover") or ""), str(item.get("site_url") or ""), time.time()),
+                (
+                    normalized,
+                    int(local_id),
+                    int(media_id),
+                    "ANIME" if item.get("media_kind") == "anime" else "MANGA",
+                    str(item.get("title") or ""),
+                    str(item.get("cover") or ""),
+                    str(item.get("site_url") or ""),
+                    time.time(),
+                ),
             )
         if normalized == "audiobook":
             self.audiobooks.auto_link_audiobook(int(local_id))
@@ -9773,7 +11472,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if normalized == "manga":
             return self.manga_unbind_anilist(int(local_id))
         with self.manager.db.connect() as conn:
-            conn.execute("DELETE FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id)))
+            conn.execute(
+                "DELETE FROM media_identities WHERE kind=? AND local_id=?", (normalized, int(local_id))
+            )
         return {"kind": normalized, "local_id": int(local_id)}
 
     def set_literature_score(
@@ -9801,7 +11502,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         raise AssertionError("unreachable literature kind")
 
     def light_novel_save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
-        return self.light_novels.save_settings(values or {})
+        saved = self.light_novels.save_settings(values or {})
+        self._screen_text_settings_changed()
+        return saved
+
+    def light_novel_jiten_profile_colors(self) -> dict[str, Any]:
+        return self.light_novels.jiten_profile_word_colors()
 
     def light_novel_generate_reader_css(
         self,
@@ -9838,21 +11544,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def audiobook_search_light_novel_nyaa(self, audiobook_id: int) -> dict[str, Any]:
         book = self.audiobooks.book(int(audiobook_id))
         linked = book.get("linked_light_novel") or {}
-        title = str(
-            linked.get("title")
-            or book.get("anilist_title")
-            or book.get("title")
-            or ""
-        ).strip()
+        title = str(linked.get("title") or book.get("anilist_title") or book.get("title") or "").strip()
         volume = int(linked.get("volume") or 0)
         query = self.light_novels._nyaa_title(title)
         return {
             "query": query,
             "category": "2_0",
             "target_volume": volume or None,
-            "releases": self.light_novels.search_nyaa(
-                query, target_volume=volume or None
-            ),
+            "releases": self.light_novels.search_nyaa(query, target_volume=volume or None),
         }
 
     @staticmethod
@@ -9875,13 +11574,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             shared = self._torrent_shared_admission()
             if shared is not None:
                 with shared.locked():
-                    if (not self._torrent_enabled_state()
-                            or not shared.enabled(fallback=self._torrent_enabled_state())):
-                        raise LightNovelError("Enable torrents before downloading an audiobook")
+                    if not self._torrent_enabled_state() or not shared.enabled(
+                        fallback=self._torrent_enabled_state()
+                    ):
+                        raise LightNovelError(err("audiobook.enableTorrents"))
                     yield
             else:
                 if not self._torrent_enabled_state():
-                    raise LightNovelError("Enable torrents before downloading an audiobook")
+                    raise LightNovelError(err("audiobook.enableTorrents"))
                 yield
 
     def _audiobook_torrent_client(self) -> tuple[str, Any]:
@@ -9916,7 +11616,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 vpn_interface=cfg.vpn_interface,
                 vpn_kill_switch=cfg.vpn_kill_switch,
             )
-        raise LightNovelError("Audiobook torrent download requires qBittorrent or aria2")
+        raise LightNovelError(err("audiobook.torrentClientRequired"))
 
     def _audiobook_nyaa_volume_selection(
         self,
@@ -9930,7 +11630,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         release_name = str(release_title or "")
         looks_like_collection = bool(
             require_series_match
-            or re.search(r"(?i)(?:collection|pack|batch|complete[ ._-]*series|全巻|全集|第?\d+[-~–—]\d+巻)", release_name)
+            or re.search(
+                r"(?i)(?:collection|pack|batch|complete[ ._-]*series|全巻|全集|第?\d+[-~–—]\d+巻)",
+                release_name,
+            )
         )
         plan = audiobook_torrent_pack_plan(
             files,
@@ -9942,13 +11645,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if int(volume.get("volume") or 0) == target:
                 selected_ids = {int(value) for value in volume.get("file_ids") or []}
                 selected = [
-                    row for row in (plan.get("files") or [])
+                    row
+                    for row in (plan.get("files") or [])
                     if int(row.get("file_id") if row.get("file_id") is not None else -1) in selected_ids
                     and row.get("is_audio")
                 ]
                 if require_series_match:
                     selected = [
-                        row for row in selected
+                        row
+                        for row in selected
                         if self._audiobook_nyaa_series_match(str(row.get("name") or ""), series_title)
                     ]
                 if selected:
@@ -9963,7 +11668,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         audio = [row for row in (plan.get("files") or []) if row.get("is_audio")]
         if require_series_match:
             audio = [
-                row for row in audio
+                row
+                for row in audio
                 if self._audiobook_nyaa_series_match(str(row.get("name") or ""), series_title)
             ]
         if matches and exact and audio and not (plan.get("archive_file_ids") or []):
@@ -9972,9 +11678,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _ln_audiobook_search_cache_key(self, book: dict[str, Any]) -> dict[str, Any]:
         return {
-            "series": unicodedata.normalize(
-                "NFKC", str(book.get("series_title") or book.get("title") or "")
-            ).strip().casefold(),
+            "series": unicodedata.normalize("NFKC", str(book.get("series_title") or book.get("title") or ""))
+            .strip()
+            .casefold(),
             "volume": max(0, int(book.get("volume") or 0)),
         }
 
@@ -9998,9 +11704,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
         result = dict(cached)
         result["cached"] = True
-        result["cache_age_seconds"] = max(
-            0.0, time.time() - float(result.get("cached_at") or time.time())
-        )
+        result["cache_age_seconds"] = max(0.0, time.time() - float(result.get("cached_at") or time.time()))
         return result
 
     def _ln_audiobook_cached_torrent_files(self, release: NyaaRelease) -> list[dict[str, Any]]:
@@ -10013,9 +11717,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         rows = cache.get(key, ttl_seconds=60 * 24 * 3600)
         return [dict(row) for row in rows] if isinstance(rows, list) else []
 
-    def _ln_audiobook_cache_torrent_files(
-        self, release: NyaaRelease, files: list[dict[str, Any]]
-    ) -> None:
+    def _ln_audiobook_cache_torrent_files(self, release: NyaaRelease, files: list[dict[str, Any]]) -> None:
         cache = getattr(self, "_ln_audiobook_torrent_cache", None)
         if cache is None or not files:
             return
@@ -10028,11 +11730,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         book = self.light_novels.book(int(book_id))
         target_volume = max(0, int(book.get("volume") or 0))
         if target_volume <= 0:
-            raise LightNovelError("This light novel does not have a detectable volume number")
+            raise LightNovelError(err("audiobook.noVolumeNumber"))
         series_title = str(book.get("series_title") or book.get("title") or "").strip()
         query = self.light_novels._nyaa_title(series_title)
         if not query:
-            raise LightNovelError("Could not derive a Nyaa search title for this series")
+            raise LightNovelError(err("audiobook.noSearchTitle"))
         client = NyaaClient(
             self.config.nyaa.base_url,
             category="2_0",
@@ -10047,13 +11749,17 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # so direct title search alone cannot discover them.  Search a small set of
         # collection feeds too, then inspect their .torrent metadata and require
         # the requested series name inside the selected file path.
-        direct_queries = tuple(dict.fromkeys((
-            query,
-            f"{query} audiobook",
-            f"{query} オーディオブック",
-            f"{query} {target_volume}",
-            f"{query} 第{target_volume}巻",
-        )))
+        direct_queries = tuple(
+            dict.fromkeys(
+                (
+                    query,
+                    f"{query} audiobook",
+                    f"{query} オーディオブック",
+                    f"{query} {target_volume}",
+                    f"{query} 第{target_volume}巻",
+                )
+            )
+        )
         collection_queries = (
             "TMW Japanese Audiobooks Collection",
             "Japanese Audiobooks Collection",
@@ -10065,7 +11771,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         discovered: dict[str, tuple[NyaaRelease, bool]] = {}
         self.logger.info(
             "LN audiobook Nyaa search start book_id=%s series=%r volume=%s query=%r",
-            int(book_id), series_title, target_volume, query,
+            int(book_id),
+            series_title,
+            target_volume,
+            query,
         )
         try:
             for search_query in direct_queries:
@@ -10096,7 +11805,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             direct = [row for row in discovered.values() if not row[1]]
             collections = [row for row in discovered.values() if row[1]]
             rank = lambda item: (
-                bool(item[0].trusted), int(item[0].seeders), int(item[0].downloads),
+                bool(item[0].trusted),
+                int(item[0].seeders),
+                int(item[0].downloads),
                 int(item[0].size_bytes),
             )
             direct = sorted(direct, key=rank, reverse=True)[:36]
@@ -10125,7 +11836,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             volume_title = str(book.get("title") or "").strip() or f"Volume {target_volume}"
                             self.logger.info(
                                 "LN audiobook Nyaa title match title=%r volume_title=%r without metadata fetch",
-                                release.title, volume_title,
+                                release.title,
+                                volume_title,
                             )
                             return {
                                 "title": release.title,
@@ -10148,7 +11860,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         # An explicit audiobook release for another volume cannot
                         # become the requested one because of chapter numbers.
                         # Skip it before any torrent metadata request.
-                        if re.search(r"(?i)(?:vol(?:ume)?[ ._-]*\d+|第?\d+巻|[IVXLCDM]+～?完全版オーディオブック)", str(release.title or "")):
+                        if re.search(
+                            r"(?i)(?:vol(?:ume)?[ ._-]*\d+|第?\d+巻|[IVXLCDM]+～?完全版オーディオブック)",
+                            str(release.title or ""),
+                        ):
                             return None
 
                     files = self._ln_audiobook_cached_torrent_files(release)
@@ -10163,7 +11878,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             metadata_source = "magnet"
                             self.logger.info(
                                 "LN audiobook Nyaa torrent metadata fallback title=%r error=%s",
-                                release.title, torrent_exc,
+                                release.title,
+                                torrent_exc,
                             )
                             qbt = QBittorrentClient(
                                 self.config.qbittorrent.base_url,
@@ -10183,12 +11899,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             finally:
                                 qbt.close()
                             if not files:
-                                raise LightNovelError(
-                                    "Could not read torrent metadata through Nyaa or qBittorrent"
-                                )
+                                raise LightNovelError(err("audiobook.metadataUnreadable"))
                         self._ln_audiobook_cache_torrent_files(release, files)
                     selected, plan = self._audiobook_nyaa_volume_selection(
-                        files, target_volume, release.title,
+                        files,
+                        target_volume,
+                        release.title,
                         series_title=series_title,
                         require_series_match=generic_collection,
                     )
@@ -10198,7 +11914,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     volume_title = str(book.get("title") or "").strip() or f"Volume {target_volume}"
                     self.logger.info(
                         "LN audiobook Nyaa match title=%r volume_title=%r tracks=%s sample=%r",
-                        release.title, volume_title, len(selected_names), selected_names[:2],
+                        release.title,
+                        volume_title,
+                        len(selected_names),
+                        selected_names[:2],
                     )
                     return {
                         "title": release.title,
@@ -10221,7 +11940,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 except Exception as exc:
                     self.logger.info(
                         "LN audiobook Nyaa inspect skipped title=%r generic=%s error=%s",
-                        release.title, generic_collection, exc,
+                        release.title,
+                        generic_collection,
+                        exc,
                     )
                     return None
 
@@ -10242,7 +11963,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             self.logger.info(
                 "LN audiobook Nyaa search done book_id=%s volume=%s direct=%s collections=%s inspected=%s matches=%s",
-                int(book_id), target_volume, len(direct), len(collections), len(releases), len(rows),
+                int(book_id),
+                target_volume,
+                len(direct),
+                len(collections),
+                len(releases),
+                len(rows),
             )
             result = {
                 "query": query,
@@ -10297,7 +12023,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "volume": max(0, int(book.get("volume") or 0)),
             "torrent_hash": str(torrent_hash or ""),
             "collection": bool(collection),
-            "selected_files": [str(row.get("name") or "") for row in selected if str(row.get("name") or "").strip()],
+            "selected_files": [
+                str(row.get("name") or "") for row in selected if str(row.get("name") or "").strip()
+            ],
             "selected_entries": [
                 {
                     "name": str(row.get("name") or ""),
@@ -10366,7 +12094,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
         manifest_path = self._ln_audiobook_selection_manifest_path(destination)
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+            manifest = (
+                json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             manifest = {}
         if (
@@ -10381,7 +12111,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 matches = [
                     path
                     for actual, path in path_by_name.items()
-                    if actual == expected or actual.endswith("/" + expected) or expected.endswith("/" + actual)
+                    if actual == expected
+                    or actual.endswith("/" + expected)
+                    or expected.endswith("/" + actual)
                 ]
                 if len(matches) == 1 and matches[0] not in seen:
                     if bool(manifest.get("collection")):
@@ -10393,22 +12125,37 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             continue
                     seen.add(matches[0])
                     resolved.append(matches[0])
-            expected_count = len({
-                self._normalized_audiobook_relative_path(value)
-                for value in (manifest.get("selected_files") or [])
-                if str(value or "").strip()
-            })
+            expected_count = len(
+                {
+                    self._normalized_audiobook_relative_path(value)
+                    for value in (manifest.get("selected_files") or [])
+                    if str(value or "").strip()
+                }
+            )
             if resolved and len(resolved) == expected_count:
                 expected_sizes = {
-                    self._normalized_audiobook_relative_path(row.get("name")): max(0, int(row.get("size_bytes") or 0))
+                    self._normalized_audiobook_relative_path(row.get("name")): max(
+                        0, int(row.get("size_bytes") or 0)
+                    )
                     for row in (manifest.get("selected_entries") or [])
                     if isinstance(row, dict) and str(row.get("name") or "").strip()
                 }
                 complete = True
                 for path in resolved:
                     try:
-                        relative = self._normalized_audiobook_relative_path(path.relative_to(destination).as_posix())
-                        expected = next((size for name, size in expected_sizes.items() if relative == name or relative.endswith("/" + name) or name.endswith("/" + relative)), 0)
+                        relative = self._normalized_audiobook_relative_path(
+                            path.relative_to(destination).as_posix()
+                        )
+                        expected = next(
+                            (
+                                size
+                                for name, size in expected_sizes.items()
+                                if relative == name
+                                or relative.endswith("/" + name)
+                                or name.endswith("/" + relative)
+                            ),
+                            0,
+                        )
                         if expected > 0 and int(path.stat().st_size) < max(1, int(expected * 0.999)):
                             complete = False
                             break
@@ -10423,7 +12170,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # exact series subtree so ``新説 狼と香辛料 / 狼と羊皮紙`` cannot be
         # imported merely because the managed outer folder says 狼と香辛料.
         exact_series_rows = [
-            row for row in disk_rows
+            row
+            for row in disk_rows
             if self._audiobook_nyaa_series_match(str(row.get("name") or ""), series_title)
         ]
         if not exact_series_rows:
@@ -10522,7 +12270,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     book_id = int(book.get("id") or 0)
                     if book_id <= 0 or int(book.get("volume") or 0) <= 0:
                         continue
-                    if self.audiobooks.link_for_light_novel(book_id, include_alignment=False, include_transcription=False):
+                    if self.audiobooks.link_for_light_novel(
+                        book_id, include_alignment=False, include_transcription=False
+                    ):
                         continue
                     destination = self._light_novel_audiobook_download_destination(book)
                     if not destination.is_dir():
@@ -10532,12 +12282,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     if not audio_paths:
                         self.logger.info(
                             "LN audiobook recovery no exact volume book_id=%s destination=%s",
-                            book_id, destination,
+                            book_id,
+                            destination,
                         )
                         continue
                     self.logger.info(
                         "LN audiobook recovery candidate book_id=%s volume=%s files=%s sample=%r",
-                        book_id, int(book.get("volume") or 0), len(audio_paths),
+                        book_id,
+                        int(book.get("volume") or 0),
+                        len(audio_paths),
                         [str(path) for path in audio_paths[:3]],
                     )
                     imported = self._import_recovered_light_novel_audiobook(book, destination, audio_paths)
@@ -10547,12 +12300,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     recovered += 1
                     self.logger.info(
                         "LN audiobook recovery linked book_id=%s audiobook_id=%s files=%s",
-                        book_id, int(imported["id"]), len(audio_paths),
+                        book_id,
+                        int(imported["id"]),
+                        len(audio_paths),
                     )
                 except Exception as exc:
                     self.logger.warning(
                         "LN audiobook recovery skipped book_id=%s error=%s",
-                        int(book.get("id") or 0), exc,
+                        int(book.get("id") or 0),
+                        exc,
                     )
             return {"skipped": False, "inspected": inspected, "recovered": recovered}
         finally:
@@ -10596,7 +12352,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             while time.monotonic() < deadline:
                 files = torrent.files(torrent_hash)
                 selected_rows = [
-                    row for row in files
+                    row
+                    for row in files
                     if int(row.get("index") if row.get("index") is not None else -1) in selected_ids
                 ]
                 if selected_rows and all(float(row.get("progress") or 0.0) >= 0.999 for row in selected_rows):
@@ -10623,19 +12380,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ln_book = self.light_novels.book(int(book_id))
             imported = self._import_recovered_light_novel_audiobook(ln_book, destination, audio_paths)
             if imported and imported.get("id"):
-                self.audiobooks.link_light_novel(
-                    int(book_id), int(imported["id"]), prepare_alignment=True
-                )
+                self.audiobooks.link_light_novel(int(book_id), int(imported["id"]), prepare_alignment=True)
             else:
                 self.audiobooks.auto_link_light_novel(int(book_id))
             self.logger.info(
                 "Audiobook volume download complete ln_book_id=%s files=%s",
-                int(book_id), len(audio_paths),
+                int(book_id),
+                len(audio_paths),
             )
         except Exception as exc:
             self.logger.warning(
                 "Audiobook volume download monitor failed ln_book_id=%s error=%s",
-                int(book_id), exc,
+                int(book_id),
+                exc,
             )
         finally:
             torrent.close()
@@ -10648,11 +12405,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         qbt_enabled = bool(getattr(getattr(self.config, "qbittorrent", None), "enabled", False))
         aria_enabled = bool(getattr(getattr(self.config, "aria2", None), "enabled", False))
         if not (qbt_enabled or aria_enabled):
-            raise LightNovelError("Selective audiobook downloads require qBittorrent or aria2")
+            raise LightNovelError(err("audiobook.selectiveNeedsClient"))
         book = self.light_novels.book(int(book_id))
         target_volume = max(0, int(book.get("volume") or release.get("target_volume") or 0))
         if target_volume <= 0:
-            raise LightNovelError("Could not determine the target audiobook volume")
+            raise LightNovelError(err("audiobook.targetVolumeUnknown"))
         item = NyaaRelease(
             title=str(release.get("title") or ""),
             link=str(release.get("link") or ""),
@@ -10692,13 +12449,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     break
                 time.sleep(0.5)
             if not files:
-                raise LightNovelError("Could not read the audiobook torrent file list")
+                raise LightNovelError(err("audiobook.fileListUnreadable"))
             series_title = str(book.get("series_title") or book.get("title") or "").strip()
             plan = audiobook_torrent_pack_plan(
                 files,
                 series_title=series_title,
                 allow_bare_numeric_volume_dirs=False,
             )
+
             def normalized_torrent_name(value: object) -> str:
                 return unicodedata.normalize("NFKC", str(value or "")).replace("\\", "/").strip("/")
 
@@ -10716,22 +12474,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     candidates = []
                     for row in available:
                         actual = normalized_torrent_name(row.get("name"))
-                        if actual == expected or actual.endswith("/" + expected) or expected.endswith("/" + actual):
+                        if (
+                            actual == expected
+                            or actual.endswith("/" + expected)
+                            or expected.endswith("/" + actual)
+                        ):
                             candidates.append(row)
                     if len(candidates) == 1:
                         row = candidates[0]
                         matched_expected.add(expected)
                         matched_ids.add(int(row.get("file_id") or -1))
-                selected = [
-                    row for row in available
-                    if int(row.get("file_id") or -1) in matched_ids
-                ]
+                selected = [row for row in available if int(row.get("file_id") or -1) in matched_ids]
                 if matched_expected != expected_names:
                     missing = sorted(expected_names - matched_expected)
-                    raise LightNovelError(
-                        "Audiobook torrent metadata changed since search; missing selected file(s): "
-                        + ", ".join(missing[:3])
-                    )
+                    raise LightNovelError(err("audiobook.metadataChanged", files=", ".join(missing[:3])))
             else:
                 selected, _plan = self._audiobook_nyaa_volume_selection(
                     files,
@@ -10741,14 +12497,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     require_series_match=bool(release.get("collection")),
                 )
             if not selected:
-                raise LightNovelError(
-                    f"Volume {target_volume} is not separable in this audiobook torrent"
-                )
+                raise LightNovelError(err("audiobook.volumeNotSeparable", volume=target_volume))
             all_ids = [int(row.get("index")) for row in files if row.get("index") is not None]
             selected_ids = {int(row.get("file_id")) for row in selected}
             self.logger.info(
                 "LN audiobook Nyaa download selection book_id=%s volume=%s tracks=%s names=%r",
-                int(book_id), target_volume, len(selected), [str(row.get("name") or "") for row in selected[:3]],
+                int(book_id),
+                target_volume,
+                len(selected),
+                [str(row.get("name") or "") for row in selected[:3]],
             )
             self._write_ln_audiobook_selection_manifest(
                 destination,
@@ -10829,9 +12586,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             try:
                 result = self.light_novel_download_audiobook_nyaa(book_id, payload)
             except Exception as exc:
-                self.logger.exception(
-                    "LN audiobook Nyaa background download failed book_id=%s", book_id
-                )
+                self.logger.exception("LN audiobook Nyaa background download failed book_id=%s", book_id)
                 with lock:
                     jobs[book_id] = {
                         **jobs.get(book_id, {}),
@@ -10880,8 +12635,111 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         self.manager.scan_library(reuse_unchanged=True, user_requested=True)
         return self.get_state()
 
+    def _ignore_hook_change(self, name: str, values: dict[str, Any], current: str) -> None:
+        requested = values.get(name)
+        if requested is not None and str(requested).strip() != str(current or "").strip():
+            self.logger.warning("SKIP step=settings.%s reason=config_file_only", name)
+
+    def _requested_mokuro_python(self, values: dict[str, Any], current: str) -> str:
+        """The Mokuro interpreter the page asks for: only the Python of a Python environment.
+
+        pudge runs this file as a program, so a settings call from the page (or
+        anything injected into it) must not turn it into a shell or ``rm``.
+        config.toml and $PUDGE_MOKURO_PYTHON may still name any interpreter.
+        """
+        requested = str(values.get("manga_mokuro_python", current) or "").strip()
+        if not requested or requested == str(current or "").strip():
+            return requested
+        if not _python_environment_interpreter(Path(requested).expanduser()):
+            self.logger.warning("SKIP step=settings.manga_mokuro_python reason=not_environment_python")
+            raise ValueError(err("settings.mokuroPythonInvalid"))
+        return requested
+
+    def _apply_saved_settings(self, *, old_delete_hours: float) -> None:
+        """Hand just-saved settings to the running services instead of rebuilding them.
+
+        Rebuilding every service on Save stopped a playing audiobook, killed STT and
+        alignment workers (the old service restarted them untracked), re-ran the
+        interrupted-job recovery on live jobs and orphaned the qBittorrent client and
+        the work queue. The database never changes here, so the manager, job journal
+        and database controllers stay; a service replaced for a changed setting is
+        closed first.
+        """
+        cfg = self.config
+        _adopt_config_values(cfg, load_config(self.config_path))
+        manager = self.manager
+        manager.config = cfg
+        policy = getattr(getattr(manager, "work_scheduler", None), "power_policy", None)
+        if policy is not None:
+            policy.update_settings(
+                manual_enabled=bool(cfg.power.manual_energy_saving),
+                auto_enabled=bool(cfg.power.auto_battery_energy_saving),
+            )
+        delete_hours = float(cfg.agent.delete_after_watched_hours)
+        if delete_hours != old_delete_hours:
+            rescheduled = manager.db.reconcile_watched_cleanup(delete_hours)
+            self.logger.info(
+                "EVENT settings.cleanup_rescheduled delete_after_hours=%s rows=%s", delete_hours, rescheduled
+            )
+        self.light_novels.config = cfg
+        ln_root = Path(cfg.library.root_dir) / "Light Novels"
+        if Path(self.light_novels.root) != ln_root:
+            ln_root.mkdir(parents=True, exist_ok=True)
+            self.light_novels.root = ln_root
+        self.manga.mokuro_python = str(cfg.tools.manga_mokuro_python or "")
+        books = self.audiobooks
+        running = (
+            str(books.ffprobe),
+            str(books.mpv),
+            str(books.ffmpeg),
+            str(books.stt_model),
+            Path(books.cache_dir).expanduser().resolve(),
+            Path(books.cover_cache_dir).expanduser().resolve(),
+        )
+        wanted = (
+            str(cfg.tools.ffprobe),
+            str(cfg.tools.mpv),
+            str(cfg.tools.ffmpeg or "ffmpeg"),
+            str(cfg.sync.japanese_stt_model or "mlx-community/whisper-tiny"),
+            Path(cfg.paths.cache_dir).expanduser().resolve(),
+            Path(cfg.library.cover_cache_dir).expanduser().resolve(),
+        )
+        if running != wanted:
+            self._replace_audiobook_service(reason="settings_saved")
+
+    def _replace_audiobook_service(self, *, reason: str) -> None:
+        """A new AudiobookService for changed tools/STT model; the old one is closed first."""
+        old = self.audiobooks
+        lingering = old.close(timeout=5.0)
+        if lingering:
+            self.logger.warning(
+                "FALLBACK step=audiobooks.replace reason=%s lingering=%s", reason, ",".join(lingering)
+            )
+        self.audiobooks = AudiobookService(
+            self.manager.db,
+            ffprobe=self.config.tools.ffprobe,
+            mpv=self.config.tools.mpv,
+            cache_dir=self.config.paths.cache_dir,
+            cover_cache_dir=self.config.library.cover_cache_dir,
+            ffmpeg=self.config.tools.ffmpeg,
+            python=python_executable(),
+            stt_model=self.config.sync.japanese_stt_model,
+            job_center=self.job_center,
+            work_scheduler=self.manager.work_scheduler,
+        )
+        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
+        self._configure_iphone()
+        self.logger.info("EVENT audiobooks.replaced reason=%s", reason)
+        if not self.safe_mode.active:
+            self.task_supervisor.start(
+                name="audiobook-stt-resume",
+                target=self.audiobooks.resume_pending_transcriptions,
+                replace=True,
+            )
+
     def save_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         cfg = self.config
+        requested_mokuro_python = self._requested_mokuro_python(values, cfg.tools.manga_mokuro_python)
         ln_current = self.light_novels.settings()
         ln_values = {
             "jiten_api_key": values.get("ln_jiten_api_key", ln_current.jiten_api_key),
@@ -10890,9 +12748,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "review_mode": values.get("ln_review_mode", ln_current.review_mode),
             "review_shortcuts": values.get("ln_review_shortcuts", ln_current.review_shortcuts),
             "show_furigana": values.get("ln_show_furigana", ln_current.show_furigana),
-            "show_pitch_accent": values.get(
-                "ln_show_pitch_accent", ln_current.show_pitch_accent
-            ),
+            "show_pitch_accent": values.get("ln_show_pitch_accent", ln_current.show_pitch_accent),
             "custom_css": values.get("ln_custom_css", ln_current.custom_css),
             "parse_ahead": values.get("ln_parse_ahead", ln_current.parse_ahead),
             "auto_download_nyaa": values.get("ln_auto_download_nyaa", ln_current.auto_download_nyaa),
@@ -10901,51 +12757,50 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "reader_theme": values.get("ln_reader_theme", ln_current.reader_theme),
             "reader_font_size": values.get("ln_reader_font_size", ln_current.reader_font_size),
             "reader_text_color": values.get("ln_reader_text_color", ln_current.reader_text_color),
-            "reader_background_color": values.get("ln_reader_background_color", ln_current.reader_background_color),
+            "reader_background_color": values.get(
+                "ln_reader_background_color", ln_current.reader_background_color
+            ),
             "reader_width": values.get("ln_reader_width", ln_current.reader_width),
             "reader_line_height": values.get("ln_reader_line_height", ln_current.reader_line_height),
             "reader_indent": values.get("ln_reader_indent", ln_current.reader_indent),
             "reader_vertical": values.get("ln_reader_vertical", ln_current.reader_vertical),
             "reader_mode": values.get("ln_reader_mode", ln_current.reader_mode),
-            "auto_bookmarks": values.get(
-                "ln_auto_bookmarks", ln_current.auto_bookmarks
+            "auto_bookmarks": values.get("ln_auto_bookmarks", ln_current.auto_bookmarks),
+            "translation_google_fallback": values.get(
+                "ln_translation_google_fallback", ln_current.translation_google_fallback
+            ),
+            "translation_prewarm_remote": values.get(
+                "ln_translation_prewarm_remote", ln_current.translation_prewarm_remote
             ),
             "audiobook_generation_provider": values.get(
                 "ln_audiobook_generation_provider", ln_current.audiobook_generation_provider
             ),
-            "audiobook_tts_model": values.get(
-                "ln_audiobook_tts_model", ln_current.audiobook_tts_model
-            ),
+            "audiobook_tts_model": values.get("ln_audiobook_tts_model", ln_current.audiobook_tts_model),
             "audiobook_character_voices": values.get(
                 "ln_audiobook_character_voices", ln_current.audiobook_character_voices
             ),
-            "irodori_tts_enabled": str(values.get(
-                "ln_audiobook_generation_provider", ln_current.audiobook_generation_provider
-            ) or "off").strip().lower() != "off",
+            "irodori_tts_enabled": str(
+                values.get("ln_audiobook_generation_provider", ln_current.audiobook_generation_provider)
+                or "off"
+            )
+            .strip()
+            .lower()
+            != "off",
             "irodori_tts_auto_generate": values.get(
                 "ln_irodori_tts_auto_generate", ln_current.irodori_tts_auto_generate
             ),
-            "irodori_tts_url": values.get(
-                "ln_irodori_tts_url", ln_current.irodori_tts_url
-            ),
-            "irodori_tts_api_key": values.get(
-                "ln_irodori_tts_api_key", ln_current.irodori_tts_api_key
-            ),
-            "irodori_tts_voice": values.get(
-                "ln_irodori_tts_voice", ln_current.irodori_tts_voice
-            ),
-            "irodori_tts_caption": values.get(
-                "ln_irodori_tts_caption", ln_current.irodori_tts_caption
-            ),
-            "irodori_tts_speed": values.get(
-                "ln_irodori_tts_speed", ln_current.irodori_tts_speed
-            ),
+            "irodori_tts_url": values.get("ln_irodori_tts_url", ln_current.irodori_tts_url),
+            "irodori_tts_api_key": values.get("ln_irodori_tts_api_key", ln_current.irodori_tts_api_key),
+            "irodori_tts_voice": values.get("ln_irodori_tts_voice", ln_current.irodori_tts_voice),
+            "irodori_tts_caption": values.get("ln_irodori_tts_caption", ln_current.irodori_tts_caption),
+            "irodori_tts_speed": values.get("ln_irodori_tts_speed", ln_current.irodori_tts_speed),
         }
         old_ocr_enabled = bool(cfg.matching.ocr_image_subtitles)
         old_ocr_counts_as_ready = bool(cfg.matching.ocr_counts_as_ready)
         old_jimaku_key = str(cfg.jimaku.api_key or "")
         old_subtitle_dirs = tuple(str(path.expanduser()) for path in cfg.paths.subtitle_dirs)
         old_watched_dirs = tuple(str(path.expanduser()) for path in cfg.paths.download_dirs)
+        old_delete_hours = float(cfg.agent.delete_after_watched_hours)
         old_anilist_connection = (
             bool(cfg.anilist.enabled),
             str(cfg.anilist.client_id or ""),
@@ -10956,36 +12811,48 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.ui.escape_exits_fullscreen = bool(
             values.get("escape_exits_fullscreen", cfg.ui.escape_exits_fullscreen)
         )
-        cfg.ui.notifications_enabled = bool(
-            values.get("notifications_enabled", cfg.ui.notifications_enabled)
-        )
+        cfg.ui.notifications_enabled = bool(values.get("notifications_enabled", cfg.ui.notifications_enabled))
         cfg.ui.jiten_developer_tools_confirmed = bool(
             values.get(
                 "jiten_developer_tools_confirmed",
                 cfg.ui.jiten_developer_tools_confirmed,
             )
         )
-        cfg.ui.review_gate_enabled = bool(
-            values.get("review_gate_enabled", cfg.ui.review_gate_enabled)
-        )
+        cfg.ui.review_gate_enabled = bool(values.get("review_gate_enabled", cfg.ui.review_gate_enabled))
         cfg.ui.review_gate_count = max(
             1, min(50, int(values.get("review_gate_count", cfg.ui.review_gate_count)))
         )
         cfg.ui.review_gate_all_due_episode_words = bool(
-            values.get("review_gate_all_due_episode_words", getattr(cfg.ui, "review_gate_all_due_episode_words", False))
+            values.get(
+                "review_gate_all_due_episode_words",
+                getattr(cfg.ui, "review_gate_all_due_episode_words", False),
+            )
         )
-        cfg.ui.review_gate_ln_enabled = bool(values.get("review_gate_ln_enabled", cfg.ui.review_gate_ln_enabled))
-        cfg.ui.review_gate_ln_all_due = bool(values.get("review_gate_ln_all_due", cfg.ui.review_gate_ln_all_due))
-        cfg.ui.review_gate_ln_count = max(1, min(50, int(values.get("review_gate_ln_count", cfg.ui.review_gate_ln_count))))
-        cfg.ui.review_gate_manga_enabled = bool(values.get("review_gate_manga_enabled", cfg.ui.review_gate_manga_enabled))
-        cfg.ui.review_gate_manga_all_due = bool(values.get("review_gate_manga_all_due", cfg.ui.review_gate_manga_all_due))
-        cfg.ui.review_gate_manga_count = max(1, min(50, int(values.get("review_gate_manga_count", cfg.ui.review_gate_manga_count))))
+        cfg.ui.review_gate_ln_enabled = bool(
+            values.get("review_gate_ln_enabled", cfg.ui.review_gate_ln_enabled)
+        )
+        cfg.ui.review_gate_ln_all_due = bool(
+            values.get("review_gate_ln_all_due", cfg.ui.review_gate_ln_all_due)
+        )
+        cfg.ui.review_gate_ln_count = max(
+            1, min(50, int(values.get("review_gate_ln_count", cfg.ui.review_gate_ln_count)))
+        )
+        cfg.ui.review_gate_manga_enabled = bool(
+            values.get("review_gate_manga_enabled", cfg.ui.review_gate_manga_enabled)
+        )
+        cfg.ui.review_gate_manga_all_due = bool(
+            values.get("review_gate_manga_all_due", cfg.ui.review_gate_manga_all_due)
+        )
+        cfg.ui.review_gate_manga_count = max(
+            1, min(50, int(values.get("review_gate_manga_count", cfg.ui.review_gate_manga_count)))
+        )
         if "sidebar_review_interval" in values:
             interval = str(values["sidebar_review_interval"])
             if interval not in {"60000", "180000", "300000", "600000", "1800000", "continuous"}:
-                raise ValueError("Invalid sidebar review interval")
+                raise ValueError(err("review.invalidSidebarInterval"))
             cfg.ui.sidebar_review_interval = interval
         cfg.library.root_dir = Path(str(values.get("library_root", cfg.library.root_dir))).expanduser()
+
         def _folder_list(value: object) -> list[Path]:
             raw = str(value or "").replace(";", "\n")
             result: list[Path] = []
@@ -11008,7 +12875,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         current_watched = "\n".join(str(path) for path in cfg.paths.download_dirs)
         cfg.paths.download_dirs = _folder_list(values.get("watched_folders", current_watched))
-        cfg.library.disk_limit_enabled = bool(values.get("disk_limit_enabled", cfg.library.disk_limit_enabled))
+        cfg.library.disk_limit_enabled = bool(
+            values.get("disk_limit_enabled", cfg.library.disk_limit_enabled)
+        )
         cfg.library.disk_limit_gb = max(0.0, float(values.get("disk_limit_gb", cfg.library.disk_limit_gb)))
         cfg.playback.enabled = True
         cfg.playback.rewind_seconds = 10.0
@@ -11022,9 +12891,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.nyaa.base_url = str(values.get("nyaa_url", cfg.nyaa.base_url)).strip().rstrip("/")
         cfg.nyaa.proxy_mode = str(values.get("proxy_mode", cfg.nyaa.proxy_mode)).strip()
         cfg.nyaa.proxy_url = str(values.get("proxy_url", cfg.nyaa.proxy_url)).strip()
-        cfg.nyaa.pre_search_command = str(values.get("search_hook", cfg.nyaa.pre_search_command)).strip()
+        # Shell hooks are set only in config.toml: a settings call from the web
+        # UI (or anything injected into it) must never become a command on the Mac.
+        self._ignore_hook_change("search_hook", values, cfg.nyaa.pre_search_command)
         cfg.nyaa.min_release_score = float(values.get("min_score", cfg.nyaa.min_release_score))
-        resolution = str(values.get("preferred_resolution", cfg.nyaa.preferred_resolution)).strip().casefold() or "1080p"
+        resolution = (
+            str(values.get("preferred_resolution", cfg.nyaa.preferred_resolution)).strip().casefold()
+            or "1080p"
+        )
         resolution_aliases = {"4k": "2160p", "best": "highest", "max": "highest", "higher": "highest"}
         resolution = resolution_aliases.get(resolution, resolution)
         if resolution not in {"480p", "720p", "1080p", "1440p", "2160p", "highest"}:
@@ -11042,35 +12916,25 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         ]
         cfg.nyaa.preferred_sources = [
             part.strip()
-            for part in str(
-                values.get("preferred_sources", ", ".join(cfg.nyaa.preferred_sources))
-            ).split(",")
+            for part in str(values.get("preferred_sources", ", ".join(cfg.nyaa.preferred_sources))).split(",")
             if part.strip()
         ]
         cfg.nyaa.require_japanese_audio = True
         cfg.nyaa.avoid_upscaled = True
-        cfg.nyaa.only_trusted_groups = bool(
-            values.get("only_trusted_groups", cfg.nyaa.only_trusted_groups)
-        )
+        cfg.nyaa.only_trusted_groups = bool(values.get("only_trusted_groups", cfg.nyaa.only_trusted_groups))
         cfg.nyaa.trusted_groups = [
             part.strip()
-            for part in str(
-                values.get("trusted_groups", ", ".join(cfg.nyaa.trusted_groups))
-            ).split(",")
+            for part in str(values.get("trusted_groups", ", ".join(cfg.nyaa.trusted_groups))).split(",")
             if part.strip()
         ]
         cfg.nyaa.preferred_groups = [
             part.strip()
-            for part in str(
-                values.get("preferred_groups", ", ".join(cfg.nyaa.preferred_groups))
-            ).split(",")
+            for part in str(values.get("preferred_groups", ", ".join(cfg.nyaa.preferred_groups))).split(",")
             if part.strip()
         ]
         cfg.nyaa.blocked_groups = [
             part.strip()
-            for part in str(
-                values.get("blocked_groups", ", ".join(cfg.nyaa.blocked_groups))
-            ).split(",")
+            for part in str(values.get("blocked_groups", ", ".join(cfg.nyaa.blocked_groups))).split(",")
             if part.strip()
         ]
         cfg.nyaa.auto_upgrade_downloaded = bool(
@@ -11092,15 +12956,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.qbittorrent.api_key = keep_masked_secret(
             values.get("qbt_api_key", cfg.qbittorrent.api_key), cfg.qbittorrent.api_key
         ).strip()
-        cfg.qbittorrent.pre_download_command = str(values.get("download_hook", cfg.qbittorrent.pre_download_command)).strip()
+        self._ignore_hook_change("download_hook", values, cfg.qbittorrent.pre_download_command)
         cfg.aria2.enabled = bool(values.get("aria2_enabled", cfg.aria2.enabled))
         cfg.aria2.binary = "aria2c"
         cfg.aria2.rpc_port = max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.aria2.rpc_port))))
         seed_mode = str(values.get("aria2_seed_mode", cfg.aria2.seed_mode)).strip().casefold()
-        cfg.aria2.seed_mode = seed_mode if seed_mode in {"off", "ratio", "ratio_or_time", "unlimited"} else "off"
+        cfg.aria2.seed_mode = (
+            seed_mode if seed_mode in {"off", "ratio", "ratio_or_time", "unlimited"} else "off"
+        )
         cfg.aria2.seed_ratio = max(0.0, float(values.get("aria2_seed_ratio", cfg.aria2.seed_ratio)))
-        cfg.aria2.seed_time_minutes = max(0.0, float(values.get("aria2_seed_time_minutes", cfg.aria2.seed_time_minutes)))
-        cfg.aria2.upload_limit_kib = max(0, int(values.get("aria2_upload_limit_kib", cfg.aria2.upload_limit_kib)))
+        cfg.aria2.seed_time_minutes = max(
+            0.0, float(values.get("aria2_seed_time_minutes", cfg.aria2.seed_time_minutes))
+        )
+        cfg.aria2.upload_limit_kib = max(
+            0, int(values.get("aria2_upload_limit_kib", cfg.aria2.upload_limit_kib))
+        )
         cfg.aria2.vpn_interface = str(values.get("aria2_vpn_interface", cfg.aria2.vpn_interface)).strip()
         cfg.aria2.vpn_kill_switch = bool(values.get("aria2_vpn_kill_switch", cfg.aria2.vpn_kill_switch))
         cfg.power.manual_energy_saving = bool(
@@ -11114,15 +12984,23 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         cfg.agent.enabled = bool(values.get("agent_enabled", cfg.agent.enabled))
         cfg.agent.poll_minutes = max(5, int(values.get("agent_poll", cfg.agent.poll_minutes)))
-        cfg.agent.anilist_refresh_minutes = max(5, int(values.get("anilist_refresh_poll", cfg.agent.anilist_refresh_minutes)))
-        cfg.agent.subtitle_poll_minutes = max(5, int(values.get("subtitle_poll", cfg.agent.subtitle_poll_minutes)))
-        cfg.agent.delete_after_watched_hours = max(0.0, float(values.get("delete_hours", cfg.agent.delete_after_watched_hours)))
+        cfg.agent.anilist_refresh_minutes = max(
+            5, int(values.get("anilist_refresh_poll", cfg.agent.anilist_refresh_minutes))
+        )
+        cfg.agent.subtitle_poll_minutes = max(
+            5, int(values.get("subtitle_poll", cfg.agent.subtitle_poll_minutes))
+        )
+        cfg.agent.delete_after_watched_hours = max(
+            0.0, float(values.get("delete_hours", cfg.agent.delete_after_watched_hours))
+        )
         cfg.anilist.enabled = bool(values.get("anilist_enabled", cfg.anilist.enabled))
         cfg.anilist.client_id = str(values.get("anilist_client_id", cfg.anilist.client_id)).strip()
         cfg.anilist.access_token = keep_masked_secret(
             values.get("anilist_token", cfg.anilist.access_token), cfg.anilist.access_token
         ).strip()
-        cfg.anilist.auto_update_progress = bool(values.get("anilist_auto_progress", cfg.anilist.auto_update_progress))
+        cfg.anilist.auto_update_progress = bool(
+            values.get("anilist_auto_progress", cfg.anilist.auto_update_progress)
+        )
         cfg.anilist.add_if_missing = bool(values.get("anilist_add_if_missing", cfg.anilist.add_if_missing))
         cfg.anilist.watched_threshold = 0.85
         cfg.anilist.watched_max_remaining_minutes = 10.0
@@ -11132,27 +13010,34 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 cfg.anilist.relations_by_release_date,
             )
         )
-        cfg.shortcuts.mpv_mark_watched = str(values.get("shortcut_mpv_mark_watched", cfg.shortcuts.mpv_mark_watched)).strip()
-        cfg.shortcuts.mpv_explain_subtitle = str(values.get("shortcut_mpv_explain_subtitle", cfg.shortcuts.mpv_explain_subtitle)).strip()
-        cfg.shortcuts.mpv_translate_subtitle = str(values.get("shortcut_mpv_translate_subtitle", cfg.shortcuts.mpv_translate_subtitle)).strip()
-        requested_study_plugin = str(
-            values.get("mpv_study_plugin", cfg.tools.mpv_study_plugin)
-        ).strip().casefold()
+        cfg.shortcuts.mpv_mark_watched = str(
+            values.get("shortcut_mpv_mark_watched", cfg.shortcuts.mpv_mark_watched)
+        ).strip()
+        cfg.shortcuts.mpv_explain_subtitle = str(
+            values.get("shortcut_mpv_explain_subtitle", cfg.shortcuts.mpv_explain_subtitle)
+        ).strip()
+        cfg.shortcuts.mpv_translate_subtitle = str(
+            values.get("shortcut_mpv_translate_subtitle", cfg.shortcuts.mpv_translate_subtitle)
+        ).strip()
+        if "shortcut_mpv_skip_segment" in values:
+            cfg.shortcuts.mpv_skip_segment = _skip_shortcut(values.get("shortcut_mpv_skip_segment")) or "Tab"
+        if "shortcut_screen_text" in values:
+            cfg.shortcuts.screen_text_toggle = str(values.get("shortcut_screen_text") or "").strip()
+        # One option: the skip button (OP/ED detection follows it).
+        cfg.playback.skip_segments_enabled = bool(
+            values.get("skip_segments_enabled", cfg.playback.skip_segments_enabled)
+        )
+        cfg.playback.stereo_downmix = bool(values.get("stereo_downmix", cfg.playback.stereo_downmix))
+        requested_study_plugin = (
+            str(values.get("mpv_study_plugin", cfg.tools.mpv_study_plugin)).strip().casefold()
+        )
         cfg.tools.mpv_study_plugin = (
-            requested_study_plugin
-            if requested_study_plugin in {"auto", "jiten", "jpdb"}
-            else "auto"
+            requested_study_plugin if requested_study_plugin in {"auto", "jiten", "jpdb"} else "auto"
         )
-        requested_manga_ocr_backend = str(
-            values.get("manga_ocr_backend", cfg.tools.manga_ocr_backend)
-        ).strip().casefold()
-        cfg.tools.manga_ocr_backend = (
-            requested_manga_ocr_backend
-            if requested_manga_ocr_backend in {"pudge", "mokuro"}
-            else "pudge"
+        cfg.tools.manga_mokuro_python = requested_mokuro_python
+        cfg.tools.manga_background_ocr = bool(
+            values.get("manga_background_ocr", cfg.tools.manga_background_ocr)
         )
-        cfg.diagnostics.energy_monitoring_enabled = True
-        cfg.diagnostics.energy_sample_seconds = 30.0
         personal_jimaku_key = keep_masked_secret(
             values.get("jimaku_api_key", cfg.jimaku.personal_api_key),
             cfg.jimaku.personal_api_key,
@@ -11163,9 +13048,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.matching.ocr_image_subtitles = bool(
             values.get("ocr_image_subtitles", cfg.matching.ocr_image_subtitles)
         )
-        cfg.matching.ocr_image_subtitles_disabled_by_user = (
-            not cfg.matching.ocr_image_subtitles
-        )
+        cfg.matching.ocr_image_subtitles_disabled_by_user = not cfg.matching.ocr_image_subtitles
         cfg.matching.ocr_counts_as_ready = bool(
             values.get("ocr_counts_as_ready", cfg.matching.ocr_counts_as_ready)
         )
@@ -11173,88 +13056,79 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         cfg.matching.subtitle_upgrade_min_score_gain = 25.0
         cfg.matching.subtitle_upgrade_check_hours = 6.0
         cfg.matching.max_subtitle_upgrade_checks_per_run = 2
-        cfg.llm.profiles[cfg.llm.provider] = {"url":cfg.llm.base_url,"model":cfg.llm.model,"api_key":cfg.llm.api_key}
+        cfg.llm.profiles[cfg.llm.provider] = {
+            "url": cfg.llm.base_url,
+            "model": cfg.llm.model,
+            "api_key": cfg.llm.api_key,
+        }
         for protocol, profile in (values.get("llm_profiles") or {}).items():
-            if protocol in {"ollama", "openai"} and isinstance(profile,dict):
-                previous = cfg.llm.profiles.get(protocol,{})
-                cfg.llm.profiles[protocol] = {"url":str(profile.get("url") or ""),"model":str(profile.get("model") or ""),
-                    "api_key":keep_masked_secret(profile.get("key", ""),previous.get("api_key", ""))}
+            if protocol in {"ollama", "openai"} and isinstance(profile, dict):
+                previous = cfg.llm.profiles.get(protocol, {})
+                cfg.llm.profiles[protocol] = {
+                    "url": str(profile.get("url") or ""),
+                    "model": str(profile.get("model") or ""),
+                    "api_key": keep_masked_secret(profile.get("key", ""), previous.get("api_key", "")),
+                }
         cfg.llm.enabled = bool(values.get("llm_enabled", cfg.llm.enabled))
         cfg.llm.provider = str(values.get("llm_provider", cfg.llm.provider)).strip().lower() or "ollama"
         if cfg.llm.provider not in {"ollama", "openai"}:
             cfg.llm.provider = "ollama"
         cfg.llm.base_url = str(values.get("llm_url", cfg.llm.base_url)).strip().rstrip("/")
         cfg.llm.api_key = keep_masked_secret(
-            values.get("llm_api_key", cfg.llm.api_key), cfg.llm.profiles.get(cfg.llm.provider,{}).get("api_key", cfg.llm.api_key)
+            values.get("llm_api_key", cfg.llm.api_key),
+            cfg.llm.profiles.get(cfg.llm.provider, {}).get("api_key", cfg.llm.api_key),
         ).strip()
         cfg.llm.model = str(values.get("llm_model", cfg.llm.model)).strip()
-        reasoning_effort = str(values.get("llm_reasoning_effort", cfg.llm.reasoning_effort)).strip().lower() or "low"
+        reasoning_effort = (
+            str(values.get("llm_reasoning_effort", cfg.llm.reasoning_effort)).strip().lower() or "low"
+        )
         cfg.llm.reasoning_effort = (
             reasoning_effort
             if reasoning_effort in {"none", "low", "medium", "high", "xhigh", "max"}
             else "low"
         )
-        assistant_effort = str(values.get("llm_assistant_reasoning_effort", cfg.llm.assistant_reasoning_effort)).strip().lower() or "low"
+        assistant_effort = (
+            str(values.get("llm_assistant_reasoning_effort", cfg.llm.assistant_reasoning_effort))
+            .strip()
+            .lower()
+            or "low"
+        )
         cfg.llm.assistant_reasoning_effort = (
-            assistant_effort if assistant_effort in {"none", "low", "medium", "high", "xhigh", "max"} else "low"
+            assistant_effort
+            if assistant_effort in {"none", "low", "medium", "high", "xhigh", "max"}
+            else "low"
         )
         cfg.llm.validate_embedded_reference = bool(
             values.get("subtitle_semantic_checks", cfg.llm.validate_embedded_reference)
         )
         cfg.sync.use_container_chapters = True
         cfg.sync.japanese_stt_fallback = True
-        cfg.sync.japanese_stt_model = str(
-            values.get("japanese_stt_model", cfg.sync.japanese_stt_model)
-        ).strip() or "mlx-community/whisper-tiny"
+        cfg.sync.japanese_stt_model = (
+            str(values.get("japanese_stt_model", cfg.sync.japanese_stt_model)).strip()
+            or "mlx-community/whisper-tiny"
+        )
         write_config(cfg, self.config_path)
-        self.audiobooks.stop_all()
-        self.config = load_config(self.config_path)
-        self.manager = AnimeManager(self.config, log=self.logger.info)
-        self._configure_database_services()
-        self.light_novels = LightNovelService(self.config, logger=self.logger)
-        self.manga = MangaService(
-            self.manager.db,
-            cache_dir=self.config.paths.cache_dir,
-            python=python_executable(),
-            work_scheduler=self.manager.work_scheduler,
-        )
-        self.audiobooks = AudiobookService(
-            self.manager.db,
-            ffprobe=self.config.tools.ffprobe,
-            mpv=self.config.tools.mpv,
-            cache_dir=self.config.paths.cache_dir,
-            cover_cache_dir=self.config.library.cover_cache_dir,
-            ffmpeg=self.config.tools.ffmpeg,
-            python=python_executable(),
-            stt_model=self.config.sync.japanese_stt_model,
-            job_center=self.job_center,
-            work_scheduler=self.manager.work_scheduler,
-        )
-        self.audiobooks.review_gate_enabled = lambda: bool(self.config.ui.review_gate_ln_enabled)
-        if not self.safe_mode.active:
-            self.task_supervisor.start(
-            name="audiobook-stt-resume",
-                target=self.audiobooks.resume_pending_transcriptions,
-                replace=True,
-            )
+        self._apply_saved_settings(old_delete_hours=old_delete_hours)
         self._ui_state_cache.invalidate()
         self._planning_search_cache = MetadataCache(
             self.config.paths.cache_dir,
             "anilist-planning-search",
             schema="v2",
         )
-        self.debug_snapshots = DebugSnapshotService(
-            self.manager,
-            cache_dir=self.config.paths.cache_dir,
-            runtime_log_path=DEFAULT_LOG_PATH,
-        )
         self.light_novels.save_settings(ln_values)
+        self._screen_text_settings_changed()
         configure_mpv_study_keys(
             jiten_api_key=str(ln_values.get("jiten_api_key") or ""),
             jpdb_api_token=str(ln_values.get("jpdb_api_token") or ""),
         )
         self.energy_monitor.update_interval(self.config.diagnostics.energy_sample_seconds)
         self._ensure_energy_monitor(reason="settings_saved")
+        screen_text_shortcut = getattr(self, "_screen_text_shortcut", None)
+        if (
+            screen_text_shortcut is not None
+            and screen_text_shortcut.status().get("shortcut") != self.config.shortcuts.screen_text_toggle
+        ):
+            self.start_global_shortcuts()
 
         # Settings that affect video readiness are reconciled immediately. The
         # returned state is rendered by the UI before any manual Refresh.
@@ -11269,8 +13143,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         new_subtitle_dirs = tuple(str(path.expanduser()) for path in self.config.paths.subtitle_dirs)
         new_watched_dirs = tuple(str(path.expanduser()) for path in self.config.paths.download_dirs)
         resolver_settings_changed = (
-            old_jimaku_key != str(self.config.jimaku.api_key or "")
-            or old_subtitle_dirs != new_subtitle_dirs
+            old_jimaku_key != str(self.config.jimaku.api_key or "") or old_subtitle_dirs != new_subtitle_dirs
         )
         if resolver_settings_changed:
             reconcile_stats["subtitle_requeued"] = self.manager.db.force_requeue_unresolved_subtitle_jobs()
@@ -11320,8 +13193,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "folder_access": folder_access,
             "reconcile": reconcile_stats,
             "recheck_subtitles": bool(
-                reconcile_stats.get("ocr_invalidated")
-                or reconcile_stats.get("subtitle_requeued")
+                reconcile_stats.get("ocr_invalidated") or reconcile_stats.get("subtitle_requeued")
             ),
             "anilist_refresh_error": anilist_refresh_error,
             "state": state,
@@ -11349,8 +13221,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         ready = bool(package_installed and manga_ocr.get("model_ready"))
         manga_ocr["package_installed"] = package_installed
         manga_ocr["installed"] = ready
-        manga_ocr["version"] = "Package + model ready" if ready else (
-            "Model not ready" if package_installed else "Not installed"
+        manga_ocr["version"] = (
+            t("web.mangaOcrPackageReady")
+            if ready
+            else (t("web.modelNotReady") if package_installed else t("web.notInstalled"))
         )
         status["manga_ocr"] = manga_ocr
         return status
@@ -11388,9 +13262,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         return self._jiten_mpv_action_payload(status)
 
-    def install_first_experience_dependencies(
-        self, values: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def install_first_experience_dependencies(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         options = values or {}
         status = install_media_tools(
             mpv=self.config.tools.mpv,
@@ -11405,15 +13277,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ffprobe = str(sibling_ffprobe)
         if ffprobe:
             self.config.tools.ffprobe = str(ffprobe)
-        key = str(
-            options.get("jiten_api_key")
-            or self.light_novels.settings().jiten_api_key
-            or ""
-        ).strip()
+        key = str(options.get("jiten_api_key") or self.light_novels.settings().jiten_api_key or "").strip()
         jpdb_key = str(
-            options.get("jpdb_api_token")
-            or self.light_novels.settings().jpdb_api_token
-            or ""
+            options.get("jpdb_api_token") or self.light_novels.settings().jpdb_api_token or ""
         ).strip()
         if bool(options.get("install_jiten_mpv")):
             status = install_jiten_mpv(
@@ -11425,18 +13291,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.light_novels.save_settings({"jiten_api_key": key})
         if jpdb_key:
             self.light_novels.save_settings({"jpdb_api_token": jpdb_key})
-        selected_plugin = str(
-            options.get("mpv_study_plugin") or self.config.tools.mpv_study_plugin
-        ).strip().casefold()
+        selected_plugin = (
+            str(options.get("mpv_study_plugin") or self.config.tools.mpv_study_plugin).strip().casefold()
+        )
         if selected_plugin in {"auto", "jiten", "jpdb"}:
             self.config.tools.mpv_study_plugin = selected_plugin
         configure_mpv_study_keys(jiten_api_key=key, jpdb_api_token=jpdb_key)
         manga_ocr = self.manga_ocr_status()
         if not (bool(manga_ocr.get("installed")) and bool(manga_ocr.get("model_ready"))):
-            self._run_manga_ocr_install()
+            self._run_mokuro_ocr_install()
             manga_ocr = self.manga_ocr_status()
         if not (bool(manga_ocr.get("installed")) and bool(manga_ocr.get("model_ready"))):
-            raise RuntimeError("MangaOCR installation did not complete")
+            raise RuntimeError(err("setup.mangaOcrIncomplete"))
 
         status = dependency_status(
             mpv=self.config.tools.mpv,
@@ -11448,7 +13314,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         manga_ocr = dict(manga_ocr)
         manga_ocr["package_installed"] = True
         manga_ocr["installed"] = True
-        manga_ocr["version"] = "Package + model ready"
+        manga_ocr["version"] = t("web.mangaOcrPackageReady")
         status["manga_ocr"] = manga_ocr
         write_config(self.config, self.config_path)
         for service, name, value in (
@@ -11476,7 +13342,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _anilist_client(self) -> AniListClient:
         if not self.config.anilist.enabled or not self.config.anilist.access_token.strip():
-            raise RuntimeError("AniList integration is not configured")
+            raise RuntimeError(err("anilist.notConfigured"))
         return AniListClient(
             self.config.anilist.endpoint,
             access_token=self.config.anilist.access_token,
@@ -11522,10 +13388,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 changed = True
             children = item.get("relations")
             if isinstance(children, list):
-                changed = (
-                    WebAppApi._overlay_relation_status(children, media_id, status)
-                    or changed
-                )
+                changed = WebAppApi._overlay_relation_status(children, media_id, status) or changed
         return changed
 
     def _set_local_anilist_status(self, media_id: int, status: str) -> None:
@@ -11546,21 +13409,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     title=str((metadata or {}).get("title") or f"AniList #{media_id}"),
                     titles=[str((metadata or {}).get("title") or f"AniList #{media_id}")],
                     cover_url=str((metadata or {}).get("cover_url") or ""),
-                    site_url=str(
-                        (metadata or {}).get("site_url")
-                        or f"https://anilist.co/anime/{media_id}"
-                    ),
+                    site_url=str((metadata or {}).get("site_url") or f"https://anilist.co/anime/{media_id}"),
                     status=status,
-                    episodes=(
-                        int(metadata["episodes"])
-                        if (metadata or {}).get("episodes")
-                        else None
-                    ),
+                    episodes=(int(metadata["episodes"]) if (metadata or {}).get("episodes") else None),
                     format=str((metadata or {}).get("format") or "") or None,
                     season_year=(
-                        int(metadata["season_year"])
-                        if (metadata or {}).get("season_year")
-                        else None
+                        int(metadata["season_year"]) if (metadata or {}).get("season_year") else None
                     ),
                     start_date=str((metadata or {}).get("start_date") or "") or None,
                     studio=str((metadata or {}).get("studio") or ""),
@@ -11579,11 +13433,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         try:
             stats = self.manager.refresh_anilist_cache()
         except Exception as exc:
-            warning = ui_text(
-                self.config.ui.language,
-                "AniList saved the change, but did not return the updated list; using local data",
-                "AniList сохранил изменение, но не отдал обновлённый список; используются локальные данные",
-            )
+            warning = err("anilist.savedButNoList")
             self.logger.warning(
                 "FALLBACK step=anilist.post_mutation_refresh error=%r",
                 exc,
@@ -11617,11 +13467,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         # Sending SaveMediaListEntry(progress=0) for it creates a CURRENT entry,
         # so a purely local reset must not contact AniList in that state.
         if list_status:
-            remote_status = (
-                "CURRENT"
-                if list_status in {"COMPLETED", "REPEATING"}
-                else list_status
-            )
+            remote_status = "CURRENT" if list_status in {"COMPLETED", "REPEATING"} else list_status
             client = self._anilist_client()
             try:
                 saved = client.set_progress(media_id, 0, remote_status)
@@ -11644,22 +13490,128 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "state": self.get_state(),
         }
 
-    def drop_anime(self, media_id: int) -> dict[str, Any]:
-        client = self._anilist_client()
-        try:
-            client.set_list_status(int(media_id), "DROPPED")
-        finally:
-            client.close()
-        self._set_local_anilist_status(int(media_id), "DROPPED")
+    ANIME_LIST_STATUSES = ("CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING")
+
+    def drop_anime(self, media_id: int, status: str | None = None) -> dict[str, Any]:
+        """Schedule the title's local files for deletion and set its list status.
+
+        Without ``status`` the title is dropped. With ``status`` (the Delete
+        dialog) AniList is changed only when it differs from the current status.
+        """
+        media_id = int(media_id)
+        target = str(status or "DROPPED").strip().upper()
+        if target not in self.ANIME_LIST_STATUSES:
+            raise ValueError(f"unknown list status: {status!r}")
+        anime = self.manager.db.get_anime(media_id)
+        previous = str(anime.status or "").strip().upper() if anime is not None else ""
+        if status is None or target != previous:
+            client = self._anilist_client()
+            try:
+                client.set_list_status(media_id, target)
+            finally:
+                client.close()
+        # "Keep" in the Deleting soon group puts the status and episode states back.
+        self.manager.db.save_drop_restore(media_id, previous)
+        # A title kept in the list must not download the deleted episodes again.
+        blocked = self.manager.db.block_redownload(media_id) if target != "DROPPED" else set()
         queued = self.manager.db.schedule_anime_cleanup(
-            int(media_id),
+            media_id,
             self.config.agent.delete_after_watched_hours,
         )
+        # schedule_anime_cleanup marks the title DROPPED locally; keep the chosen status.
+        self._set_local_anilist_status(media_id, target)
+        cancelled = self._cancel_running_anime_downloads(media_id) if target == "DROPPED" else 0
         self.logger.info(
-            "SCHEDULE step=anime.drop media_id=%s local_files=%s delete_after_hours=%s",
-            media_id, queued, self.config.agent.delete_after_watched_hours,
+            "SCHEDULE step=anime.drop media_id=%s local_files=%s delete_after_hours=%s status=%s previous=%s "
+            "redownload_blocked=%s cancelled_downloads=%s",
+            media_id,
+            queued,
+            self.config.agent.delete_after_watched_hours,
+            target,
+            previous or "none",
+            len(blocked),
+            cancelled,
         )
-        return {"ok": True, "queued": queued, "state": self.get_state()}
+        return {
+            "ok": True,
+            "queued": queued,
+            "status": target,
+            "cancelled_downloads": cancelled,
+            "state": self.get_state(),
+        }
+
+    def _cancel_running_anime_downloads(self, media_id: int) -> int:
+        """Remove the dropped title's unfinished torrents (with their partial files)."""
+        try:
+            if not self.manager.downloads_enabled():
+                return 0
+            running = [
+                item
+                for item in self.manager.db.downloads()
+                if item.media_id == int(media_id) and not AnimeManager._download_is_complete(item)
+            ]
+        except Exception as exc:  # noqa: BLE001 - dropping must not fail on the torrent client
+            self.logger.warning("FAIL step=anime.drop_cancel_downloads media_id=%s error=%r", media_id, exc)
+            return 0
+        cancelled = 0
+        for item in running:
+            try:
+                self._torrent_download_action_impl(item.torrent_hash, "remove", delete_files=True)
+                cancelled += 1
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(
+                    "FAIL step=anime.drop_cancel_download media_id=%s hash=%s error=%r",
+                    media_id,
+                    item.torrent_hash,
+                    exc,
+                )
+        return cancelled
+
+    def allow_redownload(self, media_id: int) -> dict[str, Any]:
+        """Let automatic downloading fetch the episodes deleted from the anime menu again."""
+        lifted = self.manager.db.allow_redownload(int(media_id))
+        self.logger.info(
+            "EVENT step=anime.redownload_allowed media_id=%s lifted=%s reason=menu", media_id, lifted
+        )
+        return {"ok": True, "lifted": lifted, "state": self.get_state()}
+
+    def keep_dropped_anime(self, media_id: int) -> dict[str, Any]:
+        """Cancel the scheduled deletion and put the title back where it was."""
+        media_id = int(media_id)
+        kept = self.manager.db.keep_dropped_anime(media_id)
+        restore = self.manager.db.pop_drop_restore(media_id)
+        states = restore.get("episodes") if isinstance(restore.get("episodes"), dict) else {}
+        restored = self.manager.db.restore_dropped_episode_states(media_id, states) if kept else 0
+        lifted = self.manager.db.allow_redownload(media_id)
+        previous = str(restore.get("status") or "").strip().upper()
+        anime = self.manager.db.get_anime(media_id)
+        current = str(anime.status or "").strip().upper() if anime is not None else ""
+        warning = ""
+        status_restored = ""
+        if kept and current == "DROPPED" and previous in self.ANIME_LIST_STATUSES and previous != "DROPPED":
+            try:
+                client = self._anilist_client()
+                try:
+                    client.set_list_status(media_id, previous)
+                finally:
+                    client.close()
+                self._set_local_anilist_status(media_id, previous)
+                status_restored = previous
+            except Exception as exc:  # noqa: BLE001 - the files are kept even if AniList fails
+                warning = str(exc)
+                self.logger.warning("FAIL step=anime.drop_keep_status media_id=%s error=%r", media_id, exc)
+        self.logger.info(
+            "EVENT anime.drop_keep media_id=%s kept_files=%s restored_states=%s redownload_unblocked=%s status=%s",
+            media_id,
+            kept,
+            restored,
+            lifted,
+            status_restored or current or "none",
+        )
+        result = {"ok": True, "kept": kept, "status": status_restored or current, "state": self.get_state()}
+        if warning:
+            result["warning"] = warning
+        return result
 
     def poll_planned_release_discovery(self) -> dict[str, Any]:
         """Return already-discovered Planning releases without mutating discovery state."""
@@ -11698,6 +13650,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def final_sequel_option(self, media_id: int) -> dict[str, Any]:
         """Return the earliest direct SEQUEL for the score/final-episode surface."""
         media_id = int(media_id)
+
         def direct_sequels(graph: dict[str, Any]) -> tuple[dict[int, dict[str, Any]], list[int]]:
             nodes = {
                 int(node["media_id"]): dict(node)
@@ -11836,7 +13789,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "ok": False,
                     "reason": "no_release",
                     "sequel": sequel,
-                    "message": "No suitable torrent release found yet",
+                    "message": err("manager.noSuitableRelease"),
                 }
             return {
                 "ok": True,
@@ -11979,8 +13932,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if previous and previous["running"]:
                     download_pending = True
                 else:
-                    job = {"ok": True, "running": True, "download_started": False,
-                           "release": "", "error": ""}
+                    job = {"ok": True, "running": True, "download_started": False, "release": "", "error": ""}
                     self._watching_download_jobs[media_id] = job
                     try:
                         self.task_supervisor.start(
@@ -12001,16 +13953,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         }
 
     def _download_after_watching(
-        self, cancel_event: threading.Event, media_id: int, job: dict[str, Any],
+        self,
+        cancel_event: threading.Event,
+        media_id: int,
+        job: dict[str, Any],
     ) -> None:
         result: dict[str, Any] = {}
         try:
             if cancel_event.is_set():
-                result["error"] = "Download search cancelled"
+                result["error"] = err("web.downloadSearchCancelled")
                 return
             release = self.manager.download_planned(media_id)
-            result.update(download_started=release is not None,
-                          release=release.title if release is not None else "")
+            result.update(
+                download_started=release is not None, release=release.title if release is not None else ""
+            )
         except Exception as exc:  # noqa: BLE001 - report background errors to the UI.
             result["error"] = str(exc)
             self.logger.exception("FAIL step=watching.download media_id=%s", media_id)
@@ -12022,7 +13978,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         with self._watching_download_lock:
             job = self._watching_download_jobs.get(int(media_id))
             if job is None:
-                return {"ok": False, "running": False, "error": "Download search not found"}
+                return {"ok": False, "running": False, "error": err("web.downloadSearchNotFound")}
             return dict(job)
 
     def set_anime_watching(self, media_id: int) -> dict[str, Any]:
@@ -12063,19 +14019,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._global_search_anilist_alias_cache = cache
 
         missing = sorted(
-            int(media_id)
-            for media_id in media_ids
-            if int(media_id) > 0 and int(media_id) not in cache
+            int(media_id) for media_id in media_ids if int(media_id) > 0 and int(media_id) not in cache
         )
         if not missing or not allow_network:
             return cache
-        if (
-            not self.config.anilist.enabled
-            or not self.config.anilist.access_token
-        ):
+        if not self.config.anilist.enabled or not self.config.anilist.access_token:
             return cache
 
-        gql = '''
+        gql = """
         query($ids:[Int]){
           Page(page:1,perPage:50){
             media(id_in:$ids){
@@ -12085,7 +14036,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
           }
         }
-        '''
+        """
         for offset in range(0, len(missing), 50):
             chunk = missing[offset : offset + 50]
             try:
@@ -12106,11 +14057,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         *(media.get("synonyms") or []),
                     ]
                     cache[media_id] = list(
-                        dict.fromkeys(
-                            str(value or "").strip()
-                            for value in names
-                            if str(value or "").strip()
-                        )
+                        dict.fromkeys(str(value or "").strip() for value in names if str(value or "").strip())
                     )
                 for media_id in chunk:
                     if media_id not in returned:
@@ -12137,22 +14084,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         ln_state = self.light_novels.state()
         manga_state = self.manga.state()
         audiobook_books = self.audiobooks.search_catalog()
-        ln_books = [
-            dict(item)
-            for item in (ln_state.get("books") or [])
-            if isinstance(item, dict)
-        ]
-        manga_books = [
-            dict(item)
-            for item in (manga_state.get("books") or [])
-            if isinstance(item, dict)
-        ]
+        ln_books = [dict(item) for item in (ln_state.get("books") or []) if isinstance(item, dict)]
+        manga_books = [dict(item) for item in (manga_state.get("books") or []) if isinstance(item, dict)]
 
-        linked_ids = {
-            int(anime.media_id)
-            for anime in anime_rows
-            if anime.media_id
-        }
+        linked_ids = {int(anime.media_id) for anime in anime_rows if anime.media_id}
         linked_ids.update(
             int(item["anilist_id"])
             for item in [*ln_books, *manga_books, *audiobook_books]
@@ -12192,11 +14127,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             flags=re.IGNORECASE,
         )
         episode_number = int(episode_hint.group(1)) if episode_hint else None
-        episode_prefix = (
-            cleaned[: episode_hint.start(1)].rstrip(" .#-_")
-            if episode_hint
-            else ""
-        )
+        episode_prefix = cleaned[: episode_hint.start(1)].rstrip(" .#-_") if episode_hint else ""
 
         for anime in anime_rows:
             names = list(
@@ -12222,8 +14153,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 (
                     item
                     for item in local_eps
-                    if item.episode is not None
-                    and int(item.episode) == int(anime.next_episode)
+                    if item.episode is not None and int(item.episode) == int(anime.next_episode)
                 ),
                 None,
             )
@@ -12231,11 +14161,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 chosen = max(
                     local_eps,
                     key=lambda item: (
-                        float(
-                            item.playback_updated_at
-                            or item.watched_at
-                            or 0.0
-                        ),
+                        float(item.playback_updated_at or item.watched_at or 0.0),
                         int(item.episode or 0),
                     ),
                 )
@@ -12250,30 +14176,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         "cover": self._cover_uri(anime),
                         "site_url": anime.site_url,
                         "status": anime.status,
-                        "page": (
-                            "planned"
-                            if str(anime.status or "").upper() == "PLANNING"
-                            else "current"
-                        ),
+                        "page": ("planned" if str(anime.status or "").upper() == "PLANNING" else "current"),
                         "video_path": str(chosen.video_path) if chosen else "",
                         "episode": chosen.episode if chosen else None,
                         "score": round(score, 3),
                         "priority_tier": (
                             0
-                            if chosen is not None
-                            and str(chosen.state or "").lower() in {"ready", "watched"}
+                            if chosen is not None and str(chosen.state or "").lower() in {"ready", "watched"}
                             else 1
-                            if chosen is not None
-                            or str(anime.status or "").upper() != "PLANNING"
+                            if chosen is not None or str(anime.status or "").upper() != "PLANNING"
                             else 2
                         ),
                     }
                 )
 
-            if (
-                episode_number is not None
-                and len(_global_search_normalize(episode_prefix)) >= 2
-            ):
+            if episode_number is not None and len(_global_search_normalize(episode_prefix)) >= 2:
                 prefix_score, prefix_match = _global_search_score(
                     episode_prefix,
                     names,
@@ -12283,8 +14200,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         (
                             item
                             for item in local_eps
-                            if item.episode is not None
-                            and int(item.episode) == episode_number
+                            if item.episode is not None and int(item.episode) == episode_number
                         ),
                         None,
                     )
@@ -12302,10 +14218,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 "page": "current",
                                 "score": round(min(100.0, prefix_score + 6.0), 3),
                                 "priority_tier": (
-                                    0
-                                    if str(exact.state or "").lower()
-                                    in {"ready", "watched"}
-                                    else 1
+                                    0 if str(exact.state or "").lower() in {"ready", "watched"} else 1
                                 ),
                             }
                         )
@@ -12323,16 +14236,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 {
                     "kind": "light_novel",
                     "local_id": int(book.get("id") or 0),
-                    "media_id": (
-                        int(book["anilist_id"])
-                        if book.get("anilist_id")
-                        else None
-                    ),
-                    "title": str(
-                        book.get("title")
-                        or book.get("series_title")
-                        or "Light Novel"
-                    ),
+                    "media_id": (int(book["anilist_id"]) if book.get("anilist_id") else None),
+                    "title": str(book.get("title") or book.get("series_title") or "Light Novel"),
                     "matched_title": matched,
                     "cover": str(book.get("cover_url") or ""),
                     "page": "lightnovels",
@@ -12356,22 +14261,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 {
                     "kind": "manga",
                     "local_id": int(book.get("id") or 0),
-                    "media_id": (
-                        int(book["anilist_id"])
-                        if book.get("anilist_id")
-                        else None
-                    ),
-                    "title": str(
-                        book.get("title")
-                        or book.get("series_title")
-                        or "Manga"
-                    ),
+                    "media_id": (int(book["anilist_id"]) if book.get("anilist_id") else None),
+                    "title": str(book.get("title") or book.get("series_title") or "Manga"),
                     "matched_title": matched,
-                    "cover": str(
-                        book.get("cover_url")
-                        or book.get("local_cover_url")
-                        or ""
-                    ),
+                    "cover": str(book.get("cover_url") or book.get("local_cover_url") or ""),
                     "page": "manga",
                     "volume": book.get("volume"),
                     "score": round(score, 3),
@@ -12431,65 +14324,60 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
         return results[: max(1, min(100, int(limit or 40)))]
 
+    def save_jimaku_api_key(self, api_key: str) -> dict[str, Any]:
+        """Check a personal Jimaku key with one request, then save it (the key-problem notice).
+
+        A key Jimaku refuses is not saved. When Jimaku cannot be asked right now
+        (network, rate limit) the key is saved unchecked: the next search uses it."""
+
+        key = str(api_key or "").strip()
+        if not key:
+            return {"ok": False, "saved": False, "status": "missing"}
+        check = check_jimaku_api_key(self.config.jimaku.base_url, key)
+        status = str(check.get("status") or "")
+        self.logger.info(
+            "RESULT step=jimaku.personal_key_check status=%s http_status=%s",
+            status,
+            check.get("http_status", ""),
+        )
+        if status in {"invalid", "missing"}:
+            return {"ok": False, "saved": False, "status": status}
+        verified = status in {"ok", "empty"}
+        if verified:
+            # The same key Jimaku refused before may work again: its notice is over.
+            clear_jimaku_key_rejection(self.config.paths.cache_dir, jimaku_key_fingerprint(key))
+        saved = self.save_settings({"jimaku_api_key": key})
+        return {
+            "ok": True,
+            "saved": True,
+            "status": status,
+            "verified": verified,
+            "settings": saved.get("settings"),
+            "state": saved.get("state"),
+            "recheck_subtitles": bool(saved.get("recheck_subtitles")),
+        }
+
+    def mark_jimaku_key_notice_seen(self, notice_id: str) -> dict[str, Any]:
+        """The Jimaku key notice was shown: do not open it by itself again for this trial or
+        this refused personal key."""
+
+        mark_jimaku_key_notice_seen(self.config.paths.cache_dir, str(notice_id or ""))
+        return {"ok": True}
+
     def test_saved_credentials(
         self,
         kinds: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        requested = {
-            str(value or "").strip().lower()
-            for value in (kinds or [])
-            if str(value or "").strip()
-        }
+        requested = {str(value or "").strip().lower() for value in (kinds or []) if str(value or "").strip()}
         checks: list[dict[str, Any]] = []
 
         if "jimaku" in requested:
-            key = str(self.config.jimaku.personal_api_key or "").strip()
-            if not key:
-                checks.append({"service": "Jimaku", "status": "missing"})
-            else:
-                try:
-                    response = httpx.get(
-                        f"{self.config.jimaku.base_url.rstrip('/')}/api/entries/search",
-                        headers={
-                            "Authorization": key,
-                            "Accept": "application/json",
-                            "User-Agent": APP_SLUG,
-                        },
-                        params={"anime": "true", "query": "Frieren"},
-                        timeout=8.0,
-                        follow_redirects=True,
-                    )
-                    if response.status_code in {401, 403}:
-                        checks.append({"service": "Jimaku", "status": "invalid"})
-                    elif response.status_code == 429:
-                        checks.append({"service": "Jimaku", "status": "rate_limited"})
-                    else:
-                        response.raise_for_status()
-                        payload = response.json()
-                        count = len(payload) if isinstance(payload, list) else 0
-                        checks.append(
-                            {
-                                "service": "Jimaku",
-                                "status": "ok" if count > 0 else "empty",
-                                "count": count,
-                            }
-                        )
-                except httpx.HTTPError as exc:
-                    checks.append(
-                        {
-                            "service": "Jimaku",
-                            "status": "unreachable",
-                            "detail": str(exc),
-                        }
-                    )
-                except ValueError as exc:
-                    checks.append(
-                        {
-                            "service": "Jimaku",
-                            "status": "error",
-                            "detail": str(exc),
-                        }
-                    )
+            checks.append(
+                check_jimaku_api_key(
+                    self.config.jimaku.base_url,
+                    str(self.config.jimaku.personal_api_key or "").strip(),
+                )
+            )
 
         if "anilist" in requested:
             token = str(self.config.anilist.access_token or "").strip()
@@ -12513,9 +14401,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         response.raise_for_status()
                         payload = response.json()
                         viewer = (
-                            (payload.get("data") or {}).get("Viewer")
-                            if isinstance(payload, dict)
-                            else None
+                            (payload.get("data") or {}).get("Viewer") if isinstance(payload, dict) else None
                         )
                         checks.append(
                             {
@@ -12544,11 +14430,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if backend not in requested:
                 continue
             settings = self.light_novels.settings()
-            token = (
-                settings.jiten_api_key
-                if backend == "jiten"
-                else settings.jpdb_api_token
-            )
+            token = settings.jiten_api_key if backend == "jiten" else settings.jpdb_api_token
             if not str(token or "").strip():
                 checks.append({"service": service, "status": "missing"})
                 continue
@@ -12565,9 +14447,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     or "unauthorized" in lowered
                     or "forbidden" in lowered
                     else "unreachable"
-                    if "timeout" in lowered
-                    or "connect" in lowered
-                    or "network" in lowered
+                    if "timeout" in lowered or "connect" in lowered or "network" in lowered
                     else "error"
                 )
                 checks.append(
@@ -12584,11 +14464,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         """Search AniList beyond the user's existing Planning collection."""
 
         cleaned = re.sub(r"\s+", " ", str(query or "")).strip()[:120]
-        if (
-            len(cleaned) < 3
-            or not self.config.anilist.enabled
-            or not self.config.anilist.access_token
-        ):
+        if len(cleaned) < 3 or not self.config.anilist.enabled or not self.config.anilist.access_token:
             return []
         cache_key = {
             "query": cleaned.casefold(),
@@ -12624,13 +14500,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 titles = media.get("title") or {}
                 entry = media.get("mediaListEntry") or {}
                 media_format = str(media.get("format") or "").upper()
-                kind = (
-                    "anime"
-                    if bucket == "anime"
-                    else "novel"
-                    if media_format == "NOVEL"
-                    else "manga"
-                )
+                kind = "anime" if bucket == "anime" else "novel" if media_format == "NOVEL" else "manga"
                 rows.append(
                     {
                         "media_id": int(media["id"]),
@@ -12656,7 +14526,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             ),
                             "",
                         ),
-                        "cover": (media.get("coverImage") or {}).get("extraLarge") or (media.get("coverImage") or {}).get("large") or "",
+                        "cover": (media.get("coverImage") or {}).get("extraLarge")
+                        or (media.get("coverImage") or {}).get("large")
+                        or "",
                         "site_url": media.get("siteUrl") or "",
                         "media_status": media.get("status") or "",
                         "list_status": entry.get("status") or "",
@@ -12749,7 +14621,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         errors: list[str] = []
         total = len(ln_pending) + len(manga_pending)
         try:
-            self.job_center.update(job_id, state="running", total=total, message="Refreshing Jiten parses")
+            self.job_center.update(job_id, state="running", total=total, message=t("web.refreshingJiten"))
             for index, (text, digest) in enumerate(ln_pending, 1):
                 state = self.job_center.get(job_id) or {}
                 if str(state.get("state") or "") == "cancel_requested":
@@ -12765,7 +14637,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     state="running",
                     current=index,
                     total=total,
-                    message=f"Jiten LN {index}/{len(ln_pending)}",
+                    message=t("web.jitenLnProgress", done=index, total=len(ln_pending)),
                 )
             offset = len(ln_pending)
             for index, text in enumerate(manga_pending, 1):
@@ -12783,11 +14655,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     state="running",
                     current=offset + index,
                     total=total,
-                    message=f"Jiten manga OCR {index}/{len(manga_pending)}",
+                    message=t("web.jitenMangaProgress", done=index, total=len(manga_pending)),
                 )
             self.job_center.finish(
                 job_id,
-                message=f"Jiten refreshed: LN {parsed_ln}, manga {parsed_manga}",
+                message=t("web.jitenRefreshed", ln=parsed_ln, manga=parsed_manga),
                 result={"light_novel_parses": parsed_ln, "manga_parses": parsed_manga, "errors": errors[:50]},
             )
         except Exception as exc:
@@ -12806,11 +14678,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def refresh_jiten_data(self) -> dict[str, Any]:
         """Invalidate Jiten metadata immediately and lazily parse local reading material."""
         if not str(self.light_novels.settings().jiten_api_key or "").strip():
-            raise LightNovelError("Jiten API key is not configured")
+            raise LightNovelError(err("ln.jitenKeyMissing"))
         invalidated = self.light_novels.invalidate_jiten_media_stats()
         with self._jiten_refresh_lock:
             if self._jiten_refresh_thread is not None and self._jiten_refresh_thread.is_alive():
-                return {"started": False, "running": True, "job_id": self._jiten_refresh_job_id, "invalidated": invalidated}
+                return {
+                    "started": False,
+                    "running": True,
+                    "job_id": self._jiten_refresh_job_id,
+                    "invalidated": invalidated,
+                }
             ln_pending = self.light_novels.jiten_unparsed_chapters()
             manga_pending: list[str] = []
             try:
@@ -12831,7 +14708,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.logger.info("Jiten manga preparse discovery skipped: %s", exc)
             job_id = self.job_center.start(
                 "jiten_refresh",
-                "Refresh Jiten data",
+                t("web.jobRefreshJiten"),
                 payload={"light_novels": len(ln_pending), "manga_regions": len(manga_pending)},
                 total=len(ln_pending) + len(manga_pending),
             )
@@ -12875,16 +14752,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except ValueError:
             return False
         return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() in {
-            "127.0.0.1", "localhost", "::1"
+            "127.0.0.1",
+            "localhost",
+            "::1",
         }
 
-    def _irodori_git_revision(self) -> str:
+    def _irodori_git_revision(self, *, full: bool = False) -> str:
         repo = self._irodori_repo_dir()
         if not (repo / ".git").is_dir():
             return ""
         try:
             return subprocess.check_output(
-                ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+                ["git", "-C", str(repo), "rev-parse", *(() if full else ("--short",)), "HEAD"],
                 text=True,
                 stderr=subprocess.DEVNULL,
                 timeout=3,
@@ -12930,7 +14809,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if running:
             state["running"] = True
         elif installed and state.get("state") != "failed":
-            state.update({"state": "ready", "running": False, "detail": ""})
+            # The last Install / Update's own words stay (e.g. an update that was undone).
+            state.update({"state": "ready", "running": False})
         elif not installed and state.get("state") not in {"failed"}:
             state.update({"state": "not_installed", "running": False, "detail": ""})
         local_full = ""
@@ -12944,14 +14824,70 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 ).strip()
             except Exception:
                 local_full = ""
+        # Update Irodori follows the project's main branch (a pin only chooses fresh installs).
         remote_full = "" if running or not installed else self._irodori_remote_revision(refresh=refresh)
+        record = self._irodori_last_good()
+        if (
+            not record
+            and not running
+            and state.get("state") == "ready"
+            and re.fullmatch(r"[0-9a-f]{40}", local_full)
+        ):
+            # Installed before Pudge recorded a last good commit: the commit in use is the one
+            # repair puts back (and Update goes back to) from now on.
+            record = self._adopt_irodori_last_good(local_full)
         state["installed"] = installed
         state["revision"] = local_full[:8] if local_full else ""
         state["remote_revision"] = remote_full[:8] if remote_full else ""
         state["update_available"] = bool(local_full and remote_full and local_full != remote_full)
+        state["last_good_revision"] = str(record.get("revision") or "")[:8]
+        state["last_checked_at"] = float(record.get("checked_at") or 0.0)
+        state["last_updated_at"] = float(record.get("updated_at") or 0.0)
         state["install_dir"] = str(self._irodori_install_root())
         state["log_path"] = str(self._irodori_install_log_path())
         return state
+
+    def _irodori_last_good_path(self) -> Path:
+        return self._irodori_install_root() / "last-good.json"
+
+    def _irodori_last_good(self) -> dict[str, Any]:
+        """The commit Install and repair put on the Mac: the last one that was installed or
+        passed Update's check, with when it was checked and installed."""
+        try:
+            data = json.loads(self._irodori_last_good_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict) or not re.fullmatch(r"[0-9a-f]{40}", str(data.get("revision") or "")):
+            return {}
+        return data
+
+    def _record_irodori_last_good(self, revision: str, *, updated: bool) -> None:
+        now = time.time()
+        record = self._irodori_last_good()
+        if re.fullmatch(r"[0-9a-f]{40}", revision or ""):
+            # An adopted record has no install date (updated_at 0) until an Update installs one.
+            if updated or "updated_at" not in record or record.get("revision") != revision:
+                record["updated_at"] = now
+            record["revision"] = revision
+        if not record.get("revision"):
+            return
+        record["checked_at"] = now
+        path = self._irodori_last_good_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+    def _adopt_irodori_last_good(self, revision: str) -> dict[str, Any]:
+        """Record the commit of an install that has no last good record (not checked yet)."""
+        record = {"revision": revision, "updated_at": 0.0, "adopted_at": time.time()}
+        try:
+            path = self._irodori_last_good_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            self.logger.warning("FAIL step=irodori.last_good reason=write_failed error=%r", str(exc))
+            return {}
+        self.logger.info("RESULT step=irodori.last_good result=adopted revision=%s", revision)
+        return record
 
     def _set_irodori_install_state(self, state: str, detail: str = "") -> None:
         with self._irodori_install_lock:
@@ -12975,7 +14911,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         if uv.is_file():
             return uv
         root.parent.mkdir(parents=True, exist_ok=True)
-        self._set_irodori_install_state("installing_uv", "Installing uv in a private bootstrap environment")
+        self._set_irodori_install_state("installing_uv", t("web.installingUv"))
         completed = subprocess.run(
             [python_executable(), "-m", "venv", str(root)],
             stdout=log,
@@ -12985,7 +14921,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             timeout=10 * 60,
         )
         if completed.returncode != 0 or not python.is_file():
-            raise RuntimeError(f"failed to create uv bootstrap environment (exit {completed.returncode})")
+            raise RuntimeError(err("setup.uvBootstrapFailed", code=completed.returncode))
         completed = subprocess.run(
             [str(python), "-m", "pip", "install", "--upgrade", "uv"],
             stdout=log,
@@ -12995,88 +14931,248 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             timeout=15 * 60,
         )
         if completed.returncode != 0 or not uv.is_file():
-            raise RuntimeError(f"failed to install uv (exit {completed.returncode})")
+            raise RuntimeError(err("setup.uvInstallFailed", code=completed.returncode))
         return uv
 
-    def _run_irodori_install(self) -> None:
+    def _irodori_run_git(self, commands: list[list[str]], log: Any) -> None:
+        for command in commands:
+            log.write("$ " + " ".join(map(str, command)) + "\n")
+            log.flush()
+            completed = subprocess.run(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=15 * 60,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(err("setup.irodoriSourceFailed", code=completed.returncode))
+
+    def _irodori_sync(self, uv: Path, log: Any) -> None:
+        repo = self._irodori_repo_dir()
+        example = repo / ".env.example"
+        env_file = repo / ".env"
+        if example.is_file() and not env_file.exists():
+            shutil.copy2(example, env_file)
+        self._set_irodori_install_state("installing_dependencies", t("web.installingIrodoriDeps"))
+        command = [str(uv), "sync", "--locked", "--no-dev", "--extra", "cpu"]
+        log.write("$ " + " ".join(command) + "\n")
+        log.flush()
+        completed = subprocess.run(
+            command,
+            cwd=repo,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+            timeout=90 * 60,
+            env={**os.environ, "UV_LINK_MODE": "copy"},
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(err("setup.uvSyncExit", code=completed.returncode))
+        if not self._irodori_managed_python().is_file():
+            raise RuntimeError(err("setup.irodoriEnvMissing"))
+
+    def _irodori_update_problem(self) -> str:
+        """Why the updated server does not work ("" when it started and answered /health).
+
+        Started once on a free local port, so the answer comes from this install.
+        """
+        self._stop_managed_irodori_server()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+        try:
+            self.test_irodori_tts(
+                {"url": f"http://127.0.0.1:{port}"}, start_timeout=IRODORI_UPDATE_CHECK_SECONDS
+            )
+        except Exception as exc:
+            return (str(exc) or type(exc).__name__)[-500:]
+        return ""
+
+    def _run_irodori_install(self, update: bool = False) -> None:
         root = self._irodori_install_root()
         repo = self._irodori_repo_dir()
         log_path = self._irodori_install_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         root.mkdir(parents=True, exist_ok=True)
+        rollback_to = ""
+        git = ""
+        uv: Path | None = None
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 git = shutil.which("git") or ("/usr/bin/git" if Path("/usr/bin/git").is_file() else "")
                 if not git:
-                    raise RuntimeError("git is required to install Irodori")
+                    raise RuntimeError(err("setup.gitRequired"))
+                pinned = IRODORI_TTS_COMMIT.strip()
+                last_good = str(self._irodori_last_good().get("revision") or "")
+                has_repo = (repo / ".git").is_dir()
+                update = bool(update and has_repo and self._irodori_managed_python().is_file())
+                before = self._irodori_git_revision(full=True) if update else ""
+                if update:
+                    # GitHub's main first: nothing new (or no answer) leaves the server running.
+                    self._set_irodori_install_state("updating_source", t("web.irodoriLookingForUpdate"))
+                    main = self._irodori_remote_revision(refresh=True)
+                    log.write(f"Installed {before or 'unknown'}; GitHub main {main or 'did not answer'}\n")
+                    if not main or main == before:
+                        if main:
+                            self._record_irodori_last_good(before, updated=False)
+                            self.logger.info("RESULT step=irodori.update result=current revision=%s", before)
+                            self._set_irodori_install_state(
+                                "ready", t("web.irodoriUpToDate", revision=before[:8])
+                            )
+                        else:
+                            self.logger.warning(
+                                "FAIL step=irodori.update reason=main_unavailable revision=%s",
+                                before or "unknown",
+                            )
+                            self._set_irodori_install_state(
+                                "ready",
+                                err(
+                                    "setup.irodoriUpdateUnchecked", revision=(before or last_good)[:8] or "?"
+                                ),
+                            )
+                        return
                 uv = self._irodori_uv(log)
-                if (repo / ".git").is_dir():
-                    self._set_irodori_install_state("updating_source", "Updating Irodori-TTS-Server")
+                # Install and repair: the last good commit, else the pin. Update: main.
+                target = "" if update else (last_good or pinned)
+                source = "main" if update or not target else ("last_good" if target == last_good else "pin")
+                if update:
+                    # The server runs from the environment that is about to change.
+                    self._stop_managed_irodori_server()
+                    rollback_to = last_good or before
+                    self._set_irodori_install_state("updating_source", t("web.updatingIrodori"))
                     commands = [
                         [git, "-C", str(repo), "fetch", "--depth", "1", "origin", "main"],
                         [git, "-C", str(repo), "reset", "--hard", "origin/main"],
                     ]
+                elif has_repo:
+                    self._set_irodori_install_state("updating_source", t("web.updatingIrodori"))
+                    commands = []
                 else:
                     if repo.exists():
                         shutil.rmtree(repo)
-                    self._set_irodori_install_state("cloning", "Downloading Irodori-TTS-Server")
-                    commands = [[git, "clone", "--depth", "1", "--branch", "main", "https://github.com/Aratako/Irodori-TTS-Server.git", str(repo)]]
-                for command in commands:
-                    log.write("$ " + " ".join(map(str, command)) + "\n")
-                    log.flush()
-                    completed = subprocess.run(
-                        command,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        check=False,
-                        timeout=15 * 60,
-                    )
-                    if completed.returncode != 0:
-                        raise RuntimeError(f"Irodori source command failed with exit {completed.returncode}")
-                example = repo / ".env.example"
-                env_file = repo / ".env"
-                if example.is_file() and not env_file.exists():
-                    shutil.copy2(example, env_file)
-                self._set_irodori_install_state("installing_dependencies", "Installing Irodori dependencies (macOS CPU/MPS backend)")
-                command = [str(uv), "sync", "--locked", "--no-dev", "--extra", "cpu"]
-                log.write("$ " + " ".join(command) + "\n")
+                    self._set_irodori_install_state("cloning", t("web.downloadingIrodori"))
+                    commands = [
+                        [git, "clone", "--depth", "1", "--branch", "main", IRODORI_TTS_REPOSITORY, str(repo)]
+                    ]
+                if target:
+                    commands += [
+                        [git, "-C", str(repo), "fetch", "--depth", "1", "origin", target],
+                        [git, "-C", str(repo), "reset", "--hard", target],
+                    ]
+                elif not commands:
+                    commands = [
+                        [git, "-C", str(repo), "fetch", "--depth", "1", "origin", "main"],
+                        [git, "-C", str(repo), "reset", "--hard", "origin/main"],
+                    ]
+                self._irodori_run_git(commands, log)
+                self._irodori_sync(uv, log)
+                revision = self._irodori_git_revision(full=True)
+                log.write(f"Installed Irodori-TTS-Server revision {revision or 'unknown'}\n")
                 log.flush()
-                completed = subprocess.run(
-                    command,
-                    cwd=repo,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    check=False,
-                    timeout=90 * 60,
-                    env={**os.environ, "UV_LINK_MODE": "copy"},
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError(f"uv sync exited with code {completed.returncode}")
-                if not self._irodori_managed_python().is_file():
-                    raise RuntimeError("Irodori environment was not created")
                 self._irodori_remote_revision_cache = ""
                 self._irodori_remote_revision_checked_at = 0.0
+                if update:
+                    if revision and revision == before:
+                        self._record_irodori_last_good(revision, updated=False)
+                        self.logger.info("RESULT step=irodori.update result=current revision=%s", revision)
+                        self._set_irodori_install_state(
+                            "ready", t("web.irodoriUpToDate", revision=revision[:8])
+                        )
+                        return
+                    self._set_irodori_install_state("checking", t("web.checkingIrodoriUpdate"))
+                    log.write("Starting the updated server once to check it...\n")
+                    log.flush()
+                    problem = self._irodori_update_problem()
+                    if problem:
+                        log.write(f"Check failed: {problem}\n")
+                        raise _IrodoriUpdateCheckFailed(problem, revision)
+                    self._record_irodori_last_good(revision, updated=True)
+                    self.logger.info(
+                        "RESULT step=irodori.update result=updated revision=%s previous=%s",
+                        revision or "unknown",
+                        before or "unknown",
+                    )
+                    self._set_irodori_install_state("ready", t("web.irodoriUpdated", revision=revision[:8]))
+                    return
+                self._record_irodori_last_good(revision, updated=True)
+                self.logger.info(
+                    "RESULT step=irodori.install revision=%s pinned=%s source=%s",
+                    revision or "unknown",
+                    pinned or "no",
+                    source,
+                )
                 self._set_irodori_install_state("ready", "")
         except Exception as exc:
-            self.logger.exception("FAIL step=irodori.install error=%r", str(exc))
-            self._set_irodori_install_state("failed", str(exc))
+            reason = str(exc)
+            if rollback_to and git and uv is not None:
+                # Update did not work: back to the commit that did.
+                try:
+                    with log_path.open("a", encoding="utf-8") as log:
+                        log.write(f"Update failed ({reason}); going back to {rollback_to}\n")
+                        with contextlib.suppress(RuntimeError):  # the commit may still be here
+                            self._irodori_run_git(
+                                [[git, "-C", str(repo), "fetch", "--depth", "1", "origin", rollback_to]], log
+                            )
+                        self._irodori_run_git([[git, "-C", str(repo), "reset", "--hard", rollback_to]], log)
+                        self._irodori_sync(uv, log)
+                except Exception as rollback_exc:
+                    self.logger.exception(
+                        "FAIL step=irodori.update reason=rollback_failed kept=none error=%r rollback_error=%r",
+                        reason,
+                        str(rollback_exc),
+                    )
+                    self._set_irodori_install_state("failed", str(rollback_exc))
+                else:
+                    self._record_irodori_last_good(rollback_to, updated=False)
+                    self._irodori_remote_revision_cache = ""
+                    self._irodori_remote_revision_checked_at = 0.0
+                    self.logger.warning(
+                        "FAIL step=irodori.update reason=%s revision=%s kept=%s error=%r",
+                        "check_failed" if isinstance(exc, _IrodoriUpdateCheckFailed) else "install_failed",
+                        getattr(exc, "revision", "") or "unknown",
+                        rollback_to,
+                        reason,
+                    )
+                    self._set_irodori_install_state(
+                        "ready", err("setup.irodoriUpdateKept", revision=rollback_to[:8], reason=reason)
+                    )
+            else:
+                self.logger.exception("FAIL step=irodori.install error=%r", reason)
+                self._set_irodori_install_state("failed", reason)
             if platform.system() == "Darwin" and log_path.exists():
                 subprocess.run(["open", "-R", str(log_path)], check=False)
 
     def install_irodori_tts(self) -> dict[str, Any]:
+        """Install, or repair: puts the last good commit (else the pin, else main) on the Mac."""
+        return self._start_irodori_install_job(update=False)
+
+    def update_irodori_tts(self) -> dict[str, Any]:
+        """Update to the project's main branch; the last good commit comes back if it fails."""
+        if not self._irodori_managed_python().is_file():
+            return self._start_irodori_install_job(update=False)
+        with self._irodori_tts_lock:
+            generating = any(thread.is_alive() for thread in self._irodori_tts_threads.values())
+        if generating:
+            raise RuntimeError(err("setup.irodoriUpdateWhileGenerating"))
+        return self._start_irodori_install_job(update=True)
+
+    def _start_irodori_install_job(self, *, update: bool) -> dict[str, Any]:
         with self._irodori_install_lock:
             thread = self._irodori_install_thread
             if thread is None or not thread.is_alive():
                 self._irodori_install_state = {
                     "state": "starting",
-                    "detail": "Starting Irodori installation",
+                    "detail": t("web.irodoriUpdateStarting" if update else "web.irodoriInstallStarting"),
+                    "updating": update,
                     "started_at": time.time(),
                     "finished_at": 0.0,
                 }
                 thread = threading.Thread(
                     target=self._run_irodori_install,
+                    kwargs={"update": update},
                     name=f"{APP_SLUG}-irodori-install",
                     daemon=True,
                 )
@@ -13196,9 +15292,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 tail = "\n".join(lines[-20:]).strip()
             except OSError:
                 tail = ""
-        detail = f"Managed Irodori server exited with code {code}"
-        if tail:
-            detail += f"\nServer log tail:\n{tail}"
+        detail = (
+            err("setup.irodoriExitedLog", code=code, tail=tail)
+            if tail
+            else err("setup.irodoriExited", code=code)
+        )
         return detail
 
     def _irodori_health(self, url: str, key: str, timeout: float = 5.0) -> httpx.Response:
@@ -13218,6 +15316,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         values: dict[str, Any] | None = None,
         *,
         keep_managed_alive: bool = False,
+        start_timeout: float = 120.0,
     ) -> dict[str, Any]:
         settings = self.light_novels.settings()
         values = values or {}
@@ -13231,7 +15330,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if not self._start_managed_irodori_server(url):
                     raise
                 started_here = True
-                deadline = time.monotonic() + 120.0
+                deadline = time.monotonic() + float(start_timeout)
                 last_error: Exception | None = None
                 while time.monotonic() < deadline:
                     process_error = self._irodori_server_failure_detail()
@@ -13246,8 +15345,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 else:
                     log_path = self._irodori_server_log_path()
                     raise RuntimeError(
-                        f"Managed Irodori server did not become ready after 120s: {last_error}. "
-                        f"Server log: {log_path}"
+                        err(
+                            "setup.irodoriNotReadyWithin",
+                            seconds=int(start_timeout),
+                            error=last_error,
+                            logPath=log_path,
+                        )
                     )
             try:
                 payload = response.json()
@@ -13267,19 +15370,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         values = values or {}
         provider = str(values.get("provider") or self.config.llm.provider or "ollama").strip().lower()
         if provider not in {"ollama", "openai"}:
-            raise RuntimeError(f"Unsupported LLM provider: {provider}")
+            raise RuntimeError(err("setup.llmProviderUnsupported", provider=provider))
         base_url = str(values.get("url") or self.config.llm.base_url or "").strip().rstrip("/")
         api_key = str(values.get("api_key") or "")
         if api_key == "••••••••":
             api_key = self.config.llm.api_key
         model = str(values.get("model") or self.config.llm.model or "").strip()
-        reasoning_effort = str(
-            values.get("reasoning_effort") or self.config.llm.reasoning_effort or "low"
-        ).strip().lower()
+        reasoning_effort = (
+            str(values.get("reasoning_effort") or self.config.llm.reasoning_effort or "low").strip().lower()
+        )
         if reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
             reasoning_effort = "low"
         if not base_url:
-            raise RuntimeError("LLM URL is empty")
+            raise RuntimeError(err("setup.llmUrlEmpty"))
 
         models: list[str] = []
         model_list_error: Exception | None = None
@@ -13311,21 +15414,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not isinstance(reply, dict):
                 chat_detail = str(getattr(client, "last_error", "") or "").strip()
                 if chat_detail:
-                    raise RuntimeError(f"LLM chat completion failed: {chat_detail}")
-                detail = f": {model_list_error}" if model_list_error else ""
-                raise RuntimeError(f"LLM chat completion failed{detail}")
+                    raise RuntimeError(err("setup.llmChatFailed", error=chat_detail))
+                if model_list_error:
+                    raise RuntimeError(err("setup.llmChatFailed", error=model_list_error))
+                raise RuntimeError(err("setup.llmChatFailedPlain"))
             return {"ok": True, "provider": provider, "model": model, "models": models}
 
         if model_list_error is not None:
-            raise RuntimeError(f"LLM model listing failed: {model_list_error}")
+            raise RuntimeError(err("setup.llmModelsFailed", error=model_list_error))
         if not models:
-            raise RuntimeError("LLM server returned no models")
+            raise RuntimeError(err("setup.llmNoModels"))
         return {"ok": True, "provider": provider, "model": "", "models": models}
 
     def _audiobook_generation_runtime(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         settings = self.light_novels.settings()
         values = values or {}
-        provider = str(values.get("provider") or settings.audiobook_generation_provider or "off").strip().lower()
+        provider = (
+            str(values.get("provider") or settings.audiobook_generation_provider or "off").strip().lower()
+        )
         if provider == "irodori":
             return {
                 "provider": "irodori",
@@ -13342,13 +15448,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "provider": "external",
                 "base_url": str(values.get("url") or settings.irodori_tts_url or "").strip().rstrip("/"),
                 "api_key": str(values.get("api_key") or settings.irodori_tts_api_key or ""),
-                "model": str(values.get("model") or settings.audiobook_tts_model or "tts-1").strip() or "tts-1",
+                "model": str(values.get("model") or settings.audiobook_tts_model or "tts-1").strip()
+                or "tts-1",
                 "voice": str(values.get("voice") or settings.irodori_tts_voice or "alloy").strip() or "alloy",
                 "caption": "",
                 "speed": float(values.get("speed", settings.irodori_tts_speed) or 1.0),
                 "managed": False,
             }
-        raise LightNovelError("Audiobook generation is disabled in Settings")
+        raise LightNovelError(err("audiobook.generationDisabled"))
 
     def test_audiobook_generation(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
         values = values or {}
@@ -13360,7 +15467,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         url = str(runtime["base_url"]).strip().rstrip("/")
         key = str(runtime["api_key"] or "")
         if not url:
-            raise LightNovelError("External audiobook API URL is empty")
+            raise LightNovelError(err("audiobook.apiUrlEmpty"))
         headers = self._irodori_headers(key)
         last_error: Exception | None = None
         for endpoint in ("/v1/models", "/health"):
@@ -13370,7 +15477,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 return {"ok": True, "provider": "external", "url": url}
             except Exception as exc:
                 last_error = exc
-        raise RuntimeError(f"External audiobook API is not reachable: {last_error}")
+        raise RuntimeError(err("audiobook.apiUnreachable", error=last_error))
 
     @staticmethod
     def _tts_http_error(response: httpx.Response, chapter_index: int) -> RuntimeError:
@@ -13382,7 +15489,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             detail = response.text.strip()
         detail = detail[:1600]
         return RuntimeError(
-            f"Audiobook API rejected chapter {chapter_index}: HTTP {response.status_code}"
+            err("audiobook.apiRejected", chapter=chapter_index, status=response.status_code)
             + (f" — {detail}" if detail else "")
         )
 
@@ -13429,7 +15536,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
     def _merge_audiobook_parts(self, parts: list[Path], output: Path) -> None:
         if not parts:
-            raise RuntimeError("Audiobook generation returned no audio parts")
+            raise RuntimeError(err("audiobook.noAudioParts"))
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary = output.with_suffix(".merge.part.mp3")
         temporary.unlink(missing_ok=True)
@@ -13445,9 +15552,21 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             try:
                 completed = subprocess.run(
                     [
-                        str(self.config.tools.ffmpeg), "-hide_banner", "-loglevel", "error",
-                        "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i",
-                        str(concat_list), "-c", "copy", str(temporary),
+                        str(self.config.tools.ffmpeg),
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-nostdin",
+                        "-y",
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(concat_list),
+                        "-c",
+                        "copy",
+                        str(temporary),
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -13457,14 +15576,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 )
                 if completed.returncode != 0:
                     raise RuntimeError(
-                        "ffmpeg could not join audiobook chunks: "
-                        + str(completed.stderr or "").strip()[-1600:]
+                        err("audiobook.ffmpegJoinFailed", error=str(completed.stderr or "").strip()[-1600:])
                     )
             finally:
                 concat_list.unlink(missing_ok=True)
         if not temporary.is_file() or temporary.stat().st_size < 1024:
             temporary.unlink(missing_ok=True)
-            raise RuntimeError("Joined audiobook chapter is unexpectedly small")
+            raise RuntimeError(err("audiobook.chapterTooSmall"))
         temporary.replace(output)
 
     @staticmethod
@@ -13539,7 +15657,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             body = fallback
             status_code = int(getattr(response, "status_code", 200) or 200)
-        if status_code == 422 and runtime["provider"] == "irodori" and ("irodori" in body or "caption" in body):
+        if (
+            status_code == 422
+            and runtime["provider"] == "irodori"
+            and ("irodori" in body or "caption" in body)
+        ):
             # Older managed-server schemas did not expose Voice Design yet. Keep
             # generation usable, but only after preserving the exact rejection in logs.
             self.logger.warning(
@@ -13557,9 +15679,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             status_code = int(getattr(response, "status_code", 200) or 200)
         if runtime["provider"] == "irodori" and not bool(getattr(response, "is_error", status_code >= 400)):
-            response_seed = str(getattr(response, "headers", {}).get("X-Irodori-Seed") or getattr(response, "headers", {}).get("X-Seed") or "").strip()
+            response_seed = str(
+                getattr(response, "headers", {}).get("X-Irodori-Seed")
+                or getattr(response, "headers", {}).get("X-Seed")
+                or ""
+            ).strip()
             if response_seed:
-                self.logger.debug("RESULT step=audiobook_generation.seed chapter=%s seed=%s", chapter_index, response_seed)
+                self.logger.debug(
+                    "RESULT step=audiobook_generation.seed chapter=%s seed=%s", chapter_index, response_seed
+                )
         if bool(getattr(response, "is_error", status_code >= 400)):
             raise self._tts_http_error(response, chapter_index)
         return response
@@ -13756,9 +15884,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return index
 
     @staticmethod
-    def _audiobook_apply_character_readings(
-        text: str, known_characters: list[dict[str, Any]] | None
-    ) -> str:
+    def _audiobook_apply_character_readings(text: str, known_characters: list[dict[str, Any]] | None) -> str:
         """Replace canonical AniList names with kana in the TTS request only."""
         result = str(text or "")
         replacements: dict[str, str] = {}
@@ -13784,11 +15910,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         raw = payload.get("profiles", {})
         if not isinstance(raw, dict):
             return {}
-        return {
-            str(key): str(value)
-            for key, value in raw.items()
-            if str(key).strip() and str(value).strip()
-        }
+        return {str(key): str(value) for key, value in raw.items() if str(key).strip() and str(value).strip()}
 
     @staticmethod
     def _write_audiobook_speaker_profiles(
@@ -13820,7 +15942,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return book_dir / f"manual-chapter-{int(chapter_index):04d}-{digest}.json"
 
     @staticmethod
-    def _load_audiobook_speaker_assignments(path: Path, units: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    def _load_audiobook_speaker_assignments(
+        path: Path, units: list[dict[str, Any]]
+    ) -> dict[int, dict[str, Any]]:
         assignments: dict[int, dict[str, Any]] = {}
         if not path.is_file():
             return assignments
@@ -13995,7 +16119,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "A character id is global across sequels, so CHARACTER_PROFILES is authoritative by id and its caption must be reused exactly. "
                     "SERIES_PROFILES is only a fallback for speakers that cannot be resolved to AniList. "
                     "For a new speaker create one short Japanese voice-design caption describing persistent voice identity, never temporary emotion. "
-                    "Return strict JSON only: {\"assignments\":[{\"id\":integer,\"speaker\":string,\"anilist_character_id\":integer|null,\"caption\":string}]}. "
+                    'Return strict JSON only: {"assignments":[{"id":integer,"speaker":string,"anilist_character_id":integer|null,"caption":string}]}. '
                     "Return dialogue assignments only and preserve numeric ids."
                 )
                 for batch in batches:
@@ -14016,7 +16140,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     )
                     if not isinstance(response, dict):
                         continue
-                    for row in response.get("assignments", []) if isinstance(response.get("assignments"), list) else []:
+                    for row in (
+                        response.get("assignments", [])
+                        if isinstance(response.get("assignments"), list)
+                        else []
+                    ):
                         if not isinstance(row, dict):
                             continue
                         try:
@@ -14113,7 +16241,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         for text_value, consumed, caption, speaker in raw_parts:
             if merged:
                 prev_text, prev_consumed, prev_caption, prev_speaker = merged[-1]
-                if prev_caption == caption and prev_speaker == speaker and len(prev_text) + len(text_value) + 1 <= 3600:
+                if (
+                    prev_caption == caption
+                    and prev_speaker == speaker
+                    and len(prev_text) + len(text_value) + 1 <= 3600
+                ):
                     merged[-1] = (
                         f"{prev_text}{text_value}",
                         prev_consumed + consumed,
@@ -14145,7 +16277,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="paused",
                 current=current,
                 total=total,
-                message="Audiobook generation paused",
+                message=t("ui.audiobookGenerationPaused"),
             )
             self._write_audiobook_generation_manifest(
                 output_dir,
@@ -14155,13 +16287,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "state": "paused",
                     "current": current,
                     "total": total,
-                    "message": "Audiobook generation paused",
+                    "message": t("ui.audiobookGenerationPaused"),
                     "error": "",
                 },
             )
             return True
         if control == "cancel_requested":
-            self.job_center.cancelled(job_id, message="Audiobook generation cancelled")
+            self.job_center.cancelled(job_id, message=t("web.audiobookGenerationCancelled"))
             shutil.rmtree(output_dir, ignore_errors=True)
             return True
         return False
@@ -14180,8 +16312,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             runtime = self._audiobook_generation_runtime()
             ln_settings = self.light_novels.settings()
             character_voices = bool(
-                runtime["provider"] == "irodori"
-                and ln_settings.audiobook_character_voices
+                runtime["provider"] == "irodori" and ln_settings.audiobook_character_voices
             )
             source = self.light_novels.tts_source(book_id)
             known_characters: list[dict[str, str]] = []
@@ -14194,7 +16325,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     )
             chapters = list(source.get("chapters") or [])
             if not chapters:
-                raise LightNovelError("No text chapters found")
+                raise LightNovelError(err("ln.noTextChapters"))
             chapter_sizes = [len(str(chapter.get("text") or "")) for chapter in chapters]
             total_characters = max(1, sum(chapter_sizes))
             if runtime["provider"] == "irodori":
@@ -14202,11 +16333,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     {"url": runtime["base_url"], "api_key": ""},
                     keep_managed_alive=True,
                 )
-            safe_title = re.sub(
-                r"[^\wぁ-ゟ゠-ヿ一-鿿 .()\[\]-]+",
-                "_",
-                str(source.get("title") or "Light Novel"),
-            ).strip()[:120] or "Light Novel"
+            safe_title = (
+                re.sub(
+                    r"[^\wぁ-ゟ゠-ヿ一-鿿 .()\[\]-]+",
+                    "_",
+                    str(source.get("title") or "Light Novel"),
+                ).strip()[:120]
+                or "Light Novel"
+            )
             generated_root = self._audiobook_generation_root()
             requested_output = str(start_params.get("output_dir") or "").strip()
             if requested_output:
@@ -14229,8 +16363,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "speed": runtime["speed"],
                 "caption": runtime.get("caption", ""),
                 "character_voices": character_voices,
-                "voice_seed_policy": "deterministic-character-caption-v1" if runtime["provider"] == "irodori" else "",
-                "pronunciation_policy": "anilist-character-reading-v1" if runtime["provider"] == "irodori" else "",
+                "voice_seed_policy": "deterministic-character-caption-v1"
+                if runtime["provider"] == "irodori"
+                else "",
+                "pronunciation_policy": "anilist-character-reading-v1"
+                if runtime["provider"] == "irodori"
+                else "",
                 "llm_provider": getattr(self.config.llm, "provider", "ollama") if character_voices else "",
                 "llm_model": self.config.llm.model if character_voices else "",
             }
@@ -14272,7 +16410,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="running",
                 current=0,
                 total=total_characters,
-                message="Preparing audiobook generation",
+                message=t("web.preparingAudiobookGeneration"),
             )
             self._write_audiobook_generation_manifest(
                 output_dir,
@@ -14282,11 +16420,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "state": "running",
                     "current": 0,
                     "total": total_characters,
-                    "message": "Preparing audiobook generation",
+                    "message": t("web.preparingAudiobookGeneration"),
                     "error": "",
                 },
             )
-            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=3600.0, write=30.0, pool=5.0)) as client:
+            with httpx.Client(
+                timeout=httpx.Timeout(connect=5.0, read=3600.0, write=30.0, pool=5.0)
+            ) as client:
                 for index, (chapter, chapter_characters) in enumerate(zip(chapters, chapter_sizes), 1):
                     if self._audiobook_generation_stop_if_requested(
                         book_id=book_id,
@@ -14297,11 +16437,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         total=total_characters,
                     ):
                         return
-                    title = re.sub(r'[\\/:*?"<>|]+', "_", str(chapter.get("title") or f"Chapter {index}"))[:100]
+                    title = re.sub(r'[\\/:*?"<>|]+', "_", str(chapter.get("title") or f"Chapter {index}"))[
+                        :100
+                    ]
                     output = output_dir / f"{index:04d} - {title}.mp3"
                     if reuse_final_chapters and output.exists() and output.stat().st_size > 1024:
                         completed_characters += chapter_characters
-                        message = f"Reusing chapter {index}/{len(chapters)}"
+                        message = t("web.reusingChapter", index=index, total=len(chapters))
                         self.job_center.update(
                             job_id,
                             state="running",
@@ -14322,7 +16464,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             },
                         )
                         continue
-                    message = f"Generating chapter {index}/{len(chapters)}"
+                    message = t("web.generatingChapter", index=index, total=len(chapters))
                     self.job_center.update(
                         job_id,
                         state="running",
@@ -14360,11 +16502,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     if not text_parts:
                         completed_characters += chapter_characters
                         continue
-                    chapter_parts_dir = output_dir / ".pudge-audiobook-parts" / f"{index:04d}-{profile_signature[:10]}"
+                    chapter_parts_dir = (
+                        output_dir / ".pudge-audiobook-parts" / f"{index:04d}-{profile_signature[:10]}"
+                    )
                     chapter_parts_dir.mkdir(parents=True, exist_ok=True)
                     audio_parts: list[Path] = []
                     chapter_progress = 0
-                    for part_index, (part_text, part_characters, part_caption, speaker) in enumerate(text_parts, 1):
+                    for part_index, (part_text, part_characters, part_caption, speaker) in enumerate(
+                        text_parts, 1
+                    ):
                         if self._audiobook_generation_stop_if_requested(
                             book_id=book_id,
                             job_id=job_id,
@@ -14377,9 +16523,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         part_output = chapter_parts_dir / f"{part_index:04d}.mp3"
                         if not (part_output.exists() and part_output.stat().st_size > 1024):
                             message = (
-                                f"Generating chapter {index}/{len(chapters)} · {speaker}"
+                                t(
+                                    "web.generatingChapterSpeaker",
+                                    index=index,
+                                    total=len(chapters),
+                                    speaker=speaker,
+                                )
                                 if character_voices and speaker not in {"", "narrator", "unknown"}
-                                else f"Generating chapter {index}/{len(chapters)}"
+                                else t("web.generatingChapter", index=index, total=len(chapters))
                             )
                             self.job_center.update(
                                 job_id,
@@ -14407,9 +16558,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 seed=voice_seed,
                             )
                             if len(response.content) < 1024:
-                                raise RuntimeError(
-                                    f"Audiobook API returned an unexpectedly small audio response for chapter {index}"
-                                )
+                                raise RuntimeError(err("audiobook.smallAudioResponse", index=index))
                             output_dir.mkdir(parents=True, exist_ok=True)
                             chapter_parts_dir.mkdir(parents=True, exist_ok=True)
                             marker.touch(exist_ok=True)
@@ -14424,7 +16573,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             state="running",
                             current=current,
                             total=total_characters,
-                            message=f"Generating chapter {index}/{len(chapters)}",
+                            message=t("web.generatingChapter", index=index, total=len(chapters)),
                         )
                         self._write_audiobook_generation_manifest(
                             output_dir,
@@ -14434,7 +16583,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 "state": "running",
                                 "current": current,
                                 "total": total_characters,
-                                "message": f"Generating chapter {index}/{len(chapters)}",
+                                "message": t("web.generatingChapter", index=index, total=len(chapters)),
                                 "error": "",
                             },
                         )
@@ -14460,7 +16609,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         state="running",
                         current=completed_characters,
                         total=total_characters,
-                        message=f"Generated chapter {index}/{len(chapters)}",
+                        message=t("web.generatedChapter", index=index, total=len(chapters)),
                     )
                     self._write_audiobook_generation_manifest(
                         output_dir,
@@ -14470,7 +16619,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             "state": "running",
                             "current": completed_characters,
                             "total": total_characters,
-                            "message": f"Generated chapter {index}/{len(chapters)}",
+                            "message": t("web.generatedChapter", index=index, total=len(chapters)),
                             "error": "",
                         },
                     )
@@ -14485,7 +16634,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 return
             with self._irodori_tts_lock:
                 if self._audiobook_generation_controls.get(int(book_id)) == "cancel_requested":
-                    self.job_center.cancelled(job_id, message="Source removed")
+                    self.job_center.cancelled(job_id, message=t("web.sourceRemoved"))
                     shutil.rmtree(output_dir, ignore_errors=True)
                     return
                 self.light_novels.book(int(book_id))
@@ -14516,18 +16665,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "state": "succeeded",
                     "current": total_characters,
                     "total": total_characters,
-                    "message": "Audiobook generated",
+                    "message": t("web.audiobookGenerated"),
                     "error": "",
                     "audiobook_id": int(audiobook["id"]),
                 },
             )
             self.job_center.finish(
                 job_id,
-                message="Audiobook generated",
-                result={"book_id": int(book_id), "audiobook_id": int(audiobook["id"]), "output_dir": str(output_dir)},
+                message=t("web.audiobookGenerated"),
+                result={
+                    "book_id": int(book_id),
+                    "audiobook_id": int(audiobook["id"]),
+                    "output_dir": str(output_dir),
+                },
             )
         except Exception as exc:
-            self.logger.exception("FAIL step=audiobook_generation.generate book_id=%s error=%r", book_id, str(exc))
+            self.logger.exception(
+                "FAIL step=audiobook_generation.generate book_id=%s error=%r", book_id, str(exc)
+            )
             self.job_center.fail(job_id, exc)
             if output_dir is not None and output_dir.is_dir():
                 try:
@@ -14540,7 +16695,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             "state": "failed",
                             "current": completed_characters,
                             "total": total_characters,
-                            "message": "Audiobook generation failed",
+                            "message": t("web.audiobookGenerationFailed"),
                             "error": str(exc)[-2000:],
                             "output_dir": str(output_dir),
                         },
@@ -14574,11 +16729,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         paired = self.audiobooks.link_for_light_novel(book_id, include_alignment=False)
         paired_kind = self._audiobook_link_kind(book_id, paired)
         if paired_kind == "ordinary":
-            raise LightNovelError("This light novel already has a linked audiobook")
+            raise LightNovelError(err("audiobook.alreadyLinked"))
         if mode == "generate" and paired_kind == "generated":
-            raise LightNovelError("A generated audiobook already exists; use Regenerate audiobook")
+            raise LightNovelError(err("audiobook.generatedExists"))
         if mode == "regenerate" and paired_kind != "generated":
-            raise LightNovelError("Regenerate audiobook is only available for a generated audiobook")
+            raise LightNovelError(err("audiobook.regenerateOnlyGenerated"))
         with self._irodori_tts_lock:
             running = self._irodori_tts_threads.get(book_id)
             if running is not None and running.is_alive():
@@ -14592,13 +16747,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             source = self.light_novels.tts_source(book_id)
             chapters = list(source.get("chapters") or [])
             total_characters = sum(len(str(chapter.get("text") or "")) for chapter in chapters)
-            if mode == "generate" and output_dir is None and self._audiobook_generation_manifest(book_id) is not None:
-                raise LightNovelError("Audiobook generation is partially complete; use Resume generation")
-            safe_title = re.sub(
-                r"[^\wぁ-ゟ゠-ヿ一-鿿 .()\[\]-]+",
-                "_",
-                str(source.get("title") or "Light Novel"),
-            ).strip()[:120] or "Light Novel"
+            if (
+                mode == "generate"
+                and output_dir is None
+                and self._audiobook_generation_manifest(book_id) is not None
+            ):
+                raise LightNovelError(err("audiobook.partialUseResume"))
+            safe_title = (
+                re.sub(
+                    r"[^\wぁ-ゟ゠-ヿ一-鿿 .()\[\]-]+",
+                    "_",
+                    str(source.get("title") or "Light Novel"),
+                ).strip()[:120]
+                or "Light Novel"
+            )
             if output_dir is None:
                 if mode == "regenerate":
                     output_dir = self._audiobook_generation_root() / (
@@ -14608,7 +16770,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     output_dir = self._audiobook_generation_root() / f"{safe_title} [Generated {book_id}]"
             job_id = self.job_center.start(
                 "audiobook_generation",
-                f"{'Regenerate' if mode == 'regenerate' else 'Generate'} audiobook: {source.get('title') or book_id}",
+                t(
+                    "web.jobRegenerateAudiobook" if mode == "regenerate" else "web.jobGenerateAudiobook",
+                    title=source.get("title") or book_id,
+                ),
                 payload={"book_id": book_id, "provider": runtime["provider"], "mode": mode},
                 total=total_characters,
             )
@@ -14629,7 +16794,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "total": total_characters,
                     "output_dir": str(output_dir),
                     "old_audiobook_id": int(old_audiobook_id or 0),
-                    "message": "Queued",
+                    "message": t("web.queued"),
                     "error": "",
                 },
             )
@@ -14656,10 +16821,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         book_id = int(book_id)
         manifest = self._audiobook_generation_manifest(book_id)
         if manifest is None:
-            raise LightNovelError("No partial audiobook generation was found")
+            raise LightNovelError(err("audiobook.noPartialGeneration"))
         paired = self.audiobooks.link_for_light_novel(book_id, include_alignment=False)
         if self._audiobook_link_kind(book_id, paired) == "ordinary":
-            raise LightNovelError("This light novel already has a linked audiobook")
+            raise LightNovelError(err("audiobook.alreadyLinked"))
         return self._start_light_novel_tts(
             book_id,
             mode=str(manifest.get("mode") or "generate"),
@@ -14671,7 +16836,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         book_id = int(book_id)
         paired = self.audiobooks.link_for_light_novel(book_id, include_alignment=False)
         if self._audiobook_link_kind(book_id, paired) != "generated":
-            raise LightNovelError("Regenerate audiobook is only available for a generated audiobook")
+            raise LightNovelError(err("audiobook.regenerateOnlyGenerated"))
         old_id = int((paired or {}).get("book", {}).get("id") or 0)
         return self._start_light_novel_tts(
             book_id,
@@ -14694,7 +16859,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 state="running",
                 current=float(job.get("current") or 0.0),
                 total=float(job.get("total") or 0.0),
-                message="Pausing…",
+                message=t("web.pausing"),
             )
         return {"ok": True, "job": self._irodori_tts_status(book_id)}
 
@@ -14715,7 +16880,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         shutil.rmtree(output_dir, ignore_errors=True)
         manifest_job_id = str(manifest.get("job_id") or job_id)
         if manifest_job_id:
-            self.job_center.cancelled(manifest_job_id, message="Audiobook generation cancelled")
+            self.job_center.cancelled(manifest_job_id, message=t("web.audiobookGenerationCancelled"))
         return {"ok": True, "pending": False, "deleted": True, "job": self._irodori_tts_status(book_id)}
 
     def add_media_to_planning(self, media_id: int, media_kind: str = "anime") -> dict[str, Any]:
@@ -14724,9 +16889,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         mutation = """
         mutation($mediaId:Int!){SaveMediaListEntry(mediaId:$mediaId,status:PLANNING){status}}
         """
-        entry = self.light_novels._anilist_post(mutation, {"mediaId": int(media_id)}).get(
-            "SaveMediaListEntry"
-        ) or {}
+        entry = (
+            self.light_novels._anilist_post(mutation, {"mediaId": int(media_id)}).get("SaveMediaListEntry")
+            or {}
+        )
         return {
             "ok": True,
             "entry": entry,
@@ -14756,7 +16922,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             str(values.get("nyaa_url", cfg.base_url)).strip(),
             proxy_mode=str(values.get("proxy_mode", cfg.proxy_mode)).strip(),
             proxy_url=str(values.get("proxy_url", cfg.proxy_url)).strip(),
-            pre_search_command=str(values.get("search_hook", cfg.pre_search_command)).strip(),
+            pre_search_command=cfg.pre_search_command,
             category=cfg.category,
             timeout=20.0,
         )
@@ -14777,7 +16943,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             str(values.get("qbt_password", cfg.password)),
             str(values.get("qbt_api_key", cfg.api_key)).strip(),
             verify_tls=cfg.verify_tls,
-            pre_download_command=str(values.get("download_hook", cfg.pre_download_command)).strip(),
+            pre_download_command=cfg.pre_download_command,
             auto_start_app=cfg.auto_start_app,
         )
         try:
@@ -14793,7 +16959,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             enabled=True,
             binary=str(values.get("aria2_binary", cfg.binary)).strip() or "aria2c",
             rpc_port=max(1024, min(65535, int(values.get("aria2_rpc_port", cfg.rpc_port)))),
-            pre_download_command=str(values.get("download_hook", self.config.qbittorrent.pre_download_command)).strip(),
+            pre_download_command=self.config.qbittorrent.pre_download_command,
             auto_start=False,
             seed_mode=str(values.get("aria2_seed_mode", cfg.seed_mode)),
             seed_ratio=float(values.get("aria2_seed_ratio", cfg.seed_ratio)),
@@ -14804,7 +16970,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         try:
             version = client.version()
-            return {"ok": True, "version": version, "url": client.base_url, "backend": "aria2", "network_guard": client.network_guard_status()}
+            return {
+                "ok": True,
+                "version": version,
+                "url": client.base_url,
+                "backend": "aria2",
+                "network_guard": client.network_guard_status(),
+            }
         finally:
             client.close()
 
@@ -14820,11 +16992,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {}
         if not isinstance(payload, dict):
             return {}
-        return {
-            str(key): dict(value)
-            for key, value in payload.items()
-            if isinstance(value, dict)
-        }
+        return {str(key): dict(value) for key, value in payload.items() if isinstance(value, dict)}
 
     def _save_play_registry(self) -> None:
         path = self._play_registry_path
@@ -14937,7 +17105,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"status": "starting", "pid": pid, "age": age, "restored": True}
         self.logger.error(
             "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=True",
-            Path(key).name, pid, age * 1000.0, str(record.get("ack_file") or ""),
+            Path(key).name,
+            pid,
+            age * 1000.0,
+            str(record.get("ack_file") or ""),
         )
         try:
             os.kill(pid, 15)
@@ -14950,7 +17121,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "status": "failed",
             "exit_code": -1,
             "reason": "startup_timeout",
-            "error": "mpv did not report a successful start within 10 seconds.",
+            "error": err("web.mpvStartTimeout"),
             "age": age,
         }
 
@@ -14984,10 +17155,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     return {"status": "starting", "pid": process.pid, "age": age}
                 self.logger.error(
                     "EVENT play.startup_timeout video=%s launcher_pid=%s age_ms=%.1f ack=%s restored=False",
-                    Path(key).name, process.pid, age * 1000.0, str((record or {}).get("ack_file") or ""),
+                    Path(key).name,
+                    process.pid,
+                    age * 1000.0,
+                    str((record or {}).get("ack_file") or ""),
                 )
                 from .playback_process import stop_playback_process
                 from .process_cleanup import OwnedProcessTree
+
                 try:
                     tree = OwnedProcessTree(process.pid)
                 except OSError:
@@ -15006,12 +17181,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "status": "failed",
                     "exit_code": -1,
                     "reason": "startup_timeout",
-                    "error": "mpv did not report a successful start within 10 seconds.",
+                    "error": err("web.mpvStartTimeout"),
                     "age": age,
                 }
             self.logger.info(
                 "EVENT play.launcher_exit video=%s launcher_pid=%s exit_code=%s",
-                Path(key).name, process.pid, code,
+                Path(key).name,
+                process.pid,
+                code,
             )
             self._play_processes.pop(key, None)
             self._play_started_at.pop(key, None)
@@ -15032,15 +17209,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self._play_exit_codes.pop(key, None)
         return {"status": "idle"}
 
-    def _personal_schedule_draft(
-        self, anime: LibraryAnime
-    ) -> tuple[list[int], bool, Any | None, bool, str]:
+    def _personal_schedule_draft(self, anime: LibraryAnime) -> tuple[list[int], bool, Any | None, bool, str]:
         order, reason = self._personal_schedule_episode_order(anime)
         if not order:
             return [], False, None, False, reason
-        existing = self.manager.db.personal_release_schedule(
-            anime.media_id, advance_unlocks=False
-        )
+        existing = self.manager.db.personal_release_schedule(anime.media_id, advance_unlocks=False)
         if existing is not None and existing.enabled and existing.items:
             return (
                 [int(item.episode) for item in existing.items],
@@ -15058,11 +17231,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def personal_schedule_get(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found"}
+            return {"ok": False, "error": err("web.animeNotFound")}
         snapshot = self._personal_schedule_snapshot(anime)
-        schedule = self.manager.db.personal_release_schedule(
-            anime.media_id, advance_unlocks=False
-        )
+        schedule = self.manager.db.personal_release_schedule(anime.media_id, advance_unlocks=False)
         if schedule is not None and schedule.enabled:
             snapshot["preview"] = [
                 {
@@ -15093,16 +17264,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     ) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found"}
+            return {"ok": False, "error": err("web.animeNotFound")}
         episodes, rewatch, existing, new_cycle, reason = self._personal_schedule_draft(anime)
         if not episodes:
-            return {"ok": False, "error": reason or "Schedule has no episodes"}
+            return {"ok": False, "error": reason or err("web.scheduleEmpty")}
         actual_revision = int(existing.revision) if existing is not None else 0
         if expected_revision is not None and int(expected_revision) != actual_revision:
             return {
                 "ok": False,
                 "conflict": True,
-                "error": "Schedule changed in another window. Reload it before saving.",
+                "error": err("web.scheduleChanged"),
                 "revision": actual_revision,
                 "schedule": self._personal_schedule_snapshot(anime),
             }
@@ -15114,6 +17285,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 timezone_iana=str(timezone_iana),
                 rule=rule,
                 previous_items=(existing.items if existing is not None and existing.enabled else ()),
+                previous_rule=(existing.rule if existing is not None and existing.enabled else None),
+                now=time.time(),
             )
         except (ValueError, OverflowError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -15138,10 +17311,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     ) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found"}
+            return {"ok": False, "error": err("web.animeNotFound")}
         episodes, rewatch, existing, new_cycle, reason = self._personal_schedule_draft(anime)
         if not episodes:
-            return {"ok": False, "error": reason or "Schedule has no episodes"}
+            return {"ok": False, "error": reason or err("web.scheduleEmpty")}
         try:
             rule = normalize_schedule_rule(rule_unit, rule_every)
             schedule = self.manager.db.save_personal_release_schedule(
@@ -15159,7 +17332,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {
                 "ok": False,
                 "conflict": True,
-                "error": "Schedule changed in another window. Reload it before saving.",
+                "error": err("web.scheduleChanged"),
                 "expected_revision": exc.expected_revision,
                 "revision": exc.actual_revision,
                 "schedule": self._personal_schedule_snapshot(anime),
@@ -15167,12 +17340,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         except (ValueError, OverflowError) as exc:
             return {"ok": False, "error": str(exc)}
         self.logger.info(
-            "EVENT personal_schedule.saved media_id=%s revision=%s cycle=%s first_episode=%s items=%s timezone=%s rule=%sx%s clock=%s rewatch=%s",
+            "EVENT personal_schedule.saved media_id=%s revision=%s cycle=%s first_episode=%s items=%s start=%s timezone=%s rule=%sx%s clock=%s rewatch=%s",
             anime.media_id,
             schedule.revision,
             schedule.cycle_id,
             schedule.first_episode,
             len(schedule.items),
+            schedule.start_local_datetime,
             schedule.timezone_iana,
             schedule.rule.every,
             schedule.rule.unit,
@@ -15201,19 +17375,17 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not self.config.ui.notifications_enabled:
                 self.manager.db.set_state(key, "disabled")
                 continue
-            subtitle = "Серия по расписанию готова" if self.config.ui.language == "ru" else "Scheduled episode ready"
-            message = (
-                f"{anime.title} — серия {episode} готова к просмотру."
-                if self.config.ui.language == "ru"
-                else f"{anime.title} — episode {episode} is ready to watch."
-            )
+            subtitle = t("notify.scheduledEpisodeReady")
+            message = t("notify.scheduledEpisodeReadyMessage", title=anime.title, episode=episode)
             try:
                 ok = bool(send_native_notification(subtitle, message))
             except Exception as exc:
                 ok = False
                 self.logger.warning(
                     "EVENT personal_schedule.notification_failed media_id=%s episode=%s error=%r",
-                    anime.media_id, episode, exc,
+                    anime.media_id,
+                    episode,
+                    exc,
                 )
             if ok:
                 self.manager.db.set_state(key, "delivered")
@@ -15224,14 +17396,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 delivered.append({"media_id": anime.media_id, "episode": episode})
             self.logger.info(
                 "EVENT personal_schedule.notification media_id=%s episode=%s delivered=%s",
-                anime.media_id, episode, ok,
+                anime.media_id,
+                episode,
+                ok,
             )
         return {"ok": True, "delivered": delivered, "state": self._get_state(refresh_storage=False)}
 
     def personal_schedule_disable(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found"}
+            return {"ok": False, "error": err("web.animeNotFound")}
         changed = self.manager.db.disable_personal_release_schedule(anime.media_id)
         self.logger.info("EVENT personal_schedule.disabled media_id=%s changed=%s", anime.media_id, changed)
         return {"ok": True, "changed": changed, "state": self._get_state(refresh_storage=False)}
@@ -15251,7 +17425,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"allowed": True}
         item = next((row for row in schedule.items if row.episode == int(display_episode)), None)
         if item is None or item.watched_at is not None:
-            return {"allowed": True, "scheduled": item is not None, "media_id": anime.media_id, "episode": int(display_episode), "rewatch": schedule.rewatch}
+            return {
+                "allowed": True,
+                "scheduled": item is not None,
+                "media_id": anime.media_id,
+                "episode": int(display_episode),
+                "rewatch": schedule.rewatch,
+            }
         next_item = next((row for row in schedule.items if row.watched_at is None), None)
         if next_item is None:
             return {"allowed": True}
@@ -15291,11 +17471,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         key = self._play_key(video_path)
         path = Path(key)
         if not path.is_file():
-            raise FileNotFoundError(ui_text(self.config.ui.language, f"Video not found: {path}", f"Видео не найдено: {path}"))
+            raise FileNotFoundError(err("library.videoNotFound", path=path))
 
         with self._play_lock:
             if getattr(self, "_closing", False):
-                raise RuntimeError("Pudge is shutting down")
+                raise RuntimeError(err("web.shuttingDown"))
             state = self._play_state_locked(key)
             if state["status"] in {"starting", "running"}:
                 return {"ok": True, "duplicate": True, **state}
@@ -15303,15 +17483,34 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not schedule_admission.get("allowed", True):
                 self.logger.info(
                     "EVENT personal_schedule.block_play media_id=%s episode=%s reason=%s next_episode=%s unlock_at=%s",
-                    schedule_admission.get("media_id"), schedule_admission.get("episode"),
-                    schedule_admission.get("reason"), schedule_admission.get("next_episode"),
+                    schedule_admission.get("media_id"),
+                    schedule_admission.get("episode"),
+                    schedule_admission.get("reason"),
+                    schedule_admission.get("next_episode"),
                     schedule_admission.get("unlock_at"),
                 )
-                return {"ok": False, "personal_schedule_locked": True, "status": "schedule_locked", "personal_schedule": schedule_admission}
+                return {
+                    "ok": False,
+                    "personal_schedule_locked": True,
+                    "status": "schedule_locked",
+                    "personal_schedule": schedule_admission,
+                }
             self._ensure_review_gate_runtime()
             with self._review_gate_lock:
                 gate = self._review_gate_local_status(key)
-            if gate.get("blocking"):
+            unavailable_at = self._review_gate_unavailable.pop(key, None)
+            if (
+                gate.get("blocking")
+                and unavailable_at is not None
+                and time.monotonic() - unavailable_at <= 300
+            ):
+                # review_gate_begin() could not issue a review just now: play without it.
+                self.logger.info(
+                    "EVENT review_gate.play_without_review media_id=%s episode=%s reason=review_unavailable",
+                    gate.get("media_id"),
+                    gate.get("episode"),
+                )
+            elif gate.get("blocking"):
                 self.logger.info(
                     "EVENT review_gate.block_play media_id=%s episode=%s completed=%s required=%s",
                     gate.get("media_id"),
@@ -15341,10 +17540,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     episode is not None
                     and episode.state == "waiting_text_subtitles"
                     and episode.embedded_subtitle_id is not None
-                    and (
-                        episode.subtitle_path is None
-                        or not episode.subtitle_path.is_file()
-                    )
+                    and (episode.subtitle_path is None or not episode.subtitle_path.is_file())
                 )
                 explicit_raw_unsynced = bool(
                     episode is not None
@@ -15378,9 +17574,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         # still sees the old state and omits --sub even though the
                         # recovered subtitle is already persisted in SQLite.
                         refreshed_episode = (
-                            self.manager.db.episode_by_path(path)
-                            if selection.recovered
-                            else None
+                            self.manager.db.episode_by_path(path) if selection.recovered else None
                         )
                         if refreshed_episode is not None:
                             episode = refreshed_episode
@@ -15392,7 +17586,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             # recovers a trusted selection.
                             episode.subtitle_path = selection.external_path
                             episode.embedded_subtitle_id = (
-                                None if selection.external_path is not None
+                                None
+                                if selection.external_path is not None
                                 else selection.embedded_subtitle_id
                             )
                             episode.subtitle_origin = selection.source or episode.subtitle_origin
@@ -15405,17 +17600,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 bool(selection.external_path),
                                 selection.embedded_subtitle_id,
                             )
-                    if (
-                        explicit_library_embedded_sid is not None
-                        and (
-                            episode.subtitle_path is None
-                            or not episode.subtitle_path.is_file()
-                        )
+                    if explicit_library_embedded_sid is not None and (
+                        episode.subtitle_path is None or not episode.subtitle_path.is_file()
                     ):
                         episode.embedded_subtitle_id = explicit_library_embedded_sid
                     usable_external = bool(
-                        episode.subtitle_path is not None
-                        and episode.subtitle_path.is_file()
+                        episode.subtitle_path is not None and episode.subtitle_path.is_file()
                     )
                     if (
                         usable_external
@@ -15430,21 +17620,20 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         if guard.get("status") == "rejected":
                             self.logger.warning(
                                 "REJECT step=play.subtitle_guard video=%s subtitle=%s reason=%s diagnostics=%s",
-                                path.name, episode.subtitle_path.name, guard.get("reason"), guard.get("diagnostics"),
+                                path.name,
+                                episode.subtitle_path.name,
+                                guard.get("reason"),
+                                guard.get("diagnostics"),
                             )
                             usable_external = False
                     usable_embedded = episode.embedded_subtitle_id is not None
-                    if (
-                        episode.state == "ready"
-                        and not usable_external
-                        and not usable_embedded
-                    ):
+                    if episode.state == "ready" and not usable_external and not usable_embedded:
                         # The DB can outlive cache cleanup.  A stale Ready row must
                         # not launch mpv without subtitles; invalidate it, enqueue a
                         # fresh resolver job and tell the UI that preparation resumed.
                         series_result = self.manager.revalidate_subtitle_series(
                             episode.media_id,
-                            reason="Prepared subtitle cache file is missing",
+                            reason=err("jobs.subtitleCacheMissing"),
                             priority=260,
                         )
                         if episode.media_id is None:
@@ -15453,19 +17642,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 path,
                                 episode.media_id,
                                 episode.episode,
-                                error="Prepared subtitle cache file is missing",
+                                error=err("jobs.subtitleCacheMissing"),
                                 priority=260,
                             )
                         self.logger.warning(
                             "REPAIR step=play.subtitle_missing_requeue video=%s "
                             "media_id=%s episode=%s stale_path=%r series=%s",
-                            path.name, episode.media_id, episode.episode,
+                            path.name,
+                            episode.media_id,
+                            episode.episode,
                             str(episode.subtitle_path or ""),
                             series_result,
                         )
-                        raise RuntimeError(
-                            "Prepared subtitles are missing; Pudge queued them for repair."
-                        )
+                        raise RuntimeError(err("web.preparedSubtitlesMissing"))
                 command = [
                     python_executable(),
                     "-m",
@@ -15478,14 +17667,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     if resume and episode.playback_position is not None:
                         recently_closed = bool(
                             episode.playback_updated_at is not None
-                            and 0.0
-                            <= time.time() - float(episode.playback_updated_at)
-                            < 120.0
+                            and 0.0 <= time.time() - float(episode.playback_updated_at) < 120.0
                         )
                         rewind_seconds = (
-                            0.0
-                            if recently_closed
-                            else float(self.config.playback.rewind_seconds)
+                            0.0 if recently_closed else float(self.config.playback.rewind_seconds)
                         )
                         start_at = max(
                             0.0,
@@ -15514,29 +17699,24 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         # The user explicitly requested the original source.
                         # Fast-play + --no-sync prevents any transformation.
                         command.extend(["--sub", str(episode.subtitle_path)])
-                    elif (
-                        episode.embedded_subtitle_id is not None
-                        and (
-                            episode.state in {"ready", "watched"}
-                            or (
-                                allow_image_subtitles
-                                and episode.state == "waiting_text_subtitles"
-                            )
-                        )
+                    elif episode.embedded_subtitle_id is not None and (
+                        episode.state in {"ready", "watched"}
+                        or (allow_image_subtitles and episode.state == "waiting_text_subtitles")
                     ):
-                        command.extend(
-                            ["--embedded-sid", str(episode.embedded_subtitle_id)]
-                        )
+                        command.extend(["--embedded-sid", str(episode.embedded_subtitle_id)])
                     if (
                         explicit_library_embedded_sid is not None
                         and "--sub" not in command
                         and "--embedded-sid" not in command
                     ):
-                        command.extend(
-                            ["--embedded-sid", str(explicit_library_embedded_sid)]
-                        )
+                        command.extend(["--embedded-sid", str(explicit_library_embedded_sid)])
                     if episode.episode is not None:
                         command.extend(["--episode-hint", str(episode.episode)])
+                        if episode.media_episode_end is not None:
+                            # Two episodes in one file: AniList counts each (audit 17А).
+                            command.extend(["--episode-end-hint", str(episode.media_episode_end)])
+                            if episode.part_boundary:
+                                command.extend(["--part-boundary", f"{float(episode.part_boundary):.3f}"])
                     if episode.media_id is not None:
                         anime = self.manager.db.get_anime(episode.media_id)
                         if anime is not None:
@@ -15553,9 +17733,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 ]
                             )
                             if anime.episodes is not None:
-                                command.extend(
-                                    ["--media-episodes", str(anime.episodes)]
-                                )
+                                command.extend(["--media-episodes", str(anime.episodes)])
                             if anime.format:
                                 command.extend(["--media-format", anime.format])
                 command.append(key)
@@ -15576,19 +17754,28 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 self.manager.remember_ready_before_playback(path)
                 ack_dir = self.config.paths.cache_dir / "playback-start"
                 ack_dir.mkdir(parents=True, exist_ok=True)
-                ack_path = ack_dir / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()[:20]}-{time.time_ns()}.json"
+                ack_path = (
+                    ack_dir / f"{hashlib.sha256(key.encode('utf-8')).hexdigest()[:20]}-{time.time_ns()}.json"
+                )
                 from .runtime import worker_environment
-                env = worker_environment({"PUDGE_MPV_START_ACK": str(ack_path), "PUDGE_ASSISTANT_URL": getattr(self, "asset_base", "") + "/api/mpv/explain", "PUDGE_ASSISTANT_TOKEN": getattr(self, "_http_session_token", "")})
+
+                env = worker_environment(
+                    {
+                        "PUDGE_MPV_START_ACK": str(ack_path),
+                        "PUDGE_ASSISTANT_URL": getattr(self, "asset_base", "") + "/api/mpv/explain",
+                        "PUDGE_ASSISTANT_TOKEN": getattr(self, "_http_session_token", ""),
+                    }
+                )
                 with getattr(self, "_close_lock", threading.RLock()):
                     if getattr(self, "_closing", False):
-                        raise RuntimeError("Pudge is shutting down")
+                        raise RuntimeError(err("web.shuttingDown"))
                     process = subprocess.Popen(
                         command,
                         start_new_session=True,
                         env=env,
                     )
             except OSError as exc:
-                raise RuntimeError(ui_text(self.config.ui.language, f"Could not start {APP_NAME}: {exc}", f"Не удалось запустить {APP_NAME}: {exc}")) from exc
+                raise RuntimeError(err("web.startFailed", app=APP_NAME, error=exc)) from exc
             self._play_processes[key] = process
             self._play_started_at[key] = time.time()
             self._play_registry[key] = {
@@ -15598,7 +17785,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             }
             self.logger.info(
                 "EVENT play.launcher_spawned video=%s launcher_pid=%s ack=%s",
-                path.name, process.pid, ack_path,
+                path.name,
+                process.pid,
+                ack_path,
             )
             self._save_play_registry()
             self._play_exit_codes.pop(key, None)
@@ -15609,8 +17798,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     "episode": int(schedule_admission["episode"]),
                     "rewatch": bool(schedule_admission.get("rewatch")),
                     "started_at": time.time(),
-                    "baseline_watched_at": float(scheduled_episode.watched_at or 0.0) if scheduled_episode is not None else 0.0,
-                    "baseline_playback_updated_at": float(scheduled_episode.playback_updated_at or 0.0) if scheduled_episode is not None else 0.0,
+                    "baseline_watched_at": float(scheduled_episode.watched_at or 0.0)
+                    if scheduled_episode is not None
+                    else 0.0,
+                    "baseline_playback_updated_at": float(scheduled_episode.playback_updated_at or 0.0)
+                    if scheduled_episode is not None
+                    else 0.0,
                 }
             return {"ok": True, "duplicate": False, "status": "starting", "pid": process.pid}
 
@@ -15640,18 +17833,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     result["site_url"] = anime.site_url
                     result["user_score"] = anime.user_score
                     numbered_final = bool(
-                        episode.media_episode is not None
+                        episode.last_episode is not None
                         and anime.episodes is not None
-                        and int(episode.media_episode) == int(anime.episodes)
+                        and int(episode.last_episode) == int(anime.episodes)
                         and anime.progress >= anime.episodes
                     )
                     single_entry_final = bool(
                         episode.episode is None
                         and anime.status in {"COMPLETED", "REPEATING"}
-                        and (
-                            anime.episodes == 1
-                            or str(anime.format or "").strip().upper() == "MOVIE"
-                        )
+                        and (anime.episodes == 1 or str(anime.format or "").strip().upper() == "MOVIE")
                     )
                     result["final_episode"] = numbered_final or single_entry_final
                     rating_episode = (
@@ -15673,10 +17863,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             duration = float(episode.playback_duration or 0.0)
             threshold = max(0.0, min(1.0, float(self.config.anilist.watched_threshold)))
             remaining_limit = max(0.0, float(self.config.anilist.watched_max_remaining_minutes)) * 60.0
-            fresh_progress = playback_updated > max(started_at, float(session.get("baseline_playback_updated_at") or 0.0))
+            fresh_progress = playback_updated > max(
+                started_at, float(session.get("baseline_playback_updated_at") or 0.0)
+            )
             watched_evidence = watched_at > max(started_at, float(session.get("baseline_watched_at") or 0.0))
             threshold_evidence = bool(
-                fresh_progress and duration > 0 and (position / duration >= threshold or duration - position <= remaining_limit)
+                fresh_progress
+                and duration > 0
+                and (position / duration >= threshold or duration - position <= remaining_limit)
             )
             if watched_evidence or threshold_evidence:
                 marked = self.manager.db.mark_personal_release_watched(
@@ -15685,8 +17879,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if marked:
                     self.logger.info(
                         "EVENT personal_schedule.watched media_id=%s episode=%s evidence=%s position=%.1f duration=%.1f",
-                        session["media_id"], session["episode"],
-                        "anilist" if watched_evidence else "playback_threshold", position, duration,
+                        session["media_id"],
+                        session["episode"],
+                        "anilist" if watched_evidence else "playback_threshold",
+                        position,
+                        duration,
                     )
                 self._schedule_play_sessions.pop(key, None)
                 result["personal_schedule_watched"] = True
@@ -15707,13 +17904,25 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         """Open Finder and select a text/image subtitle or its video container."""
         source_path = Path(str(path)).expanduser()
         if not source_path.is_file():
-            return {"ok": False, "error": "Subtitle source does not exist"}
+            return {"ok": False, "error": err("web.subtitleSourceMissing")}
         allowed = {
-            ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".pgs",
-            ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".webm",
+            ".srt",
+            ".ass",
+            ".ssa",
+            ".vtt",
+            ".sub",
+            ".idx",
+            ".sup",
+            ".pgs",
+            ".mkv",
+            ".mp4",
+            ".m4v",
+            ".mov",
+            ".avi",
+            ".webm",
         }
         if source_path.suffix.casefold() not in allowed:
-            return {"ok": False, "error": "Unsupported subtitle source"}
+            return {"ok": False, "error": err("web.subtitleSourceUnsupported")}
         subprocess.Popen(["open", "-R", str(source_path.resolve())])
         return {"ok": True, "path": str(source_path.resolve())}
 
@@ -15723,14 +17932,53 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             "lines": tail_log(limit=max(20, min(int(limit), 1000))),
         }
 
+    def diagnostics_text(self, log_lines: int = 200) -> str:
+        """A plain-text report to paste into a bug report: build, system, power, recent log (secrets redacted)."""
+        from .config import CONFIG_WARNINGS
+
+        _redact = DebugBundleBuilder._sanitize_text
+        identity = build_identity()
+        try:
+            power = self.manager.work_scheduler.power_snapshot()
+        except Exception:  # noqa: BLE001 - the report is best effort
+            power = {}
+        rows = [
+            f"Pudge {identity.get('display') or __version__}",
+            f"System: {platform.platform()} · Python {platform.python_version()}",
+            f"Data: {DATA_DIR}",
+            f"Log: {DEFAULT_LOG_PATH}",
+            f"Torrent backend: {self.manager.torrent_backend_name()} · traffic {'on' if self._torrent_enabled_state() else 'off'}",
+            f"Power: {power.get('mode', '?')} · battery {power.get('on_battery', '?')} · thermal {power.get('thermal_limited', '?')}",
+            f"Safe mode: {bool((self.safe_mode.status(run_checks=False) or {}).get('active'))}",
+        ]
+        if CONFIG_WARNINGS:
+            rows.append("Config warnings:")
+            rows.extend(f"  {message}" for message in CONFIG_WARNINGS)
+        rows.append("")
+        rows.append(f"Last {int(log_lines)} log lines:")
+        rows.extend(_redact(line) for line in tail_log(limit=max(20, min(int(log_lines), 1000))))
+        return "\n".join(rows)
+
+    def copy_diagnostics(self) -> dict[str, Any]:
+        """Diagnostics for a bug report, put on the clipboard (the text is also returned)."""
+        text = self.diagnostics_text()
+        copied = False
+        if sys.platform == "darwin":
+            try:
+                copied = (
+                    subprocess.run(["pbcopy"], input=text, text=True, timeout=5, check=False).returncode == 0
+                )
+            except (OSError, subprocess.SubprocessError):
+                copied = False
+        self.logger.info("EVENT diagnostics.copied characters=%s clipboard=%s", len(text), copied)
+        return {"ok": True, "copied": copied, "text": text}
+
     def open_log_folder(self) -> dict[str, Any]:
         DEFAULT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(["open", str(DEFAULT_LOG_PATH.parent)])
         return {"ok": True, "path": str(DEFAULT_LOG_PATH)}
 
-    def export_runtime_debug_bundle(
-        self, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
+    def export_runtime_debug_bundle(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         output_dir = debug_log_dir()
         frontend = dict(payload) if isinstance(payload, dict) else {}
         target = self.diagnostics_controller.export(
@@ -15770,7 +18018,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
 
             application = NSApplication.sharedApplication()
             native_window = application.keyWindow() or application.mainWindow()
-            if native_window is not None and int(native_window.styleMask()) & int(NSWindowStyleMaskFullScreen):
+            if native_window is not None and int(native_window.styleMask()) & int(
+                NSWindowStyleMaskFullScreen
+            ):
                 native_window.toggleFullScreen_(None)
         except Exception:
             self.logger.exception("FAIL step=app.exit_fullscreen.main_thread")
@@ -15842,20 +18092,15 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.logger.exception("FAIL step=app.exit_fullscreen.schedule")
             return {"ok": False, "exited": False}
 
-
     def test_notification(self) -> dict[str, Any]:
         permission = request_notification_permission(timeout=4.0)
-        language = self.config.ui.language
-        subtitle = "Проверка уведомлений" if language == "ru" else "Notification test"
-        message = (
-            f"Уведомления {APP_NAME} работают."
-            if language == "ru"
-            else f"{APP_NAME} notifications are working."
-        )
+        subtitle = t("notify.test")
+        message = t("notify.testMessage", app=APP_NAME)
         delivered = bool(permission.get("granted")) and send_native_notification(subtitle, message)
         self.logger.info(
             "EVENT notification.test granted=%s delivered=%s",
-            permission.get("granted"), delivered,
+            permission.get("granted"),
+            delivered,
         )
         return {"ok": delivered, "delivered": delivered, "permission": permission}
 
@@ -15911,19 +18156,29 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 "ui",
                 safe_event,
                 media_id=(
-                    int(safe_payload["media_id"])
-                    if safe_payload.get("media_id") is not None
-                    else None
+                    int(safe_payload["media_id"]) if safe_payload.get("media_id") is not None else None
                 ),
                 media_episode=(
-                    int(safe_payload["episode"])
-                    if safe_payload.get("episode") is not None
-                    else None
+                    int(safe_payload["episode"]) if safe_payload.get("episode") is not None else None
                 ),
                 payload=safe_payload,
             )
         except (OSError, TypeError, ValueError):
             self.logger.warning("FALLBACK step=diagnostics.ui_event event=%s", safe_event)
+        return {"ok": True}
+
+    def log_ui_error(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """An unhandled error in the window (it was also shown as a toast)."""
+        data = dict(payload or {})
+        self.logger.warning(
+            "FAIL ui.js_error kind=%s message=%r source=%s line=%s column=%s stack=%r",
+            str(data.get("kind") or "error")[:20],
+            str(data.get("message") or "")[:300],
+            str(data.get("source") or "")[-160:],
+            int(data.get("line") or 0) if str(data.get("line") or "0").isdigit() else 0,
+            int(data.get("column") or 0) if str(data.get("column") or "0").isdigit() else 0,
+            str(data.get("stack") or "")[:2000],
+        )
         return {"ok": True}
 
     def safe_mode_status(self) -> dict[str, Any]:
@@ -15939,6 +18194,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         self._ensure_energy_monitor(reason="safe_mode_resumed")
         self._start_scheduled_agent()
+        self._start_daily_snapshots()
         self.logger.info("EVENT app.safe_mode_resumed")
         return {
             "ok": True,
@@ -15949,16 +18205,13 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def reveal_safe_mode_backup(self) -> dict[str, Any]:
         backup = self.safe_mode.latest_backup()
         if backup is None:
-            return {"ok": False, "error": "No migration backup is available"}
+            return {"ok": False, "error": err("backup.noMigrationBackup")}
         if sys.platform == "darwin":
             subprocess.Popen(["open", "-R", str(backup)])
         return {"ok": True, "path": str(backup)}
 
     def get_relation_graph_cache(self) -> dict[str, Any]:
-        media_ids = [
-            int(item.media_id)
-            for item in self.manager.db.anime_list(("CURRENT", "PLANNING"))
-        ]
+        media_ids = [int(item.media_id) for item in self.manager.db.anime_list(("CURRENT", "PLANNING"))]
         return self.manager.cached_relation_graphs(media_ids)
 
     def get_relation_graph(self, media_id: int) -> dict[str, Any]:
@@ -15968,7 +18221,16 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         return self.manager.relation_graph(int(media_id), force_refresh=True)
 
     def open_url(self, url: str) -> dict[str, Any]:
-        webbrowser.open(str(url))
+        # URLs come from AniList/Jiten metadata: never hand file:, javascript:,
+        # custom app schemes or local paths to the system opener.
+        from urllib.parse import urlparse
+
+        value = str(url or "").strip()
+        parsed = urlparse(value)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+            self.logger.warning("Refused to open a non-web URL scheme=%s", parsed.scheme[:20])
+            return {"ok": False, "message": err("web.onlyWebLinks")}
+        webbrowser.open(value)
         return {"ok": True}
 
     _UI_PREFERENCE_KEYS = ("pudge.assistant.v1", "pudge.assistant.geometry.v1", "pudge.readTogether.v1")
@@ -16028,9 +18290,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         }
 
     def anime_debug_snapshot(self, media_id: int, episode: int | None = None) -> dict[str, Any]:
-        return DebugSnapshotService(self.manager, cache_dir=self.config.paths.cache_dir, runtime_log_path=DEFAULT_LOG_PATH).snapshot(
-            int(media_id), None if episode is None else int(episode)
-        )
+        return DebugSnapshotService(
+            self.manager, cache_dir=self.config.paths.cache_dir, runtime_log_path=DEFAULT_LOG_PATH
+        ).snapshot(int(media_id), None if episode is None else int(episode))
 
     def debug_reselect_subtitles(self, video_path: str) -> dict[str, Any]:
         video = Path(str(video_path)).expanduser().resolve()
@@ -16133,8 +18395,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             else ""
         )
         target = downloads / f"pudge-debug-{int(media_id)}{episode_part}-{int(time.time())}.json"
+        # The same redaction as the runtime debug bundle (keys and text).
         target.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
+            json.dumps(DebugBundleBuilder._redact(payload), ensure_ascii=False, indent=2, default=str),
             encoding="utf-8",
         )
         subprocess.run(["open", "-R", str(target)], check=False)
@@ -16144,7 +18407,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         video = Path(str(video_path)).expanduser().resolve()
         item = self.manager.db.episode_by_path(video)
         if item is None:
-            raise RuntimeError("Episode is not present in the local library")
+            raise RuntimeError(err("manager.episodeNotInLibrary"))
 
         # A retry must never destroy the last known-good subtitle before the new
         # attempt succeeds. Recover a valid prepared history path first when an
@@ -16181,7 +18444,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             self.manager.db.clear_subtitle_selection(video)
 
         self.manager.db.queue_subtitle_job(
-            video, item.media_id, item.episode, priority=220, error="Manual retry"
+            video, item.media_id, item.episode, priority=220, error=err("jobs.manualRetry")
         )
         prepared = 0
         acquired_now = False
@@ -16190,6 +18453,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if acquired_now:
                 prepared = self.manager.process_subtitle_jobs(limit=1, preferred_paths=[video])
         if not acquired_now:
+
             def worker() -> None:
                 try:
                     with maintenance_lock(self.config.paths.cache_dir, blocking=True) as acquired:
@@ -16198,8 +18462,10 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 except Exception as exc:
                     self.logger.exception(
                         "FAIL step=subtitle.manual_retry_background video=%r error=%r",
-                        str(video), str(exc),
+                        str(video),
+                        str(exc),
                     )
+
             self.task_supervisor.start(
                 name=f"{APP_SLUG}-manual-subtitle-retry",
                 target=worker,
@@ -16219,13 +18485,14 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         video = Path(str(video_path)).expanduser()
         try:
             import webview
+
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 directory=str(Path.home() / "Downloads"),
                 allow_multiple=False,
                 file_types=(
-                    "Subtitles (*.srt;*.ass;*.ssa;*.vtt;*.sup;*.pgs)",
-                    "All files (*.*)",
+                    f"{t('web.fileTypeSubtitles')} (*.srt;*.ass;*.ssa;*.vtt;*.sup;*.pgs)",
+                    f"{t('web.fileTypeAll')} (*.*)",
                 ),
             )
             if not result:
@@ -16307,13 +18574,19 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if path in seen_paths:
                     continue
                 seen_paths.add(path)
-                ep_label = "Movie" if episode.episode is None else f"Episode {episode.episode}"
-                items.append({
-                    "media_id": episode.media_id,
-                    "episode": episode.episode,
-                    "video_path": path,
-                    "title": f"{anime.title if anime else episode.title} — {ep_label}",
-                })
+                ep_label = (
+                    t("label.movie")
+                    if episode.episode is None
+                    else t("web.episodeLabel", episode=episode.episode)
+                )
+                items.append(
+                    {
+                        "media_id": episode.media_id,
+                        "episode": episode.episode,
+                        "video_path": path,
+                        "title": f"{anime.title if anime else episode.title} — {ep_label}",
+                    }
+                )
                 if limit is not None and len(items) >= max(1, int(limit)):
                     return items
         return items
@@ -16321,12 +18594,12 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def create_next_episodes_queue(self, media_id: int, count: int = 5) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.animeNotFound"), "state": self.get_state_fast()}
         if anime.media_status == "NOT_YET_RELEASED":
-            return {"ok": False, "error": "Anime has not aired yet", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.animeNotAired"), "state": self.get_state_fast()}
         items = self._ready_queue_items([anime.media_id], limit=max(1, min(50, int(count))))
         if not items:
-            return {"ok": False, "error": "No ready unwatched episodes", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.noReadyEpisodes"), "state": self.get_state_fast()}
         queue_id = self.manager.db.create_playlist(
             name=f"{anime.title} — next {len(items)}",
             kind="next_episodes",
@@ -16338,9 +18611,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
     def create_franchise_queue(self, media_id: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            return {"ok": False, "error": "Anime not found", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.animeNotFound"), "state": self.get_state_fast()}
         if anime.media_status == "NOT_YET_RELEASED":
-            return {"ok": False, "error": "Anime has not aired yet", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.animeNotAired"), "state": self.get_state_fast()}
         graph = self.manager.relation_graph(int(media_id), force_refresh=False)
         nodes = graph.get("nodes", []) if isinstance(graph, dict) else []
         ordered_ids: list[int] = []
@@ -16361,7 +18634,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             ordered_ids.append(anime.media_id)
         items = self._ready_queue_items(ordered_ids)
         if not items:
-            return {"ok": False, "error": "No ready unwatched franchise episodes", "state": self.get_state_fast()}
+            return {"ok": False, "error": err("web.noReadyFranchiseEpisodes"), "state": self.get_state_fast()}
         queue_id = self.manager.db.create_playlist(
             name=f"{anime.title} — watch order",
             kind="franchise",
@@ -16413,14 +18686,63 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             output=output,
             version=__version__,
         )
-        self.logger.info("DONE step=backup.create path=%r cached_files=%s", result["path"], result["cached_files"])
+        self.logger.info(
+            "DONE step=backup.create path=%r cached_files=%s", result["path"], result["cached_files"]
+        )
         return {"ok": True, **result}
+
+    def _start_daily_snapshots(self) -> None:
+        self.task_supervisor.start(
+            name="database-daily-snapshot",
+            target=self._daily_snapshot_loop,
+            pass_cancel_event=True,
+            replace=True,
+        )
+
+    def _daily_snapshot_loop(self, cancel_event: threading.Event) -> None:
+        # A copy of the library a day (7 kept), made after start-up has settled;
+        # checked hourly because the app can stay open for days.
+        if cancel_event.wait(120.0):
+            return
+        while not cancel_event.is_set():
+            self._make_daily_snapshot()
+            if cancel_event.wait(3600.0):
+                return
+
+    def _make_daily_snapshot(self) -> Path | None:
+        database_path = Path(self.config.library.database_path).expanduser()
+        started = time.monotonic()
+        try:
+            made = make_daily_snapshot(database_path)
+        except Exception as exc:  # noqa: BLE001 - a missed copy never disturbs the app
+            self.logger.warning("FAIL step=backup.daily_snapshot error=%r", str(exc)[:300])
+            return None
+        if made is not None:
+            self.logger.info(
+                "DONE step=backup.daily_snapshot path=%s size_mb=%.1f duration_ms=%.0f",
+                made,
+                made.stat().st_size / (1024 * 1024),
+                (time.monotonic() - started) * 1000,
+            )
+        return made
+
+    def _restore_playback_blockers(self) -> list[str]:
+        """Players whose mpv helpers write the library (playback saves, AniList count)."""
+        if getattr(self, "_play_lock", None) is None:
+            return []
+        try:
+            return sorted(
+                Path(str(item.get("video_path") or "")).name for item in self._active_playbacks_payload()
+            )
+        except Exception:  # noqa: BLE001 - an unreadable registry is not a running player
+            return []
 
     def restore_full_backup(self) -> dict[str, Any]:
         if self.window is None:
             return {"ok": False, "cancelled": True}
         try:
             import webview
+
             result = self.window.create_file_dialog(
                 webview.OPEN_DIALOG,
                 directory=str(Path.home() / "Downloads"),
@@ -16430,108 +18752,143 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             if not result:
                 return {"ok": False, "cancelled": True}
             selected = Path(str(result[0] if isinstance(result, (list, tuple)) else result))
-
-            with self._restore_lock:
-                blockers = self._restore_background_blockers()
-                if blockers:
-                    return {
-                        "ok": False,
-                        "busy": True,
-                        "error": "Background work is still active",
-                        "workers": blockers,
-                    }
-                with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
-                    if not acquired:
-                        return {
-                            "ok": False,
-                            "busy": True,
-                            "error": "Maintenance is active; retry restore after it finishes",
-                        }
-
-                    self._stop_scheduled_agent()
-                    supervisor = self.task_supervisor
-                    supervisor_lingering = supervisor.quiesce(timeout=5.0)
-                    if supervisor_lingering:
-                        supervisor.resume()
-                        self._start_scheduled_agent()
-                        return {
-                            "ok": False,
-                            "busy": True,
-                            "error": "Background tasks did not quiesce",
-                            "workers": supervisor_lingering,
-                        }
-
-                    manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
-                    if manga_lingering:
-                        supervisor.resume()
-                        self._start_scheduled_agent()
-                        return {
-                            "ok": False,
-                            "busy": True,
-                            "error": "Manga OCR is still stopping",
-                            "workers": manga_lingering,
-                        }
-
-                    needs_rebind = False
-                    self._restoring = True
-                    try:
-                        # Stop HTTP admission and join every accepted request
-                        # before removing WAL/SHM or closing its dependencies.
-                        self._stop_companion_server()
-                        needs_rebind = True
-                        self.companion_streaming.close()
-                        close_ln = getattr(self.light_novels, "close", None)
-                        if callable(close_ln):
-                            close_ln(timeout=5.0)
-                        audiobook_lingering = self.audiobooks.close(timeout=5.0)
-                        if audiobook_lingering:
-                            return {
-                                "ok": False,
-                                "busy": True,
-                                "error": "Audiobook workers did not stop",
-                                "workers": audiobook_lingering,
-                            }
-                        # Direct pywebview calls are outside HTTP request tracking.
-                        # Retire the shared repository to drain their transactions
-                        # and keep late calls from reopening the replaced database.
-                        self.manager.db.retire(timeout=5.0)
-                        restored = restore_backup(
-                            archive_path=selected,
-                            config_path=self.config_path,
-                            database_path=self.config.library.database_path,
-                            cache_dir=self.config.paths.cache_dir,
-                            post_commit=self._reload_runtime_services_after_restore,
-                        )
-                        needs_rebind = False
-                    except Exception:
-                        # restore_backup also rolls back failures during runtime
-                        # rebind; reopen the original services after rollback.
-                        if needs_rebind:
-                            needs_rebind = False
-                            self._reload_runtime_services_after_restore()
-                        raise
-                    finally:
-                        try:
-                            if needs_rebind:
-                                self._reload_runtime_services_after_restore()
-                        finally:
-                            supervisor.resume()
-                            self._start_scheduled_agent()
-                            if self.config.companion.enabled:
-                                self._start_companion_server()
-                            self._restoring = False
-
-                    if not self.safe_mode.active:
-                        self.task_supervisor.start(
-                            name="audiobook-stt-resume",
-                            target=self.audiobooks.resume_pending_transcriptions,
-                            replace=True,
-                        )
-                    self.logger.info("DONE step=backup.restore path=%r", str(selected))
-                    return {"ok": True, **restored, "state": self.get_state()}
+            return self._restore_with_quiesced_runtime(
+                lambda post_commit: restore_backup(
+                    archive_path=selected,
+                    config_path=self.config_path,
+                    database_path=self.config.library.database_path,
+                    cache_dir=self.config.paths.cache_dir,
+                    post_commit=post_commit,
+                ),
+                source=selected,
+            )
         except Exception as exc:
             self.logger.exception("FAIL step=backup.restore")
             return {"ok": False, "cancelled": False, "error": str(exc)}
+
+    def restore_local_snapshot(self, path: str) -> dict[str, Any]:
+        """Put a local copy of the library back (undo a restore, a daily copy, before an update)."""
+        try:
+            selected = Path(str(path or "")).expanduser()
+            return self._restore_with_quiesced_runtime(
+                lambda post_commit: restore_database_snapshot(
+                    snapshot_path=selected,
+                    database_path=self.config.library.database_path,
+                    post_commit=post_commit,
+                ),
+                source=selected,
+            )
+        except Exception as exc:
+            self.logger.exception("FAIL step=backup.restore_snapshot")
+            return {"ok": False, "cancelled": False, "error": str(exc)}
+
+    def _restore_with_quiesced_runtime(self, restore: Any, *, source: Path) -> dict[str, Any]:
+        with self._restore_lock:
+            players = self._restore_playback_blockers()
+            if players:
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "error": err("backup.playbackActive"),
+                    "workers": players,
+                }
+            blockers = self._restore_background_blockers()
+            if blockers:
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "error": err("backup.backgroundActive"),
+                    "workers": blockers,
+                }
+            with maintenance_lock(self.config.paths.cache_dir, blocking=False) as acquired:
+                if not acquired:
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": err("backup.maintenanceActive"),
+                    }
+
+                self._stop_scheduled_agent()
+                supervisor = self.task_supervisor
+                supervisor_lingering = supervisor.quiesce(timeout=5.0)
+                if supervisor_lingering:
+                    supervisor.resume()
+                    self._start_scheduled_agent()
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": err("backup.quiesceFailed"),
+                        "workers": supervisor_lingering,
+                    }
+
+                manga_lingering = self._quiesce_manga_ocr(timeout=5.0)
+                if manga_lingering:
+                    supervisor.resume()
+                    self._start_scheduled_agent()
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": err("backup.mangaOcrStopping"),
+                        "workers": manga_lingering,
+                    }
+
+                needs_rebind = False
+                self._restoring = True
+                try:
+                    # Stop HTTP admission and join every accepted request
+                    # before removing WAL/SHM or closing its dependencies.
+                    self._stop_iphone_server()
+                    needs_rebind = True
+                    # The iPhone service holds the old database and the old
+                    # identity: the rebind builds it again from the restored files.
+                    self._iphone_service = None
+                    close_ln = getattr(self.light_novels, "close", None)
+                    if callable(close_ln):
+                        close_ln(timeout=5.0)
+                    audiobook_lingering = self.audiobooks.close(timeout=5.0)
+                    if audiobook_lingering:
+                        return {
+                            "ok": False,
+                            "busy": True,
+                            "error": err("backup.audiobookWorkersRunning"),
+                            "workers": audiobook_lingering,
+                        }
+                    # Direct pywebview calls are outside HTTP request tracking.
+                    # Retire the shared repository to drain their transactions
+                    # and keep late calls from reopening the replaced database.
+                    self.manager.db.retire(timeout=5.0)
+                    restored = restore(self._reload_runtime_services_after_restore)
+                    needs_rebind = False
+                except Exception:
+                    # restore_backup also rolls back failures during runtime
+                    # rebind; reopen the original services after rollback.
+                    if needs_rebind:
+                        needs_rebind = False
+                        self._reload_runtime_services_after_restore()
+                    raise
+                finally:
+                    try:
+                        if needs_rebind:
+                            self._reload_runtime_services_after_restore()
+                    finally:
+                        supervisor.resume()
+                        self._start_scheduled_agent()
+                        self._restoring = False
+
+                if not self.safe_mode.active:
+                    self.task_supervisor.start(
+                        name="audiobook-stt-resume",
+                        target=self.audiobooks.resume_pending_transcriptions,
+                        replace=True,
+                    )
+                    self._start_daily_snapshots()
+                self.logger.info(
+                    "DONE step=backup.restore path=%r undo=%r iphone_identity=%s",
+                    str(source),
+                    restored.get("undo_snapshot", ""),
+                    restored.get("restored_iphone_identity", 0),
+                )
+                return {"ok": True, **restored, "state": self.get_state()}
 
     def choose_library_folder(self) -> str:
         if self.window is None:
@@ -16555,6 +18912,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             return {"ok": False, "path": "", "access": False}
         try:
             import webview
+
             initial = (
                 self.config.paths.download_dirs[0]
                 if self.config.paths.download_dirs
@@ -16590,13 +18948,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
             )
             if not result:
                 return {"ok": False, "path": "", "access": False}
-            selected = Path(
-                str(result[0] if isinstance(result, (list, tuple)) else result)
-            ).expanduser()
+            selected = Path(str(result[0] if isinstance(result, (list, tuple)) else result)).expanduser()
             access = request_folder_access([selected]).get(str(selected), False)
-            self.logger.info(
-                "EVENT subtitle_folder.chosen path=%s access=%s", selected, access
-            )
+            self.logger.info("EVENT subtitle_folder.chosen path=%s access=%s", selected, access)
             return {"ok": True, "path": str(selected), "access": bool(access)}
         except Exception as exc:
             self.logger.warning("FAIL step=subtitle_folder.choose error=%s", exc)
@@ -16616,15 +18970,46 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         allowed = set(NyaaRelease.__dataclass_fields__)
         payload = {key: value for key, value in release.items() if key in allowed}
         item = NyaaRelease(**payload)
-        added = self.manager.add_release(
-            int(media_id), item, episode=episode, batch=bool(batch)
-        )
-        return {"ok": True, "added": bool(added), "already_downloading": not added}
+        self._torrent_changed(2.0)
+        rules_of = getattr(self.manager.db, "release_numbering_rules", None)
+        rules = (lambda: rules_of(int(media_id))) if callable(rules_of) else (lambda: [])
+        rules_before = {(str(row["release_group"]), str(row["season_key"])) for row in rules()}
+        added = self.manager.add_release(int(media_id), item, episode=episode, batch=bool(batch), manual=True)
+        learned = [
+            {
+                "group": str(row["release_group"]),
+                "season": str(row["season_key"]),
+                "offset": int(row["episode_offset"]),
+            }
+            for row in rules()
+            if (str(row["release_group"]), str(row["season_key"])) not in rules_before
+        ]
+        result = {"ok": True, "added": bool(added), "already_downloading": not added}
+        if learned:
+            result["learned_numbering_rule"] = learned[0]
+        return result
+
+    def release_numbering_rules(self, media_id: int) -> list[dict[str, Any]]:
+        """Split-stage numbering learned from manual release choices for one title."""
+        return [
+            {
+                "group": str(row["release_group"]),
+                "season": str(row["season_key"]),
+                "offset": int(row["episode_offset"]),
+                "example": str(row["example_title"] or ""),
+            }
+            for row in self.manager.db.release_numbering_rules(int(media_id))
+        ]
+
+    def forget_release_numbering_rules(self, media_id: int) -> dict[str, Any]:
+        removed = self.manager.db.forget_release_numbering_rules(int(media_id))
+        self.logger.info("RULE step=release_numbering.forgotten media_id=%s removed=%s", media_id, removed)
+        return {"ok": True, "removed": removed}
 
     def add_best_planning_episode(self, media_id: int, episode: int) -> dict[str, Any]:
         anime = self.manager.db.get_anime(int(media_id))
         if anime is None:
-            raise KeyError(f"Unknown AniList id={media_id}")
+            raise KeyError(err("web.unknownAnime", mediaId=media_id))
         finished = str(anime.media_status or "").upper() == "FINISHED"
         available = int(
             (anime.episodes if finished else anime.released_episodes)
@@ -16633,7 +19018,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         )
         episode = int(episode)
         if episode < 1 or (available and episode > available):
-            raise ValueError(f"Episode {episode} is not released")
+            raise ValueError(err("web.episodeNotReleased", episode=episode))
         local = self._local_episode_for_relative(anime, episode)
         if local is not None and local.video_path.is_file():
             return {
@@ -16694,7 +19079,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
         media_id = int(media_id)
         anime = self.manager.db.get_anime(media_id)
         if anime is None:
-            raise KeyError(f"Unknown AniList id={media_id}")
+            raise KeyError(err("web.unknownAnime", mediaId=media_id))
         if self._downloads_enabled():
             try:
                 self.manager.sync_downloads()
@@ -16746,13 +19131,8 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         str(exc),
                     )
             manager.scan_library()
-            local_episodes = set(
-                self._planning_local_episodes(anime, total, manager=manager)
-            )
-            missing_episodes = [
-                episode for episode in range(1, total + 1)
-                if episode not in local_episodes
-            ]
+            local_episodes = set(self._planning_local_episodes(anime, total, manager=manager))
+            missing_episodes = [episode for episode in range(1, total + 1) if episode not in local_episodes]
 
             # Prefer one real season pack over N independent episode searches.
             # Size alone is deliberately not enough evidence for this path.
@@ -16772,8 +19152,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                     except Exception as exc:
                         batch_release = None
                         self.logger.warning(
-                            "FALLBACK step=planning_episode.batch_first "
-                            "media_id=%s error=%r",
+                            "FALLBACK step=planning_episode.batch_first media_id=%s error=%r",
                             media_id,
                             str(exc),
                         )
@@ -16800,7 +19179,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                                 state="running",
                                 current=total,
                                 total=total,
-                                message="Series pack added",
+                                message=t("web.seriesPackAdded"),
                             )
                         status = "done"
                         return
@@ -16836,13 +19215,9 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                             media_id,
                             episode,
                         )
-                        results.append(
-                            {"episode": episode, "status": "error", "error": str(exc)}
-                        )
+                        results.append({"episode": episode, "status": "error", "error": str(exc)})
                 with self._planning_episode_download_lock:
-                    self._planning_episode_download_state["episodes"] = [
-                        dict(item) for item in results
-                    ]
+                    self._planning_episode_download_state["episodes"] = [dict(item) for item in results]
                 job_id = str(getattr(self, "_planning_episode_job_id", "") or "")
                 if job_id and getattr(self, "job_center", None) is not None:
                     self.job_center.update(
@@ -16850,13 +19225,11 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                         state="running",
                         current=episode,
                         total=total,
-                        message=f"Episode {episode}/{total}",
+                        message=t("web.episodeProgress", episode=episode, total=total),
                     )
             status = "cancelled" if cancelled else "done"
         except Exception as exc:
-            self.logger.exception(
-                "FAIL step=planning_episode.batch media_id=%s", media_id
-            )
+            self.logger.exception("FAIL step=planning_episode.batch media_id=%s", media_id)
             results.append({"episode": None, "status": "error", "error": str(exc)})
             status = "failed"
         finally:
@@ -16875,7 +19248,7 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 if status == "done":
                     self.job_center.finish(
                         job_id,
-                        message="Episode search complete",
+                        message=t("web.episodeSearchComplete"),
                         result={"media_id": media_id, "episodes": results},
                     )
                 elif status == "cancelled":
@@ -16883,20 +19256,18 @@ code{{color:#a8d1ff}}@media(max-width:900px){{.grid{{grid-template-columns:1fr}}
                 else:
                     error = next(
                         (row.get("error") for row in reversed(results) if row.get("error")),
-                        "Episode search failed",
+                        err("web.episodeSearchFailed"),
                     )
                     self.job_center.fail(job_id, error)
 
-    def start_planning_episode_download(
-        self, media_id: int, attempt_of: str = ""
-    ) -> dict[str, Any]:
+    def start_planning_episode_download(self, media_id: int, attempt_of: str = "") -> dict[str, Any]:
         media_id = int(media_id)
         anime = self.manager.db.get_anime(media_id)
         if anime is None:
-            raise KeyError(f"Unknown AniList id={media_id}")
+            raise KeyError(err("web.unknownAnime", mediaId=media_id))
         total = self._planning_released_episode_count(anime)
         if total < 1:
-            raise ValueError("No released episodes")
+            raise ValueError(err("web.noReleasedEpisodes"))
         with self._planning_episode_download_lock:
             running = self._planning_episode_download_thread
             if running is not None and running.is_alive():
@@ -16949,6 +19320,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
 def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler]:
     if not getattr(api, "_http_session_token", None):
         api._http_session_token = secrets.token_urlsafe(32)
+
     class _AppAssetHandler(_QuietHandler):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, directory=str(web_root), **kwargs)
@@ -16983,8 +19355,47 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             with path.open("rb") as handle:
                 shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
 
+        def _from_this_app(self) -> bool:
+            # Only the app's own origin: a page elsewhere cannot point at a
+            # renamed host (DNS rebinding) to read library pages.
+            return self.headers.get("Host") == f"127.0.0.1:{self.server.server_address[1]}"
+
+        def _send_bytes(self, body: bytes, content_type: str, revision: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", str(content_type or "application/octet-stream"))
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.send_header("ETag", f'"{revision}"')
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:
             path = urlparse(self.path).path
+            manga_page = re.fullmatch(r"/api/manga/page/(\d+)/(\d+)/([0-9a-f]{20})", path)
+            manga_thumb = re.fullmatch(r"/api/manga/cover/([A-Za-z0-9-]+\.jpg)", path)
+            if (manga_page or manga_thumb) and not self._from_this_app():
+                self._send_json({"ok": False, "error": "forbidden"}, status=403)
+                return
+            if manga_page:
+                try:
+                    body, content_type = api.manga.page_asset(
+                        int(manga_page.group(1)),
+                        int(manga_page.group(2)),
+                        expected_revision=manga_page.group(3),
+                    )
+                    self._send_bytes(body, content_type, manga_page.group(3))
+                except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+                    api.logger.warning("FAIL manga.page_asset error=%r", str(exc))
+                    self._send_json({"ok": False, "error": "page_not_available"}, status=404)
+                return
+            if manga_thumb:
+                try:
+                    target = api.manga.cover_thumbnail_asset(manga_thumb.group(1))
+                    self._send_asset(target, "image/jpeg", target.stem)
+                except (KeyError, OSError) as exc:
+                    api.logger.debug("SKIP manga.cover_asset error=%r", str(exc))
+                    self._send_json({"ok": False, "error": "cover_not_available"}, status=404)
+                return
             manga_cover = re.fullmatch(r"/api/covers/manga/(\d+)/([0-9a-f]{20})", path)
             if manga_cover:
                 try:
@@ -16999,6 +19410,9 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
             if path == "/api/torrents/status":
                 try:
                     result = dict(api.torrent_traffic_status())
+                    monitor = getattr(api, "_torrent_monitor", None)
+                    if monitor is not None:
+                        monitor.saw(result)
                     self._send_json(result)
                 except Exception as exc:
                     api.logger.warning("FAIL torrent.http_status error=%r", str(exc))
@@ -17013,9 +19427,11 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
                 return
             expected_origin = f"http://127.0.0.1:{self.server.server_address[1]}"
             token = str(self.headers.get("X-Pudge-Token") or "")
-            if (self.headers.get("Host") != expected_origin.removeprefix("http://")
-                    or self.headers.get("Origin", expected_origin) != expected_origin
-                    or not hmac.compare_digest(token, api._http_session_token)):
+            if (
+                self.headers.get("Host") != expected_origin.removeprefix("http://")
+                or self.headers.get("Origin", expected_origin) != expected_origin
+                or not hmac.compare_digest(token, api._http_session_token)
+            ):
                 self._send_json({"ok": False, "error": "forbidden"}, status=403)
                 return
             if self.headers.get_content_type() != "application/json":
@@ -17029,11 +19445,11 @@ def _asset_handler_for_api(api: WebAppApi, web_root: Path) -> type[_QuietHandler
                 raw = self.rfile.read(size) if size else b"{}"
                 payload = json.loads(raw.decode("utf-8"))
                 if path == "/api/mpv/playback-save":
-                    if not isinstance(payload,dict):
-                        self._send_json({"ok":False,"error":"object_required"},status=400)
+                    if not isinstance(payload, dict):
+                        self._send_json({"ok": False, "error": "object_required"}, status=400)
                     else:
-                        result=api.mpv_playback_save(payload)
-                        self._send_json(result,status=200 if result.get("ok") else 410)
+                        result = api.mpv_playback_save(payload)
+                        self._send_json(result, status=200 if result.get("ok") else 410)
                     return
                 if path == "/api/mpv/explain":
                     if not isinstance(payload, dict):
@@ -17067,9 +19483,13 @@ def _start_asset_server(api: WebAppApi) -> tuple[http.server.ThreadingHTTPServer
         target = web_root / source.name
         if source.name == "index.html":
             target.write_text(
-                source.read_text(encoding="utf-8").replace("__APP_NAME__", APP_NAME)
-                    .replace("__PUDGE_HTTP_TOKEN__", api._http_session_token)
-                    .replace("__PUDGE_UI_BOOTSTRAP__", json.dumps(api.ui_preferences(), ensure_ascii=True).replace("<", "\\u003c")),
+                source.read_text(encoding="utf-8")
+                .replace("__APP_NAME__", APP_NAME)
+                .replace("__PUDGE_HTTP_TOKEN__", api._http_session_token)
+                .replace(
+                    "__PUDGE_UI_BOOTSTRAP__",
+                    json.dumps(api.ui_preferences(), ensure_ascii=True).replace("<", "\\u003c"),
+                ),
                 encoding="utf-8",
             )
         else:
@@ -17114,9 +19534,7 @@ class _MacWindowLifecycle:
             try:
                 self.on_quit(source)
             except Exception as exc:
-                self.logger.warning(
-                    "FALLBACK step=app.background_quiet_on_quit error=%r", str(exc)
-                )
+                self.logger.warning("FALLBACK step=app.background_quiet_on_quit error=%r", str(exc))
 
     def handle_closing(self) -> bool:
         if self.quit_requested:
@@ -17196,7 +19614,9 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
                         reply_claimed.set()
                     # Explicit modes include the modal loop of NSTerminateLater.
                     self.performSelectorOnMainThread_withObject_waitUntilDone_modes_(
-                        "pudgeFinishQuit:", app, False,
+                        "pudgeFinishQuit:",
+                        app,
+                        False,
                         [NSModalPanelRunLoopMode, NSDefaultRunLoopMode],
                     )
 
@@ -17208,7 +19628,9 @@ def _install_macos_app_delegate_proxy(api: "WebAppApi", lifecycle: _MacWindowLif
                         tree = OwnedProcessTree()
                         api._preserve_playback_processes(tree)
                     remaining = tree.stop()
-                    api.logger.info("EVENT app.quit_remaining_children pid=%s remaining=%s", os.getpid(), remaining)
+                    api.logger.info(
+                        "EVENT app.quit_remaining_children pid=%s remaining=%s", os.getpid(), remaining
+                    )
 
                 def timed_out() -> None:
                     api.logger.warning("WAIT step=app.quit_cleanup_timeout pid=%s", os.getpid())
@@ -17338,51 +19760,62 @@ def _request_notification_permission_after_launch(api: WebAppApi) -> None:
     )
 
 
+_INSTANCE_LOCK: Any = None
+
+
+def _focus_main_window(api: "WebAppApi") -> None:
+    """Bring the running window forward for a second launch."""
+    lifecycle = getattr(api, "_macos_window_lifecycle", None)
+    if lifecycle is not None:
+        lifecycle.reopen()
+    elif getattr(api, "window", None) is not None:
+        api.window.show()
+    if sys.platform == "darwin":
+        try:
+            from AppKit import NSApp
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(lambda: NSApp.activateIgnoringOtherApps_(True))
+        except Exception as exc:  # noqa: BLE001 - showing the window is enough
+            api.logger.info("FALLBACK step=app.activate error=%r", str(exc))
+    api.logger.info("EVENT app.focus_request_from_second_launch")
+
+
 def launch_web_app(config_path: Path) -> int:
+    global _INSTANCE_LOCK
+    from .logging_utils import set_log_rotation_owner
+
+    set_log_rotation_owner(True)  # the window rotates the shared log; CLI/agent append
     # Set the process name before Cocoa/pywebview initializes. Calling this a
     # second time from on_started handles backends that recreate NSApplication.
     _set_macos_runtime_identity()
+    # One window per data directory: a second launch would steal the first
+    # one's session markers and write to the same database.
+    from . import single_instance
+
+    _INSTANCE_LOCK = single_instance.acquire()
+    if _INSTANCE_LOCK is None:
+        focused = single_instance.request_focus()
+        print(
+            f"{APP_NAME} is already running" + ("; its window was brought to the front." if focused else ".")
+        )
+        return 0
     try:
         import webview
     except ImportError as exc:
-        raise RuntimeError("pywebview is not installed. Run ./install.sh again") from exc
+        raise RuntimeError(err("setup.pywebviewMissing")) from exc
 
     api = WebAppApi(config_path)
     _set_macos_runtime_identity()
     with timed_step(api.logger, "app.asset_server"):
         server, base_url = _start_asset_server(api)
     api.asset_base = base_url
-    companion_server = None
-    if api.config.companion.enabled:
-        try:
-            companion_server, _companion_thread = start_mobile_sync_server(
-                api.mobile_sync,
-                host=api.config.companion.bind_host,
-                port=api.config.companion.port,
-                streaming=api.companion_streaming,
-                study_parser=api.light_novels.parse_study_text,
-                logger=api.logger,
-            )
-            api._companion_server = companion_server
-            api._companion_thread = _companion_thread
-            companion_host, companion_port = companion_server.server_address
-            api.companion_base_url = f"http://{companion_host}:{companion_port}"
-            api.logger.info(
-                "EVENT companion.started host=%s port=%s",
-                companion_host,
-                companion_port,
-            )
-        except OSError as exc:
-            api.logger.warning(
-                "FALLBACK step=companion.start host=%s port=%s error=%r",
-                api.config.companion.bind_host,
-                api.config.companion.port,
-                str(exc),
-            )
-    window = webview.create_window(
+    api.manga.asset_base = base_url
+    window = js_bridge.create_window(
+        webview,
         APP_NAME,
+        api,
         url=f"{base_url}/index.html",
-        js_api=api,
         width=1280,
         height=820,
         min_size=(980, 660),
@@ -17392,6 +19825,7 @@ def launch_web_app(config_path: Path) -> int:
     )
     api.set_window(window)
     api.logger.info("EVENT app.window_created pid=%s uid=%s", os.getpid(), window.uid)
+    _INSTANCE_LOCK.serve_focus_requests(lambda: _focus_main_window(api))
 
     def on_shown() -> None:
         api.logger.info("EVENT app.window_shown pid=%s", os.getpid())
@@ -17408,7 +19842,11 @@ def launch_web_app(config_path: Path) -> int:
         window.events.closing += lifecycle.handle_closing
 
         def on_before_show() -> None:
-            api.logger.info("EVENT app.window_before_show pid=%s native=%s", os.getpid(), type(getattr(window, "native", None)).__name__)
+            api.logger.info(
+                "EVENT app.window_before_show pid=%s native=%s",
+                os.getpid(),
+                type(getattr(window, "native", None)).__name__,
+            )
             _install_macos_app_delegate_proxy(api, lifecycle)
 
         window.events.before_show += on_before_show
@@ -17418,6 +19856,7 @@ def launch_web_app(config_path: Path) -> int:
         # so the actual WebKit process has the same icon in Dock and Cmd+Tab.
         icon_set = _set_macos_runtime_identity()
         api.logger.info("EVENT app.webview_started runtime_identity=%s", icon_set)
+        api.start_global_shortcuts()
 
         # Finder drop binding is intentionally deferred until the page fires
         # ``pywebviewready``. Binding DOM drag events here used to attach too
@@ -17446,7 +19885,4 @@ def launch_web_app(config_path: Path) -> int:
         api.logger.info("APP session_stop")
         server.shutdown()
         server.server_close()
-        if companion_server is not None:
-            companion_server.shutdown()
-            companion_server.server_close()
     return 0

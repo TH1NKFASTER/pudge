@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from pudge.audio_activity import activity_regions_from_features, gate_activity_regions
@@ -10,8 +8,8 @@ from pudge.reading_audio_alignment import (
     light_novel_position_for_audio,
 )
 
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.css_support import css_rules
+from tests.i18n_support import ru
 
 
 def test_fft_features_keep_sentence_pauses_separate() -> None:
@@ -34,9 +32,7 @@ def test_fft_activity_is_gated_by_stt_to_reject_music() -> None:
     regions = [{"start": 0.0, "end": 1.0}, {"start": 2.0, "end": 3.0}]
     hints = [{"start": 2.2, "end": 2.8}]
 
-    assert gate_activity_regions(regions, hints, padding_seconds=0.1) == [
-        {"start": 2.1, "end": 2.9}
-    ]
+    assert gate_activity_regions(regions, hints, padding_seconds=0.1) == [{"start": 2.1, "end": 2.9}]
 
 
 def test_anchor_clock_is_linear_even_when_fft_reports_silence() -> None:
@@ -70,24 +66,121 @@ def test_anchor_clock_is_linear_even_when_fft_reports_silence() -> None:
     assert middle["chapter_char_offset_exact"] == 50.0
     assert late["chapter_char_offset_exact"] == 68.75
     assert near_end["chapter_char_offset_exact"] == 87.5
-    assert middle["anchor_window"]["activity"] == alignment["chapters"][0][
-        "speech_regions"
-    ]
+    assert middle["anchor_window"]["activity"] == alignment["chapters"][0]["speech_regions"]
     assert audio_position_for_light_novel_offset(alignment, 0, 50) == 14.0
 
-def test_planning_primary_download_and_visible_ln_color_contracts() -> None:
-    html = (ROOT / "pudge/web/index.html").read_text(encoding="utf-8")
-    alignment = (ROOT / "pudge/reading_audio_alignment.py").read_text(encoding="utf-8")
-    audiobooks = (ROOT / "pudge/audiobooks.py").read_text(encoding="utf-8")
 
-    assert 'data-action="planning-episodes-auto-card"' in html
-    assert "Автоскачать серии" in html
-    assert "startPlanningEpisodeDownload" in html
-    assert "planning_episode_download_status" in html
-    assert "preparePlanningEpisodeChooser" in html
-    assert "syncLnWordColorOutputs" in html
-    assert "data-ln-word-color-value" in html
-    assert 'input[type="color"]::-webkit-color-swatch' in html
-    assert "anchor.activity" in html
-    assert '"schema": "reading-audio-v3"' in alignment
-    assert "reading-audio-v3-leading-prefix-v22" in audiobooks
+# A background search for the released episodes of a Planning anime: running, then done.
+JOB = """
+let statusCalls = 0;
+__api.start_planning_episode_download = async id => ({running: true, media_id: id, title: 'Planned', current: 0, total: 3, episodes: []});
+__api.planning_episode_download_status = async () => (++statusCalls < 3 ? {running: statusCalls > 1, title: 'Planned', current: 1, total: 3, episodes: []}
+  : {running: false, title: 'Planned', current: 3, total: 3, finished_at: 1790000000, episodes: [
+      {episode: 1, status: 'local'}, {episode: 2, status: 'added', release: '[Group] Planned - 02'}, {episode: 3, status: 'missing'}]});
+"""
+
+
+def test_planning_card_auto_downloads_released_episodes(page) -> None:
+    assert ru("ui.autoDownloadEpisodes") == "Автоскачать серии"
+    anime = {
+        "media_id": 9,
+        "title": "Planned",
+        "episodes": 3,
+        "media_status": "FINISHED",
+        "status": "PLANNING",
+        "progress": 0,
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('planned', true); await __tick(20);
+            const states = () => __apiCalls.filter(call => call.name === 'get_state').length;
+            const out = {button: __text('#plannedContent [data-action="planning-episodes-auto-card"]'), label: PudgeI18n.t('ui.autoDownloadEpisodes')};
+            const before = states();
+            await __click('#plannedContent [data-action="planning-episodes-auto-card"]'); await __flush();
+            out.progress = {title: __text('#modalTitle'), body: __text('#modalBody')};
+            await __tick(1500);
+            out.done = {title: __text('#modalTitle'), body: __text('#modalBody'), reloaded: states() - before};
+            out.texts = {searching: PudgeI18n.t('ui.searchingReleasedEpisodes'), checking: PudgeI18n.t('ui.checkingLocalFilesAndSearching'),
+                         complete: PudgeI18n.t('ui.searchComplete'), added: PudgeI18n.t('ui.added'), local: PudgeI18n.t('ui.alreadyLocal'),
+                         missing: PudgeI18n.t('ui.notFound'), summary: PudgeI18n.t('ui.addedAlreadyLocalNotFound', {added: 1, local: 1, missing: 1, error: 0})};
+            return out;
+            """,
+            lang=lang,
+            state={"planned": [anime]},
+            before=JOB,
+        )
+        out, texts = result.value, result.value["texts"]
+        assert out["button"] == out["label"]
+        assert result.calls_of("start_planning_episode_download") == [[9]]
+        assert out["progress"]["title"] == f"{texts['searching']} — Planned"
+        assert out["progress"]["body"].startswith(f"{texts['checking']} 0 / 3")
+        assert out["done"]["title"] == f"{texts['complete']} — Planned"
+        body = out["done"]["body"]
+        assert body.startswith(texts["summary"])
+        assert all(
+            text in body
+            for text in (texts["local"], texts["added"], "[Group] Planned - 02", texts["missing"])
+        )
+        assert out["done"]["reloaded"] == 1  # the added episode shows up in the library
+
+
+READER = """
+__api.light_novel_open = async id => ({id, title: 'Novel', current_chapter: 0, current_offset: 0, chapters: [{chapter_index: 0, title: 'One'}]});
+__api.light_novel_chapter = async (id, index) => ({book_id: id, chapter_index: index, paragraphs: ['本文です。'], tokens: [[]]});
+__api.light_novel_save_settings = async values => ({settings: values});
+"""
+
+
+def test_ln_word_color_rows_show_no_hex_and_only_the_swatch_opens_the_picker(page) -> None:
+    result = page.run(
+        """
+        await __settle(openLightNovel(6));
+        await __click('#lnReaderAppearanceToggle'); await __tick(20);
+        const box = document.getElementById('lnReaderAppearance');
+        const ids = [...box.querySelectorAll('.ln-word-color-picker input[type=color]')].map(input => input.id);
+        const opened = [];
+        for (const id of ids) $(id).addEventListener('click', () => opened.push(id));
+        const name = $('lnrWordNew').getAttribute('aria-labelledby');
+        await __click('#' + name);   // the row's name
+        const viaRow = opened.slice();
+        await __click('#lnrWordNew');                               // the swatch itself
+        return {ids, viaRow, opened, name: $(name).textContent,
+                hex: [...box.querySelectorAll('.ln-word-color-picker')].map(row => row.innerText).filter(text => /#[0-9a-f]{3}/i.test(text)),
+                labelFor: [...box.querySelectorAll('label[for]')].map(label => label.htmlFor).filter(id => ids.includes(id))};
+        """,
+        before=READER,
+        state={"settings": {"review_gate_ln_enabled": False}},
+        api={
+            "light_novel_state": {
+                "version": 1,
+                "settings": {
+                    "jiten_api_key": "key",
+                    "word_color_theme": "custom",
+                    "word_color_new": "#f3f6fb",
+                },
+                "books": [{"id": 6, "title": "Novel", "volume": 1}],
+            }
+        },
+    )
+    out = result.value
+    assert out["ids"] == [
+        "lnrWordNew",
+        "lnrWordNotInDeck",
+        "lnrWordYoung",
+        "lnrWordMature",
+        "lnrWordMastered",
+        "lnrWordDue",
+        "lnrWordBlacklisted",
+        "lnrWordSuspended",
+        "lnrWordRedundant",
+    ]
+    assert out["name"] == "New"
+    assert out["hex"] == [] and out["labelFor"] == []
+    assert out["viaRow"] == [] and out["opened"] == ["lnrWordNew"]
+    # The swatch fills the picker (no inner frame), so the chosen colour is what one sees.
+    rules = css_rules("index.html")
+    assert (
+        rules.get('.ln-word-color-picker input[type="color"]::-webkit-color-swatch-wrapper', "padding") == "0"
+    )
+    assert rules.get('.ln-word-color-picker input[type="color"]::-webkit-color-swatch', "border") == "0"

@@ -45,9 +45,7 @@ def test_otome_single_plateau_is_untouched(tmp_path: Path) -> None:
         aligned,
     )
     embedded = {
-        "timeline_segments": [
-            {"offset_seconds": -35.0, "support": 25, "kind": "stable"}
-        ],
+        "timeline_segments": [{"offset_seconds": -35.0, "support": 25, "kind": "stable"}],
         "timeline_early_edit_audio_verification": {
             "required": True,
             "reasons": ["opening_gap_clock_ambiguity"],
@@ -95,6 +93,7 @@ def test_scaffold_requires_stt_post_clock_agreement(tmp_path: Path) -> None:
     assert output == aligned
     assert result["applied"] is False
     assert result["reason_detail"] == "speech_clock_disagrees_with_post_plateau"
+
 
 def _hyakkano_single_window_embedded() -> dict[str, object]:
     return {
@@ -187,6 +186,7 @@ def test_single_early_window_stays_rejected_when_evidence_is_weak(
     assert result["reason_detail"] == "insufficient_segment_support"
     assert result["single_window_evidence"]["accepted"] is False
 
+
 def test_hyakkano_scaffold_refines_small_preop_residual_with_stt(
     tmp_path: Path,
 ) -> None:
@@ -204,10 +204,7 @@ def test_hyakkano_scaffold_refines_small_preop_residual_with_stt(
     reference_pre = [value + 10.6 for value in pre]
     reference_post = post
     write_srt(
-        [
-            (value, value + 1.0, f"r{index}")
-            for index, value in enumerate(reference_pre + reference_post)
-        ],
+        [(value, value + 1.0, f"r{index}") for index, value in enumerate(reference_pre + reference_post)],
         reference,
     )
 
@@ -263,9 +260,7 @@ def test_preop_residual_is_not_applied_when_cold_hint_disagrees(
     write_srt(
         [
             (value, value + 1.0, f"r{index}")
-            for index, value in enumerate(
-                [value + 10.6 for value in pre] + post
-            )
+            for index, value in enumerate([value + 10.6 for value in pre] + post)
         ],
         reference,
     )
@@ -303,6 +298,7 @@ def test_preop_residual_is_not_applied_when_cold_hint_disagrees(
     cues = parse_srt(output)
     assert abs(cues[0][0] - 19.3) < 0.01
     assert abs(cues[len(pre)][0] - 180.0) < 0.01
+
 
 def test_borderline_preop_stt_is_accepted_when_cold_hint_confirms(
     tmp_path: Path,
@@ -376,16 +372,14 @@ def test_borderline_preop_stt_is_accepted_when_cold_hint_confirms(
     assert result["applied"] is True
     assert result["residual_speech_refinement"]["accepted"] is True
     assert result["residual_speech_refinement"]["borderline_speech"] is True
-    assert (
-        result["residual_speech_refinement"]["reason"]
-        == "borderline_speech_and_cold_hint_agree"
-    )
+    assert result["residual_speech_refinement"]["reason"] == "borderline_speech_and_cold_hint_agree"
     assert abs(float(result["residual_speech_shift_seconds"]) - 0.9) < 0.01
     assert abs(float(result["correction_seconds"]) - 10.2) < 0.01
 
     cues = parse_srt(output)
     assert abs(cues[0][0] - 20.2) < 0.01
     assert abs(cues[len(pre)][0] - 180.0) < 0.01
+
 
 def test_hyakkano_preop_uses_embedded_reference_for_small_residual(
     tmp_path: Path,
@@ -402,12 +396,26 @@ def test_hyakkano_preop_uses_embedded_reference_for_small_residual(
     )
 
     reference = tmp_path / "embedded-reference.srt"
-    reference_pre = [13.49, 17.5, 20.16, 22.28, 24.98, 26.02, 27.01, 30.24, 34.43, 40.29, 41.08, 42.18, 44.05, 46.6, 48.53, 50.54]
+    reference_pre = [
+        13.49,
+        17.5,
+        20.16,
+        22.28,
+        24.98,
+        26.02,
+        27.01,
+        30.24,
+        34.43,
+        40.29,
+        41.08,
+        42.18,
+        44.05,
+        46.6,
+        48.53,
+        50.54,
+    ]
     write_srt(
-        [
-            (value, value + 1.2, f"r{index}")
-            for index, value in enumerate(reference_pre + post)
-        ],
+        [(value, value + 1.2, f"r{index}") for index, value in enumerate(reference_pre + post)],
         reference,
     )
 
@@ -762,18 +770,12 @@ def test_optimize_candidates_routes_unstable_sparse_preop_through_stt(
 
     pre = [10.0, 20.0, 30.0]
     post = [180.0 + 9.0 * index for index in range(21)]
-    source_cues = [
-        (value, value + 1.5, f"c{index}")
-        for index, value in enumerate(pre + post)
-    ]
+    source_cues = [(value, value + 1.5, f"c{index}") for index, value in enumerate(pre + post)]
     write_srt(source_cues, source)
     write_srt(source_cues, alass_aligned)
     write_srt(source_cues, speech_aligned)
     target_pre = [pre[0] + 8.5, pre[1] + 9.8, pre[2] + 9.8]
-    reference_cues = [
-        (value, value + 1.0, f"r{index}")
-        for index, value in enumerate(target_pre + post)
-    ]
+    reference_cues = [(value, value + 1.0, f"r{index}") for index, value in enumerate(target_pre + post)]
     write_srt(reference_cues, reference)
     write_srt(reference_cues, speech_reference)
 
@@ -936,20 +938,14 @@ def test_hyakkano_bad_stt_map_keeps_embedded_baseline_and_repairs_two_spoken_pla
         (30.0, 31.0, "（文字）"),
         (35.0, 36.0, "♪"),
     ]
-    post = [
-        (140.0 + 9.0 * index, 141.5 + 9.0 * index, f"post-{index}")
-        for index in range(12)
-    ]
+    post = [(140.0 + 9.0 * index, 141.5 + 9.0 * index, f"post-{index}") for index in range(12)]
     write_srt(pre + post, baseline)
 
     target_dialogue = [
         (18.4, 19.9, "nanja"),
         (29.8, 31.3, "yareyare"),
     ]
-    reference_post = [
-        (start, end, text)
-        for start, end, text in post
-    ]
+    reference_post = [(start, end, text) for start, end, text in post]
     write_srt(target_dialogue + reference_post, embedded_reference)
     write_srt(target_dialogue + reference_post, speech_reference)
 
@@ -1034,10 +1030,7 @@ def test_optimize_candidates_rejects_hyakkano_bad_stt_map_and_repairs_embedded_b
         (30.0, 31.0, "（文字）"),
         (35.0, 36.0, "♪"),
     ]
-    post = [
-        (140.0 + 9.0 * index, 141.5 + 9.0 * index, f"post-{index}")
-        for index in range(21)
-    ]
+    post = [(140.0 + 9.0 * index, 141.5 + 9.0 * index, f"post-{index}") for index in range(21)]
     write_srt(pre + post, source)
     write_srt(pre + post, alass_aligned)
 
@@ -1052,10 +1045,7 @@ def test_optimize_candidates_rejects_hyakkano_bad_stt_map_and_repairs_embedded_b
     # biased clock; recovery must normalize it before dual-reference matching.
     raw_stt_clock_bias = 5.639
     write_srt(
-        [
-            (start + raw_stt_clock_bias, end + raw_stt_clock_bias, text)
-            for start, end, text in reference_cues
-        ],
+        [(start + raw_stt_clock_bias, end + raw_stt_clock_bias, text) for start, end, text in reference_cues],
         speech_reference,
     )
 
@@ -1219,10 +1209,7 @@ def test_large_alass_opening_collapse_restores_only_preopening_clock(tmp_path: P
     pre_aligned = [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 175.0]
     post_aligned = [187.0, 197.0, 207.0, 217.0, 227.0, 237.0, 247.0, 257.0]
     write_srt(
-        [
-            (value, value + 1.5, f"c{index}")
-            for index, value in enumerate(pre_aligned + post_aligned)
-        ],
+        [(value, value + 1.5, f"c{index}") for index, value in enumerate(pre_aligned + post_aligned)],
         aligned,
     )
 
@@ -1294,9 +1281,7 @@ def test_large_alass_opening_collapse_restores_only_preopening_clock(tmp_path: P
 
     assert result["applied"] is True
     assert result["large_alass_opening_clock_recovery"] is True
-    assert result["single_window_evidence"]["evidence_mode"] == (
-        "catastrophic_alass_preopening_recovery"
-    )
+    assert result["single_window_evidence"]["evidence_mode"] == ("catastrophic_alass_preopening_recovery")
     assert float(result["alass_relative_clock_seconds"]) == 115.327
     assert abs(float(result["correction_seconds"]) - (-104.827)) < 1e-6
 
@@ -1308,6 +1293,7 @@ def test_large_alass_opening_collapse_restores_only_preopening_clock(tmp_path: P
     assert repaired[len(pre_aligned)][0] == post_aligned[0]
     assert repaired[-1][0] == post_aligned[-1]
 
+
 def test_large_alass_opening_collapse_with_two_early_windows_restores_preopening_clock(
     tmp_path: Path,
 ) -> None:
@@ -1315,10 +1301,7 @@ def test_large_alass_opening_collapse_with_two_early_windows_restores_preopening
     pre_aligned = [82.0, 92.0, 102.0, 112.0, 122.0, 132.0, 142.0, 152.0]
     post_aligned = [165.0, 175.0, 185.0, 195.0, 205.0, 215.0, 225.0, 235.0]
     write_srt(
-        [
-            (value, value + 1.5, f"c{index}")
-            for index, value in enumerate(pre_aligned + post_aligned)
-        ],
+        [(value, value + 1.5, f"c{index}") for index, value in enumerate(pre_aligned + post_aligned)],
         aligned,
     )
 

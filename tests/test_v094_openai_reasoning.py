@@ -1,3 +1,5 @@
+"""OpenAI-compatible LLM: reasoning effort (behaviour; audit 71Б rewrite of the settings source checks)."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -139,15 +141,52 @@ def test_llm_test_surfaces_provider_error_body(tmp_path: Path, monkeypatch: pyte
         )
 
 
-def test_web_settings_expose_reasoning_effort_with_low_fallback() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert 'id="s_llm_reasoning"' in html
-    assert "s.llm_reasoning_effort||'low'" in html
-    assert "llm_reasoning_effort:v('s_llm_reasoning')||'low'" in html
-    assert "reasoning_effort:values.llm_reasoning_effort" in html
+LLM_ON = {
+    "llm_enabled": True,
+    "llm_provider": "openai",
+    "llm_url": "https://api.openai.com/v1",
+    "llm_model": "gpt-5.6-luna",
+}
+SAVE = "__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});"
 
 
-def test_web_settings_save_and_return_reasoning_effort(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reasoning_effort_is_an_openai_setting_that_defaults_to_low_and_is_saved_and_tested(page) -> None:
+    result = page.run(
+        r"""
+        setPage('settings'); await __tick(100);
+        await __click('[data-settings-category="advanced"]'); await __tick(10);
+        const reasoning = () => __visible('label[for="s_llm_reasoning"]');
+        const out = {shown: $('s_llm_reasoning').value, visible: reasoning()};
+        await __input('#s_llm_provider', 'ollama'); out.ollama = reasoning();
+        await __input('#s_llm_provider', 'openai');
+        await __input('#s_llm_reasoning', 'high');
+        await __click('#testLlmProvider'); await __tick(10);
+        await __click('#saveSettings'); await __tick(10);
+        return out;
+        """,
+        state={"settings": LLM_ON},  # saved before reasoning effort existed
+        before=SAVE
+        + "__api.test_llm_provider = async values => ({ok: true, provider: values.provider, model: values.model});",
+    )
+    out = result.value
+    assert out == {"shown": "low", "visible": True, "ollama": False}
+    [[tested]] = result.calls_of("test_llm_provider")
+    assert (tested["provider"], tested["model"], tested["reasoning_effort"]) == (
+        "openai",
+        "gpt-5.6-luna",
+        "high",
+    )
+    assert result.calls_of("save_settings")[0][0]["llm_reasoning_effort"] == "high"
+    stored = page.run(
+        "setPage('settings'); await __tick(100); return $('s_llm_reasoning').value;",
+        state={"settings": {**LLM_ON, "llm_reasoning_effort": "medium"}},
+    )
+    assert stored.value == "medium"
+
+
+def test_web_settings_save_and_return_reasoning_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _api(tmp_path, monkeypatch)
     result = api.save_settings({"llm_provider": "openai", "llm_reasoning_effort": "high"})
     assert result["ok"] is True

@@ -13,10 +13,8 @@ from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.review_gate import ReviewGateStore
 from pudge.web_app import WebAppApi
 from pudge import player
-
-
-ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "pudge" / "web"
+from css_support import css_rules
+from tests.i18n_support import en, ru
 
 
 class _OneCardService:
@@ -106,124 +104,204 @@ def test_review_gate_prefetch_warms_cards_before_open(tmp_path: Path) -> None:
     assert result["begin_ms"] >= 0.0
 
 
-def test_review_gate_front_back_contract_and_jiten_details() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    css = (WEB / "review_gate.css").read_text(encoding="utf-8")
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-
-    # Front is recall-only except for Jiten confusable readings: no answer/translation/furigana.
-    assert "card.wordTextPlain || card.wordText" in source
-    assert "const frontConfusable = confusableReadings(card);" in source
-    assert "pudge-review-gate-front-confusable" in source
-    assert "Confusable readings" in source
-    assert "Похожие чтения" in source
-    assert ".pudge-review-gate-front-confusable" in css
-    assert "data-review-gate-show-answer" in source
-    assert "Показать ответ" in source
-    assert "Show answer" in source
-    assert "pudge-review-gate-back\"${revealed ? '' : ' hidden'}" in source
-    assert ".pudge-review-gate-back[hidden]{display:none}" in css
-    front_block = source.split("if (card) {", 1)[1].split("} else {", 1)[0]
-    assert "frontConfusable.join" in front_block
-    assert "definitions" not in front_block
-    assert "rubyHtml(" not in front_block
-
-    # Back can use Jiten study-batch details without extra provider requests.
-    for field in (
-        "rubyText",
-        "definitions",
-        "partsOfSpeech",
-        "pitchAccents",
-        "frequencyRank",
-        "exampleSentence",
-        "sourceDeckName",
-        "deckOccurrences",
-        "confusableReadings",
-        "intervalPreview",
-    ):
-        assert field in source
-    assert "<ruby>" in source and "<rt>" in source
-
-    # Space reveals the answer; Escape only closes/cancels the gate.
-    assert "if(window.PudgeReviewGate?.handleEscape?.())return;" in html
-    assert "if(window.PudgeReviewGate?.handleKeydown?.(event))return;" in html
-    assert "<kbd>Space</kbd>" in source
-    assert "event?.code !== 'Space'" in source
-    assert "function handleEscape()" in source
-    escape_body = source.split("function handleEscape()", 1)[1].split("function handleKeydown", 1)[0]
-    assert "showAnswer()" not in escape_body
-    assert "close();" in escape_body
-
-    # Prefetch starts before any series click and refreshes once per minute.
-    assert "PREFETCH_INTERVAL_MS = 60_000" in source
-    assert "review_gate_prefetch" in source
-    assert "pywebviewready" in source
-    assert "startPrefetchLoop" in source
-
-    # Pitch is rendered graphically, not as a numeric 'Pitch: X' label.
-    assert "study?.inlinePitch" in source
-    assert "pudge-review-gate-pitch" in source
-    assert "Pitch'}:" not in source
-
-
-def test_review_gate_advances_to_prefetched_next_card_before_network_result() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    shift = source.index("cardQueue.shift();")
-    submit = source.index("await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(", shift)
-    render_next = source.index("render({loading:false}, {replaceCards:false});", shift)
-    assert shift < render_next < submit
-    assert "button.disabled = saving || !cardAuthorized" in source
-    assert "authorizedCardKeys = new Set" in source
-    assert "overlay?.classList.toggle('pudge-review-gate-busy', cardQueue.length === 0)" in source
-    assert "Saving previous" in source
-
-
-def test_warm_card_authorization_clears_busy_before_repaint() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    load = source.split("  async function loadBatch() {", 1)[1].split("\n  async function submitGrade", 1)[0]
-    auth = load.index("authorizedCardKeys = new Set")
-    clear_busy = load.index("busy = false;", auth)
-    repaint = load.index("render(status || {}, {replaceCards:true});", clear_busy)
-    assert auth < clear_busy < repaint
-    assert "overlay?.classList.toggle('pudge-review-gate-busy', cardQueue.length === 0)" in load
-    assert "button.disabled = saving || !cardAuthorized" in source
-
-def test_review_grades_are_unavailable_until_answer_is_revealed_and_authorized() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    assert "if (grade) void submitGrade" in source
-    assert "!revealed ? 'answer_hidden'" in source
-    assert "!authorizedCardKeys.has(submittedKey)" in source
-    assert "reason:'authorizing'" not in source  # reason is computed dynamically, not hard-coded branch UI
-    assert "Authorizing card" in source
-    assert "grade_blocked" in source
-
-
-def test_numeric_jiten_bracket_ruby_never_leaks_literal_brackets() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    ruby_body = source.split("  function rubyHtml(value) {", 1)[1].split("\n  function meaningRows", 1)[0]
-    ruby_function = "function rubyHtml(value) {" + ruby_body
-    script = f"""
-const esc = value => String(value ?? '');
-{ruby_function}
-process.stdout.write(rubyHtml('2[に]時[じ]'));
+# The review gate before an episode: review_gate_status blocks until window.__granted;
+# review_gate_review answers are held in window.__reviews until the test resolves them.
+GATE = r"""
+const PATH = '/v/Show - 01.mkv';
+const CARD = (wordId, word, extra = {}) => ({wordId, readingIndex: 0, wordText: word, wordTextPlain: word,
+  readings: [{readingIndex: 0, text: 'よみ'}], definitions: [{meanings: ['meaning ' + wordId]}], pudgeCardKey: `${wordId}:0`, ...extra});
+window.__granted = false; window.__reviews = [];
+__api.review_gate_status = async () => window.__granted ? {blocking: false, granted: true}
+  : {blocking: true, required: 2, completed: 0, remaining: 2, episode: 1};
+__api.review_gate_review = (...args) => new Promise(resolve => window.__reviews.push({args, resolve}));
+__api.play = async () => ({status: 'starting'});
+const gate = '#pudgeReviewGate';
+const view = () => ({word: __text(`${gate} .pudge-review-gate-word`), status: __text(`${gate} .pudge-review-gate-status`),
+  loading: __text(`${gate} .pudge-review-gate-loading`), back: __visible(`${gate} .pudge-review-gate-back`),
+  grades: [...document.querySelectorAll(`${gate} [data-review-gate-grade]`)].map(b => b.disabled),
+  busy: document.querySelector(gate)?.classList.contains('pudge-review-gate-busy') ?? null});
+const reveal = async () => { await __key(' ', {code: 'Space'}); await __tick(20); };
+const grade = async id => { await __click(`${gate} [data-review-gate-grade="${id}"]`); await __tick(20); };
+const events = name => __apiCalls.filter(c => c.name === 'review_gate_ui_event' && c.args[0].event === name).map(c => c.args[0]);
 """
-    rendered = subprocess.check_output(["node", "-e", script], text=True)
-    assert "2[に]" not in rendered
-    assert "<ruby>2<rt>に</rt></ruby>" in rendered
-    assert "<ruby>時<rt>じ</rt></ruby>" in rendered
+
+
+def test_review_card_front_asks_for_recall_and_space_reveals_the_jiten_answer(page) -> None:
+    assert (en("gate.confusableReadings"), ru("gate.confusableReadings")) == (
+        "Confusable readings",
+        "Похожие чтения",
+    )
+    assert (en("gate.showAnswer"), ru("gate.showAnswer")) == ("Show answer", "Показать ответ")
+    assert en("gate.spaceKey") == "Space"
+    result = page.run(
+        GATE
+        + """
+        const full = CARD(10, '生活', {readings: [{readingIndex: 0, text: 'せいかつ', rubyText: '生[せい]活[かつ]'}],
+          definitions: [{meanings: ['life', 'living']}], partsOfSpeech: ['noun'], pitchAccents: [0], frequencyRank: 123,
+          intervalPreview: {againSeconds: 60, goodSeconds: 86400}, sourceDeckName: 'Example deck',
+          exampleSentence: {text: '生活を楽しむ。'}, confusableReadings: ['しょうかつ']});
+        __api.review_gate_begin = async () => ({blocking: true, granted: false, required: 2, completed: 0, remaining: 2, episode: 1,
+          cards: [full, CARD(11, '犬')]});
+        await __tick(100);
+        void startPlay(PATH); await __tick(50);
+        const out = {front: {...view(), text: __text(`${gate} .pudge-review-gate-front`),
+                             ruby: document.querySelectorAll(`${gate} .pudge-review-gate-front ruby`).length}};
+        await __key('a', {code: 'KeyA'}); await __tick(20);
+        out.otherKey = view().back;
+        await grade('good');                                     // the hidden button cannot grade either
+        out.hiddenGrade = {sent: window.__reviews.length, blocked: events('grade_blocked').map(e => e.reason)};
+        await reveal();
+        const back = `${gate} .pudge-review-gate-back`;
+        out.back = {...view(), text: __text(back),
+          ruby: [...document.querySelectorAll(`${gate} .pudge-review-gate-word ruby`)].map(r => [r.firstChild.textContent, r.querySelector('rt').textContent]),
+          wordShown: __visible(`${gate} .pudge-review-gate-word`), recallHidden: !__visible(`${gate} [data-review-gate-show-answer]`) && !__visible(`${gate} .pudge-review-gate-front-confusable`),
+          pitch: document.querySelectorAll(`${gate} .pudge-review-gate-pitch .pudge-inline-pitch`).length,
+          meanings: [...document.querySelectorAll(`${gate} .pudge-review-gate-meanings li`)].map(li => li.textContent),
+          grades: [...document.querySelectorAll(`${gate} [data-review-gate-grade]`)].map(b => b.textContent)};
+        await __key('Escape'); await __tick(20);
+        out.closed = !PudgeReviewGate.isOpen();
+        out.texts = {confusable: t('gate.confusableReadings'), show: `${t('gate.showAnswer')} ${t('gate.spaceKey')}`,
+                     again: t('gate.intervalMinutes', {value: 1}), good: t('gate.intervalDays', {value: 1})};
+        return out;
+        """,
+    )
+    out = result.value
+    texts = out["texts"]
+    # Front: the word only (plus Jiten's confusable readings) and "Show answer Space".
+    assert out["front"]["word"] == "生活" and out["front"]["back"] is False and out["front"]["ruby"] == 0
+    assert out["front"]["text"].splitlines() == ["生活", texts["confusable"], "しょうかつ", texts["show"]]
+    # Other keys and grades do nothing before the answer is shown.
+    assert out["otherKey"] is False
+    assert out["hiddenGrade"] == {"sent": 0, "blocked": ["answer_hidden"]}
+    # Space shows the back with Jiten's details, from the card itself.
+    back = out["back"]
+    assert back["back"] is True
+    assert back["wordShown"] is True and back["ruby"] == [
+        ["生", "せい"],
+        ["活", "かつ"],
+    ]  # furigana over the word
+    assert back["recallHidden"] is True
+    assert back["pitch"] == 1 and "Pitch" not in back["text"]  # drawn, not "Pitch: 0"
+    for detail in ("せいかつ", "#123", "noun", "生活を楽しむ。", "Example deck"):
+        assert detail in back["text"], detail
+    assert back["meanings"] == ["life", "living"]
+    assert back["grades"][0].endswith(texts["again"]) and back["grades"][2].endswith(texts["good"])
+    # Escape cancels the gate (it never reveals), and the episode does not start.
+    assert out["closed"] is True and not result.called("play")
+    # The back stays hidden in WebKit too, whatever display rules it gets.
+    assert css_rules("review_gate.css").get(".pudge-review-gate-back[hidden]", "display") == "none"
+
+
+def test_next_card_shows_at_once_while_the_previous_review_is_saved(page) -> None:
+    assert en("gate.savingPrevious").startswith("Saving previous")
+    result = page.run(
+        GATE
+        + """
+        __api.review_gate_begin = async () => ({blocking: true, granted: false, required: 2, completed: 0, remaining: 2, episode: 1,
+          cards: [CARD(10, '一'), CARD(11, '2時', {readings: [{readingIndex: 0, text: 'にじ', rubyText: '2[に]時[じ]'}], deckOccurrences: [{originalTitle: 'Show', occurrences: 3}]}), CARD(12, '三')]});
+        await __tick(100);
+        void startPlay(PATH); await __tick(50);
+        const out = {first: view()};
+        await reveal(); await grade('good');
+        out.saving = view();                                     // card 2 at once, card 1 still on its way to Jiten
+        out.sent = window.__reviews.map(r => r.args.slice(0, 4));
+        out.attempt = window.__reviews[0].args[4];
+        window.__reviews[0].resolve({ok: true, outcome: 'unknown', completed: 0, remaining: 2, required: 2, blocking: true});
+        await __tick(20);
+        out.unknown = {...view(), toasts: __toasts()};
+        await reveal();
+        out.ruby = [...document.querySelectorAll(`${gate} .pudge-review-gate-word ruby`)].map(r => [r.firstChild.textContent, r.querySelector('rt').textContent]);
+        out.answer = __text(`${gate} .pudge-review-gate-word`);
+        out.source = __text(`${gate} .pudge-review-gate-source`);
+        await grade('good');
+        window.__reviews[1].resolve({ok: true, outcome: 'confirmed', completed: 1, remaining: 1, required: 2, blocking: true});
+        await __tick(20);
+        out.confirmed = view();
+        await reveal(); await grade('easy');
+        window.__granted = true;
+        window.__reviews[2].resolve({ok: true, outcome: 'confirmed', completed: 2, remaining: 0, required: 2, granted: true, blocking: false});
+        await __tick(50);
+        out.open = PudgeReviewGate.isOpen();
+        out.texts = {saving: t('gate.savingPrevious'), unknown: t('gate.reviewOutcomeIsUnknownIt'),
+                     of: [0, 1].map(n => t('gate.reviewedOf', {completed: n, required: 2}))};
+        out.events = ['review_optimistic', 'review_optimistic_confirm', 'review_optimistic_rollback'].map(name => events(name).length);
+        return out;
+        """,
+    )
+    out = result.value
+    texts = out["texts"]
+    assert out["first"]["word"] == "一" and out["first"]["status"] == texts["of"][0]
+    # The next card is drawn before Jiten answers; the count already includes the review.
+    assert out["saving"]["word"] == "2時"
+    assert out["saving"]["status"] == texts["of"][1] + texts["saving"]
+    assert out["saving"]["grades"] == [True] * 4 and out["saving"]["busy"] is False
+    assert out["sent"] == [["/v/Show - 01.mkv", 10, 0, "good"]] and out["attempt"]
+    # A lost answer takes the optimistic count back and says so.
+    assert out["unknown"]["status"] == texts["of"][0] and out["unknown"]["grades"] == [False] * 4
+    assert out["unknown"]["toasts"] == [texts["unknown"]]
+    # Jiten's bracket furigana over digits never shows the brackets.
+    assert out["ruby"] == [["2", "に"], ["時", "じ"]] and "[" not in out["answer"]
+    assert out["source"].endswith("Show ×3")  # where the word occurs, without a source deck
+    assert out["confirmed"]["status"] == texts["of"][1]
+    # The last review grants the episode: the gate closes and the episode starts.
+    assert out["open"] is False
+    assert result.calls_of("play") == [["/v/Show - 01.mkv", False, False, False]]
+    assert out["events"] == [3, 2, 1]
+
+
+def test_warm_cards_show_at_once_and_grade_after_authorization(page) -> None:
+    assert en("gate.authorizingCard").startswith("Authorizing card")
+    warm = [
+        {"wordId": 1, "readingIndex": 0, "wordText": "一", "wordTextPlain": "一", "pudgeCardKey": "1:0"},
+        {"wordId": 2, "readingIndex": 0, "wordText": "二", "wordTextPlain": "二", "pudgeCardKey": "2:0"},
+    ]
+    code = (
+        GATE
+        + """
+        window.__begin = [];
+        __api.review_gate_begin = () => new Promise(resolve => window.__begin.push(resolve));
+        await __tick(100);
+        void startPlay(PATH); await __tick(20);
+        const out = {opened: view()};
+        await reveal();
+        out.revealed = view();
+        window.__begin[0]({blocking: true, granted: false, required: 2, completed: 0, remaining: 2, episode: 1, cards: [CARD(1, '一'), CARD(2, '二')]});
+        await __tick(20);
+        out.authorized = view();
+        out.texts = {authorizing: t('gate.authorizingCard'), loading: t('gate.loadingJitenReviewCard'), of: t('gate.reviewedOf', {completed: 0, required: 2})};
+        return out;
+        """
+    )
+    # Cards warmed by the background prefetch: painted at once, grades wait for review_gate_begin.
+    with_warm = page.run(code, api={"review_gate_prefetch": {"cards": warm, "target": 2}}).value
+    texts = with_warm["texts"]
+    assert with_warm["opened"]["word"] == "一" and with_warm["opened"]["busy"] is False
+    assert with_warm["opened"]["status"] == texts["of"] + texts["authorizing"]
+    assert with_warm["revealed"]["back"] is True and with_warm["revealed"]["grades"] == [True] * 4
+    assert (
+        with_warm["authorized"]["status"] == texts["of"] and with_warm["authorized"]["grades"] == [False] * 4
+    )
+    assert with_warm["authorized"]["busy"] is False
+    # Nothing warmed: a loading card (the backdrop stays clickable to cancel) until the cards arrive.
+    cold = page.run(code).value
+    assert cold["opened"]["word"] is None and cold["opened"]["busy"] is True
+    assert cold["opened"]["loading"] == texts["loading"]
+    assert cold["authorized"]["word"] == "一" and cold["authorized"]["busy"] is False
 
 
 def test_review_gate_ui_diagnostics_are_logged(tmp_path: Path) -> None:
     api, _video, _service = _api(tmp_path)
     lines: list[str] = []
     api.logger = SimpleNamespace(info=lambda fmt, *args: lines.append(fmt % args))
-    result = api.review_gate_ui_event({
-        "event": "grade_blocked",
-        "card": "10:0",
-        "reason": "authorizing",
-        "enabled": False,
-        "duration_ms": 17,
-    })
+    result = api.review_gate_ui_event(
+        {
+            "event": "grade_blocked",
+            "card": "10:0",
+            "reason": "authorizing",
+            "enabled": False,
+            "duration_ms": 17,
+        }
+    )
     assert result == {"ok": True}
     assert any("EVENT review_gate.ui event=grade_blocked" in line for line in lines)
     assert any("card=10:0" in line and "reason=authorizing" in line for line in lines)
@@ -268,24 +346,9 @@ def _play_api(tmp_path: Path, *, age: float, ack_file: Path) -> tuple[WebAppApi,
     api._play_exit_codes = {}
     api._play_last_logged_status = {}
     api._play_registry_path = tmp_path / "active-playbacks.json"
-    api._play_registry = {
-        key: {"pid": launcher.pid, "started_at": started_at, "ack_file": str(ack_file)}
-    }
+    api._play_registry = {key: {"pid": launcher.pid, "started_at": started_at, "ack_file": str(ack_file)}}
     api.logger = _PlaybackLogger()
     return api, key, launcher
-
-
-def test_review_count_is_optimistic_before_jiten_round_trip() -> None:
-    source = (WEB / "review_gate.js").read_text(encoding="utf-8")
-    submit = source.split("  async function submitGrade(grade) {", 1)[1].split("\n  async function open(", 1)[0]
-    optimistic = submit.index("optimisticReviewed += 1;")
-    repaint = submit.index("render({loading:false}, {replaceCards:false});", optimistic)
-    network = submit.index("await (launch.content?window.pywebview.api.content_review_review:window.pywebview.api.review_gate_review)(", repaint)
-    assert optimistic < repaint < network
-    assert "review_optimistic" in submit
-    assert "review_optimistic_confirm" in submit
-    assert "review_optimistic_rollback" in submit
-    assert "displayedCompleted(currentStatus" in submit
 
 
 def test_play_state_becomes_running_only_after_real_mpv_spawn_ack(tmp_path: Path) -> None:
@@ -342,14 +405,36 @@ def test_run_mpv_writes_spawn_ack_and_logs_lifecycle(tmp_path: Path, monkeypatch
     assert float(payload["started_at"]) > 0
 
 
-def test_play_monitor_surfaces_backend_startup_error() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    monitor = html.split("function monitorPlay(path,queueContext=null){", 1)[1].split("async function startPlay", 1)[0]
-    assert "status.error||t('error.mpv'" in monitor
+def test_play_monitor_surfaces_backend_startup_error(page) -> None:
+    result = page.run(
+        """
+        window.__status = {status: 'failed', error: 'mpv could not open the display', exit_code: -1};
+        __api.review_gate_status = async () => ({blocking: false, granted: true});
+        __api.play = async () => ({status: 'starting'});
+        __api.play_status = async () => window.__status;
+        await __tick(100);
+        await startPlay('/v/a.mkv'); await __tick(2000);
+        const backend = __toasts();
+        window.__status = {status: 'failed', exit_code: 2};
+        await startPlay('/v/b.mkv'); await __tick(2000);
+        return {backend, generic: __toasts(), mpv: t('error.mpv', {code: 2})};
+        """,
+    )
+    out = result.value
+    assert "mpv could not open the display" in out["backend"]
+    assert out["mpv"] in out["generic"]
 
 
-def test_player_focus_helper_has_timeout() -> None:
-    source = (ROOT / "pudge" / "player.py").read_text(encoding="utf-8")
-    focus = source.split("def _focus_mpv_process", 1)[1].split("def run_mpv", 1)[0]
-    assert "timeout=1.5" in focus
-    assert "subprocess.TimeoutExpired" in focus
+def test_player_focus_helper_gives_up_instead_of_hanging(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def hanging(*_args, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired("osascript", kwargs.get("timeout"))
+
+    monkeypatch.setattr(player.sys, "platform", "darwin")
+    monkeypatch.setattr(player.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(player.subprocess, "run", hanging)
+    assert player._focus_mpv_process(4321) is None
+    # One bounded attempt: System Events never blocks playback for long.
+    assert len(calls) == 1 and 0 < calls[0]["timeout"] <= 2

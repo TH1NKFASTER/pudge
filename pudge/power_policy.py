@@ -71,10 +71,7 @@ class PowerPolicy:
         self._semantic: tuple[Any, ...] | None = None
 
     def update_settings(self, *, manual_enabled: bool, auto_enabled: bool) -> None:
-        changed = (
-            self.manual_enabled != bool(manual_enabled)
-            or self.auto_enabled != bool(auto_enabled)
-        )
+        changed = self.manual_enabled != bool(manual_enabled) or self.auto_enabled != bool(auto_enabled)
         self.manual_enabled = bool(manual_enabled)
         self.auto_enabled = bool(auto_enabled)
         if not self.auto_enabled:
@@ -98,6 +95,7 @@ class PowerPolicy:
     def _native_power_state() -> tuple[bool | None, bool | None]:
         try:
             from Foundation import NSProcessInfo
+
             info = NSProcessInfo.processInfo()
             low = bool(info.isLowPowerModeEnabled()) if hasattr(info, "isLowPowerModeEnabled") else None
             thermal = int(info.thermalState()) >= 2 if hasattr(info, "thermalState") else None
@@ -139,12 +137,11 @@ class PowerPolicy:
         try:
             thermal_text = "" if native_thermal is not None else self._run(["pmset", "-g", "therm"])
             limits = [
-                int(value)
-                for value in re.findall(
-                    r"(?:CPU|GPU)_Speed_Limit\s*=\s*(\d+)", thermal_text
-                )
+                int(value) for value in re.findall(r"(?:CPU|GPU)_Speed_Limit\s*=\s*(\d+)", thermal_text)
             ]
-            thermal = bool(native_thermal) if native_thermal is not None else bool(limits and min(limits) < 100)
+            thermal = (
+                bool(native_thermal) if native_thermal is not None else bool(limits and min(limits) < 100)
+            )
             thermal_ok = True
             self._last_good_thermal = bool(thermal)
             self._last_good_thermal_at = now
@@ -165,13 +162,11 @@ class PowerPolicy:
             thermal = self._last_good_thermal
 
         if not battery_ok and (
-            self._last_good_battery is None
-            or now - self._last_good_battery_at > self.LAST_GOOD_TTL_SECONDS
+            self._last_good_battery is None or now - self._last_good_battery_at > self.LAST_GOOD_TTL_SECONDS
         ):
             on_battery, percent = None, None
         if not thermal_ok and (
-            self._last_good_thermal is None
-            or now - self._last_good_thermal_at > self.LAST_GOOD_TTL_SECONDS
+            self._last_good_thermal is None or now - self._last_good_thermal_at > self.LAST_GOOD_TTL_SECONDS
         ):
             thermal = None
 
@@ -179,11 +174,7 @@ class PowerPolicy:
 
     def snapshot(self, *, refresh: bool = False) -> PowerSnapshot:
         now = self._monotonic()
-        if (
-            not refresh
-            and self._cache is not None
-            and now - self._cache_at < self.CACHE_SECONDS
-        ):
+        if not refresh and self._cache is not None and now - self._cache_at < self.CACHE_SECONDS:
             return self._cache
 
         on_battery, percent, thermal, fresh = self._observe()

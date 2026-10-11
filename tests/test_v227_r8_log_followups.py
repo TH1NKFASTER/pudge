@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import time
 from pathlib import Path
 
@@ -41,17 +40,56 @@ def _search_kwargs() -> dict[str, object]:
     }
 
 
-def test_schedule_home_cards_use_normal_compact_card_state() -> None:
-    html = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "personalScheduleBadge" not in html
-    assert "personal-schedule-badge" not in html
-    assert "function personalScheduleCardDateText(value)" not in html
-    caught = html[html.index("function caughtUpHomeCard(a)"):html.index("function droppedHomeCard(a)")]
-    assert "t('label.airingIn',{episode:Number(schedule.next_episode),time:formatRemaining(scheduledRemaining)})" in caught
-    assert "next_unlock_local" not in caught
-    ready = html[html.index("function readyHomeCard(a)"):html.index("function readySequenceCard(group)")]
-    assert "personal_schedule" not in ready
-    assert "personalSchedule" not in ready
+NOW = 1_790_856_000  # the page's clock: 2026-10-01 12:00 UTC
+SCHEDULE = {
+    "enabled": True,
+    "eligible": True,
+    "status": "caught_up",
+    "next_episode": 4,
+    "next_unlock_at": NOW + 2 * 3600,
+    "next_unlock_local": "2026-10-03T09:00:00",
+}
+
+
+def test_schedule_home_cards_use_normal_compact_card_state(page) -> None:
+    # Anime watched on a personal schedule look like any other Home card: no schedule badge and no
+    # unlock date; a caught-up card says when the next episode unlocks ("airs in"), counted from
+    # the unlock time (the cadence and the local date are not shown: test_v0728_g19_release_migration_schedule_ui.py).
+    ready = {
+        "media_id": 7,
+        "title": "Scheduled",
+        "site_url": "https://anilist.co/anime/7",
+        "ready_episodes": [3],
+        "local": {"video_path": "/v/Scheduled - 03.mkv", "episode": 3, "state": "ready"},
+    }
+    caught = {
+        "media_id": 8,
+        "title": "Waiting Unlock",
+        "site_url": "https://anilist.co/anime/8",
+        "media_status": "RELEASING",
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('current', true); renderCurrent(); await __tick(20);
+            const card = id => document.querySelector(`#currentContent article[data-media-id="${id}"]`);
+            return {ready: card(7).querySelector('.airing-meta').innerText, caught: card(8).querySelector('.airing-state').innerText,
+                    badges: document.querySelectorAll('#currentContent [class*="schedule"]').length,
+                    expected: {ready: `${t('label.episode')} 3`, caught: t('label.airingIn', {episode: 4, time: formatRemaining(2 * 3600)})}};
+            """,
+            lang=lang,
+            state={
+                "home": {
+                    "new_ready": [{**ready, "personal_schedule": SCHEDULE}],
+                    "caught_up": [{**caught, "personal_schedule": SCHEDULE}],
+                }
+            },
+        )
+        out = result.value
+        assert out["ready"].splitlines() == ["Scheduled", out["expected"]["ready"]]
+        assert out["caught"] == out["expected"]["caught"]
+        assert out["badges"] == 0
+        assert "2026-10-03" not in out["ready"] + out["caught"]
 
 
 def test_notification_helper_typeerror_is_best_effort_failure(monkeypatch, tmp_path: Path) -> None:
@@ -67,11 +105,8 @@ def test_notification_helper_typeerror_is_best_effort_failure(monkeypatch, tmp_p
     assert send_native_notification("Episode ready", "Example") is False
 
 
-def test_update_unloads_agent_before_runtime_package_is_removed() -> None:
-    source = Path("install.sh").read_text(encoding="utf-8")
-    early = 'launchctl bootout "gui/$(id -u)" "$AGENT_PLIST"'
-    destructive = 'rm -rf "$INSTALL_SITE_PACKAGES/pudge"'
-    assert source.index(early) < source.index(destructive)
+# The update stops the scheduled agent before the runtime package is replaced:
+# test_v142_exact_runtime_wheel_install.py (test_same_version_update_replaces_the_whole_package).
 
 
 def test_automatic_nyaa_stops_after_first_failed_route_query() -> None:
@@ -164,7 +199,6 @@ def test_jimaku_transport_failure_without_cache_retries_only_once(monkeypatch, t
         client.close()
 
 
-
 def test_ln_audiobook_recovery_is_safe_for_partial_webapp_instances() -> None:
     from pudge.web_app import WebAppApi
 
@@ -182,7 +216,5 @@ def test_notification_helper_mode_restores_active_environment(monkeypatch) -> No
 
     from pudge.notifications import maybe_handle_notification_helper
 
-    assert maybe_handle_notification_helper(
-        ["--pudge-native-notification", "Episode ready", "Example"]
-    ) == 0
+    assert maybe_handle_notification_helper(["--pudge-native-notification", "Episode ready", "Example"]) == 0
     assert "PUDGE_NOTIFICATION_HELPER_ACTIVE" not in __import__("os").environ

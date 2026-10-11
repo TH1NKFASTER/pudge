@@ -16,6 +16,7 @@ from pudge.review_providers import (
     JitenReviewProvider,
     provider_capabilities,
 )
+from tests.i18n_support import en, ru
 
 
 def _service(tmp_path: Path) -> LightNovelService:
@@ -92,9 +93,7 @@ def test_jiten_review_is_single_send_with_stable_client_request_id(
     }
 
 
-def test_jiten_ambiguous_failure_is_not_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_jiten_ambiguous_failure_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     service.save_settings({"jiten_api_key": "jiten-token"})
     calls = 0
@@ -160,9 +159,7 @@ def test_jiten_candidate_api_excludes_new_cards_and_history_proves_prior_review(
     assert snapshot["review_count"] == 1
 
 
-def test_jpdb_native_review_uses_v1_endpoint_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_jpdb_native_review_uses_v1_endpoint_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     service.save_settings({"jpdb_api_token": "jpdb-token", "study_backend": "jpdb"})
     calls: list[tuple[str, dict]] = []
@@ -187,9 +184,7 @@ def test_jpdb_native_review_uses_v1_endpoint_once(
     assert calls == [(f"{JPDB_API_BASE}/review", {"vid": 555, "sid": 777, "grade": "okay"})]
 
 
-def test_jpdb_ambiguous_failure_is_not_retried(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_jpdb_ambiguous_failure_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service(tmp_path)
     service.save_settings({"jpdb_api_token": "jpdb-token", "study_backend": "jpdb"})
     calls = 0
@@ -278,7 +273,7 @@ def test_jiten_selected_keeps_jiten_state_and_namespace(tmp_path: Path) -> None:
         "tokens": [[{"wordId": 10, "readingIndex": 1, "start": 0, "end": 1}]],
     }
     tokens, vocabulary = service._provider_scoped_study_payload(parsed, "jiten")
-    assert vocabulary[0]["normalizedState"] == "known"
+    assert vocabulary[0]["normalizedState"] == "mature"  # an older "known" is Jiten's Mature
     assert vocabulary[0]["reviewable"] is True
     assert tokens[0][0]["idNamespace"] == "jiten"
 
@@ -311,20 +306,81 @@ def test_identity_hash_ambiguity_does_not_choose_arbitrary_row(tmp_path: Path) -
     assert resolver.lookup(torrent_hash="abc") is None
 
 
-def test_review_ui_has_single_flight_attempt_and_generation_guard() -> None:
-    source = Path("pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    assert "pendingReview" in source
-    assert "reviewOutcomeUnknown" in source
-    assert "crypto?.randomUUID?.()" in source
-    assert "attempt_id: attemptId" in source
-    assert "id_namespace: current.idNamespace" in source
-    assert "activeToken !== current" in source
-    assert "activeToken?.generation !== current.generation" in source
-    assert "automatic retry is blocked" in source
-    index = Path("pudge/web/index.html").read_text(encoding="utf-8")
-    assert "lnLegacyReviewPending" in index
-    assert "attempt_id:attemptId" in index
-    assert "id_namespace:'jiten'" in index
+# Reader words whose cards come from a cached parse ("young, in no deck"): a grade waits for
+# the card's live refresh. study_states answers are held per word until release(id).
+REVIEWS = r"""
+window.__held = []; window.__hold = true;
+window.__result = {ok: true, outcome: 'confirmed'};
+__api.study_provider_capabilities = async () => ({account_key: 'jiten:me', configured: true});
+__api.study_action = async () => window.__result;
+window.__live = {'1:0': {states: ['young'], normalizedState: 'learning', studyDeckIds: []},
+                 '2:0': {states: ['mature'], normalizedState: 'learning', rawStateLabel: 'Mature', studyDeckIds: []},
+                 '3:0': {states: ['young'], normalizedState: 'learning', studyDeckIds: []}};
+__api.study_states = payload => {
+  const answer = () => ({ok: true, account_scope: 'jiten:me', states: payload.words.map(([w, r]) => ({ok: true, wordId: w, readingIndex: r, ...window.__live[`${w}:${r}`]}))});
+  if (!window.__hold) return Promise.resolve(answer());
+  return new Promise(resolve => window.__held.push({ids: payload.words.map(([w]) => w), go: () => resolve(answer())}));
+};
+const release = async id => { for (const h of window.__held.filter(h => h.ids.includes(id))) { window.__held.splice(window.__held.indexOf(h), 1); h.go(); } await __tick(50); };
+const words = [['少し', 1], ['猫', 2], ['犬', 3]];
+let pos = 0;
+const tokens = words.map(([text, wordId]) => { const start = pos; pos += text.length;
+  return {wordId, readingIndex: 0, start, end: pos, card: {spelling: text, states: ['young'], studyDeckIds: []}}; });
+const box = document.createElement('div');
+box.innerHTML = PudgeReadingTools.study.renderParsedText({paragraphs: [words.map(w => w[0]).join('')], tokens: [tokens], vocabulary: []}, {backend: 'jiten'});
+document.body.appendChild(box);
+await __tick(100);
+const open = async text => { const node = [...box.querySelectorAll('[data-pudge-study-token]')].find(n => n.textContent === text);
+  await __click(`[data-pudge-study-token="${node.dataset.pudgeStudyToken}"]`); await __tick(20); };
+const good = async () => { await __click('#pudgeStudyCard [data-pudge-study-review="good"]'); await __tick(20); };
+const reviews = () => __apiCalls.filter(c => c.name === 'study_action').map(c => c.args[0]);
+"""
+
+
+def test_word_card_sends_each_review_once_and_only_for_the_open_card(page) -> None:
+    assert en("reading.reviewOutcomeUnknownGradeAgain").startswith(
+        "Jiten did not answer; the review may be saved."
+    )
+    assert ru("reading.reviewOutcomeUnknownGradeAgain").startswith(
+        "Jiten не ответил; повторение могло сохраниться."
+    )
+    result = page.run(
+        REVIEWS
+        + """
+        const out = {};
+        await open('少し'); await good(); await good();          // two quick clicks while the refresh is pending
+        out.whilePending = reviews().length;
+        await release(1);
+        out.once = reviews().map(r => [r.word_id, r.grade]);
+        await open('猫'); await good();                          // graded, then closed before the refresh answered
+        await __click('[data-pudge-study-close]');
+        await open('犬');
+        await release(2);                                        // 猫's late answer arrives while 犬 is open
+        out.afterClose = reviews().length;
+        out.otherCardBadge = __text('#pudgeStudyCard .pudge-study-state');
+        window.__hold = false;
+        window.__result = {ok: true, outcome: 'unknown'};        // the provider's answer was lost
+        await release(3); await good(); await __tick(50);
+        window.__result = {ok: true, outcome: 'unknown', message: 'Jiten did not answer'};
+        await open('少し'); await good(); await __tick(50);
+        out.toasts = __toasts();
+        out.unknown = t('reading.reviewOutcomeUnknownGradeAgain');
+        out.young = t('reading.state.young');
+        return out;
+        """,
+    )
+    out = result.value
+    assert out["whilePending"] == 0 and out["once"] == [[1, "good"]]
+    assert out["afterClose"] == 1  # nothing sent for the closed card
+    assert out["otherCardBadge"] == out["young"]  # 犬 keeps its own state, not 猫's "Mature"
+    # An unknown outcome is not retried automatically; the toast says grading again is
+    # safe (the backend resends the same attempt id), whatever the provider's message.
+    assert out["toasts"] == [out["unknown"]]  # the same toast for both
+    sent = [call for [call] in result.calls_of("study_action")]
+    assert [row["word_id"] for row in sent] == [1, 3, 1]
+    # Every review carries its own attempt id (the backend's idempotency key) and the id namespace.
+    assert len({row["attempt_id"] for row in sent}) == 3 and all(row["attempt_id"] for row in sent)
+    assert {row["id_namespace"] for row in sent} == {"jiten"}
 
 
 def test_jpdb_capabilities_match_official_openapi_contract() -> None:

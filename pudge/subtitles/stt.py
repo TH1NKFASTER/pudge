@@ -12,14 +12,47 @@ from typing import Any
 from ..subtitle_formats import write_srt
 
 
+# Same MLX limits as audiobook STT: a whole episode otherwise peaks at 0.5-0.7 GB.
+STT_MLX_CACHE_LIMIT_BYTES = 512 * 1024 * 1024
+STT_MLX_MEMORY_LIMIT_BYTES = 6 * 1024 * 1024 * 1024
+
+
+def _stt_worker_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    environment.setdefault("PUDGE_MLX_CACHE_LIMIT_BYTES", str(STT_MLX_CACHE_LIMIT_BYTES))
+    environment.setdefault("PUDGE_MLX_MEMORY_LIMIT_BYTES", str(STT_MLX_MEMORY_LIMIT_BYTES))
+    return environment
+
+
+_WORKER_AVAILABILITY: dict[str, dict[str, Any]] = {}
+
+
 def _worker_availability(python: str) -> dict[str, Any]:
+    """Whether the MLX worker can run; checked once per process (it imports MLX)."""
+    cached = _WORKER_AVAILABILITY.get(python)
+    if cached is not None:
+        return dict(cached)
+    result = _check_worker_availability(python)
+    if result.get("reason") != "stt_timeout":  # a slow first import may succeed later
+        _WORKER_AVAILABILITY[python] = dict(result)
+    return result
+
+
+def _check_worker_availability(python: str) -> dict[str, Any]:
     try:
         completed = subprocess.run(
             [python, "-m", "pudge.subtitles.stt_worker", "--check"],
-            text=True, capture_output=True, timeout=15, check=False,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"available": False, "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_unavailable", "error": str(exc)}
+        return {
+            "available": False,
+            "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_unavailable",
+            "error": str(exc),
+        }
     if completed.returncode:
         return {
             "available": False,
@@ -58,25 +91,34 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _select_japanese_audio_stream(
-    video: Path, ffprobe_path: str | None
-) -> tuple[int | None, dict[str, Any]]:
+def _select_japanese_audio_stream(video: Path, ffprobe_path: str | None) -> tuple[int | None, dict[str, Any]]:
     if not str(ffprobe_path or "").strip():
         return None, {"available": False, "selection_reason": "ffprobe_not_provided"}
     try:
         completed = subprocess.run(
             [
-                str(ffprobe_path), "-v", "error", "-select_streams", "a",
-                "-show_entries", "stream=index,codec_name:stream_tags=language,title:stream_disposition=default",
-                "-of", "json", str(video),
+                str(ffprobe_path),
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index,codec_name:stream_tags=language,title:stream_disposition=default",
+                "-of",
+                "json",
+                str(video),
             ],
-            text=True, capture_output=True, timeout=30, check=False,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, {"available": False, "selection_reason": "ffprobe_failed", "error": str(exc)}
     if completed.returncode != 0:
         return None, {
-            "available": False, "selection_reason": "ffprobe_failed",
+            "available": False,
+            "selection_reason": "ffprobe_failed",
             "error": (completed.stderr or completed.stdout).strip()[-1000:],
         }
     try:
@@ -127,11 +169,14 @@ def _select_japanese_audio_stream(
                 "index": row.get("index"),
                 "codec": str(row.get("codec_name") or ""),
                 "language": str((row.get("tags") or {}).get("language") or "")
-                if isinstance(row.get("tags"), dict) else "",
+                if isinstance(row.get("tags"), dict)
+                else "",
                 "title": str((row.get("tags") or {}).get("title") or "")
-                if isinstance(row.get("tags"), dict) else "",
+                if isinstance(row.get("tags"), dict)
+                else "",
                 "default": bool((row.get("disposition") or {}).get("default"))
-                if isinstance(row.get("disposition"), dict) else False,
+                if isinstance(row.get("disposition"), dict)
+                else False,
             }
             for row in streams
         ],
@@ -139,10 +184,7 @@ def _select_japanese_audio_stream(
 
 
 def _cache_key(content_fingerprint: str, model: str, audio_stream_index: int | None) -> str:
-    raw = (
-        f"stt-v4-content-audio-text-clock:{content_fingerprint}:"
-        f"{model}:{audio_stream_index}"
-    )
+    raw = f"stt-v4-content-audio-text-clock:{content_fingerprint}:{model}:{audio_stream_index}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
 
 
@@ -181,7 +223,8 @@ def prepare_japanese_stt_reference(
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             payload = {}
         return reference, {
-            "available": True, "cache": "hit",
+            "available": True,
+            "cache": "hit",
             "video_content_fingerprint": content_fingerprint,
             "audio_stream": audio_stream,
             **payload,
@@ -209,8 +252,9 @@ def prepare_japanese_stt_reference(
                 "1",
                 "-ar",
                 "16000",
+                # The FLAC is deleted right after transcription: no heavy compression.
                 "-compression_level",
-                "8",
+                "0",
                 str(audio),
             ],
             text=True,
@@ -246,11 +290,13 @@ def prepare_japanese_stt_reference(
             text=True,
             capture_output=True,
             timeout=max(60.0, float(timeout_seconds)),
+            env=_stt_worker_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         audio.unlink(missing_ok=True)
         return None, {
-            "available": False, "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_worker_failed",
+            "available": False,
+            "reason": "stt_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "stt_worker_failed",
             "audio_stream": audio_stream,
             "video_content_fingerprint": content_fingerprint,
             "audio_sha256": audio_sha256,
@@ -288,7 +334,9 @@ def prepare_japanese_stt_reference(
             cues.append((start, end, text))
     if len(cues) < 8:
         return None, {
-            "available": False, "reason": "stt_too_few_segments", "segments": len(cues),
+            "available": False,
+            "reason": "stt_too_few_segments",
+            "segments": len(cues),
             "audio_stream": audio_stream,
             "video_content_fingerprint": content_fingerprint,
             "audio_sha256": audio_sha256,
@@ -297,8 +345,12 @@ def prepare_japanese_stt_reference(
     write_srt(cues, reference)
     reference_sha256 = _file_sha256(reference)
     info = {
-        "model": model, "segments": len(cues), "language": "ja", "word_timestamps": True,
-        "transcript_path": str(result_path), "reference_path": str(reference),
+        "model": model,
+        "segments": len(cues),
+        "language": "ja",
+        "word_timestamps": True,
+        "transcript_path": str(result_path),
+        "reference_path": str(reference),
         "reference_sha256": reference_sha256,
         "video_content_fingerprint": content_fingerprint,
         "audio_stream": audio_stream,

@@ -10,11 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from .i18n import err
 
 JITEN_MPV_INSTALLER_COMMIT = "90e407cc5dd963d5e36babf2a1e2ea4db2b07e6c"
 JITEN_MPV_INSTALLER_URL = (
-    "https://raw.githubusercontent.com/Sirush/JitenMPV/"
-    f"{JITEN_MPV_INSTALLER_COMMIT}/installers/unix.sh"
+    f"https://raw.githubusercontent.com/Sirush/JitenMPV/{JITEN_MPV_INSTALLER_COMMIT}/installers/unix.sh"
 )
 JITEN_MPV_RELEASES_API = "https://api.github.com/repos/Sirush/JitenMPV/releases/latest"
 JITEN_MPV_VERSION_MARKER = ".pudge-version"
@@ -140,13 +140,13 @@ def _latest_jiten_release() -> tuple[str, str]:
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError, TypeError) as exc:
-        raise FirstExperienceError(f"Could not check JitenMPV updates: {exc}") from exc
+        raise FirstExperienceError(err("setup.jitenMpvCheckFailed", error=exc)) from exc
     if not isinstance(payload, dict):
-        raise FirstExperienceError("Could not check JitenMPV updates: invalid GitHub response")
+        raise FirstExperienceError(err("setup.jitenMpvInvalidResponse"))
     tag = str(payload.get("tag_name") or "").strip()
     version = _normalize_jiten_version(tag)
     if not tag or not version:
-        raise FirstExperienceError("Could not check JitenMPV updates: latest release has no version")
+        raise FirstExperienceError(err("setup.jitenMpvNoVersion"))
     return version, tag
 
 
@@ -233,7 +233,8 @@ def _jpdb_installations() -> list[dict[str, Path]]:
         except OSError:
             continue
         lua_files = [
-            path for path in entries
+            path
+            for path in entries
             if path.is_file()
             and path.suffix.casefold() in {".lua", ".js"}
             and _looks_like_jpdb_script(path, scripts_root)
@@ -246,7 +247,8 @@ def _jpdb_installations() -> list[dict[str, Path]]:
             for directory in nearby:
                 try:
                     servers.extend(
-                        path for path in directory.iterdir()
+                        path
+                        for path in directory.iterdir()
                         if path.is_file()
                         and "jpdb" in path.name.casefold()
                         and path.suffix.casefold() not in {".lua", ".json", ".txt", ".md"}
@@ -278,8 +280,7 @@ def _jpdb_paths() -> tuple[Path, Path, Path]:
         selected = max(
             installations,
             key=lambda item: (
-                item["server"].is_file()
-                and (os.name == "nt" or os.access(item["server"], os.X_OK)),
+                item["server"].is_file() and (os.name == "nt" or os.access(item["server"], os.X_OK)),
                 item["script"].name.casefold() == "main.lua",
             ),
         )
@@ -310,21 +311,15 @@ def mpv_study_status(
     jiten_installed = script_path.is_file() and program_dir.is_dir()
     jpdb_dir, jpdb_script, jpdb_server = _jpdb_paths()
     variants = _jpdb_installations()
-    jpdb_server_ready = jpdb_server.is_file() and (
-        os.name == "nt" or os.access(jpdb_server, os.X_OK)
-    )
+    jpdb_server_ready = jpdb_server.is_file() and (os.name == "nt" or os.access(jpdb_server, os.X_OK))
     # Lua-only forks may talk directly to jpdb. The official plugin additionally
     # ships an executable server, which is verified when present.
     jpdb_installed = jpdb_script.is_file() and (
         jpdb_server_ready or not any(item["server"].is_file() for item in variants)
     )
-    jiten_key = bool(str(jiten_api_key or "").strip()) or _json_secret_configured(
-        config_path, "api_key"
-    )
+    jiten_key = bool(str(jiten_api_key or "").strip()) or _json_secret_configured(config_path, "api_key")
     jpdb_config = jpdb_dir / "config.json"
-    jpdb_key = bool(str(jpdb_api_token or "").strip()) or _json_secret_configured(
-        jpdb_config, "apiToken"
-    )
+    jpdb_key = bool(str(jpdb_api_token or "").strip()) or _json_secret_configured(jpdb_config, "apiToken")
     selected = str(selected_plugin or "auto").strip().casefold()
     if selected not in {"auto", "jiten", "jpdb"}:
         selected = "auto"
@@ -394,9 +389,7 @@ def install_media_tools(*, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str
     if missing:
         brew = _brew_path()
         if not brew:
-            raise FirstExperienceError(
-                "Homebrew is required to install mpv and ffmpeg. Install it from brew.sh, then retry."
-            )
+            raise FirstExperienceError(err("setup.homebrewRequired"))
         try:
             completed = subprocess.run(
                 [brew, "install", *missing],
@@ -406,13 +399,13 @@ def install_media_tools(*, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str
                 timeout=1800,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise FirstExperienceError(f"Dependency installation failed: {exc}") from exc
+            raise FirstExperienceError(err("setup.dependencyInstallFailed", error=exc)) from exc
         if completed.returncode:
-            detail = (completed.stderr or completed.stdout or "Homebrew failed").strip()
+            detail = (completed.stderr or completed.stdout or err("setup.homebrewFailed")).strip()
             raise FirstExperienceError(detail[-2000:])
     after = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
     if not after["mpv"]["installed"] or not after["ffmpeg"]["installed"]:
-        raise FirstExperienceError("mpv or ffmpeg is still unavailable after installation")
+        raise FirstExperienceError(err("setup.mediaToolsMissing"))
     return after
 
 
@@ -500,9 +493,7 @@ def mpv_study_script_plan(
     jpdb_path = Path(str(status["jpdb_mpv"]["script_path"]))
     jpdb_variants = [Path(value) for value in status["jpdb_mpv"].get("detected_variants", [])]
     integration_paths = {
-        path.resolve(strict=False)
-        for path in (jiten_path, jpdb_path, *jpdb_variants)
-        if path.is_file()
+        path.resolve(strict=False) for path in (jiten_path, jpdb_path, *jpdb_variants) if path.is_file()
     }
     if not integration_paths:
         return {"exclusive": False, "selected": "", "scripts": []}
@@ -518,9 +509,7 @@ def mpv_study_script_plan(
             if candidate.is_file() and candidate.suffix.casefold() in {".lua", ".js", ".so", ".dll"}:
                 discovered.append(candidate)
 
-    ordinary = [
-        path for path in discovered if path.resolve(strict=False) not in integration_paths
-    ]
+    ordinary = [path for path in discovered if path.resolve(strict=False) not in integration_paths]
     effective = str(status["mpv_study"]["effective"] or "")
     selected_path = jiten_path if effective == "jiten" else jpdb_path if effective == "jpdb" else None
     if selected_path is not None and selected_path.is_file():
@@ -541,11 +530,11 @@ def _run_jiten_mpv_installer() -> None:
         response = httpx.get(JITEN_MPV_INSTALLER_URL, timeout=30, follow_redirects=True)
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise FirstExperienceError(f"Could not download the JitenMPV installer: {exc}") from exc
+        raise FirstExperienceError(err("setup.jitenMpvDownloadFailed", error=exc)) from exc
     source = response.text
     required_markers = ("Sirush/JitenMPV", "sha256", "JITEN_MPV_MPV_CONFIG_DIR")
     if len(source) < 1000 or not all(marker in source for marker in required_markers):
-        raise FirstExperienceError("The downloaded JitenMPV installer was not recognized")
+        raise FirstExperienceError(err("setup.jitenMpvInstallerUnknown"))
     with tempfile.TemporaryDirectory(prefix="pudge-jiten-mpv-") as directory:
         installer = Path(directory) / "install.sh"
         installer.write_text(source, encoding="utf-8")
@@ -561,7 +550,7 @@ def _run_jiten_mpv_installer() -> None:
                 env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise FirstExperienceError(f"JitenMPV installation failed: {exc}") from exc
+            raise FirstExperienceError(err("setup.jitenMpvInstallFailed", error=exc)) from exc
         if completed.returncode:
             detail = (completed.stderr or completed.stdout or "JitenMPV installer failed").strip()
             raise FirstExperienceError(detail[-2000:])
@@ -572,7 +561,7 @@ def install_jiten_mpv(
 ) -> dict[str, Any]:
     status = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
     if not status["mpv"]["installed"]:
-        raise FirstExperienceError("Install mpv before JitenMPV")
+        raise FirstExperienceError(err("setup.installMpvFirst"))
     latest_version = ""
     if force or not status["jiten_mpv"]["installed"]:
         try:
@@ -585,14 +574,12 @@ def install_jiten_mpv(
     _write_jiten_api_key(api_key)
     result = dependency_status(mpv=mpv, ffmpeg=ffmpeg)
     if not result["jiten_mpv"]["installed"]:
-        raise FirstExperienceError("JitenMPV did not finish installing")
+        raise FirstExperienceError(err("setup.jitenMpvIncomplete"))
     if latest_version:
         _write_jiten_installed_version(latest_version)
         result["jiten_mpv"]["version"] = latest_version
     return result
 
 
-def update_jiten_mpv(
-    api_key: str = "", *, mpv: str = "mpv", ffmpeg: str = "ffmpeg"
-) -> dict[str, Any]:
+def update_jiten_mpv(api_key: str = "", *, mpv: str = "mpv", ffmpeg: str = "ffmpeg") -> dict[str, Any]:
     return install_jiten_mpv(api_key, mpv=mpv, ffmpeg=ffmpeg, force=True)

@@ -15,7 +15,16 @@ from typing import Any, Iterable
 
 from .consumption import ConsumptionConflictError, ConsumptionLedger, ConsumptionLedgerError
 from .database import Database
-from .consumption_volume import aggregate_volume
+from .consumption_volume import (
+    VOLUME_POLICY_VERSION,
+    aggregate_volume,
+    dump_prior_volume_state,
+    load_prior_volume_state,
+    merge_prior_volume_states,
+    prior_volume_state,
+)
+from .consumption_words import MISSING, READY, WORD_KINDS, WordUnits, earlier_pairs, tally_period
+from .i18n import err, t
 
 STATISTICS_POLICY_VERSION = "r14-v1"
 MIN_AUTOMATIC_SESSION_SECONDS = 60.0
@@ -26,6 +35,12 @@ _SHORT_SESSION_METHODS = {
     "companion_observation",
 }
 _VALID_KINDS = {"anime", "light_novel", "manga", "audiobook", "visual_novel", "review", "manual"}
+# History before a report period, summarized up to a local midnight (state table).
+VOLUME_ROLLUP_PREFIX = "consumption_volume_rollup:"
+_VOLUME_ROLLUPS_KEPT = 6
+# Events are at most 30 s long: starting a newer span this much earlier means every
+# event crossing the stored boundary is seen whole once (union, so overlap is free).
+_ROLLUP_OVERLAP_SECONDS = 120.0
 
 
 def _local_datetime(timestamp: float) -> datetime:
@@ -252,11 +267,221 @@ def _segments_by_local_day(segments: list[dict[str, Any]]) -> dict[str, list[dic
     return dict(result)
 
 
+def _manual_title(value: object) -> str:
+    """Stored titles of manual entries are English; show them in the interface language."""
+    title = str(value or "")
+    return t("web.manualEntry") if not title or title == t("web.manualEntry", lang="en") else title
+
+
+def _ln_chapter_ranges(numeric: dict[tuple[str, ...], list[tuple[float, float]]]) -> dict[str, list]:
+    """Merged character ranges read per LN chapter (the reader's chapter key is its text hash)."""
+    ranges: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for key, rows in numeric.items():
+        if len(key) == 4 and key[2] == "light_novel" and not str(key[3]).startswith("chapter:"):
+            ranges[str(key[3])].extend(rows)
+    return {chapter: _merge_intervals(rows) for chapter, rows in ranges.items()}
+
+
+def _words_in_ranges(
+    positions: list[tuple[int, int, int]], ranges: list[tuple[float, float]]
+) -> tuple[int, set[tuple[int, int]]]:
+    offsets = [row[0] for row in positions]
+    total = 0
+    pairs: set[tuple[int, int]] = set()
+    for start, end in ranges:
+        first = bisect_right(offsets, start - 1e-9)
+        last = bisect_right(offsets, end - 1e-9)
+        total += max(0, last - first)
+        pairs.update((row[1], row[2]) for row in positions[first:last])
+    return total, pairs
+
+
+def _longest_streak(days: list[dict[str, Any]]) -> int:
+    active = sorted(date.fromisoformat(str(row["day"])) for row in days if float(row.get("seconds") or 0) > 0)
+    best = run = 0
+    previous: date | None = None
+    for day in active:
+        run = run + 1 if previous is not None and (day - previous).days == 1 else 1
+        best = max(best, run)
+        previous = day
+    return best
+
+
 class ConsumptionStatistics:
-    def __init__(self, database: Database, *, logger: Any = None) -> None:
+    def __init__(
+        self,
+        database: Database,
+        *,
+        logger: Any = None,
+        ln_words: Any = None,
+        count_words: bool | None = None,
+        on_words_pending: Any = None,
+    ) -> None:
         self.database = database
         self.logger = logger
         self.ledger = ConsumptionLedger(database, logger=logger)
+        self.word_units = WordUnits(database)
+        # Word stats need parsed text; the app passes its LN word source and a way to wake
+        # the background job that parses the rest (anime subtitles, manga OCR, VN lines).
+        self.count_words = bool(ln_words is not None if count_words is None else count_words)
+        self.on_words_pending = on_words_pending
+        # ln_words(text_hash) -> [(character offset, wordId, readingIndex)] or None:
+        # the words of a light-novel chapter from its cached parse.
+        self.ln_words = ln_words
+        self._ln_word_cache: dict[str, list[tuple[int, int, int]]] = {}
+
+    def _chapter_words(self, chapter: str) -> list[tuple[int, int, int]] | None:
+        cached = self._ln_word_cache.get(chapter)
+        if cached is not None:
+            return cached
+        try:
+            positions = self.ln_words(chapter) if self.ln_words is not None else None
+        except Exception as exc:  # noqa: BLE001 - a chapter that cannot be read only lacks a word count
+            if self.logger is not None:
+                self.logger.warning("SKIP step=statistics.ln_words error=%r", exc)
+            positions = None
+        if positions is None:
+            return None
+        if len(self._ln_word_cache) > 400:
+            self._ln_word_cache.clear()
+        self._ln_word_cache[chapter] = list(positions)
+        return self._ln_word_cache[chapter]
+
+    def _words(
+        self,
+        segments: list[dict[str, Any]],
+        normalized: dict[str, Any],
+        prior_state: dict[str, Any] | None,
+        *,
+        now: float | None,
+    ) -> dict[str, Any] | None:
+        """Words met in the period, all kinds and per kind (estimates).
+
+        Anime: the subtitle lines shown while watching, each line once per session. Manga:
+        the text boxes of the pages looked at, once per session. Visual novels: the lines
+        the capture read. Light novels: the words in the character ranges read in the
+        period (a re-read passage counts once). "New" words were not met in any earlier
+        watching or reading. Only parses already made are read; what is still to parse is
+        queued for the background job and reported as pending."""
+        if not self.count_words:
+            return None
+        tally, unknown = tally_period(
+            self.word_units, segments, start=normalized["start_utc"], end=normalized["end_utc"]
+        )
+        selected_chapters = (
+            _ln_chapter_ranges(prior_volume_state(self.database, segments)["numeric"])
+            if self.ln_words is not None
+            else {}
+        )
+        if not (tally.total or tally.pending or tally.missing or selected_chapters):
+            return None
+        earlier_state = prior_state
+        if normalized["kind"] != "all" or normalized["media_uuid"]:
+            # "New words" are new to all earlier watching and reading, not only the filtered work.
+            earlier_state = None
+            if normalized["start_utc"] is not None and float(normalized["start_utc"]) > 0:
+                everything = {**normalized, "kind": "all", "media_uuid": ""}
+                earlier_state = self._prior_volume(everything, now=now)
+        known = self.word_units.lookup(f"ln:{chapter}" for chapter in selected_chapters)
+        for chapter, ranges in selected_chapters.items():
+            positions = self._chapter_words(chapter)
+            key = f"ln:{chapter}"
+            if positions is None:
+                status = known.get(key, (None, None))[0]
+                if status == MISSING or status == READY:
+                    tally.missing.add(key)
+                else:
+                    tally.pending.add(key)
+                    unknown.setdefault(key, ("light_novel", {"chapter_key": chapter}))
+                continue
+            words, pairs = _words_in_ranges(positions, ranges)
+            tally.total["light_novel"] += words
+            tally.pairs["light_novel"] |= pairs
+        if unknown:
+            self.word_units.enqueue(unknown)
+        if tally.pending and self.on_words_pending is not None:
+            try:
+                self.on_words_pending()
+            except Exception as exc:  # noqa: BLE001 - counting continues on the next look
+                if self.logger is not None:
+                    self.logger.warning("SKIP step=statistics.words_job error=%r", exc)
+        start = normalized["start_utc"]
+        earlier: set[tuple[int, int]] = set()
+        if start is not None and float(start) > 0:
+            earlier = earlier_pairs(self.word_units, earlier_state, before=float(start))
+            for chapter, ranges in _ln_chapter_ranges((earlier_state or {}).get("numeric") or {}).items():
+                positions = self._chapter_words(chapter)
+                if positions is not None:
+                    earlier |= _words_in_ranges(positions, ranges)[1]
+        kinds = [kind for kind in WORD_KINDS if kind in tally.total or kind in tally.pairs]
+        counted = bool(kinds)
+        everything = tally.everything()
+        return {
+            "total": sum(tally.total.values()) if counted else None,
+            "unique": len(everything) if counted else None,
+            "new": len(everything - earlier) if counted else None,
+            "by_kind": {
+                kind: {
+                    "total": tally.total.get(kind, 0),
+                    "unique": len(tally.pairs.get(kind, set())),
+                    "new": len(tally.pairs.get(kind, set()) - earlier),
+                }
+                for kind in kinds
+            },
+            "pending": len(tally.pending),
+            "missing": len(tally.missing),
+        }
+
+    @staticmethod
+    def _highlights(
+        days: list[dict[str, Any]],
+        journal: list[dict[str, Any]],
+        works: list[dict[str, Any]],
+        breakdown: dict[str, float],
+        volume: dict[str, Any],
+        words: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        sessions = [row for row in journal if not row.get("excluded") and float(row.get("seconds") or 0) > 0]
+        longest = max(sessions, key=lambda row: float(row["seconds"]), default=None)
+        busiest = max(days, key=lambda row: float(row.get("seconds") or 0), default=None)
+        if busiest is not None and float(busiest.get("seconds") or 0) <= 0:
+            busiest = None
+        by_kind = volume.get("by_kind") or {}
+
+        def rate(kind: str, seconds: float, per: float) -> float | None:
+            row = by_kind.get(kind) or {}
+            amount = row.get("consumed")
+            if not row.get("exact") or amount is None or float(amount) <= 0 or seconds < 60:
+                return None
+            return float(amount) / seconds * per
+
+        ln_seconds = float(breakdown.get("light_novel", 0.0)) + float(
+            breakdown.get("light_novel+audiobook", 0.0)
+        )
+        episodes = {
+            str(media_uuid)
+            for media_uuid, row in (volume.get("by_media") or {}).items()
+            if str(row.get("kind")) == "anime" and float(row.get("consumed") or 0) > 0
+        }
+        return {
+            "longest_streak_days": _longest_streak(days),
+            "busiest_day": {"day": busiest["day"], "seconds": float(busiest["seconds"])} if busiest else None,
+            "longest_session": {
+                "seconds": float(longest["seconds"]),
+                "title": str(longest.get("title") or ""),
+                "kind": str(longest.get("kind") or ""),
+                "start_utc": longest.get("start_utc"),
+            }
+            if longest
+            else None,
+            "top_work": {"title": works[0]["title"], "kind": works[0]["kind"], "seconds": works[0]["seconds"]}
+            if works
+            else None,
+            "anime_episodes": len(episodes),
+            "ln_characters_per_minute": rate("light_novel", ln_seconds, 60.0),
+            "manga_pages_per_hour": rate("manga", float(breakdown.get("manga", 0.0)), 3600.0),
+            "words": words,
+        }
 
     def _device_name(self, device_id: str) -> str:
         with self.database.connect() as conn:
@@ -287,9 +512,9 @@ class ConsumptionStatistics:
                 start_day = date.fromisoformat(str(raw.get("start_date") or ""))
                 end_day = date.fromisoformat(str(raw.get("end_date") or raw.get("start_date") or ""))
             except ValueError as exc:
-                raise ConsumptionLedgerError("invalid custom statistics period") from exc
+                raise ConsumptionLedgerError(err("consumption.invalidPeriod")) from exc
             if end_day < start_day:
-                raise ConsumptionLedgerError("statistics end date precedes start date")
+                raise ConsumptionLedgerError(err("consumption.endBeforeStart"))
             start = _local_midnight_epoch(start_day)
             end = min(current, _local_midnight_epoch(end_day + timedelta(days=1)))
         else:
@@ -322,7 +547,9 @@ class ConsumptionStatistics:
         ).fetchall()
         return {(str(row["target_type"]), str(row["target_id"])): dict(row) for row in rows}
 
-    def _raw_events(self, normalized: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    def _raw_events(
+        self, normalized: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
         start = normalized["start_utc"]
         end = normalized["end_utc"]
         conditions = ["e.interval_start_utc < ?"]
@@ -411,20 +638,48 @@ class ConsumptionStatistics:
                 assert current is not None
                 media_uuid = str(raw["linked_media_uuid"] or "")
                 if media_uuid:
-                    current["media"].append({
-                        "event_id": event_id,
-                        "media_uuid": media_uuid,
-                        "role": str(raw["linked_media_role"] or "primary"),
-                        "source_revision": str(raw["linked_source_revision"] or ""),
-                        "media_kind": str(raw["linked_media_kind"] or ""),
-                        "title_snapshot": str(raw["linked_title_snapshot"] or ""),
-                        "locator_start": json.loads(str(raw["linked_locator_start_json"] or "{}")),
-                        "locator_end": json.loads(str(raw["linked_locator_end_json"] or "{}")),
-                    })
+                    current["media"].append(
+                        {
+                            "event_id": event_id,
+                            "media_uuid": media_uuid,
+                            "role": str(raw["linked_media_role"] or "primary"),
+                            "source_revision": str(raw["linked_source_revision"] or ""),
+                            "media_kind": str(raw["linked_media_kind"] or ""),
+                            "title_snapshot": str(raw["linked_title_snapshot"] or ""),
+                            "locator_start": json.loads(str(raw["linked_locator_start_json"] or "{}")),
+                            "locator_end": json.loads(str(raw["linked_locator_end_json"] or "{}")),
+                        }
+                    )
+            if sessions:
+                # The 60-second rule judges a whole session, not the part inside
+                # the period: a session crossing the 7/30-day boundary counts in
+                # both periods exactly like in "all time".
+                totals = conn.execute(
+                    f"""
+                    SELECT ev.session_id AS session_id,
+                           SUM(CASE WHEN ev.elapsed_monotonic_ms>0
+                                     AND ABS((ev.interval_end_utc-ev.interval_start_utc)-ev.elapsed_monotonic_ms/1000.0)>2.0
+                                    THEN ev.elapsed_monotonic_ms/1000.0
+                                    ELSE MAX(0.0,ev.interval_end_utc-ev.interval_start_utc) END) AS seconds
+                    FROM consumption_events ev
+                    WHERE ev.session_id IN (
+                        SELECT DISTINCT e.session_id FROM consumption_events e
+                        JOIN consumption_sessions s ON s.session_id=e.session_id
+                        WHERE {where})
+                    GROUP BY ev.session_id
+                    """,
+                    tuple(params),
+                ).fetchall()
+                for total in totals:
+                    first_event = sessions.get(str(total["session_id"]))
+                    if first_event is not None:
+                        first_event["session_total_seconds"] = float(total["seconds"] or 0.0)
         return payload, sessions, corrections
 
     @staticmethod
-    def _corrected_interval(row: dict[str, Any], correction: dict[str, Any] | None) -> tuple[float, float] | None:
+    def _corrected_interval(
+        row: dict[str, Any], correction: dict[str, Any] | None
+    ) -> tuple[float, float] | None:
         if correction and bool(correction.get("excluded")):
             return None
         raw_start = float(row["interval_start_utc"])
@@ -458,7 +713,9 @@ class ConsumptionStatistics:
             return False
         return float(seconds) < MIN_AUTOMATIC_SESSION_SECONDS - 1e-6
 
-    def _effective_segments(self, normalized: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    def _effective_segments(
+        self, normalized: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
         events, session_rows, corrections = self._raw_events(normalized)
         by_session: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for event in events:
@@ -476,9 +733,7 @@ class ConsumptionStatistics:
                 # event-level correction semantics.
                 event = session_events[0]
                 event_media = list(event.get("media") or [])
-                interval = self._corrected_interval(
-                    event, corrections.get(("event", str(event["event_id"])))
-                )
+                interval = self._corrected_interval(event, corrections.get(("event", str(event["event_id"]))))
                 raw_start = float(event["interval_start_utc"])
                 raw_end = float(event["interval_end_utc"])
                 session_segment: dict[str, Any] | None = None
@@ -512,7 +767,7 @@ class ConsumptionStatistics:
                 if self._ignore_short_automatic_session(
                     kind=str(first.get("kind") or "unknown"),
                     measurement_method=method,
-                    seconds=seconds,
+                    seconds=max(seconds, float(first.get("session_total_seconds") or 0.0)),
                     corrected=event_corrected,
                 ):
                     continue
@@ -522,26 +777,31 @@ class ConsumptionStatistics:
                     (row for row in event_media if str(row.get("role")) == "primary"),
                     event_media[0] if event_media else {},
                 )
-                journal.append({
-                    "id": session_id,
-                    "type": "session",
-                    "session_id": session_id,
-                    "start_utc": display_start,
-                    "end_utc": display_end,
-                    "seconds": seconds,
-                    "kind": _normalize_kind(str(first.get("kind") or "unknown")),
-                    "media_uuid": str(primary_media.get("media_uuid") or first.get("primary_media_uuid") or ""),
-                    "title": str(primary_media.get("title_snapshot") or "Untitled"),
-                    "origin": str(first.get("origin") or "automatic"),
-                    "measurement_method": method,
-                    "estimated": "estimated" in method,
-                    "device_id": str(first.get("device_id") or ""),
-                    "device": str(first.get("device_name") or "") or str(first.get("device_id") or "")[:8],
-                    "excluded": False,
-                    "correction_revision": 0,
-                    "correction_reason": "",
-                    "event_count": 1,
-                })
+                journal.append(
+                    {
+                        "id": session_id,
+                        "type": "session",
+                        "session_id": session_id,
+                        "start_utc": display_start,
+                        "end_utc": display_end,
+                        "seconds": seconds,
+                        "kind": _normalize_kind(str(first.get("kind") or "unknown")),
+                        "media_uuid": str(
+                            primary_media.get("media_uuid") or first.get("primary_media_uuid") or ""
+                        ),
+                        "title": str(primary_media.get("title_snapshot") or "Untitled"),
+                        "origin": str(first.get("origin") or "automatic"),
+                        "measurement_method": method,
+                        "estimated": "estimated" in method,
+                        "device_id": str(first.get("device_id") or ""),
+                        "device": str(first.get("device_name") or "")
+                        or str(first.get("device_id") or "")[:8],
+                        "excluded": False,
+                        "correction_revision": 0,
+                        "correction_reason": "",
+                        "event_count": 1,
+                    }
+                )
                 continue
 
             media_by_uuid: dict[str, dict[str, Any]] = {}
@@ -550,10 +810,30 @@ class ConsumptionStatistics:
                     media_by_uuid[str(media["media_uuid"])] = media
             excluded = bool(session_correction and session_correction.get("excluded"))
             session_segments: list[dict[str, Any]] = []
-            replacement_start = _finite(session_correction.get("replacement_start_utc"), default=None) if session_correction else None
-            replacement_end = _finite(session_correction.get("replacement_end_utc"), default=None) if session_correction else None
-            replacement_duration = _finite(session_correction.get("replacement_duration_seconds"), default=None) if session_correction else None
-            if not excluded and session_correction and (replacement_start is not None or replacement_end is not None or replacement_duration is not None):
+            replacement_start = (
+                _finite(session_correction.get("replacement_start_utc"), default=None)
+                if session_correction
+                else None
+            )
+            replacement_end = (
+                _finite(session_correction.get("replacement_end_utc"), default=None)
+                if session_correction
+                else None
+            )
+            replacement_duration = (
+                _finite(session_correction.get("replacement_duration_seconds"), default=None)
+                if session_correction
+                else None
+            )
+            if (
+                not excluded
+                and session_correction
+                and (
+                    replacement_start is not None
+                    or replacement_end is not None
+                    or replacement_duration is not None
+                )
+            ):
                 raw_starts = [float(event["interval_start_utc"]) for event in session_events]
                 raw_ends = [float(event["interval_end_utc"]) for event in session_events]
                 start = replacement_start if replacement_start is not None else min(raw_starts)
@@ -565,21 +845,25 @@ class ConsumptionStatistics:
                 start = max(float(lower), start) if lower is not None else start
                 end = min(upper, max(start, end))
                 if end > start:
-                    session_segments.append({
-                        "start": start,
-                        "end": end,
-                        "kind": _normalize_kind(str(first.get("kind") or "unknown")),
-                        "session_id": session_id,
-                        "event_id": "",
-                        "media": list(media_by_uuid.values()),
-                        "origin": str(first.get("origin") or "automatic"),
-                        "measurement_method": "user_correction",
-                        "device_id": str(first.get("device_id") or ""),
-                        "activity_group_id": str(first.get("activity_group_id") or ""),
-                    })
+                    session_segments.append(
+                        {
+                            "start": start,
+                            "end": end,
+                            "kind": _normalize_kind(str(first.get("kind") or "unknown")),
+                            "session_id": session_id,
+                            "event_id": "",
+                            "media": list(media_by_uuid.values()),
+                            "origin": str(first.get("origin") or "automatic"),
+                            "measurement_method": "user_correction",
+                            "device_id": str(first.get("device_id") or ""),
+                            "activity_group_id": str(first.get("activity_group_id") or ""),
+                        }
+                    )
             elif not excluded:
                 for event in session_events:
-                    interval = self._corrected_interval(event, corrections.get(("event", str(event["event_id"]))))
+                    interval = self._corrected_interval(
+                        event, corrections.get(("event", str(event["event_id"])))
+                    )
                     if interval is None:
                         continue
                     start, end = interval
@@ -588,19 +872,21 @@ class ConsumptionStatistics:
                     end = min(upper, end)
                     if end <= start:
                         continue
-                    session_segments.append({
-                        "start": start,
-                        "end": end,
-                        "kind": _normalize_kind(str(event.get("kind") or "unknown")),
-                        "session_id": session_id,
-                        "event_id": str(event["event_id"]),
-                        "media": list(event.get("media") or []),
-                        "origin": str(event.get("origin") or "automatic"),
-                        "measurement_method": str(event.get("measurement_method") or "observation"),
-                        "device_id": str(event.get("device_id") or ""),
-                        "activity_group_id": str(event.get("activity_group_id") or ""),
-                        "payload": dict(event.get("payload") or {}),
-                    })
+                    session_segments.append(
+                        {
+                            "start": start,
+                            "end": end,
+                            "kind": _normalize_kind(str(event.get("kind") or "unknown")),
+                            "session_id": session_id,
+                            "event_id": str(event["event_id"]),
+                            "media": list(event.get("media") or []),
+                            "origin": str(event.get("origin") or "automatic"),
+                            "measurement_method": str(event.get("measurement_method") or "observation"),
+                            "device_id": str(event.get("device_id") or ""),
+                            "activity_group_id": str(event.get("activity_group_id") or ""),
+                            "payload": dict(event.get("payload") or {}),
+                        }
+                    )
             raw_session_start = min(float(event["interval_start_utc"]) for event in session_events)
             raw_session_end = max(float(event["interval_end_utc"]) for event in session_events)
             if session_segments:
@@ -610,40 +896,54 @@ class ConsumptionStatistics:
             else:
                 display_start, display_end, seconds = raw_session_start, raw_session_end, 0.0
             method = str(first.get("measurement_method") or "observation")
-            event_corrected = any(("event", str(event["event_id"])) in corrections for event in session_events)
+            event_corrected = any(
+                ("event", str(event["event_id"])) in corrections for event in session_events
+            )
             if self._ignore_short_automatic_session(
                 kind=str(first.get("kind") or "unknown"),
                 measurement_method=method,
-                seconds=seconds,
+                seconds=max(seconds, float(first.get("session_total_seconds") or 0.0)),
                 corrected=bool(session_correction) or event_corrected,
             ):
                 continue
             segments.extend(session_segments)
-            primary_media = next((row for row in media_by_uuid.values() if str(row.get("role")) == "primary"), None)
+            primary_media = next(
+                (row for row in media_by_uuid.values() if str(row.get("role")) == "primary"), None
+            )
             primary_media = primary_media or next(iter(media_by_uuid.values()), {})
-            journal.append({
-                "id": session_id,
-                "type": "session",
-                "session_id": session_id,
-                "start_utc": display_start,
-                "end_utc": display_end,
-                "seconds": seconds,
-                "kind": _normalize_kind(str(first.get("kind") or "unknown")),
-                "media_uuid": str(primary_media.get("media_uuid") or first.get("primary_media_uuid") or ""),
-                "title": str(primary_media.get("title_snapshot") or "Untitled"),
-                "origin": str(first.get("origin") or "automatic"),
-                "measurement_method": method,
-                "estimated": "estimated" in method,
-                "device_id": str(first.get("device_id") or ""),
-                "device": str(first.get("device_name") or "") or str(first.get("device_id") or "")[:8],
-                "excluded": excluded,
-                "correction_revision": int(session_correction.get("revision") or 0) if session_correction else 0,
-                "correction_reason": str(session_correction.get("reason") or "") if session_correction else "",
-                "event_count": len(session_events),
-            })
+            journal.append(
+                {
+                    "id": session_id,
+                    "type": "session",
+                    "session_id": session_id,
+                    "start_utc": display_start,
+                    "end_utc": display_end,
+                    "seconds": seconds,
+                    "kind": _normalize_kind(str(first.get("kind") or "unknown")),
+                    "media_uuid": str(
+                        primary_media.get("media_uuid") or first.get("primary_media_uuid") or ""
+                    ),
+                    "title": str(primary_media.get("title_snapshot") or "Untitled"),
+                    "origin": str(first.get("origin") or "automatic"),
+                    "measurement_method": method,
+                    "estimated": "estimated" in method,
+                    "device_id": str(first.get("device_id") or ""),
+                    "device": str(first.get("device_name") or "") or str(first.get("device_id") or "")[:8],
+                    "excluded": excluded,
+                    "correction_revision": int(session_correction.get("revision") or 0)
+                    if session_correction
+                    else 0,
+                    "correction_reason": str(session_correction.get("reason") or "")
+                    if session_correction
+                    else "",
+                    "event_count": len(session_events),
+                }
+            )
         return segments, journal, corrections
 
-    def _manual_rows(self, normalized: dict[str, Any], corrections: dict[tuple[str, str], dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    def _manual_rows(
+        self, normalized: dict[str, Any], corrections: dict[tuple[str, str], dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
         conditions: list[str] = []
         params: list[Any] = []
         if normalized["kind"] != "all":
@@ -679,52 +979,62 @@ class ConsumptionStatistics:
                 end = start + duration
                 if correction and correction.get("replacement_end_utc") is not None:
                     end = max(start, float(correction["replacement_end_utc"]))
-            included_in_period = start is None or (end is not None and end > (float(lower) if lower is not None else -1.0) and start < upper)
+            included_in_period = start is None or (
+                end is not None and end > (float(lower) if lower is not None else -1.0) and start < upper
+            )
             if start is None and not excluded:
                 unplaced += duration
             if start is not None and end is not None and included_in_period and not excluded:
                 clipped_start = max(float(lower), start) if lower is not None else start
                 clipped_end = min(upper, end)
                 if clipped_end > clipped_start:
-                    segments.append({
-                        "start": clipped_start,
-                        "end": clipped_end,
-                        "kind": _normalize_kind(str(row["kind"])),
-                        "session_id": f"manual:{manual_id}",
-                        "event_id": "",
-                        "media": [{
-                            "media_uuid": str(row.get("media_uuid") or ""),
-                            "title_snapshot": str(row.get("title_snapshot") or "Manual entry"),
-                            "media_kind": str(row["kind"]),
-                            "role": "primary",
-                        }],
-                        "origin": "manual",
-                        "measurement_method": "manual_exact_time",
-                        "device_id": "",
-                        "activity_group_id": "",
-                    })
+                    segments.append(
+                        {
+                            "start": clipped_start,
+                            "end": clipped_end,
+                            "kind": _normalize_kind(str(row["kind"])),
+                            "session_id": f"manual:{manual_id}",
+                            "event_id": "",
+                            "media": [
+                                {
+                                    "media_uuid": str(row.get("media_uuid") or ""),
+                                    "title_snapshot": _manual_title(row.get("title_snapshot")),
+                                    "media_kind": str(row["kind"]),
+                                    "role": "primary",
+                                }
+                            ],
+                            "origin": "manual",
+                            "measurement_method": "manual_exact_time",
+                            "device_id": "",
+                            "activity_group_id": "",
+                        }
+                    )
             if included_in_period:
-                journal.append({
-                    "id": manual_id,
-                    "type": "manual",
-                    "session_id": "",
-                    "start_utc": start,
-                    "end_utc": end,
-                    "seconds": 0.0 if excluded else duration,
-                    "kind": _normalize_kind(str(row["kind"])),
-                    "media_uuid": str(row.get("media_uuid") or ""),
-                    "title": str(row.get("title_snapshot") or "Manual entry"),
-                    "origin": "manual",
-                    "measurement_method": "manual_exact_time" if start is not None else "manual_duration_only",
-                    "estimated": start is None,
-                    "device_id": "",
-                    "device": platform.node() or "This computer",
-                    "excluded": excluded,
-                    "correction_revision": int(correction.get("revision") or 0) if correction else 0,
-                    "correction_reason": str(correction.get("reason") or "") if correction else "",
-                    "event_count": 0,
-                    "note": str(row.get("note") or ""),
-                })
+                journal.append(
+                    {
+                        "id": manual_id,
+                        "type": "manual",
+                        "session_id": "",
+                        "start_utc": start,
+                        "end_utc": end,
+                        "seconds": 0.0 if excluded else duration,
+                        "kind": _normalize_kind(str(row["kind"])),
+                        "media_uuid": str(row.get("media_uuid") or ""),
+                        "title": _manual_title(row.get("title_snapshot")),
+                        "origin": "manual",
+                        "measurement_method": "manual_exact_time"
+                        if start is not None
+                        else "manual_duration_only",
+                        "estimated": start is None,
+                        "device_id": "",
+                        "device": platform.node() or t("web.thisComputer"),
+                        "excluded": excluded,
+                        "correction_revision": int(correction.get("revision") or 0) if correction else 0,
+                        "correction_reason": str(correction.get("reason") or "") if correction else "",
+                        "event_count": 0,
+                        "note": str(row.get("note") or ""),
+                    }
+                )
         return segments, journal, unplaced
 
     def query(
@@ -739,12 +1049,22 @@ class ConsumptionStatistics:
         segments, journal, corrections = self._effective_segments(normalized)
         native_segments = list(segments)
         prior_native_segments: list[dict[str, Any]] = []
+        prior_state: dict[str, Any] | None = None
         if normalized["start_utc"] is not None and float(normalized["start_utc"]) > 0:
-            prior_scope = dict(normalized)
-            prior_scope["start_utc"] = None
-            prior_scope["end_utc"] = float(normalized["start_utc"])
-            prior_native_segments, _prior_journal, _prior_corrections = self._effective_segments(prior_scope)
-        volume = aggregate_volume(self.database, native_segments, prior_segments=prior_native_segments)
+            prior_state = self._prior_volume(normalized, now=now)
+            if prior_state is None:
+                prior_scope = dict(normalized)
+                prior_scope["start_utc"] = None
+                prior_scope["end_utc"] = float(normalized["start_utc"])
+                prior_native_segments, _prior_journal, _prior_corrections = self._effective_segments(
+                    prior_scope
+                )
+        if prior_state is None and prior_native_segments:
+            prior_state = prior_volume_state(self.database, prior_native_segments)
+        volume = aggregate_volume(
+            self.database, native_segments, prior_segments=prior_native_segments, prior_state=prior_state
+        )
+        words = self._words(native_segments, normalized, prior_state, now=now)
         manual_segments, manual_journal, manual_unplaced = self._manual_rows(normalized, corrections)
         segments.extend(manual_segments)
         journal.extend(manual_journal)
@@ -774,7 +1094,9 @@ class ConsumptionStatistics:
             if 0 <= span <= 370:
                 for offset in range(span + 1):
                     key = (first_day + timedelta(days=offset)).isoformat()
-                    day_payload.setdefault(key, {"day": key, "seconds": 0.0, "breakdown": {}, "event_count": 0})
+                    day_payload.setdefault(
+                        key, {"day": key, "seconds": 0.0, "breakdown": {}, "event_count": 0}
+                    )
         days = [day_payload[key] for key in sorted(day_payload)]
 
         # Works are logical consumption targets, not a raw count of source files.
@@ -824,24 +1146,40 @@ class ConsumptionStatistics:
             }
             linked_pair = kinds == {"light_novel", "audiobook"}
             preferred = next(
-                (media for media in media_rows if _normalize_kind(str(media.get("media_kind") or "")) == "light_novel"),
+                (
+                    media
+                    for media in media_rows
+                    if _normalize_kind(str(media.get("media_kind") or "")) == "light_novel"
+                ),
                 media_rows[0],
             )
-            media_uuids = sorted({str(media.get("media_uuid") or "") for media in media_rows if media.get("media_uuid")})
-            work_volume = [volume["by_media"][media_uuid] for media_uuid in media_uuids if media_uuid in volume["by_media"]]
-            works.append({
-                "media_uuid": str(preferred.get("media_uuid") or ""),
-                "media_uuids": media_uuids,
-                "volume": work_volume,
-                "activity_group_id": key.removeprefix("activity-group:") if key.startswith("activity-group:") else "",
-                "title": str(preferred.get("title_snapshot") or "Untitled"),
-                "kind": "light_novel+audiobook" if linked_pair else _normalize_kind(
-                    str(preferred.get("media_kind") or rows[0].get("kind") or "unknown")
-                ),
-                "seconds": seconds,
-                "last_at_utc": max(float(row["end"]) for row in rows),
-                "session_count": len({str(row.get("session_id") or "") for row in rows}),
-            })
+            media_uuids = sorted(
+                {str(media.get("media_uuid") or "") for media in media_rows if media.get("media_uuid")}
+            )
+            work_volume = [
+                volume["by_media"][media_uuid]
+                for media_uuid in media_uuids
+                if media_uuid in volume["by_media"]
+            ]
+            works.append(
+                {
+                    "media_uuid": str(preferred.get("media_uuid") or ""),
+                    "media_uuids": media_uuids,
+                    "volume": work_volume,
+                    "activity_group_id": key.removeprefix("activity-group:")
+                    if key.startswith("activity-group:")
+                    else "",
+                    "title": str(preferred.get("title_snapshot") or "Untitled"),
+                    "kind": "light_novel+audiobook"
+                    if linked_pair
+                    else _normalize_kind(
+                        str(preferred.get("media_kind") or rows[0].get("kind") or "unknown")
+                    ),
+                    "seconds": seconds,
+                    "last_at_utc": max(float(row["end"]) for row in rows),
+                    "session_count": len({str(row.get("session_id") or "") for row in rows}),
+                }
+            )
         works.sort(key=lambda row: (-float(row["seconds"]), str(row["title"]).casefold()))
 
         journal.sort(key=lambda row: (float(row["start_utc"] or 0.0), str(row["id"])), reverse=True)
@@ -851,7 +1189,7 @@ class ConsumptionStatistics:
             journal_page = journal[start_index:]
         else:
             limit = max(1, min(100000, int(journal_limit)))
-            journal_page = journal[start_index:start_index + limit]
+            journal_page = journal[start_index : start_index + limit]
         for row in journal_page:
             row["start_local"] = _format_local(row.get("start_utc"))
             row["end_local"] = _format_local(row.get("end_utc"))
@@ -868,6 +1206,7 @@ class ConsumptionStatistics:
                 ).fetchall()
             ]
         active_session_ids = {str(row.get("session_id") or "") for row in segments if row.get("session_id")}
+        highlights = self._highlights(days, journal, works, breakdown, volume, words)
         return {
             "schema": 1,
             "policy_version": STATISTICS_POLICY_VERSION,
@@ -882,12 +1221,98 @@ class ConsumptionStatistics:
             },
             "breakdown": breakdown,
             "volume": volume,
+            "highlights": highlights,
             "days": days,
             "works": works,
             "journal": journal_page,
             "journal_total": journal_total,
             "media_options": media_options,
         }
+
+    def _history_stamp(self, conn: Any, before: float) -> str:
+        """Changes when anything that a summary up to ``before`` was built from changes."""
+        events = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(MAX(rowid),0) AS last FROM consumption_events WHERE interval_start_utc < ?",
+            (float(before),),
+        ).fetchone()
+        corrections = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(MAX(rowid),0) AS last FROM consumption_corrections"
+        ).fetchone()
+        return (
+            f"{STATISTICS_POLICY_VERSION}|{VOLUME_POLICY_VERSION}|{int(events['n'])}|{int(events['last'])}"
+            f"|{int(corrections['n'])}|{int(corrections['last'])}"
+        )
+
+    def _prior_volume(self, normalized: dict[str, Any], *, now: float | None = None) -> dict[str, Any] | None:
+        """Volume history before the period from a stored summary plus only the newer events.
+
+        Summaries end at a local midnight and are rebuilt when an earlier event
+        arrives late (an offline iPhone), a correction is made, or history is reset.
+        Filtered reports (one kind or one work) still read the whole history.
+        """
+        if normalized["kind"] != "all" or normalized["media_uuid"]:
+            return None
+        boundary = float(normalized["start_utc"])
+        current = float(now if now is not None else time.time())
+        with self.database.connect() as conn:
+            rows = conn.execute(
+                "SELECT key,value FROM state WHERE substr(key,1,?)=?",
+                (len(VOLUME_ROLLUP_PREFIX), VOLUME_ROLLUP_PREFIX),
+            ).fetchall()
+            stored: list[tuple[float, str, str]] = []
+            for row in rows:
+                try:
+                    covered = float(str(row["key"])[len(VOLUME_ROLLUP_PREFIX) :])
+                    record = json.loads(str(row["value"] or "{}"))
+                    stored.append((covered, str(record["stamp"]), str(record["state"])))
+                except (TypeError, ValueError, KeyError):
+                    continue
+            stored.sort(reverse=True)
+            base: tuple[float, str] | None = None
+            for covered, stamp, text in stored:
+                if covered <= boundary and stamp == self._history_stamp(conn, covered):
+                    base = (covered, text)
+                    break
+            boundary_stamp = self._history_stamp(conn, boundary)
+        state: dict[str, Any] = {"numeric": {}, "manga": {}, "denominators": {}}
+        span_start: float | None = None
+        if base is not None:
+            try:
+                state = load_prior_volume_state(base[1])
+                span_start = base[0]
+            except (TypeError, ValueError, KeyError):
+                span_start = None
+        if span_start is None or span_start < boundary:
+            span = dict(normalized)
+            span["start_utc"] = None if span_start is None else max(0.0, span_start - _ROLLUP_OVERLAP_SECONDS)
+            span["end_utc"] = boundary
+            span_segments, _journal, _corrections = self._effective_segments(span)
+            state = merge_prior_volume_states(state, prior_volume_state(self.database, span_segments))
+        if boundary <= current and (base is None or base[0] != boundary):
+            try:
+                with self.database.connect() as conn:
+                    conn.execute(
+                        "INSERT INTO state(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        (
+                            f"{VOLUME_ROLLUP_PREFIX}{boundary:.3f}",
+                            json.dumps({"stamp": boundary_stamp, "state": dump_prior_volume_state(state)}),
+                            time.time(),
+                        ),
+                    )
+                    keys = [
+                        str(row["key"])
+                        for row in conn.execute(
+                            "SELECT key FROM state WHERE substr(key,1,?)=? ORDER BY updated_at DESC",
+                            (len(VOLUME_ROLLUP_PREFIX), VOLUME_ROLLUP_PREFIX),
+                        ).fetchall()
+                    ]
+                    for key in keys[_VOLUME_ROLLUPS_KEPT:]:
+                        conn.execute("DELETE FROM state WHERE key=?", (key,))
+            except Exception as exc:  # noqa: BLE001 - a summary that cannot be stored is only slower next time
+                if self.logger is not None:
+                    self.logger.warning("SKIP step=statistics.volume_rollup error=%r", exc)
+        return state
 
     def correction(
         self,
@@ -904,14 +1329,14 @@ class ConsumptionStatistics:
         target_type = str(target_type or "").strip().casefold()
         target_id = str(target_id or "").strip()
         if target_type not in {"session", "event", "manual"} or not target_id:
-            raise ConsumptionLedgerError("invalid correction target")
+            raise ConsumptionLedgerError(err("consumption.invalidCorrectionTarget"))
         start = _finite(start_utc, default=None)
         end = _finite(end_utc, default=None)
         duration = _finite(duration_seconds, default=None)
         if duration is not None and (duration < 0 or duration > 31 * 86400):
-            raise ConsumptionLedgerError("invalid correction duration")
+            raise ConsumptionLedgerError(err("consumption.invalidCorrectionDuration"))
         if start is not None and end is not None and end < start:
-            raise ConsumptionLedgerError("correction end precedes start")
+            raise ConsumptionLedgerError(err("consumption.correctionEndBeforeStart"))
         now = time.time()
         correction_id = str(uuid.uuid4())
         with self.database.connect() as conn:
@@ -921,7 +1346,7 @@ class ConsumptionStatistics:
                 "manual": ("consumption_manual_entries", "manual_id"),
             }[target_type]
             if conn.execute(f"SELECT 1 FROM {table} WHERE {column}=?", (target_id,)).fetchone() is None:
-                raise ConsumptionLedgerError("correction target does not exist")
+                raise ConsumptionLedgerError(err("consumption.correctionTargetMissing"))
             row = conn.execute(
                 "SELECT COALESCE(MAX(revision),0) AS revision FROM consumption_corrections WHERE target_type=? AND target_id=?",
                 (target_type, target_id),
@@ -929,7 +1354,7 @@ class ConsumptionStatistics:
             current = int(row["revision"] if row else 0)
             if int(expected_revision) != current:
                 raise ConsumptionConflictError(
-                    f"correction revision conflict: expected {expected_revision}, current {current}"
+                    err("consumption.correctionConflict", expected=expected_revision, current=current)
                 )
             device_row = conn.execute("SELECT value FROM state WHERE key='consumption_device_id'").fetchone()
             device_id = str(device_row["value"] or "") if device_row is not None else ""
@@ -943,17 +1368,20 @@ class ConsumptionStatistics:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    correction_id, target_type, target_id, revision, current, int(bool(excluded)),
-                    start, end, duration, str(reason or ""), device_id, now,
+                    correction_id,
+                    target_type,
+                    target_id,
+                    revision,
+                    current,
+                    int(bool(excluded)),
+                    start,
+                    end,
+                    duration,
+                    str(reason or ""),
+                    device_id,
+                    now,
                 ),
             )
-            self.ledger._queue_sync_record(conn, "correction", correction_id, {
-                "correction_id": correction_id, "target_type": target_type, "target_id": target_id,
-                "revision": revision, "parent_revision": current, "excluded": int(bool(excluded)),
-                "replacement_start_utc": start, "replacement_end_utc": end,
-                "replacement_duration_seconds": duration, "reason": str(reason or ""),
-                "device_id": device_id, "created_at_utc": now,
-            }, created_at=now)
         return {"ok": True, "correction_id": correction_id, "revision": revision}
 
     def add_manual(
@@ -968,10 +1396,10 @@ class ConsumptionStatistics:
     ) -> dict[str, Any]:
         normalized_kind = _normalize_kind(kind)
         if normalized_kind not in _VALID_KINDS - {"manual"}:
-            raise ConsumptionLedgerError("invalid manual entry kind")
+            raise ConsumptionLedgerError(err("consumption.invalidManualKind"))
         duration = _finite(duration_seconds, default=None)
         if duration is None or duration <= 0 or duration > 31 * 86400:
-            raise ConsumptionLedgerError("invalid manual entry duration")
+            raise ConsumptionLedgerError(err("consumption.invalidManualDuration"))
         start = _finite(started_at_utc, default=None)
         manual_id = str(uuid.uuid4())
         media_uuid = str(media_uuid or "").strip()
@@ -982,10 +1410,10 @@ class ConsumptionStatistics:
                     "SELECT title_snapshot FROM consumption_media WHERE media_uuid=?", (media_uuid,)
                 ).fetchone()
                 if row is None:
-                    raise ConsumptionLedgerError("manual entry media does not exist")
+                    raise ConsumptionLedgerError(err("consumption.manualMediaMissing"))
                 title_snapshot = str(row["title_snapshot"] or title_snapshot)
         if not media_uuid:
-            title_snapshot = title_snapshot or "Manual entry"
+            title_snapshot = title_snapshot or t("web.manualEntry", lang="en")  # stored; shown translated
             media = self.ledger.ensure_media(
                 kind=normalized_kind,
                 title=title_snapshot,
@@ -1001,13 +1429,18 @@ class ConsumptionStatistics:
                     note,origin,created_at_utc,updated_at_utc
                 ) VALUES(?,?,?,?,?,?,?,'manual',?,?)
                 """,
-                (manual_id, media_uuid, normalized_kind, title_snapshot, start, duration, str(note or ""), now, now),
+                (
+                    manual_id,
+                    media_uuid,
+                    normalized_kind,
+                    title_snapshot,
+                    start,
+                    duration,
+                    str(note or ""),
+                    now,
+                    now,
+                ),
             )
-            self.ledger._queue_sync_record(conn, "manual", manual_id, {
-                "manual_id": manual_id, "media_uuid": media_uuid, "kind": normalized_kind,
-                "title_snapshot": title_snapshot, "started_at_utc": start, "duration_seconds": duration,
-                "note": str(note or ""), "origin": "manual", "created_at_utc": now, "updated_at_utc": now,
-            }, created_at=now)
         return {"ok": True, "manual_id": manual_id, "media_uuid": media_uuid}
 
     def delete_history(self) -> dict[str, Any]:
@@ -1027,37 +1460,56 @@ class ConsumptionStatistics:
                     ) VALUES(?,?,?,?,?,?)
                     """,
                     (
-                        str(row["day"]), float(row["seconds"]), json.dumps(row["breakdown"], sort_keys=True),
-                        int(row.get("event_count") or 0), policy, now,
+                        str(row["day"]),
+                        float(row["seconds"]),
+                        json.dumps(row["breakdown"], sort_keys=True),
+                        int(row.get("event_count") or 0),
+                        policy,
+                        now,
                     ),
                 )
         return {"ok": True, "days": len(payload["days"]), "policy_version": policy}
 
-    def export_csv(self, scope: dict[str, Any] | None = None, *, output_dir: Path | None = None) -> dict[str, Any]:
+    def export_csv(
+        self, scope: dict[str, Any] | None = None, *, output_dir: Path | None = None
+    ) -> dict[str, Any]:
         payload = self.query(scope, journal_limit=None)
         root = Path(output_dir or (Path.home() / "Downloads")).expanduser()
         root.mkdir(parents=True, exist_ok=True)
         path = root / f"pudge-statistics-{time.strftime('%Y%m%d-%H%M%S')}.csv"
         with path.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow([
-                "start_local", "end_local", "duration_seconds", "title", "format", "origin",
-                "measurement", "device", "excluded", "correction_reason", "id",
-            ])
+            writer.writerow(
+                [
+                    "start_local",
+                    "end_local",
+                    "duration_seconds",
+                    "title",
+                    "format",
+                    "origin",
+                    "measurement",
+                    "device",
+                    "excluded",
+                    "correction_reason",
+                    "id",
+                ]
+            )
             for row in payload["journal"]:
-                writer.writerow([
-                    row.get("start_local") or "",
-                    row.get("end_local") or "",
-                    round(float(row.get("seconds") or 0.0), 3),
-                    row.get("title") or "",
-                    row.get("kind") or "",
-                    row.get("origin") or "",
-                    row.get("measurement_method") or "",
-                    row.get("device") or "",
-                    "1" if row.get("excluded") else "0",
-                    row.get("correction_reason") or "",
-                    row.get("id") or "",
-                ])
+                writer.writerow(
+                    [
+                        row.get("start_local") or "",
+                        row.get("end_local") or "",
+                        round(float(row.get("seconds") or 0.0), 3),
+                        row.get("title") or "",
+                        row.get("kind") or "",
+                        row.get("origin") or "",
+                        row.get("measurement_method") or "",
+                        row.get("device") or "",
+                        "1" if row.get("excluded") else "0",
+                        row.get("correction_reason") or "",
+                        row.get("id") or "",
+                    ]
+                )
         return {
             "ok": True,
             "path": str(path),

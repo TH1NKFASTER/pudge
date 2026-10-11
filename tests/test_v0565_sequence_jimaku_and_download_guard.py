@@ -2,16 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from css_support import css_rules
+
 from pudge.cli import _find_online_subtitles
 from pudge.config import AppConfig, write_config
 from pudge.manager import AnimeManager
 from pudge.manager_models import DownloadItem, LibraryAnime, LibraryEpisode
 from pudge.models import AniListAnime, JimakuEntry, JimakuFile, SubtitleCandidate, VideoIdentity
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
+from test_v0564_compact_series_and_jimaku_special import SEQUENCE, monogatari_state
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -35,23 +34,62 @@ def relation(media_id: int, title: str) -> dict:
     }
 
 
-def test_sequence_list_only_opens_from_entry_count_and_cover_is_polychrome() -> None:
-    html = HTML.read_text(encoding="utf-8")
+def test_sequence_list_only_opens_from_entry_count_and_cover_is_polychrome(tmp_path: Path, page) -> None:
+    state = monogatari_state(tmp_path)
+    lead = state["home"]["completed_ready"][0]["items"][0]
+    result = page.run(
+        SEQUENCE
+        + """
+        const out = {polychrome: card.querySelector('.ready-sequence-cover').classList.contains('polychrome'),
+                     count: __text('.ready-sequence-card .ready-sequence-count')};
+        await __fire('.ready-sequence-card .ready-sequence-meta strong', 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent');
+        out.menu = __visible('#contextMenu') && ui.contextAnime?.media_id;
+        hideContextMenu();
+        await __click('.ready-sequence-card .ready-sequence-meta strong');     // the card plays its lead entry
+        await __tick(10);
+        return out;
+        """,
+        state=state,
+        api={"play": {"ok": True}},
+    )
+    out = result.value
+    assert out["polychrome"] is True and out["count"] == "1/3"
+    assert out["menu"] == lead["media_id"]  # the card has the anime menu
+    assert [call[0] for call in result.calls_of("play")] == [lead["local"]["video_path"]]
+    # The entry list opens from the entry count only, not from hovering the whole card.
+    rules = css_rules("index.html")
+    assert rules.get(".ready-sequence-count-wrap:hover + .ready-sequence-list", "opacity") == "1"
+    assert rules.get(".ready-sequence-list", "opacity") == "0"
+    assert not [
+        selector
+        for selector in rules.selectors()
+        if ".ready-sequence-card:hover" in selector and "ready-sequence-list" in selector
+    ]
 
-    assert ".ready-sequence-count-wrap:hover + .ready-sequence-list" in html
-    assert ".ready-sequence-card:hover .ready-sequence-list" not in html
-    assert "ready-sequence-cover cover-shell polychrome" in html
-    assert 'class="ready-sequence-card" data-media-id=' in html
-    assert 'data-action="play" data-path="${escapeHtml(leadPath)}"' in html
 
-
-def test_sequence_rows_keep_titles_when_play_state_changes() -> None:
-    html = HTML.read_text(encoding="utf-8")
-    state_source = html[html.index("function setPathPlayState"):html.index("function applyKnownPlayStates")]
-
-    assert "el.tagName==='BUTTON'&&el.classList.contains('play-button')" in state_source
-    assert "if(el.tagName==='BUTTON')el.disabled=state!=='idle'" in state_source
-    assert "ready-sequence-row" not in state_source
+def test_sequence_rows_keep_titles_when_play_state_changes(tmp_path: Path, page) -> None:
+    # The entry rows are buttons too: a play state used to replace their titles with "Starting…".
+    for lang in ("en", "ru"):
+        result = page.run(
+            SEQUENCE
+            + """
+            const before = rows();
+            await __click('.ready-sequence-card .ready-sequence-meta strong');
+            await __tick(10);
+            const starting = {rows: rows(), starting: card.classList.contains('play-starting'),
+                              enabled: [...card.querySelectorAll('.ready-sequence-row')].every(row => !row.disabled)};
+            await __tick(1000);                                  // the player reports it is running
+            const running = {rows: rows(), running: card.classList.contains('play-running')};
+            return {before, starting, running};
+            """,
+            lang=lang,
+            state=monogatari_state(tmp_path / lang),
+            api={"play": {"ok": True}, "play_status": {"status": "running"}},
+        )
+        out = result.value
+        assert out["before"] == ["1 Bakemonogatari", "2 Nisemonogatari", "3 Kizumonogatari"]
+        assert out["starting"] == {"rows": out["before"], "starting": True, "enabled": True}
+        assert out["running"] == {"rows": out["before"], "running": True}
 
 
 def test_single_ready_related_entry_is_not_wrapped_in_watch_order(tmp_path: Path) -> None:
@@ -188,9 +226,10 @@ def test_fuzzy_zero_progress_torrent_does_not_block_new_download(tmp_path: Path)
         def torrents(self, *, category=""):
             return [item]
 
-    assert manager._existing_download_for_request(
-        Client(), anime, episode=1, batch=False, release_hash="new"
-    ) is None
+    assert (
+        manager._existing_download_for_request(Client(), anime, episode=1, batch=False, release_hash="new")
+        is None
+    )
 
 
 def test_missing_files_torrent_does_not_block_new_download(tmp_path: Path) -> None:
@@ -217,6 +256,7 @@ def test_missing_files_torrent_does_not_block_new_download(tmp_path: Path) -> No
         def torrents(self, *, category=""):
             return [item]
 
-    assert manager._existing_download_for_request(
-        Client(), anime, episode=None, batch=True, release_hash="new"
-    ) is None
+    assert (
+        manager._existing_download_for_request(Client(), anime, episode=None, batch=True, release_hash="new")
+        is None
+    )

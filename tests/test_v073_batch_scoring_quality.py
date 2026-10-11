@@ -86,8 +86,7 @@ def test_seed_bonus_saturates_after_twenty() -> None:
 def test_bd_marker_counts_as_bluray_preference() -> None:
     okay = _score_batch(
         _release(
-            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | "
-            "Ansatsu Kyoushitsu",
+            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | Ansatsu Kyoushitsu",
             seeders=31,
             size_gib=48.7,
             is_batch=False,
@@ -111,8 +110,7 @@ def test_batch_ranking_prefers_healthy_bluray_season_pack_over_old_range_label()
     )
     okay = _score_batch(
         _release(
-            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | "
-            "Ansatsu Kyoushitsu",
+            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | Ansatsu Kyoushitsu",
             seeders=31,
             size_gib=48.7,
             is_batch=False,
@@ -136,8 +134,7 @@ def test_batch_first_accepts_season_pack_without_batch_word(tmp_path: Path) -> N
     )
     okay = _score_batch(
         _release(
-            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | "
-            "Ansatsu Kyoushitsu",
+            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | Ansatsu Kyoushitsu",
             seeders=31,
             size_gib=48.7,
             is_batch=False,
@@ -170,8 +167,7 @@ def test_batch_first_rejects_movies_multi_season_and_partial_ranges(
     manager = _manager(tmp_path)
     base = _score_batch(
         _release(
-            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | "
-            "Ansatsu Kyoushitsu",
+            "[Okay-Subs] Assassination Classroom S1 (BD 1080p) | Ansatsu Kyoushitsu",
             seeders=31,
             size_gib=48.7,
             is_batch=False,
@@ -233,8 +229,7 @@ def test_production_search_rejects_explicit_wrong_season_before_ranking() -> Non
         format="TV",
     )
     wrong = _release(
-        "[Erai-raws] Shingeki no Kyojin Season 2 - 01 ~ 12 "
-        "[720p][BATCH][Multiple Subtitle]",
+        "[Erai-raws] Shingeki no Kyojin Season 2 - 01 ~ 12 [720p][BATCH][Multiple Subtitle]",
         seeders=20,
         size_gib=8.5,
         is_batch=True,

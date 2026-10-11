@@ -71,9 +71,7 @@ class _HistoryDB:
 def _manager(db: _HistoryDB, *, ocr_counts_as_ready: bool = False) -> AnimeManager:
     manager = AnimeManager.__new__(AnimeManager)
     manager.db = db
-    manager.config = SimpleNamespace(
-        matching=SimpleNamespace(ocr_counts_as_ready=ocr_counts_as_ready)
-    )
+    manager.config = SimpleNamespace(matching=SimpleNamespace(ocr_counts_as_ready=ocr_counts_as_ready))
     manager.logger = logging.getLogger("pudge-test-v112")
     return manager
 
@@ -95,9 +93,7 @@ def test_history_recovery_restores_prepared_final_path(tmp_path: Path) -> None:
         }
     )
 
-    recovered = _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=200637, episode=8
-    )
+    recovered = _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=200637, episode=8)
 
     assert recovered == final.resolve()
     assert db.ready_calls == [(video, final.resolve(), None, "jimaku")]
@@ -116,9 +112,7 @@ def test_history_recovery_accepts_pipeline_cache_prepared_path(tmp_path: Path) -
         }
     )
 
-    recovered = _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=200637, episode=8
-    )
+    recovered = _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=200637, episode=8)
 
     assert recovered == prepared.resolve()
     assert db.ready_calls[0][3] == "pipeline_cache"
@@ -137,9 +131,7 @@ def test_history_recovery_does_not_restore_raw_jimaku_candidate(tmp_path: Path) 
         }
     )
 
-    assert _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=1, episode=1
-    ) is None
+    assert _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=1, episode=1) is None
     assert db.ready_calls == []
 
 
@@ -159,9 +151,10 @@ def test_history_recovery_respects_ocr_not_ready_policy(tmp_path: Path) -> None:
         }
     )
 
-    assert _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=178788, episode=None
-    ) is None
+    assert (
+        _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=178788, episode=None)
+        is None
+    )
     assert db.ready_calls == []
 
 
@@ -178,9 +171,7 @@ def test_history_recovery_ignores_missing_or_rejected_prepared_path(tmp_path: Pa
             },
         }
     )
-    assert _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=1, episode=1
-    ) is None
+    assert _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=1, episode=1) is None
 
     present = tmp_path / "rejected.srt"
     present.write_text("bad", encoding="utf-8")
@@ -191,7 +182,5 @@ def test_history_recovery_ignores_missing_or_rejected_prepared_path(tmp_path: Pa
             "quality": {"accepted": False},
         },
     }
-    assert _manager(db)._recover_selected_text_subtitle_from_history(
-        video, media_id=1, episode=1
-    ) is None
+    assert _manager(db)._recover_selected_text_subtitle_from_history(video, media_id=1, episode=1) is None
     assert db.ready_calls == []

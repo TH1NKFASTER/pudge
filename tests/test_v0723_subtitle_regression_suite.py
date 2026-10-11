@@ -111,14 +111,8 @@ def _make_opening_srt(path: Path) -> tuple[list[float], list[float]]:
 
 def _make_reference(path: Path, pre: list[float], post: list[float], shift: float = 0.8) -> None:
     write_srt(
-        [
-            (value + shift, value + shift + 1.2, f"r{index}")
-            for index, value in enumerate(pre)
-        ]
-        + [
-            (value, value + 1.2, f"p{index}")
-            for index, value in enumerate(post)
-        ],
+        [(value + shift, value + shift + 1.2, f"r{index}") for index, value in enumerate(pre)]
+        + [(value, value + 1.2, f"p{index}") for index, value in enumerate(post)],
         path,
     )
 
@@ -512,10 +506,7 @@ def test_parallel_japanese_chinese_track_is_detected_as_bilingual() -> None:
 
 
 def test_pure_japanese_track_is_not_marked_bilingual() -> None:
-    cues = [
-        (index * 2.0, index * 2.0 + 1.0, f"これは日本語の字幕です{index}")
-        for index in range(40)
-    ]
+    cues = [(index * 2.0, index * 2.0 + 1.0, f"これは日本語の字幕です{index}") for index in range(40)]
     assert bilingual_cjk_profile(cues)["suspected_bilingual_cjk"] is False
 
 
@@ -527,10 +518,7 @@ def test_pure_japanese_track_is_not_marked_bilingual() -> None:
 def test_compare_timing_activity_identity_is_perfect(tmp_path: Path) -> None:
     first = tmp_path / "a.srt"
     second = tmp_path / "b.srt"
-    cues = [
-        (10.0 + index * 7.3, 12.0 + index * 7.3, f"c{index}")
-        for index in range(30)
-    ]
+    cues = [(10.0 + index * 7.3, 12.0 + index * 7.3, f"c{index}") for index in range(30)]
     write_srt(cues, first)
     write_srt(cues, second)
 
@@ -543,10 +531,7 @@ def test_compare_timing_activity_identity_is_perfect(tmp_path: Path) -> None:
 def test_compare_timing_activity_penalizes_constant_shift(tmp_path: Path) -> None:
     first = tmp_path / "a.srt"
     second = tmp_path / "b.srt"
-    cues = [
-        (10.0 + index * 7.3, 12.0 + index * 7.3, f"c{index}")
-        for index in range(30)
-    ]
+    cues = [(10.0 + index * 7.3, 12.0 + index * 7.3, f"c{index}") for index in range(30)]
     shifted = [(start + 2.0, end + 2.0, text) for start, end, text in cues]
     write_srt(cues, first)
     write_srt(shifted, second)
@@ -619,14 +604,8 @@ def test_local_speech_estimate_rejects_too_sparse_evidence() -> None:
 
 def test_windowed_reference_shift_recovers_nonperiodic_offset() -> None:
     starts = [5.0, 11.8, 19.1, 28.6, 39.4, 51.7, 65.3, 80.2]
-    candidate = [
-        (start, start + 1.0 + (index % 3) * 0.2, f"c{index}")
-        for index, start in enumerate(starts)
-    ]
-    reference = [
-        (start + 0.75, end + 0.75, text)
-        for start, end, text in candidate
-    ]
+    candidate = [(start, start + 1.0 + (index % 3) * 0.2, f"c{index}") for index, start in enumerate(starts)]
+    reference = [(start + 0.75, end + 0.75, text) for start, end, text in candidate]
 
     result = _windowed_reference_shift(
         candidate,
@@ -643,13 +622,9 @@ def test_windowed_reference_shift_recovers_nonperiodic_offset() -> None:
 
 def test_windowed_reference_shift_does_not_need_text_match() -> None:
     starts = [5.0, 11.8, 19.1, 28.6, 39.4, 51.7, 65.3, 80.2]
-    candidate = [
-        (start, start + 1.1, f"日本語{index}")
-        for index, start in enumerate(starts)
-    ]
+    candidate = [(start, start + 1.1, f"日本語{index}") for index, start in enumerate(starts)]
     reference = [
-        (start + 0.65, end + 0.65, f"English {index}")
-        for index, (start, end, _text) in enumerate(candidate)
+        (start + 0.65, end + 0.65, f"English {index}") for index, (start, end, _text) in enumerate(candidate)
     ]
 
     result = _windowed_reference_shift(

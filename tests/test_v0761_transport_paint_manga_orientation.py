@@ -1,60 +1,14 @@
+"""Read together: a quick Pause+Resume reaches mpv as two commands and the highlight keeps
+moving; the pause bridge does not build library state. Manga: an existing OCR artifact
+without the backend's orientation fix is still drawn vertically when its geometry and text
+say so (behaviour; audit 71Б rewrite)."""
+
 from __future__ import annotations
 
-import json
-import re
-import subprocess
-from pathlib import Path
-
-from pudge.manga import _normalize_region_orientation
+from css_support import css_rules
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).parents[1]
-HTML = ROOT / "pudge/web/index.html"
-MANGA_JS = ROOT / "pudge/web/manga_reader_v2.js"
-
-
-def _function(source: str, name: str) -> str:
-    match = re.search(rf"(?:async\s+)?function\s+{re.escape(name)}\s*\(", source)
-    assert match, name
-    opening = source.find("{", match.end())
-    assert opening >= 0
-    depth = 0
-    quote: str | None = None
-    escaped = False
-    index = opening
-    while index < len(source):
-        char = source[index]
-        if quote is not None:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"', "`"}:
-            quote = char
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return source[match.start() : index + 1]
-        index += 1
-    raise AssertionError(name)
-
-
-def _run_node(source: str) -> dict[str, object]:
-    completed = subprocess.run(
-        ["node", "-e", source],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(completed.stdout)
+from t71g21_support import READER, paired
+from tests.t71g06_support import reader
 
 
 def test_pause_bridge_does_not_build_the_full_audiobook_library_state() -> None:
@@ -79,102 +33,83 @@ def test_pause_bridge_does_not_build_the_full_audiobook_library_state() -> None:
     assert calls == [("set_paused", 75, True)]
 
 
-def test_coalesced_pause_resume_does_not_freeze_text_when_mpv_never_pauses() -> None:
-    source = HTML.read_text(encoding="utf-8")
-    toggle = _function(source, "toggleLnPairedPlayback")
-    script = f"""
-const calls=[];
-let actual={{audiobook_id:75,alignment:{{ready:true,status:'ready'}},playing:true,player_running:true,paused:false,position:100,speed:1,chapter_char_offset_exact:10}};
-const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-global.ui={{lnBook:{{id:6,paired_audio:{{}}}},lnChapter:{{chapter_index:1}},lnPairedState:{{...actual}},lnPairedStarted:true,lnPairedExpanded:true,lnPairedTransportDesired:null,lnPairedTransportGeneration:0,lnPairedTransportPromise:null,lnPairedLastDisplayOffset:10}};
-global.invalidateLnPairedPoll=()=>calls.push('invalidate');
-global.syncLnPairedTray=state=>{{ui.lnPairedState={{...state}};calls.push(['sync',Boolean(state.playing)]);}};
-global.cancelLnPairedInterpolation=()=>calls.push('cancel');
-global.applyLnPairedPosition=async()=>calls.push('apply');
-global.pollLnPaired=()=>calls.push('poll');
-global.lnPairedTrace=()=>{{}};
-global.lnReaderAudioProgress=()=>.5;
-global.$=()=>({{value:'1'}});
-global.pywebview={{api:{{
-  light_novel_paired_state:async()=>{{await sleep(25);return {{...actual}};}},
-  audiobook_set_paused:async(_id,paused)=>{{calls.push(['pause',paused]);actual={{...actual,playing:!paused,paused}};return {{ok:true}};}},
-  light_novel_play_paired:async()=>{{throw new Error('unexpected restart');}},
-  light_novel_prepare_audio_alignment:async()=>{{}},
-}}}};
-{toggle}
-(async()=>{{
-  const first=toggleLnPairedPlayback();
-  const second=toggleLnPairedPlayback();
-  await Promise.all([first,second]);
-  console.log(JSON.stringify({{calls,actual}}));
-}})().catch(error=>{{console.error(error);process.exit(1);}});
+# mpv takes 60 ms to answer a pause / resume.
+SLOW_MPV = """
+const setPausedNow = __api.audiobook_set_paused;
+__api.audiobook_set_paused = async (...args) => { await new Promise(resolve => setTimeout(resolve, 60)); return setPausedNow(...args); };
 """
-    result = _run_node(script)
-    pause_calls = [
-        row for row in result["calls"]
-        if isinstance(row, list) and row[0] == "pause"
+
+
+def test_quick_pause_and_resume_keep_the_text_moving(page) -> None:
+    # Old bug: Pause and Resume pressed before mpv answered the first were coalesced; when
+    # the late pause answer arrived it stopped the highlight's clock although the narration
+    # played on, and the text stood still until the backend answered again.
+    result = page.run(
+        READER
+        + r"""
+        await openReader(); await __tick(1000);
+        const since = __apiCalls.length;
+        await __key(' ', {code: 'Space'}, 'body');      // Pause ...
+        await __key(' ', {code: 'Space'}, 'body');      // ... and Resume at once
+        AUDIO.hold = true;                              // the backend is busy: no state answers for now
+        const samples = [];
+        for (let k = 0; k < 6; k++) { await __tick(300); samples.push(shown()); }
+        return {shown: samples, transport: __apiCalls.slice(since).filter(c => c.name === 'audiobook_set_paused').map(c => c.args),
+                playing: AUDIO.playing, label: __text('#lnPairedAudio'), pause: t('ui.pause')};
+        """,
+        **paired(True, extra=SLOW_MPV),
+    )
+    out = result.value
+    # Both presses reach mpv, in order; the narration plays on and so does the highlight
+    # (one character a second here).
+    assert out["transport"] == [[75, True], [75, False]]
+    assert out["playing"] is True and out["label"] == out["pause"]
+    assert out["shown"][-1] - out["shown"][0] > 1.2, out["shown"]
+    assert not result.called("audiobook_stop") and not result.called("light_novel_play_paired")
+
+
+def test_reader_draws_old_cached_horizontal_bubbles_vertically(page) -> None:
+    # Regions from an OCR artifact made before the backend normalized orientation.
+    bubble = {
+        "text": "おれの財宝か？欲しけりゃくれてやる",
+        "orientation": "horizontal",
+        "detector": "vision-contrast+vision-original+vision-rectangles",
+        "x": 0.697947,
+        "y": 0.5315,
+        "width": 0.180421,
+        "height": 0.0945,
+    }
+    caption = {
+        "text": "冒険の夜明け",
+        "orientation": "horizontal",
+        "detector": "vision-contrast+vision-original",
+        "x": 0.1,
+        "y": 0.1,
+        "width": 0.212,
+        "height": 0.043667,
+    }
+    result = reader(
+        page,
+        r"""
+        const drawn = Object.fromEntries([...document.querySelectorAll('#mangaV2Pages .manga-v2-text-region')].map(node =>
+          [node.getAttribute('aria-label'), node.classList.contains('vertical-text')]));
+        const overlays = (await exportDebug()).frames[0].overlays.map(o => [o.text, o.effective_orientation, o.orientation_reason]);
+        return {drawn, overlays};
+        """,
+        regions={0: [bubble, caption]},
+        before="__api.manga_export_ocr_debug = async () => ({path: '/logs/ocr.zip'});",
+    )
+    out = result.value
+    assert out["drawn"] == {"おれの財宝か？欲しけりゃくれてやる": True, "冒険の夜明け": False}
+    # The OCR debug log says how each region was drawn, and why.
+    assert sorted(out["overlays"]) == [
+        ["おれの財宝か？欲しけりゃくれてやる", "vertical", "low-confidence-vision-japanese"],
+        ["冒険の夜明け", "horizontal", "horizontal"],
     ]
-    assert pause_calls == [["pause", True], ["pause", False]]
-    assert result["calls"].count("cancel") == 0
-    assert result["actual"]["playing"] is True
-
-
-def test_multicolumn_japanese_bubble_is_normalized_to_vertical() -> None:
-    region = _normalize_region_orientation(
-        {
-            "text": "おれの財宝か？欲しけりゃくれてやる",
-            "raw_text": "ざい",
-            "orientation": "horizontal",
-            "confidence": 0.3,
-            "detector": "vision-contrast+vision-original+vision-rectangles",
-            "x": 0.697947,
-            "y": 0.5315,
-            "width": 0.180421,
-            "height": 0.0945,
-        }
+    # A vertical bubble's text runs top to bottom, right to left.
+    assert (
+        css_rules("manga_reader_v2.css").get(
+            ".manga-v2-text-region.vertical-text .manga-v2-region-content", "writing-mode"
+        )
+        == "vertical-rl"
     )
-    assert region["orientation"] == "vertical"
-    assert region["orientation_reason"] == "japanese-multicolumn-geometry"
-
-
-def test_shallow_horizontal_caption_stays_horizontal() -> None:
-    region = _normalize_region_orientation(
-        {
-            "text": "冒険の夜明け",
-            "orientation": "horizontal",
-            "detector": "vision-contrast+vision-original",
-            "width": 0.212,
-            "height": 0.043667,
-        }
-    )
-    assert region["orientation"] == "horizontal"
-
-
-def test_frontend_applies_vertical_writing_mode_to_existing_cached_artifact() -> None:
-    source = MANGA_JS.read_text(encoding="utf-8")
-    function = _function(source, "effectiveRegionOrientation")
-    script = f"""
-{function}
-const target=effectiveRegionOrientation({{
-  text:'おれの財宝か？欲しけりゃくれてやる',
-  orientation:'horizontal',
-  detector:'vision-contrast+vision-original+vision-rectangles'
-}},.180421,.0945);
-const caption=effectiveRegionOrientation({{
-  text:'冒険の夜明け',
-  orientation:'horizontal',
-  detector:'vision-contrast+vision-original'
-}},.212,.043667);
-console.log(JSON.stringify({{target,caption}}));
-"""
-    result = _run_node(script)
-    assert result["target"] == {
-        "vertical": True,
-        "reason": "low-confidence-vision-japanese",
-    }
-    assert result["caption"] == {
-        "vertical": False,
-        "reason": "horizontal",
-    }
-    assert "data-effective-orientation" in source
-    assert "data-orientation-reason" in source

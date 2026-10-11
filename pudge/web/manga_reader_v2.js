@@ -7,7 +7,6 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[ch]));
-  const ru = () => document.documentElement.lang === 'ru' || uiRef()?.lang === 'ru';
 
   const SETTINGS_KEY = 'pudge.manga.reader.v2';
   const COVER_CACHE_KEY = 'pudge.manga.anilist.covers.v1';
@@ -48,6 +47,7 @@
   let textParseCache = new Map();
   let textParseInflight = new Map();
   const textForegroundOcrInflight = new Set();
+  const textForegroundOcrAttempted = new Map();
   // pudge-v0.7.27-manga-cold-cache-foreground-runtime-v1
   let mangaDebugEvents = [];
   let mangaDebugSelectionKey = '';
@@ -68,12 +68,7 @@
   let preparationPollGeneration = 0;
   let mangaContextBook = null;
   let mangaContextSeries = null;
-  let mangaCorrectionContext = null;
-  let mangaGeometryEditor = null;
-  let mangaManualAddMode = false;
-  let mangaManualAddDraft = null;
-  let mangaMergeDraft = null;
-  let mangaSplitDraft = null;
+  let mangaRegionContext = null;
   let pagedVisibleCount = 1;
   const selectedBookIds = new Set();
   const libraryOcrPollers = new Map();
@@ -150,11 +145,13 @@
       title: group.title || seriesTitle(books[0]),
       body: `<div class="ln-volume-grid">${books.map(book => mangaLibraryCard(book, true)).join('')}</div>`,
       continueHtml: unfinished
-        ? `<button type="button" class="primary" data-manga-v2-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(volumeNumber(current))}</button>`
+        ? `<button type="button" class="primary" data-manga-v2-action="read" data-id="${Number(current.id)}">${PudgeI18n.t('ln.continueVolume', {volume: Number(volumeNumber(current))})}</button>`
         : '',
       afterRender: panel => {
         paintLibraryCovers(panel, books);
         applyLibrarySelection();
+        // The same Jiten chips as the volumes of the series card.
+        hydrateLibraryJiten(panel, books);
       },
     };
   }
@@ -281,7 +278,7 @@
       book.media_title ||
       stripVolume(book.title) ||
       book.title ||
-      'Manga'
+      PudgeI18n.t('stats.kind.manga')
     ).trim();
   }
 
@@ -301,7 +298,7 @@
       if (!groups.has(key)) groups.set(key, {key, title, books: []});
       const group = groups.get(key);
       group.books.push(book);
-      if ((!group.title || group.title === 'Manga') && title) group.title = title;
+      if ((!group.title || group.title === PudgeI18n.t('stats.kind.manga')) && title) group.title = title;
     }
     const result = [...groups.values()];
     for (const group of result) {
@@ -392,8 +389,8 @@
 
   function volumeLabel(book, index) {
     const n = volumeNumber(book);
-    if (Number.isFinite(n) && n > 0) return ru() ? `Том ${n}` : `Vol. ${n}`;
-    return ru() ? `Том ${index + 1}` : `Vol. ${index + 1}`;
+    if (Number.isFinite(n) && n > 0) return PudgeI18n.t('manga.vol',{n:n});
+    return PudgeI18n.t('manga.vol2',{value:index + 1});
   }
 
   function mangaLibraryCard(book, compact = false) {
@@ -402,24 +399,24 @@
     const read = total ? Math.max(0, Math.min(total, Number(book.read_pages || 0))) : 0;
     const percent = total ? Math.max(0, Math.min(100, Math.round(read / total * 100))) : 0;
     const volume = volumeNumber(book);
-    const title = compact ? (ru() ? `Том ${volume}` : `Volume ${volume}`) : esc(book.title || seriesTitle(book));
+    const title = compact ? (PudgeI18n.t('ui.volume',{volume:volume})) : esc(book.title || seriesTitle(book));
     const linkedId = anilistId(book);
     const linkedUrl = linkedId ? (book.site_url || `https://anilist.co/manga/${linkedId}`) : '';
     const score = Number(book.mean_score || 0);
     const scoreHtml = !compact && score && window.PudgeAniListScore?.chip
       ? window.PudgeAniListScore.chip(score, 'percent')
       : '';
-    const progressTitle = total ? `${read} / ${total} ${ru() ? 'страниц' : 'pages'}` : `${percent}%`;
+    const progressTitle = total ? PudgeI18n.tn('manga.readOfPages', total, {read}) : `${percent}%`;
     // pudge-v0.7.23-manga-progress-tooltip-v1
     const facts = (compact
-      ? [`${percent}%`, total ? `${total} ${ru() ? 'стр.' : 'pages'}` : '']
-      : [ru() ? `Том ${volume}` : `Volume ${volume}`, total ? `${total} ${ru() ? 'страниц' : 'pages'}` : '', `${percent}%`])
+      ? [`${percent}%`, total ? PudgeI18n.tn('manga.pagesShort', total) : '']
+      : [PudgeI18n.t('ui.volume',{volume:volume}), total ? PudgeI18n.tn('manga.pageCount', total) : '', `${percent}%`])
       .filter(Boolean)
       .map(value => value === `${percent}%`
         ? `<span data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}">${esc(value)}</span>`
         : `<span>${esc(value)}</span>`)
       .join('') + scoreHtml;
-    const cover = `<div class="ln-card-cover cover-placeholder" data-cover-placeholder="${id}" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''}>Cover</div><img class="ln-card-cover" data-cover-book="${id}" data-pudge-cover-kind="manga" data-pudge-cover-id="${id}" alt="" loading="lazy" decoding="async" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''} hidden>`;
+    const cover = `<div class="ln-card-cover cover-placeholder" data-cover-placeholder="${id}" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''}>${PudgeI18n.t('label.cover')}</div><img class="ln-card-cover" data-cover-book="${id}" data-pudge-cover-kind="manga" data-pudge-cover-id="${id}" alt="" loading="lazy" decoding="async" ${linkedUrl ? `data-manga-v2-action="anilist" data-url="${esc(linkedUrl)}" title="AniList"` : ''} hidden>`;
     const jiten = linkedId ? `<div class="planned-jiten" data-library-card-jiten data-manga-card-jiten="${linkedId}" data-jiten-book="${id}" data-jiten-volume="${volume}"><span class="planned-jiten-loading">Jiten…</span></div>` : '';
     return `<article class="ln-card ln-entry ${compact ? 'compact' : ''} ${selectedBookIds.has(id) ? 'selected' : ''}" data-manga-book="${id}" data-manga-v2-action="read" data-id="${id}">${cover}<div class="ln-card-body"><h3>${title}</h3><div class="ln-card-meta">${facts}</div><div class="ln-card-progress" data-tooltip="${esc(progressTitle)}" aria-label="${esc(progressTitle)}"><span style="width:${percent}%"></span></div>${jiten}</div></article>`;
   }
@@ -466,9 +463,9 @@
     const seriesStats = (seriesJiten || seriesScore) ? `<div class="ln-series-stats">${seriesJiten}${seriesScore}</div>` : '';
     const unfinished = current && Number(current.read_pages || 0) < Number(current.page_count || 0);
     const continueButton = unfinished
-      ? `<button type="button" class="ln-group-continue manga-series-continue" data-manga-v2-action="read" data-id="${Number(current.id)}">${ru() ? 'Продолжить' : 'Continue'} · ${ru() ? 'том' : 'vol.'} ${Number(volumeNumber(current))}</button>`
+      ? `<button type="button" class="ln-group-continue manga-series-continue" data-manga-v2-action="read" data-id="${Number(current.id)}">${PudgeI18n.t('ln.continueVolume', {volume: Number(volumeNumber(current))})}</button>`
       : '';
-    return `<section class="ln-series-group" data-manga-group-open="series" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}</strong>${seriesStats}${continueButton}</div><span class="ln-series-count">${group.books.length} ${ru() ? 'тома/томов' : 'volumes'}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
+    return `<section class="ln-series-group" data-manga-group-open="series" data-manga-series-key="${esc(group.key)}" data-manga-series-ids="${seriesIds}"><div class="ln-series-head" data-manga-series-select="${esc(group.key)}"><div class="ln-series-title-block"><strong>${esc(group.title)}</strong>${seriesStats}${continueButton}</div><span class="ln-series-count">${PudgeI18n.tn('media.volumeCount', group.books.length)}</span></div><div class="ln-series-books${scrollClass}" ${group.books.length > 2 ? 'data-series-scroll="1"' : ''} data-series-current-book="${Number(current?.id || 0)}">${group.books.map(book => mangaLibraryCard(book, true)).join('')}</div></section>`;
   }
 
   function mangaShelfContinue(groups) {
@@ -487,10 +484,10 @@
     const ids = groups.flatMap(group => group.books || []).map(book => Number(book.id)).filter(Boolean).join(',');
     const current = mangaShelfContinue(groups);
     const currentVolume = Number(current?.book ? volumeNumber(current.book) : 1);
-    const continueText = current ? `${ru() ? 'Продолжить' : 'Continue'}: ${esc(current.group.title || '')} · ${ru() ? 'том' : 'volume'} ${currentVolume}` : '';
-    const counts = `${groups.length} ${ru() ? 'серий' : 'series'} · ${Number(shelf.bookCount || 0)} ${ru() ? 'томов' : 'volumes'}${shelf.ambiguous ? (ru() ? ' · порядок связей неоднозначен' : ' · relation order ambiguous') : ''}`;
+    const continueText = current ? esc(PudgeI18n.t('manga.continueSeriesVolume', {title: current.group.title || '', volume: currentVolume})) : '';
+    const counts = `${PudgeI18n.tn('manga.seriesCount', groups.length)} · ${PudgeI18n.tn('media.volumeCount', Number(shelf.bookCount || 0))}${shelf.ambiguous ? (PudgeI18n.t('ui.relationOrderAmbiguous')) : ''}`;
     const hidden = Number(shelf.hiddenSeriesCount || 0);
-    const toggle = hidden > 0 || shelf.expanded ? `<button class="library-shelf-toggle" data-library-shelf-toggle="${esc(shelf.key)}">${shelf.expanded ? (ru() ? 'Свернуть' : 'Collapse') : (ru() ? `Ещё ${hidden}` : `${hidden} more`)}</button>` : '';
+    const toggle = hidden > 0 || shelf.expanded ? `<button class="library-shelf-toggle" data-library-shelf-toggle="${esc(shelf.key)}">${shelf.expanded ? (PudgeI18n.t('ui.collapse')) : (PudgeI18n.t('ui.more',{hidden:hidden}))}</button>` : '';
     return `<section class="ln-franchise-group library-shelf" data-manga-franchise-ids="${ids}" data-library-shelf-key="${esc(shelf.key)}" data-library-shelf-ambiguous="${shelf.ambiguous ? '1' : '0'}"><div class="library-shelf-head"><div class="library-shelf-title"><strong>${esc(shelf.title || groups[0]?.title || '')}</strong><span class="library-shelf-meta">${counts}</span>${continueText ? `<span class="library-shelf-continue">${continueText}</span>` : ''}</div>${toggle}</div><div class="ln-franchise-series">${visible.map(mangaSeriesGroupHtml).join('')}</div></section>`;
   }
 
@@ -528,8 +525,12 @@
 
   // pudge-v0.7.23-manga-library-stability-v1
   function mangaLibraryRenderSignature(books) {
+    // Expanded franchise shelves (More / Collapse) change the page as well.
+    const expandedShelves = [...new Set((books || []).map(book => String(book.franchise_key || '')).filter(Boolean))]
+      .filter(key => Boolean(window.PudgeLibraryShelves?.expanded?.(key))).sort();
     return JSON.stringify([
-      ru() ? 'ru' : 'en',
+      PudgeI18n.lang(),
+      expandedShelves,
       (books || []).map(book => [
         Number(book.id), String(book.title || ''), String(book.series_key || ''),
         Number(book.page_count || 0), Number(book.read_pages || 0),
@@ -561,7 +562,7 @@
       }
       const scrollHost = hadLibrary ? root.closest?.('.page-scroll') : null;
       const scrollAnchor = scrollHost ? window.PudgeLibraryShelves?.captureScrollAnchor?.(root, scrollHost) : null;
-      root.innerHTML = `<div class="manga-v2-library"><button id="mangaImportV2" hidden>Import</button>${books.length ? `<div class="ln-grid">${mangaLibraryGroups(books)}</div>` : `<div class="empty">${ru() ? 'Добавьте CBZ/ZIP с изображениями страниц.' : 'Add a CBZ/ZIP containing page images.'}</div>`}</div>`;
+      root.innerHTML = `<div class="manga-v2-library"><button id="mangaImportV2" hidden>${PudgeI18n.t('media.import')}</button>${books.length ? `<div class="ln-grid">${mangaLibraryGroups(books)}</div>` : `<div class="empty empty-state"><p>${esc(PudgeI18n.t('manga.emptyExplain'))}</p><button type="button" class="primary" data-manga-empty-import>${esc(PudgeI18n.t('manga.emptyImportFolder'))}</button></div>`}</div>`;
       libraryRenderSignature = renderSignature;
       paintLibraryCovers(root, books, () => renderSignature === libraryRenderSignature);
       applyLibrarySelection();
@@ -573,7 +574,7 @@
       });
       if (selectionChanged) emitSelection();
     } catch (error) {
-      root.innerHTML = `<div class="empty">${esc((window.PudgeUiLanguage?.message(error?.message || error) ?? String(error?.message || error)))}</div>`;
+      root.innerHTML = `<div class="empty">${esc(PudgeI18n.message(String(error?.message || error)))}</div>`;
     } finally {
       setTimeout(() => { libraryRendering = false; }, 0);
     }
@@ -596,7 +597,7 @@
     reader.className = 'manga-v2-reader';
     reader.innerHTML = `
       <header class="manga-v2-toolbar">
-        <button data-manga-v2-action="close">← ${ru() ? 'Библиотека' : 'Library'}</button>
+        <button data-manga-v2-action="close">← ${PudgeI18n.t('section.settingsLibrary')}</button>
         <strong id="mangaV2Title"></strong>
         <div class="manga-v2-page-picker-shell">
           <button id="mangaV2PageLabel" class="manga-v2-page-label" data-manga-v2-action="page-picker" aria-haspopup="listbox" aria-expanded="false"></button>
@@ -604,90 +605,82 @@
         </div>
         <div id="mangaV2OcrProgress" class="manga-v2-ocr-progress" aria-live="polite"></div>
         <span class="spacer"></span>
-        <button data-manga-v2-action="add-ocr-region">${ru() ? 'Добавить OCR-регион' : 'Add OCR region'}</button>
-        <button data-manga-v2-action="ocr-book">${ru() ? 'OCR тома' : 'OCR volume'}</button>
-        <button data-manga-v2-action="import-nearby-mokuro" hidden>${ru() ? 'Mokuro рядом' : 'Nearby Mokuro'}</button>
-        <button data-manga-v2-action="import-mokuro">${ru() ? 'Импорт Mokuro' : 'Import Mokuro'}</button>
-        <button data-manga-v2-action="fullscreen">${ru() ? 'Полный экран' : 'Fullscreen'}</button>
-        <button data-manga-v2-action="settings">⚙</button>
+        <button data-manga-v2-action="ocr-book">${PudgeI18n.t('manga.ocrVolume')}</button>
+        <button data-manga-v2-action="fullscreen">${PudgeI18n.t('manga.fullscreen')}</button>
+        <button data-manga-v2-action="settings" aria-label="${PudgeI18n.t('manga.readerSettings')}">⚙</button>
       </header>
       <button id="mangaV2ToolbarReveal" class="manga-v2-toolbar-reveal" data-manga-v2-action="toolbar-show"
-        title="${ru() ? 'Показать панель' : 'Show toolbar'}" aria-label="${ru() ? 'Показать панель' : 'Show toolbar'}">⌄</button>
+        title="${PudgeI18n.t('manga.showToolbar')}" aria-label="${PudgeI18n.t('manga.showToolbar')}">⌄</button>
       <main id="mangaV2Viewport" class="manga-v2-viewport">
-        <button class="manga-v2-turn manga-v2-turn-left" data-manga-v2-action="next" aria-label="Next page">‹</button>
+        <button class="manga-v2-turn manga-v2-turn-left" data-manga-v2-action="next" aria-label="${PudgeI18n.t('manga.nextPage')}">‹</button>
         <div id="mangaV2Pages" class="manga-v2-pages"></div>
-        <button class="manga-v2-turn manga-v2-turn-right" data-manga-v2-action="previous" aria-label="Previous page">›</button>
+        <button class="manga-v2-turn manga-v2-turn-right" data-manga-v2-action="previous" aria-label="${PudgeI18n.t('manga.previousPage')}">›</button>
       </main>
       <aside id="mangaV2Settings" class="manga-v2-settings">
         <div class="manga-v2-settings-head">
-          <strong>${ru() ? 'Настройки читалки' : 'Reader settings'}</strong>
-          <button data-manga-v2-action="settings">×</button>
+          <strong>${PudgeI18n.t('manga.readerSettings')}</strong>
+          <button data-manga-v2-action="settings" aria-label="${PudgeI18n.t('manga.closeSettings')}">×</button>
         </div>
-        <label>${ru() ? 'Режим' : 'Layout'}
+        <label>${PudgeI18n.t('manga.layout')}
           <select data-manga-setting="mode">
-            <option value="single">${ru() ? 'Одна страница' : 'Single page'}</option>
-            <option value="double">${ru() ? 'Разворот' : 'Double page'}</option>
-            <option value="vertical">${ru() ? 'Вертикальная лента' : 'Vertical scroll'}</option>
+            <option value="single">${PudgeI18n.t('manga.singlePage')}</option>
+            <option value="double">${PudgeI18n.t('manga.doublePage')}</option>
+            <option value="vertical">${PudgeI18n.t('manga.verticalScroll')}</option>
           </select>
         </label>
-        <label>${ru() ? 'Направление' : 'Direction'}
+        <label>${PudgeI18n.t('manga.direction')}
           <select data-manga-setting="direction">
-            <option value="rtl">${ru() ? 'Справа налево' : 'Right to left'}</option>
-            <option value="ltr">${ru() ? 'Слева направо' : 'Left to right'}</option>
+            <option value="rtl">${PudgeI18n.t('manga.rightToLeft')}</option>
+            <option value="ltr">${PudgeI18n.t('manga.leftToRight')}</option>
           </select>
         </label>
-        <label>${ru() ? 'Подгонка' : 'Fit'}
+        <label>${PudgeI18n.t('manga.fit')}
           <select data-manga-setting="fit">
-            <option value="height">${ru() ? 'По высоте' : 'Fit height'}</option>
-            <option value="width">${ru() ? 'По ширине' : 'Fit width'}</option>
-            <option value="original">${ru() ? 'Оригинальный размер' : 'Original size'}</option>
+            <option value="height">${PudgeI18n.t('manga.fitHeight')}</option>
+            <option value="width">${PudgeI18n.t('manga.fitWidth')}</option>
+            <option value="original">${PudgeI18n.t('manga.originalSize')}</option>
           </select>
         </label>
-        <label>${ru() ? 'Масштаб' : 'Zoom'} <output id="mangaV2ZoomValue"></output>
+        <label>${PudgeI18n.t('manga.zoom')} <output id="mangaV2ZoomValue"></output>
           <input type="range" min="50" max="250" step="5" data-manga-setting="zoom">
         </label>
-        <label>${ru() ? 'Отступ между страницами' : 'Page gap'} <output id="mangaV2GapValue"></output>
+        <label>${PudgeI18n.t('manga.pageGap')} <output id="mangaV2GapValue"></output>
           <input type="range" min="0" max="48" step="2" data-manga-setting="gap">
         </label>
-        <label>${ru() ? 'Фон' : 'Background'}
+        <label>${PudgeI18n.t('manga.background')}
           <select data-manga-setting="background">
-            <option value="black">${ru() ? 'Чёрный' : 'Black'}</option>
-            <option value="charcoal">${ru() ? 'Тёмно-серый' : 'Charcoal'}</option>
-            <option value="paper">${ru() ? 'Светлый' : 'Light'}</option>
+            <option value="black">${PudgeI18n.t('manga.black')}</option>
+            <option value="charcoal">${PudgeI18n.t('manga.charcoal')}</option>
+            <option value="paper">${PudgeI18n.t('manga.light')}</option>
           </select>
         </label>
         <label class="manga-v2-check">
           <input type="checkbox" data-manga-setting="statusHighlight">
-          ${ru() ? 'Подсветка слов Jiten' : 'Highlight Jiten word states'}
+          ${PudgeI18n.t('manga.highlightJitenWordStates')}
         </label>
-        <label>${ru() ? 'Интенсивность подсветки' : 'Highlight intensity'}
+        <label>${PudgeI18n.t('manga.highlightIntensity')}
           <input type="range" min="10" max="65" step="5" data-manga-setting="statusOpacity">
         </label>
-        <div class="manga-v2-status-options" role="group" aria-label="Jiten colors">
-          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusNew"><i class="state-new"></i>${ru() ? 'Новое' : 'New'}</label>
-          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusLearning"><i class="state-learning"></i>${ru() ? 'Изучаемое' : 'Learning'}</label>
-          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusKnown"><i class="state-known"></i>${ru() ? 'Известное' : 'Known'}</label>
-          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusDue"><i class="state-due"></i>${ru() ? 'Повторить (контур)' : 'Due (outline)'}</label>
+        <div class="manga-v2-status-options" role="group" aria-label="${PudgeI18n.t('manga.jitenColors')}">
+          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusNew"><i class="state-new"></i>${PudgeI18n.t('manga.new')}</label>
+          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusLearning"><i class="state-learning"></i>${PudgeI18n.t('manga.learning')}</label>
+          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusKnown"><i class="state-known"></i>${PudgeI18n.t('manga.known')}</label>
+          <label class="manga-v2-check"><input type="checkbox" data-manga-setting="statusDue"><i class="state-due"></i>${PudgeI18n.t('manga.dueOutline')}</label>
         </div>
-        <div class="manga-v2-status-palette" role="group" aria-label="Jiten palette">
-          <label>${ru() ? 'Новое' : 'New'}<input type="color" data-manga-setting="statusNewColor"></label>
-          <label>${ru() ? 'Изучаемое' : 'Learning'}<input type="color" data-manga-setting="statusLearningColor"></label>
-          <label>${ru() ? 'Известное' : 'Known'}<input type="color" data-manga-setting="statusKnownColor"></label>
-          <label>${ru() ? 'Due' : 'Due'}<input type="color" data-manga-setting="statusDueColor"></label>
+        <div class="manga-v2-status-palette" role="group" aria-label="${PudgeI18n.t('manga.jitenPalette')}">
+          <label>${PudgeI18n.t('manga.new')}<input type="color" data-manga-setting="statusNewColor"></label>
+          <label>${PudgeI18n.t('manga.learning')}<input type="color" data-manga-setting="statusLearningColor"></label>
+          <label>${PudgeI18n.t('manga.known')}<input type="color" data-manga-setting="statusKnownColor"></label>
+          <label>${PudgeI18n.t('manga.due')}<input type="color" data-manga-setting="statusDueColor"></label>
         </div>
-        <div class="manga-v2-status-note">${ru()
-          ? 'Подсветка доступна только при подтверждённом статусе Jiten и точной геометрии отдельных символов. OCR и клики от неё не зависят.'
-          : 'Only confirmed Jiten states with precise individual-glyph geometry are colored. OCR and clicks are unaffected.'}</div>
+        <div class="manga-v2-status-note">${PudgeI18n.t('manga.onlyConfirmedJitenStatesWith')}</div>
         <label class="manga-v2-check">
           <input type="checkbox" data-manga-setting="toolbar">
-          ${ru() ? 'Показывать панель' : 'Show toolbar'}
+          ${PudgeI18n.t('manga.showToolbar2')}
         </label>
-        <button data-manga-v2-action="add-ocr-region">${ru() ? 'Добавить пропущенный OCR-регион…' : 'Add missing OCR region…'}</button>
-        <button data-manga-v2-action="ocr-corrections">${ru() ? 'Исправления OCR…' : 'OCR corrections…'}</button>
+        <button data-manga-v2-action="volume-words">${PudgeI18n.t('manga.volumeWords')}</button>
         <div class="manga-v2-shortcuts">
-          ${ru()
-            ? '←/→ — страницы · +/- — масштаб · 0 — 100% · F — полный экран · T — панель · O — OCR · Esc — закрыть'
-            : '←/→ pages · +/- zoom · 0 reset · F fullscreen · T toolbar · O OCR · Esc close'}
+          ${PudgeI18n.t('manga.pagesZoom0ResetF')}
         </div>
       </aside>
       `;
@@ -695,6 +688,7 @@
     syncSettingsControls();
     applyReaderSettings();
     installZoomGestures(reader);
+    attachMangaDebugOverlay(reader);
     return reader;
   }
 
@@ -749,6 +743,10 @@
     syncSettingsControls();
   }
 
+  function pageSource(page) {
+    return String(page?.url || page?.data_uri || '');
+  }
+
   async function getPage(index) {
     const clamped = Math.max(0, Math.min(Number(index), currentPageCount - 1));
     const key = `${Number(currentBook.id)}:${clamped}`;
@@ -760,6 +758,9 @@
     }
     const page = await API().manga_page(Number(currentBook.id), clamped);
     pageCache.set(key, page);
+    // A page sent by URL is fetched by WebKit itself and kept in its HTTP
+    // cache (immutable); start that fetch now so preloading still works.
+    if (page?.url) { const warm = new Image(); warm.decoding = 'async'; warm.src = page.url; }
     while (pageCache.size > PAGE_CACHE_LIMIT) {
       pageCache.delete(pageCache.keys().next().value);
     }
@@ -789,9 +790,7 @@
     if (mangaProgressSaveFailing) return;
     mangaProgressSaveFailing = true;
     const detail = String(error?.message || error || '').trim();
-    window.toast?.(ru()
-      ? `Не удалось сохранить прогресс манги${detail ? `: ${detail}` : ''}`
-      : `Could not save manga progress${detail ? `: ${detail}` : ''}`);
+    window.toast?.(detail ? PudgeI18n.t('manga.couldNotSaveMangaProgressError',{error:detail}) : PudgeI18n.t('manga.couldNotSaveMangaProgressPlain'));
   }
 
   async function setResumePage(pageIndex) {
@@ -995,43 +994,37 @@
       selection: String(window.getSelection?.()?.toString?.() || ''),
     };
     const result = await API().manga_export_ocr_debug(payload);
-    window.toast?.(ru() ? `Лог OCR сохранён: ${result.path}` : `OCR log saved: ${result.path}`);
+    window.toast?.(PudgeI18n.t('manga.ocrLogSaved',{path:result.path}));
     return result;
   }
 
   function clearMangaTransientOverlays() {
-    closeMangaGeometryEditor();
-    mangaManualAddMode = false;
-    $('mangaReaderV2')?.classList.remove('manual-add-mode');
     window.PudgeReadingTools?.closeAll?.();
-  }
-
-  function mangaStableRegionGeometry(region) {
-    const anchor = region?.manual_geometry?.original_anchor;
-    return anchor && typeof anchor === 'object' ? {...region, ...anchor} : region;
   }
 
   function mangaRegionReadingOrder(regions) {
     const rows = [...(Array.isArray(regions) ? regions : [])];
-    const manualIds = new Set(rows.map(row => String(row?.manual_reading_order?.id || '')).filter(Boolean));
-    const completeManualOrder = rows.length > 0 && manualIds.size === 1 && rows.every(row =>
-      Number.isFinite(Number(row?.manual_reading_order?.index))
-    );
-    if (completeManualOrder) {
-      return rows.sort((left, right) =>
-        Number(left.manual_reading_order.index) - Number(right.manual_reading_order.index)
-      );
-    }
     return rows.sort((left, right) => {
-      const leftGeometry = mangaStableRegionGeometry(left);
-      const rightGeometry = mangaStableRegionGeometry(right);
-      const leftTop = 1 - Number(leftGeometry?.y || 0) - Number(leftGeometry?.height || 0);
-      const rightTop = 1 - Number(rightGeometry?.y || 0) - Number(rightGeometry?.height || 0);
+      const leftTop = 1 - Number(left?.y || 0) - Number(left?.height || 0);
+      const rightTop = 1 - Number(right?.y || 0) - Number(right?.height || 0);
       // Manga dialogue is primarily read from top to bottom.  Regions on the
       // same visual row follow Japanese right-to-left order.
+      // Stacked horizontal lines of one caption overlap horizontally and sit
+      // closer than the row band; read them top to bottom, not by right edge.
+      if (left?.orientation === 'horizontal' && right?.orientation === 'horizontal') {
+        const leftX = Number(left?.x || 0);
+        const rightX = Number(right?.x || 0);
+        const leftWidth = Number(left?.width || 0);
+        const rightWidth = Number(right?.width || 0);
+        const sharedWidth = Math.min(leftX + leftWidth, rightX + rightWidth) - Math.max(leftX, rightX);
+        const lineHeight = Math.min(Number(left?.height || 0), Number(right?.height || 0));
+        if (sharedWidth > Math.min(leftWidth, rightWidth) * .5 && Math.abs(leftTop - rightTop) > lineHeight * .6) {
+          return leftTop - rightTop;
+        }
+      }
       if (Math.abs(leftTop - rightTop) > .045) return leftTop - rightTop;
-      const leftEdge = Number(leftGeometry?.x || 0) + Number(leftGeometry?.width || 0);
-      const rightEdge = Number(rightGeometry?.x || 0) + Number(rightGeometry?.width || 0);
+      const leftEdge = Number(left?.x || 0) + Number(left?.width || 0);
+      const rightEdge = Number(right?.x || 0) + Number(right?.width || 0);
       return rightEdge - leftEdge;
     });
   }
@@ -1043,17 +1036,13 @@
     const rows = Array.isArray(regions) ? regions : [];
     const duplicates = new Set();
     rows.forEach((ruby, index) => {
-      // User-created OCR text is deliberate, not an automatic ruby candidate.
-      if (ruby?.manual_addition) return;
       const text = String(ruby?.text || '').trim();
       if (ruby?.orientation !== 'vertical' || !/^[\u3041-\u3096\u30a1-\u30fa\u30fc]{2,8}$/.test(text)) return;
-      const rubyGeometry = ruby?.manual_geometry?.original_anchor || ruby;
-      const rx = Number(rubyGeometry.x), ry = Number(rubyGeometry.y), rw = Number(rubyGeometry.width), rh = Number(rubyGeometry.height);
+      const rx = Number(ruby.x), ry = Number(ruby.y), rw = Number(ruby.width), rh = Number(ruby.height);
       if (![rx, ry, rw, rh].every(Number.isFinite) || rw <= 0 || rh <= 0) return;
       for (const base of rows) {
         if (base === ruby || base?.orientation !== 'vertical' || !/[\u3400-\u9fff]{2}/.test(String(base?.text || ''))) continue;
-        const baseGeometry = base?.manual_geometry?.original_anchor || base;
-        const bx = Number(baseGeometry.x), by = Number(baseGeometry.y), bw = Number(baseGeometry.width), bh = Number(baseGeometry.height);
+        const bx = Number(base.x), by = Number(base.y), bw = Number(base.width), bh = Number(base.height);
         if (![bx, by, bw, bh].every(Number.isFinite) || bw <= 0 || bh <= 0) continue;
         // Ruby is small, alongside the right-hand part of a kanji column and
         // contained in its vertical range. Ordinary neighbouring kana dialogue
@@ -1173,7 +1162,16 @@
       const top = Math.max(0, 1 - y - height);
       const edge = x > .58 ? ' edge-right' : '';
       const vertical = isVertical ? ' vertical-text' : '';
-      return `<div class="manga-v2-text-region${edge}${vertical}" tabindex="0"
+      // pudge-manga-dense-text-flag-v1: paragraphs of small print and text read off
+      // repeated shapes (mahjong tiles, grids) are often misread.
+      const quality = String(region.ocr_quality || '');
+      const lowConfidence = quality === 'dense_text' || quality === 'pattern' ? ' low-confidence' : '';
+      const selectionTitle = quality === 'dense_text'
+        ? (PudgeI18n.t('manga.denseSmallPrintOcrIs'))
+        : quality === 'pattern'
+          ? (PudgeI18n.t('manga.looksLikeAPictureTiles'))
+          : (PudgeI18n.t('manga.selectOcrTextTripleClick'));
+      return `<div class="manga-v2-text-region${edge}${vertical}${lowConfidence}" tabindex="0"
         data-page-index="${Number(pageIndex)}" data-region-index="${regionIndex}"
         data-effective-orientation="${isVertical ? 'vertical' : 'horizontal'}"
         data-orientation-reason="${esc(orientation.reason)}"
@@ -1184,13 +1182,13 @@
         data-raw-x="${rawX}" data-raw-y="${rawY}" data-raw-width="${rawWidth}" data-raw-height="${rawHeight}"
         data-pudge-translate-root
         data-pudge-media-id="${Number(currentBook.anilist_id || 0)}"
-        data-pudge-translate-language="${ru() ? 'ru' : 'en'}"
+        data-pudge-translate-language="${PudgeI18n.lang()}"
         aria-label="${esc(region.text || '')}"
         style="left:${x * 100}%;top:${top * 100}%;width:${width * 100}%;height:${height * 100}%">
           <div class="manga-v2-region-content">${esc(region.text || '')}</div>
           <div class="manga-v2-selection-content"
             data-manga-copy-surface="${esc(region.text || '')}"
-            title="${esc(ru() ? 'Выделение OCR-текста; тройной клик — весь бабл' : 'Select OCR text; triple-click selects the whole bubble')}">${esc(region.text || '')}</div>
+            title="${esc(selectionTitle)}">${esc(region.text || '')}</div>
         </div>`;
     }).join('');
     // renderTextLayer is called repeatedly while background OCR preparation is
@@ -1252,22 +1250,14 @@
     }
   }
 
+  // pudge-mokuro-progressive-pages-v1
+  // Mokuro reads a page alone exactly as in a volume run, so its pages are
+  // shown as soon as each one is read.
   async function loadTextRegions(
     pageIndex,
     {refresh = false, showProgress = false, parse = false, cachedOnly = false} = {},
   ) {
     if (!currentBook || !API()?.manga_text_regions) return null;
-    // Volume OCR is atomic from the reader's point of view.  Batch OCR may
-    // persist individual page caches as it advances, but exposing those pages
-    // immediately makes overlays appear/disappear while the user is reading.
-    // Keep every page visually raw until the whole volume reaches complete.
-    if (!currentBook.ocr_complete) {
-      const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
-      textRegionCache.delete(textKey(Number(currentBook.id), index));
-      const frame = $('mangaV2Pages')?.querySelector(`[data-page-index="${index}"]`);
-      frame?.querySelector('.manga-v2-text-layer')?.replaceChildren();
-      return {regions: [], cached: false, suppressed_until_volume_complete: true};
-    }
     const generation = textGeneration;
     const bookId = Number(currentBook.id);
     const index = Math.max(0, Math.min(currentPageCount - 1, Number(pageIndex)));
@@ -1302,7 +1292,11 @@
         !result?.cached &&
         regions.length === 0
       );
-      if (foregroundRetry && !textForegroundOcrInflight.has(key)) {
+      const lastForegroundTry = Number(textForegroundOcrAttempted.get(key) || 0);
+      if (foregroundRetry && !textForegroundOcrInflight.has(key) && Date.now() - lastForegroundTry > 60000) {
+        // At most once a minute per page: a page the volume run could not read
+        // is not re-read every time the run finishes another page.
+        textForegroundOcrAttempted.set(key, Date.now());
         textForegroundOcrInflight.add(key);
         mangaDebugRecord('ocr_foreground_retry', {
           page_index:index,
@@ -1335,7 +1329,8 @@
         cached:Boolean(result?.cached),
         artifact:Boolean(result?.artifact),
         region_count:regions.length,
-        regions:regions.map((region, order) => ({order, ...region})),
+        // A summary, not a copy of every region (the debug ring holds 600 events).
+        regions:regions.map((region, order) => ({order, id:region.id ?? region.region_id ?? null, chars:String(region.text || '').length})),
       });
       if (result?.cached || regions.length || refresh) textRegionCache.set(key, regions);
       else textRegionCache.delete(key);
@@ -1368,8 +1363,7 @@
     preparationPollTimer = null;
   }
 
-  function suppressPartialVolumeOcr() {
-    if (!currentBook || currentBook.ocr_complete) return;
+  function clearTextOverlays() {
     textGeneration += 1;
     textRegionCache.clear();
     textRegionResultCache.clear();
@@ -1381,10 +1375,6 @@
   }
 
   async function refreshVisibleTextRegions() {
-    if (!currentBook?.ocr_complete) {
-      suppressPartialVolumeOcr();
-      return;
-    }
     const indices = visiblePageIndices();
     await Promise.all(indices.map(index => loadTextRegions(index, {
       cachedOnly: true,
@@ -1407,37 +1397,25 @@
       completed,
       Math.max(0, Number(status?.processed_pages ?? completed)),
     );
-    const prepared = Math.max(
-      processed,
-      Math.max(0, Number(status?.prepared_pages ?? processed)),
-    );
-    const phase = String(status?.phase || '');
     const pages = total > 0 ? `${Math.min(processed, total)}/${total}` : String(processed || cached_pages);
-    const preparedPages = total > 0 ? `${Math.min(prepared, total)}/${total}` : String(prepared);
     if (active && String(status?.wait_reason || '') === 'foreground') {
-      return `${ru() ? 'OCR ждёт окончания просмотра аниме' : 'OCR waiting for playback to finish'} · ${pages}`;
-    }
-    if (active && phase === 'detecting') {
-      return `${ru() ? 'Ищу области текста' : 'Detecting text'} · ${preparedPages} · OCR ${pages}`;
-    }
-    if (active && phase === 'yielded') {
-      return `${ru() ? 'OCR уступил ручной задаче' : 'OCR yielded to manual task'} · ${pages}`;
+      return `${PudgeI18n.t('manga.ocrWaitingForPlaybackTo')} · ${pages}`;
     }
     if (active && stateName === 'parsing') {
-      return `${ru() ? 'Готовлю Jiten' : 'Preparing Jiten'} ${Number(status?.parsed_regions || 0)}/${Number(status?.total_regions || 0)} · OCR ${pages}`;
+      return `${PudgeI18n.t('manga.preparingJitenProgress', {done: Number(status?.parsed_regions || 0), total: Number(status?.total_regions || 0)})} · OCR ${pages}`;
     }
     if (active && (processing > 0 || stateName === 'running')) {
       const page = Number(status?.current_page || 0);
-      return `OCR · ${pages}${page > 0 ? ` · ${ru() ? 'страница' : 'page'} ${page} ${ru() ? 'обрабатывается…' : 'processing…'}` : ''}`;
+      return `OCR · ${pages}${page > 0 ? ` · ${PudgeI18n.t('manga.pageProcessing', {page})}` : ''}`;
     }
     if (active && (queued > 0 || stateName === 'queued')) {
-      return `${ru() ? 'OCR в очереди' : 'OCR queued'} · ${pages}${queued > 0 ? ` · ${queued}` : ''}`;
+      return `${PudgeI18n.t('manga.ocrQueued')} · ${pages}${queued > 0 ? ` · ${queued}` : ''}`;
     }
     if (failed > 0 || stateName === 'failed') {
-      return `${ru() ? 'OCR ошибок' : 'OCR failed'} · ${pages}${failed > 0 ? ` · ${failed}` : ''}`;
+      return `${PudgeI18n.t('manga.ocrFailed')} · ${pages}${failed > 0 ? ` · ${failed}` : ''}`;
     }
     if (status?.complete || stateName === 'ready' || (total > 0 && completed >= total)) {
-      return `${ru() ? 'OCR готов' : 'OCR ready'} · ${pages}`;
+      return `${PudgeI18n.t('manga.ocrReady')} · ${pages}`;
     }
     // An incomplete volume with no live worker is idle and not implicitly queued.
     // The explicit OCR Volume button remains available.
@@ -1468,12 +1446,12 @@
       button.classList.toggle('busy', active);
       button.classList.toggle('unavailable', !available);
       button.setAttribute('aria-disabled', active || !available ? 'true' : 'false');
-      button.title = available ? '' : (ru() ? 'OCR-движок не установлен' : 'OCR backend is not installed');
+      button.title = available ? '' : (PudgeI18n.t('manga.ocrBackendIsNotInstalled'));
       button.textContent = active
-        ? (ru() ? 'OCR идёт…' : 'OCR running…')
+        ? (PudgeI18n.t('manga.ocrRunning'))
         : (currentBook?.ocr_complete
-          ? (ru() ? 'Повторить OCR' : 'Rebuild OCR')
-          : (ru() ? 'OCR тома' : 'OCR volume'));
+          ? (PudgeI18n.t('manga.rebuildOcr'))
+          : (PudgeI18n.t('manga.ocrVolume')));
     }
   }
 
@@ -1492,11 +1470,12 @@
         const status = await API().manga_ocr_book_status(Number(bookId));
         if (generation !== preparationPollGeneration || !currentBook || Number(currentBook.id) !== Number(bookId)) return;
         const wasComplete = Boolean(currentBook.ocr_complete);
+        const completedBefore = Number(currentBookOcrStatus?.completed_pages ?? -1);
         syncMangaOcrUi(status);
         active = mangaOcrJobActive(status);
-        if (!currentBook.ocr_complete) {
-          suppressPartialVolumeOcr();
-        } else if (!wasComplete) {
+        if (Number(status?.completed_pages || 0) !== completedBefore) {
+          await refreshUnreadVisiblePages();
+        } else if (currentBook.ocr_complete && !wasComplete) {
           textRegionCache.clear();
           textRegionResultCache.clear();
           textParseCache.clear();
@@ -1516,17 +1495,34 @@
     void poll();
   }
 
+  // Pages of the current volume that are visible but had no OCR yet.
+  async function refreshUnreadVisiblePages() {
+    if (!currentBook) return;
+    const bookId = Number(currentBook.id);
+    const indices = visiblePageIndices().filter(index => {
+      const known = textRegionResultCache.get(textKey(bookId, index));
+      return !known || !known.cached;
+    });
+    for (const index of indices) textRegionCache.delete(textKey(bookId, index));
+    await Promise.all(indices.map(index => loadTextRegions(index, {cachedOnly:true, parse:true})));
+  }
+
   async function ensureCurrentBookPrepared() {
     if (!currentBook || !state.ocr_available) return;
     const bookId = Number(currentBook.id);
     try {
-      // Opening a volume is read-only with respect to OCR scheduling. Only the
-      // explicit OCR Volume action may create a new batch. If a batch that the
-      // user already started is still alive, reconnect the UI to that job.
-      const status = await API().manga_ocr_book_status(bookId);
+      // pudge-auto-volume-ocr-v1: opening an unfinished volume starts its OCR
+      // (missing pages only, from the reading position onwards). A job that
+      // is already running is only reconnected to the UI.
+      let status = await API().manga_ocr_book_status(bookId);
       if (!currentBook || Number(currentBook.id) !== bookId) return;
+      if (!status?.complete && !mangaOcrJobActive(status) && API()?.start_manga_ocr_book) {
+        // auto=true: the backend skips this on battery and when only failed
+        // pages are left, and stops it when the reader closes.
+        status = await API().start_manga_ocr_book(bookId, false, '', false, true);
+        if (!currentBook || Number(currentBook.id) !== bookId) return;
+      }
       syncMangaOcrUi(status);
-      if (!currentBook.ocr_complete) suppressPartialVolumeOcr();
       if (mangaOcrJobActive(status)) void pollCurrentBookPreparation(bookId);
     } catch (error) {
       console.debug?.('Manga background preparation unavailable:', error);
@@ -1536,7 +1532,7 @@
   async function recognizeWholeBook() {
     if (!currentBook) return;
     if (!state?.ocr_available) {
-      window.toast?.(ru() ? 'OCR-движок не установлен' : 'OCR backend is not installed');
+      window.toast?.(PudgeI18n.t('manga.ocrBackendIsNotInstalled'));
       return;
     }
     const bookId = Number(currentBook.id);
@@ -1549,14 +1545,15 @@
       // Passing refresh=true invalidates the current generation before the
       // background worker starts, so a complete/stale cache cannot make this
       // button finish instantly without traversing the volume.
+      textForegroundOcrAttempted.clear();
       const started = await API().start_manga_ocr_book(bookId, true);
       syncMangaOcrUi(started);
+      // The rebuild dropped every page's OCR: never keep showing the old text.
+      clearTextOverlays();
       void pollCurrentBookPreparation(bookId);
-      suppressPartialVolumeOcr();
       while (currentBook && Number(currentBook.id) === bookId) {
         const status = await API().manga_ocr_book_status(bookId);
         syncMangaOcrUi(status);
-        if (!currentBook.ocr_complete) suppressPartialVolumeOcr();
         if (!mangaOcrJobActive(status)) break;
         await new Promise(resolve => setTimeout(resolve, 800));
       }
@@ -1584,577 +1581,145 @@
 
   function closeMangaContextMenu() {
     const menu = $('contextMenu');
-    if (menu && (mangaContextBook || mangaCorrectionContext)) {
+    if (menu && (mangaContextBook || mangaRegionContext)) {
       menu.classList.remove('open');
       menu.innerHTML = '';
     }
     mangaContextBook = null;
     mangaContextSeries = null;
-    mangaCorrectionContext = null;
+    mangaRegionContext = null;
   }
 
-  function mangaCorrectionRegionContext(regionNode) {
+  function mangaRegionContextFor(regionNode) {
     if (!currentBook || !regionNode) return null;
     const pageIndex = Number(regionNode.dataset.pageIndex);
     const regionIndex = Number(regionNode.dataset.regionIndex);
     const regions = textRegionCache.get(textKey(Number(currentBook.id), pageIndex)) || [];
     const region = regions[regionIndex];
     if (!region) return null;
-    const hidden = mangaRubyDuplicateRegionIndices(regions);
-    const visibleIndices = regions.map((_row, index) => index).filter(index => !hidden.has(index));
-    const visiblePosition = visibleIndices.indexOf(regionIndex);
     return {
       bookId: Number(currentBook.id),
       pageIndex,
       regionIndex,
-      regionCount: regions.length,
-      canOrderEarlier: visiblePosition > 0,
-      canOrderLater: visiblePosition >= 0 && visiblePosition + 1 < visibleIndices.length,
       text: String(region.text || ''),
-      ocrText: String(region.ocr_text || region.raw_text || region.text || ''),
-      manualAddition: region.manual_addition || null,
-      correction: region.manual_correction || null,
-      manualOrder: region.manual_reading_order || null,
-      manualGeometry: region.manual_geometry || null,
-      orientation: String(region.orientation || 'vertical'),
-      geometry: {
-        x: Number(region.x || 0),
-        y: Number(region.y || 0),
-        width: Number(region.width || 0),
-        height: Number(region.height || 0),
-      },
     };
   }
 
-  function showMangaCorrectionContextMenu(regionNode, x, y) {
-    const context = mangaCorrectionRegionContext(regionNode);
-    if (!context) return false;
+  // pudge-manga-explain-bubble-v1
+  function mangaExplainAvailable() {
+    return Boolean(window.PudgeAssistant?.startGrammar) && window.PudgeReadingTools?.llmAvailable?.() !== false;
+  }
+
+  function explainMangaBubble(context) {
+    const text = String(context?.text || '').replace(/[\r\n]+/g, ' ').trim();
+    if (!text || !window.PudgeAssistant?.startGrammar) return;
+    const page = mangaPageStudyContext(Number(context.pageIndex));
+    window.PudgeReadingTools?.closeIfOpen?.();
+    void window.PudgeAssistant.startGrammar({text, context: page.text});
+  }
+
+  // A text region's menu offers the LLM explanation of the bubble.
+  function showMangaRegionContextMenu(regionNode, x, y) {
+    const context = mangaRegionContextFor(regionNode);
+    if (!context || !mangaExplainAvailable() || !String(context.text || '').trim()) return false;
     closeMangaContextMenu();
-    mangaCorrectionContext = context;
+    mangaRegionContext = context;
     const menu = $('contextMenu');
     if (!menu) return false;
-    if (context.manualAddition) {
-      const kind = String(context.manualAddition?.kind || 'addition');
-      const structuralUndo = kind === 'merge'
-        ? `<button data-manga-correction-action="unmerge">${ru() ? 'Отменить объединение' : 'Undo merge'}</button>`
-        : kind === 'split'
-          ? `<button data-manga-correction-action="unsplit">${ru() ? 'Отменить разделение' : 'Undo split'}</button>`
-          : `<button data-manga-correction-action="added-undo">${ru() ? 'Отменить последнюю правку / удалить регион' : 'Undo last edit / remove region'}</button>`;
-      menu.innerHTML = `
-        <button data-manga-correction-action="edit">${ru() ? 'Изменить добавленный текст…' : 'Edit added text…'}</button>
-        <button data-manga-correction-action="geometry">${ru() ? 'Исправить hitbox…' : 'Adjust hitbox…'}</button>
-        ${structuralUndo}
-        ${context.canOrderEarlier ? `<button data-manga-correction-action="order-earlier">${ru() ? 'Читать раньше' : 'Read earlier'}</button>` : ''}
-        ${context.canOrderLater ? `<button data-manga-correction-action="order-later">${ru() ? 'Читать позже' : 'Read later'}</button>` : ''}
-        ${context.manualOrder ? `<button data-manga-correction-action="order-undo">${ru() ? 'Отменить правку порядка' : 'Undo reading-order edit'}</button>` : ''}`;
-      positionMangaContextMenu(menu, x, y);
-      return true;
-    }
-    const undo = context.correction
-      ? `<button data-manga-correction-action="undo">${ru() ? 'Отменить исправление OCR' : 'Undo OCR correction'}</button>`
-      : '';
-    const earlier = context.canOrderEarlier
-      ? `<button data-manga-correction-action="order-earlier">${ru() ? 'Читать раньше' : 'Read earlier'}</button>`
-      : '';
-    const later = context.canOrderLater
-      ? `<button data-manga-correction-action="order-later">${ru() ? 'Читать позже' : 'Read later'}</button>`
-      : '';
-    const undoOrder = context.manualOrder
-      ? `<button data-manga-correction-action="order-undo">${ru() ? 'Отменить правку порядка' : 'Undo reading-order edit'}</button>`
-      : '';
-    const undoGeometry = context.manualGeometry
-      ? `<button data-manga-correction-action="geometry-undo">${ru() ? 'Отменить правку hitbox' : 'Undo hitbox correction'}</button>`
-      : '';
-    const geometry = `<button data-manga-correction-action="geometry">${ru() ? 'Исправить hitbox…' : 'Adjust hitbox…'}</button>`;
-    const suppress = `<button data-manga-correction-action="suppress">${ru() ? 'Скрыть ошибочный OCR-регион' : 'Hide incorrect OCR region'}</button>`;
-    const merge = `<button data-manga-correction-action="merge">${ru() ? 'Объединить с другим OCR-регионом…' : 'Merge with another OCR region…'}</button>`;
-    const split = `<button data-manga-correction-action="split">${ru() ? 'Разделить OCR-регион…' : 'Split OCR region…'}</button>`;
-    menu.innerHTML = `<button data-manga-correction-action="edit">${ru() ? 'Исправить текст OCR…' : 'Correct OCR text…'}</button>${geometry}${split}${merge}${suppress}${undo}${undoGeometry}${earlier}${later}${undoOrder}`;
+    menu.innerHTML = `<button data-manga-region-action="explain">${PudgeI18n.t('manga.explainBubbleLlm')}</button>`;
     positionMangaContextMenu(menu, x, y);
     return true;
   }
 
-  function clampMangaGeometry(value, min, max) {
-    return Math.max(min, Math.min(max, Number(value || 0)));
-  }
-
-  function closeMangaGeometryEditor() {
-    const editor = mangaGeometryEditor;
-    if (!editor) return false;
-    editor.node?.remove?.();
-    $('mangaReaderV2')?.classList.remove('geometry-editing');
-    mangaGeometryEditor = null;
-    return true;
-  }
-
-  function mangaGeometryFromScreenRect(rect) {
-    return {
-      x: Number(rect.left),
-      y: Math.max(0, 1 - Number(rect.top) - Number(rect.height)),
-      width: Number(rect.width),
-      height: Number(rect.height),
-    };
-  }
-
-  function renderMangaGeometryEditor() {
-    const editor = mangaGeometryEditor;
-    if (!editor?.node) return;
-    const rect = editor.rect;
-    editor.node.style.left = `${rect.left * 100}%`;
-    editor.node.style.top = `${rect.top * 100}%`;
-    editor.node.style.width = `${rect.width * 100}%`;
-    editor.node.style.height = `${rect.height * 100}%`;
-    const label = editor.node.querySelector('.manga-v2-geometry-label');
-    if (label) label.textContent = `${Math.round(rect.width * 1000) / 10}% × ${Math.round(rect.height * 1000) / 10}%`;
-  }
-
-  async function saveMangaGeometryEditor() {
-    const editor = mangaGeometryEditor;
-    if (!editor || !API()?.manga_set_ocr_geometry) return;
-    const buttons = [...editor.node.querySelectorAll('button')];
-    buttons.forEach(button => { button.disabled = true; });
+  // pudge-manga-volume-words-v1
+  async function showMangaVolumeWords() {
+    if (!currentBook || !API()?.manga_volume_words) return;
+    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
+    if (!backdrop || !title || !body) return;
+    const bookId = Number(currentBook.id);
+    title.textContent = PudgeI18n.t('manga.volumeWords2');
+    body.innerHTML = `<div class="empty">${PudgeI18n.t('manga.parsingTheVolumeText')}</div>`;
+    backdrop.hidden = false;
+    backdrop.classList.add('open');
+    let data = null;
     try {
-      const geometry = mangaGeometryFromScreenRect(editor.rect);
-      const context = editor.context;
-      const pageIndex = Number(context.pageIndex);
-      if (context.addMode) {
-        closeMangaGeometryEditor();
-        openMangaAdditionTextEditor(context, geometry);
-        return;
-      }
-      if (context.manualAddition) {
-        await API().manga_update_added_ocr_region(
-          Number(context.bookId), String(context.manualAddition.id), null, geometry,
-        );
-      } else {
-        await API().manga_set_ocr_geometry(
-          Number(context.bookId), pageIndex, Number(context.regionIndex), geometry,
-        );
-      }
-      closeMangaGeometryEditor();
-      await refreshCorrectedMangaPage(pageIndex);
-      window.toast?.(ru() ? 'Hitbox сохранён' : 'Hitbox saved');
+      data = await API().manga_volume_words(bookId, 40);
     } catch (error) {
-      buttons.forEach(button => { button.disabled = false; });
-      window.toast?.(String(error?.message || error));
-    }
-  }
-
-  function openMangaGeometryEditor(context) {
-    if (!context || !currentBook) return false;
-    closeMangaGeometryEditor();
-    const frame = $('mangaV2Pages')?.querySelector(`.manga-v2-page-frame[data-page-index="${Number(context.pageIndex)}"]`);
-    const image = frame?.querySelector?.('img');
-    if (!frame || !image) return false;
-    const geometry = context.geometry || {};
-    const x = clampMangaGeometry(geometry.x, 0, 1);
-    const y = clampMangaGeometry(geometry.y, 0, 1);
-    const width = clampMangaGeometry(geometry.width, .002, 1 - x);
-    const height = clampMangaGeometry(geometry.height, .002, 1 - y);
-    const node = document.createElement('div');
-    node.className = 'manga-v2-geometry-editor';
-    node.innerHTML = `
-      <span class="manga-v2-geometry-label"></span>
-      <div class="manga-v2-geometry-actions">
-        <button class="primary" data-manga-geometry-save>${ru() ? 'Сохранить' : 'Save'}</button>
-        <button data-manga-geometry-cancel>${ru() ? 'Отмена' : 'Cancel'}</button>
-      </div>
-      ${['nw','n','ne','e','se','s','sw','w'].map(handle => `<i data-manga-geometry-handle="${handle}"></i>`).join('')}
-    `;
-    frame.appendChild(node);
-    mangaGeometryEditor = {
-      node, frame, image, context:{...context},
-      rect:{left:x, top:Math.max(0, 1 - y - height), width, height},
-      drag:null,
-    };
-    $('mangaReaderV2')?.classList.add('geometry-editing');
-    renderMangaGeometryEditor();
-
-    node.addEventListener('pointerdown', event => {
-      if (event.target.closest?.('button')) return;
-      const editor = mangaGeometryEditor;
-      if (!editor || editor.node !== node) return;
-      const imageRect = image.getBoundingClientRect();
-      if (!(imageRect.width > 0 && imageRect.height > 0)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const handle = event.target.closest?.('[data-manga-geometry-handle]')?.dataset?.mangaGeometryHandle || 'move';
-      editor.drag = {
-        pointerId:event.pointerId,
-        handle,
-        startX:event.clientX,
-        startY:event.clientY,
-        imageWidth:imageRect.width,
-        imageHeight:imageRect.height,
-        rect:{...editor.rect},
-      };
-      node.setPointerCapture?.(event.pointerId);
-    });
-
-    node.addEventListener('pointermove', event => {
-      const editor = mangaGeometryEditor;
-      const drag = editor?.drag;
-      if (!editor || editor.node !== node || !drag || drag.pointerId !== event.pointerId) return;
-      event.preventDefault();
-      const dx = (event.clientX - drag.startX) / drag.imageWidth;
-      const dy = (event.clientY - drag.startY) / drag.imageHeight;
-      const source = drag.rect;
-      const minW = Math.max(.002, 5 / drag.imageWidth);
-      const minH = Math.max(.002, 5 / drag.imageHeight);
-      let left = source.left, top = source.top;
-      let right = source.left + source.width, bottom = source.top + source.height;
-      const handle = drag.handle;
-      if (handle === 'move') {
-        left = clampMangaGeometry(source.left + dx, 0, 1 - source.width);
-        top = clampMangaGeometry(source.top + dy, 0, 1 - source.height);
-        right = left + source.width;
-        bottom = top + source.height;
-      } else {
-        if (handle.includes('w')) left = clampMangaGeometry(source.left + dx, 0, right - minW);
-        if (handle.includes('e')) right = clampMangaGeometry(source.left + source.width + dx, left + minW, 1);
-        if (handle.includes('n')) top = clampMangaGeometry(source.top + dy, 0, bottom - minH);
-        if (handle.includes('s')) bottom = clampMangaGeometry(source.top + source.height + dy, top + minH, 1);
-      }
-      editor.rect = {left, top, width:right-left, height:bottom-top};
-      renderMangaGeometryEditor();
-    });
-
-    const finishPointer = event => {
-      const editor = mangaGeometryEditor;
-      if (!editor?.drag || editor.drag.pointerId !== event.pointerId) return;
-      editor.drag = null;
-      try { node.releasePointerCapture?.(event.pointerId); } catch (_) {}
-    };
-    node.addEventListener('pointerup', finishPointer);
-    node.addEventListener('pointercancel', finishPointer);
-    node.addEventListener('click', event => {
-      const save = event.target.closest?.('[data-manga-geometry-save]');
-      const cancel = event.target.closest?.('[data-manga-geometry-cancel]');
-      if (!save && !cancel) return;
-      event.preventDefault();
-      event.stopPropagation();
-      if (save) void saveMangaGeometryEditor(); else closeMangaGeometryEditor();
-    });
-    return true;
-  }
-
-  async function undoMangaGeometry(context) {
-    if (!context || !API()?.manga_undo_ocr_geometry) return;
-    await API().manga_undo_ocr_geometry(Number(context.bookId), Number(context.pageIndex), Number(context.regionIndex));
-    await refreshCorrectedMangaPage(context.pageIndex);
-    window.toast?.(ru() ? 'Правка hitbox отменена' : 'Hitbox correction undone');
-  }
-
-  function mangaReadingOrderRef(region) {
-    return {
-      manual_region_id: String(region?.manual_addition?.id || ''),
-      anchor: {
-        x: Number(region?.x || 0),
-        y: Number(region?.y || 0),
-        width: Number(region?.width || 0),
-        height: Number(region?.height || 0),
-        orientation: String(region?.orientation || ''),
-      },
-      original_text: String(region?.ocr_text || region?.raw_text || region?.text || ''),
-    };
-  }
-
-  async function moveMangaReadingOrder(context, delta) {
-    if (!context || !currentBook || !API()?.manga_set_ocr_reading_order) return;
-    const key = textKey(Number(context.bookId), Number(context.pageIndex));
-    const regions = [...(textRegionCache.get(key) || [])];
-    const from = Number(context.regionIndex);
-    if (from < 0 || from >= regions.length) return;
-    const hidden = mangaRubyDuplicateRegionIndices(regions);
-    const visibleIndices = regions.map((_row, index) => index).filter(index => !hidden.has(index));
-    const position = visibleIndices.indexOf(from);
-    const targetPosition = position + (Number(delta) < 0 ? -1 : 1);
-    if (position < 0 || targetPosition < 0 || targetPosition >= visibleIndices.length) return;
-    const to = visibleIndices[targetPosition];
-    [regions[from], regions[to]] = [regions[to], regions[from]];
-    await API().manga_set_ocr_reading_order(
-      Number(context.bookId),
-      Number(context.pageIndex),
-      regions.map(mangaReadingOrderRef),
-    );
-    await refreshCorrectedMangaPage(context.pageIndex);
-    window.toast?.(ru() ? 'Порядок чтения сохранён' : 'Reading order saved');
-  }
-
-  async function undoMangaReadingOrder(context) {
-    if (!context || !API()?.manga_undo_ocr_reading_order) return;
-    await API().manga_undo_ocr_reading_order(Number(context.bookId), Number(context.pageIndex));
-    await refreshCorrectedMangaPage(context.pageIndex);
-    window.toast?.(ru() ? 'Правка порядка отменена' : 'Reading-order edit undone');
-  }
-
-  function startMangaManualRegionAdd() {
-    if (!currentBook || !currentBook.ocr_complete) {
-      window.toast?.(ru() ? 'Сначала завершите OCR тома' : 'Complete volume OCR first');
+      body.innerHTML = `<div class="empty">${esc(PudgeI18n.message(String(error?.message || error)))}</div>`;
       return;
     }
-    closeMangaGeometryEditor();
-    closeReaderSettings();
-    mangaManualAddMode = !mangaManualAddMode;
-    $('mangaReaderV2')?.classList.toggle('manual-add-mode', mangaManualAddMode);
-    window.toast?.(mangaManualAddMode
-      ? (ru() ? 'Кликните по пропущенному тексту на странице, затем настройте рамку' : 'Click missing text on a page, then adjust the box')
-      : (ru() ? 'Добавление отменено' : 'Addition cancelled'));
-  }
-
-  function seedMangaManualRegion(event, image) {
-    if (!mangaManualAddMode || !currentBook || !image) return false;
-    const frame = image.closest('.manga-v2-page-frame');
-    if (!frame) return false;
-    const rect = image.getBoundingClientRect();
-    if (!(rect.width > 0 && rect.height > 0)) return false;
-    const x = clampMangaGeometry((event.clientX - rect.left) / rect.width, 0, 1);
-    const top = clampMangaGeometry((event.clientY - rect.top) / rect.height, 0, 1);
-    const width = Math.min(.18, 1 - x), height = Math.min(.12, 1 - top);
-    if (width < .002 || height < .002) return false;
-    mangaManualAddMode = false;
-    $('mangaReaderV2')?.classList.remove('manual-add-mode');
-    return openMangaGeometryEditor({
-      bookId: Number(currentBook.id), pageIndex: Number(frame.dataset.pageIndex),
-      addMode:true,
-      geometry:{x, y:1-top-height, width, height},
-    });
-  }
-
-  function openMangaAdditionTextEditor(context, geometry) {
-    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
-    if (!backdrop || !title || !body) return;
-    mangaManualAddDraft = {bookId:context.bookId, pageIndex:context.pageIndex, geometry};
-    title.textContent = ru() ? 'Добавить OCR-регион' : 'Add OCR region';
-    body.innerHTML = `<div class="form-grid">
-      <label>${ru() ? 'Текст в выделенной области' : 'Text in selected region'}<textarea id="mangaManualAddText" rows="5" maxlength="2000"></textarea></label>
-      <label>${ru() ? 'Направление текста' : 'Text direction'}
-        <select id="mangaManualAddOrientation">
-          <option value="vertical">${ru() ? 'Вертикально' : 'Vertical'}</option>
-          <option value="horizontal">${ru() ? 'Горизонтально' : 'Horizontal'}</option>
-        </select>
-      </label>
-      <div class="setting-inline-actions">
-        <button class="primary" data-manga-addition-save>${ru() ? 'Сохранить' : 'Save'}</button>
-        <button data-action="close-modal">${ru() ? 'Отмена' : 'Cancel'}</button>
-      </div></div>`;
-    backdrop.hidden = false;
-    backdrop.classList.add('open');
-    setTimeout(() => $('mangaManualAddText')?.focus(), 0);
-  }
-
-  function openMangaCorrectionEditor(context) {
-    if (!context) return;
-    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
-    if (!backdrop || !title || !body) return;
-    title.textContent = ru() ? 'Исправление OCR' : 'OCR correction';
+    if (!currentBook || Number(currentBook.id) !== bookId) return;
+    if (!data?.ok) {
+      const reasons = {
+        no_ocr: PudgeI18n.t('manga.thisVolumeHasNoOcr'),
+        no_words: PudgeI18n.t('manga.noWordsWereFoundIn'),
+        parse_failed: PudgeI18n.t('manga.couldNotParseTheText'),
+      };
+      body.innerHTML = `<div class="empty">${esc(reasons[data?.reason] || PudgeI18n.message(String(data?.reason || '')))}${data?.detail ? `: ${esc(PudgeI18n.message(String(data.detail)))}` : ''}</div>`;
+      return;
+    }
+    const pct = value => `${Math.round(Number(value || 0) * 100)}%`;
+    const backend = String(data.backend || 'jiten');
+    let decks = [];
+    let preferred = '';
+    try { decks = (await API().study_decks(backend)) || []; } catch (_) { decks = []; }
+    try { preferred = String((await API().study_deck_preference(backend))?.deck_id || ''); } catch (_) { preferred = ''; }
+    const words = Array.isArray(data.top_new) ? data.top_new : [];
+    const summary = PudgeI18n.t('manga.youKnowOfTheRunning',{value:pct(data.known_share),value2:pct(data.known_or_learning_share),unique_words:Number(data.unique_words || 0),new_unique:Number(data.new_unique || 0)});
+    const rows = words.map((word, index) => `
+      <label class="ln-nyaa-row manga-volume-word">
+        <input type="checkbox" data-volume-word="${index}" checked>
+        <span class="title">${esc(word.spelling || '')}</span>
+        <span>${esc(word.reading || '')}</span>
+        <span title="${esc(word.meaning || '')}">${esc(word.meaning || '')}</span>
+        <span>×${Number(word.count || 0)}</span>
+      </label>`).join('');
+    const deckOptions = decks.map(deck => `<option value="${esc(String(deck.id ?? ''))}"${String(deck.id ?? '') === preferred ? ' selected' : ''}>${esc(String(deck.name || deck.id || ''))}</option>`).join('');
     body.innerHTML = `
-      <div class="form-grid">
-        <label>${ru() ? 'Распознанный текст' : 'OCR text'}<textarea readonly>${esc(context.ocrText)}</textarea></label>
-        <label>${ru() ? 'Исправленный текст' : 'Corrected text'}<textarea id="mangaOcrCorrectionText" rows="5">${esc(context.text)}</textarea></label>
+      <p>${esc(summary)}</p>
+      ${words.length ? `
+        <p class="subtle">${PudgeI18n.t('manga.mostFrequentNewWordsOf')}</p>
+        <div class="manga-volume-words">${rows}</div>
         <div class="setting-inline-actions">
-          <button class="primary" data-manga-correction-save>${ru() ? 'Сохранить' : 'Save'}</button>
-          <button data-action="close-modal">${ru() ? 'Отмена' : 'Cancel'}</button>
+          <select id="mangaVolumeWordsDeck">${deckOptions}</select>
+          <button id="mangaVolumeWordsAdd" type="button">${PudgeI18n.t('manga.addCheckedWordsToThe')}</button>
         </div>
-      </div>`;
-    mangaCorrectionContext = {...context};
-    backdrop.hidden = false;
-    backdrop.classList.add('open');
-    setTimeout(() => $('mangaOcrCorrectionText')?.focus(), 0);
-  }
-
-  async function refreshCorrectedMangaPage(pageIndex) {
-    if (!currentBook) return;
-    const key = textKey(Number(currentBook.id), Number(pageIndex));
-    textRegionCache.delete(key);
-    textRegionResultCache.delete(key);
-    for (const cacheKey of [...textParseCache.keys()]) if (cacheKey.startsWith(`${key}:`)) textParseCache.delete(cacheKey);
-    for (const cacheKey of [...textParseInflight.keys()]) if (cacheKey.startsWith(`${key}:`)) textParseInflight.delete(cacheKey);
-    await loadTextRegions(Number(pageIndex), {cachedOnly:true, parse:true});
-  }
-
-  function mangaMergeRef(context) {
-    return {
-      manual_region_id: '',
-      anchor: {...context.geometry, orientation:String(context.orientation || 'vertical')},
-      original_text: String(context.ocrText || context.text || ''),
-    };
-  }
-
-  function mangaSplitPartGeometry(context, layout, ratio, partIndex) {
-    const source = context.geometry || {};
-    const x = Number(source.x || 0), y = Number(source.y || 0);
-    const width = Number(source.width || 0), height = Number(source.height || 0);
-    const share = clampMangaGeometry(Number(ratio || .5), .15, .85);
-    if (layout === 'rows') {
-      const firstHeight = height * share;
-      if (partIndex === 0) return {x, y:y + height - firstHeight, width, height:firstHeight};
-      return {x, y, width, height:height - firstHeight};
-    }
-    const firstWidth = width * share;
-    if (String(context.orientation || 'vertical') === 'vertical') {
-      if (partIndex === 0) return {x:x + width - firstWidth, y, width:firstWidth, height};
-      return {x, y, width:width - firstWidth, height};
-    }
-    if (partIndex === 0) return {x, y, width:firstWidth, height};
-    return {x:x + firstWidth, y, width:width - firstWidth, height};
-  }
-
-  function openMangaSplitEditor(context) {
-    if (!context || context.manualAddition) return;
-    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
-    if (!backdrop || !title || !body) return;
-    const chars = [...String(context.text || '')];
-    const cut = Math.max(1, Math.floor(chars.length / 2));
-    const firstText = chars.slice(0, cut).join('');
-    const secondText = chars.slice(cut).join('');
-    mangaSplitDraft = {...context};
-    title.textContent = ru() ? 'Разделить OCR-регион' : 'Split OCR region';
-    body.innerHTML = `<div class="form-grid">
-      <label>${ru() ? 'Первая часть в порядке чтения' : 'First part in reading order'}<textarea id="mangaSplitFirstText" rows="4" maxlength="2000">${esc(firstText)}</textarea></label>
-      <label>${ru() ? 'Вторая часть' : 'Second part'}<textarea id="mangaSplitSecondText" rows="4" maxlength="2000">${esc(secondText)}</textarea></label>
-      <label>${ru() ? 'Как разделить hitbox' : 'Split hitbox'}<select id="mangaSplitLayout">
-        <option value="columns">${ru() ? 'Левая / правая части' : 'Left / right'}</option>
-        <option value="rows">${ru() ? 'Верхняя / нижняя части' : 'Top / bottom'}</option>
-      </select></label>
-      <label>${ru() ? 'Доля первой части' : 'First-part size'}: <span id="mangaSplitRatioLabel">50%</span>
-        <input id="mangaSplitRatio" type="range" min="20" max="80" step="1" value="50">
-      </label>
-      <div class="muted">${ru() ? 'После разделения каждый hitbox можно отдельно поправить через ПКМ → «Исправить hitbox…».' : 'After splitting, each hitbox can be adjusted separately from its context menu.'}</div>
-      <div class="setting-inline-actions"><button class="primary" data-manga-split-save>${ru() ? 'Разделить' : 'Split'}</button><button data-action="close-modal">${ru() ? 'Отмена' : 'Cancel'}</button></div>
-    </div>`;
-    const ratio = $('mangaSplitRatio');
-    ratio?.addEventListener('input', () => { const label = $('mangaSplitRatioLabel'); if (label) label.textContent = `${ratio.value}%`; });
-    backdrop.hidden = false;
-    backdrop.classList.add('open');
-    setTimeout(() => $('mangaSplitFirstText')?.focus(), 0);
-  }
-
-  function cancelMangaMergeMode() {
-    mangaMergeDraft = null;
-    $('mangaReaderV2')?.classList.remove('manual-merge-mode');
-  }
-
-  function startMangaMerge(context) {
-    if (!context || context.manualAddition) return;
-    mangaMergeDraft = {first:{...context}, second:null};
-    $('mangaReaderV2')?.classList.add('manual-merge-mode');
-    window.toast?.(ru() ? 'Кликните по второму OCR-региону на этой странице' : 'Click the second OCR region on this page');
-  }
-
-  function chooseMangaMergeRegion(regionNode) {
-    if (!mangaMergeDraft?.first) return false;
-    const second = mangaCorrectionRegionContext(regionNode);
-    if (!second) return false;
-    const first = mangaMergeDraft.first;
-    if (second.pageIndex !== first.pageIndex || second.regionIndex === first.regionIndex || second.manualAddition) {
-      window.toast?.(ru() ? 'Выберите другой обычный OCR-регион на той же странице' : 'Choose another regular OCR region on the same page');
-      return true;
-    }
-    mangaMergeDraft.second = second;
-    $('mangaReaderV2')?.classList.remove('manual-merge-mode');
-    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
-    if (!backdrop || !title || !body) return true;
-    const combined = `${first.text || ''}${second.text || ''}`;
-    title.textContent = ru() ? 'Объединить OCR-регионы' : 'Merge OCR regions';
-    body.innerHTML = `<div class="form-grid">
-      <label>${ru() ? 'Первый регион' : 'First region'}<textarea readonly>${esc(first.text)}</textarea></label>
-      <label>${ru() ? 'Второй регион' : 'Second region'}<textarea readonly>${esc(second.text)}</textarea></label>
-      <label>${ru() ? 'Итоговый текст' : 'Merged text'}<textarea id="mangaMergeText" rows="5" maxlength="2000">${esc(combined)}</textarea></label>
-      <label>${ru() ? 'Направление текста' : 'Text direction'}<select id="mangaMergeOrientation"><option value="vertical">${ru() ? 'Вертикально' : 'Vertical'}</option><option value="horizontal">${ru() ? 'Горизонтально' : 'Horizontal'}</option></select></label>
-      <div class="setting-inline-actions"><button class="primary" data-manga-merge-save>${ru() ? 'Объединить' : 'Merge'}</button><button data-action="close-modal">${ru() ? 'Отмена' : 'Cancel'}</button></div>
-    </div>`;
-    const orientation = first.orientation === second.orientation ? first.orientation : 'vertical';
-    const select = $('mangaMergeOrientation'); if (select) select.value = orientation;
-    backdrop.hidden = false; backdrop.classList.add('open');
-    setTimeout(() => $('mangaMergeText')?.focus(), 0);
-    return true;
-  }
-
-  async function suppressMangaOcrRegion(context) {
-    if (!context || !API()?.manga_suppress_ocr_region) return;
-    await API().manga_suppress_ocr_region(
-      Number(context.bookId),
-      Number(context.pageIndex),
-      Number(context.regionIndex),
-    );
-    await refreshCorrectedMangaPage(context.pageIndex);
-    window.toast?.(ru() ? 'OCR-регион скрыт' : 'OCR region hidden');
-  }
-
-  async function restoreMangaOcrRegion(suppressionId, pageIndex) {
-    if (!currentBook || !suppressionId || !API()?.manga_restore_ocr_region) return;
-    await API().manga_restore_ocr_region(Number(currentBook.id), String(suppressionId));
-    await refreshCorrectedMangaPage(Number(pageIndex || 0));
-    window.toast?.(ru() ? 'OCR-регион восстановлен' : 'OCR region restored');
-    await showMangaCorrectionList();
-  }
-
-  async function showMangaCorrectionList() {
-    if (!currentBook || !API()?.manga_ocr_corrections) return;
-    const backdrop = $('modalBackdrop'), title = $('modalTitle'), body = $('modalBody');
-    if (!backdrop || !title || !body) return;
-    title.textContent = ru() ? 'Исправления OCR' : 'OCR corrections';
-    body.innerHTML = `<div class="empty">${ru() ? 'Загружаю…' : 'Loading…'}</div>`;
-    backdrop.hidden = false;
-    backdrop.classList.add('open');
-    try {
-      const payload = await API().manga_ocr_corrections(Number(currentBook.id));
-      const rows = Array.isArray(payload?.corrections) ? payload.corrections : [];
-      const orders = Array.isArray(payload?.reading_orders) ? payload.reading_orders : [];
-      const geometries = Array.isArray(payload?.geometries) ? payload.geometries : [];
-      const suppressions = Array.isArray(payload?.suppressions) ? payload.suppressions : [];
-      const additions = Array.isArray(payload?.additions) ? payload.additions : [];
-      const textRows = rows.map(row => `
-        <div class="ln-nyaa-row">
-          <span class="title">${ru() ? 'Стр.' : 'Page'} ${Number(row.page_index || 0) + 1}</span>
-          <span title="${esc(row.original_text || '')}">${esc(row.original_text || '')}</span>
-          <span title="${esc(row.corrected_text || '')}">→ ${esc(row.corrected_text || '')}</span>
-          <span>r${Number(row.revision || 1)}</span>
-        </div>`);
-      const orderRows = orders.map(row => `
-        <div class="ln-nyaa-row">
-          <span class="title">${ru() ? 'Стр.' : 'Page'} ${Number(row.page_index || 0) + 1}</span>
-          <span>${ru() ? 'Ручной порядок чтения' : 'Manual reading order'}</span>
-          <span>${Array.isArray(row.order) ? row.order.length : 0} ${ru() ? 'областей' : 'regions'}</span>
-          <span>r${Number(row.revision || 1)}</span>
-        </div>`);
-      const geometryRows = geometries.map(row => `
-        <div class="ln-nyaa-row">
-          <span class="title">${ru() ? 'Стр.' : 'Page'} ${Number(row.page_index || 0) + 1}</span>
-          <span>${ru() ? 'Ручной hitbox' : 'Manual hitbox'}</span>
-          <span>${esc(row.original_text || '')}</span>
-          <span>r${Number(row.revision || 1)}</span>
-        </div>`);
-      const suppressionRows = suppressions.filter(row => String(row.reason || '') !== 'merge' && String(row.reason || '') !== 'split').map(row => `
-        <div class="ln-nyaa-row">
-          <span class="title">${ru() ? 'Стр.' : 'Page'} ${Number(row.page_index || 0) + 1}</span>
-          <span>${ru() ? 'Скрытый OCR-регион' : 'Hidden OCR region'}</span>
-          <span title="${esc(row.original_text || '')}">${esc(row.original_text || '')}</span>
-          <button data-manga-suppression-restore="${esc(row.id || '')}" data-page-index="${Number(row.page_index || 0)}">${ru() ? 'Восстановить' : 'Restore'}</button>
-        </div>`);
-      const additionRows = additions.filter(row => String(row.kind || '') !== 'split' || Number(row.split_part_index || 0) === 0).map(row => {
-        const kind = String(row.kind || 'addition');
-        const merged = kind === 'merge';
-        const split = kind === 'split';
-        const splitParts = split ? additions.filter(item => String(item.split_group_id || '') === String(row.split_group_id || '')).sort((a,b) => Number(a.split_part_index || 0) - Number(b.split_part_index || 0)) : [];
-        const displayText = split ? splitParts.map(item => String(item.text || '')).join(' | ') : String(row.text || '');
-        const label = merged ? (ru() ? 'Объединённый OCR-регион' : 'Merged OCR region') : split ? (ru() ? 'Разделённый OCR-регион' : 'Split OCR region') : (ru() ? 'Добавленный OCR-регион' : 'Added OCR region');
-        const action = merged ? `data-manga-merge-undo="${esc(row.id || '')}"` : split ? `data-manga-split-undo="${esc(row.id || '')}"` : `data-manga-addition-undo="${esc(row.id || '')}"`;
-        const actionText = merged ? (ru() ? 'Разъединить' : 'Unmerge') : split ? (ru() ? 'Отменить разделение' : 'Undo split') : (ru() ? 'Отменить' : 'Undo');
-        return `
-        <div class="ln-nyaa-row">
-          <span class="title">${ru() ? 'Стр.' : 'Page'} ${Number(row.page_index || 0) + 1}</span>
-          <span>${label}</span>
-          <span title="${esc(displayText)}">${esc(displayText)}</span>
-          <button ${action} data-page-index="${Number(row.page_index || 0)}">${actionText}</button>
-        </div>`;
-      });
-      const allRows = [...textRows, ...geometryRows, ...suppressionRows, ...additionRows, ...orderRows];
-      body.innerHTML = allRows.length ? allRows.join('') : `<div class="empty">${ru() ? 'Ручных исправлений нет' : 'No manual corrections'}</div>`;
-    } catch (error) {
-      body.innerHTML = `<div class="empty danger">${esc((window.PudgeUiLanguage?.message(error?.message || error) ?? String(error?.message || error)))}</div>`;
-    }
+        <div id="mangaVolumeWordsProgress" class="subtle"></div>` : `<div class="empty">${PudgeI18n.t('manga.noNewWords')}</div>`}`;
+    $('mangaVolumeWordsAdd')?.addEventListener('click', async event => {
+      const button = event.currentTarget;
+      const deck = String($('mangaVolumeWordsDeck')?.value || '');
+      const progress = $('mangaVolumeWordsProgress');
+      if (!deck) {
+        window.toast?.(PudgeI18n.t('manga.chooseADeck'));
+        return;
+      }
+      const chosen = [...body.querySelectorAll('[data-volume-word]:checked')]
+        .map(input => words[Number(input.dataset.volumeWord)])
+        .filter(Boolean);
+      button.disabled = true;
+      let added = 0;
+      let failed = 0;
+      for (const word of chosen) {
+        if (progress) progress.textContent = `${added + failed + 1}/${chosen.length}`;
+        try {
+          const result = await API().study_action({
+            backend, action:'add', word_id:Number(word.word_id), reading_index:Number(word.reading_index),
+            deck_id:deck, id_namespace:backend,
+          });
+          if (result?.ok === false) failed += 1;
+          else added += 1;
+        } catch (_) {
+          failed += 1;
+        }
+      }
+      try { await API().set_study_deck_preference(backend, deck); } catch (_) { /* preference only */ }
+      if (progress) {
+        progress.textContent = failed
+          ? PudgeI18n.t('manga.wordsAddedFailed', {added, failed})
+          : PudgeI18n.t('manga.wordsAdded', {added});
+      }
+      button.disabled = false;
+    });
   }
 
   function positionMangaContextMenu(menu, x, y) {
@@ -2162,6 +1727,24 @@
     const rect = menu.getBoundingClientRect();
     menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
     menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  }
+
+  // A volume's Mokuro sidecar is chosen with the native file picker.
+  async function importMangaMokuro(bookId) {
+    try {
+      const result = await API().choose_manga_mokuro(bookId);
+      if (result?.error) throw new Error(result.error);
+      if (result?.cancelled) return;
+      window.toast?.(PudgeI18n.t('manga.mokuroImportedSkippedPages',{imported_pages:Number(result.imported_pages || 0),skipped_pages:Number(result.skipped_pages || 0)}));
+      if (currentBook && Number(currentBook.id) === bookId) {
+        textGeneration += 1;
+        textRegionCache.clear(); textRegionResultCache.clear();
+        textParseCache.clear(); textParseInflight.clear();
+        syncMangaOcrUi(await API().manga_ocr_book_status(bookId));
+        await refreshVisibleTextRegions();
+      }
+      await renderLibrary(true);
+    } catch (error) { window.toast?.(String(error?.message || error)); }
   }
 
   function showMangaContextMenu(book, x, y) {
@@ -2172,23 +1755,25 @@
     if (!menu) return;
     const linked = Boolean(anilistId(book));
     const selected = selectedBookIds.has(Number(book.id));
-    const select = `<button data-manga-context-action="select">${selected ? (ru() ? 'Снять выделение' : 'Deselect') : (ru() ? 'Выделить' : 'Select')}</button>`;
+    const select = `<button data-manga-context-action="select">${selected ? (PudgeI18n.t('ui.deselect')) : (PudgeI18n.t('ui.select'))}</button>`;
     const openAniList = linked
-      ? `<button data-manga-context-action="anilist">${ru() ? 'Открыть AniList' : 'Open AniList'}</button>`
+      ? `<button data-manga-context-action="anilist">${PudgeI18n.t('action.openAniList')}</button>`
       : '';
     const link = `<button data-manga-context-action="anilist-search">${linked
-      ? (ru() ? 'Изменить AniList' : 'Change AniList')
-      : (ru() ? 'Найти в AniList' : 'Find on AniList')}</button>`;
+      ? (PudgeI18n.t('ui.changeAnilist'))
+      : (PudgeI18n.t('ui.findOnAnilist'))}</button>`;
     const names = '';
     const ocr = book.ocr_complete
-      ? (ru() ? 'Повторить OCR тома' : 'Rebuild volume OCR')
-      : (ru() ? 'OCR тома' : 'OCR volume');
+      ? (PudgeI18n.t('manga.rebuildVolumeOcr'))
+      : (PudgeI18n.t('manga.ocrVolume'));
     menu.innerHTML = `
-      ${select}<button data-manga-context-action="read">${ru() ? 'Читать' : 'Read'}</button>
+      ${select}<button data-manga-context-action="read">${PudgeI18n.t('ui.read')}</button>
       ${openAniList}${link}${names}
+      <button data-manga-context-action="edit-metadata">${PudgeI18n.t('ui.editVolumeAndSeries')}</button>
       <button data-manga-context-action="ocr-book" ${state?.ocr_available ? '' : 'disabled'}>${ocr}</button>
-      <button data-manga-context-action="reset-progress">${ru() ? 'Сбросить прогресс чтения' : 'Reset reading progress'}</button>
-      <button class="danger-action" data-manga-context-action="remove-series">${ru() ? 'Удалить из Pudge' : 'Remove from Pudge'}</button>`;
+      <button data-manga-context-action="import-mokuro">${PudgeI18n.t('manga.importMokuro')}</button>
+      <button data-manga-context-action="reset-progress">${PudgeI18n.t('ui.resetReadingProgress')}</button>
+      <button class="danger-action" data-manga-context-action="remove-series">${PudgeI18n.t('manga.removeFromPudge')}</button>`;
     positionMangaContextMenu(menu, x, y);
   }
 
@@ -2202,25 +1787,25 @@
     const linked = Boolean(anilistId(book));
     const allSelected = group.books.every(item => selectedBookIds.has(Number(item.id)));
     const allOcrReady = group.books.every(item => Boolean(item.ocr_complete));
-    const select = `<button data-manga-context-action="select-series">${allSelected ? (ru() ? 'Снять выделение со всех томов' : 'Deselect all volumes') : (ru() ? 'Выделить все тома' : 'Select all volumes')}</button>`;
+    const select = `<button data-manga-context-action="select-series">${allSelected ? (PudgeI18n.t('ui.deselectAllVolumes')) : (PudgeI18n.t('ui.selectAllVolumes'))}</button>`;
     const openAniList = linked
-      ? `<button data-manga-context-action="anilist">${ru() ? 'Открыть AniList' : 'Open AniList'}</button>`
+      ? `<button data-manga-context-action="anilist">${PudgeI18n.t('action.openAniList')}</button>`
       : '';
     const score = linked
-      ? `<button data-manga-context-action="score-series">${ru() ? 'Поставить оценку' : 'Set score'}</button>`
+      ? `<button data-manga-context-action="score-series">${PudgeI18n.t('action.setScore')}</button>`
       : '';
     const link = `<button data-manga-context-action="anilist-search">${linked
-      ? (ru() ? 'Изменить AniList' : 'Change AniList')
-      : (ru() ? 'Найти в AniList' : 'Find on AniList')}</button>`;
+      ? (PudgeI18n.t('ui.changeAnilist'))
+      : (PudgeI18n.t('ui.findOnAnilist'))}</button>`;
     const ocr = allOcrReady
-      ? (ru() ? 'Повторить OCR всех томов' : 'Rebuild OCR for all volumes')
-      : (ru() ? 'OCR всех томов' : 'OCR all volumes');
+      ? (PudgeI18n.t('manga.rebuildOcrForAllVolumes'))
+      : (PudgeI18n.t('manga.ocrAllVolumes'));
     menu.innerHTML = `
-      ${select}<button data-manga-context-action="read-series">${ru() ? 'Читать' : 'Read'}</button>
+      ${select}<button data-manga-context-action="read-series">${PudgeI18n.t('ui.read')}</button>
       ${openAniList}${score}${link}
       <button data-manga-context-action="ocr-series" ${state?.ocr_available ? '' : 'disabled'}>${ocr}</button>
-      <button data-manga-context-action="reset-progress-series">${ru() ? 'Сбросить прогресс серии' : 'Reset series progress'}</button>
-      <button class="danger-action" data-manga-context-action="remove-series">${ru() ? 'Удалить из Pudge' : 'Remove from Pudge'}</button>`;
+      <button data-manga-context-action="reset-progress-series">${PudgeI18n.t('manga.resetSeriesProgress')}</button>
+      <button class="danger-action" data-manga-context-action="remove-series">${PudgeI18n.t('manga.removeFromPudge')}</button>`;
     positionMangaContextMenu(menu, x, y);
   }
 
@@ -2234,7 +1819,7 @@
       }
       libraryOcrPollers.delete(Number(bookId));
       await renderLibrary();
-      if (status.complete) window.toast?.(ru() ? 'OCR тома готов' : 'Volume OCR ready');
+      if (status.complete) window.toast?.(PudgeI18n.t('manga.volumeOcrReady'));
       else if (status.errors?.length) window.toast?.(status.errors.join(' • '));
     } catch (error) {
       libraryOcrPollers.delete(Number(bookId));
@@ -2247,7 +1832,7 @@
     if (!bookId || libraryOcrPollers.has(bookId)) return;
     try {
       await API().start_manga_ocr_book(bookId, Boolean(refresh));
-      window.toast?.(ru() ? 'OCR тома запущен' : 'Volume OCR started');
+      window.toast?.(PudgeI18n.t('manga.volumeOcrStarted'));
       libraryOcrPollers.set(bookId, null);
       await pollLibraryBookOcr(bookId);
     } catch (error) {
@@ -2259,7 +1844,7 @@
   async function startLibrarySeriesOcr(books, rebuild = false) {
     const queue = (books || []).filter(book => Number(book?.id) && !libraryOcrPollers.has(Number(book.id)));
     if (!queue.length) return;
-    window.toast?.(ru() ? `OCR томов поставлен в очередь: ${queue.length}` : `Volume OCR queued: ${queue.length}`);
+    window.toast?.(PudgeI18n.t('manga.volumeOcrQueued',{count:queue.length}));
     for (const book of queue) {
       const bookId = Number(book.id);
       try {
@@ -2343,7 +1928,7 @@
     if (generation !== pageRenderGeneration || !currentBook || Number(currentBook.id) !== bookId) return;
     pages.innerHTML = loaded.map(page => `
       <figure class="manga-v2-page-frame${isDoublePage(page) ? ' spread' : ''}" data-spread="${isDoublePage(page) ? '1' : '0'}" data-page-index="${Number(page.page_index)}">
-        <img src="${page.data_uri}" alt="${esc(page.name || '')}">
+        <img src="${esc(pageSource(page))}" alt="${esc(page.name || '')}" decoding="async">
         <div class="manga-v2-text-layer"></div>
       </figure>`).join('');
     updatePageLabel();
@@ -2384,7 +1969,7 @@
           frame.dataset.loaded = 'loading';
           void getPage(index).then(page => {
             if (generation !== pageRenderGeneration || !currentBook || Number(currentBook.id) !== bookId) return;
-            frame.innerHTML = `<img src="${page.data_uri}" alt="${esc(page.name || '')}"><div class="manga-v2-text-layer"></div>`;
+            frame.innerHTML = `<img src="${esc(pageSource(page))}" alt="${esc(page.name || '')}" decoding="async"><div class="manga-v2-text-layer"></div>`;
             frame.dataset.loaded = '1';
             void loadTextRegions(index, {cachedOnly:true, parse:true});
           }).catch(() => { frame.dataset.loaded = ''; });
@@ -2397,7 +1982,9 @@
         else nearbyFrames.delete(entry.target);
       }
       preloadApprovedPart();
-    }, {root:$('mangaV2Viewport'), rootMargin:'120% 0px'});
+    // Preload 60 % of a screen ahead and keep ±1 page decoded (was 120 % / ±3:
+    // 7-9 full-size pages, 170-220 MB of bitmaps).
+    }, {root:$('mangaV2Viewport'), rootMargin:'60% 0px'});
 
     const updateVisiblePage = index => {
       approvedPage=index;
@@ -2408,7 +1995,7 @@
       preloadApprovedPart();
       for (const frame of pages.querySelectorAll('.manga-v2-page-frame[data-loaded="1"]')) {
         const frameIndex = Number(frame.dataset.pageIndex);
-        if (nearbyFrames.has(frame) || Math.abs(frameIndex - currentPage) <= 3) continue;
+        if (nearbyFrames.has(frame) || Math.abs(frameIndex - currentPage) <= 1) continue;
         frame.innerHTML = `<div class="manga-v2-page-placeholder">${frameIndex + 1}</div>`;
         delete frame.dataset.loaded;
         pageCache.delete(`${bookId}:${frameIndex}`);
@@ -2474,6 +2061,8 @@
     const requested=Math.floor(Number(index)/20)*20;
     const key=`${bookId}:${requested}`;
     if(approvedMangaParts.has(key))return true;
+    // Manga reviews need OCR text; without an OCR backend the part opens directly.
+    if(!state?.ocr_available)return true;
     if(mangaGatePromise)return false;
     mangaGatePromise=window.PudgeReviewGate.require('manga',bookId,requested);
     try{
@@ -2497,7 +2086,7 @@
     if (entryGeneration !== bookOpenGeneration) return false;
     const pendingBook = (pendingState.books || []).find(book => Number(book.id) === Number(bookId));
     if (!pendingBook) return false;
-    const approved = await window.PudgeReviewGate.require('manga', Number(bookId), Math.floor(Number(pendingBook.position || 0) / 20) * 20);
+    const approved = !pendingState?.ocr_available || await window.PudgeReviewGate.require('manga', Number(bookId), Math.floor(Number(pendingBook.position || 0) / 20) * 20);
     if (entryGeneration !== bookOpenGeneration || !approved) return false;
     approvedMangaParts.clear();
     approvedMangaParts.add(`${Number(bookId)}:${Math.floor(Number(pendingBook.position || 0) / 20) * 20}`);
@@ -2505,6 +2094,7 @@
     clearMangaTransientOverlays();
     state = pendingState;
     hydratePersistedStatusPreferences(state?.reader_preferences);
+    if (currentBook && Number(currentBook.id) !== Number(pendingBook.id)) releaseAutoVolumeOcr(currentBook.id);
     currentBook = pendingBook;
     if (!currentBook) return;
     currentPage = Number(currentBook.position || 0);
@@ -2527,7 +2117,7 @@
     const ocrButton = document.querySelector('[data-manga-v2-action="ocr-book"]');
     if (ocrButton) {
       // Opening a book is not an OCR job. Keep the action usable only when
-      // MangaOCR is actually available; an unavailable engine is a disabled
+      // Mokuro is actually available; an unavailable engine is a disabled
       // grey action, not a button that fails after the click.
       const available = Boolean(state?.ocr_available);
       ocrButton.disabled = false;
@@ -2535,19 +2125,10 @@
       ocrButton.classList.remove('busy');
       ocrButton.classList.toggle('unavailable', !available);
       ocrButton.setAttribute('aria-disabled', available ? 'false' : 'true');
-      ocrButton.title = available ? '' : (ru() ? 'OCR-движок не установлен' : 'OCR backend is not installed');
+      ocrButton.title = available ? '' : (PudgeI18n.t('manga.ocrBackendIsNotInstalled'));
     }
     reader.classList.add('open');
     document.body.classList.add('manga-v2-reading');
-    const nearbyButton = document.querySelector('[data-manga-v2-action="import-nearby-mokuro"]');
-    if (nearbyButton) nearbyButton.hidden = true;
-    const nearbyBook = currentBook;
-    void API().manga_nearby_mokuro(Number(bookId)).then(result => {
-      if (nearbyButton && currentBook === nearbyBook && reader.classList.contains('open')) {
-        nearbyButton.hidden = !result?.available;
-        nearbyButton.title = String(result?.filename || '');
-      }
-    }).catch(() => { if (nearbyButton && currentBook === nearbyBook) nearbyButton.hidden = true; });
     // Start status reconciliation immediately. Page rendering must never be a
     // prerequisite for re-enabling the OCR action.
     const ocrStatusPromise = (async () => {
@@ -2569,7 +2150,15 @@
     void ensureCurrentBookPrepared();
   }
 
+  // Volume OCR that opening the reader started stops when the reader closes
+  // or moves to another volume (an OCR started with the toolbar button keeps going).
+  function releaseAutoVolumeOcr(bookId) {
+    if (!bookId || !API()?.stop_manga_ocr_book) return;
+    Promise.resolve(API().stop_manga_ocr_book(Number(bookId), true)).catch(() => {});
+  }
+
   function closeReader() {
+    releaseAutoVolumeOcr(currentBook?.id);
     bookOpenGeneration += 1;
     approvedMangaParts.clear();
     window.PudgeAssistant?.close?.();
@@ -2594,6 +2183,8 @@
     mangaLastSelection = null;
     mangaPointerSelection = null;
     $('mangaReaderV2')?.classList.remove('open', 'toolbar-peek');
+    mangaDebugButtonRevealed = false;
+    ensureMangaDebugOverlayButton(mangaReaderNode());
     document.body.classList.remove('manga-v2-reading');
     currentBook = null;
     currentBookOcrStatus = null;
@@ -2835,11 +2426,11 @@
   });
 
   document.addEventListener('contextmenu', event => {
-    const correctionRegion = event.target.closest?.('.manga-v2-text-region');
-    if (correctionRegion && correctionRegion.closest?.('#mangaReaderV2')) {
+    const textRegion = event.target.closest?.('.manga-v2-text-region');
+    if (textRegion && textRegion.closest?.('#mangaReaderV2')) {
       event.preventDefault();
       event.stopPropagation();
-      showMangaCorrectionContextMenu(correctionRegion, event.clientX, event.clientY);
+      showMangaRegionContextMenu(textRegion, event.clientX, event.clientY);
       return;
     }
     const entry = event.target.closest?.('[data-manga-book]');
@@ -3255,10 +2846,12 @@
 
   function mangaTokenHitboxes(regionNode, region) {
     if (!regionNode || !region) return [];
-    // Mokuro supplies a block rectangle, not word/character rectangles. Make
-    // the actual block clickable for sentence lookup, without inventing word
-    // hitboxes. A precise text selection is handled before this fallback.
-    if (region?.provenance?.source === 'mokuro' && region?.geometry_status === 'approximate') {
+    // Mokuro regions without per-character segments only have line/block
+    // rectangles. Make them clickable for sentence lookup, without inventing
+    // word hitboxes. Regions converted with line-split character segments
+    // (word_geometry mapped_segments) use the normal segment path below.
+    if (region?.provenance?.source === 'mokuro' && region?.geometry_status === 'approximate' &&
+        String(region.word_geometry || '') !== 'mapped_segments') {
       const x = Number(regionNode.dataset.rawX);
       const y = Number(regionNode.dataset.rawY);
       const width = Number(regionNode.dataset.rawWidth);
@@ -3368,7 +2961,7 @@
     const tokens = [...regionNode.querySelectorAll('[data-pudge-study-token]')];
     if (diagnostics) diagnostics.parsedTokens += tokens.length;
     const tokenKey = tokenIndex => `${Number(regionIndex)}:${Number(tokenIndex)}`;
-    if (region?.provenance?.source === 'mokuro') {
+    if (region?.provenance?.source === 'mokuro' && String(region.word_geometry || '') !== 'mapped_segments') {
       if (diagnostics) tokens.forEach((_, tokenIndex) => diagnostics.geometryUnmapped.add(tokenKey(tokenIndex)));
       return [];
     }
@@ -3801,187 +3394,14 @@
       toggleSelection(Number(libraryEntry.dataset.mangaBook));
       return;
     }
-    const suppressionRestore = event.target.closest?.('[data-manga-suppression-restore]');
-    if (suppressionRestore) {
+    const regionAction = event.target.closest?.('[data-manga-region-action]');
+    if (regionAction) {
       event.preventDefault();
       event.stopPropagation();
-      suppressionRestore.disabled = true;
-      try {
-        await restoreMangaOcrRegion(
-          suppressionRestore.dataset.mangaSuppressionRestore,
-          Number(suppressionRestore.dataset.pageIndex || 0),
-        );
-      } catch (error) {
-        suppressionRestore.disabled = false;
-        window.toast?.(String(error?.message || error));
-      }
-      return;
-    }
-    const splitUndo = event.target.closest?.('[data-manga-split-undo]');
-    if (splitUndo) {
-      event.preventDefault();
-      event.stopPropagation();
-      splitUndo.disabled = true;
-      try {
-        await API().manga_unsplit_ocr_region(Number(currentBook.id), String(splitUndo.dataset.mangaSplitUndo));
-        await refreshCorrectedMangaPage(Number(splitUndo.dataset.pageIndex || 0));
-        await showMangaCorrectionList();
-      } catch (error) {
-        splitUndo.disabled = false;
-        window.toast?.(String(error?.message || error));
-      }
-      return;
-    }
-    const mergeUndo = event.target.closest?.('[data-manga-merge-undo]');
-    if (mergeUndo) {
-      event.preventDefault();
-      event.stopPropagation();
-      mergeUndo.disabled = true;
-      try {
-        await API().manga_unmerge_ocr_region(Number(currentBook.id), String(mergeUndo.dataset.mangaMergeUndo));
-        await refreshCorrectedMangaPage(Number(mergeUndo.dataset.pageIndex || 0));
-        await showMangaCorrectionList();
-      } catch (error) {
-        mergeUndo.disabled = false;
-        window.toast?.(String(error?.message || error));
-      }
-      return;
-    }
-    const additionUndo = event.target.closest?.('[data-manga-addition-undo]');
-    if (additionUndo) {
-      event.preventDefault();
-      event.stopPropagation();
-      additionUndo.disabled = true;
-      try {
-        await API().manga_undo_added_ocr_region(Number(currentBook.id), String(additionUndo.dataset.mangaAdditionUndo));
-        await refreshCorrectedMangaPage(Number(additionUndo.dataset.pageIndex || 0));
-        await showMangaCorrectionList();
-      } catch (error) {
-        additionUndo.disabled = false;
-        window.toast?.(String(error?.message || error));
-      }
-      return;
-    }
-    const correctionAction = event.target.closest?.('[data-manga-correction-action]');
-    if (correctionAction) {
-      event.preventDefault();
-      event.stopPropagation();
-      const context = mangaCorrectionContext ? {...mangaCorrectionContext} : null;
-      const type = correctionAction.dataset.mangaCorrectionAction;
+      const context = mangaRegionContext ? {...mangaRegionContext} : null;
+      const type = regionAction.dataset.mangaRegionAction;
       closeMangaContextMenu();
-      if (!context) return;
-      if (type === 'edit') openMangaCorrectionEditor(context);
-      else if (type === 'geometry') openMangaGeometryEditor(context);
-      else if (type === 'split') openMangaSplitEditor(context);
-      else if (type === 'merge') startMangaMerge(context);
-      else if (type === 'suppress') await suppressMangaOcrRegion(context);
-      else if (type === 'unsplit' && context.manualAddition) {
-        await API().manga_unsplit_ocr_region(context.bookId, String(context.manualAddition.id));
-        await refreshCorrectedMangaPage(context.pageIndex);
-        window.toast?.(ru() ? 'Разделение отменено' : 'Split undone');
-      }
-      else if (type === 'unmerge' && context.manualAddition) {
-        await API().manga_unmerge_ocr_region(context.bookId, String(context.manualAddition.id));
-        await refreshCorrectedMangaPage(context.pageIndex);
-        window.toast?.(ru() ? 'Объединение отменено' : 'Merge undone');
-      }
-      else if (type === 'added-undo' && context.manualAddition) {
-        await API().manga_undo_added_ocr_region(context.bookId, String(context.manualAddition.id));
-        await refreshCorrectedMangaPage(context.pageIndex);
-      }
-      else if (type === 'geometry-undo') await undoMangaGeometry(context);
-      else if (type === 'undo' && API()?.manga_undo_ocr_correction) {
-        await API().manga_undo_ocr_correction(context.bookId, context.pageIndex, context.regionIndex);
-        await refreshCorrectedMangaPage(context.pageIndex);
-        window.toast?.(ru() ? 'Исправление OCR отменено' : 'OCR correction undone');
-      }
-      else if (type === 'order-earlier') await moveMangaReadingOrder(context, -1);
-      else if (type === 'order-later') await moveMangaReadingOrder(context, 1);
-      else if (type === 'order-undo') await undoMangaReadingOrder(context);
-      return;
-    }
-    if (event.target.closest?.('[data-manga-split-save]')) {
-      event.preventDefault(); event.stopPropagation();
-      const draft = mangaSplitDraft;
-      const firstText = String($('mangaSplitFirstText')?.value || '').trim();
-      const secondText = String($('mangaSplitSecondText')?.value || '').trim();
-      if (!draft || !firstText || !secondText) { window.toast?.(ru() ? 'Обе части должны содержать текст' : 'Both parts need text'); return; }
-      const layout = String($('mangaSplitLayout')?.value || 'columns');
-      const ratio = Number($('mangaSplitRatio')?.value || 50) / 100;
-      const save = event.target.closest('[data-manga-split-save]'); save.disabled = true;
-      try {
-        const orientation = String(draft.orientation || 'vertical');
-        await API().manga_split_ocr_region(
-          draft.bookId, draft.pageIndex, mangaMergeRef(draft),
-          [
-            {text:firstText, orientation, geometry:mangaSplitPartGeometry(draft, layout, ratio, 0)},
-            {text:secondText, orientation, geometry:mangaSplitPartGeometry(draft, layout, ratio, 1)},
-          ],
-        );
-        const pageIndex = draft.pageIndex;
-        mangaSplitDraft = null;
-        $('modalBackdrop')?.classList.remove('open');
-        await refreshCorrectedMangaPage(pageIndex);
-        window.toast?.(ru() ? 'OCR-регион разделён' : 'OCR region split');
-      } catch (error) { save.disabled = false; window.toast?.(String(error?.message || error)); }
-      return;
-    }
-    if (event.target.closest?.('[data-manga-merge-save]')) {
-      event.preventDefault(); event.stopPropagation();
-      const draft = mangaMergeDraft;
-      const text = String($('mangaMergeText')?.value || '').trim();
-      const orientation = String($('mangaMergeOrientation')?.value || 'vertical');
-      if (!draft?.first || !draft?.second || !text) return;
-      const save = event.target.closest('[data-manga-merge-save]'); save.disabled = true;
-      try {
-        await API().manga_merge_ocr_regions(
-          draft.first.bookId, draft.first.pageIndex,
-          mangaMergeRef(draft.first), mangaMergeRef(draft.second), text, orientation,
-        );
-        const pageIndex = draft.first.pageIndex;
-        mangaMergeDraft = null;
-        $('modalBackdrop')?.classList.remove('open');
-        await refreshCorrectedMangaPage(pageIndex);
-        window.toast?.(ru() ? 'OCR-регионы объединены' : 'OCR regions merged');
-      } catch (error) { save.disabled = false; window.toast?.(String(error?.message || error)); }
-      return;
-    }
-    if (event.target.closest?.('[data-manga-addition-save]')) {
-      event.preventDefault();
-      event.stopPropagation();
-      const draft = mangaManualAddDraft;
-      const text = String($('mangaManualAddText')?.value || '').trim();
-      const orientation = String($('mangaManualAddOrientation')?.value || 'vertical');
-      if (!draft || !text || !currentBook || Number(currentBook.id) !== Number(draft.bookId)) return;
-      const save = event.target.closest('[data-manga-addition-save]');
-      save.disabled = true;
-      try {
-        await API().manga_add_ocr_region(draft.bookId, draft.pageIndex, draft.geometry, text, orientation);
-        mangaManualAddDraft = null;
-        $('modalBackdrop')?.classList.remove('open');
-        await refreshCorrectedMangaPage(draft.pageIndex);
-        window.toast?.(ru() ? 'OCR-регион добавлен' : 'OCR region added');
-      } catch (error) {
-        save.disabled = false;
-        window.toast?.(String(error?.message || error));
-      }
-      return;
-    }
-    if (event.target.closest?.('[data-manga-correction-save]')) {
-      event.preventDefault();
-      event.stopPropagation();
-      const context = mangaCorrectionContext ? {...mangaCorrectionContext} : null;
-      const text = String($('mangaOcrCorrectionText')?.value || '').trim();
-      if (!context || !text) return;
-      if (context.manualAddition) {
-        await API().manga_update_added_ocr_region(context.bookId, String(context.manualAddition.id), text, null);
-      } else {
-        await API().manga_set_ocr_correction(context.bookId, context.pageIndex, context.regionIndex, text);
-      }
-      $('modalBackdrop')?.classList.remove('open');
-      mangaCorrectionContext = null;
-      await refreshCorrectedMangaPage(context.pageIndex);
-      window.toast?.(ru() ? 'Исправление OCR сохранено' : 'OCR correction saved');
+      if (context && type === 'explain') explainMangaBubble(context);
       return;
     }
     const contextAction = event.target.closest?.('[data-manga-context-action]');
@@ -4010,15 +3430,23 @@
         await window.PudgeMedia?.showMangaAniListSearch?.(
           Number(book.id), seriesTitle(book),
         );
+      } else if (type === 'edit-metadata') {
+        const saved = await window.PudgeLibraryMetadata?.edit('manga', book);
+        if (saved) {
+          await renderLibrary(true);
+          window.toast?.(PudgeI18n.t('ui.volumeAndSeriesSaved'));
+        }
       } else if (type === 'names') {
         await window.showCharacterGlossaryEditor?.(anilistId(book), seriesTitle(book));
       } else if (type === 'ocr-series' && series) {
         void startLibrarySeriesOcr(series.books, series.books.every(item => Boolean(item.ocr_complete)));
       } else if (type === 'ocr-book') {
         void startLibraryBookOcr(book, Boolean(book.ocr_complete));
+      } else if (type === 'import-mokuro') {
+        await importMangaMokuro(Number(book.id));
       } else if (type === 'reset-progress' || (type === 'reset-progress-series' && series)) {
         const confirmed = await window.pudgeConfirm?.(
-          ru() ? 'Сбросить прогресс чтения? Настройки и привязка AniList сохранятся.' : 'Reset reading progress? Settings and AniList metadata will be preserved.',
+          PudgeI18n.t('manga.resetProgressConfirm'),
         );
         if (!confirmed) return;
         if (type === 'reset-progress-series' && series) {
@@ -4032,7 +3460,7 @@
         await renderLibrary(false);
       } else if (type === 'remove-series') {
         const confirmed = await window.pudgeConfirm?.(
-          ru() ? 'Удалить эту мангу из Pudge? Исходные CBZ/ZIP останутся на диске.' : 'Remove this manga from Pudge? Source CBZ/ZIP files will stay on disk.',
+          PudgeI18n.t('manga.removeConfirm'),
           {danger:true},
         );
         if (!confirmed) return;
@@ -4048,11 +3476,6 @@
     if (event.target.closest?.('[data-pudge-study-token]')) return;
     const textRegion = event.target.closest?.('.manga-v2-text-region');
     const selectionSurface = event.target.closest?.('.manga-v2-selection-content');
-    if (textRegion && mangaMergeDraft?.first && !mangaMergeDraft?.second) {
-      event.preventDefault(); event.stopPropagation();
-      chooseMangaMergeRegion(textRegion);
-      return;
-    }
     if (selectionSurface && textRegion) {
       if (Number(event.detail || 0) >= 3) {
         if (selectWholeMangaBubble(textRegion)) {
@@ -4069,17 +3492,17 @@
       return;
     }
     if (event.target.closest?.('.manga-v2-page-frame img')) {
-      if (seedMangaManualRegion(event, event.target.closest('.manga-v2-page-frame img'))) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
       if (await handleMangaImageStudyClick(event)) {
         event.preventDefault();
         return;
       }
     }
     if (textRegion) return;
+    // The empty library's button: the same import as the toolbar's Import.
+    if (event.target.closest?.('[data-manga-empty-import]')) {
+      $('mangaImportV2')?.click();
+      return;
+    }
     if (event.target.id === 'mangaImportV2') {
       // pudge-v0.7.23-manga-folder-picker-v1
       // Bulk manga torrents are usually nested folder trees; selecting the
@@ -4104,38 +3527,11 @@
     else if (type === 'next') await movePage(+1);
     else if (type === 'previous') await movePage(-1);
     else if (type === 'ocr-book') await recognizeWholeBook();
-    else if ((type === 'import-mokuro' || type === 'import-nearby-mokuro') && currentBook) {
-      const bookId = Number(currentBook.id);
-      const button = action;
-      button.disabled = true;
-      try {
-        const result = type === 'import-nearby-mokuro'
-          ? await API().import_nearby_mokuro(bookId)
-          : await API().choose_manga_mokuro(bookId);
-        if (result?.error) throw new Error(result.error);
-        if (!result?.cancelled) {
-          window.toast?.(ru()
-            ? `Mokuro: импортировано ${Number(result.imported_pages || 0)}, пропущено ${Number(result.skipped_pages || 0)} страниц`
-            : `Mokuro: imported ${Number(result.imported_pages || 0)}, skipped ${Number(result.skipped_pages || 0)} pages`);
-          if (currentBook && Number(currentBook.id) === bookId) {
-            textGeneration += 1;
-            textRegionCache.clear(); textRegionResultCache.clear();
-            textParseCache.clear(); textParseInflight.clear();
-            syncMangaOcrUi(await API().manga_ocr_book_status(bookId));
-            // The reader intentionally displays overlays only for a complete volume.
-            if (currentBook.ocr_complete) await refreshVisibleTextRegions();
-            if (type === 'import-nearby-mokuro') button.hidden = true;
-          }
-        }
-      } catch (error) { window.toast?.(String(error?.message || error)); }
-      finally { button.disabled = false; }
-    }
     else if (type === 'page-picker') togglePagePicker();
     else if (type === 'fullscreen') await toggleFullscreen();
     else if (type === 'toolbar-show') toggleToolbar(true);
     else if (type === 'settings') toggleReaderSettings();
-    else if (type === 'ocr-corrections') await showMangaCorrectionList();
-    else if (type === 'add-ocr-region') startMangaManualRegionAdd();
+    else if (type === 'volume-words') await showMangaVolumeWords();
   }, true);
 
   document.addEventListener('click', event => {
@@ -4174,9 +3570,8 @@
       toggleToolbar();
     } else if (event.key.toLowerCase() === 'o' && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
       event.preventDefault();
-      if (!state?.ocr_available) window.toast?.(ru() ? 'OCR-движок не установлен' : 'OCR backend is not installed');
-      else if (currentBook?.ocr_complete) void loadTextRegions(currentPage, {refresh:true, showProgress:false, parse:true});
-      else window.toast?.(ru() ? 'Дождитесь OCR всего тома' : 'Wait for the whole-volume OCR to finish');
+      if (!state?.ocr_available) window.toast?.(PudgeI18n.t('manga.ocrBackendIsNotInstalled'));
+      else void loadTextRegions(currentPage, {refresh:true, showProgress:false, parse:true});
     } else if (event.key === '+' || event.key === '=') {
       event.preventDefault();
       setZoom(Number(settings.zoom || 100) + 10);
@@ -4206,16 +3601,6 @@
 
   function closeEscapeSurface() {
     if (!$('mangaReaderV2')?.classList.contains('open')) return false;
-    if (mangaManualAddMode) {
-      mangaManualAddMode = false;
-      $('mangaReaderV2')?.classList.remove('manual-add-mode');
-      return true;
-    }
-    if (mangaMergeDraft?.first && !mangaMergeDraft?.second) {
-      cancelMangaMergeMode();
-      return true;
-    }
-    if (closeMangaGeometryEditor()) return true;
     if (!$('mangaV2PagePicker')?.hidden) { closePagePicker(); return true; }
     if (closeReaderSettings()) return true;
     closeReader();
@@ -4278,9 +3663,9 @@
   })();
 
   function mangaDebugOverlayLabel(mode = mangaDebugOverlayMode) {
-    if (mode === 'regions') return 'OCR Debug: Regions';
-    if (mode === 'words') return 'OCR Debug: Words';
-    return 'OCR Debug: Off';
+    if (mode === 'regions') return PudgeI18n.t('manga.ocrDebugRegions');
+    if (mode === 'words') return PudgeI18n.t('manga.ocrDebugWords');
+    return PudgeI18n.t('manga.ocrDebugOff');
   }
 
   function mangaDebugRegionText(region) {
@@ -4306,16 +3691,25 @@
     region.dataset.debugLabel = (`R${regionIndex}${provenance ? ` · ${provenance}` : ''}${text ? ` · ${text}` : ''}`).slice(0, 260);
   }
 
+  // The toolbar button is a debugging aid: it stays out of the toolbar until Shift+D is
+  // pressed (or a saved mode is on) and then stays until the reader closes.
+  let mangaDebugButtonRevealed = false;
+
   function ensureMangaDebugOverlayButton(reader) {
     const toolbar = reader?.querySelector?.('.manga-v2-toolbar');
     if (!toolbar) return null;
     let button = toolbar.querySelector('[data-manga-v2-action="toggle-debug-overlay"]');
+    if (mangaDebugOverlayMode !== 'off') mangaDebugButtonRevealed = true;
+    if (!mangaDebugButtonRevealed) {
+      button?.remove();
+      return null;
+    }
     if (!button) {
       button = document.createElement('button');
       button.type = 'button';
       button.className = 'secondary';
       button.dataset.mangaV2Action = 'toggle-debug-overlay';
-      button.title = 'Cycle visible OCR overlay (Shift+D)';
+      button.title = PudgeI18n.t('manga.ocrDebugCycle');
       const spacer = toolbar.querySelector('.spacer');
       if (spacer?.parentNode === toolbar) toolbar.insertBefore(button, spacer);
       else toolbar.appendChild(button);
@@ -4423,19 +3817,31 @@
     if (!event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
     if (event.key !== 'D' && event.key !== 'd') return;
     event.preventDefault();
+    mangaDebugButtonRevealed = true;
     cycleMangaDebugOverlay();
   }, true);
 
-  const mangaDebugOverlayObserver = new MutationObserver(() => {
-    if (mangaDebugOverlayMode === 'off') return;
-    syncMangaDebugOverlayUi();
-  });
+  let mangaDebugOverlayObserver = null;
+  let mangaDebugOverlayObserved = null;
 
-  queueMicrotask(() => {
-    const reader = mangaReaderNode();
+  // Called by buildReader(): the reader is created lazily when a volume opens, so the
+  // toolbar button, a saved mode and the page-turn re-sync start from there (once).
+  function attachMangaDebugOverlay(reader) {
     if (!reader) return;
-    mangaDebugOverlayObserver.observe(reader, {subtree:true, childList:true, attributes:true, attributeFilter:['class']});
+    if (!mangaDebugOverlayObserver) {
+      mangaDebugOverlayObserver = new MutationObserver(() => {
+        if (mangaDebugOverlayMode === 'off') return;
+        syncMangaDebugOverlayUi();
+        // Drop the records of our own changes (button label, hitbox layers) so the
+        // observer does not keep re-triggering itself.
+        mangaDebugOverlayObserver.takeRecords();
+      });
+    }
+    if (mangaDebugOverlayObserved !== reader) {
+      mangaDebugOverlayObserved = reader;
+      mangaDebugOverlayObserver.observe(reader, {subtree:true, childList:true, attributes:true, attributeFilter:['class']});
+    }
     syncMangaDebugOverlayUi(reader);
-  });
+  }
 
 })();

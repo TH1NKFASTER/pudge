@@ -33,7 +33,9 @@ def _book(api: WebAppApi, tmp_path: Path) -> dict:
     return book
 
 
-def test_duplicate_irodori_click_returns_existing_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_duplicate_irodori_click_returns_existing_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     api = _api(tmp_path, monkeypatch)
     book = _book(api, tmp_path)
     release = threading.Event()
@@ -94,11 +96,73 @@ def test_irodori_server_exit_surfaces_server_log(tmp_path: Path, monkeypatch: py
     assert "ModuleNotFoundError: bad dependency" in detail
 
 
-def test_v90_ui_disables_repeat_irodori_and_renders_progress() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "lnIrodoriStarting:new Set()" in html
-    assert 'class="ln-irodori-progress"' in html
-    assert "generationBusy" in html
-    assert "patchLnAudiobookProgress" in html
-    assert "irodori_tts_active" in html
-    assert "scheduleLnStatePoll" in html
+# Light novel 6 on the shelf with audiobook generation (Irodori) on. window.LN is what
+# light_novel_state answers; generating waits for window.answerGenerate().
+GENERATION = r"""
+window.LN = {version: 1, settings: {audiobook_generation_provider: 'irodori'}, irodori_tts_active: false,
+             books: [{id: 6, title: 'Novel', volume: 1, character_count: 1000}]};
+__api.light_novel_state = async () => JSON.parse(JSON.stringify(window.LN));
+__api.generate_light_novel_tts = () => new Promise(resolve => {
+  window.answerGenerate = () => resolve({started: true, job: {state: 'queued', current: 0, total: 1000}}); });
+"""
+SHELF = r"""
+setPage('lightnovels'); await __tick(100);
+const card = id => document.querySelector(`#lightNovelsContent [data-ln-book="${id}"]`);
+const menu = async () => {
+  await __fire('#lightNovelsContent [data-ln-book="6"]', 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent');
+  return [...document.querySelectorAll('#contextMenu [data-ln-context-action]')].map(b => b.dataset.lnContextAction);
+};
+const progress = () => { const slot = card(6).querySelector('[data-ln-tts-status]');
+  return {visible: slot.checkVisibility(), percent: slot.querySelector('[data-ln-tts-percent]').innerText,
+          bar: slot.querySelector('[data-ln-tts-bar]').style.width}; };
+const running = (current, extra = {}) => { window.LN.irodori_tts_active = true;
+  Object.assign(window.LN.books[0], {irodori_tts: {active: true, state: 'running', current, total: 1000}}, extra); };
+"""
+
+
+def test_generating_an_audiobook_cannot_be_started_twice_and_shows_its_progress_in_place(page) -> None:
+    result = page.run(
+        SHELF
+        + r"""
+        const out = {menu: await menu()};
+        const item = document.querySelector('#contextMenu [data-ln-context-action="generate-audiobook"]');
+        item.click(); item.click();                                                        // an impatient second click
+        await __tick(10);
+        out.whileStarting = await menu();
+        window.answerGenerate(); await __tick(10);
+        out.started = progress();
+        const original = card(6);
+        // While it runs, chapters are found and the book's details change: the card is patched,
+        // not redrawn (a full redraw made the whole shelf blink at every poll).
+        running(400, {character_count: 1200, chapter_count: 3}); await __tick(1000);
+        out.running = {...progress(), sameCard: card(6) === original};
+        // A volume added meanwhile is a new book list: that is drawn at once.
+        window.LN.books.push({id: 7, title: 'Novel', volume: 2}); await __tick(1000);
+        out.added = Boolean(card(7));
+        const redrawn = card(6);
+        running(700); await __tick(1000);
+        out.later = {...progress(), sameCard: card(6) === redrawn};
+        // Finished: the shelf is drawn once more with the new details.
+        window.LN.irodori_tts_active = false;
+        window.LN.books[0].irodori_tts = {active: false, state: 'succeeded', current: 1000, total: 1000};
+        window.LN.books[0].paired_audio = {ln_book_id: 6, book: {id: 80}};
+        await __tick(1000);
+        out.finished = {sameCard: card(6) === redrawn, badge: Boolean(card(6).querySelector('.ln-paired-audio-badge')),
+                        progress: card(6).querySelector('[data-ln-tts-status]').checkVisibility()};
+        const polls = __apiCalls.filter(c => c.name === 'light_novel_state').length;
+        await __tick(5000);
+        out.pollsAfterFinish = __apiCalls.filter(c => c.name === 'light_novel_state').length - polls;
+        return out;
+        """,
+        before=GENERATION,
+    )
+    out = result.value
+    assert "generate-audiobook" in out["menu"]
+    assert result.calls_of("generate_light_novel_tts") == [[6]]
+    assert "generate-audiobook" not in out["whileStarting"]
+    assert out["started"]["visible"] is True and out["started"]["percent"] == "0%"
+    assert out["running"] == {"visible": True, "percent": "40%", "bar": "40%", "sameCard": True}
+    assert out["added"] is True
+    assert out["later"] == {"visible": True, "percent": "70%", "bar": "70%", "sameCard": True}
+    assert out["finished"] == {"sameCard": False, "badge": True, "progress": False}
+    assert out["pollsAfterFinish"] == 0

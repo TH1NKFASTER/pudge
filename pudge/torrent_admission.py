@@ -6,6 +6,7 @@ backends.  Only the process holding the lock may publish an enabled-state
 change; an atomically replaced state file lets background readers see Off
 without relying on their stale in-memory AppConfig.
 """
+
 from __future__ import annotations
 
 import json

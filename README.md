@@ -1,12 +1,14 @@
 # Pudge
 
+Completely vibecoded.
+
 Pudge is a macOS app for watching anime with Japanese subtitles and keeping
 anime, manga, Light Novels, and audiobooks in one local library. It can find
 new episodes, prepare subtitles, play video through mpv, track progress, and
 pair audiobooks with Light Novels without turning the setup into a collection
 of separate scripts.
 
-Current version: **0.7.30**.
+Current version: **0.8.0**.
 
 ## What Pudge can do
 
@@ -17,7 +19,7 @@ Current version: **0.7.30**.
 - read text from a selected Visual Novel window on demand with the macOS OCR reader;
 - play M4B, MP3, Opus, and FLAC audiobooks and pair them with Light Novels;
 - group Light Novels, manga, and audiobooks by series and volume;
-- open a private companion page on a phone or tablet for reading and local playback.
+- continue audiobooks, light novels, manga and episodes on an iPhone with the Pudge iPhone app (paired over HTTPS on the same Wi‑Fi).
 
 Pudge keeps its library and progress on your Mac. Optional online services are
 used only for the features you enable. Exported backups do not contain API
@@ -48,7 +50,7 @@ Download `pudge-macos-vX.Y.Z.zip` from GitHub Releases, then run:
 
 ```bash
 cd ~/Downloads
-unzip 0.7.30.zip
+unzip pudge-macos-v0.8.0.zip
 cd pudge
 ./install.sh
 ```
@@ -84,17 +86,12 @@ stored in the repository.
 Treat the AniList token like a password. This flow follows AniList's
 [implicit-grant authentication guide](https://docs.anilist.co/guide/auth/).
 
-## MangaOCR
+## Manga OCR
 
-Manga reading works without OCR. To add on-demand Japanese text recognition to
-an installed release:
-
-```bash
-~/.local/share/pudge/venv/bin/python -m pip install "manga-ocr>=0.1.14,<1"
-```
-
-MangaOCR downloads its model when it is first used. Pudge does not run OCR just
-because a manga page is open.
+Manga reading works without OCR. Japanese text recognition uses
+[Mokuro](https://github.com/kha-white/mokuro): install it from
+**Settings → Manga OCR** (a separate Python environment; its models download
+once), or point Pudge at the Python of an existing Mokuro environment there.
 
 ## Remove Pudge
 
@@ -111,10 +108,8 @@ because other apps may use them.
 ## Development
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev,sync]"
+brew install uv
+make install-dev    # uv sync --locked: the versions in uv.lock, into .venv-test
 make test-batches
 make lint
 ```
@@ -123,15 +118,13 @@ Release installs run a short offline preflight before replacing the app. To
 run the complete developer suite during installation, set
 `PUDGE_INSTALL_FULL_TESTS=1`; its separate test environment may need downloads.
 
-Add `.[manga]` when working on OCR. More details are in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+More details are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Troubleshooting
 
 - If an episode is being repaired, **Refresh** rechecks the local series and keeps the next unwatched episode ahead of later repair work.
 - If playback is active, heavy subtitle repair may wait until playback closes and then resume automatically.
 - For subtitle problems, open **Settings → Diagnostics** and include the relevant log details in a bug report.
-- If a mobile library looks old, bring the companion page to the foreground. It refreshes immediately and every 15 seconds while visible.
 - Backups keep the library, settings, and Pudge-managed prepared subtitle files. Restoring a backup keeps the credentials already installed on that Mac.
 
 Report security issues through [SECURITY.md](SECURITY.md). Contribution and

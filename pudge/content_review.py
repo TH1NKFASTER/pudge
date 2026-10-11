@@ -11,6 +11,7 @@ from .review_gate import ContentReviewIdentity, ReviewGateStore, _state_key, rev
 from .review_episode_due import build_text_due_review_cards
 from .review_providers import credential_account_key, ReviewOutcomeUnknown
 from .review_actions import resolve_wire_grade
+from .i18n import err
 
 
 class ContentReviewService:
@@ -22,36 +23,56 @@ class ContentReviewService:
         self.lock = threading.RLock()
         self.sessions: dict[str, dict[str, Any]] = {}
 
-    def source(self, kind: str, book_id: int, part: int, *, prepare: bool) -> tuple[ContentReviewIdentity, str]:
+    def source(
+        self, kind: str, book_id: int, part: int, *, prepare: bool
+    ) -> tuple[ContentReviewIdentity, str]:
         if kind == "ln":
             book = self.api.light_novels.book(book_id)
             if not Path(book["file_path"]).is_file():
-                raise FileNotFoundError("Light novel source was removed")
+                raise FileNotFoundError(err("review.lnSourceRemoved"))
             with self.api.light_novels._connection() as conn:
-                row = conn.execute("SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index=?",
-                                   (book_id, part)).fetchone()
+                row = conn.execute(
+                    "SELECT text,text_hash FROM ln_chapters WHERE book_id=? AND chapter_index=?",
+                    (book_id, part),
+                ).fetchone()
             if row is None:
-                raise ValueError("Light novel chapter was removed")
+                raise ValueError(err("review.lnChapterRemoved"))
             text = str(row["text"])
             revision = str(row["text_hash"])
-            identity = ContentReviewIdentity(kind, f"{book_id}:{book['created_at']}:{book['file_path']}", revision, part)
+            identity = ContentReviewIdentity(
+                kind, f"{book_id}:{book['created_at']}:{book['file_path']}", revision, part
+            )
         elif kind == "manga":
             book = dict(self.api.manga._book(book_id))
             if not Path(book["path"]).is_file():
-                raise FileNotFoundError("Manga source was removed")
+                raise FileNotFoundError(err("review.mangaSourceRemoved"))
             part = max(0, part // 20 * 20)
             lines = []
             for page in range(part, min(part + 20, int(book["page_count"]))):
                 result = self.api.manga.text_regions(book_id, page, cached_only=not prepare)
                 if result.get("status") in {"missing", "failed"} or result.get("available") is False:
-                    raise ValueError("Recognize the next 20 manga pages before reviewing them")
+                    raise ValueError(err("review.recognizeMangaPages"))
                 lines.extend(str(region.get("text") or "") for region in result.get("regions") or [])
             text = "\n".join(lines)
             revision = hashlib.sha256((str(book.get("source_fingerprint") or "") + text).encode()).hexdigest()
-            identity = ContentReviewIdentity(kind, f"{book_id}:{book['created_at']}:{book['path']}", revision, part)
+            identity = ContentReviewIdentity(
+                kind, f"{book_id}:{book['created_at']}:{book['path']}", revision, part
+            )
         else:
-            raise ValueError("Unsupported content review kind")
+            raise ValueError(err("review.unsupportedKind"))
         return identity, text
+
+    @staticmethod
+    def _unavailable(message: str) -> dict[str, Any]:
+        # The gate only blocks when it can issue the review. Without Jiten, OCR
+        # or a usable due scan the reader goes on (nothing is granted).
+        return {
+            "blocking": False,
+            "granted": False,
+            "enabled": True,
+            "reason": "review_unavailable",
+            "message": str(message)[:400],
+        }
 
     def begin(self, kind: str, book_id: int, part: int) -> dict[str, Any]:
         config = self.api.config.ui
@@ -59,32 +80,60 @@ class ContentReviewService:
             return {"blocking": False, "granted": True, "enabled": False}
         settings = self.api.light_novels.settings()
         if settings.study_backend != "jiten" or not settings.jiten_api_key:
-            raise ValueError("Configure Jiten before reviewing content")
+            return self._unavailable(err("review.configureJiten"))
         account = credential_account_key("jiten", settings.jiten_api_key)
-        identity, text = self.source(kind, int(book_id), int(part), prepare=True)
+        try:
+            identity, text = self.source(kind, int(book_id), int(part), prepare=True)
+        except (FileNotFoundError, ValueError) as exc:
+            return self._unavailable(str(exc))
         with self.lock:
             self.store.clear_unearned_grant(account, identity)
             if self.store.snapshot(account, identity)["granted"]:
                 return {"blocking": False, "granted": True, "reason": "already_reviewed"}
-        scanned = build_text_due_review_cards(self.api.light_novels, text, identity.revision)
+        try:
+            scanned = build_text_due_review_cards(self.api.light_novels, text, identity.revision)
+        except Exception as exc:  # noqa: BLE001 - provider/parse failure: nothing to issue
+            return self._unavailable(str(exc))
+        due_keys = {review_card_key(c["wordId"], c["readingIndex"]) for c in scanned["cards"]}
         cards = scanned["cards"]
         if not getattr(config, f"review_gate_{kind}_all_due", False):
-            cards = cards[:max(1, min(50, int(getattr(config, f"review_gate_{kind}_count", 5))))]
+            cards = cards[: max(1, min(50, int(getattr(config, f"review_gate_{kind}_count", 5))))]
         issued_key = f"content_review_targets:v1:{account}:{identity.logical_id}"
+        stored = False
         with self.lock:
             self._require_exists(kind, int(book_id))
             raw = self.api.manager.db.get_state(issued_key, "")
             if raw and json.loads(raw):
                 cards = json.loads(raw)
+                stored = True
             elif cards:
                 self.api.manager.db.set_state(issued_key, json.dumps(cards, ensure_ascii=False))
+        if stored or self.store.snapshot(account, identity)["unknown_card_keys"]:
+            # Cards no longer due were reviewed (here or in Jiten); unknown
+            # outcomes still due are issued again.
+            issued = {review_card_key(c["wordId"], c["readingIndex"]) for c in cards}
+            before = self.store.snapshot(account, identity)
+            required = len(set(before["confirmed_card_keys"]) | set(before["unknown_card_keys"]) | issued)
+            with self.lock:
+                self.store.settle(account, identity, required=required, due_keys=due_keys, issued_keys=issued)
         snapshot = self.store.snapshot(account, identity)
         excluded = set(snapshot["confirmed_card_keys"]) | set(snapshot["unknown_card_keys"])
-        targets = set(snapshot["confirmed_card_keys"]) | set(snapshot["unknown_card_keys"]) | {review_card_key(c["wordId"], c["readingIndex"]) for c in cards}
+        targets = (
+            set(snapshot["confirmed_card_keys"])
+            | set(snapshot["unknown_card_keys"])
+            | {review_card_key(c["wordId"], c["readingIndex"]) for c in cards}
+        )
         token = secrets.token_urlsafe(24)
-        session = {"identity": identity, "kind": kind, "book_id": int(book_id), "part": int(part),
-                   "account": account, "required": len(targets), "keys": targets,
-                   "cards": [c for c in cards if review_card_key(c["wordId"], c["readingIndex"]) not in excluded]}
+        session = {
+            "identity": identity,
+            "kind": kind,
+            "book_id": int(book_id),
+            "part": int(part),
+            "account": account,
+            "required": len(targets),
+            "keys": targets,
+            "cards": [c for c in cards if review_card_key(c["wordId"], c["readingIndex"]) not in excluded],
+        }
         with self.lock:
             # P10: content deleted while cards were scanned must not get
             # a fresh session, grant or unknown-words record.
@@ -99,14 +148,22 @@ class ContentReviewService:
             owned = [issued_key, _state_key(account, identity, "content_review:v1")]
             if kind == "manga":
                 unknown_key = f"manga_unknown_words:{identity.logical_id}"
-                self.api.manager.db.set_state(unknown_key,
-                    json.dumps(scanned.get("unknown_words", []), ensure_ascii=False))
+                self.api.manager.db.set_state(
+                    unknown_key, json.dumps(scanned.get("unknown_words", []), ensure_ascii=False)
+                )
                 owned.append(unknown_key)
             self._remember_owned_keys(kind, int(book_id), owned)
-        return {**progress.payload(), "blocking": not progress.granted, "token": token,
-                "cards": session["cards"], "unknown_words": scanned.get("unknown_words", []),
-                "all_due_episode_words": True, "enabled": True, "checked": True,
-                "reason": "no_due_cards" if not targets else "review_required"}
+        return {
+            **progress.payload(),
+            "blocking": not progress.granted,
+            "token": token,
+            "cards": session["cards"],
+            "unknown_words": scanned.get("unknown_words", []),
+            "all_due_episode_words": True,
+            "enabled": True,
+            "checked": True,
+            "reason": "no_due_cards" if not targets else "review_required",
+        }
 
     def _require_exists(self, kind: str, book_id: int) -> None:
         owner = getattr(self.api, "light_novels" if kind == "ln" else "manga", None)
@@ -116,7 +173,7 @@ class ContentReviewService:
         try:
             lookup(book_id)
         except Exception as exc:
-            raise ValueError("Content was removed; reopen reviews") from exc
+            raise ValueError(err("review.contentRemoved")) from exc
 
     @staticmethod
     def _owned_keys_index(kind: str, book_id: int) -> str:
@@ -149,28 +206,32 @@ class ContentReviewService:
     def forget(self, kind: str, book_ids: list[int]) -> None:
         ids = {int(value) for value in book_ids}
         with self.lock:
-            for token in [t for t, s in self.sessions.items() if s["kind"] == kind and int(s["book_id"]) in ids]:
+            for token in [
+                t for t, s in self.sessions.items() if s["kind"] == kind and int(s["book_id"]) in ids
+            ]:
                 self.sessions.pop(token, None)
             self.forget_persisted(self.api.manager.db, kind, list(ids))
 
     def _session(self, token: str) -> dict[str, Any]:
         session = self.sessions.get(str(token))
         if session is None:
-            raise ValueError("Review session expired; reopen reviews")
+            raise ValueError(err("review.sessionExpired"))
         settings = self.api.light_novels.settings()
         if credential_account_key("jiten", settings.jiten_api_key) != session["account"]:
-            raise ValueError("Jiten account changed; reopen reviews")
+            raise ValueError(err("ln.jitenAccountChanged"))
         identity, _text = self.source(session["kind"], session["book_id"], session["part"], prepare=False)
         if identity != session["identity"]:
-            raise ValueError("Content changed or was removed; reopen reviews")
+            raise ValueError(err("review.contentChanged"))
         return session
 
-    def review(self, token: str, word_id: int, reading_index: int, grade: str, attempt_id: str) -> dict[str, Any]:
+    def review(
+        self, token: str, word_id: int, reading_index: int, grade: str, attempt_id: str
+    ) -> dict[str, Any]:
         with self.lock:
             s = self._session(token)
             key = review_card_key(word_id, reading_index)
             if key not in s["keys"]:
-                raise ValueError("Card was not issued for this content")
+                raise ValueError(err("review.cardNotIssued"))
             before = self.store.status(s["account"], s["identity"], required=s["required"])
             if key in before.confirmed_card_keys or key in before.unknown_card_keys:
                 return {**before.payload(), "outcome": "duplicate"}
@@ -178,17 +239,27 @@ class ContentReviewService:
                 "jiten", getattr(self.api.light_novels.settings(), "review_mode", "native"), grade
             )
             try:
-                result = self.api.light_novels.strict_review_submit(word_id, reading_index, wire_grade, attempt_id=attempt_id, expected_account_key=s["account"])
+                result = self.api.light_novels.strict_review_submit(
+                    word_id,
+                    reading_index,
+                    wire_grade,
+                    attempt_id=attempt_id,
+                    expected_account_key=s["account"],
+                )
             except ReviewOutcomeUnknown:
                 result = {"outcome": "unknown"}
             # Do not resurrect deleted content when a provider reply arrives late.
             self._session(token)
             if result.get("outcome") == "unknown":
-                progress = self.store.mark_unknown(s["account"], s["identity"], required=s["required"], card_key=key)
+                progress = self.store.mark_unknown(
+                    s["account"], s["identity"], required=s["required"], card_key=key
+                )
             elif result.get("ok") is False:
-                raise ValueError(result.get("message") or "Review failed")
+                raise ValueError(result.get("message") or err("review.failed"))
             else:
-                progress = self.store.mark_confirmed(s["account"], s["identity"], required=s["required"], card_key=key)
+                progress = self.store.mark_confirmed(
+                    s["account"], s["identity"], required=s["required"], card_key=key
+                )
             return {**result, **progress.payload(), "blocking": not progress.granted}
 
     def undo(self, token: str, word_id: int, reading_index: int) -> dict[str, Any]:
@@ -197,9 +268,13 @@ class ContentReviewService:
             key = review_card_key(word_id, reading_index)
             progress = self.store.status(s["account"], s["identity"], required=s["required"])
             if key not in progress.confirmed_card_keys:
-                raise ValueError("This card has no confirmed review in the session")
-            result = self.api.light_novels.strict_review_undo(word_id, reading_index, expected_account_key=s["account"])
+                raise ValueError(err("review.noConfirmedReview"))
+            result = self.api.light_novels.strict_review_undo(
+                word_id, reading_index, expected_account_key=s["account"]
+            )
             self._session(token)
             if result.get("ok") and result.get("outcome") == "undone":
-                progress = self.store.unmark_confirmed(s["account"], s["identity"], required=s["required"], card_key=key)
+                progress = self.store.unmark_confirmed(
+                    s["account"], s["identity"], required=s["required"], card_key=key
+                )
             return {**result, **progress.payload(), "blocking": not progress.granted}

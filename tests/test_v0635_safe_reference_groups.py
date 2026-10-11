@@ -27,9 +27,7 @@ def test_split_merge_does_not_scale_japanese_cues_to_longer_english_groups(tmp_p
     write_srt(candidate, aligned)
     write_srt(reference, embedded)
 
-    output, result = refine_with_embedded_reference_groups(
-        aligned, embedded, tmp_path / "cache", force=True
-    )
+    output, result = refine_with_embedded_reference_groups(aligned, embedded, tmp_path / "cache", force=True)
 
     assert output == aligned
     assert result["applied"] is False
@@ -58,9 +56,7 @@ def test_applied_group_refinement_preserves_each_japanese_duration(tmp_path: Pat
     write_srt(candidate, aligned)
     write_srt(reference, embedded)
 
-    output, result = refine_with_embedded_reference_groups(
-        aligned, embedded, tmp_path / "cache", force=True
-    )
+    output, result = refine_with_embedded_reference_groups(aligned, embedded, tmp_path / "cache", force=True)
 
     assert result["applied"] is True
     before = parse_srt(aligned)

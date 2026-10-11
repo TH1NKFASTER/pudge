@@ -1,17 +1,20 @@
+"""v1.79: the torrent switch's session state and its narrow config writer, the second
+chapter's held text clock, reader-parse refreshes off the response path (behaviour; audit
+71Б rewrite)."""
+
 from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
 import threading
+import tomllib
 
 import pytest
 
 from pudge import web_app
 from pudge.config import AppConfig, load_config, write_config, write_torrents_enabled
 from pudge.reading_audio_alignment import _raw_anchors_with_leading_hold, light_novel_position_for_audio
-
-ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "pudge" / "web" / "index.html"
+from test_v197_torrent_http_bridge import SWITCH
 
 
 def _second_chapter() -> dict:
@@ -51,9 +54,14 @@ def _torrent_api(tmp_path: Path):
     api._torrent_session_enabled = False
 
     class DB:
-        def __init__(self): self.values = {"ui_state_version": "1"}
-        def get_state(self, key, default=""): return self.values.get(key, default)
-        def set_state(self, key, value): self.values[key] = value
+        def __init__(self):
+            self.values = {"ui_state_version": "1"}
+
+        def get_state(self, key, default=""):
+            return self.values.get(key, default)
+
+        def set_state(self, key, value):
+            self.values[key] = value
 
     api.manager = SimpleNamespace(
         config=cfg,
@@ -87,35 +95,43 @@ def test_torrent_session_state_keeps_partial_config_test_stubs_compatible() -> N
     assert api2._torrent_enabled_state() is False
 
 
-def test_narrow_torrent_writer_preserves_unrelated_config_without_keychain(monkeypatch, tmp_path: Path) -> None:
-    path = tmp_path / "config.toml"
-    path.write_text(
+def test_narrow_torrent_writer_preserves_unrelated_config_without_keychain(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
         '[nyaa]\nbase_url = "https://nyaa.si"\ntorrents_enabled = false\n\n'
         '[qbittorrent]\npassword = "do-not-touch"\n',
         encoding="utf-8",
     )
-    cfg = AppConfig(config_path=path)
+    cfg = AppConfig(config_path=config_path)
     cfg.nyaa.torrents_enabled = True
 
     # The narrow writer must never route through the full secret persistence path.
     import pudge.config as config_module
+
     monkeypatch.setattr(
         type(config_module._SECRET_STORE),
         "persisted_config_value",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("Keychain hot-path access")),
     )
-    write_torrents_enabled(cfg, path)
+    write_torrents_enabled(cfg, config_path)
 
-    text = path.read_text(encoding="utf-8")
-    assert "torrents_enabled = true" in text
-    assert 'password = "do-not-touch"' in text
-    assert load_config(path).nyaa.torrents_enabled is True
+    # The file the writer produced: only the flag changed, the other sections are untouched.
+    written = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert written["nyaa"] == {"base_url": "https://nyaa.si", "torrents_enabled": True}
+    assert written["qbittorrent"] == {"password": "do-not-touch"}
+    assert load_config(config_path).nyaa.torrents_enabled is True
 
 
-def test_torrent_persist_failure_restores_session_instead_of_silent_false_snapshot(monkeypatch, tmp_path: Path) -> None:
+def test_torrent_persist_failure_restores_session_instead_of_silent_false_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
     api, _ = _torrent_api(tmp_path)
     api.task_supervisor = None
-    monkeypatch.setattr(web_app, "write_torrents_enabled", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        web_app, "write_torrents_enabled", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full"))
+    )
 
     with pytest.raises(OSError, match="disk full"):
         api.set_torrents_enabled(True)
@@ -141,13 +157,30 @@ def test_torrent_background_search_schedule_failure_cannot_undo_persisted_on(tmp
     assert load_config(config_path).nyaa.torrents_enabled is True
 
 
-def test_torrent_ack_releases_frontend_pending_intent_to_backend_session_state() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    handler = html.split("async function torrentToggleHttpCapture(){", 1)[1].split("document.addEventListener('click',event=>{", 1)[0]
-    assert "Boolean(result?.enabled)!==desired" in handler
-    assert "ui.state.settings.torrents_enabled=Boolean(result.enabled)" in handler
-    assert "ui.torrentToggleDesired=null" in handler
-    assert "scheduleTorrentTrafficPoll(0)" in handler
+def test_confirmed_switch_asks_for_the_torrent_status_at_once(page) -> None:
+    # Once the backend confirmed the switch, the window drops its pending wish and reads the
+    # backend's status right away instead of at the next slow poll (what the backend says
+    # from then on wins: test_v195_torrent_authoritative_state.py).
+    result = page.run(
+        r"""
+        await __tick(1000);
+        const since = __fetches.length;
+        __backend.hold.enabled = true;
+        await __click('#torrentToggleButton'); await __tick(5);
+        const pending = {state: __switchState(), requests: __fetches.slice(since).map(f => f.method)};
+        __backend.pending.enabled.shift()(); await __tick(20);
+        return {pending, confirmed: __switchState(), requests: __fetches.slice(since).map(f => [f.method, f.url])};
+        """,
+        before=SWITCH,
+    )
+    out = result.value
+    assert (
+        out["pending"]["state"]["on"],
+        out["pending"]["state"]["disabled"],
+        out["pending"]["requests"],
+    ) == (False, True, ["POST"])
+    assert out["confirmed"]["on"] is True and out["confirmed"]["disabled"] is False
+    assert out["requests"] == [["POST", "/api/torrents/enabled"], ["GET", "/api/torrents/status"]]
 
 
 def test_second_chapter_hold_anchors_are_intrinsically_monotonic() -> None:
@@ -238,6 +271,7 @@ def test_light_novel_open_preserves_legacy_log_then_emits_timing_breakdown() -> 
     assert result["paired_audio"]["book_id"] == 7
     assert records[0][0] == "LN open book=%s chapters=%s paired=%s elapsed=%.3fs"
     assert records[1][0].startswith("TIMING step=ln.open ")
+
 
 def test_torrent_loaded_config_remains_authoritative_until_first_explicit_toggle() -> None:
     api = web_app.WebAppApi.__new__(web_app.WebAppApi)

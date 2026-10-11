@@ -26,6 +26,7 @@ from .cache_management import (
     touch_segment_audio,
 )
 from .config import SyncConfig
+from .i18n import err
 from .language import TEXT_SUBTITLE_EXTENSIONS
 from .llm import OllamaClient
 from .logging_utils import configure_logging, timed_step
@@ -62,9 +63,7 @@ def _matching_release_crc(video: Path, subtitle: Path) -> str | None:
     return shared[0] if len(shared) == 1 else None
 
 
-def _exact_release_zero_offset_result(
-    video: Path, subtitle: Path, output: Path
-) -> dict[str, object] | None:
+def _exact_release_zero_offset_result(video: Path, subtitle: Path, output: Path) -> dict[str, object] | None:
     crc = _matching_release_crc(video, subtitle)
     if crc is None:
         return None
@@ -239,11 +238,7 @@ def _salvage_sparse_preopening_timeline_attempt(
     if len(main_pool) < 12:
         return None
     main_median = float(statistics.median(float(row["offset"]) for row in main_pool))
-    main_inliers = [
-        row
-        for row in main_pool
-        if abs(float(row["offset"]) - main_median) <= 3.0
-    ]
+    main_inliers = [row for row in main_pool if abs(float(row["offset"]) - main_median) <= 3.0]
     if len(main_inliers) < 12:
         return None
 
@@ -256,8 +251,7 @@ def _salvage_sparse_preopening_timeline_attempt(
     # early probe.  This rejects cases where the whole episode is simply on a
     # different global clock.
     reacquired = any(
-        90.0 <= float(row["center"]) <= 190.0
-        and abs(float(row["offset"]) - post_offset) <= 3.0
+        90.0 <= float(row["center"]) <= 190.0 and abs(float(row["offset"]) - post_offset) <= 3.0
         for row in rows
     )
     if not reacquired:
@@ -443,15 +437,13 @@ def _prefer_embedded_timeline_over_conflicting_speech(
     if fused:
         return True, fused_meta
     scaffold_conflict = (
-        str(opening_scaffold.get("reason_detail") or "")
-        == "speech_clock_disagrees_with_post_plateau"
+        str(opening_scaffold.get("reason_detail") or "") == "speech_clock_disagrees_with_post_plateau"
     )
     opening_reacquire = timeline_result.get("timeline_opening_gap_reacquire")
     reacquired_clock = bool(
         isinstance(opening_reacquire, dict)
         and opening_reacquire.get("applied")
-        and str(opening_reacquire.get("reason") or "")
-        == "dominant_clock_reacquired_after_opening_gap"
+        and str(opening_reacquire.get("reason") or "") == "dominant_clock_reacquired_after_opening_gap"
     )
     if not scaffold_conflict and not reacquired_clock:
         return False, {"reason": "no_speech_clock_conflict"}
@@ -464,8 +456,7 @@ def _prefer_embedded_timeline_over_conflicting_speech(
     stable = [
         row
         for row in segments
-        if isinstance(row, dict)
-        and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
+        if isinstance(row, dict) and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
     ]
     if len(stable) < 2:
         return False, {"reason": "timeline_not_piecewise"}
@@ -542,11 +533,7 @@ def _best_reference_discontinuity_rejection(
     # Once the exact embedded text reference rejects a catastrophic ALASS
     # block discontinuity, audio/ffsubsync is weaker and very expensive for
     # the same candidate. Preserve the rejected result for the quality gate.
-    rejected = [
-        item
-        for item in successful
-        if bool(item[1].get("reference_discontinuity_rejected"))
-    ]
+    rejected = [item for item in successful if bool(item[1].get("reference_discontinuity_rejected"))]
     if not rejected:
         return None
     return max(
@@ -598,47 +585,62 @@ def _gate_embedded_reference_alass_discontinuity(
     # ALASS may preserve all cues but attach a block to the wrong dialogue-dense
     # scene. Global activity overlap alone cannot prove a huge block jump is real.
     if not reference_ok:
-        return reference_ok, reference_reason, {
-            "checked": False,
-            "reason": "reference_already_unreliable",
-        }
+        return (
+            reference_ok,
+            reference_reason,
+            {
+                "checked": False,
+                "reason": "reference_already_unreliable",
+            },
+        )
 
     try:
         spread = abs(float(result.get("alass_shift_spread_seconds") or 0.0))
         blocks = int(result.get("alass_blocks") or 0)
         distinct = int(result.get("alass_distinct_shifts") or 0)
     except (TypeError, ValueError):
-        return reference_ok, reference_reason, {
-            "checked": False,
-            "reason": "shift_metrics_unavailable",
-        }
+        return (
+            reference_ok,
+            reference_reason,
+            {
+                "checked": False,
+                "reason": "shift_metrics_unavailable",
+            },
+        )
 
     if spread < 30.0 or max(blocks, distinct) < 3:
-        return reference_ok, reference_reason, {
-            "checked": True,
-            "accepted": True,
-            "reason": "shift_map_not_extreme",
-            "spread_seconds": round(spread, 3),
-            "blocks": blocks,
-            "distinct_shifts": distinct,
-        }
+        return (
+            reference_ok,
+            reference_reason,
+            {
+                "checked": True,
+                "accepted": True,
+                "reason": "shift_map_not_extreme",
+                "spread_seconds": round(spread, 3),
+                "blocks": blocks,
+                "distinct_shifts": distinct,
+            },
+        )
 
     repair = result.get("reference_piecewise_repair")
     repair_data = repair if isinstance(repair, dict) else {}
     edit_boundaries = repair_data.get("edit_boundaries")
     confirmed_boundary = bool(
-        repair_data.get("applied")
-        or (isinstance(edit_boundaries, list) and edit_boundaries)
+        repair_data.get("applied") or (isinstance(edit_boundaries, list) and edit_boundaries)
     )
     if confirmed_boundary:
-        return reference_ok, reference_reason, {
-            "checked": True,
-            "accepted": True,
-            "reason": "extreme_map_confirmed_by_piecewise_boundary",
-            "spread_seconds": round(spread, 3),
-            "blocks": blocks,
-            "distinct_shifts": distinct,
-        }
+        return (
+            reference_ok,
+            reference_reason,
+            {
+                "checked": True,
+                "accepted": True,
+                "reason": "extreme_map_confirmed_by_piecewise_boundary",
+                "spread_seconds": round(spread, 3),
+                "blocks": blocks,
+                "distinct_shifts": distinct,
+            },
+        )
 
     def metric(name: str) -> float:
         try:
@@ -651,12 +653,7 @@ def _gate_embedded_reference_alass_discontinuity(
     end = metric("end")
     weighted = metric("weighted")
 
-    strong_local_confirmation = (
-        start >= 0.72
-        and middle >= 0.78
-        and end >= 0.72
-        and weighted >= 0.75
-    )
+    strong_local_confirmation = start >= 0.72 and middle >= 0.78 and end >= 0.72 and weighted >= 0.75
     details = {
         "checked": True,
         # Dense dialogue can make two different episodes look excellent by timing
@@ -695,7 +692,6 @@ def _gate_embedded_reference_alass_discontinuity(
     )
 
 
-
 def _apply_robust_semantic_activity_gate(
     validation: dict[str, object],
     activity: dict[str, object],
@@ -710,20 +706,14 @@ def _apply_robust_semantic_activity_gate(
     try:
         matched = int(validation.get("robust_matches") or validation.get("matched_samples") or 0)
         total = int(validation.get("total_samples") or 0)
-        similarity = float(
-            validation.get("robust_similarity")
-            or validation.get("similarity")
-            or 0.0
-        )
+        similarity = float(validation.get("robust_similarity") or validation.get("similarity") or 0.0)
     except (TypeError, ValueError):
         matched, total, similarity = 0, 0, 0.0
 
     scores = validation.get("sample_scores")
     complete_scores = isinstance(scores, list) and total > 0 and len(scores) == total
 
-    if bool(validation.get("accepted")) and bool(
-        validation.get("robust_semantic_acceptance")
-    ):
+    if bool(validation.get("accepted")) and bool(validation.get("robust_semantic_acceptance")):
         required_activity = float(minimum_activity)
 
         if total >= 5 and matched >= total and similarity >= 0.85:
@@ -738,10 +728,7 @@ def _apply_robust_semantic_activity_gate(
 
         if weighted < required_activity:
             validation["accepted"] = False
-            validation["reason"] = (
-                f"robust_semantic_activity_too_low:"
-                f"{weighted:.4f}<{required_activity:.4f}"
-            )
+            validation["reason"] = f"robust_semantic_activity_too_low:{weighted:.4f}<{required_activity:.4f}"
         return validation
 
     if (
@@ -766,9 +753,8 @@ def _apply_robust_semantic_activity_gate(
                 float(validation.get("similarity") or 0.0),
                 similarity,
             )
-            validation["reason"] = (
-                "accepted_from_sample_scores_with_activity: "
-                + str(validation.get("reason") or "semantic majority")
+            validation["reason"] = "accepted_from_sample_scores_with_activity: " + str(
+                validation.get("reason") or "semantic majority"
             )
 
     return validation
@@ -837,7 +823,10 @@ def _matched_onset_pairs(
         if abs(delta) <= tolerance:
             if j + 1 < len(reference):
                 next_index, next_time = reference[j + 1]
-                if abs(candidate_time - next_time) < abs(delta) and abs(candidate_time - next_time) <= tolerance:
+                if (
+                    abs(candidate_time - next_time) < abs(delta)
+                    and abs(candidate_time - next_time) <= tolerance
+                ):
                     j += 1
                     reference_index, reference_time = next_index, next_time
                     delta = candidate_time - reference_time
@@ -875,7 +864,6 @@ def _onset_candidate_shifts(
     if 0.0 not in shifts:
         shifts.append(0.0)
     return shifts
-
 
 
 def _activity_correlation_for_shift(
@@ -933,12 +921,7 @@ def _activity_correlation_for_shift(
             n01 += 1
         else:
             n00 += 1
-    denominator = (
-        (n11 + n10)
-        * (n11 + n01)
-        * (n00 + n10)
-        * (n00 + n01)
-    ) ** 0.5
+    denominator = ((n11 + n10) * (n11 + n01) * (n00 + n10) * (n00 + n01)) ** 0.5
     if denominator <= 0.0:
         return 0.0
     return (n11 * n00 - n10 * n01) / denominator
@@ -1049,7 +1032,9 @@ def estimate_constant_subtitle_offsets(
         ]
         refined_shift = float(statistics.median(matched_shifts)) if matched_shifts else shift
         mean_error = sum(errors) / matched if matched else strict_tolerance * 4.0
-        matched_reference_times = [reference_starts[reference_index] for _, reference_index, _ in strict_pairs]
+        matched_reference_times = [
+            reference_starts[reference_index] for _, reference_index, _ in strict_pairs
+        ]
         regions = {
             min(region_count_total - 1, int((time / duration) * region_count_total))
             for time in matched_reference_times
@@ -1091,9 +1076,7 @@ def estimate_constant_subtitle_offsets(
         source_in_overlap = sum(overlap_start <= value + shift <= overlap_end for value in source_starts)
         reference_in_overlap = sum(overlap_start <= value <= overlap_end for value in reference_starts)
         expected_random = (
-            source_in_overlap
-            * reference_in_overlap
-            * min(1.0, (2.0 * strict_tolerance) / overlap_duration)
+            source_in_overlap * reference_in_overlap * min(1.0, (2.0 * strict_tolerance) / overlap_duration)
         )
         onset_excess = matched - expected_random
         onset_z = onset_excess / ((expected_random + 1.0) ** 0.5)
@@ -1109,9 +1092,7 @@ def estimate_constant_subtitle_offsets(
         minimum_matches = max(6, int(round(denominator * 0.03)))
         distributed = region_count >= 4 and span_ratio >= 0.55
         landmark_key = int(round(shift / 0.20))
-        landmark_support = sum(
-            landmark_votes.get(landmark_key + delta, 0.0) for delta in (-1, 0, 1)
-        )
+        landmark_support = sum(landmark_votes.get(landmark_key + delta, 0.0) for delta in (-1, 0, 1))
         evidence = (
             onset_z >= 2.25
             or activity_correlation >= 0.08
@@ -1307,8 +1288,7 @@ def _shift_subtitle_for_semantic_validation(
     stat = source.stat()
     digest = hashlib.sha1(
         (
-            f"semantic-offset-v1:{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-            f"{offset_seconds:.3f}"
+            f"semantic-offset-v1:{source.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{offset_seconds:.3f}"
         ).encode()
     ).hexdigest()[:20]
     output_dir = cache_dir / "semantic-offset"
@@ -1403,10 +1383,7 @@ def prepare_speech_reference(
 ) -> tuple[Path | None, dict[str, object]]:
     """Extract VAD speech once and reuse it for every subtitle candidate."""
     video_stat = video.stat()
-    raw = (
-        f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:"
-        f"{config.vad}:{ffmpeg_path or ''}"
-    )
+    raw = f"{video.resolve()}:{video_stat.st_size}:{video_stat.st_mtime_ns}:{config.vad}:{ffmpeg_path or ''}"
     digest = hashlib.sha1(raw.encode()).hexdigest()[:20]
     output_dir = cache_dir / "speech"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1480,7 +1457,11 @@ def synchronize_subtitle(
             cached=True,
             sync_was_successful=True,
             output=str(output),
-            **{key: value for key, value in cached.items() if key not in {"reason", "cached", "sync_was_successful", "output"}},
+            **{
+                key: value
+                for key, value in cached.items()
+                if key not in {"reason", "cached", "sync_was_successful", "output"}
+            },
         )
 
     try:
@@ -1534,12 +1515,8 @@ def synchronize_subtitle(
         for handler, _ in handler_levels:
             handler.setLevel(logging.WARNING)
     sink = io.StringIO()
-    output_context = (
-        redirect_stdout(sink) if quiet else nullcontext()
-    )
-    error_context = (
-        redirect_stderr(sink) if quiet else nullcontext()
-    )
+    output_context = redirect_stdout(sink) if quiet else nullcontext()
+    error_context = redirect_stderr(sink) if quiet else nullcontext()
     try:
         with output_context, error_context:
             parsed = ffsubsync_impl.make_parser().parse_args(arguments)
@@ -1582,11 +1559,7 @@ def synchronize_subtitle(
         result["sync_was_successful"] = False
         return subtitle, result
 
-    if (
-        config.skip_on_low_quality
-        and offset is not None
-        and abs(offset) > config.quality_max_offset_seconds
-    ):
+    if config.skip_on_low_quality and offset is not None and abs(offset) > config.quality_max_offset_seconds:
         output.unlink(missing_ok=True)
         result["reason"] = "quality_offset_exceeded"
         result["sync_was_successful"] = False
@@ -1771,7 +1744,7 @@ def synchronize_with_alass(
             return subtitle, _result(
                 "alass_timeout",
                 sync_was_successful=False,
-                error=f"ALASS превысил timeout {config.alass_timeout_seconds}s",
+                error=err("sync.alassTimeout", seconds=config.alass_timeout_seconds),
                 reference_kind="subtitle" if reference_is_subtitle else "media",
                 command_output=(exc.stdout or "")[-2000:] if isinstance(exc.stdout, str) else "",
             )
@@ -1785,7 +1758,7 @@ def synchronize_with_alass(
 
         command_output = completed.stdout or ""
         if completed.returncode != 0 or not safe_output.exists() or safe_output.stat().st_size == 0:
-            detail = command_output[-2000:].strip() or "ALASS не создал выходной файл"
+            detail = command_output[-2000:].strip() or err("sync.alassNoOutput")
             return subtitle, _result(
                 "alass_error",
                 sync_was_successful=False,
@@ -1811,7 +1784,6 @@ def synchronize_with_alass(
     )
     _write_metadata(output, result)
     return output, result
-
 
 
 def _resolve_command(command: str) -> str | None:
@@ -1864,9 +1836,7 @@ def _select_timing_reference_stream(streams: list[dict[str, object]]) -> dict[st
         if codec not in _TEXT_REFERENCE_CODECS:
             continue
         tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
-        disposition = (
-            stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
-        )
+        disposition = stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
         language = str(tags.get("language", "")).casefold().replace("_", "-")
         title = str(tags.get("title", ""))
         lowered = title.casefold()
@@ -1881,9 +1851,13 @@ def _select_timing_reference_stream(streams: list[dict[str, object]]) -> dict[st
             score += 25.0
         if any(marker in lowered for marker in ("cr", "dialog", "dialogue", "full")):
             score += 15.0
-        if any(marker in lowered for marker in ("commentary", "comment", "comms")) or int(disposition.get("comment", 0) or 0):
+        if any(marker in lowered for marker in ("commentary", "comment", "comms")) or int(
+            disposition.get("comment", 0) or 0
+        ):
             score -= 200.0
-        if any(marker in lowered for marker in ("forced", "sign", "song", "karaoke")) or int(disposition.get("forced", 0) or 0):
+        if any(marker in lowered for marker in ("forced", "sign", "song", "karaoke")) or int(
+            disposition.get("forced", 0) or 0
+        ):
             score -= 120.0
         if codec in {"subrip", "srt"}:
             score += 5.0
@@ -2020,7 +1994,7 @@ def extract_embedded_timing_reference(
         if extracted.returncode != 0 or not valid_cues:
             return None, _result(
                 "timing_reference_extract_failed",
-                error=extracted.stdout[-1000:] if verbose else "ffmpeg не извлёк валидную текстовую дорожку",
+                error=extracted.stdout[-1000:] if verbose else err("sync.referenceExtractFailed"),
             )
         # Styled ASS tracks can contain the same visible event hundreds of times
         # (for example one sign duplicated by animation layers).  Exact duplicate
@@ -2258,9 +2232,7 @@ def _segment_reliability(
     roughness = statistics.median(differences) if differences else 0.0
     large_jump_cutoff = max(5.0, jump_threshold * 2.0, limit * 0.12)
     large_jump_ratio = (
-        sum(delta >= large_jump_cutoff for delta in differences) / len(differences)
-        if differences
-        else 0.0
+        sum(delta >= large_jump_cutoff for delta in differences) / len(differences) if differences else 0.0
     )
     spread = max(offsets) - min(offsets) if len(offsets) >= 2 else 0.0
     dominant_cluster = _largest_offset_cluster_fraction(
@@ -2412,8 +2384,7 @@ def evaluate_segment_alignment(
         boundary_hit = bool(
             successful
             and offset_value is not None
-            and abs(abs(offset_value) - max(0.1, local_padding))
-            <= max(0.25, max(0.1, local_padding) * 0.02)
+            and abs(abs(offset_value) - max(0.1, local_padding)) <= max(0.25, max(0.1, local_padding) * 0.02)
         )
         item.update(
             {
@@ -2437,9 +2408,7 @@ def evaluate_segment_alignment(
     successful_count = len(offsets)
     boundary_labels = {"start", "end", "full"}
     boundary_successful = sum(
-        1
-        for item in segments
-        if item.get("label") in boundary_labels and item.get("successful")
+        1 for item in segments if item.get("label") in boundary_labels and item.get("successful")
     )
     # Dense short-window scans contain many silent/low-dialogue windows. Requiring
     # 60% success made large segment counts unusable; a handful of trustworthy
@@ -2827,9 +2796,7 @@ def _merge_intervals(
     reading speeds between Japanese and English subtitles.
     """
     intervals = sorted(
-        (max(0.0, start - padding_seconds), end + padding_seconds)
-        for start, end, _ in cues
-        if end > start
+        (max(0.0, start - padding_seconds), end + padding_seconds) for start, end, _ in cues if end > start
     )
     merged: list[tuple[float, float]] = []
     for start, end in intervals:
@@ -2936,12 +2903,7 @@ def compare_timing_activity(
         scores[name] = 1.0 if denominator <= 0 else (2.0 * intersection / denominator)
 
     # Cold open matters more than the ending here; middle remains a guardrail.
-    weighted = (
-        0.45 * scores["start"]
-        + 0.40 * scores["middle"]
-        + 0.10 * scores["end"]
-        + 0.05 * scores["full"]
-    )
+    weighted = 0.45 * scores["start"] + 0.40 * scores["middle"] + 0.10 * scores["end"] + 0.05 * scores["full"]
     return {
         "available": True,
         "reason": "ok",
@@ -2969,12 +2931,8 @@ def compare_dialogue_timing_activity(
     dialogue repair look worse in the all-cue activity score.
     """
     try:
-        candidate_cues = [
-            cue for cue in parse_srt(candidate) if not _is_reference_non_dialogue(cue[2])
-        ]
-        reference_cues = [
-            cue for cue in parse_srt(reference) if not _is_reference_non_dialogue(cue[2])
-        ]
+        candidate_cues = [cue for cue in parse_srt(candidate) if not _is_reference_non_dialogue(cue[2])]
+        reference_cues = [cue for cue in parse_srt(reference) if not _is_reference_non_dialogue(cue[2])]
     except OSError as exc:
         return {"available": False, "reason": "read_error", "error": str(exc)}
     if not candidate_cues or not reference_cues:
@@ -3008,12 +2966,7 @@ def compare_dialogue_timing_activity(
         )
         denominator = candidate_length + reference_length
         scores[name] = 1.0 if denominator <= 0 else (2.0 * intersection / denominator)
-    weighted = (
-        0.45 * scores["start"]
-        + 0.40 * scores["middle"]
-        + 0.10 * scores["end"]
-        + 0.05 * scores["full"]
-    )
+    weighted = 0.45 * scores["start"] + 0.40 * scores["middle"] + 0.10 * scores["end"] + 0.05 * scores["full"]
     return {
         "available": True,
         "reason": "ok",
@@ -3105,16 +3058,8 @@ def _windowed_reference_shift(
         # first and last activity landmarks of this window.
         first_edge_error = abs(shifted_starts[0] - local_reference_starts[0])
         last_edge_error = abs(shifted_starts[-1] - local_reference_starts[-1])
-        edge_penalty = 0.08 * (
-            min(6.0, first_edge_error) + min(6.0, last_edge_error)
-        )
-        score = (
-            2.25 * correlation
-            + 1.05 * overlap
-            + 1.20 * coverage
-            - 0.012 * abs(shift)
-            - edge_penalty
-        )
+        edge_penalty = 0.08 * (min(6.0, first_edge_error) + min(6.0, last_edge_error))
+        score = 2.25 * correlation + 1.05 * overlap + 1.20 * coverage - 0.012 * abs(shift) - edge_penalty
         return score, {
             "available": True,
             "shift_seconds": round(float(shift), 3),
@@ -3274,9 +3219,9 @@ def _repair_stable_opening_plateaus(
 
     gap_candidates = [
         (previous_end, next_start, next_start - previous_end)
-        for (_previous_start, previous_end, _previous_text),
-            (next_start, _next_end, _next_text)
-        in zip(candidate_cues, candidate_cues[1:])
+        for (_previous_start, previous_end, _previous_text), (next_start, _next_end, _next_text) in zip(
+            candidate_cues, candidate_cues[1:]
+        )
         if next_start - previous_end >= 20.0
         and previous_end >= 20.0
         and next_start <= min(duration * 0.45, 10 * 60.0)
@@ -3437,18 +3382,10 @@ def _repair_stable_opening_plateaus(
     weighted_gain = float(after_activity.get("weighted") or 0.0) - float(
         before_activity.get("weighted") or 0.0
     )
-    start_gain = float(after_opening.get("start") or 0.0) - float(
-        before_opening.get("start") or 0.0
-    )
-    middle_loss = float(before_activity.get("middle") or 0.0) - float(
-        after_activity.get("middle") or 0.0
-    )
-    accepted = (
-        middle_loss <= 0.020
-        and (
-            weighted_gain >= 0.004
-            or (start_gain >= 0.015 and weighted_gain >= -0.001)
-        )
+    start_gain = float(after_opening.get("start") or 0.0) - float(before_opening.get("start") or 0.0)
+    middle_loss = float(before_activity.get("middle") or 0.0) - float(after_activity.get("middle") or 0.0)
+    accepted = middle_loss <= 0.020 and (
+        weighted_gain >= 0.004 or (start_gain >= 0.015 and weighted_gain >= -0.001)
     )
     if verbose:
         print(
@@ -3496,7 +3433,6 @@ def _repair_stable_opening_plateaus(
     )
 
 
-
 def _reference_repair_engine_suffix(result: dict[str, object]) -> str:
     if str(result.get("strategy") or "") == "embedded_reference_dialogue_anchors":
         return "+reference-dialogue-anchors"
@@ -3527,11 +3463,7 @@ def _reference_only_opening_gap(
         candidate_cues[1:],
     ):
         gap_seconds = float(right_start - left_end)
-        if (
-            gap_seconds < 45.0
-            or left_end < 15.0
-            or right_start > min(duration * 0.45, 10 * 60.0)
-        ):
+        if gap_seconds < 45.0 or left_end < 15.0 or right_start > min(duration * 0.45, 10 * 60.0):
             continue
         interior_start = left_end + min(8.0, gap_seconds * 0.12)
         interior_end = right_start - min(8.0, gap_seconds * 0.12)
@@ -3600,11 +3532,7 @@ def _anchor_region_cluster(
     if cluster is None:
         return None
     center = float(cluster["offset_seconds"])
-    inliers = [
-        item
-        for item in offsets
-        if abs(float(item["offset_seconds"]) - center) <= tolerance
-    ]
+    inliers = [item for item in offsets if abs(float(item["offset_seconds"]) - center) <= tolerance]
     if len(inliers) < minimum_support:
         return None
     return {
@@ -3656,18 +3584,12 @@ def _repair_with_embedded_reference_dialogue_anchors(
         max(end for _start, end, _text in reference_cues),
     )
 
-    candidate_dialogue = [
-        cue for cue in candidate_cues if not _is_reference_non_dialogue(cue[2])
-    ]
+    candidate_dialogue = [cue for cue in candidate_cues if not _is_reference_non_dialogue(cue[2])]
     if len(candidate_dialogue) < 12:
         return aligned, _result("reference_dialogue_too_few_candidate_cues", applied=False)
 
     def select_range(start: float, end: float, *, limit: int = 10) -> list[tuple[float, float, str]]:
-        selected = [
-            cue
-            for cue in candidate_dialogue
-            if cue[1] >= start and cue[0] <= end
-        ]
+        selected = [cue for cue in candidate_dialogue if cue[1] >= start and cue[0] <= end]
         if len(selected) <= limit:
             return selected
         center = (start + end) / 2.0
@@ -3686,11 +3608,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
             key=lambda cue: abs(((cue[0] + cue[1]) / 2.0) - center),
         )
         selected = sorted(ranked[:limit], key=lambda cue: cue[0])
-        return [
-            cue
-            for cue in selected
-            if cue[0] >= gap_end + 5.0
-        ]
+        return [cue for cue in selected if cue[0] >= gap_end + 5.0]
 
     middle = select_near(max(gap_end + 120.0, duration * 0.52), limit=8)
     late = select_near(max(gap_end + 240.0, duration * 0.80), limit=8)
@@ -3939,12 +3857,8 @@ def _repair_with_embedded_reference_dialogue_anchors(
 
         return list(range(left, right + 1))
 
-    before_ja_indexes = [
-        int(index) for index in strongest_before.get("japanese", [])
-    ]
-    before_en_indexes = [
-        int(index) for index in strongest_before.get("english", [])
-    ]
+    before_ja_indexes = [int(index) for index in strongest_before.get("japanese", [])]
+    before_en_indexes = [int(index) for index in strongest_before.get("english", [])]
 
     before_ja_indexes = expand_compact_group(
         before_lookup["japanese"],
@@ -3955,14 +3869,8 @@ def _repair_with_embedded_reference_dialogue_anchors(
         before_en_indexes,
     )
 
-    before_ja_rows = [
-        before_lookup["japanese"][index]
-        for index in before_ja_indexes
-    ]
-    before_en_rows = [
-        before_lookup["english"][index]
-        for index in before_en_indexes
-    ]
+    before_ja_rows = [before_lookup["japanese"][index] for index in before_ja_indexes]
+    before_en_rows = [before_lookup["english"][index] for index in before_en_indexes]
 
     if not before_ja_rows or not before_en_rows:
         return aligned, _result(
@@ -4039,25 +3947,15 @@ def _repair_with_embedded_reference_dialogue_anchors(
         if cluster is None:
             continue
 
-        matches = [
-            item
-            for item in cluster.get("matches", [])
-            if isinstance(item, dict)
-        ]
+        matches = [item for item in cluster.get("matches", []) if isinstance(item, dict)]
         if len(matches) < 2:
             continue
 
-        mean_confidence = statistics.fmean(
-            float(item.get("confidence") or 0.0)
-            for item in matches
-        )
+        mean_confidence = statistics.fmean(float(item.get("confidence") or 0.0) for item in matches)
         if mean_confidence < 0.88:
             continue
 
-        anchor_time = statistics.median(
-            float(item["candidate_time"])
-            for item in matches
-        )
+        anchor_time = statistics.median(float(item["candidate_time"]) for item in matches)
 
         tagged_matches = []
         for item in matches:
@@ -4117,9 +4015,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
         left = timeline_anchors[index]
         right = timeline_anchors[index + 1]
 
-        midpoint = (
-            float(left["time"]) + float(right["time"])
-        ) / 2.0
+        midpoint = (float(left["time"]) + float(right["time"])) / 2.0
         boundary, _boundary_evidence = choose_edit_boundary(
             float(left["time"]),
             float(right["time"]),
@@ -4130,10 +4026,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
         # The first clock transition is known to happen inside the JP-silent
         # opening. Clamp it there rather than allowing the midpoint to leak
         # into spoken dialogue.
-        if (
-            left["region"] == "before_opening"
-            and right["region"] == "after_opening"
-        ):
+        if left["region"] == "before_opening" and right["region"] == "after_opening":
             boundary = min(
                 gap_end,
                 max(gap_start, boundary),
@@ -4144,15 +4037,10 @@ def _repair_with_embedded_reference_dialogue_anchors(
     def correction_for_time(timestamp: float) -> float:
         for index, boundary in enumerate(boundaries):
             if timestamp < boundary:
-                return float(
-                    timeline_anchors[index]["offset_seconds"]
-                )
+                return float(timeline_anchors[index]["offset_seconds"])
         return float(timeline_anchors[-1]["offset_seconds"])
 
-    corrections = [
-        correction_for_time((start + end) / 2.0)
-        for start, end, _text in candidate_cues
-    ]
+    corrections = [correction_for_time((start + end) / 2.0) for start, end, _text in candidate_cues]
 
     if max(abs(value) for value in corrections) < 0.12:
         return aligned, _result(
@@ -4181,8 +4069,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
     reference_stat = reference.stat()
 
     anchor_signature = ",".join(
-        f"{float(item['time']):.3f}:{float(item['offset_seconds']):.4f}"
-        for item in timeline_anchors
+        f"{float(item['time']):.3f}:{float(item['offset_seconds']):.4f}" for item in timeline_anchors
     )
 
     digest = hashlib.sha1(
@@ -4216,10 +4103,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
             all_anchor_offsets.append(value)
             residuals_after.append(abs(value - anchor_offset))
 
-    anchor_mae_before = statistics.fmean(
-        abs(value)
-        for value in all_anchor_offsets
-    )
+    anchor_mae_before = statistics.fmean(abs(value) for value in all_anchor_offsets)
     anchor_mae_after = statistics.fmean(residuals_after)
 
     # Hold out each match from sufficiently populated regional clusters. This
@@ -4247,18 +4131,14 @@ def _repair_with_embedded_reference_dialogue_anchors(
     after_activity = compare_timing_activity(output, reference)
 
     middle_loss = (
-        float(before_activity.get("middle") or 0.0)
-        - float(after_activity.get("middle") or 0.0)
-        if before_activity.get("available")
-        and after_activity.get("available")
+        float(before_activity.get("middle") or 0.0) - float(after_activity.get("middle") or 0.0)
+        if before_activity.get("available") and after_activity.get("available")
         else 0.0
     )
 
     weighted_loss = (
-        float(before_activity.get("weighted") or 0.0)
-        - float(after_activity.get("weighted") or 0.0)
-        if before_activity.get("available")
-        and after_activity.get("available")
+        float(before_activity.get("weighted") or 0.0) - float(after_activity.get("weighted") or 0.0)
+        if before_activity.get("available") and after_activity.get("available")
         else 0.0
     )
 
@@ -4270,9 +4150,7 @@ def _repair_with_embedded_reference_dialogue_anchors(
         and (holdout_p95 is None or holdout_p95 <= 1.25)
     )
 
-    after_offset = float(
-        regional_clusters["after_opening"]["offset_seconds"]
-    )
+    after_offset = float(regional_clusters["after_opening"]["offset_seconds"])
 
     post_matches = []
     for name, cluster in regional_clusters.items():
@@ -4352,7 +4230,6 @@ def _repair_with_embedded_reference_dialogue_anchors(
     )
 
 
-
 def _repair_sparse_cold_open(
     aligned: Path,
     reference: Path,
@@ -4370,14 +4247,10 @@ def _repair_sparse_cold_open(
     dialogue to already be aligned, and move the whole pre-main block rigidly.
     """
     candidate_dialogue = [
-        (index, cue)
-        for index, cue in enumerate(candidate_cues)
-        if not _is_reference_non_dialogue(cue[2])
+        (index, cue) for index, cue in enumerate(candidate_cues) if not _is_reference_non_dialogue(cue[2])
     ]
     reference_dialogue = [
-        (index, cue)
-        for index, cue in enumerate(reference_cues)
-        if not _is_reference_non_dialogue(cue[2])
+        (index, cue) for index, cue in enumerate(reference_cues) if not _is_reference_non_dialogue(cue[2])
     ]
     diagnostics: dict[str, object] = {
         "applied": False,
@@ -4405,10 +4278,7 @@ def _repair_sparse_cold_open(
 
     cold_dialogue = candidate_dialogue[:split]
     next_dialogue_index, next_dialogue = candidate_dialogue[split]
-    post_error = min(
-        abs(float(cue[0]) - float(next_dialogue[0]))
-        for _index, cue in reference_dialogue
-    )
+    post_error = min(abs(float(cue[0]) - float(next_dialogue[0])) for _index, cue in reference_dialogue)
     diagnostics.update(
         {
             "cold_dialogue_cues": len(cold_dialogue),
@@ -4422,9 +4292,7 @@ def _repair_sparse_cold_open(
         return aligned, diagnostics
 
     reference_limit = float(next_dialogue[0]) - 20.0
-    eligible_reference = [
-        cue for _index, cue in reference_dialogue if float(cue[1]) <= reference_limit
-    ]
+    eligible_reference = [cue for _index, cue in reference_dialogue if float(cue[1]) <= reference_limit]
     count = len(cold_dialogue)
     if len(eligible_reference) < count:
         diagnostics["reason"] = "sparse_cold_open_reference_block_missing"
@@ -4442,16 +4310,12 @@ def _repair_sparse_cold_open(
             for source_time, reference_time in zip(source_starts, reference_starts)
         ]
         offsets.extend(
-            reference_time - source_time
-            for source_time, reference_time in zip(source_ends, reference_ends)
+            reference_time - source_time for source_time, reference_time in zip(source_ends, reference_ends)
         )
         correction = float(statistics.median(offsets))
         dispersion = max(abs(value - correction) for value in offsets)
         relative_errors = [
-            abs(
-                (reference_starts[index] - reference_starts[0])
-                - (source_starts[index] - source_starts[0])
-            )
+            abs((reference_starts[index] - reference_starts[0]) - (source_starts[index] - source_starts[0]))
             for index in range(1, count)
         ]
         fingerprint_error = statistics.fmean(relative_errors)
@@ -4474,11 +4338,7 @@ def _repair_sparse_cold_open(
     correction = float(best["correction"])
     dispersion = float(best["dispersion"])
     fingerprint_error = float(best["fingerprint_error"])
-    runner_up_margin = (
-        float(candidates[1]["score"]) - float(best["score"])
-        if len(candidates) > 1
-        else None
-    )
+    runner_up_margin = float(candidates[1]["score"]) - float(best["score"]) if len(candidates) > 1 else None
     before_error = statistics.fmean(
         abs(reference_time - source_time)
         for source_time, reference_time in zip(source_starts, best_reference_starts)
@@ -4493,9 +4353,7 @@ def _repair_sparse_cold_open(
             "correction_seconds": round(correction, 4),
             "offset_dispersion_seconds": round(dispersion, 4),
             "gap_fingerprint_error_seconds": round(fingerprint_error, 4),
-            "runner_up_margin": (
-                round(runner_up_margin, 4) if runner_up_margin is not None else None
-            ),
+            "runner_up_margin": (round(runner_up_margin, 4) if runner_up_margin is not None else None),
             "onset_mae_before_seconds": round(before_error, 4),
             "onset_mae_after_seconds": round(after_error, 4),
         }
@@ -4524,16 +4382,10 @@ def _repair_sparse_cold_open(
     if any(start < 0.0 or end <= start for start, end, _text in shifted):
         diagnostics["reason"] = "sparse_cold_open_invalid_timestamps"
         return aligned, diagnostics
-    if any(
-        shifted[index][0] + 0.001 < shifted[index - 1][0]
-        for index in range(1, len(shifted))
-    ):
+    if any(shifted[index][0] + 0.001 < shifted[index - 1][0] for index in range(1, len(shifted))):
         diagnostics["reason"] = "sparse_cold_open_reorders_cues"
         return aligned, diagnostics
-    if (
-        next_dialogue_index > 0
-        and shifted[next_dialogue_index - 1][1] > float(next_dialogue[0]) - 0.10
-    ):
+    if next_dialogue_index > 0 and shifted[next_dialogue_index - 1][1] > float(next_dialogue[0]) - 0.10:
         diagnostics["reason"] = "sparse_cold_open_overlaps_main_dialogue"
         return aligned, diagnostics
 
@@ -4608,9 +4460,7 @@ def _repair_early_prefix_clock(
     """
     diagnostics: dict[str, object] = {"applied": False, "reason": "early_prefix_not_applicable"}
     dialogue = [
-        (index, cue)
-        for index, cue in enumerate(candidate_cues)
-        if not _is_reference_non_dialogue(cue[2])
+        (index, cue) for index, cue in enumerate(candidate_cues) if not _is_reference_non_dialogue(cue[2])
     ]
     reference_starts = sorted(
         float(cue[0]) for cue in reference_cues if not _is_reference_non_dialogue(cue[2])
@@ -4647,11 +4497,7 @@ def _repair_early_prefix_clock(
                 for src in prefix_starts
                 for ref in reference_starts
                 if 2.5 <= abs(ref - src) <= 60.0
-                and (
-                    ref - src <= gap_seconds - 0.3
-                    if ref > src
-                    else first_start + (ref - src) >= 0.0
-                )
+                and (ref - src <= gap_seconds - 0.3 if ref > src else first_start + (ref - src) >= 0.0)
             }
         )
         scored: list[tuple[int, float, float]] = []
@@ -4715,9 +4561,7 @@ def _repair_early_prefix_clock(
         reference_starts,
         tolerance,
     )
-    correction = float(best["correction_seconds"]) + statistics.median(
-        ref - src for src, ref in pairs
-    )
+    correction = float(best["correction_seconds"]) + statistics.median(ref - src for src, ref in pairs)
     block_end = int(best["block_end_index"])
     shifted = [
         (start + correction, end + correction, text) if index < block_end else (start, end, text)
@@ -4908,9 +4752,7 @@ def _repair_with_embedded_reference_piecewise_core(
                         for item in matches
                         if isinstance(item, dict)
                     ]
-                    print(
-                        f"    anchor region {region_name}: {compact}"
-                    )
+                    print(f"    anchor region {region_name}: {compact}")
 
     plateau_path, plateau_result = _repair_stable_opening_plateaus(
         aligned,
@@ -4965,9 +4807,7 @@ def _repair_with_embedded_reference_piecewise_core(
     raw_anchor_records: list[tuple[float, float, str]] = []
     seen_regions: set[tuple[int, int]] = set()
     cold_keys = {
-        (int(round(start * 10)), int(round(end * 10)))
-        for start, end in cold_regions
-        if end > start + 15.0
+        (int(round(start * 10)), int(round(end * 10))) for start, end in cold_regions if end > start + 15.0
     }
     transition_keys = {
         (int(round(start * 10)), int(round(end * 10)))
@@ -4990,16 +4830,14 @@ def _repair_with_embedded_reference_piecewise_core(
             region_end=region_end,
             max_shift_seconds=cold_max_shift if is_short_cold_probe else broad_max_shift,
         )
-        result["probe_kind"] = "cold" if is_short_cold_probe else (
-            "transition" if key in transition_keys else "broad"
+        result["probe_kind"] = (
+            "cold" if is_short_cold_probe else ("transition" if key in transition_keys else "broad")
         )
         result["center"] = round(center, 3)
         windows.append(result)
         if result.get("confident"):
             kind = str(result["probe_kind"])
-            raw_anchor_records.append(
-                (center, float(result.get("shift_seconds") or 0.0), kind)
-            )
+            raw_anchor_records.append((center, float(result.get("shift_seconds") or 0.0), kind))
 
     if len(raw_anchor_records) < 3:
         return aligned, _result(
@@ -5118,9 +4956,7 @@ def _repair_with_embedded_reference_piecewise_core(
                 contaminated_broad_times.add(round(float(timepoint), 3))
 
     trusted_broad_records = [
-        record
-        for record in broad_records
-        if round(float(record[0]), 3) not in contaminated_broad_times
+        record for record in broad_records if round(float(record[0]), 3) not in contaminated_broad_times
     ]
 
     cold_cluster_offset: float | None = None
@@ -5130,19 +4966,14 @@ def _repair_with_embedded_reference_piecewise_core(
         clustered = [value for value in cold_values if abs(value - cold_median) <= 1.5]
         if len(clustered) >= 2:
             cold_cluster_offset = float(statistics.median(clustered))
-    elif (
-        len(strong_cold_records) == 1
-        and abs(strong_cold_records[0][1]) > broad_max_shift + 1.0
-    ):
+    elif len(strong_cold_records) == 1 and abs(strong_cold_records[0][1]) > broad_max_shift + 1.0:
         # A shift outside the normal ±12s search range cannot be represented by
         # any broad probe. Keep it only when the onset evidence above is strong.
         cold_cluster_offset = strong_cold_records[0][1]
 
     stabilized_records: list[tuple[float, float, str]] = []
     continuity_limit = max(2.5, float(config.piecewise_jump_threshold_seconds))
-    weak_large_cold_times = {
-        round(float(item["timepoint"]), 3) for item in weak_large_cold_probes
-    }
+    weak_large_cold_times = {round(float(item["timepoint"]), 3) for item in weak_large_cold_probes}
     for timepoint, offset, kind in raw_anchor_records:
         rounded_time = round(float(timepoint), 3)
         if kind == "cold" and rounded_time in weak_large_cold_times:
@@ -5195,11 +5026,10 @@ def _repair_with_embedded_reference_piecewise_core(
     ]
     if weak_large_cold_probes and verbose:
         rejected = [
-            (item["offset_seconds"], item["coverage"], item["onset_ratio"])
-            for item in weak_large_cold_probes
+            (item["offset_seconds"], item["coverage"], item["onset_ratio"]) for item in weak_large_cold_probes
         ]
         print(
-            "  Piecewise: отклонена слабая большая cold-open поправка "
+            "  Piecewise: rejected a weak large cold-open correction "
             f"(offset, coverage, onset_ratio)={rejected}"
         )
     if max(abs(offset) for _center, offset in anchors) < config.piecewise_min_offset_seconds:
@@ -5241,19 +5071,15 @@ def _repair_with_embedded_reference_piecewise_core(
         # the largest gap overlapping that anchor pair.
         cue_gaps = [
             (previous_end, next_start, next_start - previous_end)
-            for (_previous_start, previous_end, _previous_text),
-                (next_start, _next_end, _next_text)
-            in zip(candidate_cues, candidate_cues[1:])
+            for (_previous_start, previous_end, _previous_text), (next_start, _next_end, _next_text) in zip(
+                candidate_cues, candidate_cues[1:]
+            )
             if next_start - previous_end >= 20.0
         ]
         for (left_time, left_offset), (right_time, right_offset) in zip(anchors, anchors[1:]):
             if abs(right_offset - left_offset) < discontinuity_threshold:
                 continue
-            overlapping = [
-                gap
-                for gap in cue_gaps
-                if gap[0] <= right_time and gap[1] >= left_time
-            ]
+            overlapping = [gap for gap in cue_gaps if gap[0] <= right_time and gap[1] >= left_time]
             midpoint = (left_time + right_time) / 2.0
             boundary, evidence = choose_edit_boundary(
                 left_time,
@@ -5286,10 +5112,7 @@ def _repair_with_embedded_reference_piecewise_core(
                     )
             return _piecewise_offset(anchors, midpoint, jump_threshold)
 
-        corrections = [
-            correction_for_cue(start, end)
-            for start, end, _text in candidate_cues
-        ]
+        corrections = [correction_for_cue(start, end) for start, end, _text in candidate_cues]
         repaired, sequence_safety = _retime_cues_without_reordering(
             candidate_cues,
             corrections,
@@ -5316,8 +5139,9 @@ def _repair_with_embedded_reference_piecewise_core(
         long_gap_index = next(
             (
                 index
-                for index, ((_, previous_end, _), (next_start, _, _))
-                in enumerate(zip(candidate_cues, candidate_cues[1:]), start=1)
+                for index, ((_, previous_end, _), (next_start, _, _)) in enumerate(
+                    zip(candidate_cues, candidate_cues[1:]), start=1
+                )
                 if next_start - previous_end >= 60.0 and previous_end <= 90.0
             ),
             None,
@@ -5325,7 +5149,8 @@ def _repair_with_embedded_reference_piecewise_core(
         if long_gap_index is not None and repaired:
             cold_end = candidate_cues[long_gap_index - 1][1]
             window_refs = [
-                cue for cue in reference_cues
+                cue
+                for cue in reference_cues
                 if cue[1] >= candidate_cues[0][0] - 2.0 and cue[0] <= cold_end + 10.0
             ]
 
@@ -5344,7 +5169,8 @@ def _repair_with_embedded_reference_piecewise_core(
             unique = [cue for cue in window_refs if counts.get(_reference_key(cue[2]), 0) == 1]
             dialogue_anchor = next(
                 (
-                    cue for cue in unique
+                    cue
+                    for cue in unique
                     if cue[0] >= candidate_cues[0][0] + 2.0
                     and any(cue[0] < dup[1] and cue[1] > dup[0] for dup in duplicated)
                 ),
@@ -5362,8 +5188,7 @@ def _repair_with_embedded_reference_piecewise_core(
                     # The opening gap is long by construction, but keep an explicit
                     # monotonic safety check before accepting the special anchor.
                     if all(
-                        shifted[index][0] >= shifted[index - 1][0]
-                        and shifted[index][1] > shifted[index][0]
+                        shifted[index][0] >= shifted[index - 1][0] and shifted[index][1] > shifted[index][0]
                         for index in range(1, len(shifted))
                     ):
                         repaired = shifted
@@ -5381,12 +5206,8 @@ def _repair_with_embedded_reference_piecewise_core(
     after = compare_timing_activity(output, reference)
     before_cold = compare_timing_activity(aligned, reference, priority_seconds=60.0)
     after_cold = compare_timing_activity(output, reference, priority_seconds=60.0)
-    before_dialogue = compare_dialogue_timing_activity(
-        aligned, reference, priority_seconds=60.0
-    )
-    after_dialogue = compare_dialogue_timing_activity(
-        output, reference, priority_seconds=60.0
-    )
+    before_dialogue = compare_dialogue_timing_activity(aligned, reference, priority_seconds=60.0)
+    after_dialogue = compare_dialogue_timing_activity(output, reference, priority_seconds=60.0)
     if (
         not before.get("available")
         or not after.get("available")
@@ -5410,26 +5231,18 @@ def _repair_with_embedded_reference_piecewise_core(
     cold_start_gain = float(after_cold.get("start") or 0.0) - float(before_cold.get("start") or 0.0)
     middle_loss = float(before.get("middle") or 0.0) - float(after.get("middle") or 0.0)
     weighted_gain = float(after.get("weighted") or 0.0) - float(before.get("weighted") or 0.0)
-    cold_weighted_gain = float(after_cold.get("weighted") or 0.0) - float(
-        before_cold.get("weighted") or 0.0
-    )
-    large_early_correction = any(
-        timepoint <= 120.0 and abs(offset) >= 2.5 for timepoint, offset in anchors
-    )
+    cold_weighted_gain = float(after_cold.get("weighted") or 0.0) - float(before_cold.get("weighted") or 0.0)
+    large_early_correction = any(timepoint <= 120.0 and abs(offset) >= 2.5 for timepoint, offset in anchors)
     cold_absolute_quality_ok = (
-        not large_early_correction
-        or float(after_cold.get("start") or 0.0) >= 0.72
-        or cold_start_gain >= 0.15
+        not large_early_correction or float(after_cold.get("start") or 0.0) >= 0.72 or cold_start_gain >= 0.15
     )
     dialogue_start_gain = (
-        float(after_dialogue.get("start") or 0.0)
-        - float(before_dialogue.get("start") or 0.0)
+        float(after_dialogue.get("start") or 0.0) - float(before_dialogue.get("start") or 0.0)
         if before_dialogue.get("available") and after_dialogue.get("available")
         else 0.0
     )
     dialogue_weighted_gain = (
-        float(after_dialogue.get("weighted") or 0.0)
-        - float(before_dialogue.get("weighted") or 0.0)
+        float(after_dialogue.get("weighted") or 0.0) - float(before_dialogue.get("weighted") or 0.0)
         if before_dialogue.get("available") and after_dialogue.get("available")
         else 0.0
     )
@@ -5441,29 +5254,26 @@ def _repair_with_embedded_reference_piecewise_core(
         and dialogue_start_gain >= 0.08
         and dialogue_weighted_gain >= 0.025
     )
-    accepted = (
-        middle_loss <= 0.025
-        and (
-            (
-                cold_absolute_quality_ok
-                and (
-                    # A small but consistent opening gain is worthwhile for broadcast
-                    # captions. Grand Blue S03E05 improved 2.77 percentage points and
-                    # was previously rejected by the overly strict 3-point boundary.
-                    (cold_start_gain >= 0.025 and cold_weighted_gain >= 0.004)
-                    or (start_gain >= 0.025 and weighted_gain >= 0.004)
-                    or (weighted_gain >= 0.015 and start_gain >= -0.005)
-                )
+    accepted = middle_loss <= 0.025 and (
+        (
+            cold_absolute_quality_ok
+            and (
+                # A small but consistent opening gain is worthwhile for broadcast
+                # captions. Grand Blue S03E05 improved 2.77 percentage points and
+                # was previously rejected by the overly strict 3-point boundary.
+                (cold_start_gain >= 0.025 and cold_weighted_gain >= 0.004)
+                or (start_gain >= 0.025 and weighted_gain >= 0.004)
+                or (weighted_gain >= 0.015 and start_gain >= -0.005)
             )
-            # SDH-heavy Japanese tracks can make the all-cue activity score worse
-            # even when spoken dialogue becomes much better aligned. Rescue only
-            # a large opening correction with a strong dialogue-only gain.
-            or dialogue_rescue
         )
+        # SDH-heavy Japanese tracks can make the all-cue activity score worse
+        # even when spoken dialogue becomes much better aligned. Rescue only
+        # a large opening correction with a strong dialogue-only gain.
+        or dialogue_rescue
     )
     if verbose:
         print(
-            "  Piecewise-проверка по встроенному эталону: "
+            "  Piecewise check against the embedded reference: "
             f"anchors={[(round(t, 1), round(o, 2)) for t, o in anchors]}, "
             f"cold={before_cold.get('start')}→{after_cold.get('start')}, "
             f"start={before.get('start')}→{after.get('start')}, "
@@ -5526,8 +5336,6 @@ def _repair_with_embedded_reference_piecewise_core(
     )
 
 
-
-
 def _is_reference_non_dialogue(text: str) -> bool:
     """Return True for captions that should not drive cross-language cue alignment.
 
@@ -5543,15 +5351,12 @@ def _is_reference_non_dialogue(text: str) -> bool:
         return True
     if any(symbol in compact for symbol in ("♬", "♪", "♫")):
         return True
-    if (
-        (compact.startswith("(") and compact.endswith(")"))
-        or (compact.startswith("（") and compact.endswith("）"))
+    if (compact.startswith("(") and compact.endswith(")")) or (
+        compact.startswith("（") and compact.endswith("）")
     ):
         return True
     meaningful = sum(
-        character.isalnum()
-        or "\u3040" <= character <= "\u30ff"
-        or "\u4e00" <= character <= "\u9fff"
+        character.isalnum() or "\u3040" <= character <= "\u30ff" or "\u4e00" <= character <= "\u9fff"
         for character in compact
     )
     return meaningful < max(2, int(len(compact) * 0.15))
@@ -5602,14 +5407,10 @@ def refine_with_embedded_reference_groups(
         )
 
     candidate_dialogue = [
-        (index, cue)
-        for index, cue in enumerate(basis_cues)
-        if not _is_reference_non_dialogue(cue[2])
+        (index, cue) for index, cue in enumerate(basis_cues) if not _is_reference_non_dialogue(cue[2])
     ]
     reference_dialogue = [
-        (index, cue)
-        for index, cue in enumerate(reference_cues)
-        if not _is_reference_non_dialogue(cue[2])
+        (index, cue) for index, cue in enumerate(reference_cues) if not _is_reference_non_dialogue(cue[2])
     ]
     if len(candidate_dialogue) < 10 or len(reference_dialogue) < 10:
         return aligned, _result("reference_groups_not_enough_dialogue", applied=False)
@@ -5685,12 +5486,7 @@ def refine_with_embedded_reference_groups(
                     duration_ratio = max(candidate_duration, reference_duration) / min(
                         candidate_duration, reference_duration
                     )
-                    if (
-                        start_error > 2.0
-                        or end_error > 2.0
-                        or center_error > 1.6
-                        or duration_ratio > 2.6
-                    ):
+                    if start_error > 2.0 or end_error > 2.0 or center_error > 1.6 or duration_ratio > 2.6:
                         continue
                     cost = (
                         0.95 * start_error
@@ -5752,9 +5548,7 @@ def refine_with_embedded_reference_groups(
         reference_group_size,
         cost,
     ) in matches:
-        basis_start, basis_end = _cue_group_span(
-            candidate, candidate_index, candidate_group_size
-        )
+        basis_start, basis_end = _cue_group_span(candidate, candidate_index, candidate_group_size)
         reference_start, reference_end = _cue_group_span(
             reference_items, reference_index, reference_group_size
         )
@@ -5829,9 +5623,7 @@ def refine_with_embedded_reference_groups(
     matched_candidate_count = len(replacements)
     coverage = matched_candidate_count / max(1, len(candidate_dialogue))
     minimum_groups = max(8, int(round(len(candidate_dialogue) * 0.18)))
-    mean_boundary_error = (
-        statistics.fmean(before_boundary_errors) if before_boundary_errors else 0.0
-    )
+    mean_boundary_error = statistics.fmean(before_boundary_errors) if before_boundary_errors else 0.0
     if len(accepted_groups) < minimum_groups or coverage < 0.45:
         return aligned, _result(
             "reference_groups_insufficient_coverage",
@@ -5890,28 +5682,23 @@ def refine_with_embedded_reference_groups(
     if len(output_cues) == len(candidate_cues):
         duration_changes = [
             abs((new_end - new_start) - (old_end - old_start))
-            for (old_start, old_end, _old_text), (new_start, new_end, _new_text)
-            in zip(candidate_cues, output_cues)
+            for (old_start, old_end, _old_text), (new_start, new_end, _new_text) in zip(
+                candidate_cues, output_cues
+            )
         ]
     large_duration_changes = sum(change > 0.15 for change in duration_changes)
-    large_duration_change_ratio = (
-        large_duration_changes / len(duration_changes) if duration_changes else 1.0
-    )
+    large_duration_change_ratio = large_duration_changes / len(duration_changes) if duration_changes else 1.0
     weighted_gain = (
-        float(after_activity.get("weighted") or 0.0)
-        - float(before_activity.get("weighted") or 0.0)
+        float(after_activity.get("weighted") or 0.0) - float(before_activity.get("weighted") or 0.0)
         if before_activity.get("available") and after_activity.get("available")
         else float("-inf")
     )
     start_gain = (
-        float(after_activity.get("start") or 0.0)
-        - float(before_activity.get("start") or 0.0)
+        float(after_activity.get("start") or 0.0) - float(before_activity.get("start") or 0.0)
         if before_activity.get("available") and after_activity.get("available")
         else float("-inf")
     )
-    activity_improved = weighted_gain >= 0.001 or (
-        start_gain >= 0.005 and weighted_gain >= -0.0005
-    )
+    activity_improved = weighted_gain >= 0.001 or (start_gain >= 0.005 and weighted_gain >= -0.0005)
     structurally_safe = (
         len(output_cues) == len(candidate_cues)
         and large_duration_change_ratio <= 0.03
@@ -5921,12 +5708,10 @@ def refine_with_embedded_reference_groups(
 
     if verbose:
         split_groups = sum(
-            1
-            for group in accepted_groups
-            if group["candidate_cues"] != group["reference_cues"]
+            1 for group in accepted_groups if group["candidate_cues"] != group["reference_cues"]
         )
         print(
-            "  Групповая коррекция по встроенному эталону: "
+            "  Group correction against the embedded reference: "
             f"groups={len(accepted_groups)}, split/merge={split_groups}, "
             f"coverage={coverage:.3f}, adjusted={adjusted_cues}, "
             f"mean_boundary_error={mean_boundary_error:.3f}s, "
@@ -5936,9 +5721,7 @@ def refine_with_embedded_reference_groups(
     common_result = dict(
         matched_groups=len(accepted_groups),
         split_merge_groups=sum(
-            1
-            for group in accepted_groups
-            if group["candidate_cues"] != group["reference_cues"]
+            1 for group in accepted_groups if group["candidate_cues"] != group["reference_cues"]
         ),
         matched_candidate_cues=matched_candidate_count,
         dialogue_candidate_cues=len(candidate_dialogue),
@@ -6026,6 +5809,7 @@ def _validate_embedded_reference_output(
         return False, "aligned_too_long", details
     return True, "ok", details
 
+
 def _embedded_reference_is_better(
     baseline: dict[str, object],
     aligned: dict[str, object],
@@ -6057,10 +5841,7 @@ def _embedded_reference_is_better(
     if aligned_weighted >= baseline_weighted + 0.025:
         return True, "weighted_improved"
     # If both are already very strong, the embedded track remains the safer clock.
-    if (
-        aligned_start >= 0.82
-        and (aligned_middle >= 0.82 or value(aligned, "full") >= 0.88)
-    ):
+    if aligned_start >= 0.82 and (aligned_middle >= 0.82 or value(aligned, "full") >= 0.88):
         return True, "strong_reference_alignment"
     return False, "no_material_improvement"
 
@@ -6073,10 +5854,7 @@ def _write_onset_pulses(
     prefix: str,
 ) -> None:
     duration = max(0.08, pulse_seconds)
-    cues = [
-        (start, start + duration, f"{prefix}-{index:06d}")
-        for index, start in enumerate(starts, start=1)
-    ]
+    cues = [(start, start + duration, f"{prefix}-{index:06d}") for index, start in enumerate(starts, start=1)]
     write_srt(cues, destination)
 
 
@@ -6232,8 +6010,7 @@ def synchronize_pgs_with_embedded_reference(
     after_coverage = float(after["coverage"])
     improvement = after_coverage - before_coverage
     accepted = (
-        after_coverage >= 0.55
-        or improvement >= config.pgs_onset_min_improvement
+        after_coverage >= 0.55 or improvement >= config.pgs_onset_min_improvement
     ) and after_coverage >= before_coverage
     if not accepted:
         output.unlink(missing_ok=True)
@@ -6269,7 +6046,6 @@ def synchronize_pgs_with_embedded_reference(
     return output, result
 
 
-
 def _stt_alass_transition_safety(
     source: Path,
     aligned: Path,
@@ -6296,8 +6072,9 @@ def _stt_alass_transition_safety(
 
     shifts = [
         float(aligned_start) - float(source_start)
-        for (source_start, _source_end, _text), (aligned_start, _aligned_end, _aligned_text)
-        in zip(source_cues, aligned_cues)
+        for (source_start, _source_end, _text), (aligned_start, _aligned_end, _aligned_text) in zip(
+            source_cues, aligned_cues
+        )
     ]
     transitions: list[dict[str, object]] = []
 
@@ -6424,16 +6201,10 @@ def _stt_alass_map_safe(
             except (TypeError, ValueError):
                 continue
     if max_unsupported_jump >= 20.0:
-        return False, str(
-            transition_safety.get("reason")
-            or "stt_alass_large_edit_without_gap_support"
-        )
+        return False, str(transition_safety.get("reason") or "stt_alass_large_edit_without_gap_support")
 
     if spread >= 20.0 and not bool(transition_safety.get("accepted")):
-        return False, str(
-            transition_safety.get("reason")
-            or "stt_alass_large_edit_without_gap_support"
-        )
+        return False, str(transition_safety.get("reason") or "stt_alass_large_edit_without_gap_support")
 
     return True, "ok"
 
@@ -6514,7 +6285,9 @@ def _strong_embedded_timeline_after_unsafe_stt(
         and holdout_coverage >= 0.85
     )
     return strong, {
-        "reason": "strong_embedded_timeline_after_unsafe_stt" if strong else "embedded_timeline_not_strong_enough",
+        "reason": "strong_embedded_timeline_after_unsafe_stt"
+        if strong
+        else "embedded_timeline_not_strong_enough",
         "unsafe_attempts": unsafe_attempts,
         "transient_excursions": transient_excursions,
         "largest_unsupported_jump_seconds": round(largest_unsupported_jump, 3),
@@ -6564,9 +6337,7 @@ def _local_speech_shift_estimate(
         # A Whisper segment can explain at most one subtitle cue and cue order
         # must be preserved, which prevents dense speech from manufacturing a
         # convincing but wrong cold-open offset.
-        previous: list[tuple[int, float]] = [
-            (0, 0.0) for _ in range(len(ordered_reference) + 1)
-        ]
+        previous: list[tuple[int, float]] = [(0, 0.0) for _ in range(len(ordered_reference) + 1)]
         for source_time in shifted:
             current: list[tuple[int, float]] = [(0, 0.0)]
             for ref_index, reference_time in enumerate(ordered_reference, start=1):
@@ -6616,21 +6387,13 @@ def _local_speech_shift_estimate(
     best_error = float(best["mean_error"])
     matched_gain = best_matched - baseline_matched
     error_gain = (
-        baseline_error - best_error
-        if math.isfinite(baseline_error) and math.isfinite(best_error)
-        else 0.0
+        baseline_error - best_error if math.isfinite(baseline_error) and math.isfinite(best_error) else 0.0
     )
 
     accepted = bool(
         abs(best_shift) >= 0.20
         and float(best["coverage"]) >= 0.45
-        and (
-            matched_gain >= 2
-            or (
-                best_matched >= max(4, baseline_matched - 1)
-                and error_gain >= 0.12
-            )
-        )
+        and (matched_gain >= 2 or (best_matched >= max(4, baseline_matched - 1) and error_gain >= 0.12))
     )
     return {
         "accepted": accepted,
@@ -6643,22 +6406,17 @@ def _local_speech_shift_estimate(
         "baseline": {
             "matched": baseline_matched,
             "coverage": round(float(baseline["coverage"]), 4),
-            "mean_error_seconds": (
-                round(baseline_error, 4) if math.isfinite(baseline_error) else None
-            ),
+            "mean_error_seconds": (round(baseline_error, 4) if math.isfinite(baseline_error) else None),
         },
         "best": {
             "matched": best_matched,
             "coverage": round(float(best["coverage"]), 4),
-            "mean_error_seconds": (
-                round(best_error, 4) if math.isfinite(best_error) else None
-            ),
+            "mean_error_seconds": (round(best_error, 4) if math.isfinite(best_error) else None),
         },
         "matched_gain": matched_gain,
         "mean_error_gain_seconds": round(error_gain, 4),
         "matching": "monotonic_one_to_one",
     }
-
 
 
 def _refine_sparse_preopening_cues(
@@ -6691,14 +6449,16 @@ def _refine_sparse_preopening_cues(
         embedded_cues = parse_srt(Path(embedded_reference))
         speech_cues = parse_srt(speech_path)
     except OSError as exc:
-        return cues, {"attempted": True, "accepted": False, "reason": "reference_read_error", "error": str(exc)}
+        return cues, {
+            "attempted": True,
+            "accepted": False,
+            "reason": "reference_read_error",
+            "error": str(exc),
+        }
 
     embedded_starts = sorted(float(start) for start, _end, _text in embedded_cues)
     speech_clock_adjust = float(speech_reference_clock_adjust_seconds)
-    speech_starts = sorted(
-        float(start) + speech_clock_adjust
-        for start, _end, _text in speech_cues
-    )
+    speech_starts = sorted(float(start) + speech_clock_adjust for start, _end, _text in speech_cues)
     if len(embedded_starts) < 2 or len(speech_starts) < 2:
         return cues, {"attempted": True, "accepted": False, "reason": "too_few_reference_onsets"}
 
@@ -6706,15 +6466,9 @@ def _refine_sparse_preopening_cues(
 
     def matching_reference_pair(value: float) -> tuple[float, float] | None:
         embedded_near = [
-            candidate
-            for candidate in embedded_starts
-            if abs(candidate - value) <= nearest_limit
+            candidate for candidate in embedded_starts if abs(candidate - value) <= nearest_limit
         ]
-        speech_near = [
-            candidate
-            for candidate in speech_starts
-            if abs(candidate - value) <= nearest_limit
-        ]
+        speech_near = [candidate for candidate in speech_starts if abs(candidate - value) <= nearest_limit]
         pairs = [
             (embedded_target, speech_target)
             for embedded_target in embedded_near
@@ -6781,16 +6535,10 @@ def _refine_sparse_preopening_cues(
         first_delta = float(proposals[first_proposal_index][2])
         later_deltas = [float(proposals[index][2]) for index in later_indices]
         later_delta = float(statistics.median(later_deltas))
-        later_dispersion = max(
-            abs(value - later_delta) for value in later_deltas
-        )
+        later_dispersion = max(abs(value - later_delta) for value in later_deltas)
         first_later_jump = abs(first_delta - later_delta)
-        first_later_errors_before = [
-            before_errors[proposal_indices.index(first_proposal_index)]
-        ]
-        first_later_errors_after = [
-            after_errors[proposal_indices.index(first_proposal_index)]
-        ]
+        first_later_errors_before = [before_errors[proposal_indices.index(first_proposal_index)]]
+        first_later_errors_after = [after_errors[proposal_indices.index(first_proposal_index)]]
         for index in later_indices:
             position = proposal_indices.index(index)
             first_later_errors_before.append(before_errors[position])
@@ -6821,19 +6569,12 @@ def _refine_sparse_preopening_cues(
                     cue_text,
                 )
             starts = [float(start) for start, _end, _text in plateau_refined]
-            timestamps_valid = all(
-                start >= 0.0 and end > start
-                for start, end, _text in plateau_refined
-            )
-            ordered = not any(
-                current + 1e-6 < previous
-                for previous, current in zip(starts, starts[1:])
-            )
+            timestamps_valid = all(start >= 0.0 and end > start for start, end, _text in plateau_refined)
+            ordered = not any(current + 1e-6 < previous for previous, current in zip(starts, starts[1:]))
             opening_boundary_safe = bool(
                 split_index >= len(plateau_refined)
                 or split_index <= 0
-                or float(plateau_refined[split_index - 1][1])
-                <= float(plateau_refined[split_index][0]) - 0.10
+                or float(plateau_refined[split_index - 1][1]) <= float(plateau_refined[split_index][0]) - 0.10
             )
             if timestamps_valid and ordered and opening_boundary_safe:
                 return plateau_refined, {
@@ -6848,9 +6589,7 @@ def _refine_sparse_preopening_cues(
                     "first_cue_shift_seconds": round(first_delta, 3),
                     "later_plateau_shift_seconds": round(later_delta, 3),
                     "first_later_jump_seconds": round(first_later_jump, 3),
-                    "later_plateau_dispersion_seconds": round(
-                        later_dispersion, 3
-                    ),
+                    "later_plateau_dispersion_seconds": round(later_dispersion, 3),
                     "mean_before_error_seconds": round(plateau_before, 4),
                     "mean_after_error_seconds": round(plateau_after, 4),
                     "mean_error_gain_seconds": round(plateau_gain, 4),
@@ -6876,7 +6615,9 @@ def _refine_sparse_preopening_cues(
     shifts: list[dict[str, object]] = []
     for index, (new_start, new_end, delta, target) in proposals.items():
         refined[index] = (max(0.0, new_start), max(0.05, new_end), refined[index][2])
-        shifts.append({"cue_index": index, "shift_seconds": round(delta, 3), "target_seconds": round(target, 3)})
+        shifts.append(
+            {"cue_index": index, "shift_seconds": round(delta, 3), "target_seconds": round(target, 3)}
+        )
 
     starts = [float(start) for start, _end, _text in refined]
     if any(current + 1e-6 < previous for previous, current in zip(starts, starts[1:])):
@@ -7031,9 +6772,7 @@ def _repair_salvaged_sparse_preop_after_bad_stt_map(
         speech_reference_clock_adjust_seconds=speech_reference_clock_adjust,
     )
     refinement = dict(refinement)
-    refinement["speech_reference_clock_adjust_seconds"] = round(
-        speech_reference_clock_adjust, 4
-    )
+    refinement["speech_reference_clock_adjust_seconds"] = round(speech_reference_clock_adjust, 4)
     if not bool(refinement.get("accepted")):
         return baseline_aligned, {
             "applied": False,
@@ -7062,14 +6801,8 @@ def _repair_salvaged_sparse_preop_after_bad_stt_map(
             except (TypeError, ValueError):
                 continue
 
-    same_direction = all(
-        value == 0.0 or value * expected_delta > 0.0
-        for value in shift_values
-    )
-    close_to_hint = bool(
-        shift_values
-        and all(abs(value - expected_delta) <= 4.0 for value in shift_values)
-    )
+    same_direction = all(value == 0.0 or value * expected_delta > 0.0 for value in shift_values)
+    close_to_hint = bool(shift_values and all(abs(value - expected_delta) <= 4.0 for value in shift_values))
     if not (same_direction and close_to_hint):
         return baseline_aligned, {
             "applied": False,
@@ -7108,7 +6841,6 @@ def _repair_salvaged_sparse_preop_after_bad_stt_map(
         "refinement": refinement,
         "output": str(output),
     }
-
 
 
 def _tri_modal_sparse_cold_open_clock(
@@ -7153,18 +6885,12 @@ def _tri_modal_sparse_cold_open_clock(
         onset_matched = int(onset_best.get("matched") or 0)
         onset_coverage = float(onset_best.get("coverage") or 0.0)
         onset_error_raw = onset_best.get("mean_error_seconds")
-        onset_error = (
-            float(onset_error_raw)
-            if onset_error_raw not in {None, ""}
-            else float("inf")
-        )
+        onset_error = float(onset_error_raw) if onset_error_raw not in {None, ""} else float("inf")
         semantic_eligible = int(semantic.get("eligible_cues") or 0)
     except (TypeError, ValueError):
         return rejected
 
-    semantic_anchors = [
-        row for row in (semantic.get("anchors") or []) if isinstance(row, dict)
-    ]
+    semantic_anchors = [row for row in (semantic.get("anchors") or []) if isinstance(row, dict)]
     semantic_shifts: list[float] = []
     for row in semantic_anchors:
         try:
@@ -7199,8 +6925,7 @@ def _tri_modal_sparse_cold_open_clock(
         if abs(value) >= 0.20 and abs(value) <= 12.75:
             edge_hints.append(value)
     same_direction_edges = [
-        value for value in edge_hints
-        if value * onset_shift > 0.0 and value * semantic_shift > 0.0
+        value for value in edge_hints if value * onset_shift > 0.0 and value * semantic_shift > 0.0
     ]
     if not same_direction_edges:
         return {**rejected, "reason": "edge_hint_direction_mismatch"}
@@ -7243,6 +6968,7 @@ def _tri_modal_sparse_cold_open_clock(
         "onset_mean_error_seconds": round(onset_error, 4),
     }
 
+
 def _restore_embedded_opening_clock_scaffold(
     aligned: Path,
     embedded_result: dict[str, object],
@@ -7275,9 +7001,9 @@ def _restore_embedded_opening_clock_scaffold(
         )
 
     stable = [
-        row for row in segments
-        if isinstance(row, dict)
-        and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
+        row
+        for row in segments
+        if isinstance(row, dict) and str(row.get("kind") or "stable") in {"stable", "post_opening_reacquire"}
     ]
     if len(stable) < 2:
         return aligned, _result(
@@ -7326,11 +7052,7 @@ def _restore_embedded_opening_clock_scaffold(
     opening_alass_transition: dict[str, object] | None = None
     alass_relative_clock = 0.0
     transition_safety = speech_result.get("stt_alass_transition_safety")
-    transition_rows = (
-        transition_safety.get("transitions")
-        if isinstance(transition_safety, dict)
-        else None
-    )
+    transition_rows = transition_safety.get("transitions") if isinstance(transition_safety, dict) else None
     opening_transition_candidates: list[dict[str, object]] = []
     if isinstance(transition_rows, list):
         for row in transition_rows:
@@ -7342,11 +7064,7 @@ def _restore_embedded_opening_clock_scaffold(
                 nearby_gap_seconds = float(row.get("nearby_gap_seconds") or 0.0)
             except (TypeError, ValueError):
                 continue
-            if (
-                abs(jump) >= 20.0
-                and nearby_gap_seconds >= 45.0
-                and 0.0 < source_time <= 300.0
-            ):
+            if abs(jump) >= 20.0 and nearby_gap_seconds >= 45.0 and 0.0 < source_time <= 300.0:
                 opening_transition_candidates.append(row)
     if opening_transition_candidates:
         opening_alass_transition = max(
@@ -7355,13 +7073,23 @@ def _restore_embedded_opening_clock_scaffold(
         )
         # transition jump = post_shift - pre_shift, therefore the existing
         # pre-vs-post relative clock contributed by ALASS is -jump.
-        alass_relative_clock = -float(
-            opening_alass_transition.get("jump_seconds") or 0.0
-        )
+        alass_relative_clock = -float(opening_alass_transition.get("jump_seconds") or 0.0)
+    else:
+        from .subtitles.validation import alass_transition_matching_timeline_boundary
 
-    existing_relative_clock = (
-        alass_relative_clock + pre_refinement - post_refinement
-    )
+        # ALASS may already have made the same (smaller) edit as the embedded
+        # timeline at the same long gap, e.g. a TV source with a ~10s sponsor
+        # card after the OP.  That jump is part of the existing relative clock;
+        # ignoring it re-applies the edit to the cold open (+10s late).
+        matching_transition = alass_transition_matching_timeline_boundary(
+            transition_rows,
+            embedded_result.get("timeline_boundaries"),
+        )
+        if matching_transition is not None:
+            opening_alass_transition = matching_transition
+            alass_relative_clock = -float(matching_transition.get("jump_seconds") or 0.0)
+
+    existing_relative_clock = alass_relative_clock + pre_refinement - post_refinement
     correction = target_relative_clock - existing_relative_clock
 
     speech_post_error = abs(speech_offset - post_offset)
@@ -7375,11 +7103,7 @@ def _restore_embedded_opening_clock_scaffold(
     )
 
     risk_reasons_raw = risk.get("reasons")
-    risk_reasons = (
-        {str(value) for value in risk_reasons_raw}
-        if isinstance(risk_reasons_raw, list)
-        else set()
-    )
+    risk_reasons = {str(value) for value in risk_reasons_raw} if isinstance(risk_reasons_raw, list) else set()
     cold_start = embedded_result.get("timeline_cold_start")
     cold_overlap_delta = 0.0
     cold_overlap_gap = 0.0
@@ -7389,14 +7113,11 @@ def _restore_embedded_opening_clock_scaffold(
         try:
             cold_overlap_delta = float(cold_start.get("delta_seconds") or 0.0)
             cold_overlap_gap = float(cold_start.get("gap_seconds") or 0.0)
-            cold_overlap_boundary = float(
-                cold_start.get("boundary_source_time") or 0.0
-            )
+            cold_overlap_boundary = float(cold_start.get("boundary_source_time") or 0.0)
         except (TypeError, ValueError):
             cold_overlap_delta = cold_overlap_gap = cold_overlap_boundary = 0.0
         cold_overlap_ambiguity = bool(
-            str(cold_start.get("reason") or "")
-            == "cold_start_overlaps_main_boundary"
+            str(cold_start.get("reason") or "") == "cold_start_overlaps_main_boundary"
             and "opening_gap_clock_ambiguity" in risk_reasons
             and abs(cold_overlap_delta) >= 1.5
             and cold_overlap_gap >= 45.0
@@ -7427,8 +7148,7 @@ def _restore_embedded_opening_clock_scaffold(
         cold_overlap_ambiguity
         and isinstance(plateau, dict)
         and bool(plateau.get("applied"))
-        and str(plateau_choice.get("mode") or "")
-        == "sparse_cross_modal_consensus"
+        and str(plateau_choice.get("mode") or "") == "sparse_cross_modal_consensus"
         and abs(pre_refinement) >= 0.20
         and abs(post_refinement) < 0.50
     )
@@ -7466,17 +7186,14 @@ def _restore_embedded_opening_clock_scaffold(
     dominant_opening_reacquire = bool(
         isinstance(opening_reacquire, dict)
         and bool(opening_reacquire.get("applied"))
-        and str(opening_reacquire.get("reason") or "")
-        == "dominant_clock_reacquired_after_opening_gap"
+        and str(opening_reacquire.get("reason") or "") == "dominant_clock_reacquired_after_opening_gap"
         and "early_path_clock_change" in risk_reasons
         and "opening_gap_clock_ambiguity" in risk_reasons
         and first_support >= 1
         and post_support >= 6
         and abs(speech_offset - post_offset) <= 2.5
     )
-    strong_single_window_early_clock = bool(
-        tri_modal_cold_open_authoritative or dominant_opening_reacquire
-    )
+    strong_single_window_early_clock = bool(tri_modal_cold_open_authoritative or dominant_opening_reacquire)
     single_window_evidence: dict[str, object] = (
         {
             "accepted": True,
@@ -7493,9 +7210,7 @@ def _restore_embedded_opening_clock_scaffold(
         else {}
     )
     if first_support == 1 and post_support >= 12:
-        salvaged_unstable = embedded_result.get(
-            "timeline_unstable_sparse_preopening_salvage"
-        )
+        salvaged_unstable = embedded_result.get("timeline_unstable_sparse_preopening_salvage")
         salvage_confirmed = bool(
             isinstance(salvaged_unstable, dict)
             and salvaged_unstable.get("accepted")
@@ -7506,23 +7221,19 @@ def _restore_embedded_opening_clock_scaffold(
             single_window_evidence = {
                 "accepted": True,
                 "evidence_mode": "unstable_path_salvage",
-                "speech_post_error_seconds": round(
-                    abs(speech_offset - post_offset), 4
-                ),
+                "speech_post_error_seconds": round(abs(speech_offset - post_offset), 4),
                 "salvage": dict(salvaged_unstable),
             }
 
         validation = embedded_result.get("timeline_validation")
         after_validation = (
             validation.get("after")
-            if isinstance(validation, dict)
-            and isinstance(validation.get("after"), dict)
+            if isinstance(validation, dict) and isinstance(validation.get("after"), dict)
             else {}
         )
         holdout = (
             validation.get("holdout")
-            if isinstance(validation, dict)
-            and isinstance(validation.get("holdout"), dict)
+            if isinstance(validation, dict) and isinstance(validation.get("holdout"), dict)
             else {}
         )
         edge_hints_raw = embedded_result.get("timeline_edge_hints_seconds")
@@ -7537,11 +7248,7 @@ def _restore_embedded_opening_clock_scaffold(
             first_score = float(first.get("mean_score") or 0.0)
             first_coverage = float(first.get("mean_coverage") or 0.0)
             after_f1 = float(after_validation.get("f1") or 0.0)
-            activity_f1 = (
-                float(validation.get("activity_f1") or 0.0)
-                if isinstance(validation, dict)
-                else 0.0
-            )
+            activity_f1 = float(validation.get("activity_f1") or 0.0) if isinstance(validation, dict) else 0.0
             holdout_p90 = float(holdout.get("p90_abs_residual_seconds"))
             holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
             early_span = float(risk.get("early_offset_span_seconds") or 0.0)
@@ -7557,14 +7264,10 @@ def _restore_embedded_opening_clock_scaffold(
             early_jump = 0.0
 
         first_hint_error = (
-            min(abs(first_offset - value) for value in edge_hints)
-            if edge_hints
-            else float("inf")
+            min(abs(first_offset - value) for value in edge_hints) if edge_hints else float("inf")
         )
         post_hint_error = (
-            min(abs(post_offset - value) for value in edge_hints)
-            if edge_hints
-            else float("inf")
+            min(abs(post_offset - value) for value in edge_hints) if edge_hints else float("inf")
         )
         edge_confirmed_single_window = bool(
             first_score >= 3.0
@@ -7647,22 +7350,14 @@ def _restore_embedded_opening_clock_scaffold(
                 "first_score": round(first_score, 4),
                 "first_coverage": round(first_coverage, 4),
                 "first_hint_error_seconds": (
-                    round(first_hint_error, 4)
-                    if math.isfinite(first_hint_error)
-                    else None
+                    round(first_hint_error, 4) if math.isfinite(first_hint_error) else None
                 ),
                 "post_hint_error_seconds": (
-                    round(post_hint_error, 4)
-                    if math.isfinite(post_hint_error)
-                    else None
+                    round(post_hint_error, 4) if math.isfinite(post_hint_error) else None
                 ),
                 "after_f1": round(after_f1, 4),
                 "activity_f1": round(activity_f1, 4),
-                "holdout_p90_seconds": (
-                    round(holdout_p90, 4)
-                    if math.isfinite(holdout_p90)
-                    else None
-                ),
+                "holdout_p90_seconds": (round(holdout_p90, 4) if math.isfinite(holdout_p90) else None),
                 "holdout_mean_coverage": round(holdout_coverage, 4),
                 "early_offset_span_seconds": round(early_span, 4),
                 "early_max_jump_seconds": round(early_jump, 4),
@@ -7681,25 +7376,19 @@ def _restore_embedded_opening_clock_scaffold(
         validation = embedded_result.get("timeline_validation")
         after_validation = (
             validation.get("after")
-            if isinstance(validation, dict)
-            and isinstance(validation.get("after"), dict)
+            if isinstance(validation, dict) and isinstance(validation.get("after"), dict)
             else {}
         )
         holdout = (
             validation.get("holdout")
-            if isinstance(validation, dict)
-            and isinstance(validation.get("holdout"), dict)
+            if isinstance(validation, dict) and isinstance(validation.get("holdout"), dict)
             else {}
         )
         try:
             first_score = float(first.get("mean_score") or 0.0)
             first_coverage = float(first.get("mean_coverage") or 0.0)
             after_f1 = float(after_validation.get("f1") or 0.0)
-            activity_f1 = (
-                float(validation.get("activity_f1") or 0.0)
-                if isinstance(validation, dict)
-                else 0.0
-            )
+            activity_f1 = float(validation.get("activity_f1") or 0.0) if isinstance(validation, dict) else 0.0
             holdout_p90 = float(holdout.get("p90_abs_residual_seconds"))
             holdout_coverage = float(holdout.get("mean_coverage") or 0.0)
         except (TypeError, ValueError):
@@ -7738,10 +7427,7 @@ def _restore_embedded_opening_clock_scaffold(
                 "correction_seconds": round(correction, 4),
             }
 
-    if (
-        (first_support < 2 and not strong_single_window_early_clock)
-        or post_support < 6
-    ):
+    if (first_support < 2 and not strong_single_window_early_clock) or post_support < 6:
         return aligned, _result(
             "opening_scaffold_unavailable",
             applied=False,
@@ -7791,12 +7477,8 @@ def _restore_embedded_opening_clock_scaffold(
         ):
             try:
                 split_index = int(opening_alass_transition.get("cue_index"))
-                gap_seconds = float(
-                    opening_alass_transition.get("nearby_gap_seconds") or 0.0
-                )
-                gap_midpoint = float(
-                    opening_alass_transition.get("nearby_gap_time") or 0.0
-                )
+                gap_seconds = float(opening_alass_transition.get("nearby_gap_seconds") or 0.0)
+                gap_midpoint = float(opening_alass_transition.get("nearby_gap_time") or 0.0)
             except (TypeError, ValueError):
                 split_index = 0
                 gap_seconds = 0.0
@@ -7851,25 +7533,18 @@ def _restore_embedded_opening_clock_scaffold(
             except (TypeError, ValueError):
                 candidate_delta = 0.0
             if (
-                str(cold_start.get("reason") or "")
-                == "cold_start_overlaps_main_boundary"
+                str(cold_start.get("reason") or "") == "cold_start_overlaps_main_boundary"
                 and 0.45 <= abs(candidate_delta) <= 8.0
             ):
                 cold_delta = candidate_delta
 
-        reference = (
-            Path(str(reference_raw)).expanduser()
-            if reference_raw not in {None, ""}
-            else None
-        )
+        reference = Path(str(reference_raw)).expanduser() if reference_raw not in {None, ""} else None
         if reference is None or not reference.is_file():
             residual_speech_refinement = {
                 "attempted": False,
                 "accepted": False,
                 "reason": "timing_reference_unavailable",
-                "cold_hint_delta_seconds": (
-                    round(cold_delta, 3) if cold_delta is not None else None
-                ),
+                "cold_hint_delta_seconds": (round(cold_delta, 3) if cold_delta is not None else None),
             }
         elif cold_delta is None:
             residual_speech_refinement = {
@@ -7888,22 +7563,12 @@ def _restore_embedded_opening_clock_scaffold(
                     "error": str(exc),
                 }
             else:
-                pre_starts = [
-                    float(start)
-                    for start, _end, _text in repaired[:split_index]
-                ][:48]
-                reference_starts = [
-                    float(start)
-                    for start, _end, _text in reference_cues
-                ]
+                pre_starts = [float(start) for start, _end, _text in repaired[:split_index]][:48]
+                reference_starts = [float(start) for start, _end, _text in reference_cues]
                 if pre_starts and split_index > 0:
                     low = min(pre_starts) - 3.0
                     high = float(repaired[split_index - 1][1]) + 3.0
-                    local_reference = [
-                        value
-                        for value in reference_starts
-                        if low <= value <= high
-                    ]
+                    local_reference = [value for value in reference_starts if low <= value <= high]
                     estimate = _local_speech_shift_estimate(
                         pre_starts,
                         local_reference,
@@ -7918,16 +7583,12 @@ def _restore_embedded_opening_clock_scaffold(
                         candidate_shift = 0.0
 
                     best_metrics = estimate.get("best")
-                    best_metrics = (
-                        best_metrics if isinstance(best_metrics, dict) else {}
-                    )
+                    best_metrics = best_metrics if isinstance(best_metrics, dict) else {}
                     try:
                         best_matched = int(best_metrics.get("matched") or 0)
                         best_coverage = float(best_metrics.get("coverage") or 0.0)
                         matched_gain = int(estimate.get("matched_gain") or 0)
-                        error_gain = float(
-                            estimate.get("mean_error_gain_seconds") or 0.0
-                        )
+                        error_gain = float(estimate.get("mean_error_gain_seconds") or 0.0)
                     except (TypeError, ValueError):
                         best_matched = matched_gain = 0
                         best_coverage = error_gain = 0.0
@@ -7944,9 +7605,7 @@ def _restore_embedded_opening_clock_scaffold(
                         and matched_gain >= 1
                         and error_gain >= 0.10
                     )
-                    speech_supported = bool(
-                        bool(estimate.get("accepted")) or borderline_speech
-                    )
+                    speech_supported = bool(bool(estimate.get("accepted")) or borderline_speech)
                     if cold_overlap_ambiguity:
                         # The first-edge hint can overshoot when the two subtitle
                         # tracks do not begin with corresponding cues.  In this
@@ -7958,8 +7617,7 @@ def _restore_embedded_opening_clock_scaffold(
                             bool(estimate.get("accepted"))
                             and 0.20 <= abs(candidate_shift) <= 3.0
                             and candidate_shift * cold_delta > 0.0
-                            and abs(candidate_shift)
-                            <= abs(cold_delta) + 0.75
+                            and abs(candidate_shift) <= abs(cold_delta) + 0.75
                         )
                     else:
                         agrees_with_hint = bool(
@@ -7986,9 +7644,7 @@ def _restore_embedded_opening_clock_scaffold(
                         "borderline_speech": borderline_speech,
                         "cold_hint_delta_seconds": round(cold_delta, 3),
                         "speech_shift_seconds": round(candidate_shift, 3),
-                        "agreement_error_seconds": round(
-                            abs(candidate_shift - cold_delta), 3
-                        ),
+                        "agreement_error_seconds": round(abs(candidate_shift - cold_delta), 3),
                     }
                     if agrees_with_hint:
                         residual_shift = candidate_shift
@@ -7996,26 +7652,15 @@ def _restore_embedded_opening_clock_scaffold(
                             (
                                 max(
                                     0.0,
-                                    float(start)
-                                    + (
-                                        residual_shift
-                                        if index < split_index
-                                        else 0.0
-                                    ),
+                                    float(start) + (residual_shift if index < split_index else 0.0),
                                 ),
                                 max(
                                     0.05,
-                                    float(end)
-                                    + (
-                                        residual_shift
-                                        if index < split_index
-                                        else 0.0
-                                    ),
+                                    float(end) + (residual_shift if index < split_index else 0.0),
                                 ),
                                 cue_text,
                             )
-                            for index, (start, end, cue_text)
-                            in enumerate(repaired)
+                            for index, (start, end, cue_text) in enumerate(repaired)
                         ]
                         correction += residual_shift
                 else:
@@ -8052,8 +7697,7 @@ def _restore_embedded_opening_clock_scaffold(
             except (TypeError, ValueError):
                 candidate_delta = 0.0
             if (
-                str(cold_start.get("reason") or "")
-                == "cold_start_overlaps_main_boundary"
+                str(cold_start.get("reason") or "") == "cold_start_overlaps_main_boundary"
                 and 0.40 <= abs(candidate_delta) <= 2.5
             ):
                 cold_delta = candidate_delta
@@ -8086,9 +7730,7 @@ def _restore_embedded_opening_clock_scaffold(
                     0.0,
                     min(float(start) for start, _end, _text in pre_cues) - 1.5,
                 )
-                region_end = (
-                    max(float(end) for _start, end, _text in pre_cues) + 1.5
-                )
+                region_end = max(float(end) for _start, end, _text in pre_cues) + 1.5
                 probe = _windowed_reference_shift(
                     repaired,
                     reference_cues,
@@ -8131,9 +7773,7 @@ def _restore_embedded_opening_clock_scaffold(
                     "cold_hint_agrees": cold_hint_agrees,
                     "shift_seconds": round(candidate_shift, 3),
                     "cold_hint_delta_seconds": round(cold_delta, 3),
-                    "agreement_error_seconds": round(
-                        abs(candidate_shift - cold_delta), 3
-                    ),
+                    "agreement_error_seconds": round(abs(candidate_shift - cold_delta), 3),
                     "probe": probe,
                 }
                 if agrees:
@@ -8142,26 +7782,15 @@ def _restore_embedded_opening_clock_scaffold(
                         (
                             max(
                                 0.0,
-                                float(start)
-                                + (
-                                    embedded_reference_shift
-                                    if index < split_index
-                                    else 0.0
-                                ),
+                                float(start) + (embedded_reference_shift if index < split_index else 0.0),
                             ),
                             max(
                                 0.05,
-                                float(end)
-                                + (
-                                    embedded_reference_shift
-                                    if index < split_index
-                                    else 0.0
-                                ),
+                                float(end) + (embedded_reference_shift if index < split_index else 0.0),
                             ),
                             cue_text,
                         )
-                        for index, (start, end, cue_text)
-                        in enumerate(repaired)
+                        for index, (start, end, cue_text) in enumerate(repaired)
                     ]
                     correction += embedded_reference_shift
 
@@ -8170,11 +7799,7 @@ def _restore_embedded_opening_clock_scaffold(
         "accepted": False,
         "reason": "not_applicable",
     }
-    if (
-        strong_single_window_early_clock
-        and not tri_modal_cold_open_authoritative
-        and split_index <= 6
-    ):
+    if strong_single_window_early_clock and not tri_modal_cold_open_authoritative and split_index <= 6:
         repaired, sparse_preop_refinement = _refine_sparse_preopening_cues(
             repaired,
             split_index,
@@ -8183,9 +7808,7 @@ def _restore_embedded_opening_clock_scaffold(
             max_adjust_seconds=(
                 3.25
                 if isinstance(
-                    embedded_result.get(
-                        "timeline_unstable_sparse_preopening_salvage"
-                    ),
+                    embedded_result.get("timeline_unstable_sparse_preopening_salvage"),
                     dict,
                 )
                 else 2.5
@@ -8300,10 +7923,13 @@ def _local_stt_text_shift_estimate(
             shift = ref_start - float(cue_start)
             if abs(shift) > float(max_shift_seconds) + 0.75:
                 continue
-            similarity = max(
-                float(fuzz.ratio(cue_text, ref_text)),
-                float(fuzz.partial_ratio(cue_text, ref_text)),
-            ) / 100.0
+            similarity = (
+                max(
+                    float(fuzz.ratio(cue_text, ref_text)),
+                    float(fuzz.partial_ratio(cue_text, ref_text)),
+                )
+                / 100.0
+            )
             candidates.append((similarity, -abs(shift), shift, ref_text, ref_start))
         if not candidates:
             continue
@@ -8344,11 +7970,7 @@ def _local_stt_text_shift_estimate(
     # dialogue as one plateau, while unrelated text matches scatter broadly.
     best_cluster: list[dict[str, object]] = []
     for center in shifts:
-        cluster = [
-            row
-            for row in anchors
-            if abs(float(row["shift_seconds"]) - center) <= 0.70
-        ]
+        cluster = [row for row in anchors if abs(float(row["shift_seconds"]) - center) <= 0.70]
         if len(cluster) > len(best_cluster):
             best_cluster = cluster
         elif len(cluster) == len(best_cluster) and cluster:
@@ -8370,18 +7992,10 @@ def _local_stt_text_shift_estimate(
     else:
         median_shift = (cluster_shifts[middle - 1] + cluster_shifts[middle]) / 2.0
     mean_similarity = (
-        sum(float(row["similarity"]) for row in best_cluster) / len(best_cluster)
-        if best_cluster
-        else 0.0
+        sum(float(row["similarity"]) for row in best_cluster) / len(best_cluster) if best_cluster else 0.0
     )
-    unique_reference_count = len(
-        {round(float(row["reference_start_seconds"]), 3) for row in best_cluster}
-    )
-    spread = (
-        max(cluster_shifts) - min(cluster_shifts)
-        if len(cluster_shifts) >= 2
-        else 0.0
-    )
+    unique_reference_count = len({round(float(row["reference_start_seconds"]), 3) for row in best_cluster})
+    spread = max(cluster_shifts) - min(cluster_shifts) if len(cluster_shifts) >= 2 else 0.0
     coverage = len(best_cluster) / max(1, eligible)
     accepted = bool(
         len(best_cluster) >= 3
@@ -8424,26 +8038,14 @@ def _choose_plateau_shift(
     on its own.  The sparse path therefore accepts only when the two independent
     estimates agree tightly; it never accepts one weak estimate by itself.
     """
-    onset_shift = (
-        float(onset.get("shift_seconds") or 0.0)
-        if bool(onset.get("accepted"))
-        else 0.0
-    )
-    semantic_shift = (
-        float(semantic.get("shift_seconds") or 0.0)
-        if bool(semantic.get("accepted"))
-        else 0.0
-    )
+    onset_shift = float(onset.get("shift_seconds") or 0.0) if bool(onset.get("accepted")) else 0.0
+    semantic_shift = float(semantic.get("shift_seconds") or 0.0) if bool(semantic.get("accepted")) else 0.0
     try:
         semantic_support = int(semantic.get("cluster_support") or 0)
         semantic_coverage = float(semantic.get("coverage") or 0.0)
         semantic_similarity = float(semantic.get("mean_similarity") or 0.0)
         raw_semantic_spread = semantic.get("cluster_spread_seconds")
-        semantic_spread = (
-            float(raw_semantic_spread)
-            if raw_semantic_spread not in {None, ""}
-            else 999.0
-        )
+        semantic_spread = float(raw_semantic_spread) if raw_semantic_spread not in {None, ""} else 999.0
     except (TypeError, ValueError):
         semantic_support = 0
         semantic_coverage = semantic_similarity = 0.0
@@ -8458,9 +8060,7 @@ def _choose_plateau_shift(
         and abs(semantic_shift) <= float(semantic_limit_seconds) + 0.75
     )
     conflicting = bool(
-        strong_semantic
-        and bool(onset.get("accepted"))
-        and abs(semantic_shift - onset_shift) >= 1.50
+        strong_semantic and bool(onset.get("accepted")) and abs(semantic_shift - onset_shift) >= 1.50
     )
 
     # Sparse cold-open consensus: the generic onset gate wants >=45% coverage
@@ -8476,11 +8076,7 @@ def _choose_plateau_shift(
             onset_best_matched = int(onset_best.get("matched") or 0)
             onset_best_coverage = float(onset_best.get("coverage") or 0.0)
             raw_onset_error = onset_best.get("mean_error_seconds")
-            onset_best_error = (
-                float(raw_onset_error)
-                if raw_onset_error not in {None, ""}
-                else float("inf")
-            )
+            onset_best_error = float(raw_onset_error) if raw_onset_error not in {None, ""} else float("inf")
             onset_error_gain = float(onset.get("mean_error_gain_seconds") or 0.0)
             semantic_best_shift = float(semantic.get("best_shift_seconds") or 0.0)
             semantic_eligible = int(semantic.get("eligible_cues") or 0)
@@ -8526,9 +8122,7 @@ def _choose_plateau_shift(
                 "mode": "sparse_cross_modal_consensus",
                 "onset_shift_seconds": round(onset_best_shift, 3),
                 "semantic_shift_seconds": round(semantic_best_shift, 3),
-                "agreement_seconds": round(
-                    abs(onset_best_shift - semantic_best_shift), 3
-                ),
+                "agreement_seconds": round(abs(onset_best_shift - semantic_best_shift), 3),
                 "onset_matched": onset_best_matched,
                 "onset_coverage": round(onset_best_coverage, 4),
                 "onset_mean_error_seconds": round(onset_best_error, 4),
@@ -8565,7 +8159,6 @@ def _choose_plateau_shift(
     }
 
 
-
 def _accept_opening_plateau_refinement(
     *,
     pre_choice_mode: str,
@@ -8589,13 +8182,9 @@ def _accept_opening_plateau_refinement(
     """
 
     regular_activity_accepted = bool(
-        after_weighted + 0.008 >= before_weighted
-        and after_start + 0.003 >= before_start
+        after_weighted + 0.008 >= before_weighted and after_start + 0.003 >= before_start
     )
-    semantic_text_not_degraded = bool(
-        after_text_available
-        and after_text_rank + 0.005 >= before_text_rank
-    )
+    semantic_text_not_degraded = bool(after_text_available and after_text_rank + 0.005 >= before_text_rank)
     sparse_cross_modal_consensus = bool(
         pre_choice_mode == "sparse_cross_modal_consensus"
         or post_choice_mode == "sparse_cross_modal_consensus"
@@ -8604,10 +8193,7 @@ def _accept_opening_plateau_refinement(
         sparse_cross_modal_consensus
         and after_weighted + 0.030 >= before_weighted
         and after_start + 0.040 >= before_start
-        and (
-            semantic_text_not_degraded
-            or (not before_text_available and not after_text_available)
-        )
+        and (semantic_text_not_degraded or (not before_text_available and not after_text_available))
     )
     accepted = bool(
         (
@@ -8624,6 +8210,7 @@ def _accept_opening_plateau_refinement(
         "sparse_cross_modal_consensus": sparse_cross_modal_consensus,
         "sparse_consensus_accepted": sparse_consensus_accepted,
     }
+
 
 def _refine_stt_opening_plateaus(
     source: Path,
@@ -8642,11 +8229,7 @@ def _refine_stt_opening_plateaus(
             applied=False,
             error=str(exc),
         )
-    if (
-        len(source_cues) < 10
-        or len(source_cues) != len(aligned_cues)
-        or len(reference_cues) < 10
-    ):
+    if len(source_cues) < 10 or len(source_cues) != len(aligned_cues) or len(reference_cues) < 10:
         return aligned, _result(
             "stt_plateau_structure_unavailable",
             applied=False,
@@ -8672,19 +8255,12 @@ def _refine_stt_opening_plateaus(
 
     gap_seconds, split_index, source_gap_midpoint = max(gaps)
     aligned_gap_midpoint = (
-        float(aligned_cues[split_index - 1][1])
-        + float(aligned_cues[split_index][0])
+        float(aligned_cues[split_index - 1][1]) + float(aligned_cues[split_index][0])
     ) / 2.0
 
-    reference_starts = sorted(
-        float(start)
-        for start, _end, text in reference_cues
-        if str(text or "").strip()
-    )
+    reference_starts = sorted(float(start) for start, _end, text in reference_cues if str(text or "").strip())
     pre_starts = [
-        float(start)
-        for start, _end, text in aligned_cues[:split_index]
-        if str(text or "").strip()
+        float(start) for start, _end, text in aligned_cues[:split_index] if str(text or "").strip()
     ][-24:]
     post_limit = aligned_gap_midpoint + 240.0
     post_starts = [
@@ -8698,26 +8274,16 @@ def _refine_stt_opening_plateaus(
     # dialogue/music later in the file could create a false +1s optimum.
     pre_reference_start = (min(pre_starts) - 12.0) if pre_starts else 0.0
     pre_reference_end = (
-        float(aligned_cues[split_index - 1][1]) + 12.0
-        if split_index > 0
-        else aligned_gap_midpoint
+        float(aligned_cues[split_index - 1][1]) + 12.0 if split_index > 0 else aligned_gap_midpoint
     )
     pre_reference_starts = [
-        value
-        for value in reference_starts
-        if pre_reference_start <= value <= pre_reference_end
+        value for value in reference_starts if pre_reference_start <= value <= pre_reference_end
     ]
 
-    post_reference_start = (
-        (min(post_starts) - 3.0) if post_starts else aligned_gap_midpoint
-    )
-    post_reference_end = (
-        (max(post_starts) + 3.0) if post_starts else post_limit
-    )
+    post_reference_start = (min(post_starts) - 3.0) if post_starts else aligned_gap_midpoint
+    post_reference_end = (max(post_starts) + 3.0) if post_starts else post_limit
     post_reference_starts = [
-        value
-        for value in reference_starts
-        if post_reference_start <= value <= post_reference_end
+        value for value in reference_starts if post_reference_start <= value <= post_reference_end
     ]
 
     pre_estimate = _local_speech_shift_estimate(
@@ -8740,11 +8306,7 @@ def _refine_stt_opening_plateaus(
         reference,
         max_shift_seconds=12.0,
     )
-    post_semantic_cues = [
-        cue
-        for cue in aligned_cues[split_index:]
-        if float(cue[0]) <= post_limit
-    ][:48]
+    post_semantic_cues = [cue for cue in aligned_cues[split_index:] if float(cue[0]) <= post_limit][:48]
     post_semantic = _local_stt_text_shift_estimate(
         post_semantic_cues,
         reference,
@@ -8825,8 +8387,7 @@ def _refine_stt_opening_plateaus(
     pre_choice_mode = str(pre_choice.get("mode") or "")
     post_choice_mode = str(post_choice.get("mode") or "")
     semantic_override = bool(
-        pre_choice_mode.startswith("semantic")
-        or post_choice_mode.startswith("semantic")
+        pre_choice_mode.startswith("semantic") or post_choice_mode.startswith("semantic")
     )
     semantic_conflict_override = bool(
         pre_choice_mode in {"semantic_override", "semantic_only"}
@@ -8853,15 +8414,9 @@ def _refine_stt_opening_plateaus(
         semantic_text_improved=semantic_text_improved,
         semantic_conflict_override=semantic_conflict_override,
     )
-    semantic_text_not_degraded = bool(
-        acceptance_meta.get("semantic_text_not_degraded")
-    )
-    sparse_cross_modal_consensus = bool(
-        acceptance_meta.get("sparse_cross_modal_consensus")
-    )
-    sparse_consensus_accepted = bool(
-        acceptance_meta.get("sparse_consensus_accepted")
-    )
+    semantic_text_not_degraded = bool(acceptance_meta.get("semantic_text_not_degraded"))
+    sparse_cross_modal_consensus = bool(acceptance_meta.get("sparse_cross_modal_consensus"))
+    sparse_consensus_accepted = bool(acceptance_meta.get("sparse_consensus_accepted"))
     diagnostics = _result(
         "applied" if accepted else "stt_plateau_activity_degraded",
         applied=accepted,
@@ -8956,10 +8511,13 @@ def _subtitle_stt_text_score(aligned: Path, reference: Path) -> dict[str, object
         reference_text = "".join(nearby)
         if not reference_text:
             continue
-        score = max(
-            float(fuzz.ratio(source_text, reference_text)),
-            float(fuzz.partial_ratio(source_text, reference_text)),
-        ) / 100.0
+        score = (
+            max(
+                float(fuzz.ratio(source_text, reference_text)),
+                float(fuzz.partial_ratio(source_text, reference_text)),
+            )
+            / 100.0
+        )
         weight = float(min(36, max(2, len(source_text))))
         weighted_score += score * weight
         total_weight += weight
@@ -9032,9 +8590,7 @@ def _stt_text_clock_candidate(
             segment_ends.append(float(segment.get("end") or segment.get("start") or 0.0))
         except (TypeError, ValueError):
             continue
-    duration = max(
-        [float(source_cues[-1][1]), *segment_ends, 0.25]
-    )
+    duration = max([float(source_cues[-1][1]), *segment_ends, 0.25])
     try:
         alignment = align_light_novel_to_transcript(
             [{"chapter_index": 0, "title": "subtitle", "text": source_text}],
@@ -9130,9 +8686,7 @@ def _stt_text_clock_candidate(
         text_score = text_coverage = activity_score = 0.0
     gate_failures: list[str] = []
     if not bool(transition_safety.get("accepted")):
-        gate_failures.append(
-            "transition_safety:" + str(transition_safety.get("reason") or "rejected")
-        )
+        gate_failures.append("transition_safety:" + str(transition_safety.get("reason") or "rejected"))
     if not bool(text_alignment.get("available")):
         gate_failures.append("text_alignment:unavailable")
     elif text_score < 0.62:
@@ -9164,9 +8718,13 @@ def _stt_text_clock_candidate(
         "frontier_reason": alignment.get("frontier_reason"),
         "confidence": alignment.get("confidence"),
         "build_stages": [
-            "source_parsed", "stt_segments_loaded", "semantic_alignment_built",
-            "cue_clock_mapped", "transition_safety_checked",
-            "semantic_score_checked", "activity_checked",
+            "source_parsed",
+            "stt_segments_loaded",
+            "semantic_alignment_built",
+            "cue_clock_mapped",
+            "transition_safety_checked",
+            "semantic_score_checked",
+            "activity_checked",
         ],
         "mapped_cues": mapped,
         "eligible_cues": eligible,
@@ -9181,6 +8739,7 @@ def _stt_text_clock_candidate(
         # Preserve the rejected clock: it is small and invaluable for benchmark/debug.
         return None, diagnostics
     return output, diagnostics
+
 
 def _try_japanese_stt_fallback(
     video: Path,
@@ -9248,7 +8807,9 @@ def _try_japanese_stt_fallback(
     if text_aligned is not None and bool(stt_text_alignment.get("accepted")):
         text_activity = stt_text_alignment.get("activity")
         try:
-            text_activity_score = float(text_activity.get("weighted") or 0.0) if isinstance(text_activity, dict) else 0.0
+            text_activity_score = (
+                float(text_activity.get("weighted") or 0.0) if isinstance(text_activity, dict) else 0.0
+            )
         except (TypeError, ValueError):
             text_activity_score = 0.0
         return text_aligned, _result(
@@ -9326,15 +8887,7 @@ def _try_japanese_stt_fallback(
         attempt_payload = {
             "split_penalty": float(split_penalty),
             "accepted": accepted,
-            "reason": (
-                "ok"
-                if accepted
-                else (
-                    map_reason
-                    if not map_safe
-                    else "stt_activity_gate_failed"
-                )
-            ),
+            "reason": ("ok" if accepted else (map_reason if not map_safe else "stt_activity_gate_failed")),
             "blocks": result.get("alass_blocks"),
             "distinct_shifts": result.get("alass_distinct_shifts"),
             "shift_spread_seconds": result.get("alass_shift_spread_seconds"),
@@ -9399,6 +8952,7 @@ def _try_japanese_stt_fallback(
     )
     return None, last_result
 
+
 def _verify_extreme_reference_map_with_speech(
     video: Path,
     subtitle: Path,
@@ -9437,11 +8991,7 @@ def _verify_extreme_reference_map_with_speech(
     diagnostics = {
         "attempted": True,
         "accepted": accepted,
-        "reason": (
-            "japanese_speech_verified"
-            if accepted
-            else "japanese_speech_verification_failed"
-        ),
+        "reason": ("japanese_speech_verified" if accepted else "japanese_speech_verification_failed"),
         "engine": speech_result.get("engine"),
         "stt_reason": speech_result.get("reason"),
         "offset_seconds": speech_result.get("offset_seconds"),
@@ -9468,9 +9018,7 @@ def _optimize_subtitle_unguarded(
 ) -> tuple[Path, dict[str, object]]:
     """Choose a safe timing strategy and never trust ambiguous local FFT peaks."""
     container_edit_points = (
-        probe_container_edit_points(video, ffprobe_path)
-        if config.use_container_chapters
-        else []
+        probe_container_edit_points(video, ffprobe_path) if config.use_container_chapters else []
     )
     if subtitle.suffix.casefold() == ".sup":
         if not config.enabled:
@@ -9510,7 +9058,7 @@ def _optimize_subtitle_unguarded(
         if verbose and timing_reference is not None:
             language = timing_reference_result.get("language") or "-"
             title = timing_reference_result.get("title") or "-"
-            print(f"  Эталон тайминга: встроенная дорожка {language}, {title}")
+            print(f"  Timing reference: embedded track {language}, {title}")
 
     prealigned_reference_path: Path | None = None
     prealigned_reference_result: dict[str, object] | None = None
@@ -9590,8 +9138,8 @@ def _optimize_subtitle_unguarded(
                         else:
                             offset_text = "non-linear"
                         print(
-                            "  Прямое сопоставление субтитров через ALASS: "
-                            f"offset={offset_text}, структура={structure_reason}, "
+                            "  Direct subtitle matching via ALASS: "
+                            f"offset={offset_text}, structure={structure_reason}, "
                             f"cues={structure.get('aligned_cues', '-')} / "
                             f"{structure.get('source_cues', '-')}, "
                             f"activity={activity.get('weighted', '-')}"
@@ -9606,9 +9154,7 @@ def _optimize_subtitle_unguarded(
                     validation["alignment_mode"] = "alass-timestamp"
                     validation["estimated_offset_seconds"] = direct_result.get("offset_seconds")
                     validation["alass_constant_shift"] = direct_result.get("alass_constant_shift")
-                    validation["alass_shift_spread_seconds"] = direct_result.get(
-                        "alass_shift_spread_seconds"
-                    )
+                    validation["alass_shift_spread_seconds"] = direct_result.get("alass_shift_spread_seconds")
                     validation["reference_output_structure"] = structure
                     validation["reference_activity"] = activity
                     validation["structure_reason"] = structure_reason
@@ -9690,9 +9236,7 @@ def _optimize_subtitle_unguarded(
                                 force=force,
                             )
                             shifted_validation["alignment_mode"] = "constant-offset-timestamp"
-                            shifted_validation["estimated_offset_seconds"] = round(
-                                candidate_offset, 3
-                            )
+                            shifted_validation["estimated_offset_seconds"] = round(candidate_offset, 3)
                             shifted_validation["constant_offset_estimate"] = dict(estimate)
                             shifted_validation["reference_activity"] = shifted_activity
                             shifted_validation = _apply_robust_semantic_activity_gate(
@@ -9721,9 +9265,9 @@ def _optimize_subtitle_unguarded(
                                 }
                             )
                             if verbose:
-                                state = "принят" if shifted_accepted else "отклонён"
+                                state = "accepted" if shifted_accepted else "rejected"
                                 print(
-                                    "  Проверка constant-offset эталона: "
+                                    "  Constant-offset reference check: "
                                     f"offset={candidate_offset:+.2f}s, {state}, "
                                     f"activity={shifted_activity.get('weighted', '-')}, "
                                     f"phrases={shifted_validation.get('matched_samples', '-')}/"
@@ -9733,21 +9277,11 @@ def _optimize_subtitle_unguarded(
                                 continue
 
                             try:
-                                semantic_matches = float(
-                                    shifted_validation.get("matched_samples") or 0
-                                )
-                                semantic_total = max(
-                                    1.0, float(shifted_validation.get("total_samples") or 1)
-                                )
-                                semantic_similarity = float(
-                                    shifted_validation.get("similarity") or 0.0
-                                )
-                                activity_score = float(
-                                    shifted_activity.get("weighted") or 0.0
-                                )
-                                estimate_priority = float(
-                                    estimate.get("semantic_priority") or 0.0
-                                )
+                                semantic_matches = float(shifted_validation.get("matched_samples") or 0)
+                                semantic_total = max(1.0, float(shifted_validation.get("total_samples") or 1))
+                                semantic_similarity = float(shifted_validation.get("similarity") or 0.0)
+                                activity_score = float(shifted_activity.get("weighted") or 0.0)
+                                estimate_priority = float(estimate.get("semantic_priority") or 0.0)
                             except (TypeError, ValueError):
                                 semantic_matches = 0.0
                                 semantic_total = 1.0
@@ -9791,9 +9325,7 @@ def _optimize_subtitle_unguarded(
                                 verbose=verbose,
                             )
                             final_reference_path = (
-                                repaired_path
-                                if repair_result.get("applied")
-                                else best_shifted_path
+                                repaired_path if repair_result.get("applied") else best_shifted_path
                             )
 
                             best_validation["reference_piecewise_repair"] = repair_result
@@ -9818,7 +9350,7 @@ def _optimize_subtitle_unguarded(
                             recovered = True
                             if verbose:
                                 print(
-                                    "  Выбран лучший constant-offset эталон: "
+                                    "  Best constant-offset reference selected: "
                                     f"offset={best_offset:+.2f}s, "
                                     f"similarity={best_validation.get('similarity', '-')}, "
                                     f"phrases={best_validation.get('matched_samples', '-')}/"
@@ -9843,9 +9375,9 @@ def _optimize_subtitle_unguarded(
 
         if verbose:
             validation = timing_reference_validation or {}
-            state = "принят" if validation.get("accepted") else "отклонён"
+            state = "accepted" if validation.get("accepted") else "rejected"
             print(
-                "  LLM-проверка встроенного эталона: "
+                "  Embedded-reference LLM check: "
                 f"{state}, mode={validation.get('alignment_mode', '-')}, "
                 f"offset={validation.get('estimated_offset_seconds', '-')}, "
                 f"similarity={validation.get('similarity', '-')}, "
@@ -9865,10 +9397,7 @@ def _optimize_subtitle_unguarded(
             alass_result.setdefault("output", str(alass_out))
         else:
             timeline_source = subtitle
-            if (
-                timing_reference is not None
-                and timeline_source.suffix.casefold() in {".ass", ".ssa"}
-            ):
+            if timing_reference is not None and timeline_source.suffix.casefold() in {".ass", ".ssa"}:
                 timeline_source, _timeline_conversion = convert_to_plain_srt(
                     timeline_source,
                     cache_dir,
@@ -9877,15 +9406,17 @@ def _optimize_subtitle_unguarded(
                     verbose=verbose,
                 )
 
-            exact_release_result = _exact_release_zero_offset_result(
-                video, subtitle, timeline_source
-            )
+            exact_release_result = _exact_release_zero_offset_result(video, subtitle, timeline_source)
             if timing_reference is not None and exact_release_result is not None:
                 alass_out = timeline_source
                 alass_result = exact_release_result
                 timeline_attempt = dict(alass_result)
                 _record_timeline_debug_attempt(
-                    cache_dir, video, timeline_source, timing_reference, timeline_attempt,
+                    cache_dir,
+                    video,
+                    timeline_source,
+                    timing_reference,
+                    timeline_attempt,
                     stage="synchronize_subtitle_exact_release",
                 )
             elif timing_reference is not None and timeline_source.suffix.casefold() == ".srt":
@@ -9898,7 +9429,11 @@ def _optimize_subtitle_unguarded(
                 )
                 timeline_attempt = dict(alass_result)
                 _record_timeline_debug_attempt(
-                    cache_dir, video, timeline_source, timing_reference, timeline_attempt,
+                    cache_dir,
+                    video,
+                    timeline_source,
+                    timing_reference,
+                    timeline_attempt,
                     stage="synchronize_subtitle",
                 )
             else:
@@ -9926,30 +9461,50 @@ def _optimize_subtitle_unguarded(
                 alass_result["timeline_alignment_attempt"] = timeline_attempt
             elif verbose:
                 print(
-                    "  Subtitle-only timeline alignment принят до ALASS: "
+                    "  Subtitle-only timeline alignment accepted before ALASS: "
                     f"{alass_result.get('timeline_segments', [])}"
                 )
-        if (bool(alass_result.get("timeline_alignment_reliable"))
-                and _timeline_needs_audio_verification(alass_result)):
+        if bool(alass_result.get("timeline_alignment_reliable")) and _timeline_needs_audio_verification(
+            alass_result
+        ):
             speech_path, speech_result = _try_japanese_stt_fallback(
-                video, subtitle, cache_dir, config, ffmpeg_path=ffmpeg_path,
-                ffprobe_path=ffprobe_path, alass_path=alass_path, verbose=verbose,
+                video,
+                subtitle,
+                cache_dir,
+                config,
+                ffmpeg_path=ffmpeg_path,
+                ffprobe_path=ffprobe_path,
+                alass_path=alass_path,
+                verbose=verbose,
             )
-            if (speech_path is not None and speech_result.get("sync_was_successful")
-                    and speech_result.get("reference_alignment_reliable")):
+            if (
+                speech_path is not None
+                and speech_result.get("sync_was_successful")
+                and speech_result.get("reference_alignment_reliable")
+            ):
                 speech_result["embedded_timeline_audio_verification"] = {
-                    "accepted": True, "risk": alass_result.get("timeline_early_edit_audio_verification"),
+                    "accepted": True,
+                    "risk": alass_result.get("timeline_early_edit_audio_verification"),
                     "timeline_segments": alass_result.get("timeline_segments"),
                 }
                 return speech_path, speech_result
-            use_embedded, unsafe_stt_meta = _strong_embedded_timeline_after_unsafe_stt(alass_result, speech_result)
+            use_embedded, unsafe_stt_meta = _strong_embedded_timeline_after_unsafe_stt(
+                alass_result, speech_result
+            )
             if use_embedded:
                 alass_result["unsafe_stt_map"] = unsafe_stt_meta
-                alass_result["speech_verification"] = {"reason": speech_result.get("reason"), "attempts": speech_result.get("stt_alass_attempts")}
+                alass_result["speech_verification"] = {
+                    "reason": speech_result.get("reason"),
+                    "attempts": speech_result.get("stt_alass_attempts"),
+                }
             else:
-                alass_result.update(sync_was_successful=False, reference_alignment_reliable=False,
-                    reason="timeline_edit_requires_audio_verification", unverified_timeline_edit=True,
-                    speech_verification=speech_result)
+                alass_result.update(
+                    sync_was_successful=False,
+                    reference_alignment_reliable=False,
+                    reason="timeline_edit_requires_audio_verification",
+                    unverified_timeline_edit=True,
+                    speech_verification=speech_result,
+                )
                 return subtitle, alass_result
         if bool(alass_result.get("sync_was_successful")):
             base_engine = (
@@ -9962,9 +9517,7 @@ def _optimize_subtitle_unguarded(
                 and isinstance(alass_result.get("reference_piecewise_repair"), dict)
                 and alass_result["reference_piecewise_repair"].get("applied")
             ):
-                suffix = _reference_repair_engine_suffix(
-                    alass_result["reference_piecewise_repair"]
-                )
+                suffix = _reference_repair_engine_suffix(alass_result["reference_piecewise_repair"])
                 if suffix not in base_engine:
                     base_engine += suffix
             alass_result["engine"] = base_engine
@@ -10029,12 +9582,10 @@ def _optimize_subtitle_unguarded(
                     alass_result["reference_piecewise_repair"] = repair_result
                     if repair_result.get("applied"):
                         activity_path = repaired_path
-                        reference_ok, reference_reason, structure = (
-                            _validate_embedded_reference_output(
-                                source_for_gate,
-                                activity_path,
-                                timing_reference,
-                            )
+                        reference_ok, reference_reason, structure = _validate_embedded_reference_output(
+                            source_for_gate,
+                            activity_path,
+                            timing_reference,
                         )
                         aligned_activity = compare_timing_activity(
                             activity_path,
@@ -10057,52 +9608,37 @@ def _optimize_subtitle_unguarded(
                 speech_replacement = False
                 if (
                     not reference_ok
-                    and discontinuity_gate.get("reason")
-                    == "extreme_map_requires_speech_verification"
+                    and discontinuity_gate.get("reason") == "extreme_map_requires_speech_verification"
                 ):
-                    speech_path, speech_verification = (
-                        _verify_extreme_reference_map_with_speech(
-                            video,
-                            subtitle,
-                            cache_dir,
-                            config,
-                            discontinuity_gate,
-                            ffmpeg_path=ffmpeg_path,
-                            ffprobe_path=ffprobe_path,
-                            alass_path=alass_path,
-                            verbose=verbose,
-                        )
+                    speech_path, speech_verification = _verify_extreme_reference_map_with_speech(
+                        video,
+                        subtitle,
+                        cache_dir,
+                        config,
+                        discontinuity_gate,
+                        ffmpeg_path=ffmpeg_path,
+                        ffprobe_path=ffprobe_path,
+                        alass_path=alass_path,
+                        verbose=verbose,
                     )
                     alass_result["extreme_map_speech_verification"] = speech_verification
                     if speech_path is not None:
                         speech_result_raw = speech_verification.get("result")
-                        speech_result = (
-                            dict(speech_result_raw)
-                            if isinstance(speech_result_raw, dict)
-                            else {}
-                        )
-                        speech_result["selection_reason"] = (
-                            "extreme_map_japanese_speech_verification"
-                        )
+                        speech_result = dict(speech_result_raw) if isinstance(speech_result_raw, dict) else {}
+                        speech_result["selection_reason"] = "extreme_map_japanese_speech_verification"
                         speech_result["embedded_reference_extreme_map"] = {
                             "gate": dict(discontinuity_gate),
                             "engine": alass_result.get("engine"),
                             "offset_seconds": alass_result.get("offset_seconds"),
-                            "shift_spread_seconds": alass_result.get(
-                                "alass_shift_spread_seconds"
-                            ),
+                            "shift_spread_seconds": alass_result.get("alass_shift_spread_seconds"),
                         }
                         successful.append((speech_path, speech_result))
                         speech_replacement = True
 
-                if (
-                    not reference_ok
-                    and discontinuity_gate.get("reason")
-                    in {
-                        "extreme_unconfirmed_alass_discontinuity",
-                        "extreme_map_requires_speech_verification",
-                    }
-                ):
+                if not reference_ok and discontinuity_gate.get("reason") in {
+                    "extreme_unconfirmed_alass_discontinuity",
+                    "extreme_map_requires_speech_verification",
+                }:
                     alass_result["reference_discontinuity_rejected"] = True
                 alass_result["reference_activity_reason"] = reference_reason
                 alass_result["reference_output_structure"] = structure
@@ -10110,8 +9646,8 @@ def _optimize_subtitle_unguarded(
 
                 if verbose:
                     print(
-                        "  Проверка прямого ALASS по английскому эталону: "
-                        f"структура={reference_reason}, cues="
+                        "  Direct ALASS English-reference validation: "
+                        f"structure={reference_reason}, cues="
                         f"{structure.get('aligned_cues', '-')} / {structure.get('source_cues', '-')}, "
                         f"start={aligned_activity.get('start', '-')}, "
                         f"middle={aligned_activity.get('middle', '-')}"
@@ -10176,10 +9712,7 @@ def _optimize_subtitle_unguarded(
                 failure_error = str(alass_result.get("error") or "")
                 if verbose:
                     detail = f": {failure_error}" if failure_error else ""
-                    print(
-                        "  Выравнивание по английскому эталону не выполнено "
-                        f"({failure_reason}){detail}"
-                    )
+                    print(f"  Alignment against English reference failed ({failure_reason}){detail}")
                 for _, existing_result in successful:
                     existing_result["embedded_reference_failure_reason"] = failure_reason
                     if failure_error:
@@ -10207,8 +9740,7 @@ def _optimize_subtitle_unguarded(
     # Audio/FFT is a fallback. Prefer an embedded text subtitle clock:
     # onset matching -> semantic verification -> direct ALASS.
     reference_aligned_already = any(
-        bool(item_result.get("reference_alignment_reliable"))
-        for _item_path, item_result in successful
+        bool(item_result.get("reference_alignment_reliable")) for _item_path, item_result in successful
     )
 
     discontinuity_rejection = _best_reference_discontinuity_rejection(
@@ -10216,9 +9748,7 @@ def _optimize_subtitle_unguarded(
     )
     if discontinuity_rejection is not None and not reference_aligned_already:
         rejected_path, rejected_result = discontinuity_rejection
-        rejected_result["selection_reason"] = (
-            "embedded_reference_discontinuity_rejected_before_audio"
-        )
+        rejected_result["selection_reason"] = "embedded_reference_discontinuity_rejected_before_audio"
         rejected_result["audio_fallback_skipped"] = True
         rejected_result["audio_fallback_skip_reason"] = (
             "embedded_text_reference_is_stronger_than_audio_for_catastrophic_discontinuity"
@@ -10227,8 +9757,8 @@ def _optimize_subtitle_unguarded(
             gate = rejected_result.get("reference_discontinuity_gate")
             gate_data = gate if isinstance(gate, dict) else {}
             print(
-                "  Audio/ffsubsync fallback пропущен: "
-                "встроенная текстовая дорожка уже отклонила большой ALASS-скачок "
+                "  Audio/ffsubsync fallback skipped: "
+                "the embedded text track already rejected a large ALASS jump "
                 f"(spread={gate_data.get('spread_seconds', '?')}s)"
             )
         return rejected_path, rejected_result
@@ -10346,9 +9876,7 @@ def _optimize_subtitle_unguarded(
     # A text subtitle embedded in the same video is a stronger timing reference
     # than audio VAD. If ALASS aligns to it and the residual offset is small, use
     # that result directly and do not run experimental audio-piecewise repair.
-    reference_aligned = [
-        item for item in successful if item[1].get("reference_alignment_reliable")
-    ]
+    reference_aligned = [item for item in successful if item[1].get("reference_alignment_reliable")]
     if reference_aligned:
         best_path, best_result = max(
             reference_aligned,
@@ -10388,13 +9916,13 @@ def _optimize_subtitle_unguarded(
             if verbose and diagnostics.get("available"):
                 if diagnostics.get("reliable"):
                     print(
-                        f"    {result.get('engine')}: локальная проверка надёжна, max offset="
+                        f"    {result.get('engine')}: local validation reliable, max offset="
                         f"{diagnostics.get('max_abs_offset_seconds')}s, spread="
                         f"{diagnostics.get('offset_spread_seconds')}s"
                     )
                 else:
                     print(
-                        f"    {result.get('engine')}: локальная проверка отклонена "
+                        f"    {result.get('engine')}: local validation rejected "
                         f"({diagnostics.get('quality_reason')})"
                     )
 
@@ -10433,9 +9961,7 @@ def _optimize_subtitle_unguarded(
                 "engine": str(result.get("engine", "unknown")),
                 "alignment_score": result.get("alignment_score"),
                 "reason": result.get("reason"),
-                "local_reliable": diagnostics.get("reliable")
-                if isinstance(diagnostics, dict)
-                else None,
+                "local_reliable": diagnostics.get("reliable") if isinstance(diagnostics, dict) else None,
                 "local_quality_reason": diagnostics.get("quality_reason")
                 if isinstance(diagnostics, dict)
                 else None,
@@ -10515,6 +10041,15 @@ def _timeline_validation_regression(
     }
 
 
+# Reasons that say the subtitle content belongs to another episode. The Russian
+# marker matches results stored by versions before audit 68Б.
+_CONTENT_MISMATCH_MARKERS = (
+    "semantic mismatch",
+    "content does not match",
+    "содержание не совпало",
+)
+
+
 def raw_fallback_disqualified(result: dict[str, object]) -> bool:
     """Whether a rejected automatic candidate must not be exposed as raw.
 
@@ -10531,6 +10066,7 @@ def raw_fallback_disqualified(result: dict[str, object]) -> bool:
         return True
     if bool(result.get("unverified_timeline_edit")):
         from .subtitles.verification import verification_failure
+
         failure = verification_failure(result)
         # Missing STT is not negative evidence about the original subtitle's
         # identity. Let the caller apply its episode/language identity checks.
@@ -10539,17 +10075,14 @@ def raw_fallback_disqualified(result: dict[str, object]) -> bool:
 
     reason = str(result.get("reason") or "").casefold()
     normalized_reason = reason.replace("_", " ").replace("-", " ")
-    if "semantic mismatch" in normalized_reason or "содержание не совпало" in normalized_reason:
+    if any(marker in normalized_reason for marker in _CONTENT_MISMATCH_MARKERS):
         return True
 
     validation = result.get("timing_reference_validation")
     if isinstance(validation, dict) and validation.get("accepted") is False:
         validation_reason = str(validation.get("reason") or "").casefold()
         normalized_validation_reason = validation_reason.replace("_", " ").replace("-", " ")
-        if (
-            "semantic mismatch" in normalized_validation_reason
-            or "содержание не совпало" in normalized_validation_reason
-        ):
+        if any(marker in normalized_validation_reason for marker in _CONTENT_MISMATCH_MARKERS):
             return True
     return False
 
@@ -10562,22 +10095,18 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
     check is strong evidence that the subtitle belongs to another episode.
     """
     if not bool(result.get("sync_was_successful")):
-        return False, str(result.get("reason") or "синхронизация не удалась")
+        return False, str(result.get("reason") or err("sync.syncFailed"))
 
     # Hard structural rejects come before every identity exception and before
     # ``reference_alignment_reliable``: exact filenames or high timing activity
     # never make a destroyed time map acceptable.
     guard = result.get("alignment_output_guard")
     if isinstance(guard, dict) and guard.get("status") == "rejected":
-        return False, f"тайминг разрушен при выравнивании: {guard.get('reason')}"
+        return False, err("sync.timingBroken", reason=str(guard.get("reason")))
     if bool(result.get("reference_discontinuity_rejected")):
         gate = result.get("reference_discontinuity_gate")
         gate_data = gate if isinstance(gate, dict) else {}
-        return (
-            False,
-            "встроенная дорожка: ALASS дал неподтверждённый большой скачок "
-            f"(spread={gate_data.get('spread_seconds', '?')}s)",
-        )
+        return False, err("sync.embeddedLargeJump", spread=str(gate_data.get("spread_seconds", "?")))
 
     validation = result.get("timing_reference_validation")
     if isinstance(validation, dict):
@@ -10593,7 +10122,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 and bool(context.get("entry_exact_title_match"))
                 and bool(context.get("single_special_exact_entry"))
                 and str(context.get("subtitle_suffix") or "").casefold()
-                    not in {".sup", ".pgs", ".sub", ".idx"}
+                not in {".sup", ".pgs", ".sub", ".idx"}
             )
             exact_linked_movie = bool(
                 isinstance(context, dict)
@@ -10603,7 +10132,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 and str(context.get("episode_match") or "") == "exact"
                 and str(context.get("media_format") or "").casefold() == "movie"
                 and str(context.get("subtitle_suffix") or "").casefold()
-                    not in {".sup", ".pgs", ".sub", ".idx"}
+                not in {".sup", ".pgs", ".sub", ".idx"}
             )
             exact_linked_numbered_episode = bool(
                 isinstance(context, dict)
@@ -10614,10 +10143,9 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                     bool(context.get("entry_exact_title_match"))
                     or float(context.get("filename_score") or 0.0) >= 80.0
                 )
-                and str(context.get("media_format") or "").casefold()
-                    in {"tv", "tv_short", "ona", "ova"}
+                and str(context.get("media_format") or "").casefold() in {"tv", "tv_short", "ona", "ova"}
                 and str(context.get("subtitle_suffix") or "").casefold()
-                    not in {".sup", ".pgs", ".sub", ".idx"}
+                not in {".sup", ".pgs", ".sub", ".idx"}
             )
             structurally_complete = bool(
                 validation.get("alignment_mode") == "alass-timestamp"
@@ -10628,17 +10156,9 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 and float(activity.get("weighted") or 0.0) >= 0.80
             )
             if exact_single_special and structurally_complete:
-                return (
-                    True,
-                    "точный одноэпизодный SPECIAL Jimaku; "
-                    "текстовая дорожка совпадает по структуре и таймингу",
-                )
+                return True, err("sync.exactSpecial")
             if exact_linked_movie and structurally_complete:
-                return (
-                    True,
-                    "точный фильм AniList/Jimaku; "
-                    "текстовая дорожка совпадает по структуре и таймингу",
-                )
+                return True, err("sync.exactMovie")
             # Exact AniList-linked episode files are substantially stronger identity
             # evidence than semantic spot checks against an embedded translation.
             # Broadcast/streaming masters can differ in sponsor cards, recaps and
@@ -10653,8 +10173,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 and isinstance(structure, dict)
                 and float(structure.get("retained_ratio") or 0.0) >= 0.95
                 and int(structure.get("source_cues") or 0) >= 120
-                and int(structure.get("aligned_cues") or 0)
-                    == int(structure.get("source_cues") or 0)
+                and int(structure.get("aligned_cues") or 0) == int(structure.get("source_cues") or 0)
                 and isinstance(activity, dict)
             )
             if exact_numbered_structure:
@@ -10667,11 +10186,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                     and diagnostics.get("reliable") is False
                 ):
                     severe_local_reason = str(diagnostics.get("quality_reason") or "")
-                    severe_reasons = {
-                        part.strip()
-                        for part in severe_local_reason.split(",")
-                        if part.strip()
-                    }
+                    severe_reasons = {part.strip() for part in severe_local_reason.split(",") if part.strip()}
                     severe_local_failure = bool(
                         severe_reasons
                         & {
@@ -10681,11 +10196,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                         }
                     )
                 if severe_local_failure:
-                    return (
-                        False,
-                        "точная серия найдена, но выбранный тайминг нестабилен: "
-                        + severe_local_reason,
-                    )
+                    return False, err("sync.exactEpisodeUnstable", reason=severe_local_reason)
 
                 weighted_activity = float(activity.get("weighted") or 0.0)
                 matched_samples = int(validation.get("matched_samples") or 0)
@@ -10695,54 +10206,34 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 # independent signal. This identity exception must never override
                 # a severe multi-window timing failure.
                 if weighted_activity >= 0.78 or (
-                    weighted_activity >= 0.65
-                    and total_samples >= 4
-                    and matched_samples >= 2
+                    weighted_activity >= 0.65 and total_samples >= 4 and matched_samples >= 2
                 ):
-                    return (
-                        True,
-                        "точная серия AniList/Jimaku; номер и полная структура "
-                        "подтверждены таймингом",
-                    )
-            return False, str(validation.get("reason") or "содержание не совпало с серией")
+                    return True, err("sync.exactEpisodeConfirmed")
+            return False, str(validation.get("reason") or err("sync.contentMismatch"))
 
     if bool(result.get("reference_discontinuity_rejected")):
         gate = result.get("reference_discontinuity_gate")
         gate_data = gate if isinstance(gate, dict) else {}
-        return (
-            False,
-            "встроенная дорожка: ALASS дал неподтверждённый большой скачок "
-            f"(spread={gate_data.get('spread_seconds', '?')}s)",
-        )
+        return False, err("sync.embeddedLargeJump", spread=str(gate_data.get("spread_seconds", "?")))
 
     from .subtitles.validation import unverified_timeline_edit
+
     if unverified_timeline_edit(result):
         result["unverified_timeline_edit"] = True
-        return False, "изменение часов timeline требует проверки по японской аудиодорожке"
+        return False, err("sync.timelineNeedsAudio")
 
     if bool(result.get("reference_alignment_reliable")):
         timeline_regressed, regression = _timeline_validation_regression(result)
         if timeline_regressed:
             result["timeline_validation_regression"] = regression
-            return (
-                False,
-                "timeline-remap ухудшил исходный тайминг по matched/coverage/F1/error; "
-                "нужна другая временная опора",
-            )
-        return True, "надёжная встроенная временная дорожка"
+            return False, err("sync.timelineRemapWorse")
+        return True, err("sync.reliableEmbeddedTrack")
 
     diagnostics = result.get("segment_diagnostics")
     if isinstance(diagnostics, dict) and bool(diagnostics.get("available")):
         if not bool(diagnostics.get("reliable")):
-            quality_reason = str(
-                diagnostics.get("quality_reason")
-                or "нестабильные метрики в разных участках серии"
-            )
-            reasons = {
-                part.strip()
-                for part in quality_reason.split(",")
-                if part.strip()
-            }
+            quality_reason = str(diagnostics.get("quality_reason") or err("sync.unstableMetrics"))
+            reasons = {part.strip() for part in quality_reason.split(",") if part.strip()}
             context = result.get("candidate_context")
             if isinstance(context, dict):
                 title_similarity_value = float(context.get("title_similarity") or 0.0)
@@ -10750,10 +10241,7 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 exact_identity = (
                     context.get("source") == "jimaku"
                     and context.get("episode_match") == "exact"
-                    and (
-                        bool(context.get("entry_anilist_match"))
-                        or title_similarity_value >= 85.0
-                    )
+                    and (bool(context.get("entry_anilist_match")) or title_similarity_value >= 85.0)
                     and filename_score >= 80.0
                 )
                 # Broadcast masters such as AT-X/BS-EX can differ from a CR video
@@ -10761,13 +10249,44 @@ def subtitle_quality_accepted(result: dict[str, object]) -> tuple[bool, str]:
                 # hits while the interior timing and exact Jimaku identity remain
                 # trustworthy. Do not treat this single diagnostic as a different
                 # episode; semantic mismatch and large-jump failures still reject.
-                if exact_identity and reasons == {"too_many_boundary_hits"}:
-                    return True, "точная серия Jimaku; различаются только границы эфира"
-            return False, str(
-                quality_reason
-            )
+                if (
+                    exact_identity
+                    and reasons == {"too_many_boundary_hits"}
+                    and _boundary_hits_are_only_broadcast_edges(diagnostics)
+                ):
+                    return True, err("sync.broadcastBoundaries")
+            return False, str(quality_reason)
 
     return True, "ok"
+
+
+def _boundary_hits_are_only_broadcast_edges(diagnostics: dict) -> bool:
+    """True when boundary hits are confined to the broadcast edges.
+
+    A different broadcast master shifts the opening/sponsor cards and credits,
+    but the interior still aligns. When most windows fail, most successful
+    windows sit on the search limit, or the offsets span the whole search
+    range, the subtitle is a different episode (e.g. an absolute-numbered
+    sequel file) and must not be accepted on identity alone. Diagnostics
+    without these measurements keep the legacy behaviour.
+    """
+
+    def number(key: str) -> float | None:
+        value = diagnostics.get(key)
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    if bool(diagnostics.get("spans_full_search")):
+        return False
+    successful_ratio = number("successful_ratio")
+    if successful_ratio is not None and successful_ratio < 0.5:
+        return False
+    edge_hit_ratio = number("edge_hit_ratio")
+    if edge_hit_ratio is not None and edge_hit_ratio > 0.5:
+        return False
+    return True
 
 
 _EMBEDDED_REFERENCE_SRT_ACTIVITY_TOLERANCE = 0.005
@@ -10867,11 +10386,7 @@ def _rank_embedded_reference_candidates(
         }.get(value, 1),
         default="unknown",
     )
-    same_language_pool = [
-        item
-        for item in language_pool
-        if language_priority(item) == best_language_priority
-    ]
+    same_language_pool = [item for item in language_pool if language_priority(item) == best_language_priority]
     best_same_language_activity = max(
         (activity_value(item) for item in same_language_pool),
         default=best_activity,
@@ -10942,6 +10457,7 @@ def _rank_embedded_reference_candidates(
         "raw_best": best_raw_candidate.name if best_raw_candidate is not None else None,
     }
 
+
 def _exact_jimaku_timing_consensus(
     items: list[
         tuple[
@@ -10961,7 +10477,8 @@ def _exact_jimaku_timing_consensus(
         dict[str, object],
         dict[str, object],
         dict[str, object],
-    ] | None,
+    ]
+    | None,
     dict[str, object],
 ]:
     """Trust several exact Jimaku releases that independently fit one clock.
@@ -11006,8 +10523,7 @@ def _exact_jimaku_timing_consensus(
             and float(candidate.score) >= 75.0
         )
         structurally_complete = (
-            structure.get("reason") == "ok"
-            and float(structure.get("retained_ratio") or 0.0) >= 0.95
+            structure.get("reason") == "ok" and float(structure.get("retained_ratio") or 0.0) >= 0.95
         )
         if exact_identity and structurally_complete and weighted >= 0.80:
             qualified.append((weighted, item))
@@ -11167,7 +10683,6 @@ def _exact_jimaku_audio_clock_consensus(
     return (selected[1], selected[2], selected[3]), payload
 
 
-
 def _embedded_rank_regression_guard(
     sorted_prealigned: list[tuple[object, ...]],
     risky_candidate: SubtitleCandidate,
@@ -11229,6 +10744,7 @@ def _embedded_rank_regression_guard(
     }
     return (winner if accepted else None), meta
 
+
 def _optimize_candidates_unguarded(
     video: Path,
     candidates: Iterable[SubtitleCandidate],
@@ -11249,32 +10765,30 @@ def _optimize_candidates_unguarded(
     """Score every candidate with one shared audio analysis, then optimize the winner."""
     all_candidates = list(candidates)
     identity_rejected = [
-        candidate for candidate in all_candidates
-        if _candidate_explicit_anilist_mismatch(candidate)
+        candidate for candidate in all_candidates if _candidate_explicit_anilist_mismatch(candidate)
     ]
     verification_attempts: list[dict[str, object]] = []
     candidate_list = [
-        candidate for candidate in all_candidates
-        if not _candidate_explicit_anilist_mismatch(candidate)
+        candidate for candidate in all_candidates if not _candidate_explicit_anilist_mismatch(candidate)
     ]
     if not candidate_list:
-        reason = (
-            "explicit_anilist_identity_mismatch"
-            if identity_rejected
-            else "no_candidates"
-        )
-        return None, None, _result(
-            reason,
-            sync_was_successful=False,
-            identity_rejected=[
-                {
-                    "name": candidate.name,
-                    "source": candidate.source,
-                    "entry_anilist_id": candidate.details.get("entry_anilist_id"),
-                    "requested_anilist_id": candidate.details.get("requested_anilist_id"),
-                }
-                for candidate in identity_rejected
-            ],
+        reason = "explicit_anilist_identity_mismatch" if identity_rejected else "no_candidates"
+        return (
+            None,
+            None,
+            _result(
+                reason,
+                sync_was_successful=False,
+                identity_rejected=[
+                    {
+                        "name": candidate.name,
+                        "source": candidate.source,
+                        "entry_anilist_id": candidate.details.get("entry_anilist_id"),
+                        "requested_anilist_id": candidate.details.get("requested_anilist_id"),
+                    }
+                    for candidate in identity_rejected
+                ],
+            ),
         )
     if identity_rejected:
         configure_logging().info(
@@ -11290,17 +10804,13 @@ def _optimize_candidates_unguarded(
             ],
         )
     container_edit_points = (
-        probe_container_edit_points(video, ffprobe_path)
-        if config.use_container_chapters
-        else []
+        probe_container_edit_points(video, ffprobe_path) if config.use_container_chapters else []
     )
     # Prefer a subtitle clock before extracting audio. Container chapters make
     # the deterministic exact-episode consensus and local cut repair useful even
     # when semantic LLM checks are disabled (the default). Only ambiguous
     # candidates enter the optional LLM loop below.
-    if config.use_container_chapters or (
-        validate_embedded_reference_with_llm and llm is not None
-    ):
+    if config.use_container_chapters or (validate_embedded_reference_with_llm and llm is not None):
         timing_reference, timing_reference_result = extract_embedded_timing_reference(
             video,
             cache_dir,
@@ -11313,7 +10823,7 @@ def _optimize_candidates_unguarded(
             if verbose:
                 language = timing_reference_result.get("language") or "-"
                 title = timing_reference_result.get("title") or "-"
-                print(f"  Эталон до аудиоанализа: встроенная дорожка {language}, {title}")
+                print(f"  Reference before audio analysis: embedded track {language}, {title}")
 
             prealigned: list[
                 tuple[
@@ -11324,6 +10834,11 @@ def _optimize_candidates_unguarded(
                     dict[str, object],
                     dict[str, object],
                 ]
+            ] = []
+            # One translation published as SRT and ASS (or uploaded twice) has
+            # the same cues: align it once and reuse the result for the copy.
+            aligned_cue_sets: list[
+                tuple[tuple[str, list[tuple[float, float]]], str, dict[str, object] | None]
             ] = []
             for index, candidate in enumerate(candidate_list, start=1):
                 if candidate.path.suffix.casefold() not in {".srt", ".ass", ".ssa"}:
@@ -11339,6 +10854,45 @@ def _optimize_candidates_unguarded(
                     )
                     if semantic_source.suffix.casefold() != ".srt":
                         continue
+
+                cue_set = _candidate_cue_set(semantic_source)
+                earlier = next(
+                    (entry for entry in aligned_cue_sets if _same_cue_set(entry[0], cue_set)),
+                    None,
+                )
+                if earlier is not None:
+                    _cues, earlier_name, earlier_item = earlier
+                    configure_logging().info(
+                        "CACHE step=subtitle.candidate_same_cues video=%s candidate=%r same_as=%r",
+                        video.name,
+                        candidate.name,
+                        earlier_name,
+                    )
+                    if earlier_item is None:
+                        continue  # the same cues already failed to align
+                    native_srt = float(prefer_srt and candidate.path.suffix.casefold() == ".srt")
+                    reused_result = dict(earlier_item["alass_result"])
+                    reused_result["alignment_reused_from"] = earlier_name
+                    prealigned.append(
+                        (
+                            (
+                                earlier_item["rank"][0],
+                                earlier_item["rank"][1],
+                                native_srt,
+                                float(candidate.score),
+                            ),
+                            candidate,
+                            earlier_item["aligned"],
+                            reused_result,
+                            dict(earlier_item["activity"]),
+                            dict(earlier_item["structure"]),
+                        )
+                    )
+                    continue
+                memo_slot: int | None = None
+                if cue_set is not None:
+                    memo_slot = len(aligned_cue_sets)
+                    aligned_cue_sets.append((cue_set, candidate.name, None))
 
                 exact_release_result = _exact_release_zero_offset_result(
                     video, candidate.path, semantic_source
@@ -11359,7 +10913,11 @@ def _optimize_candidates_unguarded(
                     timeline_attempt = dict(alass_result)
                     debug_stage = f"optimize_candidate_{index}"
                 _record_timeline_debug_attempt(
-                    cache_dir, video, semantic_source, timing_reference, timeline_attempt,
+                    cache_dir,
+                    video,
+                    semantic_source,
+                    timing_reference,
+                    timeline_attempt,
                     stage=debug_stage,
                 )
                 if not bool(alass_result.get("timeline_alignment_reliable")):
@@ -11377,14 +10935,14 @@ def _optimize_candidates_unguarded(
                     alass_result["timeline_alignment_attempt"] = timeline_attempt
                 elif verbose:
                     print(
-                        "  Subtitle-only timeline alignment принят: "
+                        "  Subtitle-only timeline alignment accepted: "
                         f"segments={alass_result.get('timeline_segments', [])}"
                     )
                 if not bool(alass_result.get("sync_was_successful")):
                     if verbose:
                         print(
-                            f"  Субтитровый кандидат {index}/{len(candidate_list)}: "
-                            f"ALASS не выполнен ({alass_result.get('reason', '-')})"
+                            f"  Subtitle candidate {index}/{len(candidate_list)}: "
+                            f"ALASS failed ({alass_result.get('reason', '-')})"
                         )
                     continue
                 if alass_result.get("offset_seconds") is None:
@@ -11425,6 +10983,18 @@ def _optimize_candidates_unguarded(
                         structure_payload,
                     )
                 )
+                if memo_slot is not None and cue_set is not None:
+                    aligned_cue_sets[memo_slot] = (
+                        cue_set,
+                        candidate.name,
+                        {
+                            "rank": rank,
+                            "aligned": aligned_plain,
+                            "alass_result": dict(alass_result),
+                            "activity": dict(activity),
+                            "structure": dict(structure_payload),
+                        },
+                    )
                 if verbose:
                     offset = alass_result.get("offset_seconds")
                     constant_shift = alass_result.get("alass_constant_shift")
@@ -11435,8 +11005,8 @@ def _optimize_candidates_unguarded(
                     else:
                         offset_text = "non-linear"
                     print(
-                        f"  Субтитровый кандидат {index}/{len(candidate_list)}: "
-                        f"offset={offset_text}, структура={structure_reason}, "
+                        f"  Subtitle candidate {index}/{len(candidate_list)}: "
+                        f"offset={offset_text}, structure={structure_reason}, "
                         f"activity={activity.get('weighted', '-')}"
                     )
 
@@ -11460,7 +11030,7 @@ def _optimize_candidates_unguarded(
                 )
                 if verbose:
                     print(
-                        "  Выбран чистый SRT с приемлемым качеством тайминга: "
+                        "  Selected a clean SRT with acceptable timing quality: "
                         f"{embedded_rank_meta.get('selected')}"
                     )
             risky_timeline_item = next(
@@ -11480,22 +11050,11 @@ def _optimize_candidates_unguarded(
                         or (
                             isinstance(item[3].get("timeline_validation"), dict)
                             and (
-                                float(
-                                    item[3]["timeline_validation"]
-                                    .get("after", {})
-                                    .get("f1", 0.0)
-                                    or 0.0
-                                ) >= 0.72
-                                or bool(
-                                    item[3]["timeline_validation"].get(
-                                        "layered_reference_acceptance"
-                                    )
-                                )
+                                float(item[3]["timeline_validation"].get("after", {}).get("f1", 0.0) or 0.0)
+                                >= 0.72
+                                or bool(item[3]["timeline_validation"].get("layered_reference_acceptance"))
                             )
-                            and float(
-                                item[3]["timeline_validation"].get("activity_f1", 0.0)
-                                or 0.0
-                            ) >= 0.72
+                            and float(item[3]["timeline_validation"].get("activity_f1", 0.0) or 0.0) >= 0.72
                         )
                     )
                 ),
@@ -11551,22 +11110,11 @@ def _optimize_candidates_unguarded(
                         or (
                             isinstance(item[3].get("timeline_validation"), dict)
                             and (
-                                float(
-                                    item[3]["timeline_validation"]
-                                    .get("after", {})
-                                    .get("f1", 0.0)
-                                    or 0.0
-                                ) >= 0.72
-                                or bool(
-                                    item[3]["timeline_validation"].get(
-                                        "layered_reference_acceptance"
-                                    )
-                                )
+                                float(item[3]["timeline_validation"].get("after", {}).get("f1", 0.0) or 0.0)
+                                >= 0.72
+                                or bool(item[3]["timeline_validation"].get("layered_reference_acceptance"))
                             )
-                            and float(
-                                item[3]["timeline_validation"].get("activity_f1", 0.0)
-                                or 0.0
-                            ) >= 0.72
+                            and float(item[3]["timeline_validation"].get("activity_f1", 0.0) or 0.0) >= 0.72
                         )
                     )
                 ),
@@ -11606,7 +11154,7 @@ def _optimize_candidates_unguarded(
                 )
                 if verbose:
                     print(
-                        "  Выбран deterministic subtitle timeline: "
+                        "  Selected deterministic subtitle timeline: "
                         f"{candidate.name}; "
                         f"segments={timeline_result.get('timeline_segments', [])}"
                     )
@@ -11621,9 +11169,7 @@ def _optimize_candidates_unguarded(
                     _risk_activity,
                     _risk_structure,
                 ) = risky_timeline_item
-                risk_payload = risky_timeline_result.get(
-                    "timeline_early_edit_audio_verification"
-                )
+                risk_payload = risky_timeline_result.get("timeline_early_edit_audio_verification")
                 configure_logging().info(
                     "VERIFY step=subtitle.early_edit_speech video=%s candidate=%r risk=%s",
                     video.name,
@@ -11647,14 +11193,12 @@ def _optimize_candidates_unguarded(
                 ):
                     salvaged_repair: dict[str, object] | None = None
                     if risky_timeline_salvaged:
-                        repaired_baseline, salvaged_repair = (
-                            _repair_salvaged_sparse_preop_after_bad_stt_map(
-                                _embedded_aligned,
-                                risky_timeline_result,
-                                speech_result,
-                                timing_reference,
-                                cache_dir,
-                            )
+                        repaired_baseline, salvaged_repair = _repair_salvaged_sparse_preop_after_bad_stt_map(
+                            _embedded_aligned,
+                            risky_timeline_result,
+                            speech_result,
+                            timing_reference,
+                            cache_dir,
                         )
                         if bool(salvaged_repair.get("applied")):
                             final_result = dict(risky_timeline_result)
@@ -11724,21 +11268,17 @@ def _optimize_candidates_unguarded(
                     if speech_aligned is None:
                         pass
                     else:
-                        speech_aligned, opening_scaffold = (
-                            _restore_embedded_opening_clock_scaffold(
-                                speech_aligned,
-                                risky_timeline_result,
-                                speech_result,
-                                cache_dir,
-                                embedded_reference=timing_reference,
-                            )
+                        speech_aligned, opening_scaffold = _restore_embedded_opening_clock_scaffold(
+                            speech_aligned,
+                            risky_timeline_result,
+                            speech_result,
+                            cache_dir,
+                            embedded_reference=timing_reference,
                         )
-                        prefer_embedded, conflict_meta = (
-                            _prefer_embedded_timeline_over_conflicting_speech(
-                                risky_timeline_result,
-                                speech_result,
-                                opening_scaffold,
-                            )
+                        prefer_embedded, conflict_meta = _prefer_embedded_timeline_over_conflicting_speech(
+                            risky_timeline_result,
+                            speech_result,
+                            opening_scaffold,
                         )
                         if prefer_embedded and not risky_timeline_salvaged:
                             final_result = dict(risky_timeline_result)
@@ -11788,12 +11328,10 @@ def _optimize_candidates_unguarded(
                             speech_aligned,
                             timing_reference,
                         )
-                        protected_item, regression_guard = (
-                            _embedded_rank_regression_guard(
-                                sorted_prealigned,
-                                risky_candidate,
-                                speech_activity,
-                            )
+                        protected_item, regression_guard = _embedded_rank_regression_guard(
+                            sorted_prealigned,
+                            risky_candidate,
+                            speech_activity,
                         )
                         if protected_item is not None:
                             (
@@ -11939,13 +11477,9 @@ def _optimize_candidates_unguarded(
                     return risky_candidate, _embedded_aligned, final_result
 
             embedded_consensus_pool = [
-                item
-                for item in sorted_prealigned
-                if not _timeline_needs_audio_verification(item[3])
+                item for item in sorted_prealigned if not _timeline_needs_audio_verification(item[3])
             ]
-            consensus_item, consensus = _exact_jimaku_timing_consensus(
-                embedded_consensus_pool
-            )
+            consensus_item, consensus = _exact_jimaku_timing_consensus(embedded_consensus_pool)
             if consensus_item is not None:
                 _rank, candidate, aligned, alass_result, activity, structure = consensus_item
 
@@ -11956,9 +11490,7 @@ def _optimize_candidates_unguarded(
                 # first dialogue cues before trusting the global subtitle clock.
                 consensus_attempt = alass_result.get("timeline_alignment_attempt")
                 if isinstance(consensus_attempt, dict):
-                    salvaged_consensus = _salvage_sparse_preopening_timeline_attempt(
-                        consensus_attempt
-                    )
+                    salvaged_consensus = _salvage_sparse_preopening_timeline_attempt(consensus_attempt)
                     if salvaged_consensus is not None:
                         speech_aligned, speech_result = _try_japanese_stt_fallback(
                             video,
@@ -12025,9 +11557,7 @@ def _optimize_candidates_unguarded(
                                 )
                                 return candidate, repaired_consensus, final_result
 
-                consensus_reason = str(
-                    consensus.get("reason") or "exact_jimaku_timing_consensus"
-                )
+                consensus_reason = str(consensus.get("reason") or "exact_jimaku_timing_consensus")
                 group_matching_basis = aligned
                 repaired_aligned, repair_result = repair_with_embedded_reference_piecewise(
                     aligned,
@@ -12113,17 +11643,13 @@ def _optimize_candidates_unguarded(
                 )
                 if verbose:
                     print(
-                        "  Точная серия подтверждена строгим совпадением "
-                        f"AniList/Jimaku и таймингов: {candidate.name}"
+                        "  Exact episode confirmed by a strict AniList/Jimaku "
+                        f"and timing match: {candidate.name}"
                     )
                 return candidate, aligned, final_result
 
             semantic_candidates = (
-                [
-                    item
-                    for item in sorted_prealigned
-                    if not _timeline_needs_audio_verification(item[3])
-                ][:5]
+                [item for item in sorted_prealigned if not _timeline_needs_audio_verification(item[3])][:5]
                 if validate_embedded_reference_with_llm and llm is not None
                 else []
             )
@@ -12143,16 +11669,14 @@ def _optimize_candidates_unguarded(
                 validation["alignment_mode"] = "alass-timestamp"
                 validation["estimated_offset_seconds"] = alass_result.get("offset_seconds")
                 validation["alass_constant_shift"] = alass_result.get("alass_constant_shift")
-                validation["alass_shift_spread_seconds"] = alass_result.get(
-                    "alass_shift_spread_seconds"
-                )
+                validation["alass_shift_spread_seconds"] = alass_result.get("alass_shift_spread_seconds")
                 validation["reference_activity"] = activity
                 validation["reference_output_structure"] = structure
                 validation = _apply_robust_semantic_activity_gate(validation, activity)
                 if verbose:
-                    state = "принят" if validation.get("accepted") else "отклонён"
+                    state = "accepted" if validation.get("accepted") else "rejected"
                     print(
-                        f"  LLM-проверка субтитрового кандидата {semantic_index}/"
+                        f"  LLM check of subtitle candidate {semantic_index}/"
                         f"{min(5, len(prealigned))}: {state}, "
                         f"similarity={validation.get('similarity', '-')}, "
                         f"phrases={validation.get('matched_samples', '-')}/"
@@ -12237,15 +11761,45 @@ def _optimize_candidates_unguarded(
         verbose=verbose,
     )
     if verbose and reference is not None:
-        state = "кэш" if reference_result.get("reason") == "cached" else "готов"
-        print(f"  Общий аудиоанализ: {state}")
+        state = "cached" if reference_result.get("reason") == "cached" else "ready"
+        print(f"  Shared audio analysis: {state}")
 
     evaluation_config = replace(config, engine="ffsubsync", compare_engines=False)
-    evaluated: list[tuple[SubtitleCandidate, Path, dict[str, object]]] = []
-    for index, candidate in enumerate(candidate_list, start=1):
+    # Identical files in the same format (re-uploads) are evaluated once; the
+    # output keeps the input format, so an SRT never reuses an ASS result.
+    plan: list[tuple[SubtitleCandidate, int | None]] = []
+    seen_cue_sets: list[tuple[str, tuple[str, list[tuple[float, float]]], int]] = []
+    for position, candidate in enumerate(candidate_list):
+        suffix = candidate.path.suffix.casefold()
+        cue_set = _candidate_cue_set(candidate.path) if suffix == ".srt" else None
+        earlier = next(
+            (entry[2] for entry in seen_cue_sets if entry[0] == suffix and _same_cue_set(entry[1], cue_set)),
+            None,
+        )
+        plan.append((candidate, earlier))
+        if earlier is None and cue_set is not None:
+            seen_cue_sets.append((suffix, cue_set, position))
+    unique = [position for position, (_candidate, earlier) in enumerate(plan) if earlier is None]
+    outcomes: dict[int, tuple[Path, dict[str, object]]] = {}
+    workers = _candidate_evaluation_workers(len(unique)) if reference is not None else 1
+    if workers > 1:
+        outcomes = _evaluate_candidates_in_processes(
+            video,
+            [(position, plan[position][0]) for position in unique],
+            cache_dir,
+            evaluation_config,
+            ffmpeg_path=ffmpeg_path,
+            force=force,
+            reference=reference,
+            workers=workers,
+        )
+    for position in unique:
+        if position in outcomes:
+            continue
+        candidate = plan[position][0]
         if verbose:
-            print(f"  Проверка {index}/{len(candidate_list)}: {candidate.name}")
-        path, result = synchronize_subtitle(
+            print(f"  Checking {position + 1}/{len(candidate_list)}: {candidate.name}")
+        outcomes[position] = synchronize_subtitle(
             video,
             candidate.path,
             cache_dir,
@@ -12257,6 +11811,22 @@ def _optimize_candidates_unguarded(
             tag="candidate-eval",
             reference=reference,
         )
+    evaluated: list[tuple[SubtitleCandidate, Path, dict[str, object]]] = []
+    for position, (candidate, earlier) in enumerate(plan):
+        if earlier is not None:
+            path, result = outcomes[earlier]
+            reused = dict(result)
+            reused["engine"] = "ffsubsync-evaluation"
+            reused["alignment_reused_from"] = plan[earlier][0].name
+            evaluated.append((candidate, path, reused))
+            configure_logging().info(
+                "CACHE step=subtitle.candidate_same_cues video=%s candidate=%r same_as=%r",
+                video.name,
+                candidate.name,
+                plan[earlier][0].name,
+            )
+            continue
+        path, result = outcomes[position]
         result["engine"] = "ffsubsync-evaluation"
         evaluated.append((candidate, path, result))
         if verbose:
@@ -12265,9 +11835,7 @@ def _optimize_candidates_unguarded(
                 f"offset={result.get('offset_seconds', '-')}, reason={result.get('reason')}"
             )
 
-    successful_evaluated = [
-        item for item in evaluated if bool(item[2].get("sync_was_successful"))
-    ]
+    successful_evaluated = [item for item in evaluated if bool(item[2].get("sync_was_successful"))]
     audio_consensus_item, audio_consensus = _exact_jimaku_audio_clock_consensus(
         evaluated, prefer_srt=prefer_srt
     )
@@ -12291,7 +11859,8 @@ def _optimize_candidates_unguarded(
         )
         configure_logging().info(
             "ACCEPT step=subtitle.audio_clock_consensus video=%s candidate=%r offsets=%s spread=%s",
-            video.name, candidate.name,
+            video.name,
+            candidate.name,
             audio_consensus.get("offsets_seconds"),
             audio_consensus.get("offset_spread_seconds"),
         )
@@ -12326,9 +11895,7 @@ def _optimize_candidates_unguarded(
         default=1,
     )
     preferred_language_pool = [
-        item
-        for item in selection_pool
-        if candidate_language_priority(item) == best_language_priority
+        item for item in selection_pool if candidate_language_priority(item) == best_language_priority
     ] or selection_pool
 
     best_alignment = max(
@@ -12340,8 +11907,7 @@ def _optimize_candidates_unguarded(
         abs(best_alignment) * max(0.0, srt_tolerance_ratio) if best_alignment != float("-inf") else 0.0,
     )
     near_best = [
-        item for item in preferred_language_pool
-        if alignment_value(item) >= best_alignment - tolerance
+        item for item in preferred_language_pool if alignment_value(item) >= best_alignment - tolerance
     ] or preferred_language_pool
 
     def candidate_score(item: tuple[SubtitleCandidate, Path, dict[str, object]]) -> tuple[int, float, float]:
@@ -12392,14 +11958,10 @@ def _optimize_candidates_unguarded(
             "offset_seconds": result.get("offset_seconds"),
             "successful": bool(result.get("sync_was_successful")),
             "language_purity": (
-                candidate.details.get("language_purity")
-                if isinstance(candidate.details, dict)
-                else None
+                candidate.details.get("language_purity") if isinstance(candidate.details, dict) else None
             ),
             "bilingual_cjk": bool(
-                candidate.details.get("bilingual_cjk")
-                if isinstance(candidate.details, dict)
-                else False
+                candidate.details.get("bilingual_cjk") if isinstance(candidate.details, dict) else False
             ),
         }
         for candidate, _, result in evaluated
@@ -12494,17 +12056,122 @@ def _optimize_candidates_unguarded(
                 final_result["selection_reason"] = "quality_fallback_candidate"
             return candidate, final_path, final_result
         if verbose and attempt_index < min(8, len(ordered_items)):
-            print(
-                f"  Вариант {attempt_index} отклонён ({quality_reason}); "
-                "проверяю следующий источник…"
-            )
+            print(f"  Candidate {attempt_index} rejected ({quality_reason}); checking the next source…")
 
     last_result["speech_verification_attempts"] = verification_attempts
     last_result["quality_fallback_attempts"] = quality_attempts
     last_result["candidate_quality_accepted"] = False
-    last_result["candidate_quality_reason"] = "все проверенные варианты отклонены"
+    last_result["candidate_quality_reason"] = err("sync.allCheckedRejected")
     return None, None, last_result
 
+
+_PARALLEL_CANDIDATE_CHECKS = 3
+
+
+def _candidate_evaluation_workers(count: int) -> int:
+    """How many candidates are checked at once: 2-3 on mains power, else one by one.
+
+    Only the episode-preparation process opts in (PUDGE_CANDIDATE_PROCESSES); each
+    check runs in its own process, so memory and CPU peaks are kept off battery.
+    """
+    if count < 2 or os.environ.get("PUDGE_CANDIDATE_PROCESSES") != "auto":
+        return 1
+    if os.uname().sysname != "Darwin":
+        return 1
+    try:
+        from .power_policy import PowerPolicy
+
+        snapshot = PowerPolicy(run_command=subprocess.run).snapshot(refresh=True)
+    except Exception:  # noqa: BLE001 - unknown power state: stay serial
+        return 1
+    if snapshot.on_battery is not False or snapshot.thermal_limited or snapshot.mode != "normal":
+        return 1
+    return max(1, min(_PARALLEL_CANDIDATE_CHECKS, (os.cpu_count() or 2) // 2, count))
+
+
+def _evaluate_candidates_in_processes(
+    video: Path,
+    items: list[tuple[int, SubtitleCandidate]],
+    cache_dir: Path,
+    config: SyncConfig,
+    *,
+    ffmpeg_path: str,
+    force: bool,
+    reference: Path | None,
+    workers: int,
+) -> dict[int, tuple[Path, dict[str, object]]]:
+    """Check candidates in parallel processes; whatever fails here is checked one by one after."""
+    import concurrent.futures
+    import multiprocessing
+
+    results: dict[int, tuple[Path, dict[str, object]]] = {}
+    started = time.monotonic()
+    try:
+        context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+            futures = {
+                pool.submit(
+                    synchronize_subtitle,
+                    video,
+                    candidate.path,
+                    cache_dir,
+                    config,
+                    ffmpeg_path=ffmpeg_path,
+                    force=force,
+                    verbose=False,
+                    quiet=True,
+                    tag="candidate-eval",
+                    reference=reference,
+                ): position
+                for position, candidate in items
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    results[futures[future]] = future.result()
+                except Exception as exc:  # noqa: BLE001 - retried serially by the caller
+                    configure_logging().warning(
+                        "RETRY step=subtitle.parallel_candidate video=%s error=%r", video.name, exc
+                    )
+    except Exception as exc:  # noqa: BLE001 - no pool (spawn failed): serial checks
+        configure_logging().warning(
+            "FALLBACK step=subtitle.parallel_candidates video=%s error=%r", video.name, exc
+        )
+    configure_logging().info(
+        "RESULT step=subtitle.parallel_candidates video=%s workers=%s checked=%s/%s seconds=%.1f",
+        video.name,
+        workers,
+        len(results),
+        len(items),
+        time.monotonic() - started,
+    )
+    return results
+
+
+def _candidate_cue_set(path: Path) -> tuple[str, list[tuple[float, float]]] | None:
+    """Dialogue text hash plus every cue's times, for spotting the same file twice."""
+    try:
+        cues = parse_srt(Path(path))
+    except Exception:  # noqa: BLE001 - unreadable means "align it normally"
+        return None
+    if not cues:
+        return None
+    text = "\n".join(re.sub(r"\s+", "", cue[2]) for cue in cues)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest(), [(float(cue[0]), float(cue[1])) for cue in cues]
+
+
+def _same_cue_set(
+    first: tuple[str, list[tuple[float, float]]] | None,
+    second: tuple[str, list[tuple[float, float]]] | None,
+    *,
+    tolerance: float = 0.02,
+) -> bool:
+    """Same text and the same times within ASS centisecond rounding."""
+    if first is None or second is None or first[0] != second[0] or len(first[1]) != len(second[1]):
+        return False
+    return all(
+        abs(a_start - b_start) <= tolerance and abs(a_end - b_end) <= tolerance
+        for (a_start, a_end), (b_start, b_end) in zip(first[1], second[1])
+    )
 
 
 def _subtitle_text_fingerprint(path: Path, cache_dir: Path) -> str:
@@ -12540,15 +12207,14 @@ def _guard_alignment_result(
             return result
     except OSError:
         pass
-    music_stabilization = stabilize_music_marker_pairs(
-        Path(raw), output, cache_dir=Path(cache_dir)
-    )
+    music_stabilization = stabilize_music_marker_pairs(Path(raw), output, cache_dir=Path(cache_dir))
     if music_stabilization.get("applied"):
         result["alignment_music_marker_stabilization"] = music_stabilization
     verdict = validate_alignment_output(Path(raw), output, cache_dir=Path(cache_dir))
     result["alignment_output_guard"] = verdict
     try:
         from .subtitles.timing_runs import final_timing_runs
+
         result["final_timing_runs"] = final_timing_runs(Path(raw), output)
     except (OSError, ValueError):
         result["final_timing_runs"] = []
@@ -12562,7 +12228,10 @@ def _guard_alignment_result(
         result["candidate_quality_reason"] = reason
         configure_logging().warning(
             "REJECT step=subtitle.alignment_guard raw=%s output=%s reason=%s diagnostics=%s",
-            Path(raw).name, output.name, verdict.get("reason"), verdict.get("diagnostics"),
+            Path(raw).name,
+            output.name,
+            verdict.get("reason"),
+            verdict.get("diagnostics"),
         )
     return result
 
@@ -12585,13 +12254,8 @@ def _recover_rejected_clock(
         return path, result
     # A semantic/identity failure cannot be cured by moving timestamps.
     validation = result.get("timing_reference_validation")
-    validation_reason = (
-        str(validation.get("reason") or "") if isinstance(validation, dict) else ""
-    )
-    if (
-        "semantic" in validation_reason.casefold()
-        and validation.get("accepted") is False
-    ):
+    validation_reason = str(validation.get("reason") or "") if isinstance(validation, dict) else ""
+    if "semantic" in validation_reason.casefold() and validation.get("accepted") is False:
         return path, result
     from .subtitles.speech_recovery import recover_constant_speech_clock
 
@@ -12623,9 +12287,7 @@ def _recover_rejected_clock(
             )
         if source.suffix.casefold() != ".srt":
             return path, result
-        recovered, recovery = recover_constant_speech_clock(
-            source, Path(str(transcript)), cache_dir
-        )
+        recovered, recovery = recover_constant_speech_clock(source, Path(str(transcript)), cache_dir)
     except (OSError, ValueError, TypeError, subprocess.SubprocessError) as exc:
         result["speech_constant_recovery"] = {
             "attempted": True,
@@ -12677,6 +12339,7 @@ def optimize_subtitle(
     _guard_alignment_result(subtitle, path, result, cache_dir)
     path, result = _recover_rejected_clock(video, subtitle, path, result, cache_dir, config, **kwargs)
     from .subtitles.verification import annotate_verification
+
     annotate_verification(result)
     return path, result
 
@@ -12691,18 +12354,33 @@ def optimize_candidates(
     """Guarded candidate choice: no early-return branch can hand out a file
     that fails the output guard or the quality gate; the next candidate is tried."""
     remaining = list(candidates)
-    initial_identity_rejected = [{"name": c.name, "source": c.source, "entry_anilist_id": c.details.get("entry_anilist_id"), "requested_anilist_id": c.details.get("requested_anilist_id")} for c in remaining if _candidate_explicit_anilist_mismatch(c)]
+    initial_identity_rejected = [
+        {
+            "name": c.name,
+            "source": c.source,
+            "entry_anilist_id": c.details.get("entry_anilist_id"),
+            "requested_anilist_id": c.details.get("requested_anilist_id"),
+        }
+        for c in remaining
+        if _candidate_explicit_anilist_mismatch(c)
+    ]
     rejected: list[dict[str, object]] = []
     last_result: dict[str, object] = {}
     for _attempt in range(max(1, len(remaining))):
         selected, path, result = _optimize_candidates_unguarded(
-            video, remaining, cache_dir, config, **kwargs  # type: ignore[arg-type]
+            video,
+            remaining,
+            cache_dir,
+            config,
+            **kwargs,  # type: ignore[arg-type]
         )
         last_result = result
         if selected is None or path is None:
             break
         _guard_alignment_result(selected.path, path, result, cache_dir)
-        path, result = _recover_rejected_clock(video, selected.path, path, result, cache_dir, config, **kwargs)
+        path, result = _recover_rejected_clock(
+            video, selected.path, path, result, cache_dir, config, **kwargs
+        )
         last_result = result
         if selected.path.suffix.casefold() not in TEXT_SUBTITLE_EXTENSIONS:
             # Bitmap flows (OCR fallback) keep their own acceptance rules.
@@ -12714,18 +12392,22 @@ def optimize_candidates(
                 break
             result["candidate_quality_accepted"] = False
             result["candidate_quality_reason"] = reason
-        rejected.append({
-            "name": selected.name,
-            "path": str(selected.path),
-            "reason": str(result.get("candidate_quality_reason") or result.get("reason") or ""),
-            "raw_fallback_disqualified": raw_fallback_disqualified(result),
-            "rejected_output": str(path),
-            "alignment_output_guard": result.get("alignment_output_guard"),
-            "speech_constant_recovery": result.get("speech_constant_recovery"),
-        })
+        rejected.append(
+            {
+                "name": selected.name,
+                "path": str(selected.path),
+                "reason": str(result.get("candidate_quality_reason") or result.get("reason") or ""),
+                "raw_fallback_disqualified": raw_fallback_disqualified(result),
+                "rejected_output": str(path),
+                "alignment_output_guard": result.get("alignment_output_guard"),
+                "speech_constant_recovery": result.get("speech_constant_recovery"),
+            }
+        )
         configure_logging().warning(
             "REJECT step=subtitle.optimize_candidates_guard candidate=%s reason=%s remaining=%s",
-            selected.name, rejected[-1]["reason"], len(remaining) - 1,
+            selected.name,
+            rejected[-1]["reason"],
+            len(remaining) - 1,
         )
         remaining = [c for c in remaining if c is not selected and c.path != selected.path]
         selected, path = None, None
@@ -12741,10 +12423,11 @@ def optimize_candidates(
         if selected is None or path is None:
             last_result["last_candidate_failure_reason"] = last_result.get("reason")
             last_result["reason"] = "all_candidate_quality_checks_failed"
-            last_result["candidate_quality_reason"] = "все подходящие варианты отклонены; причины сохранены по каждому источнику"
+            last_result["candidate_quality_reason"] = err("sync.allSuitableRejected")
     if initial_identity_rejected:
         last_result["identity_rejected"] = initial_identity_rejected
     from .subtitles.verification import annotate_verification
+
     annotate_verification(last_result)
     last_result.setdefault("alignment_guard_version", GUARD_VERSION)
     if selected is None or path is None:

@@ -1,11 +1,11 @@
 """Global Off must fence both user actions and delayed On follow-ups."""
+
 from __future__ import annotations
 
 import logging
 import threading
 import time
 from types import SimpleNamespace
-from pathlib import Path
 
 from pudge import web_app
 from pudge.config import AppConfig
@@ -52,7 +52,7 @@ def _api(tmp_path, events, *, enabled, client=None):
     api.manager = SimpleNamespace(
         config=api.config,
         db=SimpleNamespace(downloads=lambda: [SimpleNamespace(torrent_hash="abc", raw={"backend": "aria2"})]),
-        torrent_clients=lambda: (events.append("clients") or [("aria2", client or _Client(events))]),
+        torrent_clients=lambda: events.append("clients") or [("aria2", client or _Client(events))],
         auto_search_current=lambda: events.append("search") or 1,
         download_intents=SimpleNamespace(waiting_count=lambda: 0),
         torrent_backend_name=lambda: "aria2",
@@ -63,7 +63,7 @@ def _api(tmp_path, events, *, enabled, client=None):
     api._bump_ui_state_version = lambda: None
     api._downloads_configured = lambda: True
     api.task_supervisor = _Supervisor()
-    api._quiesce_torrent_backends = lambda *, reason: (events.append("quiesce") or {})
+    api._quiesce_torrent_backends = lambda *, reason: events.append("quiesce") or {}
     return api
 
 
@@ -148,6 +148,8 @@ def test_off_waits_for_in_flight_resume_before_shutting_down(tmp_path, monkeypat
             off_thread.join(timeout=5)
     assert not action_thread.is_alive() and not off_thread.is_alive()
     assert not failures
+    # Off answered at once; its background half stops the backends after the resume.
+    assert api._wait_torrent_off_quiet(5)
     assert events.index("start:abc") < events.index("quiesce")
     assert api.torrent_download_action("abc", "resume")["blocked_by_global_off"] is True
 
@@ -177,10 +179,12 @@ def test_old_off_does_not_stop_newer_on(tmp_path, monkeypatch):
         assert api.set_torrents_enabled(True)["enabled"] is True
     off_thread.join(timeout=5)
     assert not off_thread.is_alive()
+    assert api._wait_torrent_off_quiet(5)
     assert "quiesce" not in events
 
 
-def test_qbittorrent_off_attempts_other_hashes_after_pause_error(tmp_path, monkeypatch):
+def test_qbittorrent_off_stops_every_hash_in_one_call(tmp_path, monkeypatch):
+    # One torrents/stop call for all hashes (it used to be one call, and one login, per hash).
     events = []
     api = _api(tmp_path, events, enabled=False)
     api.config.qbittorrent.enabled = True
@@ -188,6 +192,7 @@ def test_qbittorrent_off_attempts_other_hashes_after_pause_error(tmp_path, monke
         SimpleNamespace(torrent_hash="broken"),
         SimpleNamespace(torrent_hash="healthy"),
     ]
+    failing = {"pause": False}
 
     class FakeQBittorrent:
         def __init__(self, *args, **kwargs):
@@ -195,19 +200,50 @@ def test_qbittorrent_off_attempts_other_hashes_after_pause_error(tmp_path, monke
 
         def pause(self, value):
             events.append(value)
-            if value == "broken":
-                raise OSError("test first pause failed")
+            if failing["pause"]:
+                raise OSError("test pause failed")
 
         def close(self):
             events.append("close")
 
     monkeypatch.setattr(web_app, "QBittorrentClient", FakeQBittorrent)
-    assert api._quiesce_qbittorrent(reason="test") == 1
-    assert events == ["broken", "healthy", "close"]
+    assert api._quiesce_qbittorrent(reason="test") == 2
+    assert events == ["broken|healthy", "close"]
+    events.clear()
+    failing["pause"] = True
+    assert api._quiesce_qbittorrent(reason="test") == 0
+    assert events == ["broken|healthy", "close"]
 
 
-def test_download_center_handles_global_off_without_dropping_downloads():
-    text = (Path(__file__).resolve().parents[1] / "pudge/web/index.html").read_text()
-    action = text.split("if(['torrent-pause','torrent-resume'", 1)[1].split("if(action==='open-needs-action'", 1)[0]
-    assert "if(result?.blocked_by_global_off)" in action
-    assert action.index("if(result?.blocked_by_global_off)") < action.index("ui.downloadCenter={...result,mediaId}")
+def test_download_center_handles_global_off_without_dropping_downloads(page):
+    # Torrents were switched off globally (another process): the backend refuses to resume.
+    # The window says why and keeps the list; it used to replace it with the empty answer.
+    download = {
+        "hash": "abc",
+        "name": "Show 03",
+        "state": "paused",
+        "progress": 0.4,
+        "media_id": 7,
+        "backend": "aria2",
+    }
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            await openDownloadCenter(7); await __tick(20);
+            const rows = () => [...document.querySelectorAll('#modalBody [data-download-hash]')].map(n => n.dataset.downloadHash);
+            const before = rows();
+            await __click('#modalBody [data-action="torrent-resume"]'); await __tick(20);
+            return {before, after: rows(), toasts: __toasts(), expected: PudgeI18n.t('ui.enableTorrentsBeforeResuming'),
+                    enabled: !document.querySelector('#modalBody [data-action="torrent-resume"]').disabled};
+            """,
+            lang=lang,
+            state={"settings": {"torrents_enabled": True}},
+            api={
+                "torrent_downloads": {"downloads": [download], "backend": "aria2"},
+                "torrent_download_action": {"ok": False, "blocked_by_global_off": True, "downloads": []},
+            },
+        )
+        out = result.value
+        assert result.calls_of("torrent_download_action") == [["abc", "resume", False, "aria2"]]
+        assert out["before"] == out["after"] == ["abc"]
+        assert out["toasts"] == [out["expected"]] and out["enabled"] is True

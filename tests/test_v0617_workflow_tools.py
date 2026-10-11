@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pudge import ocr
 from pudge.config import AppConfig
 from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
+from tests.i18n_support import en
 
 
 def make_manager(tmp_path: Path) -> AnimeManager:
@@ -25,9 +27,7 @@ def test_manual_subtitle_is_copied_and_queued_with_high_priority(tmp_path: Path)
     manager.db.upsert_anime(LibraryAnime(media_id=10, title="Example"))
     video = tmp_path / "library" / "Example - 01.mkv"
     video.write_bytes(b"video")
-    manager.db.upsert_episode(
-        LibraryEpisode(media_id=10, title="Example", episode=1, video_path=video)
-    )
+    manager.db.upsert_episode(LibraryEpisode(media_id=10, title="Example", episode=1, video_path=video))
     subtitle = tmp_path / "manual.srt"
     subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nこんにちは\n", encoding="utf-8")
 
@@ -50,7 +50,9 @@ def test_subtitle_inbox_change_requeues_unresolved_jobs(tmp_path: Path) -> None:
     video = tmp_path / "library" / "Inbox Show - 02.mkv"
     video.write_bytes(b"video")
     manager.db.upsert_episode(
-        LibraryEpisode(media_id=11, title="Inbox Show", episode=2, video_path=video, state="waiting_subtitles")
+        LibraryEpisode(
+            media_id=11, title="Inbox Show", episode=2, video_path=video, state="waiting_subtitles"
+        )
     )
     manager.db.queue_subtitle_job(video, 11, 2, delay_seconds=3600, error="waiting")
 
@@ -74,7 +76,9 @@ def test_episode_diagnostics_explain_missing_subtitles(tmp_path: Path) -> None:
     video = tmp_path / "library" / "Diagnostic Show - 03.mkv"
     video.write_bytes(b"video")
     manager.db.upsert_episode(
-        LibraryEpisode(media_id=12, title="Diagnostic Show", episode=3, video_path=video, state="waiting_text_subtitles")
+        LibraryEpisode(
+            media_id=12, title="Diagnostic Show", episode=3, video_path=video, state="waiting_text_subtitles"
+        )
     )
     manager.db.queue_subtitle_job(video, 12, 3, error="Only image subtitles found")
 
@@ -85,8 +89,6 @@ def test_episode_diagnostics_explain_missing_subtitles(tmp_path: Path) -> None:
     subtitle_check = next(item for item in result["checks"] if item["key"] == "subtitle")
     assert subtitle_check["ok"] is False
     assert "image subtitles" in subtitle_check["detail"]
-
-
 
 
 def test_episode_diagnostics_do_not_expose_missing_internal_row_as_video_status(tmp_path: Path) -> None:
@@ -114,14 +116,67 @@ def test_ocr_quality_gate_flags_weak_results_and_accepts_normal_results() -> Non
     assert good["status"] == "accepted"
 
 
-def test_web_ui_exposes_settings_maintenance_diagnostics_and_repair() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'data-page="downloads"' not in html
-    assert 'id="settingsMaintenance"' in html
-    assert "openEpisodeDiagnostics" in html
-    assert "choose_manual_subtitle" in html
-    assert "repair_library" in html
-    assert "Subtitle Inbox" in html
+def test_why_not_ready_lets_the_user_choose_a_subtitle_file(tmp_path: Path, page) -> None:
+    # A waiting card opens "Why not ready?" (the backend's real diagnosis); its "Choose
+    # subtitle" button asks the backend for a manual file and shows the new diagnosis.
+    manager = make_manager(tmp_path)
+    manager.config.ui.language = "en"
+    manager.db.upsert_anime(LibraryAnime(media_id=12, title="Diagnostic Show"))
+    video = tmp_path / "library" / "Diagnostic Show - 03.mkv"
+    video.write_bytes(b"video")
+    manager.db.upsert_episode(
+        LibraryEpisode(
+            media_id=12, title="Diagnostic Show", episode=3, video_path=video, state="waiting_text_subtitles"
+        )
+    )
+    manager.db.queue_subtitle_job(video, 12, 3, error="Only image subtitles found")
+    diagnosis = json.loads(json.dumps(manager.diagnose_episode(12, 3), default=str))
+    card = {
+        "media_id": 12,
+        "title": "Diagnostic Show",
+        "episodes": 12,
+        "next_episode": 3,
+        "site_url": "https://anilist.co/anime/12",
+        "local": {"episode": 3, "state": "waiting_text_subtitles", "video_path": str(video)},
+    }
+    result = page.run(
+        r"""
+        await __click('#currentContent [data-action="diagnose-card"][data-media-id="12"]'); await __tick(20);
+        const out = {title: __text('#modalTitle'), checks: __text('#modalBody .diagnostic-checks'), expected: t('action.whyNotReady')};
+        await __click('#modalBody [data-action="choose-diagnostic-subtitle"]'); await __tick(20);
+        out.open = $('modalBackdrop').classList.contains('open');
+        return out;
+        """,
+        state={"home": {"waiting": [card]}, "current": [card]},
+        api={"diagnose_episode": diagnosis, "choose_manual_subtitle": {"ok": True}},
+    )
+    out = result.value
+    assert out["title"] == f"{out['expected']} — Diagnostic Show"
+    assert "image subtitles" in out["checks"]
+    assert result.calls_of("choose_manual_subtitle") == [[str(video)]]
+    assert result.calls_of("diagnose_episode") == [[12, 3], [12, 3]] and out["open"] is True
+
+
+def test_settings_repair_library_reports_what_it_fixed(page) -> None:
+    # Settings > Maintenance (where the old Downloads page's tools live, see
+    # test_v0663_ln_reader_search_and_epub.py) repairs the library and lists the counts.
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            setPage('settings', true); await __tick(20);
+            const inMaintenance = Boolean($('repairLibrary').closest('#settingsMaintenance'));
+            await __click('#repairLibrary'); await __tick(20);
+            return {inMaintenance, page: ui.page, summary: __text('#repairSummary'), enabled: !$('repairLibrary').disabled,
+                    expected: `${t('uiC.repair.staleSubtitles')}: 2 • ${t('uiC.repair.jobsCreated')}: 1`};
+            """,
+            lang=lang,
+            before="__api.repair_library = async () => ({result: {stale_subtitles: 2, jobs_created: 1}, state: await __api.get_state()});",
+        )
+        out = result.value
+        assert out["inMaintenance"] is True and out["page"] == "settings" and out["enabled"] is True
+        assert out["summary"] == out["expected"]
+        assert result.calls_of("repair_library") == [[]]
+    assert en("settings.subtitleFolder") == "Subtitle Inbox"
 
 
 def test_episode_diagnostics_localize_persisted_prepare_output_to_english(tmp_path: Path) -> None:

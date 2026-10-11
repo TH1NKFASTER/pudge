@@ -23,7 +23,9 @@ def _service(tmp_path: Path) -> AudiobookService:
     )
 
 
-@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg/ffprobe unavailable")
+@pytest.mark.skipif(
+    not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg/ffprobe unavailable"
+)
 @pytest.mark.parametrize("directory", ["audio", "reader's audio"])
 def test_precision_window_extracts_across_file_boundary(tmp_path: Path, monkeypatch, directory: str) -> None:
     # A literal backslash-n or unescaped apostrophe makes real concat fail.
@@ -33,12 +35,26 @@ def test_precision_window_extracts_across_file_boundary(tmp_path: Path, monkeypa
     for index, frequency in enumerate((440, 880)):
         source = folder / f"part-{index}.flac"
         subprocess.run(
-            ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i",
-             f"sine=frequency={frequency}:sample_rate=16000:duration=1", "-c:a", "flac", str(source)],
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"sine=frequency={frequency}:sample_rate=16000:duration=1",
+                "-c:a",
+                "flac",
+                str(source),
+            ],
             check=True,
             capture_output=True,
         )
-        files.append({"file_index": index, "path": str(source), "start": float(index), "end": float(index + 1)})
+        files.append(
+            {"file_index": index, "path": str(source), "start": float(index), "end": float(index + 1)}
+        )
     service = _service(tmp_path)
     monkeypatch.setattr(service, "_file_rows", lambda _book_id: files)
     destination = folder / "boundary.flac"
@@ -48,7 +64,9 @@ def test_precision_window_extracts_across_file_boundary(tmp_path: Path, monkeypa
     assert (start, duration) == pytest.approx((0.75, 0.75))
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(destination)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert float(json.loads(probe.stdout)["format"]["duration"]) == pytest.approx(0.75, abs=0.01)
     assert not list(folder.glob("pudge-chapter-start-parts-*"))
@@ -94,7 +112,8 @@ def test_ipc_returns_only_matching_complete_reply(tmp_path: Path, monkeypatch, f
             return [expected[:7], expected[7:19], expected[19:]]
         return [
             b'{"event":"property-change","data":13}\n'
-            + json.dumps({"request_id": request_id + 1, "error": "success", "data": 99}).encode() + b"\n"
+            + json.dumps({"request_id": request_id + 1, "error": "success", "data": 99}).encode()
+            + b"\n"
             + expected
         ]
 
@@ -117,9 +136,12 @@ def test_ipc_does_not_accept_an_unsolicited_event_as_acknowledgement(tmp_path: P
 
 
 def test_ipc_bounds_total_reply_bytes(tmp_path: Path, monkeypatch) -> None:
-    client = _IPCSocket(lambda request_id: [
-        json.dumps({"request_id": request_id, "error": "success", "data": "x" * (1024 * 1024)}).encode() + b"\n"
-    ])
+    client = _IPCSocket(
+        lambda request_id: [
+            json.dumps({"request_id": request_id, "error": "success", "data": "x" * (1024 * 1024)}).encode()
+            + b"\n"
+        ]
+    )
     monkeypatch.setattr("pudge.audiobooks.socket.socket", lambda *_args: client)
 
     assert AudiobookService._ipc_command(tmp_path / "book.sock", ["get_property", "time-pos"]) is None
@@ -153,7 +175,9 @@ class _Player:
 def _live_book(tmp_path: Path, monkeypatch, *, multifile: bool = False, paused: bool = False):
     service = _service(tmp_path)
     monkeypatch.setattr(service, "_probe", lambda _path: (100.0, []))
-    monkeypatch.setattr(service, "prepare_transcription", lambda *_args, **_kwargs: {"status": "queued", "ready": False})
+    monkeypatch.setattr(
+        service, "prepare_transcription", lambda *_args, **_kwargs: {"status": "queued", "ready": False}
+    )
     monkeypatch.setattr(service, "_tracked_thread", lambda **_kwargs: None)
     monkeypatch.setattr(service, "_tempo_filter_args", lambda: ())
     folder = tmp_path / "book"
@@ -172,7 +196,9 @@ def _live_book(tmp_path: Path, monkeypatch, *, multifile: bool = False, paused: 
 
     def command(_path, payload):
         if payload[0] == "seek":
-            live["time-pos"] = float(payload[1]) + (float(live["time-pos"]) if payload[2] == "relative" else 0.0)
+            live["time-pos"] = float(payload[1]) + (
+                float(live["time-pos"]) if payload[2] == "relative" else 0.0
+            )
         elif payload[0] == "set_property":
             live[payload[1]] = payload[2]
         return {"request_id": 1, "error": "success", "data": None}
@@ -184,7 +210,9 @@ def _live_book(tmp_path: Path, monkeypatch, *, multifile: bool = False, paused: 
 
 
 @pytest.mark.parametrize("control", ["absolute", "relative"])
-def test_seek_then_immediate_stop_persists_accepted_position(tmp_path: Path, monkeypatch, control: str) -> None:
+def test_seek_then_immediate_stop_persists_accepted_position(
+    tmp_path: Path, monkeypatch, control: str
+) -> None:
     # Stop must consume the same position that seek publishes to the UI/DB.
     service, book_id, _process, _ipc_path, _live = _live_book(tmp_path, monkeypatch)
 
@@ -197,7 +225,9 @@ def test_seek_then_immediate_stop_persists_accepted_position(tmp_path: Path, mon
 
 def test_relative_seek_publishes_target_before_live_clock_catches_up(tmp_path: Path, monkeypatch) -> None:
     service, book_id, _process, _ipc_path, _live = _live_book(tmp_path, monkeypatch)
-    monkeypatch.setattr(service, "_ipc_command", lambda _path, _command: {"request_id": 1, "error": "success", "data": None})
+    monkeypatch.setattr(
+        service, "_ipc_command", lambda _path, _command: {"request_id": 1, "error": "success", "data": None}
+    )
 
     result = service.seek(book_id, 50.0)
     service.stop(book_id)
@@ -241,7 +271,9 @@ def test_paired_reader_waits_for_post_ack_clock_then_resumes_tracking(tmp_path: 
     service, book_id, _process, _ipc_path, live = _live_book(tmp_path, monkeypatch, paused=True)
     with service.db.connect() as conn:
         conn.execute("CREATE TABLE ln_chapters (book_id INTEGER)")
-    monkeypatch.setattr(service, "link_for_light_novel", lambda *_args, **_kwargs: {"book": service.book(book_id)})
+    monkeypatch.setattr(
+        service, "link_for_light_novel", lambda *_args, **_kwargs: {"book": service.book(book_id)}
+    )
     monkeypatch.setattr(service, "_load_alignment", lambda *_args: None)
     monkeypatch.setattr(service, "alignment_status", lambda *_args: {"status": "not_started", "ready": False})
     monkeypatch.setattr(service, "_ipc_command", lambda *_args: {"error": "success"})
@@ -268,7 +300,9 @@ def test_seek_clock_guard_expires_when_player_never_confirms(tmp_path: Path, mon
 
 
 def test_cross_file_restart_repairs_unhonored_start_before_clock_guard(tmp_path: Path, monkeypatch) -> None:
-    service, book_id, _process, _ipc_path, _live = _live_book(tmp_path, monkeypatch, multifile=True, paused=True)
+    service, book_id, _process, _ipc_path, _live = _live_book(
+        tmp_path, monkeypatch, multifile=True, paused=True
+    )
     clock, commands = [100.0], []
     monkeypatch.setattr("pudge.audiobooks.time.monotonic", lambda: clock[0])
     monkeypatch.setattr("pudge.audiobooks.subprocess.Popen", lambda *_args, **_kwargs: _Player())
@@ -310,7 +344,9 @@ def test_paired_reader_discards_position_read_started_before_seek(tmp_path: Path
     service, book_id, _process, _ipc_path, _live = _live_book(tmp_path, monkeypatch, paused=True)
     with service.db.connect() as conn:
         conn.execute("CREATE TABLE ln_chapters (book_id INTEGER)")
-    monkeypatch.setattr(service, "link_for_light_novel", lambda *_args, **_kwargs: {"book": service.book(book_id)})
+    monkeypatch.setattr(
+        service, "link_for_light_novel", lambda *_args, **_kwargs: {"book": service.book(book_id)}
+    )
     monkeypatch.setattr(service, "_load_alignment", lambda *_args: None)
     monkeypatch.setattr(service, "alignment_status", lambda *_args: {"status": "not_started", "ready": False})
 
@@ -326,17 +362,30 @@ def test_paired_reader_discards_position_read_started_before_seek(tmp_path: Path
     assert service.book(book_id)["position"] == 70.0
 
 
-@pytest.mark.parametrize("transition,paused", [("cross-file", True), ("cross-file", False), ("relative-cross-file", True), ("seek-error", True)])
-def test_seek_restart_preserves_transport_context(tmp_path: Path, monkeypatch, transition: str, paused: bool) -> None:
-    service, book_id, _process, _ipc_path, live = _live_book(tmp_path, monkeypatch, multifile=True, paused=paused)
+@pytest.mark.parametrize(
+    "transition,paused",
+    [("cross-file", True), ("cross-file", False), ("relative-cross-file", True), ("seek-error", True)],
+)
+def test_seek_restart_preserves_transport_context(
+    tmp_path: Path, monkeypatch, transition: str, paused: bool
+) -> None:
+    service, book_id, _process, _ipc_path, live = _live_book(
+        tmp_path, monkeypatch, multifile=True, paused=paused
+    )
     service.set_speed(book_id, 1.75)
     service.set_sleep_timer(book_id, seconds=60.0)
     deadline = service._sleep_deadlines[book_id]
     # Chapter-end timers and paired review state survive the same transition.
     service._sleep_chapter_ends[book_id] = 160.0
-    context = {"origin": "ln", "consumer": "ln", "ln_book_id": 9, "chapter": 1,
-               "ranges": [{"chapter_index": 1, "start": 100.0, "end": 160.0}],
-               "pending_chapter": 2, "session": "before-seek"}
+    context = {
+        "origin": "ln",
+        "consumer": "ln",
+        "ln_book_id": 9,
+        "chapter": 1,
+        "ranges": [{"chapter_index": 1, "start": 100.0, "end": 160.0}],
+        "pending_chapter": 2,
+        "session": "before-seek",
+    }
     service._review_contexts[book_id] = dict(context)
     launches = []
 
@@ -348,10 +397,16 @@ def test_seek_restart_preserves_transport_context(tmp_path: Path, monkeypatch, t
 
     monkeypatch.setattr("pudge.audiobooks.subprocess.Popen", launch)
     if transition == "seek-error":
-        monkeypatch.setattr(service, "_ipc_command", lambda _path, _command: {"request_id": 1, "error": "error", "data": None})
+        monkeypatch.setattr(
+            service, "_ipc_command", lambda _path, _command: {"request_id": 1, "error": "error", "data": None}
+        )
     target = 70.0 if transition == "seek-error" else 125.0
 
-    result = service.seek(book_id, 105.0) if transition == "relative-cross-file" else service.seek_to(book_id, target)
+    result = (
+        service.seek(book_id, 105.0)
+        if transition == "relative-cross-file"
+        else service.seek_to(book_id, target)
+    )
 
     assert result["book"]["position"] == target
     assert result["book"]["paused"] is paused
@@ -408,7 +463,9 @@ def test_legacy_mpv_can_start_audiobook_on_macos(tmp_path: Path, monkeypatch, le
     assert process.wait(timeout=5) == 0
 
 
-@pytest.mark.parametrize("extra_args", [["--keep-open=always"], ["--keep-open=yes"], ["--keep-open"], ["--no-keep-open"]])
+@pytest.mark.parametrize(
+    "extra_args", [["--keep-open=always"], ["--keep-open=yes"], ["--keep-open"], ["--no-keep-open"]]
+)
 def test_video_keeps_explicit_user_keep_open_setting(extra_args: list[str]) -> None:
     command = build_mpv_command("mpv", Path("episode.mkv"), None, None, extra_args)
 

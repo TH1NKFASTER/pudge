@@ -2,33 +2,63 @@
 --
 -- Pudge writes a session JSON (PUDGE_SEGMENTS_FILE) with already detected
 -- segments before starting mpv; this script never analyses anything.
--- The button is shown only inside [start, end) and seeks to `end`
--- (absolute+exact), so a scene after the ending credits stays.  Clicks are
+-- The button is shown only during the first BUTTON_SECONDS of [start, end)
+-- (also after seeking back into them) and seeks to `end` (absolute+exact),
+-- so a scene after the ending credits stays.  Clicks are
 -- captured only while the pointer is over the button; the key binding exists
--- only while the button is visible.  Automatic skipping is opt-in and happens
--- once per segment when playback runs into it (never after seeking back).
+-- only while the button is visible.  There is no automatic skipping.
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
 local segments_file = os.getenv('PUDGE_SEGMENTS_FILE') or ''
-local ui_language = (os.getenv('PUDGE_UI_LANGUAGE') or 'en'):lower()
 local skip_key = os.getenv('PUDGE_SHORTCUT_SKIP_SEGMENT') or 'Tab'
-local auto_skip = {
-    intro = (os.getenv('PUDGE_AUTO_SKIP_INTRO') or '0') == '1',
-    outro = (os.getenv('PUDGE_AUTO_SKIP_OUTRO') or '0') == '1',
-}
 
-local function tr(english, russian)
-    if ui_language == 'ru' then return russian end
-    return english
+-- Interface texts come from the window's string catalog: cli.py passes the
+-- path of pudge/web/locales.<lang>.js in PUDGE_LOCALE_FILE. The file is strict
+-- JSON wrapped in one JavaScript line (between the first '= {' and the last
+-- '};'). Without it every text falls back to English.
+local function load_locale()
+    local path = os.getenv('PUDGE_LOCALE_FILE') or ''
+    if path == '' then return {} end
+    local handle = io.open(path, 'r')
+    if not handle then return {} end
+    local content = handle:read('*a') or ''
+    handle:close()
+    local start = content:find('= {', 1, true)
+    local finish, position = nil, 1
+    while true do
+        local found = content:find('};', position, true)
+        if not found then break end
+        finish, position = found, found + 1
+    end
+    if not start or not finish or finish <= start then return {} end
+    local data = utils.parse_json(content:sub(start + 2, finish))
+    if type(data) ~= 'table' then return {} end
+    return data
+end
+
+local locale = load_locale()
+
+-- tr_key('osd.someKey', 'English fallback', {name = value}) with {name} fields.
+local function tr_key(key, fallback, params)
+    local text = locale[key]
+    if type(text) ~= 'string' or text == '' then text = fallback end
+    if params then
+        text = (text:gsub('{([%w_]+)}', function(name)
+            local value = params[name]
+            if value == nil then return nil end
+            return tostring(value)
+        end))
+    end
+    return text
 end
 
 local session = nil
 local segments = {}
 local current = nil
-local last_time = nil
-local auto_done = {}
+local shown = false -- the button (and its key) is on screen
+local BUTTON_SECONDS = 5
 local hovered = false
 local key_bound = false
 local mouse_bound = false
@@ -84,9 +114,17 @@ end
 
 local function label(segment)
     if segment.kind == 'intro' then
-        return tr('Skip opening', 'Пропустить опенинг')
+        return tr_key('osd.skipOpening', 'Skip opening')
     end
-    return tr('Skip ending', 'Пропустить эндинг')
+    return tr_key('osd.skipEnding', 'Skip ending')
+end
+
+-- Approximate label width in Latin-letter units: a Cyrillic letter takes two
+-- UTF-8 bytes and is about 1.1 Latin letters wide.
+local function text_units(value)
+    local text = tostring(value or '')
+    local _, ascii = text:gsub('[\1-\127]', '')
+    return ascii + (#text - ascii) / 1.8
 end
 
 local function ass_escape(value)
@@ -112,7 +150,7 @@ local function clear_button()
 end
 
 local function draw_button()
-    if not current or not overlay then
+    if not current or not shown or not overlay then
         clear_button()
         return
     end
@@ -123,7 +161,7 @@ local function draw_button()
     local font = math.max(18, math.floor(height * 0.03))
     local hint = skip_key ~= '' and ('  ' .. skip_key) or ''
     local text = label(current)
-    local text_width = math.floor((#text / (ui_language == 'ru' and 1.8 or 1.0) + #hint * 0.8) * font * 0.55)
+    local text_width = math.floor((text_units(text) + #hint * 0.8) * font * 0.55)
     local box_w = text_width + font * 2
     local box_h = math.floor(font * 2.1)
     local x1 = math.floor(width - width * 0.03)
@@ -166,8 +204,8 @@ skip_current = function(reason)
     -- skip never adds watched seconds (they are wall-clock, not position).
     mp.commandv('script-message', 'pudge-segment-skip', segment.kind,
         string.format('%.3f', from), string.format('%.3f', segment.finish), reason or 'manual')
-    auto_done[segment.id] = true
     current = nil
+    shown = false
     set_key(false)
     clear_button()
     mp.commandv('seek', string.format('%.3f', segment.finish), 'absolute+exact')
@@ -202,7 +240,7 @@ end
 
 update_hover = function(_, pos)
     if type(pos) ~= 'table' then pos = mp.get_property_native('mouse-pos') or {} end
-    local inside = current ~= nil and point_in_button(tonumber(pos.x), tonumber(pos.y))
+    local inside = current ~= nil and shown and point_in_button(tonumber(pos.x), tonumber(pos.y))
     if inside then bind_mouse() else unbind_mouse() end
     if inside ~= hovered then
         hovered = inside
@@ -221,37 +259,25 @@ local function evaluate(_, value)
     local t = tonumber(value)
     if not finite(t) or #segments == 0 then return end
     local segment = active_segment(t)
-    if segment ~= current then
-        local previous = last_time
-        current = segment
-        if segment then
-            -- Natural entry: playback ran into the segment (or the file
-            -- started at its first second), not a seek back into it.
-            local natural = (previous ~= nil and previous < segment.start and t - previous < 1.5)
-                or (previous == nil and t - segment.start < 1.0)
-            if auto_skip[segment.kind] and natural and not auto_done[segment.id] then
-                last_time = t
-                mp.osd_message(segment.kind == 'intro'
-                    and tr('Opening skipped', 'Опенинг пропущен')
-                    or tr('Ending skipped', 'Эндинг пропущен'), 2)
-                skip_current('auto')
-                return
-            end
-            set_key(true)
+    local changed = segment ~= current
+    if changed then current = segment end
+    -- The button appears only for the first seconds of the segment.
+    local show = current ~= nil and t - current.start < BUTTON_SECONDS
+    if show ~= shown or (show and changed) then
+        shown = show
+        set_key(show)
+        if show then
             draw_button()
             update_hover()
         else
-            set_key(false)
             clear_button()
         end
     end
-    last_time = t
 end
 
 local function reset()
     current = nil
-    last_time = nil
-    auto_done = {}
+    shown = false
     set_key(false)
     clear_button()
 end
@@ -281,7 +307,7 @@ mp.observe_property('duration', 'number', function(_, duration)
     end
 end)
 mp.observe_property('time-pos', 'number', evaluate)
-mp.observe_property('osd-dimensions', 'native', function() if current then draw_button() end end)
+mp.observe_property('osd-dimensions', 'native', function() if shown then draw_button() end end)
 mp.observe_property('mouse-pos', 'native', update_hover)
 
 -- Exposed for input.conf users: `KEY script-binding pudge_skip_segments/skip`.

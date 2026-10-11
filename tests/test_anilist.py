@@ -492,7 +492,14 @@ def test_set_status_and_delete_list_entry():
         if "mediaListEntry" in query:
             return httpx.Response(
                 200,
-                json={"data": {"Media": {"id": 123, "mediaListEntry": {"id": 456, "progress": 0, "status": "PLANNING"}}}},
+                json={
+                    "data": {
+                        "Media": {
+                            "id": 123,
+                            "mediaListEntry": {"id": 456, "progress": 0, "status": "PLANNING"},
+                        }
+                    }
+                },
             )
         if "DeleteMediaListEntry" in query:
             return httpx.Response(200, json={"data": {"DeleteMediaListEntry": {"deleted": True}}})

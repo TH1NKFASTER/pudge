@@ -29,7 +29,9 @@ def test_first_numeric_volume_directory_beats_deeper_chapter_number() -> None:
     assert plan["volumes"][0]["file_ids"] == [0, 1]
 
 
-def test_download_completion_imports_chapter_subfolders_as_one_named_volume(monkeypatch, tmp_path: Path) -> None:
+def test_download_completion_imports_chapter_subfolders_as_one_named_volume(
+    monkeypatch, tmp_path: Path
+) -> None:
     import pudge.web_app as web_app
 
     destination = tmp_path / "download"
@@ -60,7 +62,9 @@ def test_download_completion_imports_chapter_subfolders_as_one_named_volume(monk
     linked: list[tuple[int, int, bool]] = []
 
     class FakeAudiobooks:
-        def import_folder(self, folder: Path, *, auto_link=True, prepare_transcription=True, title_override=None):
+        def import_folder(
+            self, folder: Path, *, auto_link=True, prepare_transcription=True, title_override=None
+        ):
             imported.append((Path(folder), bool(auto_link), title_override))
             return {"id": 77}
 
@@ -80,10 +84,17 @@ def test_download_completion_imports_chapter_subfolders_as_one_named_volume(monk
 
     monkeypatch.setattr(web_app, "QBittorrentClient", FakeQbt)
     api = object.__new__(web_app.WebAppApi)
-    api.config = SimpleNamespace(qbittorrent=SimpleNamespace(
-        base_url="http://127.0.0.1:8080", username="", password="", api_key="",
-        verify_tls=True, pre_download_command="", auto_start_app=False,
-    ))
+    api.config = SimpleNamespace(
+        qbittorrent=SimpleNamespace(
+            base_url="http://127.0.0.1:8080",
+            username="",
+            password="",
+            api_key="",
+            verify_tls=True,
+            pre_download_command="",
+            auto_start_app=False,
+        )
+    )
     api.audiobooks = FakeAudiobooks()
     api.light_novels = FakeLightNovels()
     api.logger = SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)

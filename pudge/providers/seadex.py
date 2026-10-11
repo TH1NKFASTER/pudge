@@ -63,7 +63,7 @@ class SeaDexRecommendation:
         return self.status == "found"
 
     def match(self, info_hash: str, link: str = "") -> str:
-        """"preferred" | "alternative" | "" for one release (exact hash / Nyaa id)."""
+        """ "preferred" | "alternative" | "" for one release (exact hash / Nyaa id)."""
         digest = str(info_hash or "").strip().casefold()
         view = _nyaa_view_id(link)
         if digest and digest in self.preferred_hashes or view and view in self.preferred_nyaa_ids:
@@ -82,7 +82,9 @@ def parse_entries(anilist_id: int, payload: Any, *, fetched_at: float) -> SeaDex
     items = payload.get("items") if isinstance(payload, dict) else None
     if not isinstance(items, list):
         raise ValueError("SeaDex response has no items list")
-    entries = [item for item in items if isinstance(item, dict) and int(item.get("alID") or 0) == int(anilist_id)]
+    entries = [
+        item for item in items if isinstance(item, dict) and int(item.get("alID") or 0) == int(anilist_id)
+    ]
     if not entries:
         return SeaDexRecommendation(anilist_id=int(anilist_id), status="missing", fetched_at=fetched_at)
     sets = {"ph": set(), "ah": set(), "pn": set(), "an": set()}
@@ -168,7 +170,9 @@ def _http_fetch(url: str, params: dict[str, Any], timeout: float) -> tuple[int, 
 
     from ..branding import APP_SLUG
 
-    response = httpx.get(url, params=params, timeout=timeout, headers={"User-Agent": APP_SLUG, "Accept": "application/json"})
+    response = httpx.get(
+        url, params=params, timeout=timeout, headers={"User-Agent": APP_SLUG, "Accept": "application/json"}
+    )
     return response.status_code, (response.json() if response.status_code == 200 else None)
 
 
@@ -222,7 +226,9 @@ class SeaDexClient:
         if cached is not None and not cached.stale:
             return cached
         if not allow_network:
-            return cached or SeaDexRecommendation(anilist_id=anilist_id, status="unavailable", error="not_cached")
+            return cached or SeaDexRecommendation(
+                anilist_id=anilist_id, status="unavailable", error="not_cached"
+            )
         params = {"filter": f"alID={anilist_id}", "expand": "trs", "perPage": 500, "skipTotal": "true"}
         try:
             status, payload = self.fetch(SEADEX_ENTRIES_URL, params, float(timeout))
@@ -248,5 +254,9 @@ def bonus_for(rec: SeaDexRecommendation | None, info_hash: str, link: str = "") 
     if kind == "preferred":
         return PREFERRED_BONUS, ["seadex-exact", "seadex-preferred", f"seadex-bonus={int(PREFERRED_BONUS)}"]
     if kind == "alternative":
-        return ALTERNATIVE_BONUS, ["seadex-exact", "seadex-alternative", f"seadex-bonus={int(ALTERNATIVE_BONUS)}"]
+        return ALTERNATIVE_BONUS, [
+            "seadex-exact",
+            "seadex-alternative",
+            f"seadex-bonus={int(ALTERNATIVE_BONUS)}",
+        ]
     return 0.0, []

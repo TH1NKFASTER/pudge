@@ -10,7 +10,11 @@ from typing import Any
 from .config import AppConfig
 
 _CACHE_SCHEMA = "final-pipeline-v13-ass-geometry-speech-recovery"
-_DEFAULT_TTL_SECONDS = 7 * 24 * 3600
+# No age limit: a manifest stays valid while the video/dependency snapshots,
+# the prepared file and the alignment guard still hold (the library scan always
+# trusted it that way). An age limit only re-ran the whole pipeline for an
+# episode opened a week after it was prepared.
+_DEFAULT_TTL_SECONDS = 0
 
 
 def _jsonable(value: Any) -> Any:

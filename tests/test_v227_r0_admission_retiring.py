@@ -145,8 +145,7 @@ def test_supervisor_tracks_retiring_cooperative_task_until_actual_finish() -> No
     assert "same-name" in lingering
     assert old.running
     assert any(
-        row["name"] == "same-name" and row["retiring"] and row["running"]
-        for row in supervisor.status()
+        row["name"] == "same-name" and row["retiring"] and row["running"] for row in supervisor.status()
     )
 
     release_old.set()

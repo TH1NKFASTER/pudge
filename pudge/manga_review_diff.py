@@ -130,7 +130,9 @@ def compare_review_directories(old_root: Path, new_root: Path) -> dict[str, Any]
                 summary["added"] += 1
                 changes.append({"kind": "added", "new": _summary_region(new, new_index)})
         order = {"text_changed": 0, "geometry_changed": 1, "removed": 2, "added": 3}
-        changes.sort(key=lambda item: (order[str(item["kind"])], int((item.get("old") or item.get("new"))["index"])))
+        changes.sort(
+            key=lambda item: (order[str(item["kind"])], int((item.get("old") or item.get("new"))["index"]))
+        )
         pages.append({"page": page, "changes": changes})
     return {
         "schema": SCHEMA_VERSION,
@@ -175,9 +177,7 @@ def _markdown(report: dict[str, Any]) -> str:
         for change in page["changes"]:
             old = change.get("old") or {}
             new = change.get("new") or {}
-            lines.append(
-                f"- `{change['kind']}`: `{old.get('text', '')}` → `{new.get('text', '')}`"
-            )
+            lines.append(f"- `{change['kind']}`: `{old.get('text', '')}` → `{new.get('text', '')}`")
         lines.append("")
     return "\n".join(lines)
 

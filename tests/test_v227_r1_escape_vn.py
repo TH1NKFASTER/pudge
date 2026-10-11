@@ -1,238 +1,177 @@
-from __future__ import annotations
+"""One Escape closes exactly one surface, the topmost one (library selection first); visual
+novels have no AniList identity (behaviour, page harness; audit 71Б rewrite)."""
 
-import json
-from pathlib import Path
-import subprocess
+from __future__ import annotations
 
 import pytest
 
 from pudge.web_app import WebAppApi, _media_identity_anilist_kind
+from tests.i18n_support import en
 
+BOOKS = [{"id": 7, "title": "Novel 7", "volume": 1}, {"id": 11, "title": "Novel 11", "volume": 1}]
 
-ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "pudge" / "web"
-INDEX = WEB / "index.html"
-COVER = WEB / "cover_preview.js"
-VN = WEB / "visual_novels.js"
-
-
-def _escape_fixture() -> dict[str, object]:
-    html = INDEX.read_text(encoding="utf-8")
-    dispatcher = "function isEscapeKey" + html.split("function isEscapeKey", 1)[1].split(
-        "// pudge-r1-escape-dispatch-end", 1
-    )[0]
-    cover_source = COVER.read_text(encoding="utf-8")
-
-    script = f"""
-const vm = require('vm');
-const coverSource = {json.dumps(cover_source)};
-const dispatcher = {json.dumps(dispatcher)};
-
-const state = {{
-  overlay:false, confirm:false, modal:false, manga:false,
-  fullscreenCalls:0, closes:[]
-}};
-
-const windowTarget = new EventTarget();
-global.window = windowTarget;
-window.innerWidth = 1200;
-window.innerHeight = 800;
-
-const fakeImage = {{
-  style:{{setProperty(){{}},transform:'',transition:''}},
-  releasePointerCapture(){{}},
-}};
-const fakeOverlay = {{
-  isConnected:true,
-  querySelector(selector){{ return selector === 'img' ? fakeImage : null; }},
-  remove(){{ state.overlay=false; this.isConnected=false; }},
-}};
-const classListFor = (id) => ({{
-  contains(name) {{
-    if (id === 'modalBackdrop' && name === 'open') return state.modal;
-    return false;
-  }},
-  remove(){{}}, add(){{}}
-}});
-
-global.document = {{
-  body: {{}},
-  activeElement:null,
-  addEventListener(){{}},
-  querySelector(selector) {{
-    if (!state.overlay) return null;
-    if (selector === '.pudge-cover-preview') return fakeOverlay;
-    if (selector === '.pudge-cover-preview img') return fakeImage;
-    return null;
-  }},
-  createElement() {{ throw new Error('fixture does not open previews'); }},
-  getElementById() {{ return null; }},
-}};
-global.requestAnimationFrame = () => 1;
-global.cancelAnimationFrame = () => {{}};
-
-global.ui = {{
-  page:'lightnovels',
-  lnSelection:new Set(),
-  lnStudyTriggerCapturing:false,
-  shortcutCaptureTarget:null,
-  state:{{settings:{{escape_exits_fullscreen:true}}}},
-}};
-
-global.$ = id => ({{
-  id,
-  hidden: id === 'globalSearchOverlay' ? true : false,
-  classList: classListFor(id),
-  click() {{ state.closes.push(id + ':click'); }},
-}});
-
-global.clearLnSelection = () => {{ state.closes.push('selection'); ui.lnSelection.clear(); }};
-global.finishLnStudyTriggerCapture = () => state.closes.push('ln-trigger');
-global.stopShortcutCapture = () => state.closes.push('shortcut');
-global.closeLnFind = () => state.closes.push('ln-find');
-global.closeGlobalSearch = () => state.closes.push('search');
-global.closeOnboarding = () => state.closes.push('onboarding-close');
-global.skipOnboarding = async () => state.closes.push('onboarding-skip');
-global.closeModal = () => {{ state.closes.push('modal'); state.modal=false; }};
-global.hideContextMenu = () => state.closes.push('context');
-global.closeLnChapterPicker = () => state.closes.push('ln-chapter');
-global.hideLnStudyStateMenu = () => state.closes.push('ln-state');
-global.hideLnTranslation = () => state.closes.push('ln-translation');
-
-global.pywebview = {{api:{{exit_fullscreen:async()=>{{state.fullscreenCalls += 1;}}}}}};
-window.PudgeSelect = {{closeIfOpen:()=>false}};
-window.PudgeConfirm = {{closeIfOpen:()=>{{if(!state.confirm)return false;state.confirm=false;state.closes.push('confirm');return true;}}}};
-window.PudgeDebug = {{close:()=>state.closes.push('debug')}};
-window.PudgeReadingTools = {{closeIfOpen:()=>false}};
-window.PudgeAudiobookSelection = {{selectedBookIds:()=>[],clearSelection:()=>{{}}}};
-window.PudgeMangaReaderV2 = {{
-  selectedBookIds:()=>[],
-  clearSelection:()=>{{}},
-  closeEscapeSurface:()=>{{if(!state.manga)return false;state.manga=false;state.closes.push('manga');return true;}}
-}};
-
-global.performance = global.performance || {{now:()=>0}};
-vm.runInThisContext(coverSource);
-vm.runInThisContext(dispatcher);
-
-function keyEvent(type, key='Escape', code='Escape', repeat=false, composing=false) {{
-  const event = new Event(type, {{cancelable:true}});
-  Object.defineProperties(event, {{
-    key:{{value:key}}, code:{{value:code}}, repeat:{{value:repeat}}, isComposing:{{value:composing}}
-  }});
-  return event;
-}}
-function reset() {{
-  state.overlay=false;state.confirm=false;state.modal=false;state.manga=false;
-  state.fullscreenCalls=0;state.closes=[];ui.lnSelection=new Set();
-  fakeOverlay.isConnected=true;
-}}
-async function tick() {{ await Promise.resolve(); await new Promise(resolve=>setImmediate(resolve)); }}
-
-(async()=>{{
-  const result={{}};
-
-  reset(); state.overlay=true; state.modal=true; ui.lnSelection=new Set([1]);
-  let event=keyEvent('keydown'); window.dispatchEvent(event); await tick();
-  result.previewOverModalSelection={{overlay:state.overlay,modal:state.modal,selection:ui.lnSelection.size,fullscreen:state.fullscreenCalls,prevented:event.defaultPrevented}};
-
-  reset(); state.overlay=true;
-  event=keyEvent('keydown','Escape','Escape',true,false); window.dispatchEvent(event); await tick();
-  result.repeat={{overlay:state.overlay,fullscreen:state.fullscreenCalls,prevented:event.defaultPrevented}};
-
-  reset(); state.overlay=true; ui.lnSelection=new Set([11]);
-  event=keyEvent('keyup'); window.dispatchEvent(event); await tick();
-  result.keyup={{overlay:state.overlay,selection:ui.lnSelection.size,prevented:event.defaultPrevented,closes:[...state.closes]}};
-
-  reset(); state.overlay=true;
-  event=keyEvent('keydown','Esc','',false,false); window.dispatchEvent(event); await tick();
-  result.escAlias={{overlay:state.overlay}};
-
-  reset(); state.overlay=true;
-  event=keyEvent('keydown','x','Escape',false,false); window.dispatchEvent(event); await tick();
-  result.codeAlias={{overlay:state.overlay}};
-
-  reset(); ui.lnSelection=new Set([7]);
-  event=keyEvent('keydown'); window.dispatchEvent(event); await tick();
-  result.selection={{selection:ui.lnSelection.size,fullscreen:state.fullscreenCalls,closes:[...state.closes]}};
-
-  reset(); state.manga=true;
-  event=keyEvent('keydown'); window.dispatchEvent(event); await tick();
-  result.reader={{manga:state.manga,fullscreen:state.fullscreenCalls,closes:[...state.closes]}};
-
-  reset(); state.overlay=true;
-  event=keyEvent('keydown','Escape','Escape',false,true); window.dispatchEvent(event); await tick();
-  result.composing={{overlay:state.overlay,prevented:event.defaultPrevented,fullscreen:state.fullscreenCalls}};
-
-  reset(); state.confirm=true; state.overlay=true;
-  event=keyEvent('keydown'); window.dispatchEvent(event); await tick();
-  result.confirmPriority={{confirm:state.confirm,overlay:state.overlay,closes:[...state.closes]}};
-
-  reset();
-  event=keyEvent('keydown'); window.dispatchEvent(event); await tick();
-  result.fullscreen={{fullscreen:state.fullscreenCalls}};
-
-  process.stdout.write(JSON.stringify(result));
-}})().catch(error=>{{console.error(error);process.exit(1);}});
+# A cover whose preview stays open until closed (dom_lite images decode at once).
+SURFACES = r"""
+const MakeImage = window.Image;
+window.Image = function Image() {
+  const img = MakeImage();
+  img.decode = async () => { img.__naturalWidth = 600; img.__naturalHeight = 900; };
+  return img;
+};
+__api.cover_preview_resolve = async () => ({preview_url: 'full.jpg', source_kind: 'local_page', source_revision: 'r'});
+__api.character_glossary = async () => [];
 """
-    return json.loads(subprocess.check_output(["node", "-e", script], text=True, stderr=subprocess.STDOUT))
+
+# press(init): one key press (keydown, then keyup) at the focused element; what the window did with it.
+ESCAPE = r"""
+setPage('lightnovels'); await __tick(100);
+const press = async (init = {}, {down = true, up = true} = {}) => {
+  const event = type => new KeyboardEvent(type, {key: 'Escape', code: 'Escape', bubbles: true, cancelable: true, ...init});
+  const keydown = event('keydown'), keyup = event('keyup');
+  if (down) document.body.dispatchEvent(keydown);
+  if (up) document.body.dispatchEvent(keyup);
+  await __tick(20);
+  return {prevented: down ? keydown.defaultPrevented : keyup.defaultPrevented, ...open()};
+};
+const select = async id => { await __click(`#lightNovelsContent [data-ln-book="${id}"]`, {metaKey: true}); await __tick(20); };
+const open = () => ({
+  selection: [...ui.lnSelection],
+  preview: PudgeCoverPreview.isOpen(),
+  modal: $('modalBackdrop').classList.contains('open'),
+  confirm: PudgeConfirm.isOpen(),
+  fullscreenExits: __apiCalls.filter(call => call.name === 'exit_fullscreen').length,
+});
+const cover = document.createElement('img');
+cover.src = 'thumb.jpg'; cover.dataset.pudgeCoverKind = 'light_novel'; cover.dataset.pudgeCoverId = '7';
+document.body.appendChild(cover);
+"""
 
 
-def test_escape_dispatch_closes_exactly_one_uppermost_surface() -> None:
-    result = _escape_fixture()
+def test_one_escape_closes_one_surface_from_the_top_down(page) -> None:
+    result = page.run(
+        ESCAPE
+        + r"""
+        await select(7);
+        void showCharacterGlossaryEditor(77, 'Novel'); await __tick(20);
+        PudgeCoverPreview.open(cover); await __tick(20);
+        const steps = {stacked: open()};
+        // The library selection goes first, before the preview and the dialog under it.
+        steps.first = await press();
+        // A held key repeats keydowns: they close nothing more.
+        steps.repeat = await press({repeat: true});
+        // Text input in progress (IME): Escape belongs to the input method.
+        steps.composing = await press({isComposing: true});
+        // A confirmation over the preview: Escape answers it (No) and closes nothing else,
+        // also from a layout whose key name differs but whose code is Escape.
+        let answer = 'none';
+        pudgeConfirm('Delete?').then(value => { answer = value; }); await __tick(20);
+        steps.confirmShown = open();
+        steps.code = await press({key: 'x'});
+        steps.confirmAnswer = answer;
+        // "Esc" (older WebKit) closes the preview, not the dialog under it.
+        steps.esc = await press({key: 'Esc', code: ''});
+        steps.modal = await press();
+        // Nothing left: Escape leaves full screen.
+        steps.nothing = await press();
+        return steps;
+        """,
+        before=SURFACES,
+        api={"light_novel_state": {"version": 1, "settings": {}, "books": BOOKS}},
+    )
+    steps = result.value
+    base = {"selection": [], "preview": True, "modal": True, "confirm": False, "fullscreenExits": 0}
+    assert steps["stacked"] == {**base, "selection": [7]}
+    assert steps["first"] == {**base, "prevented": True}
+    assert steps["repeat"] == {**base, "prevented": True}
+    assert steps["composing"] == {**base, "prevented": False}
+    assert steps["confirmShown"] == {**base, "confirm": True}
+    assert steps["code"] == {**base, "prevented": True}
+    assert steps["confirmAnswer"] is False
+    assert steps["esc"] == {**base, "preview": False, "prevented": True}
+    assert steps["modal"] == {**base, "preview": False, "modal": False, "prevented": True}
+    assert steps["nothing"] == {
+        **base,
+        "preview": False,
+        "modal": False,
+        "prevented": True,
+        "fullscreenExits": 1,
+    }
 
-    assert result["previewOverModalSelection"] == {
-        "overlay": True,
-        "modal": True,
-        "selection": 0,
-        "fullscreen": 0,
+
+def test_escape_keyup_alone_still_leaves_library_multi_select(page) -> None:
+    # WKWebView can swallow the keydown (a focused native control): the keyup clears
+    # the card selection, and only the selection.
+    result = page.run(
+        ESCAPE
+        + r"""
+        await select(7); await select(11);
+        PudgeCoverPreview.open(cover); await __tick(20);
+        const before = open();
+        const keyup = await press({}, {down: false});
+        const again = await press({}, {down: false});
+        return {before, keyup, again};
+        """,
+        before=SURFACES,
+        api={"light_novel_state": {"version": 1, "settings": {}, "books": BOOKS}},
+    )
+    out = result.value
+    assert out["before"]["selection"] == [7, 11]
+    assert out["keyup"] == {
+        "selection": [],
+        "preview": True,
+        "modal": False,
+        "confirm": False,
+        "fullscreenExits": 0,
         "prevented": True,
     }
-    assert result["repeat"] == {"overlay": True, "fullscreen": 0, "prevented": True}
-    assert result["keyup"] == {"overlay": True, "selection": 0, "prevented": True, "closes": ["selection"]}
-    assert result["escAlias"] == {"overlay": False}
-    assert result["codeAlias"] == {"overlay": False}
-    assert result["selection"] == {"selection": 0, "fullscreen": 0, "closes": ["selection"]}
-    assert result["reader"] == {"manga": False, "fullscreen": 0, "closes": ["manga"]}
-    assert result["composing"] == {"overlay": True, "prevented": False, "fullscreen": 0}
-    assert result["confirmPriority"] == {"confirm": False, "overlay": True, "closes": ["confirm"]}
-    assert result["fullscreen"] == {"fullscreen": 1}
+    # Without a selection, a lone keyup does nothing.
+    assert out["again"] == {**out["keyup"], "prevented": False}
 
 
-def test_escape_has_one_primary_dispatcher_and_selection_keyup_fallback() -> None:
-    html = INDEX.read_text(encoding="utf-8")
-    assert html.count("window.addEventListener('keydown',dispatchEscapeEvent,true)") == 1
-    assert html.count("window.addEventListener('keyup',captureEscapeCardSelection,true)") == 1
-    assert "if(!clearSelectionOnEscape('keyup'))return;" in html
-
-    for name in (
-        "cover_preview.js",
-        "pudge_select.js",
-        "pudge_confirm.js",
-        "reading_tools.js",
-        "manga_reader_v2.js",
-        "debug.js",
-    ):
-        source = (WEB / name).read_text(encoding="utf-8")
-        assert "event.key === 'Escape'" not in source
-        assert "event.key==='Escape'" not in source
-
-
-def test_visual_novel_frontend_has_no_anilist_identity_surface() -> None:
-    source = VN.read_text(encoding="utf-8")
-    assert "vnIdentity" not in source
-    assert "refreshIdentity" not in source
-    assert "media_identity_current('visual_novel'" not in source
-    assert "showMediaIdentity?.('visual_novel'" not in source
-    assert "pudge-media-identity-changed" not in source
-
-    # Capture/OCR/Jiten reading functionality remains present.
-    assert "visual_novel_start(0,gameTitle,'',true)" in source
-    assert "Choose game window" in source
-    assert "visual_novel_windows" not in source
-    assert "visual_novel_start" in source
-    assert "visual_novel_parse" in source
-    assert "PudgeReadingTools" in source
+def test_visual_novel_page_captures_a_window_and_reads_lines_without_anilist(page) -> None:
+    assert en("vn.chooseGameWindow") == "Choose game window"
+    result = page.run(
+        r"""
+        await __click('[data-page="visualnovels"]'); await __tick(100);
+        const root = document.getElementById('visualNovelsContent');
+        const out = {start: __text('#vnStart'), expected: t('vn.chooseGameWindow'),
+                     anilist: [...root.querySelectorAll('button,a')].filter(n => /anilist/i.test(n.outerHTML)).length};
+        await __input('#vnGameTitle', 'My Game');
+        await __click('#vnStart'); await __tick(50);
+        window.VN.transcript = [{id: 1, text: '猫が好き'}];          // the next line read off the game window
+        await __tick(600);
+        out.words = [...document.querySelectorAll('#vnCurrent [data-pudge-study-token]')].map(n => n.textContent);
+        await __click(`#vnCurrent [data-pudge-study-token="${document.querySelector('#vnCurrent [data-pudge-study-token]').dataset.pudgeStudyToken}"]`);
+        await __tick(50);
+        out.card = document.querySelector('#pudgeStudyCard.open .pudge-study-term')?.textContent;
+        out.apis = [...new Set(__apiCalls.map(call => call.name))].filter(name => /^visual_novel|identity/.test(name));
+        return out;
+        """,
+        before=r"""
+        window.VN = {running: false, transcript: []};
+        __api.visual_novel_state = async () => ({running: window.VN.running, status: window.VN.running ? 'running' : 'idle', transcript: window.VN.transcript,
+                                                 capture_count: 3, ocr_count: 1, window_id: 5, window_title: 'My Game'});
+        __api.visual_novel_set_dialogue_region = async () => ({ok: true});
+        __api.visual_novel_start = async () => { window.VN.running = true; return {running: true, window_id: 5, window_title: 'My Game'}; };
+        __api.visual_novel_parse = async text => ({paragraphs: [text], tokens: [[{wordId: 1, readingIndex: 0, start: 0, end: 1}, {wordId: 2, readingIndex: 0, start: 2, end: 4}]],
+          vocabulary: [{wordId: 1, readingIndex: 0, spelling: '猫', reading: 'ねこ', meaningsChunks: [['cat']]}, {wordId: 2, readingIndex: 0, spelling: '好き', reading: 'すき', meaningsChunks: [['liked']]}]});
+        """,
+    )
+    out = result.value
+    assert out["start"] == out["expected"]
+    assert out["anilist"] == 0
+    # The system window picker (useSystemPicker=true), no window list, no AniList lookups.
+    assert result.calls_of("visual_novel_start") == [[0, "My Game", "", True]]
+    assert result.calls_of("visual_novel_set_dialogue_region") == [[0, 0.38, 1, 0.62]]
+    assert result.calls_of("visual_novel_parse") == [["猫が好き"]]
+    assert set(out["apis"]) == {
+        "visual_novel_state",
+        "visual_novel_set_dialogue_region",
+        "visual_novel_start",
+        "visual_novel_parse",
+    }
+    # Lines are Jiten words with the shared word card.
+    assert out["words"] == ["猫", "好き"] and out["card"].startswith("猫")
 
 
 def test_backend_rejects_vn_and_unknown_anilist_identity_before_routing() -> None:

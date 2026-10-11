@@ -1,4 +1,5 @@
 """Network-off regressions for aria2 observation and audiobook downloads."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from pudge import i18n
 from pudge.light_novels import LightNovelError
 from pudge.providers.aria2 import Aria2Client, Aria2Error
 from pudge.torrent_admission import TorrentAdmission
@@ -30,9 +32,10 @@ def test_missing_aria2_read_or_stop_never_spawns_sidecar(tmp_path: Path, monkeyp
     monkeypatch.setattr(client, "_probe", lambda: False)
     monkeypatch.setattr(client, "_start", lambda: starts.append("unexpected spawn"))
     try:
-        with pytest.raises(Aria2Error, match="RPC не запущен"):
+        with pytest.raises(Aria2Error, match="aria2 RPC is not running") as raised:
             operation(client)
         assert not starts
+        assert i18n.message(str(raised.value), "ru") == "aria2 RPC не запущен"
     finally:
         client.close()
 
@@ -99,17 +102,26 @@ def _audiobook_api(tmp_path: Path, fake: _FakeTorrent) -> WebAppApi:
         paths=SimpleNamespace(download_dirs=[str(tmp_path)]),
         library=SimpleNamespace(root_dir=str(tmp_path)),
     )
-    api.light_novels = SimpleNamespace(book=lambda book_id: {
-        "id": book_id, "title": "Book", "series_title": "Book", "volume": 1,
-    })
+    api.light_novels = SimpleNamespace(
+        book=lambda book_id: {
+            "id": book_id,
+            "title": "Book",
+            "series_title": "Book",
+            "volume": 1,
+        }
+    )
     api.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
     api._audiobook_torrent_client = lambda: ("aria2", fake)
     return api
 
 
 def _release():
-    return {"title": "Book volume 1", "info_hash": "a" * 40,
-            "target_volume": 1, "selected_files": ["book.m4b"]}
+    return {
+        "title": "Book volume 1",
+        "info_hash": "a" * 40,
+        "target_volume": 1,
+        "selected_files": ["book.m4b"],
+    }
 
 
 def test_audiobook_add_blocked_by_shared_off_before_start(tmp_path: Path) -> None:

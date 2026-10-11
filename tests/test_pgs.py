@@ -83,7 +83,10 @@ def test_sync_pgs_against_embedded_reference(monkeypatch, tmp_path: Path) -> Non
     source = _sup(tmp_path / "input.sup", [10, 20, 30, 40, 50, 60, 70, 80])
     reference = tmp_path / "english.srt"
     write_srt(
-        [(start, start + 1.0, f"line-{index}") for index, start in enumerate([15, 25, 35, 45, 55, 65, 75, 85])],
+        [
+            (start, start + 1.0, f"line-{index}")
+            for index, start in enumerate([15, 25, 35, 45, 55, 65, 75, 85])
+        ],
         reference,
     )
 
@@ -112,6 +115,4 @@ def test_sync_pgs_against_embedded_reference(monkeypatch, tmp_path: Path) -> Non
     )
     assert result["sync_was_successful"] is True
     assert result["engine"] == "pgs-onset+alass"
-    assert onset_times(parse_pgs_cues(output)) == pytest.approx(
-        [15, 25, 35, 45, 55, 65, 75, 85], abs=0.001
-    )
+    assert onset_times(parse_pgs_cues(output)) == pytest.approx([15, 25, 35, 45, 55, 65, 75, 85], abs=0.001)

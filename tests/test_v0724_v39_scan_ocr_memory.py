@@ -43,9 +43,7 @@ def _allow_heavy_scan(manager: AnimeManager, monkeypatch) -> None:
     )
 
 
-def test_ocr_streams_compositions_without_materializing_display_list(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_ocr_streams_compositions_without_materializing_display_list(tmp_path: Path, monkeypatch) -> None:
     video = tmp_path / "movie.mkv"
     video.write_bytes(b"video")
     subtitle = tmp_path / "movie.sup"
@@ -78,9 +76,7 @@ def test_ocr_streams_compositions_without_materializing_display_list(
     assert "こんにちは" in output.read_text(encoding="utf-8")
 
 
-def test_pgs_segment_reader_streams_file_without_path_read_bytes(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_pgs_segment_reader_streams_file_without_path_read_bytes(tmp_path: Path, monkeypatch) -> None:
     path = tmp_path / "one.sup"
     payload = b"abc"
     path.write_bytes(
@@ -104,9 +100,7 @@ def test_pgs_segment_reader_streams_file_without_path_read_bytes(
     assert rows[0].time_seconds == 1.0
 
 
-def test_library_scan_fingerprint_reuses_recent_unchanged_scan(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_fingerprint_reuses_recent_unchanged_scan(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     _allow_heavy_scan(manager, monkeypatch)
     video = manager.config.library.root_dir / "Example - 01.mkv"
@@ -128,9 +122,7 @@ def test_library_scan_fingerprint_reuses_recent_unchanged_scan(
     assert calls == ["scan"]
 
 
-def test_library_scan_fingerprint_invalidates_when_sidecar_changes(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_fingerprint_invalidates_when_sidecar_changes(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     _allow_heavy_scan(manager, monkeypatch)
     video = manager.config.library.root_dir / "Example - 01.mkv"
@@ -151,9 +143,7 @@ def test_library_scan_fingerprint_invalidates_when_sidecar_changes(
     assert calls == ["scan", "scan"]
 
 
-def test_library_scan_does_not_start_over_existing_heavy_ocr(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_does_not_start_over_existing_heavy_ocr(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     video = manager.config.library.root_dir / "Example - 01.mkv"
     video.write_bytes(b"video")
@@ -178,6 +168,7 @@ def test_recent_interactive_refresh_suppresses_delayed_startup_maintenance(
     manager = _manager(tmp_path)
     import json
     import os
+
     manager.db.set_state(
         "interactive_refresh_completed_at_v39",
         json.dumps({"pid": os.getpid(), "completed_at": time.time()}),
@@ -193,9 +184,7 @@ def test_recent_interactive_refresh_suppresses_delayed_startup_maintenance(
     assert stats["library"] == 0
 
 
-def test_successful_interactive_refresh_marks_recent_completion(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_successful_interactive_refresh_marks_recent_completion(tmp_path: Path, monkeypatch) -> None:
     manager = _manager(tmp_path)
     monkeypatch.setattr(
         manager,
@@ -206,6 +195,7 @@ def test_successful_interactive_refresh_marks_recent_completion(
     manager.run_interactive_refresh(pre_scanned_library_count=0)
 
     import json
+
     payload = json.loads(manager.db.get_state("interactive_refresh_completed_at_v39", "{}"))
     assert float(payload["completed_at"]) > 0
 
@@ -252,9 +242,7 @@ def test_library_scan_fingerprint_cache_is_shared_between_manager_processes(
     assert calls == ["scan"]
 
 
-def test_bitmap_ocr_memory_guard_preserves_prepared_bitmap_for_retry(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_bitmap_ocr_memory_guard_preserves_prepared_bitmap_for_retry(tmp_path: Path, monkeypatch) -> None:
     import itertools
 
     import pudge.manager as manager_module
@@ -321,9 +309,7 @@ def test_bitmap_ocr_memory_guard_preserves_prepared_bitmap_for_retry(
     assert str(job["state"]) == "pending"
 
 
-def test_library_scan_fingerprint_reuses_unchanged_cache_for_one_hour(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_library_scan_fingerprint_reuses_unchanged_cache_for_one_hour(tmp_path: Path, monkeypatch) -> None:
     """Unchanged libraries must not trigger the old 15-minute full rescan."""
     import json
     import time

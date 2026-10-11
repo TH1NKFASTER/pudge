@@ -1,4 +1,5 @@
 """Synthetic macOS flags and exact-path WebKit registration repair."""
+
 import json
 import plistlib
 import stat
@@ -9,7 +10,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from pudge.mac_app_aliases import (
-    LSREGISTER, cleanup_aliases, unregister_webkit_data_folders,
+    LSREGISTER,
+    cleanup_aliases,
+    unregister_webkit_data_folders,
 )
 
 
@@ -20,9 +23,7 @@ class Preferences:
 
 class VisibilityTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(
-            prefix="pudge-visibility-", suffix=".noindex"
-        )
+        temporary = tempfile.TemporaryDirectory(prefix="pudge-visibility-", suffix=".noindex")
         self.addCleanup(temporary.cleanup)
         self.home = Path(temporary.name)
         self.app = self.home / "Applications/pudge.app"
@@ -40,10 +41,7 @@ class VisibilityTests(unittest.TestCase):
         def synthetic_stat(path, *args, **kwargs):
             value = original_stat(path, *args, **kwargs)
             if path == self.app:
-                fields = {
-                    name: getattr(value, name)
-                    for name in dir(value) if name.startswith("st_")
-                }
+                fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
                 fields["st_flags"] = self.flags
                 return SimpleNamespace(**fields)
             return value
@@ -62,8 +60,13 @@ class VisibilityTests(unittest.TestCase):
 
     def cleanup(self, names=(), webkit=False):
         return cleanup_aliases(
-            self.app, "com.pudge.app", names, self.backups, Preferences(),
-            run=self.run_command, webkit_home=self.home if webkit else None,
+            self.app,
+            "com.pudge.app",
+            names,
+            self.backups,
+            Preferences(),
+            run=self.run_command,
+            webkit_home=self.home if webkit else None,
         )
 
     def test_hidden_bundle_is_visible_other_flags_and_original_backup_preserved(self):
@@ -83,9 +86,7 @@ class VisibilityTests(unittest.TestCase):
         self.assertEqual(list(self.backups.iterdir()), [backup])
 
     def test_wrong_identity_prevents_all_commands_and_backups(self):
-        (self.app / "Contents/Info.plist").write_bytes(
-            plistlib.dumps({"CFBundleIdentifier": "foreign.app"})
-        )
+        (self.app / "Contents/Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": "foreign.app"}))
         with self.assertRaisesRegex(RuntimeError, "Unexpected app identity"):
             self.cleanup()
         self.assertFalse(self.calls)
@@ -96,7 +97,11 @@ class VisibilityTests(unittest.TestCase):
         alias.symlink_to(self.app)
         with self.assertRaisesRegex(RuntimeError, "Canonical application is a symlink"):
             cleanup_aliases(
-                alias, "com.pudge.app", (), self.backups, Preferences(),
+                alias,
+                "com.pudge.app",
+                (),
+                self.backups,
+                Preferences(),
                 run=self.run_command,
             )
         self.assertFalse(self.calls)
@@ -130,10 +135,9 @@ class VisibilityTests(unittest.TestCase):
             self.assertIn([LSREGISTER, "-u", str(path)], self.calls)
             self.assertEqual((path / "synthetic-cookie.txt").read_text(), "preserve")
         final_registration = self.calls.index([LSREGISTER, "-f", str(self.app)])
-        self.assertTrue(all(
-            index < final_registration
-            for index, call in enumerate(self.calls) if "-u" in call
-        ))
+        self.assertTrue(
+            all(index < final_registration for index, call in enumerate(self.calls) if "-u" in call)
+        )
 
     def test_app_contents_and_foreign_data_symlinks_are_preserved(self):
         root = self.home / "Library/WebKit"

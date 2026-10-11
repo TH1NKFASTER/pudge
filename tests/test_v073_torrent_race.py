@@ -145,9 +145,7 @@ def test_race_fast_path_does_not_start_alternatives(tmp_path, monkeypatch) -> No
     assert qbt.deleted == []
 
 
-def test_race_starts_alternatives_after_dead_top_one_and_keeps_best_live(
-    tmp_path, monkeypatch
-) -> None:
+def test_race_starts_alternatives_after_dead_top_one_and_keeps_best_live(tmp_path, monkeypatch) -> None:
     from pudge import manager as manager_module
 
     clock = Clock()

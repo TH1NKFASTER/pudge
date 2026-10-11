@@ -5,6 +5,8 @@ from pudge.database import Database
 from pudge.manager_models import LibraryAnime
 from pudge.providers.anilist import _primary_studio, _relation_node_payload
 from pudge.web_app import WebAppApi
+from test_v0552_planning_relations import DIAGRAM, planning_relations_state
+from tests.i18n_support import en, ru
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -79,14 +81,29 @@ def test_planning_payload_contains_root_and_relation_studios(tmp_path: Path) -> 
     assert planned["relations"]["prequel_levels"][-1][0]["studio"] == "Sunrise"
 
 
-def test_planning_ui_shows_studio_only_in_row_and_large_relation_preview() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(
-        encoding="utf-8"
-    )
-    assert "'label.studio':'Studio: {studio}'" in html
-    assert "'label.studio':'Студия: {studio}'" in html
-    assert 'data-studio="${escapeHtml(item.studio||\'\')}"' in html
-    assert "const studioRow=studio?" in html
-    assert "planned&&a.studio" in html
-    # Studio is intentionally absent from the compact relation-node metadata.
-    assert "function relationMeta(item){return [item.format,item.season_year]" in html
+def test_planning_ui_shows_studio_only_in_row_and_large_relation_preview(tmp_path: Path, page) -> None:
+    assert en("label.studio", studio="MAPPA") == "Studio: MAPPA"
+    assert ru("label.studio", studio="MAPPA") == "Студия: MAPPA"
+    for lang in ("en", "ru"):
+        result = page.run(
+            DIAGRAM
+            + """
+            const studio = id => __text(`#plannedContent > [data-media-id="${id}"] .planned-studio`);
+            const out = {rows: [studio(100), studio(200)],
+                         expected: [t('label.studio', {studio: 'Kyoto Animation'}), t('label.studio', {studio: 'Bones'})],
+                         compact: relationNode(90).querySelector('.relation-node-meta').innerText};
+            await __fire('#plannedContent .relation-node[data-media-id="90"]', 'mouseover', {relatedTarget: document.body}, 'MouseEvent');
+            out.preview = $('relationPreview').innerText;
+            out.previewStudio = t('label.studio', {studio: 'Sunrise'});
+            // A Watching card has no studio row.
+            out.watching = animeCard({media_id: 5, title: 'Watching', studio: 'MAPPA', progress: 1, episodes: 12}, false);
+            return out;
+            """,
+            lang=lang,
+            state=planning_relations_state(tmp_path / lang),
+        )
+        out = result.value
+        assert out["rows"] == out["expected"]
+        assert out["compact"] == "TV • 2024"  # the compact node: format and year only
+        assert out["previewStudio"] in out["preview"].split("\n")
+        assert "MAPPA" not in out["watching"]

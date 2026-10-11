@@ -9,7 +9,6 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,13 +16,199 @@ import pytest
 from pudge.config import AppConfig
 from pudge.jiten_words import JitenWordRepository, normalize_card
 from pudge.runtime import mac_app_instances, worker_environment
-from pudge.ui_localization import ERROR_TRANSLATIONS, localize_ui_message
+from pudge.i18n import message
+from page_harness import web_module
+from tests.i18n_support import i18n_source
 
-WEB = Path(__file__).resolve().parents[1] / "pudge" / "web"
+
+# (Russian, English) pairs of the former pudge/ui_localization catalog. Audit 68Б
+# replaced it with the error.* entries of pudge/web/locales.<lang>.js, read by
+# pudge.i18n.message and PudgeI18n.message; the same cases must still translate.
+# The torrent-not-listed message names one backend twice ({backend} in the catalog).
+LEGACY_ERRORS = (
+    (
+        "Нужен AniList ID или ссылка вида https://anilist.co/anime/12345",
+        "An AniList ID or a URL such as https://anilist.co/anime/12345 is required",
+    ),
+    ("AniList ID должен быть положительным", "AniList ID must be positive"),
+    ("Файл субтитров не найден: {0}", "Subtitle file not found: {0}"),
+    ("Видео не найдено: {0}", "Video not found: {0}"),
+    ("Все torrent backend отключены", "All torrent backends are disabled"),
+    ("AniList id={0} отсутствует в локальной базе", "AniList id={0} is missing from the local database"),
+    ("Поиск релизов отключён", "Release search is disabled"),
+    ("Torrent-загрузки отключены в настройках", "Torrent downloads are disabled in Settings"),
+    ("AniList id={0} отсутствует в базе", "AniList id={0} is missing from the database"),
+    (
+        "{0} принял запрос, но торрент не появился в списке загрузок. Повтори попытку; если ошибка сохранится, открой Diagnostics — там будет причина проверки {0}.",
+        "{0} accepted the request, but the torrent did not appear in Downloads. Retry; if the error persists, open Diagnostics for the {0} check details.",
+    ),
+    ("Не удалось прочитать контейнер через ffprobe: {0}", "Could not read the container with ffprobe: {0}"),
+    ("Не найден mpv: {0}", "mpv not found: {0}"),
+    ("Ошибка AniList: HTTP {0} для {1}", "AniList error: HTTP {0} for {1}"),
+    ("Ошибка AniList: некорректный JSON: {0}", "AniList error: invalid JSON: {0}"),
+    ("AniList вернул ошибку: {0}", "AniList returned an error: {0}"),
+    ("AniList вернул ответ без data", "AniList returned a response without data"),
+    ("Ошибка AniList: {0}", "AniList error: {0}"),
+    ("Не удалось определить пользователя AniList", "Could not identify the AniList user"),
+    ("Аниме AniList id={0} не найдено", "Anime AniList id={0} was not found"),
+    ("AniList не вернул обновлённую запись списка", "AniList did not return the updated list entry"),
+    ("Недопустимый статус AniList: {0}", "Invalid AniList status: {0}"),
+    ("Оценка AniList должна быть от 1 до 10", "AniList score must be between 1 and 10"),
+    ("AniList не вернул сохранённую оценку", "AniList did not return the saved score"),
+    ("Номер серии для AniList должен быть положительным", "AniList episode number must be positive"),
+    (
+        "Встроенный torrent backend не найден: aria2c не установлен. Повторно запусти install.sh или выполни: brew install aria2",
+        "The built-in torrent backend was not found: aria2c is not installed. Run install.sh again or use: brew install aria2",
+    ),
+    ("aria2 RPC недоступен: {0}{1}", "aria2 RPC unavailable: {0}{1}"),
+    ("aria2 RPC недоступен: {0}", "aria2 RPC unavailable: {0}"),
+    (
+        "Kill switch включён, но VPN interface не указан. Укажи активный интерфейс VPN (обычно utun…)",
+        "Kill switch is enabled, but the VPN interface is not set. Enter the active VPN interface (usually utun…)",
+    ),
+    (
+        "VPN interface {0} сейчас недоступен; torrent traffic заблокирован",
+        "VPN interface {0} is unavailable; torrent traffic is blocked",
+    ),
+    ("Встроенный aria2 backend отключён", "The built-in aria2 backend is disabled"),
+    ("Не удалось запустить aria2c: {0}", "Could not start aria2c: {0}"),
+    ("aria2c запущен, но RPC не ответил на порту {0}", "aria2c started, but RPC did not respond on port {0}"),
+    ("Не удалось остановить старый Pudge aria2 sidecar", "Could not stop the previous Pudge aria2 sidecar"),
+    ("aria2 RPC не запущен", "aria2 RPC is not running"),
+    (
+        "Релиз не содержит ни magnet-ссылки, ни torrent URL",
+        "The release contains neither a magnet link nor a torrent URL",
+    ),
+    ("Не задан JIMAKU_API_KEY", "JIMAKU_API_KEY is not set"),
+    ("Ошибка Jimaku API: {0}", "Jimaku API error: {0}"),
+    ("Ошибка Jimaku API: неизвестная сетевая ошибка", "Jimaku API error: unknown network error"),
+    ("Не удалось скачать {0}: {1}", "Could not download {0}: {1}"),
+    ("Nyaa вернул некорректный RSS: {0}", "Nyaa returned invalid RSS: {0}"),
+    (
+        "Команда перед поиском Nyaa завершилась с ошибкой: {0}",
+        "The command before the Nyaa search failed: {0}",
+    ),
+    (
+        "Для SOCKS-прокси не установлена зависимость socksio. Повторно запустите ./install.sh.",
+        "The SOCKS proxy dependency socksio is not installed. Run ./install.sh again.",
+    ),
+    ("Nyaa недоступен{0}: {1}", "Nyaa unavailable{0}: {1}"),
+    (
+        "Команда VPN перед скачиванием завершилась с ошибкой: {0}",
+        "The VPN command before downloading failed: {0}",
+    ),
+    ("qBittorrent Web API недоступен: {0}", "qBittorrent Web API unavailable: {0}"),
+    ("qBittorrent не принял логин: HTTP {0}", "qBittorrent rejected the login: HTTP {0}"),
+    ("qBittorrent не принял логин: {0}", "qBittorrent rejected the login: {0}"),
+    ("Не удалось получить версию qBittorrent: {0}", "Could not get the qBittorrent version: {0}"),
+    (
+        "qBittorrent найден, но API key отклонён. Проверьте, что ключ создан в qBittorrent 5.2 → Settings → Web UI → API keys и вставлен полностью.",
+        "qBittorrent was found, but the API key was rejected. Check that the key was created in qBittorrent 5.2 → Settings → Web UI → API keys and pasted in full.",
+    ),
+    ("Не удалось получить версию qBittorrent: HTTP {0}", "Could not get the qBittorrent version: HTTP {0}"),
+    ("Не удалось получить категории qBittorrent: {0}", "Could not get qBittorrent categories: {0}"),
+    ("Не удалось получить теги qBittorrent: {0}", "Could not get qBittorrent tags: {0}"),
+    ("Не удалось снять теги qBittorrent: {0}", "Could not remove qBittorrent tags from the torrent: {0}"),
+    ("Не удалось удалить теги qBittorrent: {0}", "Could not delete qBittorrent tags: {0}"),
+    (
+        "Не удалось создать категорию qBittorrent '{0}': {1}",
+        "Could not create qBittorrent category '{0}': {1}",
+    ),
+    (
+        "Торрент добавлен, но не удалось назначить категорию/теги: {0}",
+        "The torrent was added, but its category/tags could not be assigned: {0}",
+    ),
+    (
+        "Не удалось обновить путь торрента qBittorrent: {0}",
+        "Could not update the qBittorrent torrent path: {0}",
+    ),
+    ("Не удалось перепроверить торрент qBittorrent: {0}", "Could not recheck the qBittorrent torrent: {0}"),
+    ("Не удалось добавить торрент: {0}", "Could not add the torrent: {0}"),
+    (
+        "qBittorrent не добавил торрент (409 Conflict). Торрент не найден среди существующих; возможны некорректная magnet-ссылка или недоступная папка загрузки: {0}.{1}",
+        "qBittorrent did not add the torrent (409 Conflict). It was not found among existing torrents; the magnet link may be invalid or the download folder unavailable: {0}.{1}",
+    ),
+    (
+        "qBittorrent принял запрос, но не смог добавить торрент (failure_count={0})",
+        "qBittorrent accepted the request, but could not add the torrent (failure_count={0})",
+    ),
+    ("qBittorrent вернул неожиданный ответ: {0}", "qBittorrent returned an unexpected response: {0}"),
+    (
+        "Не удалось получить metadata торрента через qBittorrent: {0}",
+        "Could not get torrent metadata with qBittorrent: {0}",
+    ),
+    ("Не удалось запустить торрент: {0}", "Could not start the torrent: {0}"),
+    ("Не удалось остановить торрент: {0}", "Could not stop the torrent: {0}"),
+    ("Не удалось получить загрузки qBittorrent: {0}", "Could not get qBittorrent downloads: {0}"),
+    ("Не удалось получить файлы торрента: {0}", "Could not get torrent files: {0}"),
+    ("Не удалось выбрать файлы торрента: {0}", "Could not select torrent files: {0}"),
+    ("Не удалось удалить торрент: {0}", "Could not delete the torrent: {0}"),
+    ("Некорректный timestamp субтитров: {0}", "Invalid subtitle timestamp: {0}"),
+    (" напрямую", " directly"),
+    (" через {0}", " through {0}"),
+    (" Ответ qBittorrent: {0}", " qBittorrent response: {0}"),
+    (
+        "qBittorrent установлен, но Web UI API не отвечает по адресу {0}. Откройте qBittorrent → Settings → Web UI, включите «Web User Interface (Remote control)» и укажите в {1} тот же порт. API key отвечает только за авторизацию и сам Web UI не запускает. Техническая ошибка: {2}",
+        "qBittorrent is installed, but its Web UI API does not respond at {0}. Open qBittorrent → Settings → Web UI, enable “Web User Interface (Remote control)” and set the same port in {1}. The API key only handles authorization and does not start the Web UI. Technical error: {2}",
+    ),
+    ("Не удалось запустить {0}: {1}", "Could not start {0}: {1}"),
+    (
+        "AniList сохранил изменение, но не отдал обновлённый список; используются локальные данные",
+        "AniList saved the change, but did not return the updated list; using local data",
+    ),
+    (
+        "Jimaku: найден архив .7z/.rar, но 7-Zip не установлен",
+        "Jimaku: found a .7z/.rar archive, but 7-Zip is not installed",
+    ),
+    ("Jimaku: не удалось распаковать {0}", "Jimaku: could not extract {0}"),
+    (
+        "AniList вернул HTTP 500 на расширенный запрос; использован упрощённый запрос, данные графа оставлены из кэша",
+        "AniList returned HTTP 500 for the extended query; used a simplified query and kept cached graph data",
+    ),
+    # Subtitle quality-gate reasons (shown in Diagnostics/debug views).
+    ("синхронизация не удалась", "synchronization failed"),
+    ("тайминг разрушен при выравнивании: {0}", "timing was broken by alignment: {0}"),
+    (
+        "встроенная дорожка: ALASS дал неподтверждённый большой скачок (spread={0}s)",
+        "embedded track: ALASS produced an unconfirmed large jump (spread={0}s)",
+    ),
+    (
+        "точный одноэпизодный SPECIAL Jimaku; текстовая дорожка совпадает по структуре и таймингу",
+        "exact single-episode Jimaku SPECIAL; the text track matches in structure and timing",
+    ),
+    (
+        "точный фильм AniList/Jimaku; текстовая дорожка совпадает по структуре и таймингу",
+        "exact AniList/Jimaku movie; the text track matches in structure and timing",
+    ),
+    (
+        "точная серия найдена, но выбранный тайминг нестабилен: {0}",
+        "exact episode found, but the selected timing is unstable: {0}",
+    ),
+    (
+        "точная серия AniList/Jimaku; номер и полная структура подтверждены таймингом",
+        "exact AniList/Jimaku episode; number and full structure confirmed by timing",
+    ),
+    ("содержание не совпало с серией", "content does not match the episode"),
+    (
+        "изменение часов timeline требует проверки по японской аудиодорожке",
+        "a timeline clock change needs verification against the Japanese audio track",
+    ),
+    (
+        "timeline-remap ухудшил исходный тайминг по matched/coverage/F1/error; нужна другая временная опора",
+        "timeline remap worsened the original timing (matched/coverage/F1/error); another timing reference is needed",
+    ),
+    ("надёжная встроенная временная дорожка", "reliable embedded timing track"),
+    ("нестабильные метрики в разных участках серии", "unstable metrics across parts of the episode"),
+    (
+        "точная серия Jimaku; различаются только границы эфира",
+        "exact Jimaku episode; only broadcast boundaries differ",
+    ),
+)
 
 
 def node(script: str) -> str:
-    return subprocess.check_output(["node", "-e", script], text=True, timeout=15)
+    # stdin, not -e: scripts that include the interface catalogs exceed the argument limit.
+    return subprocess.check_output(["node", "-"], input=script, text=True, timeout=15)
 
 
 def test_drop_uses_lexical_ui_language_without_window_ui():
@@ -45,32 +230,54 @@ ui.lang='ru';listeners.dragenter(drag('a.txt'));assert.equal(box.dataset.dropLab
 listeners.drop(bad());assert.equal(notices.pop(),'Поддерживаются EPUB и TXT');
 assert(!classes.has('ln-file-drag'));
 """
-    node(setup + (WEB / "ln_drop.js").read_text() + checks)
+    node(setup + i18n_source() + web_module("ln_drop.js") + checks)
 
 
-def test_known_error_catalog_is_identical_in_python_and_ui_and_preserves_source_text():
+def test_known_errors_translate_both_ways_in_python_and_ui_and_preserve_source_text():
+    # One catalog now serves Python and the window, so there is no parity check of two copies.
     values = ["/tmp/Русская книга [01].mkv", "исходный ответ провайдера", "3"]
-    samples = [ru.format(*values) for ru, _ in ERROR_TRANSLATIONS]
-    expected = [en.format(*values) for _, en in ERROR_TRANSLATIONS]
-    assert [localize_ui_message(text, "en") for text in samples] == expected
-    assert [localize_ui_message(text, "ru") for text in samples] == samples
+    russian = [ru.format(*values) for ru, _ in LEGACY_ERRORS]
+    english = [en.format(*values) for _, en in LEGACY_ERRORS]
+    assert [message(text, "en") for text in russian] == english
+    assert [message(text, "ru") for text in russian] == russian
+    assert [message(text, "ru") for text in english] == russian
+    assert [message(text, "en") for text in english] == english
     setup = "global.window=global;const ui={lang:'en'};"
     checks = f"""
-const input={json.dumps(samples, ensure_ascii=False)};
-const catalog=window.PudgeUiLanguage.ERROR_TRANSLATIONS;
-const english=input.map(text=>window.PudgeUiLanguage.message(text));ui.lang='ru';
-console.log(JSON.stringify({{catalog,english,russian:input.map(text=>window.PudgeUiLanguage.message(text))}}));
+const russian={json.dumps(russian, ensure_ascii=False)}, english={json.dumps(english, ensure_ascii=False)};
+const out={{english:russian.map(text=>PudgeI18n.message(text)), englishSame:english.map(text=>PudgeI18n.message(text)),
+  legacy:russian.map(text=>window.PudgeUiLanguage.message(text))}};
+ui.lang='ru';
+out.russian=russian.map(text=>PudgeI18n.message(text));out.russianFromEnglish=english.map(text=>PudgeI18n.message(text));
+console.log(JSON.stringify(out));
 """
-    result = json.loads(node(setup + (WEB / "ui_localization.js").read_text() + checks))
-    assert result["catalog"] == [list(row) for row in ERROR_TRANSLATIONS]
-    assert result["english"] == expected
-    assert result["russian"] == samples
+    result = json.loads(node(setup + i18n_source() + checks))
+    assert result["english"] == english
+    assert result["englishSame"] == english
+    assert result["legacy"] == english
+    assert result["russian"] == russian
+    assert result["russianFromEnglish"] == russian
     for text in ("Название книги: Видео не найдено", "/tmp/Не найден mpv: книга.mkv", "Свободный текст"):
-        assert localize_ui_message(text, "en") == text
+        assert message(text, "en") == text
+        assert message(text, "ru") == text
     nested = "Error: Не удалось запустить Pudge: Не найден mpv: /tmp/Русская книга"
-    assert (
-        localize_ui_message(nested, "en") == "Error: Could not start Pudge: mpv not found: /tmp/Русская книга"
-    )
+    nested_en = "Error: Could not start Pudge: mpv not found: /tmp/Русская книга"
+    assert message(nested, "en") == nested_en
+    assert message(nested_en, "ru") == "Ошибка: Не удалось запустить Pudge: Не найден mpv: /tmp/Русская книга"
+    probe = f"""
+const free={json.dumps(["Название книги: Видео не найдено", "/tmp/Не найден mpv: книга.mkv", "Свободный текст"], ensure_ascii=False)};
+console.log(JSON.stringify({{free:free.map(text=>PudgeI18n.message(text,'en')),
+  nested:PudgeI18n.message({json.dumps(nested, ensure_ascii=False)},'en'),
+  nestedRu:PudgeI18n.message({json.dumps(nested_en, ensure_ascii=False)},'ru')}}));
+"""
+    result = json.loads(node(setup + i18n_source() + probe))
+    assert result["free"] == [
+        "Название книги: Видео не найдено",
+        "/tmp/Не найден mpv: книга.mkv",
+        "Свободный текст",
+    ]
+    assert result["nested"] == nested_en
+    assert result["nestedRu"] == "Ошибка: Не удалось запустить Pudge: Не найден mpv: /tmp/Русская книга"
 
 
 def powder_dto():
@@ -143,151 +350,30 @@ def test_old_incomplete_lexical_cache_is_retired_without_removing_data(tmp_path)
         repository.pool.shutdown()
 
 
-def test_javascript_readings_match_backend_and_jiten_click_does_not_grade():
+def test_javascript_readings_match_backend(page):
+    # The window's Jiten word helpers read a card like the backend does. Opening the word on
+    # Jiten from the review gate (open_url, no grade) is tested in
+    # test_review_gate_undo_and_layout.py::test_revealing_the_answer_keeps_the_word_in_its_slot_and_adds_the_reading.
     payload = {**powder_dto(), "readingIndex": 0}
     expected = normalize_card(payload)
-    source = (
-        (WEB / "review_gate.js")
-        .read_text()
-        .replace(
-            "window.PudgeReviewGate = {",
-            "window.PudgeReviewGate = {ensureUiForTest:ensureUi, jitenWordHtmlForTest:jitenWordHtml,",
-        )
+    result = page.run(
+        f"""
+        const card = {json.dumps(payload, ensure_ascii=False)};
+        const normalized = PudgeJitenWords.normalize(card);
+        return {{primary: normalized.primary_reading, all: normalized.all_readings,
+                line: PudgeJitenWords.readingsLine(card),
+                badUrls: [PudgeJitenWords.url({{wordId: '1/evil', readingIndex: 0}}), PudgeJitenWords.url({{wordId: 1, readingIndex: -1}})],
+                url: PudgeJitenWords.url({{wordId: 1504770, readingIndex: 0}})}};
+        """
     )
-    setup = r"""
-global.window=global;const assert=require('node:assert/strict'),opened=[],listeners={};let graded=0;
-window.addEventListener=()=>{};window.pywebview={api:{open_url:async url=>opened.push(url),review_gate_grade:()=>graded++}};
-const overlay={isConnected:true,classList:{},setAttribute(){},addEventListener:(k,fn)=>listeners[k]=fn};
-global.document={documentElement:{lang:'en'},body:{appendChild(){}},createElement:()=>overlay,addEventListener(){}};
-"""
-    checks = f"""
-(async()=>{{
-const card={json.dumps(payload, ensure_ascii=False)};
-const normalized=window.PudgeJitenWords.normalize(card);
-assert.equal(normalized.primary_reading,{json.dumps(expected["primary_reading"])});
-assert.deepEqual(normalized.all_readings,{json.dumps(expected["all_readings"])});
-assert.equal(window.PudgeJitenWords.readingsLine(card),'こ');
-assert.equal(window.PudgeJitenWords.url({{wordId:'1/evil',readingIndex:0}}),'');
-assert.equal(window.PudgeJitenWords.url({{wordId:1,readingIndex:-1}}),'');
-const html=window.PudgeReviewGate.jitenWordHtmlForTest(card,'粉');
-assert(html.includes('data-word-id="1504770"')&&html.includes('data-reading-index="0"'));
-assert(html.includes('Open word on Jiten'));
-window.PudgeReviewGate.ensureUiForTest();let prevented=false;
-listeners.click({{preventDefault(){{prevented=true;}},target:{{closest:selector=>selector==='[data-review-gate-jiten]'?{{dataset:{{wordId:'1504770',readingIndex:'0'}}}}:null}}}});
-await Promise.resolve();assert(prevented);assert.equal(graded,0);
-assert.deepEqual(opened,['https://jiten.moe/vocabulary/1504770/0']);
-}})().catch(error=>{{console.error(error);process.exitCode=1;}});
-"""
-    node(setup + (WEB / "jiten_words.js").read_text() + source + checks)
+    out = result.value
+    assert (out["primary"], out["all"]) == (expected["primary_reading"], expected["all_readings"])
+    assert out["line"] == "こ"
+    assert out["badUrls"] == ["", ""]
+    assert out["url"] == "https://jiten.moe/vocabulary/1504770/0"
 
 
-@pytest.mark.parametrize("language", ["en", "ru"])
-def test_advanced_settings_language_and_no_model_save(language, tmp_path, monkeypatch):
-    from pudge import settings_ui
-
-    texts, buttons, combos, errors, saved = [], [], [], [], []
-
-    class Variable:
-        def __init__(self, value=None, **kw):
-            self.value = value
-
-        def get(self):
-            return self.value
-
-        def set(self, value):
-            self.value = value
-
-        def trace_add(self, *args):
-            pass
-
-    class Widget:
-        def __init__(self, *args, **kw):
-            self.kw = kw
-            if "text" in kw:
-                texts.append(kw["text"])
-            if "command" in kw and "text" in kw:
-                buttons.append(self)
-            if "textvariable" in kw and kw.get("state") == "readonly":
-                combos.append(self)
-
-        def __setitem__(self, key, value):
-            self.kw[key] = value
-            if key == "values" and self not in combos:
-                combos.append(self)
-
-        def __getattr__(self, name):
-            return lambda *args, **kw: None
-
-        def title(self, text):
-            texts.append(text)
-
-        def winfo_screenwidth(self):
-            return 1440
-
-        def winfo_screenheight(self):
-            return 900
-
-        def add(self, widget, **kw):
-            texts.append(kw.get("text", ""))
-
-        def grid_slaves(self, **kw):
-            return []
-
-    ttk = SimpleNamespace(
-        **{
-            name: Widget
-            for name in (
-                "Frame",
-                "Label",
-                "Notebook",
-                "Scrollbar",
-                "Style",
-                "Entry",
-                "Button",
-                "Combobox",
-                "Checkbutton",
-                "Separator",
-            )
-        }
-    )
-    dialogs = SimpleNamespace(
-        showinfo=lambda *a, **kw: texts.extend(a[:2]), showerror=lambda *a, **kw: errors.append(a)
-    )
-    tk = SimpleNamespace(
-        Tk=Widget,
-        Canvas=Widget,
-        StringVar=Variable,
-        BooleanVar=Variable,
-        TclError=RuntimeError,
-        ttk=ttk,
-        messagebox=dialogs,
-        filedialog=SimpleNamespace(askdirectory=lambda **kw: ""),
-    )
-    monkeypatch.setitem(sys.modules, "tkinter", tk)
-    monkeypatch.setattr(settings_ui, "SmoothScrollController", lambda *a: Widget())
-    monkeypatch.setattr(settings_ui, "enable_edit_shortcuts", lambda *a: None)
-    cfg = AppConfig()
-    cfg.ui.language = language
-    cfg.llm.enabled = False
-    cfg.llm.model = "previous-real-model"
-    monkeypatch.setattr(settings_ui, "load_config", lambda path: cfg)
-    monkeypatch.setattr(settings_ui, "write_config", lambda config, path: saved.append(config))
-    assert settings_ui.launch_settings(tmp_path / "config.toml") == 0
-    no_model = "No model" if language == "en" else "Без модели"
-    assert any(no_model in widget.kw.get("values", ()) for widget in combos)
-    if language == "en":
-        assert not any(any("А" <= c <= "я" or c in "Ёё" for c in text) for text in texts)
-        assert "Create Client ID" in texts
-    else:
-        assert "Модель" in texts and "Сохранить" in texts
-        assert "Создать Client ID" in texts
-    assert f"{'Version' if language == 'en' else 'Версия'}: {settings_ui.__version__}" in texts
-    save = next(
-        widget for widget in buttons if widget.kw["text"] == ("Save" if language == "en" else "Сохранить")
-    )
-    save.kw["command"]()
-    assert errors == [] and saved == [cfg]
-    assert not cfg.llm.enabled and cfg.llm.model == "previous-real-model"
+# test_advanced_settings_language_and_no_model_save: the Tk settings window (settings_ui.py) was deleted on purpose (68Б).
 
 
 def test_worker_environment_removes_gui_identity_without_changing_parent(monkeypatch):

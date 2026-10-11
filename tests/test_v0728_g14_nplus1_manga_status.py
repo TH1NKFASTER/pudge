@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from tests.t71g06_support import STUDY, column, reader, vertical
+
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / "pudge" / "web"
 
@@ -78,18 +80,74 @@ def test_optimal_eligibility_survives_visual_highlight_toggle_for_card_star() ->
     assert _run_node(script) == {"target": "1", "other": ""}
 
 
-def test_manga_status_overlay_accepts_segment_mapped_approximate_geometry_only() -> None:
-    manga = (WEB / "manga_reader_v2.js").read_text(encoding="utf-8")
-    assert "['observed','approximate'].includes(geometryStatus)" in manga
-    assert "String(region.word_geometry || '') !== 'mapped_segments'" in manga
-    assert "String(box.source || '') === 'region-single-token'" in manga
-    assert "String(box.source || '').startsWith('mokuro-')" in manga
-    assert "approximate:geometryStatus === 'approximate'" in manga
-    assert "if (box.approximate) node.classList.add('is-approximate')" in manga
-    assert "mangaGeometryStatus(region, segments) !== 'observed'" not in manga
+# One page with every kind of OCR geometry; all words have a confirmed Jiten state.
+GEOMETRY_KINDS = {
+    0: [
+        column("猫が好き", 0.80, 0.90),  # approximate, mapped per character
+        column("白い犬", 0.70, 0.90, source="vision-accurate", status=None),  # observed (Vision) characters
+        column("赤い花", 0.60, 0.90, mapped=False),  # characters not mapped to the text
+        vertical("魚", 0.50, 0.70, 0.05, 0.10),  # no characters: the region is one word
+        column("青い鳥", 0.40, 0.90, source="ink-grid-v1", status=None),  # synthetic grid
+        vertical(
+            "海だ",
+            0.30,
+            0.90,
+            0.05,
+            0.15,
+            geometry_status="approximate",  # Mokuro lines only
+            provenance={
+                "source": "mokuro",
+                "line_boxes": [{"text": "海だ", "x": 0.30, "y": 0.75, "width": 0.05, "height": 0.15}],
+            },
+        ),
+        column(
+            "山だ", 0.20, 0.90, source="mokuro", provenance={"source": "mokuro"}
+        ),  # Mokuro lines split into characters
+    ]
+}
+GEOMETRY_WORDS = {
+    "猫が好き": [["猫", 1, 0], ["が", 2, 0], ["好き", 3, 0]],
+    "白い犬": [["白い", 4, 0], ["犬", 5, 0]],
+    "赤い花": [["赤い", 6, 0], ["花", 7, 0]],
+    "魚": [["魚", 8, 0]],
+    "青い鳥": [["青い", 9, 0], ["鳥", 10, 0]],
+    "海だ": [["海", 11, 0], ["だ", 12, 0]],
+    "山だ": [["山", 13, 0], ["だ", 12, 0]],
+}
+LIVE = r"""
+window.__live = {'1:0': {states: ['new'], normalizedState: 'new'}, '3:0': {states: ['young', 'due'], normalizedState: 'due'},
+  '4:0': {states: ['new'], normalizedState: 'new'}, '5:0': {states: ['known'], normalizedState: 'known'}};
+for (const id of [6, 7, 8, 9, 10, 11, 13]) window.__live[`${id}:0`] = {states: ['young'], normalizedState: 'learning'};
+"""
+
+
+def test_word_states_are_painted_only_on_character_geometry_mapped_to_the_words(page) -> None:
+    result = reader(
+        page,
+        "return marks();",
+        regions=GEOMETRY_KINDS,
+        parse=GEOMETRY_WORDS,
+        prefs={"configured": True, "statusHighlight": True},
+        before=STUDY + LIVE,
+    )
+    painted = {
+        (mark["region"], mark["word"]): (mark["state"], mark["due"], mark["approximate"])
+        for mark in result.value
+    }
+    # Observed and approximate per-character geometry is painted (approximate is marked as such);
+    # a word without a confirmed state (が) is not.
+    assert painted == {
+        ("猫が好き", "猫"): ("new", False, True),
+        ("猫が好き", "好き"): ("learning", True, True),
+        ("白い犬", "白い"): ("new", False, False),
+        ("白い犬", "犬"): ("known", False, False),
+        ("山だ", "山"): ("learning", False, True),
+    }
 
 
 def test_g14_javascript_syntax() -> None:
     for rel in ("pudge/web/reading_tools.js", "pudge/web/manga_reader_v2.js"):
-        result = subprocess.run(["node", "--check", str(ROOT / rel)], cwd=ROOT, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(
+            ["node", "--check", str(ROOT / rel)], cwd=ROOT, capture_output=True, text=True, timeout=15
+        )
         assert result.returncode == 0, result.stdout + result.stderr

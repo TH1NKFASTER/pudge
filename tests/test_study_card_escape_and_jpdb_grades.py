@@ -1,107 +1,170 @@
-"""Escape closes the word card even with leftover selections; jpdb's five grades fit."""
+"""Escape closes the word card even with leftover selections; jpdb's five grades fit
+(behaviour in the window; audit 71Б rewrite)."""
 
 from __future__ import annotations
 
-import json
-import subprocess
-from pathlib import Path
+from css_support import css_rules
+from study_page_support import LN_BOOK, SELECTION
 
-WEB = Path(__file__).resolve().parents[1] / "pudge" / "web"
+LN_BOOKS = {
+    "version": 1,
+    "settings": {},
+    "books": [{"id": 6, "title": "Novel", "volume": 1}, {"id": 7, "title": "Novel", "volume": 2}],
+}
+READER = {
+    "before": LN_BOOK,
+    "state": {"settings": {"review_gate_ln_enabled": False}},
+    "api": {"light_novel_state": LN_BOOKS},
+}
 
-
-def _run_escape(*, library_selected: bool, native_selected: bool, event_type: str = 'keydown', study_dom_open: bool = True) -> dict:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    dispatcher = "function isEscapeKey" + html.split("function isEscapeKey", 1)[1].split(
-        "// pudge-r1-escape-dispatch-end", 1
-    )[0]
-    script = f"""
-const vm=require('vm');
-const dispatcher={dispatcher!r};
-const state={{study:true,closes:[],libraryCleared:false,nativeCleared:false}};
-const windowTarget=new EventTarget();global.window=windowTarget;
-global.logs=[];global.logUiEvent=(name,payload)=>{{logs.push(name)}};
-global.document={{getElementById:id=>id==='pudgeStudyCard'?{{classList:{{contains:()=>state.study&&{'true' if True else 'false'}}}}}:null}};
-global.ui={{page:'lightnovels',lnSelection:new Set({'[1,2]' if library_selected else '[]'}),lnStudyTriggerCapturing:false,shortcutCaptureTarget:null,onboardingForced:false,state:{{settings:{{escape_exits_fullscreen:true}}}}}};
-global.$=id=>({{hidden:id==='globalSearchOverlay',classList:{{contains:()=>false,remove(){{}}}},click(){{}}}});
-global.clearLnSelection=()=>{{state.libraryCleared=true;ui.lnSelection.clear();}};
-window.getSelection=()=>({{isCollapsed:{'false' if native_selected else 'true'},removeAllRanges(){{state.nativeCleared=true;}}}});
-global.finishLnStudyTriggerCapture=()=>{{}};global.stopShortcutCapture=()=>{{}};global.closeLnFind=()=>{{}};
-global.closeGlobalSearch=()=>{{}};global.closeModal=()=>{{}};global.hideContextMenu=()=>{{}};
-global.closeLnChapterPicker=()=>{{}};global.hideLnStudyStateMenu=()=>{{}};global.hideLnTranslation=()=>{{}};
-global.pywebview={{api:{{exit_fullscreen:async()=>{{state.closes.push('fullscreen')}}}}}};
-window.PudgeSelect={{closeIfOpen:()=>false}};window.PudgeConfirm={{closeIfOpen:()=>false}};window.PudgeCoverPreview={{closeIfOpen:()=>false}};
-window.PudgeReadingTools={{study:{{closeIfOpen:()=>{{if(!state.study)return false;state.study=false;state.closes.push('study');return true;}}}},closeIfOpen:()=>false}};
-window.PudgeReviewGate={{handleEscape:()=>false}};window.PudgeMangaReaderV2={{selectedBookIds:()=>[],closeEscapeSurface:()=>false}};window.PudgeAudiobookSelection={{selectedBookIds:()=>[]}};
-vm.runInThisContext(dispatcher);
-const event=new Event({event_type!r},{{cancelable:true}});Object.defineProperties(event,{{key:{{value:'Escape'}},code:{{value:'Escape'}},repeat:{{value:false}},isComposing:{{value:false}}}});
-window.dispatchEvent(event);
-setImmediate(()=>process.stdout.write(JSON.stringify({{...state,logs}})));
+# Two volumes stay selected on the shelf, a word card is open in the reader, and the
+# reader's first paragraph is selected as text.
+OPEN_CARD = (
+    SELECTION
+    + """
+setPage('lightnovels'); await __tick(50);
+toggleLnSelection(6); toggleLnSelection(7);
+await __settle(openLightNovel(6)); await __tick(300);
+await __click('#lnReader [data-ln-token="0:0"]'); await __tick(20);
+select(document.querySelector('#lnReader [data-ln-paragraph="1"]'));
+const card = document.getElementById('pudgeStudyCard');
+const escape = type => __fire('body', type, {key: 'Escape', code: 'Escape'}, 'KeyboardEvent');
+const state = () => ({card: card.classList.contains('open'), library: ui.lnSelection.size,
+                      text: !getSelection().isCollapsed, reader: $('lnReaderShell').classList.contains('open')});
+const before = state();
 """
-    return json.loads(subprocess.check_output(["node", "-e", script], text=True))
+)
 
 
-def test_escape_closes_word_card_despite_leftover_library_selection() -> None:
-    result = _run_escape(library_selected=True, native_selected=False)
-    assert result["study"] is False and result["closes"] == ["study"]
-    assert result["libraryCleared"] is False
+def test_escape_closes_word_card_first_despite_leftover_selections(page) -> None:
+    # The card used to stay open: a leftover selection swallowed the Escape (only the close
+    # button's focus ring appeared).
+    result = page.run(
+        OPEN_CARD + "await escape('keydown'); await __tick(10); return {before, after: state()};", **READER
+    )
+    assert result.value["before"] == {"card": True, "library": 2, "text": True, "reader": True}
+    assert result.value["after"] == {"card": False, "library": 2, "text": True, "reader": True}
 
 
-def test_escape_closes_word_card_despite_native_text_selection() -> None:
-    result = _run_escape(library_selected=False, native_selected=True)
-    assert result["study"] is False and result["closes"] == ["study"]
-    assert result["nativeCleared"] is False
+def test_keyup_fallback_closes_word_card_when_webkit_ate_keydown(page) -> None:
+    result = page.run(OPEN_CARD + "await escape('keyup'); await __tick(10); return state();", **READER)
+    assert result.value == {"card": False, "library": 2, "text": True, "reader": True}
+    assert result.calls_of("log_ui_event")[-1] == ["escape.study_keyup_fallback", {"keydown_seen": False}]
 
 
-def test_keyup_fallback_closes_word_card_when_webkit_ate_keydown() -> None:
-    result = _run_escape(library_selected=True, native_selected=True, event_type="keyup")
-    assert result["study"] is False and result["closes"] == ["study"]
-    assert result["libraryCleared"] is False and result["nativeCleared"] is False
-    assert result["logs"] == ["escape.study_keyup_fallback"]
+def test_one_escape_press_closes_only_the_word_card(page) -> None:
+    result = page.run(
+        OPEN_CARD
+        + """
+        await escape('keydown'); await escape('keyup'); await __tick(10);
+        const first = state();
+        await escape('keydown'); await escape('keyup'); await __tick(10);
+        return {first, second: state()};
+        """,
+        **READER,
+    )
+    assert result.value["first"] == {"card": False, "library": 2, "text": True, "reader": True}
+    assert result.value["second"]["library"] == 0 and result.value["second"]["reader"] is True
 
 
-def test_five_grade_row_gets_its_own_line_and_labels_cannot_overlap() -> None:
-    js = (WEB / "reading_tools.js").read_text(encoding="utf-8")
-    assert '<div class="pudge-study-action-row" data-count="${activeToken.reviewActions.actions.length}">' in js
-    css = (WEB / "reading_tools.css").read_text(encoding="utf-8")
-    assert ".pudge-study-review-actions .pudge-study-grade{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}" in css
-    assert '.pudge-study-action-row[data-count="5"]>.pudge-study-review-actions{flex:1 1 100%}' in css
-    assert '.pudge-study-action-row[data-count="5"]>.pudge-study-add-wrap{flex:1 1 100%;justify-content:flex-end;padding-left:0;border-left:0}' in css
-
-
-def test_escape_closes_context_menu_before_search_overlay_exists() -> None:
+def test_escape_closes_context_menu_before_search_overlay_exists(page) -> None:
     """Regression: the lazily created search overlay counted as "open" while absent."""
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    dispatcher = "function isEscapeKey" + html.split("function isEscapeKey", 1)[1].split(
-        "// pudge-r1-escape-dispatch-end", 1
-    )[0]
-    script = f"""
-const vm=require('vm');
-const dispatcher={dispatcher!r};
-const state={{menu:true,closes:[]}};
-global.window=new EventTarget();global.logUiEvent=()=>{{}};
-global.document={{getElementById:()=>null}};
-global.ui={{page:'current',lnSelection:new Set(),lnStudyTriggerCapturing:false,shortcutCaptureTarget:null,onboardingForced:false,state:{{settings:{{escape_exits_fullscreen:true}}}}}};
-global.$=id=>id==='globalSearchOverlay'?null:({{hidden:false,style:{{}},classList:{{contains:name=>id==='contextMenu'&&name==='open'?state.menu:false,remove(){{}}}},click(){{}}}});
-window.getSelection=()=>({{isCollapsed:true}});
-global.clearLnSelection=()=>{{}};global.finishLnStudyTriggerCapture=()=>{{}};global.stopShortcutCapture=()=>{{}};global.closeLnFind=()=>{{}};
-global.closeGlobalSearch=()=>{{state.closes.push('search')}};global.closeModal=()=>{{}};global.hideContextMenu=()=>{{state.menu=false;state.closes.push('menu')}};
-global.closeLnChapterPicker=()=>{{}};global.hideLnStudyStateMenu=()=>{{}};global.hideLnTranslation=()=>{{}};
-global.pywebview={{api:{{exit_fullscreen:async()=>{{state.closes.push('fullscreen')}}}}}};
-window.PudgeSelect={{closeIfOpen:()=>false}};window.PudgeConfirm={{closeIfOpen:()=>false}};window.PudgeCoverPreview={{closeIfOpen:()=>false}};
-window.PudgeReadingTools={{study:{{closeIfOpen:()=>false}},closeIfOpen:()=>false}};
-window.PudgeReviewGate={{handleEscape:()=>false}};window.PudgeMangaReaderV2={{selectedBookIds:()=>[],closeEscapeSurface:()=>false,closeSettingsIfOpen:()=>false}};window.PudgeAudiobookSelection={{selectedBookIds:()=>[]}};
-vm.runInThisContext(dispatcher);
-const event=new Event('keydown',{{cancelable:true}});Object.defineProperties(event,{{key:{{value:'Escape'}},code:{{value:'Escape'}},repeat:{{value:false}},isComposing:{{value:false}}}});
-window.dispatchEvent(event);
-setImmediate(()=>process.stdout.write(JSON.stringify(state)));
-"""
-    result = json.loads(subprocess.check_output(["node", "-e", script], text=True))
-    assert result == {"menu": False, "closes": ["menu"]}
+    result = page.run(
+        """
+        await __fire('#currentContent [data-media-id="7"]', 'contextmenu', {clientX: 50, clientY: 60}, 'MouseEvent');
+        const out = {overlay: Boolean(document.getElementById('globalSearchOverlay')), menu: $('contextMenu').classList.contains('open')};
+        await __key('Escape', {code: 'Escape'}, 'body'); await __tick(10);
+        out.closed = !$('contextMenu').classList.contains('open');
+        out.fullscreenAfterMenu = __apiCalls.filter(c => c.name === 'exit_fullscreen').length;
+        await __key('Escape', {code: 'Escape'}, 'body'); await __tick(10);    // nothing left open: leave full screen
+        out.fullscreenAfterNext = __apiCalls.filter(c => c.name === 'exit_fullscreen').length;
+        return out;
+        """,
+        state={
+            "home": {
+                "waiting": [
+                    {
+                        "media_id": 7,
+                        "title": "Show",
+                        "next_episode": 3,
+                        "site_url": "https://anilist.co/anime/7",
+                    }
+                ]
+            }
+        },
+    )
+    assert result.value == {
+        "overlay": False,
+        "menu": True,
+        "closed": True,
+        "fullscreenAfterMenu": 0,
+        "fullscreenAfterNext": 1,
+    }
 
 
-def test_grade_key_settings_are_collapsible() -> None:
-    html = (WEB / "index.html").read_text(encoding="utf-8")
-    assert '<details id="s_review_shortcuts_group"' in html
-    group = html[html.index('<details id="s_review_shortcuts_group"'):]
-    assert group.index('<div id="s_review_shortcuts"') < group.index("</details>")
-    assert '<div id="s_review_shortcuts" style="display:contents">' not in html
+def test_five_grade_row_gets_its_own_line_and_labels_cannot_overlap(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            await __settle(openLightNovel(6)); await __tick(300);
+            await __click('#lnReader [data-ln-token="0:0"]'); await __tick(20);
+            const row = document.querySelector('#pudgeStudyCard .pudge-study-action-row');
+            return {count: row.dataset.count, grades: [...row.querySelectorAll('[data-pudge-study-review]')].map(b => b.textContent),
+                    expected: ['nothing', 'something', 'hard', 'okay', 'easy'].map(id => t(`review.action.${id}`))};
+            """,
+            lang=lang,
+            before=LN_BOOK,
+            state={"settings": {"review_gate_ln_enabled": False}},
+            api={"light_novel_state": {"version": 1, "settings": {"study_backend": "jpdb"}, "books": []}},
+        )
+        assert result.value["count"] == "5"
+        assert result.value["grades"] == result.value["expected"]
+    rules = css_rules("reading_tools.css")
+    # Five grades take the whole line; the Add button moves to the next line, right-aligned.
+    assert rules.get('.pudge-study-action-row[data-count="5"]', "flex-wrap") == "wrap"
+    assert (
+        rules.get('.pudge-study-action-row[data-count="5"]>.pudge-study-review-actions', "flex") == "1 1 100%"
+    )
+    add = rules.declarations('.pudge-study-action-row[data-count="5"]>.pudge-study-add-wrap')
+    assert (add["flex"], add["justify-content"], add["padding-left"], add["border-left"]) == (
+        "1 1 100%",
+        "flex-end",
+        "0",
+        "0",
+    )
+    assert (
+        rules.get('.pudge-study-review-actions[data-count="5"]', "grid-template-columns")
+        == "repeat(5,minmax(0,1fr))"
+    )
+    # A long label is cut with an ellipsis instead of running into its neighbour.
+    grade = rules.declarations(".pudge-study-review-actions .pudge-study-grade")
+    assert (grade["min-width"], grade["white-space"], grade["overflow"], grade["text-overflow"]) == (
+        "0",
+        "nowrap",
+        "hidden",
+        "ellipsis",
+    )
+
+
+def test_grade_key_settings_are_collapsible(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            """
+            setPage('settings'); await __tick(20);
+            const keys = () => [...document.querySelectorAll('#s_review_shortcuts_group .shortcut-recorder[data-review-binding]')];
+            const out = {summary: __text('#s_review_shortcuts_group > summary'), expected: PudgeI18n.t('ui.gradeKeys'),
+                         count: keys().length, group: __visible('#s_review_shortcuts_group > summary'), shownClosed: keys().some(el => el.checkVisibility())};
+            $('s_review_shortcuts_group').open = true;      // what a click on the summary does (dom_lite has no default action for it)
+            out.shownOpen = keys().every(el => el.checkVisibility());
+            return out;
+            """,
+            lang=lang,
+        )
+        out = result.value
+        assert out["summary"] == out["expected"]
+        assert (
+            out["count"] >= 4
+            and out["group"] is True
+            and out["shownClosed"] is False
+            and out["shownOpen"] is True
+        )

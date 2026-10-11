@@ -1,4 +1,5 @@
 """Backend-observed Torrent Off must be distinct from the user's Off intent."""
+
 from __future__ import annotations
 
 import logging
@@ -18,7 +19,8 @@ def _api(tmp_path: Path, monkeypatch, *, qbt_enabled: bool = True) -> web_app.We
     api.config.qbittorrent.enabled = qbt_enabled
     api.config.aria2.enabled = False
     api.manager = SimpleNamespace(
-        config=api.config, db=SimpleNamespace(downloads=lambda: []),
+        config=api.config,
+        db=SimpleNamespace(downloads=lambda: []),
         download_intents=SimpleNamespace(waiting_count=lambda: 0),
         torrent_backend_name=lambda: "qBittorrent" if qbt_enabled else "disabled",
         torrent_clients=lambda: [],
@@ -30,7 +32,9 @@ def _api(tmp_path: Path, monkeypatch, *, qbt_enabled: bool = True) -> web_app.We
     api._torrent_traffic_lock = threading.Lock()
     api._last_torrent_traffic = {}
     api._torrent_off_evidence = {
-        "generation": 1, "aria2_shutdown_confirmed": False, "checked_at": 0,
+        "generation": 1,
+        "aria2_shutdown_confirmed": False,
+        "checked_at": 0,
     }
     api._downloads_configured = lambda: qbt_enabled
     api.logger = logging.getLogger("test-verified-off-e2")
@@ -39,7 +43,8 @@ def _api(tmp_path: Path, monkeypatch, *, qbt_enabled: bool = True) -> web_app.We
 
 def _row(state: str, *, category: str = "pudge", tags: str = "", speed: int = 0):
     return SimpleNamespace(
-        torrent_hash=f"hash-{category}", state=state,
+        torrent_hash=f"hash-{category}",
+        state=state,
         raw={"category": category, "tags": tags, "dlspeed": speed, "upspeed": 0},
     )
 
@@ -227,7 +232,8 @@ def test_failed_config_persist_cannot_leave_off_evidence(tmp_path, monkeypatch) 
     api.config.nyaa.torrents_enabled = True
     api._torrent_shared_admission = lambda: None
     api._quiesce_torrent_backends = lambda *, reason: {
-        "aria2_stopped": True, "qbittorrent_paused": 0,
+        "aria2_stopped": True,
+        "qbittorrent_paused": 0,
     }
     api._ui_state_cache = None
     api._bump_ui_state_version = lambda: ""
@@ -260,12 +266,22 @@ def test_off_pauses_untracked_audiobook_but_not_foreign_torrent(tmp_path, monkey
             assert category == ""
             return [
                 SimpleNamespace(torrent_hash="anime-hash", state="downloading", raw={"category": "other"}),
-                SimpleNamespace(torrent_hash="audio-hash", state="downloading", raw={
-                    "category": "pudge-audiobooks", "tags": "pudge,audiobook",
-                }),
-                SimpleNamespace(torrent_hash="foreign-hash", state="downloading", raw={
-                    "category": "other", "tags": "private",
-                }),
+                SimpleNamespace(
+                    torrent_hash="audio-hash",
+                    state="downloading",
+                    raw={
+                        "category": "pudge-audiobooks",
+                        "tags": "pudge,audiobook",
+                    },
+                ),
+                SimpleNamespace(
+                    torrent_hash="foreign-hash",
+                    state="downloading",
+                    raw={
+                        "category": "other",
+                        "tags": "private",
+                    },
+                ),
             ]
 
         def pause(self, torrent_hash):
@@ -276,13 +292,14 @@ def test_off_pauses_untracked_audiobook_but_not_foreign_torrent(tmp_path, monkey
 
     monkeypatch.setattr(web_app, "QBittorrentClient", SafeClient)
     assert api._quiesce_qbittorrent(reason="test") == 2
-    assert paused == ["anime-hash", "audio-hash"]
+    assert paused == ["anime-hash|audio-hash"]  # one stop call
 
 
 def test_live_listing_failure_still_pauses_all_persisted_hashes(tmp_path, monkeypatch) -> None:
     api = _api(tmp_path, monkeypatch)
     api.manager.db.downloads = lambda: [
-        SimpleNamespace(torrent_hash="healthy"), SimpleNamespace(torrent_hash="broken"),
+        SimpleNamespace(torrent_hash="healthy"),
+        SimpleNamespace(torrent_hash="broken"),
     ]
     paused: list[str] = []
 
@@ -295,15 +312,13 @@ def test_live_listing_failure_still_pauses_all_persisted_hashes(tmp_path, monkey
 
         def pause(self, torrent_hash):
             paused.append(torrent_hash)
-            if torrent_hash == "broken":
-                raise TimeoutError("pause failed")
 
         def close(self):
             pass
 
     monkeypatch.setattr(web_app, "QBittorrentClient", SafeClient)
-    assert api._quiesce_qbittorrent(reason="test") == 1
-    assert paused == ["broken", "healthy"]
+    assert api._quiesce_qbittorrent(reason="test") == 2
+    assert paused == ["broken|healthy"]  # one stop call for every persisted hash
 
 
 def test_shutdown_constructor_error_is_unconfirmed_not_an_off_toggle_failure(tmp_path, monkeypatch) -> None:

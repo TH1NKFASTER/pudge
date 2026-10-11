@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from pudge.config import AppConfig, write_config
@@ -16,7 +17,7 @@ def make_api(tmp_path: Path) -> WebAppApi:
     return WebAppApi(cfg.config_path)
 
 
-def test_activity_payload_exposes_anime_titles(tmp_path: Path) -> None:
+def _api_with_unreadable_release(tmp_path: Path) -> WebAppApi:
     api = make_api(tmp_path)
     anime = LibraryAnime(media_id=1111, title="Readable Anime", status="CURRENT", episodes=12)
     video = tmp_path / "[Group] unreadable.release.name.mkv"
@@ -39,20 +40,32 @@ def test_activity_payload_exposes_anime_titles(tmp_path: Path) -> None:
             is_batch=False,
         )
     )
+    return api
 
-    state = api.get_state_fast()
+
+def test_activity_payload_exposes_anime_titles(tmp_path: Path) -> None:
+    state = _api_with_unreadable_release(tmp_path).get_state_fast()
 
     assert state["subtitle_jobs"][0]["anime_title"] == "Readable Anime"
     assert state["downloads"][0]["anime_title"] == "Readable Anime"
 
 
-def test_activity_html_never_uses_anilist_id_as_display_title() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    start = html.index("function renderDownloads()")
-    end = html.index("function input(", start)
-    activity = html[start:end]
-
-    assert "`AniList ${job.media_id}`" not in activity
-    assert "`AniList ${item.media_id}`" not in activity
-    assert "job.anime_title||job.video" in activity
-    assert "d.anime_title||d.name" in activity
+def test_downloads_show_the_anime_title_not_an_anilist_id(tmp_path: Path, page) -> None:
+    # The Downloads window (the backend's real list) names the anime; the release name is the
+    # detail line. It used to fall back to "AniList 1111".
+    downloads = json.loads(
+        json.dumps(_api_with_unreadable_release(tmp_path).torrent_downloads(None, False), default=str)
+    )
+    result = page.run(
+        r"""
+        await openDownloadCenter(null); await __tick(20);
+        const card = document.querySelector('#modalBody .download-card');
+        return {title: card.querySelector('.download-card-title strong').textContent, detail: card.querySelector('.download-card-title span').textContent,
+                text: __text('#modalBody')};
+        """,
+        api={"torrent_downloads": downloads},
+    )
+    out = result.value
+    assert out["title"] == "Readable Anime"
+    assert "[Group] unreadable.release.name" in out["detail"]
+    assert "AniList 1111" not in out["text"]

@@ -1,32 +1,40 @@
+"""Listen together: the precise word clock of a recovered chapter start (cached
+chapter-start STT words + the reader's readings) — in the alignment and when a cached
+alignment is loaded again (behaviour; audit 71Б rewrite).
+
+The illustrations of v1.83 (the same eagerly loaded <img>, revealed in place):
+test_v186_ttsu_images_clock_window.py."""
+
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from pudge.audiobooks import _READING_AUDIO_ALIGNMENT_REVISION
 from pudge.reading_audio_alignment import (
     _punctuation_boundaries,
     chapter_audio_text,
     light_novel_position_for_audio,
 )
+from t71g23_support import paired_book, write_alignment
 
-ROOT = Path(__file__).resolve().parents[1]
-HTML = ROOT / "pudge" / "web" / "index.html"
-AUDIOBOOKS = ROOT / "pudge" / "audiobooks.py"
+SECOND_ACT = (
+    "緩やかに下る坂も終わり、しばらくは土地の起伏といえば申し訳程度の小さい丘、という実に進みやすい道だった。"
+)
+SECOND_ACT_HINTS = [
+    {"offset_start": 0, "offset_end": 3, "surface": "緩やか", "reading": "ゆるやか"},
+    {"offset_start": 8, "offset_end": 11, "surface": "終わり", "reading": "おわり"},
+    {"offset_start": 11, "offset_end": 15, "surface": "しばらく", "reading": "しばらく"},
+    {"offset_start": 15, "offset_end": 16, "surface": "は", "reading": "は"},
+    {"offset_start": 16, "offset_end": 18, "surface": "土地", "reading": "とち"},
+    {"offset_start": 18, "offset_end": 19, "surface": "の", "reading": "の"},
+    {"offset_start": 19, "offset_end": 21, "surface": "起伏", "reading": "きふく"},
+]
 
 
 def _second_act_with_precision_words() -> dict:
-    text = (
-        "緩やかに下る坂も終わり、しばらくは土地の起伏といえば"
-        "申し訳程度の小さい丘、という実に進みやすい道だった。"
-    )
-    hints = [
-        {"offset_start": 0, "offset_end": 3, "surface": "緩やか", "reading": "ゆるやか"},
-        {"offset_start": 8, "offset_end": 11, "surface": "終わり", "reading": "おわり"},
-        {"offset_start": 11, "offset_end": 15, "surface": "しばらく", "reading": "しばらく"},
-        {"offset_start": 15, "offset_end": 16, "surface": "は", "reading": "は"},
-        {"offset_start": 16, "offset_end": 18, "surface": "土地", "reading": "とち"},
-        {"offset_start": 18, "offset_end": 19, "surface": "の", "reading": "の"},
-        {"offset_start": 19, "offset_end": 21, "surface": "起伏", "reading": "きふく"},
-    ]
+    text = SECOND_ACT
+    hints = [dict(hint) for hint in SECOND_ACT_HINTS]
     # This shape mimics the cached chapter-start --words STT: short words have
     # their own timestamps, including the real pause before しばらく.
     precision_segments = [
@@ -102,27 +110,56 @@ def test_precision_word_clock_keeps_shibaraku_current_longer_than_linear_prefix(
     assert float(after["chapter_char_offset_exact"]) >= 15.0
 
 
-def test_runtime_loader_attaches_cached_precision_words_and_reader_hints() -> None:
-    source = AUDIOBOOKS.read_text(encoding="utf-8")
-    block = source.split("def _attach_runtime_alignment_context", 1)[1].split(
-        "def _load_alignment", 1
-    )[0]
-    assert "_cached_chapter_start_reading_hints" in block
-    assert "_chapter_start_precision_cache_path" in block
-    assert '"_runtime_reading_hints"' in block
-    assert '"_runtime_precision_segments"' in block
-    assert "audiobook-chapter-start-stt-v1" in block
+def test_cached_alignment_gets_the_precision_words_and_reader_readings_back(tmp_path: Path) -> None:
+    # A cached alignment stores only the chapter's coarse clock. When it is loaded for
+    # reading together, the chapter-start STT words cached on disk and the reader's
+    # readings of the chapter are attached again, so the highlight keeps the precise word
+    # timing (しばらく stays lit through its pause) instead of the linear prefix.
+    audio, ln_id, audio_id = paired_book(
+        tmp_path, [("第一幕", "第一幕。旅の始まりです。"), ("第二幕", SECOND_ACT)], duration=7200.0
+    )
+    tokens, cursor = [], 0
+    for hint in SECOND_ACT_HINTS:  # the reader's tokens: positions in the raw text
+        start = SECOND_ACT.index(hint["surface"], cursor)
+        cursor = start + len(hint["surface"])
+        tokens.append({"start": start, "end": cursor, "reading": hint["reading"]})
+    with audio.db.connect() as conn:
+        conn.execute(
+            "INSERT INTO ln_parse_cache(text_hash,parsed_json,created_at) VALUES(?,?,?)",
+            (
+                "chapter-1",
+                json.dumps({"paragraphs": [SECOND_ACT], "tokens": [tokens]}, ensure_ascii=False),
+                0.0,
+            ),
+        )
+    alignment = _second_act_with_precision_words()
+    chapter = alignment["chapters"][0]
+    segments = chapter.pop("_runtime_precision_segments")
+    for key in [key for key in chapter if key.startswith("_runtime")]:
+        chapter.pop(key)
+    path = audio._alignment_path(ln_id, audio_id)
+    write_alignment(audio, audio_id, path, alignment["chapters"], _READING_AUDIO_ALIGNMENT_REVISION)
+    stt = audio._chapter_start_precision_cache_path(path, 1)
+    stt.parent.mkdir(parents=True, exist_ok=True)
+    stt.write_text(
+        json.dumps({"schema": "audiobook-chapter-start-stt-v1", "segments": segments}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
+    def spoken_at(position: float) -> dict:
+        audio.set_position(audio_id, position)
+        return audio.paired_state(ln_id)
 
-def test_hidden_spoiler_images_keep_same_eager_img_in_normal_flow() -> None:
-    html = HTML.read_text(encoding="utf-8")
+    state = spoken_at(6859.66)
+    assert state["ln_chapter_index"] == 1
+    assert 11.0 <= float(state["chapter_char_offset_exact"]) < 15.0  # still inside しばらく
+    assert state["anchor_window"]["runtime_reading_hint_mode"] == "precision_word_reading_prefix"
+    assert 15.0 <= float(spoken_at(6860.05)["chapter_char_offset_exact"]) < 16.0  # は, as the STT heard it
 
-    assert "ln-inline-image-spoiler-label" in html
-    assert 'src="${src}" data-ln-src="${src}"' in html
-    assert 'loading="eager"' in html
-    assert "function lnLoadInlineImage(img" in html
-    assert "const deferHidden=root.classList.contains('blur-images')" not in html
-    assert "if(deferHidden){img.removeAttribute('src')" not in html
-    assert "canvas.className='ln-inline-image-raster'" not in html
-    assert "canvas.className='ln-inline-image-blur-preview'" not in html
-    assert "lnLoadInlineImage(image,figure)" in html  # legacy recovery path remains
+    # Without the cached STT words nothing precise can be added: the clock runs ahead of
+    # the voice (past 土地 while は is spoken).
+    stt.unlink()
+    audio._alignment_payload_cache.clear()
+    state = spoken_at(6860.05)
+    assert "runtime_reading_hint_mode" not in state["anchor_window"]
+    assert float(state["chapter_char_offset_exact"]) > 17.0

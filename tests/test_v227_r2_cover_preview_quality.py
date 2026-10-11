@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 from pathlib import Path
-import subprocess
 import time
 import zipfile
 import http.server
@@ -20,10 +18,6 @@ from pudge.database import Database
 from pudge.light_novels import LightNovelService
 from pudge.manga import MangaService
 from pudge.web_app import WebAppApi, _asset_handler_for_api
-
-
-ROOT = Path(__file__).resolve().parents[1]
-COVER_JS = ROOT / "pudge" / "web" / "cover_preview.js"
 
 
 def _jpeg(width: int, height: int) -> bytes:
@@ -69,9 +63,7 @@ def test_manga_thumbnail_stays_small_but_preview_is_original_bytes(tmp_path: Pat
     assert ref.preview_url.startswith(f"http://127.0.0.1:7777/api/covers/manga/{book_id}/")
     assert not ref.preview_url.startswith("data:")
 
-    target, media_type, revision = service.cover_preview_asset(
-        book_id, expected_revision=ref.source_revision
-    )
+    target, media_type, revision = service.cover_preview_asset(book_id, expected_revision=ref.source_revision)
     assert revision == ref.source_revision
     assert media_type == "image/jpeg"
     assert target.parent.name == "manga-cover-previews"
@@ -165,9 +157,7 @@ def test_asset_server_streams_original_manga_preview_with_revision_cache_headers
     target.write_bytes(raw)
 
     class Manga:
-        def cover_preview_asset(
-            self, book_id: int, *, expected_revision: str = ""
-        ) -> tuple[Path, str, str]:
+        def cover_preview_asset(self, book_id: int, *, expected_revision: str = "") -> tuple[Path, str, str]:
             assert book_id == 9
             assert expected_revision == revision
             return target, "image/jpeg", revision
@@ -179,9 +169,7 @@ def test_asset_server_streams_original_manga_preview_with_revision_cache_headers
     web_root = tmp_path / "web"
     web_root.mkdir()
     api = SimpleNamespace(manga=Manga(), logger=Logger())
-    server = http.server.ThreadingHTTPServer(
-        ("127.0.0.1", 0), _asset_handler_for_api(api, web_root)
-    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _asset_handler_for_api(api, web_root))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -225,87 +213,71 @@ def test_web_cover_resolver_returns_typed_contract_and_clamps_dpr() -> None:
         api.cover_preview_resolve("anime", 7)
 
 
-def _preview_race_fixture() -> dict[str, object]:
-    source = COVER_JS.read_text(encoding="utf-8")
-    script = f"""
-const vm=require('vm');
-const source={json.dumps(source)};
-let overlay=null;
-const pending=new Map();
-const classList=()=>({{add(){{}},remove(){{}},toggle(){{}},contains(){{return false;}}}});
-class Button{{constructor(kind){{this.kind=kind;this.hidden=kind==='retry';this.isConnected=true;}}focus(){{document.activeElement=this;}}closest(selector){{return selector.includes(this.kind)?this:null;}}}}
-class PreviewImage{{
-  constructor(){{this.style={{setProperty(k,v){{this[k]=v;}}}};this.dataset={{}};this.classList=classList();this.naturalWidth=80;this.naturalHeight=120;this.complete=true;this._src='';this.isConnected=true;}}
-  set src(value){{this._src=String(value);}}
-  get src(){{return this._src;}}
-  get currentSrc(){{return this._src;}}
-  get offsetWidth(){{return parseFloat(this.style.width)||80;}}
-  get offsetHeight(){{return parseFloat(this.style.height)||120;}}
-  addEventListener(){{}}
-  releasePointerCapture(){{}}
-  getBoundingClientRect(){{const w=this.offsetWidth,h=this.offsetHeight;return {{left:600-w/2,right:600+w/2,top:400-h/2,bottom:400+h/2,width:w,height:h}};}}
-}}
-class Overlay{{
-  constructor(){{this.isConnected=true;this.classList=classList();this.close=new Button('close');this.retry=new Button('retry');this.image=new PreviewImage();this.listeners={{}};}}
-  setAttribute(){{}}
-  set innerHTML(value){{const m=String(value).match(/<img[^>]+src=\"([^\"]*)\"/);if(m)this.image.src=m[1].replaceAll('&amp;','&').replaceAll('&quot;','\"');}}
-  querySelector(selector){{if(selector==='img'||selector.includes('preview img'))return this.image;if(selector.includes('retry'))return this.retry;if(selector.includes('close'))return this.close;return null;}}
-  querySelectorAll(selector){{return selector==='button'?[this.close,this.retry]:[];}}
-  addEventListener(type,fn){{this.listeners[type]=fn;}}
-  remove(){{this.isConnected=false;if(overlay===this)overlay=null;}}
-}}
-class SourceImage{{
-  constructor(id,fallback){{this.dataset={{pudgeCoverKind:'manga',pudgeCoverId:String(id)}};this.src=fallback;this.currentSrc=fallback;this.isConnected=true;}}
-  closest(){{return this;}}
-  focus(){{}}
-}}
-class Candidate{{
-  constructor(){{this.naturalWidth=0;this.naturalHeight=0;this.complete=true;this._src='';}}
-  set src(value){{this._src=String(value);this.naturalWidth=this._src.includes('small')?100:1600;this.naturalHeight=this._src.includes('small')?50:2400;}}
-  get src(){{return this._src;}}
-  async decode(){{await Promise.resolve();}}
-}}
-global.Image=Candidate;
-const windowTarget=new EventTarget();global.window=windowTarget;window.innerWidth=1200;window.innerHeight=800;window.devicePixelRatio=2;
-window.pywebview={{api:{{cover_preview_resolve:(kind,id)=>new Promise(resolve=>pending.set(Number(id),resolve))}}}};
-global.pywebview=window.pywebview;
-global.document={{
-  body:{{appendChild(node){{overlay=node;node.isConnected=true;}}}},activeElement:null,
-  addEventListener(){{}},querySelector(selector){{if(!overlay)return null;if(selector==='.pudge-cover-preview')return overlay;if(selector==='.pudge-cover-preview img')return overlay.image;return null;}},
-  createElement(tag){{if(tag==='div')return new Overlay();if(tag==='img')return new PreviewImage();throw new Error(tag);}}
-}};
-global.requestAnimationFrame=fn=>{{setImmediate(fn);return 1;}};global.cancelAnimationFrame=()=>{{}};
-vm.runInThisContext(source);
-const tick=async()=>{{await Promise.resolve();await new Promise(resolve=>setImmediate(resolve));await Promise.resolve();}};
-(async()=>{{
-  const result={{}};
-  window.PudgeCoverPreview.open(new SourceImage(1,'thumb-A'));
-  window.PudgeCoverPreview.open(new SourceImage(2,'thumb-B'));
-  pending.get(1)({{preview_url:'high-A',source_kind:'local_page',source_revision:'a'}});await tick();
-  result.lateA=overlay?.image?.src;
-  pending.get(2)({{preview_url:'high-B',source_kind:'local_page',source_revision:'b'}});await tick();
-  result.bApplied=overlay?.image?.src;
-  result.fitWidth=parseFloat(overlay?.image?.style?.width||'0');
-  window.PudgeCoverPreview.zoom(10);result.maxZoom=overlay?.image?.style?.transform||'';
-  window.PudgeCoverPreview.zoom(.1);result.minZoom=overlay?.image?.style?.transform||'';
-  window.PudgeCoverPreview.open(new SourceImage(3,'thumb-C'));
-  window.PudgeCoverPreview.close();
-  pending.get(3)({{preview_url:'high-C',source_kind:'local_page',source_revision:'c'}});await tick();
-  result.closedStaysClosed=overlay===null;
-  window.PudgeCoverPreview.openRef({{preview_url:'small-source',thumbnail_url:'small-thumb',source_kind:'remote',source_revision:'d'}},'small-thumb');await tick();
-  result.smallUpscaled=parseFloat(overlay?.image?.style?.width||'0')>100;
-  process.stdout.write(JSON.stringify(result));
-}})().catch(error=>{{console.error(error);process.exit(1);}});
+# Covers on the page (natural size 1600x2400, or 100x50 for "small" sources); the
+# high-resolution answers are held until the test answers them.
+COVERS = r"""
+const MakeImage = window.Image;
+window.Image = function Image() {
+  const img = MakeImage();
+  img.decode = async () => { const small = String(img.src).includes('small');
+    img.__naturalWidth = small ? 100 : 1600; img.__naturalHeight = small ? 50 : 2400; };
+  return img;
+};
+window.__pending = new Map();
+__api.cover_preview_resolve = (kind, id) => new Promise(resolve => window.__pending.set(Number(id), resolve));
 """
-    return json.loads(subprocess.check_output(["node", "-e", script], text=True))
 
 
-def test_cover_preview_generation_guards_late_responses_and_fits_sources() -> None:
-    result = _preview_race_fixture()
-    assert result["lateA"] == "thumb-B"
-    assert result["bApplied"] == "high-B"
-    assert float(result["fitWidth"]) > 0
-    assert "scale(6)" in str(result["maxZoom"])
-    assert "scale(0.5)" in str(result["minZoom"])
-    assert result["closedStaysClosed"] is True
-    assert result["smallUpscaled"] is True
+def test_cover_preview_shows_the_latest_cover_in_full_resolution_fitted_to_the_window(page) -> None:
+    result = page.run(
+        """
+        const shelf = document.createElement('div');
+        shelf.innerHTML = [1, 2, 3].map(id => `<div class="cover-shell"><img id="cover${id}" src="thumb-${id}.jpg" data-pudge-cover-kind="manga" data-pudge-cover-id="${id}"></div>`).join('');
+        document.body.appendChild(shelf);
+        for (const img of shelf.querySelectorAll('img')) img.__rect = {x: 10, y: 10, width: 80, height: 120};
+        const shown = () => document.querySelector('.pudge-cover-preview img')?.getAttribute('src') ?? null;
+        const size = () => { const img = document.querySelector('.pudge-cover-preview img'); return [parseFloat(img.style.width), parseFloat(img.style.height)]; };
+        const answer = async (id, url) => { window.__pending.get(id)({preview_url: url, source_kind: 'local_page', source_revision: `r${id}`}); await __tick(20); };
+        const zoom = async deltaY => { await __fire('.pudge-cover-preview img', 'wheel', {ctrlKey: true, deltaY, clientX: 650, clientY: 450}, 'WheelEvent');
+          return document.querySelector('.pudge-cover-preview img').style.transform; };
+        const out = {};
+        // Dragging a cover with the mouse opens it (the thumbnail first).
+        await __fire('#cover1', 'pointerdown', {pointerId: 1, pointerType: 'mouse', button: 0, clientX: 50, clientY: 50}, 'PointerEvent');
+        for (const dx of [20, 80, 160]) await __fire('#cover1', 'pointermove', {pointerId: 1, pointerType: 'mouse', clientX: 50 + dx, clientY: 50}, 'PointerEvent');
+        await __fire('#cover1', 'pointerup', {pointerId: 1, pointerType: 'mouse', clientX: 210, clientY: 50}, 'PointerEvent');
+        await __tick(20);
+        out.dragged = shown();
+        // Another cover opens before the first one's full version arrives: the late answer is ignored.
+        PudgeCoverPreview.open(document.querySelector('#cover2')); await __tick(20);
+        out.second = shown();
+        await answer(1, 'high-1.jpg');
+        out.lateFirst = shown();
+        await answer(2, 'high-2.jpg');
+        out.full = shown(); out.fitted = size();
+        out.zoomIn = await zoom(-1000); out.zoomOut = await zoom(1000);
+        // Closed before its answer arrives: the preview stays closed.
+        await __key('Escape'); await __tick(20);
+        PudgeCoverPreview.open(document.querySelector('#cover3')); await __tick(20);
+        await __key('Escape'); await __tick(20);
+        await answer(3, 'high-3.jpg');
+        out.closed = PudgeCoverPreview.isOpen();
+        // A small original is scaled up to the window too.
+        PudgeCoverPreview.open(document.querySelector('#cover1')); await __tick(20);
+        await answer(1, 'small-1.jpg');
+        out.small = shown(); out.smallSize = size();
+        return out;
+        """,
+        before=COVERS,
+    )
+    out = result.value
+    assert (out["dragged"], out["second"], out["lateFirst"]) == ("thumb-1.jpg", "thumb-2.jpg", "thumb-2.jpg")
+    assert out["full"] == "high-2.jpg"
+    assert out["fitted"] == [552, 828]  # 1600x2400 in a 1300x900 window, 36 px margins
+    assert out["zoomIn"].endswith("scale(6)") and out["zoomOut"].endswith("scale(0.5)")
+    assert out["closed"] is False
+    assert out["small"] == "small-1.jpg" and out["smallSize"][0] > 100
+    # The window asks for the cover by its stable id, with its pixel ratio and size.
+    assert result.calls_of("cover_preview_resolve")[:2] == [
+        ["manga", 1, 2, 1300, 900],
+        ["manga", 2, 2, 1300, 900],
+    ]

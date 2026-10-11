@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +12,7 @@ from pudge.database import Database
 from pudge.light_novels import LightNovelError, LightNovelService
 from pudge.metadata_cache import MetadataCache
 from pudge.web_app import WebAppApi
+from tests.i18n_support import en
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -101,7 +102,9 @@ def test_jiten_manual_refresh_invalidates_metadata_and_only_parses_existing_text
     )
     # If manual refresh accidentally launches OCR, this test must fail.  It should
     # consume only manga_ocr_cache rows that already exist.
-    monkeypatch.setattr(api.manga, "ocr_page", lambda *_a, **_k: pytest.fail("OCR must stay lazy"), raising=False)
+    monkeypatch.setattr(
+        api.manga, "ocr_page", lambda *_a, **_k: pytest.fail("OCR must stay lazy"), raising=False
+    )
 
     result = api.refresh_jiten_data()
     assert result["started"] is True
@@ -204,20 +207,28 @@ def test_irodori_generation_is_chaptered_reusable_and_skips_whisper(
     assert api.job_center.get(retry_job)["state"] == "succeeded"
 
 
-
-def test_generated_folder_can_skip_autolink_and_transcription(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generated_folder_can_skip_autolink_and_transcription(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     folder = tmp_path / "generated"
     folder.mkdir()
     (folder / "0001.mp3").write_bytes(b"audio")
-    service = AudiobookService(Database(tmp_path / "audio.sqlite3"), ffprobe="ffprobe", mpv="mpv", cache_dir=tmp_path / "cache-audio")
+    service = AudiobookService(
+        Database(tmp_path / "audio.sqlite3"), ffprobe="ffprobe", mpv="mpv", cache_dir=tmp_path / "cache-audio"
+    )
     monkeypatch.setattr(service, "_probe", lambda _path: (12.0, []))
-    monkeypatch.setattr(service, "auto_link_audiobook", lambda *_a, **_k: pytest.fail("auto-link must be skipped"))
-    monkeypatch.setattr(service, "prepare_transcription", lambda *_a, **_k: pytest.fail("STT must be skipped"))
+    monkeypatch.setattr(
+        service, "auto_link_audiobook", lambda *_a, **_k: pytest.fail("auto-link must be skipped")
+    )
+    monkeypatch.setattr(
+        service, "prepare_transcription", lambda *_a, **_k: pytest.fail("STT must be skipped")
+    )
 
     book = service.import_folder(folder, auto_link=False, prepare_transcription=False)
 
     assert book["multi_file"] is True
     assert book["duration"] == pytest.approx(12.0)
+
 
 def test_irodori_generation_disabled_has_no_side_effects(tmp_path: Path) -> None:
     api = _api(tmp_path)
@@ -229,12 +240,96 @@ def test_irodori_generation_disabled_has_no_side_effects(tmp_path: Path) -> None
     assert api._irodori_tts_threads == {}
 
 
-def test_v88_web_ui_wires_jiten_refresh_and_optional_irodori() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert 'data-sidebar-context-action="jiten"' in html
-    assert "refresh_jiten_data" in html
-    assert 'id="s_ln_audiobook_provider"' in html
-    assert 'id="s_ln_irodori_auto"' in html
-    assert "test_audiobook_generation" in html
-    assert "generate_light_novel_tts" in html
-    assert "Audiobook generation" in html
+def test_sidebar_refresh_menu_updates_jiten_data(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(
+            r"""
+            await __fire('#refreshAll', 'contextmenu', {clientX: 20, clientY: 20}, 'MouseEvent');
+            const item = document.querySelector('#contextMenu [data-sidebar-context-action=jiten]');
+            const label = item.innerText;
+            item.click(); await __tick(10);
+            return {label, toast: __text('#toast'), texts: [t('ui.updateJitenData'), t('ui.jitenRefreshIsRunningLn', {light_novels: 2, manga_regions: 5})]};
+            """,
+            lang=lang,
+            api={"refresh_jiten_data": {"started": True, "light_novels": 2, "manga_regions": 5}},
+        )
+        out = result.value
+        assert out["label"] == out["texts"][0]
+        assert out["toast"] == out["texts"][1]
+        assert result.calls_of("refresh_jiten_data") == [[]]
+
+
+def test_audiobook_generation_is_optional_and_lives_in_advanced_settings(page, tmp_path: Path) -> None:
+    assert en("ui.audiobookGeneration") == "Audiobook generation"
+    api = _api(tmp_path)
+    state = json.loads(json.dumps(api.get_state(), default=str))
+    result = page.run(
+        r"""
+        setPage('settings'); await __tick(50);
+        const fields = () => ({provider: $('s_ln_audiobook_provider').value, shown: __visible('#s_ln_audiobook_provider'),
+                               irodori: __visible('#audiobookIrodoriFields'), external: __visible('#audiobookExternalFields'),
+                               auto: __visible('#audiobookAutoRow')});
+        const essential = fields();
+        await __click('#settingsContent [role=tab][data-settings-category=advanced]');
+        const advanced = {...fields(), heading: $('s_ln_audiobook_provider').closest('.setting-block').querySelector('h3').innerText,
+                          expected: t('ui.audiobookGeneration')};
+        await __input('#s_ln_audiobook_provider', 'irodori');
+        const irodori = fields();
+        await __input('#s_ln_irodori_auto', true);
+        await __click('#testAudiobookGeneration'); await __tick(10);
+        const tested = {toasts: __toasts(), ready: t('ui.audiobookGenerationIsReady')};
+        await __click('#saveSettings'); await __tick(10);
+        return {essential, advanced, irodori, tested};
+        """,
+        state=state,
+        api={"test_audiobook_generation": {"ok": True}},
+        before="__api.save_settings = async values => ({ok: true, settings: {...values, light_novels: {}}});",
+    )
+    out = result.value
+    # Off by default, and not among the essential settings.
+    assert out["essential"]["provider"] == "off" and out["essential"]["shown"] is False
+    assert out["advanced"]["shown"] is True and out["advanced"]["heading"] == out["advanced"]["expected"]
+    assert (out["advanced"]["irodori"], out["advanced"]["external"], out["advanced"]["auto"]) == (
+        False,
+        False,
+        False,
+    )
+    assert (out["irodori"]["irodori"], out["irodori"]["external"], out["irodori"]["auto"]) == (
+        True,
+        False,
+        True,
+    )
+    [[test_values]] = result.calls_of("test_audiobook_generation")
+    assert test_values["provider"] == "irodori"
+    assert out["tested"]["ready"] in out["tested"]["toasts"]
+    [[values]] = result.calls_of("save_settings")
+    api.save_settings(values)
+    saved = api.light_novels.settings_payload()
+    assert (saved["audiobook_generation_provider"], saved["irodori_tts_auto_generate"]) == ("irodori", True)
+
+
+def test_light_novel_menu_offers_audiobook_generation_only_with_a_provider(page) -> None:
+    book = {"id": 9, "title": "Novel", "volume": 1, "character_count": 1000}
+    code = r"""
+        await __fire('#lightNovelsContent [data-ln-book="9"]', 'contextmenu', {clientX: 20, clientY: 20}, 'MouseEvent');
+        const item = document.querySelector('#contextMenu [data-ln-context-action=generate-audiobook]');
+        const label = item?.innerText ?? null;
+        item?.click(); await __tick(10);
+        return {label, toast: __text('#toast'), texts: [t('ui.generateAudiobook'), t('ui.audiobookGenerationStarted')]};
+    """
+    off = page.run(code, api={"light_novel_state": {"version": 1, "settings": {}, "books": [book]}})
+    assert off.value["label"] is None
+    on = page.run(
+        code,
+        api={
+            "light_novel_state": {
+                "version": 1,
+                "settings": {"audiobook_generation_provider": "irodori"},
+                "books": [book],
+            },
+            "generate_light_novel_tts": {"ok": True, "job": {"state": "queued"}},
+        },
+    )
+    assert on.value["label"] == on.value["texts"][0]
+    assert on.calls_of("generate_light_novel_tts") == [[9]]
+    assert on.value["toast"] == on.value["texts"][1]

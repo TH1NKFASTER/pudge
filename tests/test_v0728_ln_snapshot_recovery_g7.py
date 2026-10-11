@@ -37,7 +37,9 @@ def test_cold_start_preserves_anilist_groups_without_network_and_scopes_snapshot
     rows = [{"media_id": 123, "format": "NOVEL", "title": "Alpha", "status": "CURRENT", "relations": []}]
     service._save_literature_snapshot(rows, service._literature_account())
     with service._connection() as conn:
-        stored = conn.execute("SELECT value FROM ln_settings WHERE key='anilist_literature_snapshot:v1'").fetchone()
+        stored = conn.execute(
+            "SELECT value FROM ln_settings WHERE key='anilist_literature_snapshot:v1'"
+        ).fetchone()
         assert "token-A" not in str(stored[0])
 
     restarted = service_at(tmp_path)

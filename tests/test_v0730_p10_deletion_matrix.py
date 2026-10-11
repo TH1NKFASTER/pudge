@@ -1,4 +1,5 @@
 """P10: deleting library content while it is being consumed (synthetic data only)."""
+
 from __future__ import annotations
 
 import io
@@ -22,8 +23,6 @@ from pudge.light_novels import LightNovelService
 from pudge.manga import MangaService
 from pudge.review_gate import ContentReviewIdentity
 from pudge.web_app import WebAppApi
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _cbz(path: Path) -> Path:
@@ -96,11 +95,17 @@ def _paired(tmp_path: Path) -> tuple[AudiobookService, LightNovelService, Databa
 
 def _put_audio(audio: AudiobookService, path: Path, title: str) -> int:
     path.write_bytes(f"audio-{title}".encode())
-    return int(audio._upsert(
-        path=path, title=title, duration=120.0,
-        files=[{"index": 0, "path": str(path), "title": title, "duration": 120.0, "start": 0.0, "end": 120.0}],
-        chapters=[{"index": 0, "title": "Chapter 1", "start": 0.0, "end": 120.0}],
-    )["id"])
+    return int(
+        audio._upsert(
+            path=path,
+            title=title,
+            duration=120.0,
+            files=[
+                {"index": 0, "path": str(path), "title": title, "duration": 120.0, "start": 0.0, "end": 120.0}
+            ],
+            chapters=[{"index": 0, "title": "Chapter 1", "start": 0.0, "end": 120.0}],
+        )["id"]
+    )
 
 
 def _ln_api(audio: AudiobookService, novels: LightNovelService, db: Database) -> WebAppApi:
@@ -117,20 +122,21 @@ def _ln_api(audio: AudiobookService, novels: LightNovelService, db: Database) ->
 
 # Row 1: manga deleted during OCR / content review -------------------------------------------
 
+
 def test_manga_delete_cancels_running_ocr_and_restart_does_not_resume_it(tmp_path, monkeypatch):
     api, db = _manga_api(tmp_path)
     book_id = int(api.manga.import_file(_cbz(tmp_path / "Vol 1.cbz"))["id"])
     monkeypatch.setattr(api, "_manga_ocr_backend_available", lambda **_k: True)
     entered, release, seen_cancel = threading.Event(), threading.Event(), []
 
-    def late_ocr(_book_id, *, progress=None, cancelled=None):
+    def late_ocr(_book_id, *, progress=None, cancelled=None, **_kwargs):
         entered.set()
         release.wait(3)
         seen_cancel.append(bool(cancelled and cancelled()))
         # A late worker ignores cancellation and reports a complete result.
         return {"complete": True, "cached_pages": 1, "total_pages": 1, "errors": []}
 
-    monkeypatch.setattr(api.manga, "ocr_book", late_ocr)
+    monkeypatch.setattr(api.manga, "ocr_book_mokuro", late_ocr)
     api.start_manga_ocr_book(book_id)
     job_id = api._manga_ocr_job_ids[book_id]
     assert entered.wait(2)
@@ -156,13 +162,16 @@ def test_late_ocr_publish_cannot_recreate_deleted_or_reimported_manga(tmp_path):
     api.manga_remove_books([book_id])
     update = [(0, [{"text": "架空", "box": [0, 0, 1, 1]}], "ready", "", False)]
     with pytest.raises(KeyError):
-        api.manga._commit_ocr_page_updates(book_id, source_fingerprint=fingerprint, generation=generation, updates=update)
+        api.manga._commit_ocr_page_updates(
+            book_id, source_fingerprint=fingerprint, generation=generation, updates=update
+        )
     # Re-import the same file; if SQLite reuses the id, the stale generation
     # captured by the old worker must still be rejected.
     again = int(api.manga.import_file(source)["id"])
     try:
         published = api.manga._commit_ocr_page_updates(
-            book_id, source_fingerprint=fingerprint, generation=generation, updates=update)
+            book_id, source_fingerprint=fingerprint, generation=generation, updates=update
+        )
     except KeyError:
         published = False
     assert published is False
@@ -178,13 +187,18 @@ def test_manga_delete_clears_content_review_sessions_and_unknown_words(tmp_path,
     api.config.ui.review_gate_manga_enabled = True
     api.config.ui.review_gate_manga_all_due = True
     api.light_novels = SimpleNamespace(
-        settings=lambda: SimpleNamespace(study_backend="jiten", jiten_api_key="synthetic-key"))
+        settings=lambda: SimpleNamespace(study_backend="jiten", jiten_api_key="synthetic-key")
+    )
     gate = ContentReviewService(api)
     api._content_review_service = gate
     gate.source = lambda kind, bid, part, *, prepare: (
-        ContentReviewIdentity(kind, f"content-{bid}", "rev", part), "架空")
-    monkeypatch.setattr("pudge.content_review.build_text_due_review_cards", lambda *a: {
-        "cards": [{"wordId": 3, "readingIndex": 0}], "unknown_words": [{"text": "架空"}]})
+        ContentReviewIdentity(kind, f"content-{bid}", "rev", part),
+        "架空",
+    )
+    monkeypatch.setattr(
+        "pudge.content_review.build_text_due_review_cards",
+        lambda *a: {"cards": [{"wordId": 3, "readingIndex": 0}], "unknown_words": [{"text": "架空"}]},
+    )
     doomed = gate.begin("manga", book_id, 0)
     kept = gate.begin("manga", keep_id, 0)
     doomed_keys = json.loads(db.get_state(f"content_review_book_keys:v1:manga:{book_id}", "[]"))
@@ -209,27 +223,40 @@ def test_manga_delete_detaches_history_and_without_review_service_cleans_persist
     book_id = int(api.manga.import_file(_cbz(tmp_path / "Vol 1.cbz"))["id"])
     media = api.consumption.manga_media(book_id)
     db.set_state("manga_unknown_words:synthetic", "[]")
-    db.set_state(f"content_review_book_keys:v1:manga:{book_id}", json.dumps(["manga_unknown_words:synthetic"]))
+    db.set_state(
+        f"content_review_book_keys:v1:manga:{book_id}", json.dumps(["manga_unknown_words:synthetic"])
+    )
     api.manga_remove_books([book_id])
     assert db.get_state("manga_unknown_words:synthetic", "") == ""
     with db.connect() as conn:
-        row = conn.execute("SELECT current_library_id,deleted_at FROM consumption_media WHERE media_uuid=?",
-                           (media.media_uuid,)).fetchone()
+        row = conn.execute(
+            "SELECT current_library_id,deleted_at FROM consumption_media WHERE media_uuid=?",
+            (media.media_uuid,),
+        ).fetchone()
     assert row["current_library_id"] == "" and row["deleted_at"] is not None
 
 
 # Row 2: paused audiobook deleted ------------------------------------------------------------
+
 
 def test_paused_audiobook_delete_stops_player_saves_once_and_leaves_no_sidebar_block(tmp_path, monkeypatch):
     audio, _novels, db, ln_id, audio_id = _paired(tmp_path)
     player = _Player()
     audio._players[audio_id] = player
     audio._last_positions[audio_id] = 42.0
-    audio._review_contexts[audio_id] = {"origin": "ln", "consumer": "sidebar", "ln_book_id": ln_id,
-                                        "chapter": 0, "pending_chapter": 1, "ranges": []}
+    audio._review_contexts[audio_id] = {
+        "origin": "ln",
+        "consumer": "sidebar",
+        "ln_book_id": ln_id,
+        "chapter": 0,
+        "pending_chapter": 1,
+        "ranges": [],
+    }
     saved = []
     original = audio.set_position
-    monkeypatch.setattr(audio, "set_position", lambda bid, pos: (saved.append((bid, pos)), original(bid, pos)))
+    monkeypatch.setattr(
+        audio, "set_position", lambda bid, pos: (saved.append((bid, pos)), original(bid, pos))
+    )
     assert audio.sidebar_state()["books"][0]["player_running"] is True
 
     result = audio.delete_many([audio_id])
@@ -251,6 +278,7 @@ def test_sidebar_state_skips_player_whose_book_row_is_gone(tmp_path):
 
 # Row 3: linked audiobook deleted while the LN is open --------------------------------------
 
+
 def test_deleting_linked_audiobook_clears_ln_paired_panel_and_keeps_ln(tmp_path):
     audio, novels, db, ln_id, audio_id = _paired(tmp_path)
     api = _ln_api(audio, novels, db)
@@ -262,14 +290,20 @@ def test_deleting_linked_audiobook_clears_ln_paired_panel_and_keeps_ln(tmp_path)
 
 # Row 4: LN deleted while its audiobook plays ------------------------------------------------
 
+
 def test_deleting_ln_disconnects_reader_review_but_keeps_audio(tmp_path):
     audio, novels, db, ln_id, audio_id = _paired(tmp_path)
     api = _ln_api(audio, novels, db)
     player = _Player()
     audio._players[audio_id] = player
-    audio._review_contexts[audio_id] = {"origin": "ln", "consumer": "ln", "ln_book_id": ln_id, "chapter": 0,
-                                        "pending_chapter": 2,
-                                        "ranges": [{"chapter_index": 3, "start": 10.0}]}
+    audio._review_contexts[audio_id] = {
+        "origin": "ln",
+        "consumer": "ln",
+        "ln_book_id": ln_id,
+        "chapter": 0,
+        "pending_chapter": 2,
+        "ranges": [{"chapter_index": 3, "start": 10.0}],
+    }
     paused = []
     audio.set_paused = lambda *a: paused.append(a)
     audio.seek_to = lambda *a: None
@@ -287,17 +321,22 @@ def test_deleting_ln_disconnects_reader_review_but_keeps_audio(tmp_path):
 
 # Row 5: restart after audiobook delete ------------------------------------------------------
 
+
 def test_restart_after_audiobook_delete_restores_no_job_for_deleted_book(tmp_path, monkeypatch):
     audio, _novels, db, _ln_id, audio_id = _paired(tmp_path)
     audio.delete_many([audio_id])
-    restarted = AudiobookService(Database(db.path), ffprobe="ffprobe", ffmpeg="ffmpeg", mpv="mpv",
-                                 cache_dir=tmp_path / "cache")
-    monkeypatch.setattr(restarted, "prepare_transcription", lambda *a, **k: pytest.fail("dead STT job resumed"))
+    restarted = AudiobookService(
+        Database(db.path), ffprobe="ffprobe", ffmpeg="ffmpeg", mpv="mpv", cache_dir=tmp_path / "cache"
+    )
+    monkeypatch.setattr(
+        restarted, "prepare_transcription", lambda *a, **k: pytest.fail("dead STT job resumed")
+    )
     assert restarted.resume_pending_transcriptions() == 0
     assert restarted.sidebar_state() == {"books": []}
 
 
 # Row 6: mass delete with several active owners ---------------------------------------------
+
 
 def test_mass_manga_delete_cancels_every_active_ocr_owner(tmp_path):
     api, _db = _manga_api(tmp_path)
@@ -341,14 +380,16 @@ def test_mass_audiobook_delete_one_failure_keeps_others_cleaned_and_history_link
     assert first not in audio._review_contexts and third not in audio._review_contexts
     with db.connect() as conn:
         current = {
-            book_id: conn.execute("SELECT current_library_id FROM consumption_media WHERE media_uuid=?",
-                                  (media.media_uuid,)).fetchone()[0]
+            book_id: conn.execute(
+                "SELECT current_library_id FROM consumption_media WHERE media_uuid=?", (media.media_uuid,)
+            ).fetchone()[0]
             for book_id, media in medias.items()
         }
     assert current == {first: "", second: str(second), third: ""}
 
 
 # Row 7: repeat delete is a no-op ------------------------------------------------------------
+
 
 def test_repeat_delete_is_idempotent_for_every_library(tmp_path):
     api, _db = _manga_api(tmp_path / "manga")
@@ -367,7 +408,40 @@ def test_repeat_delete_is_idempotent_for_every_library(tmp_path):
 
 # Frontend: the sidebar/float drop a book that is absent from the next state ---------------
 
-def test_sidebar_companion_hides_activity_when_book_disappears() -> None:
-    js = (ROOT / "pudge/web/sidebar_companion.js").read_text(encoding="utf-8")
-    assert "return books.find(book => book.playing)\n      || books.find(book => book.player_running)\n      || null;" in js
-    assert "if (!book) {\n      host.hidden = true;" in js
+# The sidebar polls sidebar_audio_state; the test changes window.audioBooks between polls.
+SIDEBAR_AUDIO = """
+window.audioBooks = [];
+__api.sidebar_audio_state = async () => ({books: window.audioBooks});
+"""
+
+
+def test_sidebar_companion_hides_activity_when_book_disappears(page) -> None:
+    book = {
+        "id": 5,
+        "title": "Deleted Book",
+        "playing": True,
+        "player_running": True,
+        "position": 30,
+        "duration": 600,
+        "speed": 1,
+    }
+    result = page.run(
+        r"""
+        const view = () => ({shown: __visible('.sidebar-audio'), text: document.querySelector('[data-sidebar-audio]')?.innerText || ''});
+        const poll = async books => { window.audioBooks = books; await __tick(2100); return view(); };
+        const out = {};
+        out.playing = await poll([BOOK]);
+        out.paused = await poll([{...BOOK, playing: false, paused: true}]);    // a paused player keeps its block
+        out.deleted = await poll([]);                                           // the book was deleted: nothing left behind
+        out.again = await poll([BOOK]);
+        out.remembered = await poll([{...BOOK, playing: false, player_running: false}]);  // no player: no block
+        return out;
+        """.replace("BOOK", json.dumps(book)),
+        before=SIDEBAR_AUDIO,
+    )
+    out = result.value
+    assert out["playing"]["shown"] is True and "0:30" in out["playing"]["text"]
+    assert out["paused"]["shown"] is True
+    assert out["deleted"] == {"shown": False, "text": ""}
+    assert out["again"]["shown"] is True
+    assert out["remembered"] == {"shown": False, "text": ""}

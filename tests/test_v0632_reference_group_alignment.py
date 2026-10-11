@@ -65,9 +65,7 @@ def test_reference_group_refinement_handles_split_and_merged_cues(tmp_path: Path
     assert refined[3][1] == pytest.approx(reference_cues[1][1], abs=0.03)
     for original, updated in zip(basis_cues[2:4], refined[2:4]):
         assert updated[1] - updated[0] == pytest.approx(original[1] - original[0], abs=0.002)
-    assert refined[3][0] - refined[2][1] == pytest.approx(
-        basis_cues[3][0] - basis_cues[2][1], abs=0.002
-    )
+    assert refined[3][0] - refined[2][1] == pytest.approx(basis_cues[3][0] - basis_cues[2][1], abs=0.002)
 
 
 def test_reference_group_refinement_rejects_basis_with_changed_cue_count(tmp_path: Path) -> None:

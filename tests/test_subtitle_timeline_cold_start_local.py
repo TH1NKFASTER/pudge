@@ -98,7 +98,6 @@ def test_cold_start_accepts_modest_but_clear_two_cue_improvement() -> None:
     assert boundaries
 
 
-
 def test_cold_start_rejects_bleach_sized_reedited_opening() -> None:
     cues = [
         (15.082, 18.085, "a"),

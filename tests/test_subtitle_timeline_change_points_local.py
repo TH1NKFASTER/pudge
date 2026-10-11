@@ -11,10 +11,7 @@ def _bins(onsets):
 
 def test_fixed_offset_boundary_is_phase_invariant() -> None:
     source = [float(value) for value in range(0, 121, 4)]
-    reference = [
-        onset + (11.0 if onset < 60.0 else 16.0)
-        for onset in source
-    ]
+    reference = [onset + (11.0 if onset < 60.0 else 16.0) for onset in source]
 
     boundary, diagnostics = _fixed_offset_boundary_refinement(
         source,
@@ -34,10 +31,35 @@ def test_fixed_offset_boundary_is_phase_invariant() -> None:
 def test_transition_bridge_can_cross_stable_boundary() -> None:
     source = [float(value) for value in range(0, 101, 5)]
     source += [
-        111.0, 114.0, 118.0, 122.0, 126.0, 130.0, 134.0,
-        138.0, 142.0, 146.0, 150.0, 154.0, 158.0, 162.0,
-        166.0, 170.0, 174.0, 178.0, 182.0, 186.0, 190.0,
-        194.0, 198.0, 202.0, 206.0, 210.0, 214.0, 218.0, 222.0,
+        111.0,
+        114.0,
+        118.0,
+        122.0,
+        126.0,
+        130.0,
+        134.0,
+        138.0,
+        142.0,
+        146.0,
+        150.0,
+        154.0,
+        158.0,
+        162.0,
+        166.0,
+        170.0,
+        174.0,
+        178.0,
+        182.0,
+        186.0,
+        190.0,
+        194.0,
+        198.0,
+        202.0,
+        206.0,
+        210.0,
+        214.0,
+        218.0,
+        222.0,
     ]
 
     def offset(onset: float) -> float:
@@ -90,8 +112,14 @@ def test_transition_bridge_can_cross_stable_boundary() -> None:
 def test_post_gap_reacquire_rejects_unsafe_immediate_drop() -> None:
     source = [0.0, 20.0, 40.0, 100.0, 101.0, 110.0, 120.0, 130.0]
     reference = [
-        16.0, 36.0, 56.0,
-        121.0, 119.0, 128.0, 138.0, 148.0,
+        16.0,
+        36.0,
+        56.0,
+        121.0,
+        119.0,
+        128.0,
+        138.0,
+        148.0,
     ]
     cues = [(onset, onset + 0.5, str(index)) for index, onset in enumerate(source)]
     segments = [
@@ -125,18 +153,12 @@ def test_post_gap_reacquire_rejects_unsafe_immediate_drop() -> None:
         [70.0],
     )
 
-    assert not any(
-        segment.get("kind") == "post_gap_reacquire"
-        for segment in refined
-    )
+    assert not any(segment.get("kind") == "post_gap_reacquire" for segment in refined)
 
 
 def test_fixed_offset_boundary_scans_before_transition_window() -> None:
     source = [float(value) for value in range(500, 721, 4)]
-    reference = [
-        onset + (11.0 if onset < 590.0 else 16.0)
-        for onset in source
-    ]
+    reference = [onset + (11.0 if onset < 590.0 else 16.0) for onset in source]
 
     boundary, diagnostics = _fixed_offset_boundary_refinement(
         source,
@@ -156,9 +178,20 @@ def test_fixed_offset_boundary_scans_before_transition_window() -> None:
 def test_post_gap_reacquire_is_applied_after_transition_bridge() -> None:
     source = [float(value) for value in range(1000, 1081, 8)]
     source += [
-        1109.0, 1114.0, 1119.0, 1124.0, 1129.0, 1134.0,
-        1139.0, 1144.0, 1149.0, 1154.0, 1159.0, 1164.0,
-        1170.0, 1180.0,
+        1109.0,
+        1114.0,
+        1119.0,
+        1124.0,
+        1129.0,
+        1134.0,
+        1139.0,
+        1144.0,
+        1149.0,
+        1154.0,
+        1159.0,
+        1164.0,
+        1170.0,
+        1180.0,
     ]
 
     def offset(onset: float) -> float:
@@ -203,14 +236,8 @@ def test_post_gap_reacquire_is_applied_after_transition_bridge() -> None:
         [1119.0],
     )
 
-    reacquire = next(
-        segment for segment in refined
-        if segment.get("kind") == "post_gap_reacquire"
-    )
-    bridge = next(
-        segment for segment in refined
-        if segment.get("kind") == "transition_bridge"
-    )
+    reacquire = next(segment for segment in refined if segment.get("kind") == "post_gap_reacquire")
+    bridge = next(segment for segment in refined if segment.get("kind") == "transition_bridge")
 
     assert reacquire["offset_seconds"] == 21.0
     assert bridge["offset_seconds"] == 19.0

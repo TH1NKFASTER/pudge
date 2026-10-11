@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-import time
 import zipfile
 from pathlib import Path
 
@@ -55,7 +54,7 @@ def test_invalid_backup_never_mutates_live_files(tmp_path: Path) -> None:
             cache_dir=cache_dir,
         )
 
-    assert database_path.read_bytes() == before_db
+    assert (tmp_path / "live.sqlite3").read_bytes() == before_db
     assert config_path.read_bytes() == before_config
     assert not (cache_dir / "restored-subtitles").exists()
     assert Database(database_path).get_state("marker") == "current"
@@ -85,8 +84,8 @@ def test_restore_commit_failure_rolls_back_database_and_config(
     live_db_path = tmp_path / "live.sqlite3"
     live_db = Database(live_db_path)
     live_db.set_state("marker", "current")
-    live_config = tmp_path / "live.toml"
-    live_config.write_text('language = "en"\n', encoding="utf-8")
+    live_config_path = tmp_path / "live.toml"
+    live_config_path.write_text('language = "en"\n', encoding="utf-8")
     live_cache = tmp_path / "live-cache"
     live_cache.mkdir()
 
@@ -104,13 +103,13 @@ def test_restore_commit_failure_rolls_back_database_and_config(
     with pytest.raises(OSError, match="fault injected"):
         restore_backup(
             archive_path=archive_path,
-            config_path=live_config,
+            config_path=live_config_path,
             database_path=live_db_path,
             cache_dir=live_cache,
         )
 
     assert Database(live_db_path).get_state("marker") == "current"
-    assert live_config.read_text(encoding="utf-8") == 'language = "en"\n'
+    assert live_config_path.read_text(encoding="utf-8") == 'language = "en"\n'
 
 
 def test_task_supervisor_quiesce_blocks_new_work_until_resumed() -> None:

@@ -4,6 +4,11 @@ import json
 import threading
 import time
 from typing import Any
+from .i18n import err
+
+
+class UnconfirmedCandidatesError(ValueError):
+    """A new attempt was refused: an earlier one still owns unconfirmed torrent candidates."""
 
 
 class DownloadIntentStore:
@@ -99,10 +104,18 @@ class DownloadIntentStore:
 
     @staticmethod
     def numbering_metadata(item: Any) -> dict[str, Any]:
-        return {name: getattr(item, name, None) for name in (
-            "mapped_media_episode", "raw_release_episode", "numbering_status",
-            "numbering_scheme", "numbering_rule", "numbering_revision", "group",
-        )}
+        return {
+            name: getattr(item, name, None)
+            for name in (
+                "mapped_media_episode",
+                "raw_release_episode",
+                "numbering_status",
+                "numbering_scheme",
+                "numbering_rule",
+                "numbering_revision",
+                "group",
+            )
+        }
 
     def begin(
         self,
@@ -118,7 +131,7 @@ class DownloadIntentStore:
 
         def replace(current: dict[str, Any]) -> dict[str, Any]:
             if current.get("owned_candidates"):
-                raise ValueError("Unconfirmed acquisition candidates must be recovered before retry")
+                raise UnconfirmedCandidatesError(err("manager.candidatesUnconfirmed"))
             try:
                 previous_revision = int(current.get("revision") or 0)
             except (TypeError, ValueError):
@@ -190,6 +203,13 @@ class DownloadIntentStore:
                 payload["selected_numbering"] = self.numbering_metadata(selected)
             if owned_candidates is not None:
                 payload["owned_candidates"] = owned_candidates
+                # When the candidates became unconfirmed: recovery releases an
+                # absent one only after a grace period (updated_at moves on
+                # every recovery attempt, so it cannot be used for that).
+                if owned_candidates:
+                    payload.setdefault("unconfirmed_since", payload["updated_at"])
+                else:
+                    payload.pop("unconfirmed_since", None)
             if winner_finalized is not None:
                 payload["winner_finalized"] = bool(winner_finalized)
             return payload
@@ -210,12 +230,22 @@ class DownloadIntentStore:
         connector = getattr(self.db, "connect", None)
         if callable(connector):
             with connector() as conn:
-                values = [row["value"] for row in conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'")]
+                values = [
+                    row["value"]
+                    for row in conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'")
+                ]
         else:
             values = list(self._memory.values())
-        return [payload for raw in values if (payload := self._decode(raw))
-                and payload.get("owned_candidates")
-                and payload.get("state") in {"recovery_required", "trying", "selecting"}]
+        # Any state: an attempt interrupted after "waiting"/"downloading" was
+        # written can still own candidates, and would otherwise block every
+        # later attempt for that episode forever.
+        return [
+            payload for raw in values if (payload := self._decode(raw)) and payload.get("owned_candidates")
+        ]
+
+    def unconfirmed(self, media_id: int, episode: int | None, batch: bool) -> bool:
+        """True while an earlier attempt still owns unconfirmed candidates."""
+        return bool((self.get(media_id, episode, batch) or {}).get("owned_candidates"))
 
     def clear(self, media_id: int, episode: int | None, batch: bool) -> None:
         with self._lock:
@@ -290,9 +320,7 @@ class DownloadIntentStore:
             return count
         try:
             with connector() as conn:
-                rows = conn.execute(
-                    "SELECT value FROM state WHERE key LIKE 'download_intent:%'"
-                ).fetchall()
+                rows = conn.execute("SELECT value FROM state WHERE key LIKE 'download_intent:%'").fetchall()
         except Exception:
             return 0
         count = 0

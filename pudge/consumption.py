@@ -14,6 +14,11 @@ from typing import Any, Iterable
 
 from .database import Database
 
+# Lower is stronger: aliases that identify this exact file/library item.
+_ALIAS_PRIORITY = {"content": 0, "path": 1, "video_path": 1, "legacy_fingerprint": 2, "local": 3}
+# Identities several library items can share (AniList volume/episode).
+_SHARED_ALIAS_TYPES = frozenset({"external"})
+
 LEDGER_SCHEMA_VERSION = 2
 MAX_CHUNK_SECONDS = 30.0
 MAX_PAYLOAD_BYTES = 64 * 1024
@@ -55,8 +60,6 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()
 
 
-
-
 def _system_timezone_metadata(timestamp: float) -> tuple[str, int]:
     moment = datetime.fromtimestamp(float(timestamp)).astimezone()
     offset = int((moment.utcoffset().total_seconds() if moment.utcoffset() else 0.0))
@@ -71,6 +74,7 @@ def _system_timezone_metadata(timestamp: float) -> tuple[str, int]:
         except OSError:
             pass
     return str(moment.tzname() or "local"), offset
+
 
 def _file_sample_fingerprint(path: Path, *, sample_bytes: int = 65536) -> str:
     """Cheap content fingerprint stable across renames.
@@ -107,31 +111,6 @@ class ConsumptionLedger:
     def __init__(self, database: Database, *, logger: Any = None) -> None:
         self.database = database
         self.logger = logger
-
-    @staticmethod
-    def _queue_sync_record(
-        conn: Any, record_type: str, record_key: str, payload: dict[str, Any], *, created_at: float | None = None
-    ) -> None:
-        record_type = str(record_type)
-        record_key = str(record_key)
-        payload_json = _json(payload)
-        existing = conn.execute(
-            "SELECT payload_json FROM consumption_sync_outbox WHERE record_type=? AND record_key=?",
-            (record_type, record_key),
-        ).fetchone()
-        if existing is not None and str(existing["payload_json"] or "") == payload_json:
-            return
-        # A changed logical record needs a new monotonic cursor. Updating the old
-        # row in place would make clients that already passed that cursor miss it.
-        if existing is not None:
-            conn.execute(
-                "DELETE FROM consumption_sync_outbox WHERE record_type=? AND record_key=?",
-                (record_type, record_key),
-            )
-        conn.execute(
-            "INSERT INTO consumption_sync_outbox(record_type,record_key,payload_json,created_at_utc) VALUES(?,?,?,?)",
-            (record_type, record_key, payload_json, float(created_at or time.time())),
-        )
 
     @staticmethod
     def _history_epoch_conn(conn: Any) -> int:
@@ -196,7 +175,7 @@ class ConsumptionLedger:
             raise ConsumptionLedgerError("at least one stable media alias is required")
         now = time.time()
         with self.database.connect() as conn:
-            media_ids: set[str] = set()
+            existing: dict[tuple[str, str], str] = {}
             for alias_type, alias_value in clean_aliases:
                 row = conn.execute(
                     "SELECT media_uuid FROM consumption_media_aliases "
@@ -204,12 +183,13 @@ class ConsumptionLedger:
                     (kind, alias_type, alias_value),
                 ).fetchone()
                 if row is not None:
-                    media_ids.add(str(row["media_uuid"]))
-            if len(media_ids) > 1:
-                raise ConsumptionConflictError(
-                    f"stable aliases resolve to multiple media IDs: {sorted(media_ids)}"
-                )
-            media_uuid = next(iter(media_ids), "") or str(preferred_uuid or uuid.uuid4())
+                    existing[(alias_type, alias_value)] = str(row["media_uuid"])
+            media_uuid = self._resolve_media(
+                conn,
+                existing,
+                current_library_kind=str(current_library_kind or ""),
+                current_library_id=str(current_library_id or ""),
+            ) or str(preferred_uuid or uuid.uuid4())
             row = conn.execute(
                 "SELECT media_uuid FROM consumption_media WHERE media_uuid=?", (media_uuid,)
             ).fetchone()
@@ -246,13 +226,25 @@ class ConsumptionLedger:
                     WHERE media_uuid=?
                     """,
                     (
-                        str(title or ""), str(title or ""),
-                        str(current_library_kind or ""), str(current_library_id or ""),
-                        str(source_revision or ""), str(source_revision or ""),
-                        payload, now, media_uuid,
+                        str(title or ""),
+                        str(title or ""),
+                        str(current_library_kind or ""),
+                        str(current_library_id or ""),
+                        str(source_revision or ""),
+                        str(source_revision or ""),
+                        payload,
+                        now,
+                        media_uuid,
                     ),
                 )
             for alias_type, alias_value in clean_aliases:
+                owner = existing.get((alias_type, alias_value))
+                if alias_type in _SHARED_ALIAS_TYPES and owner is not None and owner != media_uuid:
+                    # A shared identity (AniList volume or episode) keeps pointing
+                    # at the item that owns it; a second book never takes it over.
+                    continue
+                if owner == media_uuid:
+                    continue
                 conn.execute(
                     """
                     INSERT INTO consumption_media_aliases(kind,alias_type,alias_value,media_uuid,created_at)
@@ -261,15 +253,53 @@ class ConsumptionLedger:
                     """,
                     (kind, alias_type, alias_value, media_uuid, now),
                 )
-                alias_key = _sha(_json([kind, alias_type, alias_value, media_uuid]))
-                self._queue_sync_record(conn, "alias", alias_key, {
-                    "kind": kind, "alias_type": alias_type, "alias_value": alias_value,
-                    "media": {
-                        "media_uuid": media_uuid, "kind": kind, "title": str(title or ""),
-                        "source_revision": str(source_revision or ""),
-                    },
-                }, created_at=now)
         return ConsumptionMediaRef(media_uuid, kind, str(title or ""), str(source_revision or ""))
+
+    @staticmethod
+    def _resolve_media(
+        conn: Any,
+        existing: dict[tuple[str, str], str],
+        *,
+        current_library_kind: str,
+        current_library_id: str,
+    ) -> str:
+        """Pick the media an item's aliases point to, strongest alias first.
+
+        Content/path/local aliases identify this very item. A shared alias
+        (AniList volume or episode) only merges into media no other library
+        item owns — a re-import or re-download — never into a different book
+        that happens to carry the same AniList volume.
+        """
+        own = sorted(
+            (
+                (_ALIAS_PRIORITY.get(alias_type, 50), media)
+                for (alias_type, _value), media in existing.items()
+                if alias_type not in _SHARED_ALIAS_TYPES
+            ),
+        )
+        if own:
+            if len({media for _rank, media in own}) > 1:
+                from .logging_utils import configure_logging
+
+                configure_logging().warning(
+                    "CONFLICT step=consumption.media_aliases chosen=%s others=%s",
+                    own[0][1],
+                    sorted({media for _rank, media in own[1:]} - {own[0][1]}),
+                )
+            return own[0][1]
+        for (alias_type, _value), media in existing.items():
+            if alias_type not in _SHARED_ALIAS_TYPES:
+                continue
+            row = conn.execute(
+                "SELECT current_library_kind,current_library_id FROM consumption_media WHERE media_uuid=?",
+                (media,),
+            ).fetchone()
+            if row is None:
+                return media
+            owner = (str(row["current_library_kind"] or ""), str(row["current_library_id"] or ""))
+            if not owner[1] or owner == (current_library_kind, current_library_id):
+                return media
+        return ""
 
     def detach_library_media(self, *, kind: str, local_id: str) -> bool:
         """Detach a deleted library row without deleting its history."""
@@ -290,18 +320,26 @@ class ConsumptionLedger:
         with self.database.connect() as conn:
             row = conn.execute(
                 """
-                SELECT e.media_id,COALESCE(e.media_episode,e.episode) AS episode,
+                SELECT e.media_id,COALESCE(e.media_episode,e.episode) AS episode,e.media_episode_end AS episode_end,
                        e.title AS episode_title,a.title AS anime_title
                 FROM episodes e LEFT JOIN anime a ON a.media_id=e.media_id
                 WHERE e.video_path=? ORDER BY e.updated_at DESC LIMIT 1
                 """,
                 (path,),
             ).fetchone()
-        if row is None or row["media_id"] is None or row["episode"] is None:
+        if row is None or row["media_id"] is None:
             return None
         media_id = int(row["media_id"])
-        episode = int(row["episode"])
-        title = f"{row['anime_title'] or media_id} · {episode}"
+        # Movies and one-part specials are stored without an episode number.
+        # AniList counts them as episode 1, and their watch time must reach
+        # statistics like any episode's (a two-hour movie used to be dropped).
+        single_part = row["episode"] is None
+        episode = 1 if single_part else int(row["episode"])
+        title = str(row["anime_title"] or media_id)
+        if not single_part:
+            title += f" · {episode}"
+        if row["episode_end"] is not None:
+            title += f"–{int(row['episode_end'])}"  # two episodes in one file
         return self.ensure_media(
             kind="anime_episode",
             title=title,
@@ -372,7 +410,11 @@ class ConsumptionLedger:
             current_library_kind="light_novel",
             current_library_id=str(int(book_id)),
             source_revision=revision,
-            metadata={"anilist_id": row["anilist_id"], "volume": row["volume"], "character_count": total_characters},
+            metadata={
+                "anilist_id": row["anilist_id"],
+                "volume": row["volume"],
+                "character_count": total_characters,
+            },
         )
 
     def audiobook_media(self, book_id: int) -> ConsumptionMediaRef | None:
@@ -390,9 +432,7 @@ class ConsumptionLedger:
         for item in files:
             file_path = Path(str(item["path"] or "")).expanduser()
             sampled = _file_sample_fingerprint(file_path, sample_bytes=16384)
-            source_parts.append(
-                f"{sampled or file_path.name}|{float(item['duration'] or 0):.3f}"
-            )
+            source_parts.append(f"{sampled or file_path.name}|{float(item['duration'] or 0):.3f}")
         if source_parts:
             revision = _sha("\n".join(source_parts))
         else:
@@ -432,9 +472,7 @@ class ConsumptionLedger:
             else:
                 vn_id = str(row["id"])
                 if str(row["title"] or "") != title:
-                    conn.execute(
-                        "UPDATE vn_titles SET title=?,updated_at=? WHERE id=?", (title, now, vn_id)
-                    )
+                    conn.execute("UPDATE vn_titles SET title=?,updated_at=? WHERE id=?", (title, now, vn_id))
         return self.ensure_media(
             kind="visual_novel",
             title=title,
@@ -667,9 +705,7 @@ class ConsumptionLedger:
             ).fetchone()
             if seq_existing is not None:
                 if str(seq_existing["content_hash"]) == content_hash:
-                    return ConsumptionAppendResult(
-                        str(seq_existing["event_id"]), device_id, seq, True
-                    )
+                    return ConsumptionAppendResult(str(seq_existing["event_id"]), device_id, seq, True)
                 raise ConsumptionConflictError("device sequence was reused with different content")
             conn.execute(
                 """
@@ -680,12 +716,22 @@ class ConsumptionLedger:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    identifier, device_id, seq, str(session_id), str(kind), start, end,
-                    elapsed, received, resolved_timezone, resolved_offset,
-                    payload_json, content_hash, LEDGER_SCHEMA_VERSION,
+                    identifier,
+                    device_id,
+                    seq,
+                    str(session_id),
+                    str(kind),
+                    start,
+                    end,
+                    elapsed,
+                    received,
+                    resolved_timezone,
+                    resolved_offset,
+                    payload_json,
+                    content_hash,
+                    LEDGER_SCHEMA_VERSION,
                 ),
             )
-            sync_media: list[dict[str, Any]] = []
             for row in media_rows:
                 conn.execute(
                     """
@@ -694,40 +740,14 @@ class ConsumptionLedger:
                     ) VALUES(?,?,?,?,?,?)
                     """,
                     (
-                        identifier, row["media_uuid"], row["source_revision"], row["role"],
-                        _json(row["locator_start"]), _json(row["locator_end"]),
+                        identifier,
+                        row["media_uuid"],
+                        row["source_revision"],
+                        row["role"],
+                        _json(row["locator_start"]),
+                        _json(row["locator_end"]),
                     ),
                 )
-                media_info = conn.execute(
-                    "SELECT kind,title_snapshot,source_revision FROM consumption_media WHERE media_uuid=?",
-                    (row["media_uuid"],),
-                ).fetchone()
-                sync_media.append({
-                    "media_uuid": row["media_uuid"],
-                    "kind": str(media_info["kind"] if media_info is not None else kind),
-                    "title": str(media_info["title_snapshot"] if media_info is not None else ""),
-                    "source_revision": row["source_revision"] or str(media_info["source_revision"] if media_info is not None else ""),
-                    "role": row["role"],
-                    "locator_start": row["locator_start"],
-                    "locator_end": row["locator_end"],
-                })
-            self._queue_sync_record(conn, "event", identifier, {
-                "event_id": identifier, "device_id": device_id, "device_seq": seq,
-                "session": {
-                    "session_id": str(session_id),
-                    "kind": str(session_row["kind"] or kind),
-                    "primary_media_uuid": str(session_row["primary_media_uuid"] or ""),
-                    "activity_group_id": str(session_row["activity_group_id"] or ""),
-                    "started_at_utc": float(session_row["started_at_utc"]),
-                    "ended_at_utc": session_row["ended_at_utc"],
-                    "origin": str(session_row["origin"] or "automatic"),
-                    "measurement_method": str(session_row["measurement_method"] or "observation"),
-                    "policy_version": str(session_row["policy_version"] or "r7-v1"),
-                },
-                "kind": str(kind), "interval_start_utc": start, "interval_end_utc": end,
-                "elapsed_monotonic_ms": elapsed, "timezone_iana": resolved_timezone,
-                "utc_offset": resolved_offset, "payload": payload or {}, "media": sync_media,
-            }, created_at=received)
         return ConsumptionAppendResult(identifier, device_id, seq, False)
 
     def _active_session_for_media(
@@ -789,7 +809,6 @@ class ConsumptionLedger:
             return ""
         return f"ln-audio:{int(ln_book_id)}:{int(audiobook_id)}"
 
-
     def record_anime_playback(
         self,
         video_path: Path,
@@ -811,7 +830,9 @@ class ConsumptionLedger:
                 "SELECT playback_position FROM episodes WHERE video_path=? ORDER BY updated_at DESC LIMIT 1",
                 (str(Path(video_path).expanduser().resolve()),),
             ).fetchone()
-        previous_position = float(previous["playback_position"] or position) if previous is not None else float(position)
+        previous_position = (
+            float(previous["playback_position"] or position) if previous is not None else float(position)
+        )
         total = active
         results: list[ConsumptionAppendResult] = []
         chunks = max(1, int(math.ceil(total / 15.0)))
@@ -832,13 +853,15 @@ class ConsumptionLedger:
                     interval_start_utc=chunk_start,
                     interval_end_utc=chunk_end,
                     elapsed_monotonic_ms=chunk * 1000.0,
-                    media=[{
-                        "media_uuid": media_ref.media_uuid,
-                        "source_revision": media_ref.source_revision,
-                        "role": "primary",
-                        "locator_start": {"position_seconds": max(0.0, locator0)},
-                        "locator_end": {"position_seconds": max(0.0, locator1)},
-                    }],
+                    media=[
+                        {
+                            "media_uuid": media_ref.media_uuid,
+                            "source_revision": media_ref.source_revision,
+                            "role": "primary",
+                            "locator_start": {"position_seconds": max(0.0, locator0)},
+                            "locator_end": {"position_seconds": max(0.0, locator1)},
+                        }
+                    ],
                     payload={
                         "duration_seconds": max(0.0, float(duration or 0.0)),
                         "measurement": "mpv_active_seconds",
@@ -849,7 +872,9 @@ class ConsumptionLedger:
         if self.logger:
             self.logger.debug(
                 "EVENT consumption.anime_chunk media=%s chunks=%s active_s=%.3f",
-                media_ref.media_uuid, len(results), active,
+                media_ref.media_uuid,
+                len(results),
+                active,
             )
         return results
 
@@ -881,15 +906,20 @@ class ConsumptionLedger:
         media_ref = self._media_for_local(kind, int(local_id))
         if media_ref is None:
             return []
-        normalized_kind = "light_novel" if str(kind).casefold() in {"light_novel", "novel", "ln"} else str(kind).casefold()
+        normalized_kind = (
+            "light_novel" if str(kind).casefold() in {"light_novel", "novel", "ln"} else str(kind).casefold()
+        )
         resolved_group = str(activity_group_id or "")
         if not resolved_group and normalized_kind == "light_novel":
             paired_audio_id = int((payload or {}).get("paired_audio_id") or 0)
             resolved_group = self._ln_audio_group(int(local_id), paired_audio_id)
         now = time.time()
         session_id = self._active_session_for_media(
-            media_ref.media_uuid, normalized_kind, now=now,
-            measurement_method=measurement_method, activity_group_id=resolved_group,
+            media_ref.media_uuid,
+            normalized_kind,
+            now=now,
+            measurement_method=measurement_method,
+            activity_group_id=resolved_group,
         )
         results: list[ConsumptionAppendResult] = []
         remaining = active
@@ -897,18 +927,25 @@ class ConsumptionLedger:
         while remaining > 0.001:
             chunk = min(15.0, remaining)
             start = end - chunk
-            results.append(self.append_interval(
-                session_id=session_id, kind=normalized_kind,
-                interval_start_utc=start, interval_end_utc=end, elapsed_monotonic_ms=chunk * 1000.0,
-                media=[{
-                    "media_uuid": media_ref.media_uuid,
-                    "source_revision": media_ref.source_revision,
-                    "role": "primary",
-                    "locator_start": locator_start or {},
-                    "locator_end": locator_end or {},
-                }],
-                payload={"measurement": measurement_method, **(payload or {})},
-            ))
+            results.append(
+                self.append_interval(
+                    session_id=session_id,
+                    kind=normalized_kind,
+                    interval_start_utc=start,
+                    interval_end_utc=end,
+                    elapsed_monotonic_ms=chunk * 1000.0,
+                    media=[
+                        {
+                            "media_uuid": media_ref.media_uuid,
+                            "source_revision": media_ref.source_revision,
+                            "role": "primary",
+                            "locator_start": locator_start or {},
+                            "locator_end": locator_end or {},
+                        }
+                    ],
+                    payload={"measurement": measurement_method, **(payload or {})},
+                )
+            )
             end = start
             remaining -= chunk
         return list(reversed(results))
@@ -922,26 +959,222 @@ class ConsumptionLedger:
         position_end: float,
         speed: float = 1.0,
     ) -> list[ConsumptionAppendResult]:
-        linked_ln_id = 0
+        return self.record_reader_activity(
+            kind="audiobook",
+            local_id=int(book_id),
+            active_seconds=active_seconds,
+            locator_start={"position_seconds": max(0.0, float(position_start or 0.0))},
+            locator_end={"position_seconds": max(0.0, float(position_end or 0.0))},
+            payload={
+                "speed": max(0.1, float(speed or 1.0)),
+                "seek_or_discontinuity": abs(float(position_end) - float(position_start))
+                > max(10.0, active_seconds * max(1.0, float(speed or 1.0)) * 4.0),
+            },
+            activity_group_id=self.audiobook_activity_group(int(book_id)),
+            measurement_method="audiobook_active_playback",
+        )
+
+    def audiobook_activity_group(self, book_id: int) -> str:
+        """The LN<->audiobook group of a linked audiobook ("" when it is not linked)."""
         with self.database.connect() as conn:
             row = conn.execute(
                 "SELECT ln_book_id FROM reading_audio_links WHERE audiobook_id=? "
                 "ORDER BY updated_at DESC,ln_book_id LIMIT 1",
                 (int(book_id),),
             ).fetchone()
-            if row is not None:
-                linked_ln_id = int(row["ln_book_id"] or 0)
-        return self.record_reader_activity(
-            kind="audiobook", local_id=int(book_id), active_seconds=active_seconds,
-            locator_start={"position_seconds": max(0.0, float(position_start or 0.0))},
-            locator_end={"position_seconds": max(0.0, float(position_end or 0.0))},
-            payload={
-                "speed": max(0.1, float(speed or 1.0)),
-                "seek_or_discontinuity": abs(float(position_end) - float(position_start)) > max(10.0, active_seconds * max(1.0, float(speed or 1.0)) * 4.0),
-            },
-            activity_group_id=self._ln_audio_group(linked_ln_id, int(book_id)),
-            measurement_method="audiobook_active_playback",
+        return self._ln_audio_group(int(row["ln_book_id"] or 0) if row is not None else 0, int(book_id))
+
+    def light_novel_activity_group(self, ln_book_id: int) -> str:
+        """The LN<->audiobook group of a light novel with a linked audiobook ("" otherwise)."""
+        with self.database.connect() as conn:
+            row = conn.execute(
+                "SELECT audiobook_id FROM reading_audio_links WHERE ln_book_id=?", (int(ln_book_id),)
+            ).fetchone()
+        return self._ln_audio_group(int(ln_book_id), int(row["audiobook_id"] or 0) if row is not None else 0)
+
+    def record_device_interval(
+        self,
+        *,
+        device_id: str,
+        device_name: str,
+        event_id: str,
+        kind: str,
+        media_ref: ConsumptionMediaRef,
+        start_utc: float,
+        end_utc: float,
+        active_seconds: float,
+        locator_start: dict[str, Any] | None = None,
+        locator_end: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        measurement_method: str = "device_observation",
+        activity_group_id: str = "",
+        timezone_iana: str = "",
+        utc_offset: int | None = None,
+        clock_skew_seconds: float = 0.0,
+    ) -> str:
+        """Store one interval measured on a paired device (the iPhone) at its own clock times.
+
+        Returns "applied", or "duplicate" for a retry of the same event. The same
+        event id with other content raises ConsumptionConflictError. Time spent on
+        one work on the Mac and on the phone at once is counted once in reports,
+        because reports take the union of overlapping intervals.
+
+        A phone clock ahead of the Mac's never loses the time: the interval moves back by
+        `clock_skew_seconds` (the device's measured lead), and one still ending more than
+        5 minutes in the future moves back to end now. The shift is kept in the payload;
+        retries match on the times the device sent.
+        """
+        start, end, active = float(start_utc), float(end_utc), float(active_seconds)
+        now = time.time()
+        sent_start, sent_end = start, end
+        skew = float(clock_skew_seconds or 0.0)
+        if not math.isfinite(skew) or skew < 0:
+            skew = 0.0
+        if (
+            not all(math.isfinite(value) for value in (start, end, active))
+            or start < 0
+            or end < start
+            or end - start > MAX_CHUNK_SECONDS + 0.001
+            or active < 0
+            or active > (end - start) + 2.5
+        ):
+            raise ConsumptionLedgerError("invalid device interval")
+        if end - skew > now + 300.0:
+            skew = end - now
+        start, end = start - skew, end - skew
+        if start < 0:
+            raise ConsumptionLedgerError("invalid device interval")
+        device = str(device_id or "").strip()
+        identifier = str(event_id or "").strip()
+        if not device or not identifier or len(identifier) > 160:
+            raise ConsumptionLedgerError("device interval needs a device and an event id")
+        normalized_kind = str(kind or "").strip().casefold()
+        if normalized_kind not in {"anime", "light_novel", "manga", "audiobook"}:
+            raise ConsumptionLedgerError("unsupported device interval kind")
+        event_payload = {"measurement": str(measurement_method), **(payload or {})}
+        stored_payload = (
+            {**event_payload, "clock_skew_seconds": round(skew, 3)} if skew > 0 else event_payload
         )
+        payload_json = _json(stored_payload)
+        if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+            raise ConsumptionLedgerError("consumption payload is too large")
+        media_row = {
+            "media_uuid": media_ref.media_uuid,
+            "source_revision": media_ref.source_revision,
+            "role": "primary",
+            "locator_start": locator_start or {},
+            "locator_end": locator_end or {},
+        }
+        automatic_zone, automatic_offset = _system_timezone_metadata(end)
+        zone = str(timezone_iana or "") or automatic_zone
+        offset = automatic_offset if utc_offset is None else int(utc_offset)
+        content_hash = _sha(
+            _json(
+                {
+                    "device": device,
+                    "kind": normalized_kind,
+                    "start": round(sent_start, 6),
+                    "end": round(sent_end, 6),
+                    "elapsed": round(active * 1000.0, 3),
+                    "payload": event_payload,
+                    "timezone": zone,
+                    "utc_offset": offset,
+                    "media": [media_row],
+                }
+            )
+        )
+        with self.database.connect() as conn:
+            existing = conn.execute(
+                "SELECT content_hash FROM consumption_events WHERE event_id=?", (identifier,)
+            ).fetchone()
+            if existing is not None:
+                if str(existing["content_hash"]) != content_hash:
+                    raise ConsumptionConflictError("event_id was retried with different content")
+                return "duplicate"
+            self._ensure_remote_device(conn, device, device_name)
+            session = conn.execute(
+                """
+                SELECT s.session_id,s.started_at_utc,COALESCE(MAX(e.interval_end_utc),s.started_at_utc) AS last_at
+                FROM consumption_sessions s LEFT JOIN consumption_events e ON e.session_id=s.session_id
+                WHERE s.device_id=? AND s.kind=? AND s.primary_media_uuid=? AND s.status='active'
+                GROUP BY s.session_id ORDER BY last_at DESC LIMIT 1
+                """,
+                (device, normalized_kind, media_ref.media_uuid),
+            ).fetchone()
+            if (
+                session is not None
+                and start - float(session["last_at"] or 0.0) <= 90.0
+                and start >= float(session["started_at_utc"] or 0.0) - 90.0
+            ):
+                session_id = str(session["session_id"])
+            else:
+                if session is not None:
+                    conn.execute(
+                        "UPDATE consumption_sessions SET ended_at_utc=?,status='closed' WHERE session_id=?",
+                        (float(session["last_at"] or start), str(session["session_id"])),
+                    )
+                session_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO consumption_sessions(
+                        session_id,profile_id,device_id,activity_group_id,kind,primary_media_uuid,started_at_utc,
+                        ended_at_utc,origin,status,measurement_method,policy_version,schema_version,metadata_json
+                    ) VALUES(?,?,?,?,?,?,?,NULL,'automatic','active',?,'r7-v1',?,'{}')
+                    """,
+                    (
+                        session_id,
+                        "default",
+                        device,
+                        str(activity_group_id or "") or str(uuid.uuid4()),
+                        normalized_kind,
+                        media_ref.media_uuid,
+                        start,
+                        str(measurement_method),
+                        LEDGER_SCHEMA_VERSION,
+                    ),
+                )
+            seq = self._next_seq(conn, device)
+            conn.execute(
+                """
+                INSERT INTO consumption_events(
+                    event_id,device_id,device_seq,session_id,kind,interval_start_utc,
+                    interval_end_utc,elapsed_monotonic_ms,received_at_utc,timezone_iana,
+                    utc_offset,payload_json,content_hash,schema_version
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    identifier,
+                    device,
+                    seq,
+                    session_id,
+                    normalized_kind,
+                    start,
+                    end,
+                    active * 1000.0,
+                    now,
+                    zone,
+                    offset,
+                    payload_json,
+                    content_hash,
+                    LEDGER_SCHEMA_VERSION,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO consumption_event_media(
+                    event_id,media_uuid,source_revision,role,locator_start_json,locator_end_json
+                ) VALUES(?,?,?,?,?,?)
+                """,
+                (
+                    identifier,
+                    media_ref.media_uuid,
+                    media_ref.source_revision,
+                    "primary",
+                    _json(locator_start or {}),
+                    _json(locator_end or {}),
+                ),
+            )
+        return "applied"
 
     def record_vn_runtime(
         self,
@@ -971,320 +1204,56 @@ class ConsumptionLedger:
         while remaining > 0.001:
             chunk = min(15.0, remaining)
             start = end - chunk
-            results.append(self.append_interval(
-                session_id=str(session_id), kind="visual_novel",
-                interval_start_utc=start, interval_end_utc=end, elapsed_monotonic_ms=chunk * 1000.0,
-                media=[{
-                    "media_uuid": media_uuid,
-                    "source_revision": str(media["source_revision"] if media is not None else ""),
-                    "role": "primary",
-                }],
-                payload={
-                    "measurement": "capture_runtime_estimated",
-                    "capture_count": max(0, int(capture_count or 0)),
-                    "focus_verified": False,
-                },
-            ))
+            results.append(
+                self.append_interval(
+                    session_id=str(session_id),
+                    kind="visual_novel",
+                    interval_start_utc=start,
+                    interval_end_utc=end,
+                    elapsed_monotonic_ms=chunk * 1000.0,
+                    media=[
+                        {
+                            "media_uuid": media_uuid,
+                            "source_revision": str(media["source_revision"] if media is not None else ""),
+                            "role": "primary",
+                        }
+                    ],
+                    payload={
+                        "measurement": "capture_runtime_estimated",
+                        "capture_count": max(0, int(capture_count or 0)),
+                        "focus_verified": False,
+                    },
+                )
+            )
             end = start
             remaining -= chunk
         return list(reversed(results))
-
-    def _seed_sync_outbox(self) -> None:
-        """Seed R9 transport from retained pre-R9 history once, without changing facts."""
-        with self.database.connect() as conn:
-            done = conn.execute("SELECT value FROM state WHERE key='consumption_sync_seeded_v2'").fetchone()
-            if done is not None and str(done["value"] or "") == "1":
-                return
-            aliases = conn.execute(
-                """SELECT a.kind,a.alias_type,a.alias_value,a.media_uuid,m.title_snapshot,m.source_revision
-                   FROM consumption_media_aliases a JOIN consumption_media m ON m.media_uuid=a.media_uuid"""
-            ).fetchall()
-            for row in aliases:
-                key = _sha(_json([row["kind"],row["alias_type"],row["alias_value"],row["media_uuid"]]))
-                self._queue_sync_record(conn,"alias",key,{
-                    "kind":str(row["kind"]),"alias_type":str(row["alias_type"]),"alias_value":str(row["alias_value"]),
-                    "media":{"media_uuid":str(row["media_uuid"]),"kind":str(row["kind"]),"title":str(row["title_snapshot"] or ""),"source_revision":str(row["source_revision"] or "")},
-                })
-            # Existing events are materialized with the same wire shape used by new appends.
-            event_ids = [str(row["event_id"]) for row in conn.execute("SELECT event_id FROM consumption_events ORDER BY received_at_utc,event_id")]
-            for event_id in event_ids:
-                payload = self._sync_event_payload_conn(conn,event_id)
-                if payload is not None:
-                    self._queue_sync_record(conn,"event",event_id,payload,created_at=float(payload.get("received_at_utc") or time.time()))
-            for row in conn.execute("SELECT * FROM consumption_corrections ORDER BY created_at_utc,correction_id"):
-                payload = {key: row[key] for key in row.keys()}
-                self._queue_sync_record(conn,"correction",str(row["correction_id"]),payload,created_at=float(row["created_at_utc"]))
-            for row in conn.execute("SELECT * FROM consumption_manual_entries ORDER BY created_at_utc,manual_id"):
-                payload = {key: row[key] for key in row.keys()}
-                self._queue_sync_record(conn,"manual",str(row["manual_id"]),payload,created_at=float(row["created_at_utc"]))
-            conn.execute(
-                "INSERT INTO state(key,value,updated_at) VALUES('consumption_sync_seeded_v2','1',?) "
-                "ON CONFLICT(key) DO UPDATE SET value='1',updated_at=excluded.updated_at",
-                (time.time(),),
-            )
-
-    def _sync_event_payload_conn(self, conn: Any, event_id: str) -> dict[str, Any] | None:
-        row = conn.execute(
-            """SELECT e.*,s.activity_group_id,s.primary_media_uuid,s.started_at_utc AS session_started_at,
-                      s.ended_at_utc AS session_ended_at,s.origin,s.measurement_method,s.policy_version
-               FROM consumption_events e JOIN consumption_sessions s ON s.session_id=e.session_id
-               WHERE e.event_id=?""",
-            (str(event_id),),
-        ).fetchone()
-        if row is None:
-            return None
-        media=[]
-        for item in conn.execute(
-            """SELECT em.*,m.kind AS media_kind,m.title_snapshot,m.source_revision AS media_revision
-               FROM consumption_event_media em JOIN consumption_media m ON m.media_uuid=em.media_uuid
-               WHERE em.event_id=? ORDER BY CASE em.role WHEN 'primary' THEN 0 ELSE 1 END,em.media_uuid""",
-            (str(event_id),),
-        ).fetchall():
-            media.append({
-                "media_uuid":str(item["media_uuid"]),"kind":str(item["media_kind"] or ""),
-                "title":str(item["title_snapshot"] or ""),
-                "source_revision":str(item["source_revision"] or item["media_revision"] or ""),
-                "role":str(item["role"] or "primary"),
-                "locator_start":json.loads(str(item["locator_start_json"] or "{}")),
-                "locator_end":json.loads(str(item["locator_end_json"] or "{}")),
-            })
-        return {
-            "event_id":str(row["event_id"]),"device_id":str(row["device_id"]),"device_seq":int(row["device_seq"]),
-            "received_at_utc":float(row["received_at_utc"]),
-            "session":{"session_id":str(row["session_id"]),"kind":str(row["kind"]),
-                       "primary_media_uuid":str(row["primary_media_uuid"] or ""),
-                       "activity_group_id":str(row["activity_group_id"] or ""),
-                       "started_at_utc":float(row["session_started_at"]),"ended_at_utc":row["session_ended_at"],
-                       "origin":str(row["origin"] or "automatic"),"measurement_method":str(row["measurement_method"] or "observation"),
-                       "policy_version":str(row["policy_version"] or "r7-v1")},
-            "kind":str(row["kind"]),"interval_start_utc":float(row["interval_start_utc"]),
-            "interval_end_utc":float(row["interval_end_utc"]),"elapsed_monotonic_ms":float(row["elapsed_monotonic_ms"]),
-            "timezone_iana":str(row["timezone_iana"] or ""),"utc_offset":int(row["utc_offset"] or 0),
-            "payload":json.loads(str(row["payload_json"] or "{}")),"media":media,
-        }
-
-    def sync_changes(self, *, cursor: int = 0, limit: int = 200) -> dict[str, Any]:
-        self._seed_sync_outbox()
-        start=max(0,int(cursor)); page=max(1,min(2000,int(limit)))
-        with self.database.connect() as conn:
-            epoch=self._history_epoch_conn(conn)
-            earliest=conn.execute("SELECT COALESCE(MIN(id),0) AS id FROM consumption_sync_outbox").fetchone()
-            rows=conn.execute(
-                "SELECT id,record_type,record_key,payload_json,created_at_utc FROM consumption_sync_outbox WHERE id>? ORDER BY id LIMIT ?",
-                (start,page+1),
-            ).fetchall()
-        visible=rows[:page]
-        earliest_id=int(earliest["id"] if earliest else 0)
-        return {
-            "schema":2,"reset_epoch":epoch,"cursor":int(visible[-1]["id"]) if visible else start,
-            "has_more":len(rows)>page,"earliest_cursor":earliest_id,
-            "reset_required":bool(start>0 and earliest_id>0 and start<earliest_id-1),
-            "records":[{"cursor":int(row["id"]),"record_id":f"{row['record_type']}:{row['record_key']}",
-                         "type":str(row["record_type"]),"payload":json.loads(str(row["payload_json"])),
-                         "created_at_utc":float(row["created_at_utc"])} for row in visible],
-        }
-
-    def _ensure_wire_media_conn(self, conn: Any, item: dict[str, Any]) -> str:
-        media_uuid=str(item.get("media_uuid") or "").strip()
-        if not media_uuid:
-            raise ConsumptionLedgerError("consumption sync media_uuid is required")
-        kind=str(item.get("kind") or "unknown").strip().casefold() or "unknown"
-        title=str(item.get("title") or "")
-        revision=str(item.get("source_revision") or "")
-        now=time.time()
-        row=conn.execute("SELECT 1 FROM consumption_media WHERE media_uuid=?",(media_uuid,)).fetchone()
-        if row is None:
-            conn.execute(
-                """INSERT INTO consumption_media(media_uuid,kind,title_snapshot,current_library_kind,current_library_id,
-                   source_revision,metadata_json,deleted_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (media_uuid,kind,title,"","",revision,"{}",None,now,now),
-            )
-        else:
-            conn.execute(
-                "UPDATE consumption_media SET title_snapshot=CASE WHEN ?!='' THEN ? ELSE title_snapshot END,"
-                "source_revision=CASE WHEN ?!='' THEN ? ELSE source_revision END,updated_at=? WHERE media_uuid=?",
-                (title,title,revision,revision,now,media_uuid),
-            )
-        return media_uuid
-
-    def _apply_sync_record_conn(self, conn: Any, device_id: str, record_type: str, payload: dict[str, Any], *, device_name: str = "") -> str:
-        kind=str(record_type or "").strip().casefold()
-        if kind=="alias":
-            media=payload.get("media") if isinstance(payload.get("media"),dict) else {}
-            media_uuid=self._ensure_wire_media_conn(conn,media)
-            alias_kind=str(payload.get("kind") or media.get("kind") or "unknown").casefold()
-            alias_type=str(payload.get("alias_type") or "").casefold(); alias_value=str(payload.get("alias_value") or "")
-            if not alias_type or not alias_value: raise ConsumptionLedgerError("invalid synced alias")
-            conn.execute(
-                """INSERT INTO consumption_media_aliases(kind,alias_type,alias_value,media_uuid,created_at)
-                   VALUES(?,?,?,?,?) ON CONFLICT(kind,alias_type,alias_value) DO UPDATE SET media_uuid=excluded.media_uuid""",
-                (alias_kind,alias_type,alias_value,media_uuid,time.time()),
-            )
-            return "applied"
-        if kind=="correction":
-            correction_id=str(payload.get("correction_id") or "").strip()
-            if not correction_id: raise ConsumptionLedgerError("invalid synced correction")
-            existing=conn.execute("SELECT * FROM consumption_corrections WHERE correction_id=?",(correction_id,)).fetchone()
-            if existing is not None:
-                return "duplicate"
-            conn.execute(
-                """INSERT INTO consumption_corrections(correction_id,target_type,target_id,revision,parent_revision,excluded,
-                   replacement_start_utc,replacement_end_utc,replacement_duration_seconds,reason,device_id,created_at_utc)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (correction_id,str(payload.get("target_type") or ""),str(payload.get("target_id") or ""),int(payload.get("revision") or 0),
-                 int(payload.get("parent_revision") or 0),int(bool(payload.get("excluded"))),payload.get("replacement_start_utc"),
-                 payload.get("replacement_end_utc"),payload.get("replacement_duration_seconds"),str(payload.get("reason") or ""),
-                 str(payload.get("device_id") or device_id),float(payload.get("created_at_utc") or time.time())),
-            )
-            return "applied"
-        if kind=="manual":
-            manual_id=str(payload.get("manual_id") or "").strip()
-            if not manual_id: raise ConsumptionLedgerError("invalid synced manual entry")
-            media_uuid=str(payload.get("media_uuid") or "")
-            if media_uuid and conn.execute("SELECT 1 FROM consumption_media WHERE media_uuid=?",(media_uuid,)).fetchone() is None:
-                self._ensure_wire_media_conn(conn,{"media_uuid":media_uuid,"kind":str(payload.get("kind") or "unknown"),"title":str(payload.get("title_snapshot") or "")})
-            existing=conn.execute("SELECT 1 FROM consumption_manual_entries WHERE manual_id=?",(manual_id,)).fetchone()
-            if existing is not None: return "duplicate"
-            conn.execute(
-                """INSERT INTO consumption_manual_entries(manual_id,media_uuid,kind,title_snapshot,started_at_utc,duration_seconds,
-                   note,origin,created_at_utc,updated_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (manual_id,media_uuid or None,str(payload.get("kind") or "manual"),str(payload.get("title_snapshot") or ""),
-                 payload.get("started_at_utc"),float(payload.get("duration_seconds") or 0.0),str(payload.get("note") or ""),
-                 str(payload.get("origin") or "manual"),float(payload.get("created_at_utc") or time.time()),float(payload.get("updated_at_utc") or time.time())),
-            )
-            return "applied"
-        if kind!="event":
-            raise ConsumptionLedgerError(f"unsupported consumption sync record: {kind}")
-        event_id=str(payload.get("event_id") or "").strip()
-        session=payload.get("session") if isinstance(payload.get("session"),dict) else {}
-        session_id=str(session.get("session_id") or "").strip()
-        seq=int(payload.get("device_seq") or 0)
-        if not event_id or not session_id or seq<=0: raise ConsumptionLedgerError("invalid synced consumption event")
-        start=float(payload.get("interval_start_utc") or 0.0); end=float(payload.get("interval_end_utc") or 0.0); elapsed=float(payload.get("elapsed_monotonic_ms") or 0.0)
-        if not all(math.isfinite(v) for v in (start,end,elapsed)) or start<0 or end<start or end-start>MAX_CHUNK_SECONDS+0.001 or elapsed>(MAX_CHUNK_SECONDS+0.001)*1000:
-            raise ConsumptionLedgerError("invalid synced consumption interval")
-        media_items=payload.get("media") if isinstance(payload.get("media"),list) else []
-        if not media_items: raise ConsumptionLedgerError("synced consumption event has no media")
-        primary=""
-        for item in media_items:
-            if not isinstance(item,dict): continue
-            uid=self._ensure_wire_media_conn(conn,item)
-            if not primary or str(item.get("role") or "primary")=="primary": primary=uid
-        self._ensure_remote_device(conn,device_id,device_name)
-        existing=conn.execute("SELECT content_hash FROM consumption_events WHERE event_id=?",(event_id,)).fetchone()
-        event_payload=payload.get("payload") if isinstance(payload.get("payload"),dict) else {}
-        media_hash_rows=[]
-        for item in media_items:
-            if not isinstance(item,dict): continue
-            media_hash_rows.append({"media_uuid":str(item.get("media_uuid") or ""),"source_revision":str(item.get("source_revision") or ""),"role":str(item.get("role") or "primary"),"locator_start":item.get("locator_start") or {},"locator_end":item.get("locator_end") or {}})
-        media_hash_rows.sort(key=lambda row:(row["media_uuid"],row["role"]))
-        zone=str(payload.get("timezone_iana") or ""); offset=int(payload.get("utc_offset") or 0)
-        content_hash=_sha(_json({"session_id":session_id,"kind":str(payload.get("kind") or session.get("kind") or "unknown"),"start":round(start,6),"end":round(end,6),"elapsed":round(elapsed,3),"payload":event_payload,"timezone":zone,"utc_offset":offset,"media":media_hash_rows}))
-        if existing is not None:
-            if str(existing["content_hash"])!=content_hash: raise ConsumptionConflictError("synced event_id content conflict")
-            return "duplicate"
-        seq_existing=conn.execute("SELECT event_id,content_hash FROM consumption_events WHERE device_id=? AND device_seq=?",(device_id,seq)).fetchone()
-        if seq_existing is not None:
-            if str(seq_existing["content_hash"])==content_hash: return "duplicate"
-            raise ConsumptionConflictError("synced device sequence conflict")
-        if conn.execute("SELECT 1 FROM consumption_sessions WHERE session_id=?",(session_id,)).fetchone() is None:
-            conn.execute(
-                """INSERT INTO consumption_sessions(session_id,profile_id,device_id,activity_group_id,kind,primary_media_uuid,started_at_utc,
-                   ended_at_utc,origin,status,measurement_method,policy_version,schema_version,metadata_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (session_id,"default",device_id,str(session.get("activity_group_id") or ""),str(session.get("kind") or payload.get("kind") or "unknown"),
-                 str(session.get("primary_media_uuid") or primary) or None,float(session.get("started_at_utc") or start),session.get("ended_at_utc"),
-                 str(session.get("origin") or "companion"),"closed" if session.get("ended_at_utc") is not None else "active",
-                 str(session.get("measurement_method") or "companion_observation"),str(session.get("policy_version") or "r9-sync-v1"),LEDGER_SCHEMA_VERSION,"{}"),
-            )
-        received=time.time()
-        conn.execute(
-            """INSERT INTO consumption_events(event_id,device_id,device_seq,session_id,kind,interval_start_utc,interval_end_utc,
-               elapsed_monotonic_ms,received_at_utc,timezone_iana,utc_offset,payload_json,content_hash,schema_version)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (event_id,device_id,seq,session_id,str(payload.get("kind") or session.get("kind") or "unknown"),start,end,elapsed,received,zone,offset,_json(event_payload),content_hash,LEDGER_SCHEMA_VERSION),
-        )
-        for item in media_items:
-            if not isinstance(item,dict): continue
-            conn.execute(
-                """INSERT INTO consumption_event_media(event_id,media_uuid,source_revision,role,locator_start_json,locator_end_json)
-                   VALUES(?,?,?,?,?,?)""",
-                (event_id,str(item.get("media_uuid") or ""),str(item.get("source_revision") or ""),str(item.get("role") or "primary"),_json(item.get("locator_start") or {}),_json(item.get("locator_end") or {})),
-            )
-        conn.execute("UPDATE consumption_devices SET next_seq=MAX(next_seq,?),updated_at=? WHERE device_id=?",(seq+1,received,device_id))
-        return "applied"
-
-    def push_sync_records(self, device_id: str, records: Iterable[dict[str, Any]], *, reset_epoch: int, device_name: str = "") -> dict[str, Any]:
-        rows=list(records)
-        if len(rows)>2000: raise ConsumptionLedgerError("too many consumption sync records")
-        with self.database.connect() as conn:
-            current_epoch=self._history_epoch_conn(conn)
-            # A newer epoch is accepted only as an explicit reset record. An older
-            # offline device must rebase before any event can resurrect history.
-            if int(reset_epoch)<current_epoch:
-                return {"schema":2,"reset_epoch":current_epoch,"reset_required":True,"results":[]}
-            if int(reset_epoch)>current_epoch:
-                reset_rows=[row for row in rows if isinstance(row,dict) and str(row.get("type") or "").casefold()=="reset"]
-                if int(reset_epoch)!=current_epoch+1 or len(reset_rows)!=1 or len(rows)!=1:
-                    raise ConsumptionConflictError("consumption reset epoch conflict")
-                reset_payload=reset_rows[0].get("payload") if isinstance(reset_rows[0].get("payload"),dict) else {}
-                if int(reset_payload.get("reset_epoch") or reset_epoch)!=int(reset_epoch):
-                    raise ConsumptionConflictError("consumption reset payload epoch conflict")
-                self._delete_history_conn(conn,new_epoch=int(reset_epoch),reset_at=float(reset_payload.get("reset_at_utc") or time.time()))
-                record_id=str(reset_rows[0].get("record_id") or f"reset:{int(reset_epoch)}")
-                digest=_sha(_json({"type":"reset","payload":reset_payload}))
-                conn.execute(
-                    "INSERT OR REPLACE INTO consumption_sync_receipts(device_id,record_id,record_hash,received_at_utc) VALUES(?,?,?,?)",
-                    (str(device_id),record_id,digest,time.time()),
-                )
-                return {"schema":2,"reset_epoch":int(reset_epoch),"reset_required":False,"results":[{"record_id":record_id,"status":"applied"}]}
-            results=[]
-            for raw in rows:
-                if not isinstance(raw,dict): raise ConsumptionLedgerError("consumption sync record must be an object")
-                record_type=str(raw.get("type") or "").casefold(); payload=raw.get("payload") if isinstance(raw.get("payload"),dict) else {}
-                record_id=str(raw.get("record_id") or f"{record_type}:{_sha(_json(payload))}")
-                digest=_sha(_json({"type":record_type,"payload":payload}))
-                receipt=conn.execute("SELECT record_hash FROM consumption_sync_receipts WHERE device_id=? AND record_id=?",(str(device_id),record_id)).fetchone()
-                if receipt is not None:
-                    if str(receipt["record_hash"])!=digest: raise ConsumptionConflictError("consumption sync retry changed content")
-                    results.append({"record_id":record_id,"status":"duplicate"}); continue
-                if record_type=="reset":
-                    payload_epoch=int(payload.get("reset_epoch") or current_epoch)
-                    if payload_epoch!=current_epoch:
-                        raise ConsumptionConflictError("reset record did not match current epoch")
-                    conn.execute("INSERT INTO consumption_sync_receipts(device_id,record_id,record_hash,received_at_utc) VALUES(?,?,?,?)",(str(device_id),record_id,digest,time.time()))
-                    results.append({"record_id":record_id,"status":"duplicate"})
-                    continue
-                status=self._apply_sync_record_conn(conn,str(device_id),record_type,payload,device_name=device_name)
-                conn.execute("INSERT INTO consumption_sync_receipts(device_id,record_id,record_hash,received_at_utc) VALUES(?,?,?,?)",(str(device_id),record_id,digest,time.time()))
-                key=record_id.split(":",1)[1] if record_id.startswith(record_type+":") else _sha(record_id)
-                self._queue_sync_record(conn,record_type,key,payload)
-                results.append({"record_id":record_id,"status":status})
-            return {"schema":2,"reset_epoch":current_epoch,"reset_required":False,"results":results}
 
     def _delete_history_conn(self, conn: Any, *, new_epoch: int, reset_at: float) -> None:
         conn.execute("DELETE FROM consumption_sync_outbox")
         conn.execute("DELETE FROM consumption_sync_receipts")
         conn.execute("DELETE FROM vn_capture_sessions")
+        conn.execute("DELETE FROM vn_capture_lines")
         conn.execute("DELETE FROM consumption_event_media")
         conn.execute("DELETE FROM consumption_events")
         conn.execute("DELETE FROM consumption_sessions")
         conn.execute("DELETE FROM consumption_corrections")
         conn.execute("DELETE FROM consumption_manual_entries")
         conn.execute("DELETE FROM consumption_daily_rollups")
+        # Statistics volume summaries (consumption_statistics.VOLUME_ROLLUP_PREFIX).
+        conn.execute("DELETE FROM state WHERE substr(key,1,26)='consumption_volume_rollup:'")
         conn.execute(
             """INSERT INTO consumption_history_state(profile_id,reset_epoch,reset_at_utc) VALUES('default',?,?)
                ON CONFLICT(profile_id) DO UPDATE SET reset_epoch=excluded.reset_epoch,reset_at_utc=excluded.reset_at_utc""",
-            (int(new_epoch),float(reset_at)),
+            (int(new_epoch), float(reset_at)),
         )
-        self._queue_sync_record(conn,"reset",str(int(new_epoch)),{"reset_epoch":int(new_epoch),"reset_at_utc":float(reset_at)},created_at=float(reset_at))
 
     def delete_history(self) -> dict[str, Any]:
-        now=time.time()
+        now = time.time()
         with self.database.connect() as conn:
-            epoch=self._history_epoch_conn(conn)+1
-            self._delete_history_conn(conn,new_epoch=epoch,reset_at=now)
-        return {"ok":True,"reset_epoch":epoch,"reset_at_utc":now}
+            epoch = self._history_epoch_conn(conn) + 1
+            self._delete_history_conn(conn, new_epoch=epoch, reset_at=now)
+        return {"ok": True, "reset_epoch": epoch, "reset_at_utc": now}
 
     def ledger_counts(self) -> dict[str, int]:
         with self.database.connect() as conn:

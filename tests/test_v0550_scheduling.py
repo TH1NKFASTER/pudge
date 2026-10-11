@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import pudge.manager_models as manager_models
 from pudge.config import AppConfig, load_config, write_config
@@ -46,11 +47,12 @@ def test_new_agent_intervals_round_trip(tmp_path: Path) -> None:
     config.agent.anilist_refresh_minutes = 120
     write_config(config, path)
 
-    text = path.read_text(encoding="utf-8")
+    written = tomllib.loads(path.read_text(encoding="utf-8"))["agent"]
     loaded = load_config(path)
 
-    assert "torrent_poll_minutes = 10" in text
-    assert "anilist_refresh_minutes = 120" in text
+    # The file keeps the names older Pudge versions read.
+    assert written["torrent_poll_minutes"] == 10
+    assert written["anilist_refresh_minutes"] == 120
     assert loaded.agent.poll_minutes == 10
     assert loaded.agent.anilist_refresh_minutes == 120
 

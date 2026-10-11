@@ -52,9 +52,7 @@ def test_absolute_episode_number_crosses_ova_bridge(monkeypatch):
         client.close()
 
     assert absolute == 90
-    assert [item.id for item in chain] == [
-        101280, 161802, 108511, 116742, 156822, 182205
-    ]
+    assert [item.id for item in chain] == [101280, 161802, 108511, 116742, 156822, 182205]
 
 
 def test_old_cache_48_is_upgraded_to_72(tmp_path, monkeypatch):
@@ -98,17 +96,11 @@ def test_old_cache_48_is_upgraded_to_72(tmp_path, monkeypatch):
         ),
     )
 
-    aliases = _jimaku_episode_aliases(
-        anime, 18, cfg, logging.getLogger("test")
-    )
+    aliases = _jimaku_episode_aliases(anime, 18, cfg, logging.getLogger("test"))
 
     assert aliases == (90,)
     payload = json.loads(
-        (
-            cfg.paths.cache_dir
-            / "anilist-episode-offset"
-            / "182205.json"
-        ).read_text(encoding="utf-8")
+        (cfg.paths.cache_dir / "anilist-episode-offset" / "182205.json").read_text(encoding="utf-8")
     )
     assert payload["offset"] == 72
     assert payload["resolver_version"] >= 2  # bumped to 3 for external episode rules

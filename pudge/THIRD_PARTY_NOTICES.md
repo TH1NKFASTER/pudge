@@ -66,6 +66,13 @@ SOFTWARE.
 Source: <https://github.com/kanjieater/SubPlz>
 
 
+## QR Code generator (Project Nayuki)
+
+`pudge/_qr.py` (iPhone pairing QR codes, generated locally) is the Python
+QR Code generator library by Project Nayuki
+(https://www.nayuki.io/page/qr-code-generator-library), MIT License,
+Copyright (c) Project Nayuki. The full license text is kept in the file header.
+
 ## Optional external applications
 
 Pudge does not bundle mpv, FFmpeg, JitenMPV, or jpdb-mpv-plugin binaries. During
@@ -79,6 +86,11 @@ programs in the user's normal per-user or system package locations.
 - JitenMPV: Apache-2.0, <https://github.com/Sirush/JitenMPV>
 - jpdb-mpv-plugin: optional user-installed integration,
   <https://github.com/Sahil811/jpdb-mpv-plugin>
+- Mokuro (manga OCR engine, includes comic-text-detector): GPL-3.0,
+  <https://github.com/kha-white/mokuro>. Installed only on request into a
+  separate Python environment (or an existing one the user points to) and run
+  there as a separate program. `pudge/manga_mokuro_worker.py` runs inside that
+  environment, imports nothing from Pudge and exchanges only JSON files.
 
 The JitenMPV setup action downloads a pinned copy of its official Unix
 installer. That installer verifies the checksum published with the selected

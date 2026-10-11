@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pudge.first_experience as first
 
+from tests.i18n_support import ru
+
 
 def _fake_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
     return (
@@ -39,7 +41,11 @@ def test_check_only_checks_and_never_runs_installer(monkeypatch, tmp_path: Path)
     first._write_jiten_installed_version("0.2.4")
     monkeypatch.setattr(first, "dependency_status", lambda **_kwargs: _installed_status())
     monkeypatch.setattr(first, "_latest_jiten_release", lambda: ("0.2.5", "v0.2.5"))
-    monkeypatch.setattr(first, "_run_jiten_mpv_installer", lambda: (_ for _ in ()).throw(AssertionError("installer ran during check")))
+    monkeypatch.setattr(
+        first,
+        "_run_jiten_mpv_installer",
+        lambda: (_ for _ in ()).throw(AssertionError("installer ran during check")),
+    )
 
     result = first.check_jiten_mpv_update()
     assert result["update_available"] is True
@@ -85,16 +91,127 @@ def test_update_runs_official_installer_only_on_explicit_update(monkeypatch, tmp
     assert first._read_jiten_installed_version() == "0.2.5"
 
 
-def test_settings_use_two_step_check_then_update_button() -> None:
-    root = Path(__file__).resolve().parents[1]
-    html = (root / "pudge/web/index.html").read_text(encoding="utf-8")
-    web_app = (root / "pudge/web_app.py").read_text(encoding="utf-8")
+# Settings → Jiten: one button that installs, checks or updates JitenMPV.
+JITEN_BUTTON = r"""
+const view = () => ({button: __text('#jitenMpvAction'), status: __text('#s_jiten_mpv_update_status')});
+const press = async () => { await __click('#jitenMpvAction'); await __tick(10); return view(); };
+const texts = {check: t('ui.checkJitenmpvUpdate'), update: t('ui.updateJitenmpv'), install: t('ui.installJitenmpv'),
+               updated: t('ui.jitenmpvUpdated'), installed: t('ui.jitenmpvInstalled'), offline: t('ui.couldNotCheckGithub'),
+               missing: t('ui.jitenmpvIsNotInstalled'), upToDate: t('ui.upToDate', {value: ' v0.2.5'})};
+"""
 
-    assert "Проверить обновление JitenMPV" in html
-    assert "Обновить JitenMPV" in html
-    assert "Установить JitenMPV" in html
-    assert "mode==='check'" in html
-    assert "pywebview.api.jiten_mpv_check_update()" in html
-    assert "pywebview.api.jiten_mpv_update()" in html
-    assert "def jiten_mpv_check_update(" in web_app
-    assert "def jiten_mpv_update(" in web_app
+
+def _plugins(installed: bool, version: str = "") -> dict[str, object]:
+    return {"mpv_study_plugins": {"jiten_mpv": {"installed": installed, "version": version}}}
+
+
+def test_settings_check_first_and_update_only_on_a_second_press(page) -> None:
+    assert ru("ui.checkJitenmpvUpdate") == "Проверить обновление JitenMPV"
+    assert ru("ui.updateJitenmpv") == "Обновить JitenMPV"
+    assert ru("ui.installJitenmpv") == "Установить JitenMPV"
+    for lang in ("en", "ru"):
+        result = page.run(
+            JITEN_BUTTON
+            + r"""
+            const start = view();
+            const checked = await press();
+            const calls = __apiCalls.map(call => call.name).filter(name => name.startsWith('jiten_mpv'));
+            const updated = await press();
+            return {start, checked, calls, updated, toast: __text('#toast'), texts};
+            """,
+            lang=lang,
+            state={"settings": _plugins(True, "0.2.4")},
+            api={
+                "jiten_mpv_check_update": {
+                    "reachable": True,
+                    "update_available": True,
+                    "current_version_known": True,
+                    "current_version": "0.2.4",
+                    "latest_version": "0.2.5",
+                },
+                "jiten_mpv_update": {"ok": True, "plugins": _plugins(True, "0.2.5")["mpv_study_plugins"]},
+            },
+        )
+        out = result.value
+        texts = out["texts"]
+        assert out["start"] == {"button": texts["check"], "status": "v0.2.4"}
+        # Checking never updates: the button offers the update and shows both versions.
+        assert out["calls"] == ["jiten_mpv_check_update"]
+        assert out["checked"] == {"button": texts["update"], "status": "v0.2.4 → v0.2.5"}
+        assert out["updated"] == {"button": texts["check"], "status": "v0.2.5"}
+        assert out["toast"] == texts["updated"]
+        assert [call["name"] for call in result.calls if call["name"].startswith("jiten_mpv")] == [
+            "jiten_mpv_check_update",
+            "jiten_mpv_update",
+        ]
+
+
+def test_settings_report_up_to_date_unreachable_and_not_installed(page) -> None:
+    code = (
+        JITEN_BUTTON
+        + "const start = view(); return {start, pressed: await press(), toast: __text('#toast'), texts};"
+    )
+    current = page.run(
+        code,
+        state={"settings": _plugins(True, "0.2.5")},
+        api={
+            "jiten_mpv_check_update": {
+                "reachable": True,
+                "update_available": False,
+                "current_version": "0.2.5",
+            }
+        },
+    )
+    texts = current.value["texts"]
+    assert current.value["pressed"] == {"button": texts["check"], "status": texts["upToDate"]}
+    offline = page.run(
+        code,
+        state={"settings": _plugins(True, "0.2.5")},
+        api={"jiten_mpv_check_update": {"reachable": False, "update_available": False}},
+    )
+    assert offline.value["pressed"] == {"button": texts["check"], "status": texts["offline"]}
+    assert not offline.called("jiten_mpv_update")
+    missing = page.run(
+        code,
+        state={"settings": _plugins(False)},
+        api={"jiten_mpv_install": {"ok": True, "plugins": _plugins(True, "0.2.5")["mpv_study_plugins"]}},
+    )
+    assert missing.value["start"] == {"button": texts["install"], "status": texts["missing"]}
+    assert missing.value["pressed"] == {"button": texts["check"], "status": "v0.2.5"}
+    assert missing.value["toast"] == texts["installed"]
+    assert [call["name"] for call in missing.calls if call["name"].startswith("jiten_mpv")] == [
+        "jiten_mpv_install"
+    ]
+
+
+def test_backend_check_and_update_endpoints(monkeypatch, tmp_path: Path) -> None:
+    import pudge.web_app as web_app
+    from test_web_app import make_api
+
+    api = make_api(tmp_path)
+    api.light_novels.save_settings({"jiten_api_key": "jiten-key"})
+    checked: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        web_app,
+        "check_jiten_mpv_update",
+        lambda **kwargs: checked.append(kwargs) or {"update_available": True},
+    )
+    assert api.jiten_mpv_check_update() == {"update_available": True}
+    assert checked == [{"mpv": api.config.tools.mpv, "ffmpeg": api.config.tools.ffmpeg}]
+
+    updated: list[str] = []
+    monkeypatch.setattr(
+        web_app,
+        "update_jiten_mpv_release",
+        lambda key, **_kwargs: updated.append(key) or {"jiten_mpv": {"installed": True, "version": "0.2.5"}},
+    )
+    monkeypatch.setattr(
+        web_app, "mpv_study_status", lambda **_kwargs: {"jiten_mpv": {"installed": True, "version": "0.2.5"}}
+    )
+    result = api.jiten_mpv_update()
+    assert updated == ["jiten-key"]
+    assert result == {
+        "ok": True,
+        "status": {"installed": True, "version": "0.2.5"},
+        "plugins": {"jiten_mpv": {"installed": True, "version": "0.2.5"}},
+    }

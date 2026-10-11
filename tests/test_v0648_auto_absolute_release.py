@@ -40,7 +40,8 @@ def _release(*, score: float = 176.2, seeders: int = 482, reasons: list[str] | N
         remake=False,
         group="AnoZu",
         score=score,
-        reasons=reasons or [
+        reasons=reasons
+        or [
             "title=100",
             "exact-title-phrase",
             "wrong-season=17",
@@ -155,7 +156,9 @@ def test_automatic_release_search_keeps_same_alias_count_as_find_episode(tmp_pat
             pass
 
     monkeypatch.setattr(manager, "nyaa_client", lambda timeout=20.0: DummyClient())
-    monkeypatch.setattr(manager, "_release_episode_context", lambda anime, episode: ((43,), ("BLEACH: Sennen Kessen-hen",)))
+    monkeypatch.setattr(
+        manager, "_release_episode_context", lambda anime, episode: ((43,), ("BLEACH: Sennen Kessen-hen",))
+    )
 
     def fake_search_ranked(client, anime, **kwargs):
         captured.update(kwargs)

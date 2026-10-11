@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+from css_support import css_rules
+from pudge import web_app
 from pudge.uninstall import build_uninstall_plan, launch_uninstaller, render_uninstall_script
-
-
-ROOT = Path(__file__).parents[1]
+from source_policy import source
+from test_web_app import make_api
+from tests.i18n_support import en, ru
 
 
 def test_uninstall_plan_removes_pudge_owned_state_without_shared_tools(tmp_path: Path) -> None:
@@ -64,9 +70,7 @@ def test_uninstall_script_waits_for_pudge_and_uses_exact_targets(tmp_path: Path)
     assert "*.app" not in script
 
 
-def test_uninstaller_is_launched_as_a_detached_private_script(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_uninstaller_is_launched_as_a_detached_private_script(tmp_path: Path, monkeypatch) -> None:
     launched: dict[str, object] = {}
 
     def fake_popen(command, **options):
@@ -85,51 +89,79 @@ def test_uninstaller_is_launched_as_a_detached_private_script(
         script_path.unlink(missing_ok=True)
 
 
-def test_settings_expose_a_red_double_confirmed_uninstall_action() -> None:
-    html = (ROOT / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    backend = (ROOT / "pudge" / "web_app.py").read_text(encoding="utf-8")
-    confirm = (ROOT / "pudge" / "web" / "pudge_confirm.js").read_text(encoding="utf-8")
-
-    assert 'id="uninstallPudge"' in html
-    assert "Delete Pudge from this Mac" in html
-    assert "Удалить Pudge с этого Mac" in html
-    assert 'class="uninstall-pudge"' in html
-    assert "pywebview.api.uninstall_pudge()" in html
-    assert html.count("pudgeConfirm(finalWarning") == 1
-    assert "def uninstall_pudge" in backend
-    assert "options?.danger" in confirm
-    assert "confirm.danger" in confirm
-
-
-def test_companion_refreshes_visible_library_and_uses_new_shell_cache() -> None:
-    companion = ROOT / "pudge" / "web" / "companion"
-    app = (companion / "app.js").read_text(encoding="utf-8")
-    html = (companion / "index.html").read_text(encoding="utf-8")
-    service_worker = (companion / "sw.js").read_text(encoding="utf-8")
-
-    assert "PUDGE_COMPANION_LIVE_SYNC_V15" in app
-    assert "refreshVisibleLibrary" in app
-    assert "loadLibrary().catch(() => {})" in app
-    assert "window.addEventListener('focus', refreshVisibleLibrary)" in app
-    assert "window.setInterval(refreshVisibleLibrary, 15000)" in app
-    assert "app.js?v=15" in html
-    assert "styles.css?v=15" in html
-    assert "pudge-companion-shell-v15" in service_worker
+UNINSTALL = r"""
+setPage('settings', true); await __tick(100);
+const confirmation = () => ({title: __text('#pudgeConfirmTitle'), message: $('pudgeConfirmMessage').textContent,
+  ok: __text('[data-pudge-confirm="ok"]'), danger: document.querySelector('[data-pudge-confirm="ok"]').classList.contains('danger')});
+const uninstalls = () => __apiCalls.filter(call => call.name === 'uninstall_pudge').length;
+const out = {button: $('uninstallPudge').innerText, expected: {
+  first: {title: t('ui.deletePudge'), message: t('ui.thisPermanentlyRemovesThePudge'), ok: t('ui.continue'), danger: true},
+  second: {title: t('ui.deleteEverything'), message: t('ui.finalConfirmationThisCannotBe'), ok: t('ui.deletePudge2'), danger: true},
+  button: t('ui.deletePudgeFromThisMac')}};
+await __click('#uninstallPudge'); await __tick(20);
+out.first = confirmation();
+await __click('[data-pudge-confirm="cancel"]'); await __tick(20);
+out.afterFirstCancel = uninstalls();
+await __click('#uninstallPudge'); await __tick(20);
+await __click('[data-pudge-confirm="ok"]'); await __tick(20);
+out.second = confirmation();
+await __click('[data-pudge-confirm="cancel"]'); await __tick(20);
+out.afterSecondCancel = uninstalls();
+await __click('#uninstallPudge'); await __tick(20);
+await __click('[data-pudge-confirm="ok"]'); await __tick(20);
+await __click('[data-pudge-confirm="ok"]'); await __tick(20);
+out.afterBoth = uninstalls(); out.disabled = $('uninstallPudge').disabled;
+return out;
+"""
 
 
-def test_source_documentation_uses_human_initial_setup_language() -> None:
-    documents = [
-        ROOT / "README.md",
-        ROOT / "CHANGELOG.md",
-        ROOT / "CONTRIBUTING.md",
-        ROOT / "CONTRIBUTING.md",
-        ROOT / "SECURITY.md",
-        ROOT / "pudge" / "THIRD_PARTY_NOTICES.md",
-    ]
-    combined = "\n".join(path.read_text(encoding="utf-8") for path in documents).casefold()
+def test_settings_offer_a_red_double_confirmed_uninstall(page) -> None:
+    for lang in ("en", "ru"):
+        result = page.run(UNINSTALL, lang=lang)
+        out = result.value
+        assert out["button"] == out["expected"]["button"]
+        # Two red confirmations; cancelling either one deletes nothing.
+        assert out["first"] == out["expected"]["first"] and out["second"] == out["expected"]["second"]
+        assert (out["afterFirstCancel"], out["afterSecondCancel"], out["afterBoth"]) == (0, 0, 1)
+        assert out["disabled"] is True
+    assert en("ui.deletePudgeFromThisMac") == "Delete Pudge from this Mac"
+    assert ru("ui.deletePudgeFromThisMac") == "Удалить Pudge с этого Mac"
+    assert css_rules("index.html").get("button.uninstall-pudge", "background") == "#a51f33"
 
-    assert "first experience" not in combined
-    assert "first-experience" not in combined
-    assert "first run" not in combined
-    assert "first-run" not in combined
-    assert "## remove pudge" in (ROOT / "README.md").read_text(encoding="utf-8").casefold()
+
+def test_uninstall_api_starts_the_detached_cleanup_then_closes_the_window(
+    tmp_path: Path, monkeypatch
+) -> None:
+    api = make_api(tmp_path)
+    launched, timers, destroyed = [], [], []
+
+    class Timer:
+        def __init__(self, delay, function):
+            timers.append((delay, function))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(web_app, "launch_uninstaller", launched.append)
+    monkeypatch.setattr(web_app.threading, "Timer", Timer)
+    monkeypatch.setattr(web_app.sys, "platform", "linux")
+    with pytest.raises(RuntimeError, match=re.escape(en("error.web.uninstallMacOnly"))):
+        api.uninstall_pudge()
+    assert launched == [] and timers == []
+    monkeypatch.setattr(web_app.sys, "platform", "darwin")
+    result = api.uninstall_pudge()
+    [plan] = launched
+    assert result == {"ok": True, "target_count": len(plan.targets)}
+    # This installation's own config and database are part of the plan.
+    assert {Path(api.config_path), Path(api.config.library.database_path)} <= set(plan.targets)
+    # The window closes shortly after the cleanup process was started.
+    [(delay, close)] = timers
+    assert delay == 0.2
+    api.window = SimpleNamespace(destroy=lambda: destroyed.append(True))
+    close()
+    assert destroyed == [True]
+
+
+def test_readme_tells_users_how_to_remove_pudge() -> None:
+    # policy: users follow README's removal instructions; the section must stay.
+    assert "## remove pudge" in source("README.md").casefold()

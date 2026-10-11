@@ -7,9 +7,7 @@ import pytest
 from pudge.config import AppConfig
 from pudge.light_novels import LightNovelError, LightNovelService
 from pudge.web_app import WebAppApi
-
-
-ROOT = Path(__file__).resolve().parents[1]
+from tests.i18n_support import en
 
 
 def _service(tmp_path: Path) -> LightNovelService:
@@ -48,7 +46,7 @@ def test_live_jiten_state_uses_known_state_endpoint_and_short_cache(
     assert calls == ["vocabulary/120/2/known-state"]
     assert first["states"] == ["mature"]
     assert first["rawStateLabel"] == "Mature"
-    assert first["normalizedState"] == "learning"
+    assert first["normalizedState"] == "mature"
     assert first["knowledgeStatus"] == "live_provider_state"
     assert second["states"] == ["mature"]
     assert second["knowledgeStatus"] == "live_state_cache"
@@ -61,8 +59,8 @@ def test_live_jiten_state_accepts_string_enum_names(tmp_path: Path, monkeypatch:
     result = service.jiten_live_state(10, 0)
 
     assert result["states"] == ["due", "mature"]
-    # Jiten displays the durable tier as the primary word status; Due remains
-    # present in states for coloring/review logic.
+    # The card's label is Jiten's primary status; the colour is Due, which wins over
+    # every other state (the user's choice).
     assert result["rawStateLabel"] == "Mature"
     assert result["normalizedState"] == "due"
 
@@ -196,13 +194,68 @@ def test_web_api_exposes_live_study_state_without_chapter_reparse() -> None:
     }
 
 
-def test_reader_refreshes_live_state_and_shows_exact_jiten_tier() -> None:
-    source = (ROOT / "pudge/web/reading_tools.js").read_text(encoding="utf-8")
-    assert "light_novel_study_state" in source
-    assert "https://jiten.moe/vocabulary/${wordId}/${readingIndex}" in source
-    assert "API().open_url(url)" in source
-    assert "refreshLiveStudyState(activeToken, target)" in source
-    assert "rawStateLabel" in source
-    assert "['blacklisted','Blacklisted']" in source
-    assert "['mature','Mature']" in source
-    assert "Network failure must not demote" in source
+# A reader paragraph of Jiten words (vocabulary = the parse snapshot) and the live
+# Jiten state answers; window.__offline makes the state lookups fail.
+STUDY_PAGE = r"""
+window.__live = window.__live || {};
+window.__offline = false;
+__api.study_provider_capabilities = async () => ({account_key: 'jiten:me', configured: true});
+__api.study_states = async payload => {
+  if (window.__offline) throw new Error('offline');
+  return {ok: true, account_scope: 'jiten:me', states: payload.words.map(([w, r]) =>
+    ({ok: true, wordId: w, readingIndex: r, ...(window.__live[`${w}:${r}`] || {states: [], normalizedState: 'new'})}))};
+};
+const paragraph = words => {
+  let pos = 0;
+  const tokens = words.map(([text, wordId, readingIndex]) => { const start = pos; pos += text.length; return {wordId, readingIndex, start, end: pos}; });
+  const vocabulary = words.map(([text, wordId, readingIndex, card]) => ({wordId, readingIndex, spelling: text, ...card}));
+  const box = document.createElement('div');
+  box.innerHTML = PudgeReadingTools.study.renderParsedText({paragraphs: [words.map(w => w[0]).join('')], tokens: [tokens], vocabulary}, {backend: 'jiten'});
+  document.body.appendChild(box);
+};
+const word = text => [...document.querySelectorAll('[data-pudge-study-token]')].find(n => n.textContent === text);
+const openCard = async text => {
+  await __click(`[data-pudge-study-token="${word(text).dataset.pudgeStudyToken}"]`);
+  await __tick(50);
+  const badge = document.querySelector('#pudgeStudyCard .pudge-study-state');
+  return {label: badge.textContent, state: [...badge.classList].find(c => c.startsWith('state-'))};
+};
+"""
+
+
+def test_word_card_refreshes_the_live_jiten_tier_and_keeps_it_when_offline(page) -> None:
+    assert en("reading.state.blacklisted") == "Blacklisted"
+    assert en("reading.state.mature") == "Mature"
+    result = page.run(
+        STUDY_PAGE
+        + """
+        window.__live['120:2'] = {states: ['mature'], rawStateLabel: 'Mature', normalizedState: 'learning'};
+        paragraph([['少し', 120, 2, {states: []}]]);                 // the cached chapter parse says New
+        await __tick(100);
+        const calls = __apiCalls.length;
+        const live = await openCard('少し');
+        const refresh = __apiCalls.slice(calls).filter(c => c.name === 'study_states').map(c => c.args[0]);
+        await __click('#pudgeStudyCard [data-pudge-study-jiten]');
+        await __tick(10);
+        await __click('[data-pudge-study-close]');
+
+        window.__offline = true;                                     // Jiten cannot be reached
+        paragraph([['猫', 7, 0, {states: ['blacklisted']}], ['犬', 8, 0, {states: ['mature']}]]);
+        await __tick(100);
+        const blacklisted = await openCard('猫');
+        await __click('[data-pudge-study-close]');
+        const mature = await openCard('犬');
+        return {live, refresh, blacklisted, mature,
+                labels: {mature: t('reading.state.mature'), blacklisted: t('reading.state.blacklisted')}};
+        """,
+        lang="ru",
+    )
+    out = result.value
+    # Opening the card asks Jiten for this word's current state and shows its exact tier.
+    assert out["refresh"] == [{"backend": "jiten", "words": [[120, 2]], "force": False}]
+    assert out["live"] == {"label": "Mature", "state": "state-mature"}
+    # The arrow opens the word on jiten.moe.
+    assert result.calls_of("open_url") == [["https://jiten.moe/vocabulary/120/2"]]
+    # A failed refresh keeps the last known state instead of demoting the word to New.
+    assert out["blacklisted"] == {"label": out["labels"]["blacklisted"], "state": "state-blacklisted"}
+    assert out["mature"] == {"label": out["labels"]["mature"], "state": "state-mature"}

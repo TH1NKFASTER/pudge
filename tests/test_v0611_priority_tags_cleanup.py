@@ -129,12 +129,9 @@ def test_qbittorrent_cleanup_removes_score_and_all_unused_tags() -> None:
 def test_cleanup_repairs_missing_hash_before_deleting_koukaku(tmp_path: Path, monkeypatch) -> None:
     manager = make_manager(tmp_path)
     manager.config.qbittorrent.enabled = True
-    manager.db.upsert_anime(
-        LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12)
-    )
+    manager.db.upsert_anime(LibraryAnime(media_id=177699, title="Koukaku", progress=5, episodes=12))
     video = manager.config.library.root_dir / (
-        "[Erai-raws] Koukaku Kidoutai (2026) - 05 "
-        "[1080p AMZN WEB-DL AVC EAC3][MultiSub][ADDB49AE].mkv"
+        "[Erai-raws] Koukaku Kidoutai (2026) - 05 [1080p AMZN WEB-DL AVC EAC3][MultiSub][ADDB49AE].mkv"
     )
     video.write_bytes(b"video")
     manager.db.upsert_episode(
@@ -169,7 +166,11 @@ def test_cleanup_repairs_missing_hash_before_deleting_koukaku(tmp_path: Path, mo
             self.deleted: list[tuple[str, bool]] = []
 
         def torrent_status(self, torrent_hash: str):
-            return None if any(hash_ == torrent_hash for hash_, _delete_files in self.deleted) else {"hash": torrent_hash, "progress": 1.0}
+            return (
+                None
+                if any(hash_ == torrent_hash for hash_, _delete_files in self.deleted)
+                else {"hash": torrent_hash, "progress": 1.0}
+            )
 
         def delete(self, torrent_hash: str, *, delete_files: bool = True) -> None:
             self.deleted.append((torrent_hash, delete_files))

@@ -62,9 +62,7 @@ def test_runtime_precision_span_reinjects_vad_hold_beyond_first_coarse_anchor(mo
 
     # The next word must not light up on the tiny pre-gap STT tail.
     assert not any(
-        abs(float(row["offset"]) - 133.0) < 1e-6
-        and float(row["time"]) < 14086.700 - 1e-6
-        for row in refined
+        abs(float(row["offset"]) - 133.0) < 1e-6 and float(row["time"]) < 14086.700 - 1e-6 for row in refined
     )
     assert {"offset": 132.999, "time": 14085.96} in refined
     assert {"offset": 132.999, "time": 14086.699} in refined

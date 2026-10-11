@@ -47,7 +47,9 @@ def test_exact_direct_audiobook_title_is_offered_without_torrent_metadata(monkey
 
         def fetch_torrent_payload(self, url: str) -> bytes:
             fetched.append(url)
-            raise AssertionError("exact direct audiobook releases must not fetch torrent metadata during search")
+            raise AssertionError(
+                "exact direct audiobook releases must not fetch torrent metadata during search"
+            )
 
         def close(self):
             pass
@@ -72,7 +74,9 @@ def test_exact_direct_audiobook_title_is_offered_without_torrent_metadata(monkey
     api = object.__new__(web_app.WebAppApi)
     api.light_novels = FakeLightNovels()
     api.config = SimpleNamespace(
-        nyaa=SimpleNamespace(base_url="https://nyaa.invalid", proxy_mode="direct", proxy_url="", pre_search_command=""),
+        nyaa=SimpleNamespace(
+            base_url="https://nyaa.invalid", proxy_mode="direct", proxy_url="", pre_search_command=""
+        ),
         qbittorrent=SimpleNamespace(enabled=False),
         aria2=SimpleNamespace(enabled=True),
     )
@@ -122,6 +126,7 @@ def test_selective_audiobook_download_can_use_aria2_backend(monkeypatch, tmp_pat
     class FakeThread:
         def __init__(self, *, target, args, name, daemon):
             thread_args.append(tuple(args))
+
         def start(self):
             pass
 
@@ -129,6 +134,7 @@ def test_selective_audiobook_download_can_use_aria2_backend(monkeypatch, tmp_pat
         @staticmethod
         def book(book_id: int):
             return {"id": book_id, "title": "狼と香辛料II", "series_title": "狼と香辛料", "volume": 2}
+
         @staticmethod
         def _release_volume_match(title: str, target: int):
             return (target == 2), (2, 2), (target == 2)
@@ -145,18 +151,21 @@ def test_selective_audiobook_download_can_use_aria2_backend(monkeypatch, tmp_pat
     api._audiobook_torrent_client = lambda: ("aria2", FakeTorrent())
     monkeypatch.setattr(web_app.threading, "Thread", FakeThread)
 
-    result = api.light_novel_download_audiobook_nyaa(180, {
-        "title": "狼と香辛料II～完全版オーディオブック (Spice and Wolf, Vol. 2 - Unabridged Japanese Audiobook)",
-        "link": "https://nyaa.invalid/view/2",
-        "torrent_url": "https://nyaa.invalid/download/2.torrent",
-        "info_hash": "a" * 40,
-        "size": "1.2 GiB",
-        "seeders": 20,
-        "trusted": True,
-        "target_volume": 2,
-        "collection": False,
-        "selected_files": [],
-    })
+    result = api.light_novel_download_audiobook_nyaa(
+        180,
+        {
+            "title": "狼と香辛料II～完全版オーディオブック (Spice and Wolf, Vol. 2 - Unabridged Japanese Audiobook)",
+            "link": "https://nyaa.invalid/view/2",
+            "torrent_url": "https://nyaa.invalid/download/2.torrent",
+            "info_hash": "a" * 40,
+            "size": "1.2 GiB",
+            "seeders": 20,
+            "trusted": True,
+            "target_volume": 2,
+            "collection": False,
+            "selected_files": [],
+        },
+    )
 
     assert priorities == [([1], 0)]
     assert started == ["aria-hash"]

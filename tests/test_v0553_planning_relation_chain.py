@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from css_support import css_rules
+
 from pudge.config import AppConfig, write_config
 from pudge.manager_models import LibraryAnime
 from pudge.providers.anilist import AniListClient
 from pudge.web_app import WebAppApi
+from test_v0552_planning_relations import DIAGRAM, planning_relations_state
 
 
 def make_api(tmp_path: Path) -> WebAppApi:
@@ -118,7 +121,9 @@ def test_anilist_library_caches_nested_relation_metadata(monkeypatch) -> None:
             "status": "FINISHED",
             "siteUrl": f"https://anilist.co/anime/{media_id}",
             "coverImage": {"large": f"https://img.example/{media_id}.jpg"},
-            "mediaListEntry": {"status": status, "progress": 12 if status == "COMPLETED" else 0} if status else None,
+            "mediaListEntry": {"status": status, "progress": 12 if status == "COMPLETED" else 0}
+            if status
+            else None,
             "relations": {"edges": children or []},
         }
 
@@ -190,15 +195,65 @@ def test_anilist_library_caches_nested_relation_metadata(monkeypatch) -> None:
     assert prequel["relations"][0]["media_id"] == 80
 
 
-def test_planning_ui_has_cover_chain_tooltips_and_context_actions() -> None:
-    html = (Path(__file__).parents[1] / "pudge" / "web" / "index.html").read_text(encoding="utf-8")
-    assert "prequel_levels" in html
-    assert "sequel_levels" in html
-    assert "relation-node-cover" in html
-    assert "data-tooltip" in html
-    assert "relation-node.watched" in html
-    assert "data-relation-node" in html
-    assert "showRelationMenu" in html
-    assert "add_to_planning" in html
-    assert "relation.prequelStep" in html
-    assert "relation.sequelStep" in html
+def test_relation_nodes_show_covers_and_watched_state(tmp_path: Path, page) -> None:
+    result = page.run(
+        DIAGRAM
+        + """
+        const cover = id => { const img = relationNode(id).querySelector('img.relation-node-cover');
+                              return img ? img.getAttribute('src') : relationNode(id).querySelector('.relation-node-cover').innerText; };
+        return {covers: [cover(90), cover(80)], placeholder: t('label.cover'),
+                watched: [90, 80, 110].map(id => relationNode(id).classList.contains('watched'))};
+        """,
+        state=planning_relations_state(tmp_path),
+    )
+    out = result.value
+    assert out["covers"] == ["https://img.example/90.jpg", out["placeholder"]]
+    assert out["watched"] == [True, False, False]  # Prequel is COMPLETED in the user's list
+    rules = css_rules("index.html")
+    assert rules.declarations(".relation-node.watched"), "watched relations are styled differently"
+
+
+MENU = (
+    DIAGRAM
+    + """
+const menuFor = async id => {
+  await __fire(`#plannedContent .relation-node[data-media-id="${id}"] .relation-node-title`, 'contextmenu', {clientX: 5, clientY: 5}, 'MouseEvent');
+  return {open: __visible('#contextMenu'), items: [...document.querySelectorAll('#contextMenu [data-context-action]')].map(b => [b.dataset.contextAction, b.innerText])};
+};
+const labels = {open: t('action.openAniList'), add: t('action.addPlanning'), remove: t('action.removePlanning'),
+                downloadOnly: t('action.downloadWithoutWatching'), added: t('toast.addedPlanning')};
+"""
+)
+
+
+def test_relation_context_menu_offers_actions_by_list_status(tmp_path: Path, page) -> None:
+    state = planning_relations_state(tmp_path)
+    for lang in ("en", "ru"):
+        result = page.run(
+            MENU
+            + """
+            const out = {labels, watched: await menuFor(90), planned: await menuFor(110), other: await menuFor(111)};
+            await __click('#contextMenu [data-context-action="add-planning"]');
+            await __tick(10);
+            out.toasts = __toasts();
+            out.menuClosed = !__visible('#contextMenu');
+            await menuFor(90);
+            await __click('#contextMenu [data-context-action="open"]');
+            await __tick(10);
+            return out;
+            """,
+            lang=lang,
+            state=state,
+            api={"add_to_planning": {"ok": True, "state": state}},
+        )
+        out, labels = result.value, result.value["labels"]
+        assert out["watched"] == {"open": True, "items": [["open", labels["open"]]]}
+        assert out["planned"]["items"] == [
+            ["open", labels["open"]],
+            ["download-only", labels["downloadOnly"]],
+            ["remove-planning", labels["remove"]],
+        ]
+        assert out["other"]["items"] == [["open", labels["open"]], ["add-planning", labels["add"]]]
+        assert result.calls_of("add_to_planning") == [[111]]
+        assert labels["added"] in out["toasts"] and out["menuClosed"] is True
+        assert result.calls_of("open_url") == [["https://anilist.co/anime/90"]]

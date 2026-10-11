@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib
+import json
+import tomllib
 from pathlib import Path
 
 from pudge.branding import (
@@ -13,6 +16,7 @@ from pudge.branding import (
     LEGACY_APP_SLUGS,
     LEGACY_BUNDLE_IDS,
 )
+from source_policy import source
 
 ROOT = Path(__file__).parents[1]
 
@@ -38,9 +42,16 @@ def test_legacy_brand_is_retained_only_for_migration() -> None:
 
 
 def test_packaging_points_at_pudge_namespace() -> None:
-    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'name = "pudge"' in text
-    assert 'pudge = "pudge.cli:main"' in text
-    assert 'pudge-agent = "pudge.agent:main"' in text
-    assert 'include = ["pudge*"]' in text
-    assert "anime" + "_mpv" not in text
+    # policy: the package metadata in pyproject.toml (name, console scripts, packages) is only
+    # read by pip/setuptools at install time; check it names the pudge namespace and that the
+    # console scripts lead to callables.
+    project = tomllib.loads(source("pyproject.toml"))
+    assert project["project"]["name"] == "pudge"
+    scripts = project["project"]["scripts"]
+    assert scripts == {"pudge": "pudge.cli:main", "pudge-agent": "pudge.agent:main"}
+    for target in scripts.values():
+        module, _, function = target.partition(":")
+        assert callable(getattr(importlib.import_module(module), function))
+    include = project["tool"]["setuptools"]["packages"]["find"]["include"]
+    assert include == ["pudge*"]
+    assert "anime" + "_mpv" not in json.dumps(project)

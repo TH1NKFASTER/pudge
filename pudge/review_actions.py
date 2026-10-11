@@ -17,6 +17,7 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
+from .i18n import err, t
 
 REVIEW_MODES = ("native", "binary")
 DEFAULT_REVIEW_MODE = "native"
@@ -32,27 +33,33 @@ class ReviewAction:
     default_key: str
 
 
+def _action(action_id: str, wire: str, label: str, tone: str, default_key: str) -> ReviewAction:
+    """Labels in both languages come from the interface catalog (``web.reviewGrade<Label>``)."""
+    key = f"web.reviewGrade{label}"
+    return ReviewAction(action_id, wire, t(key, lang="en"), t(key, lang="ru"), tone, default_key)
+
+
 _ACTIONS: dict[tuple[str, str], tuple[ReviewAction, ...]] = {
     ("jiten", "native"): (
-        ReviewAction("again", "again", "Again", "Снова", "again", "1"),
-        ReviewAction("hard", "hard", "Hard", "Трудно", "hard", "2"),
-        ReviewAction("good", "good", "Good", "Хорошо", "good", "3"),
-        ReviewAction("easy", "easy", "Easy", "Легко", "easy", "4"),
+        _action("again", "again", "Again", "again", "1"),
+        _action("hard", "hard", "Hard", "hard", "2"),
+        _action("good", "good", "Good", "good", "3"),
+        _action("easy", "easy", "Easy", "easy", "4"),
     ),
     ("jiten", "binary"): (
-        ReviewAction("fail", "again", "Fail", "Не помню", "again", "1"),
-        ReviewAction("pass", "good", "Pass", "Помню", "good", "2"),
+        _action("fail", "again", "Fail", "again", "1"),
+        _action("pass", "good", "Pass", "good", "2"),
     ),
     ("jpdb", "native"): (
-        ReviewAction("nothing", "nothing", "Nothing", "Ничего", "again", "1"),
-        ReviewAction("something", "something", "Something", "Что-то", "something", "2"),
-        ReviewAction("hard", "hard", "Hard", "Трудно", "hard", "3"),
-        ReviewAction("okay", "okay", "Okay", "Хорошо", "good", "4"),
-        ReviewAction("easy", "easy", "Easy", "Легко", "easy", "5"),
+        _action("nothing", "nothing", "Nothing", "again", "1"),
+        _action("something", "something", "Something", "something", "2"),
+        _action("hard", "hard", "Hard", "hard", "3"),
+        _action("okay", "okay", "Okay", "good", "4"),
+        _action("easy", "easy", "Easy", "easy", "5"),
     ),
     ("jpdb", "binary"): (
-        ReviewAction("fail", "fail", "Fail", "Не помню", "again", "1"),
-        ReviewAction("pass", "pass", "Pass", "Помню", "good", "2"),
+        _action("fail", "fail", "Fail", "again", "1"),
+        _action("pass", "pass", "Pass", "good", "2"),
     ),
 }
 
@@ -103,8 +110,7 @@ def normalize_shortcuts(value: Any) -> dict[str, str]:
             continue
         shortcut = str(raw or "").strip()
         if shortcut and (
-            not _SHORTCUT_RE.fullmatch(shortcut)
-            or shortcut.rsplit("+", 1)[-1].casefold() in _RESERVED_KEYS
+            not _SHORTCUT_RE.fullmatch(shortcut) or shortcut.rsplit("+", 1)[-1].casefold() in _RESERVED_KEYS
         ):
             continue
         out[key] = shortcut
@@ -129,8 +135,12 @@ def binding_conflicts(shortcuts: dict[str, str]) -> list[dict[str, Any]]:
             folded = shortcut.casefold()
             if folded in seen:
                 conflicts.append(
-                    {"provider": provider, "mode": mode, "shortcut": shortcut,
-                     "actions": [seen[folded], action_id]}
+                    {
+                        "provider": provider,
+                        "mode": mode,
+                        "shortcut": shortcut,
+                        "actions": [seen[folded], action_id],
+                    }
                 )
             else:
                 seen[folded] = action_id
@@ -143,16 +153,14 @@ def action_set_payload(provider: str, mode: str, shortcuts: dict[str, str]) -> d
         "provider": normalize_provider(provider),
         "mode": normalize_mode(mode),
         "actions": [
-            {**asdict(action), "shortcut": bindings[action.id]}
-            for action in actions_for(provider, mode)
+            {**asdict(action), "shortcut": bindings[action.id]} for action in actions_for(provider, mode)
         ],
     }
 
 
 def all_action_sets(shortcuts: dict[str, str]) -> dict[str, Any]:
     return {
-        f"{provider}:{mode}": action_set_payload(provider, mode, shortcuts)
-        for provider, mode in _ACTIONS
+        f"{provider}:{mode}": action_set_payload(provider, mode, shortcuts) for provider, mode in _ACTIONS
     }
 
 
@@ -167,6 +175,10 @@ def resolve_wire_grade(provider: str, mode: str, requested: str) -> str:
         if value == action.id:
             return action.wire
     raise ReviewActionError(
-        f"Review action {requested!r} is not available for "
-        f"{normalize_provider(provider)} in {normalize_mode(mode)} mode"
+        err(
+            "review.actionUnavailable",
+            action=repr(requested),
+            provider=normalize_provider(provider),
+            mode=normalize_mode(mode),
+        )
     )

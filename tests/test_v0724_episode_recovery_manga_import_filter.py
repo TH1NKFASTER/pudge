@@ -1,3 +1,5 @@
+"""Episode recovery, aria2 orphans, manga series removal and the LN import language filter of v0.7.24."""
+
 from __future__ import annotations
 
 import io
@@ -14,8 +16,6 @@ from pudge.manager import AnimeManager
 from pudge.manager_models import LibraryAnime, LibraryEpisode
 from pudge.manga import MangaService
 from pudge.providers.aria2 import Aria2Client
-
-ROOT = Path(__file__).parents[1]
 
 
 def _manager(tmp_path: Path) -> AnimeManager:
@@ -69,10 +69,8 @@ def test_debug_defaults_to_next_episode_instead_of_previous_ready_row(tmp_path: 
     assert snapshot["available_episodes"][-1]["state"] == "missing"
 
 
-def test_debug_episode_selector_hides_single_episode_media() -> None:
-    js = (ROOT / "pudge" / "web" / "debug.js").read_text(encoding="utf-8")
-    assert "totalEpisodes===1" in js
-    assert "format==='MOVIE'" in js
+# The debug window hides its episode picker for single-episode media and movies:
+# tests/test_v0717_episode_debug_torrent_context.py::test_anime_debug_switches_between_the_local_episodes.
 
 
 def test_aria2_orphaned_metadata_recovers_completed_episode_rows(tmp_path: Path, monkeypatch) -> None:
@@ -128,24 +126,28 @@ def test_orphaned_aria2_item_recreates_seihantai_episode_row(tmp_path: Path, mon
     video = folder / "[SubsPlease] Seihantai na Kimi to Boku - 19 (1080p) [C9121DE6].mkv"
     video.write_bytes(b"video")
     manager.db.upsert_anime(
-        LibraryAnime(media_id=210031, title="Seihantai na Kimi to Boku 2nd Season", episodes=13, status="CURRENT")
+        LibraryAnime(
+            media_id=210031, title="Seihantai na Kimi to Boku 2nd Season", episodes=13, status="CURRENT"
+        )
     )
     cache = manager.config.paths.cache_dir / "anilist-release-numbering" / "210031.json"
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text('{"offset":12,"resolver_version":2,"prequel_titles":[]}', encoding="utf-8")
 
     aria = Aria2Client(state_dir=tmp_path / "aria2", auto_start=False)
-    aria._save_metadata({
-        "forgotten": {
-            "info_hash": "f3a099e5c9a9519b1b406a23202f94e1e9d07157",
-            "title": video.name,
-            "save_path": str(folder),
-            "media_id": 210031,
-            "episode": 7,
-            "anime_title": "Seihantai na Kimi to Boku 2nd Season",
-            "completed_on": 10,
+    aria._save_metadata(
+        {
+            "forgotten": {
+                "info_hash": "f3a099e5c9a9519b1b406a23202f94e1e9d07157",
+                "title": video.name,
+                "save_path": str(folder),
+                "media_id": 210031,
+                "episode": 7,
+                "anime_title": "Seihantai na Kimi to Boku 2nd Season",
+                "completed_on": 10,
+            }
         }
-    })
+    )
     monkeypatch.setattr(aria, "_all_statuses", lambda: [])
     orphan = aria.torrents()[0]
     aria.close()
@@ -186,9 +188,9 @@ def test_manga_remove_series_keeps_source_files(tmp_path: Path) -> None:
     assert removed == 2
     assert service.state()["books"] == []
     assert first.is_file() and second.is_file()
-    js = (ROOT / "pudge" / "web" / "manga_reader_v2.js").read_text(encoding="utf-8")
-    assert 'data-manga-context-action="remove-series"' in js
-    assert "manga_remove_series" in js
+    # The window's "Remove from Pudge" (red, in volume and series menus) calls manga_remove_series:
+    # tests/test_v0726_fast_delete_drop_anilist_tombstones.py::test_removing_books_from_the_context_menu_does_not_wait_for_the_backend
+    # and test_v0723_nested_manga_cleanup_delete_ui.py::test_destructive_actions_are_red_everywhere.
 
 
 def test_light_novel_auto_import_language_gate_accepts_japanese_and_rejects_junk(tmp_path: Path) -> None:
@@ -200,9 +202,14 @@ def test_light_novel_auto_import_language_gate_accepts_japanese_and_rejects_junk
     service = LightNovelService(cfg)
 
     japanese = tmp_path / "rezero.txt"
-    japanese.write_text(("これは日本語のライトノベル本文です。彼は街を歩き、彼女と話しました。" * 30), encoding="utf-8")
+    japanese.write_text(
+        ("これは日本語のライトノベル本文です。彼は街を歩き、彼女と話しました。" * 30), encoding="utf-8"
+    )
     technical = tmp_path / "README.txt"
-    technical.write_text(("Python package build validation dependency links requirements source code license. " * 50), encoding="utf-8")
+    technical.write_text(
+        ("Python package build validation dependency links requirements source code license. " * 50),
+        encoding="utf-8",
+    )
     tiny = tmp_path / "BUILD_VALIDATION.txt"
     tiny.write_text("build validation ok", encoding="utf-8")
 
@@ -224,7 +231,9 @@ def test_light_novel_managed_folder_scan_skips_non_japanese_technical_files(tmp_
     cfg.paths.cache_dir = tmp_path / "cache"
     service = LightNovelService(cfg)
     (service.root / "README.txt").write_text("technical dependency metadata " * 80, encoding="utf-8")
-    (service.root / "Japanese.txt").write_text("これは日本語の本文です。物語が続きます。" * 40, encoding="utf-8")
+    (service.root / "Japanese.txt").write_text(
+        "これは日本語の本文です。物語が続きます。" * 40, encoding="utf-8"
+    )
 
     assert service.scan_downloaded() == 1
     titles = [book["title"] for book in service.books()]

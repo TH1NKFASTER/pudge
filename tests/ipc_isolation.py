@@ -1,4 +1,5 @@
 """Short temporary Unix-socket paths independent of pytest's base directory."""
+
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory

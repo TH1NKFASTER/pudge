@@ -1,4 +1,5 @@
 """Exact-path app alias cleanup, Dock pin preservation, and failure safety."""
+
 import copy
 import json
 import plistlib
@@ -30,9 +31,16 @@ class Preferences:
 
 
 def tile(path):
-    return {"GUID": 123, "tile-type": "file-tile", "tile-data": {
-        "file-data": {"_CFURLString": path.as_uri() + "/", "_CFURLStringType": 15},
-        "file-label": "Anime MPV", "book": b"old bookmark", "extra": "keep"}}
+    return {
+        "GUID": 123,
+        "tile-type": "file-tile",
+        "tile-data": {
+            "file-data": {"_CFURLString": path.as_uri() + "/", "_CFURLStringType": 15},
+            "file-label": "Anime MPV",
+            "book": b"old bookmark",
+            "extra": "keep",
+        },
+    }
 
 
 def execute(app, backup, prefs, names=("Anime MPV",), callback=None):
@@ -56,8 +64,9 @@ class AppAliasTests(unittest.TestCase):
         self.tmp_path = Path(self.temporary.name)
         self.app = self.tmp_path / "Applications" / "pudge.app"
         (self.app / "Contents").mkdir(parents=True)
-        (self.app / "Contents/Info.plist").write_bytes(plistlib.dumps(
-            {"CFBundleIdentifier": "com.pudge.app"}))
+        (self.app / "Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleIdentifier": "com.pudge.app"})
+        )
 
     def test_removes_only_current_alias_and_preserves_dock_tiles_absolute(self):
         app, tmp_path = self.app, self.tmp_path
@@ -67,7 +76,7 @@ class AppAliasTests(unittest.TestCase):
         other = tmp_path / "Other.app"
         original = [tile(other), tile(alias)]
         prefs = Preferences(copy.deepcopy(original))
-        backup, calls = execute(app, tmp_path / "backup.noindex", prefs)
+        backup_output, calls = execute(app, tmp_path / "backup.noindex", prefs)
         assert not alias.exists() and not alias.is_symlink()
         assert app.is_dir()
         assert prefs.values["persistent-apps"][0] == original[0]
@@ -77,8 +86,12 @@ class AppAliasTests(unittest.TestCase):
         assert changed["tile-data"]["file-data"]["_CFURLString"] == app.as_uri() + "/"
         assert changed["tile-data"]["bundle-identifier"] == "com.pudge.app"
         assert "book" not in changed["tile-data"]
-        assert plistlib.loads((backup / "dock-before.plist").read_bytes())["persistent-apps"] == original
-        assert json.loads((backup / "aliases.json").read_text()) == {str(alias): app.name if relative else str(app)}
+        assert (
+            plistlib.loads((backup_output / "dock-before.plist").read_bytes())["persistent-apps"] == original
+        )
+        assert json.loads((backup_output / "aliases.json").read_text()) == {
+            str(alias): app.name if relative else str(app)
+        }
         assert [LSREGISTER, "-u", str(alias)] in calls
         assert [LSREGISTER, "-f", str(app)] in calls
         assert ["/usr/bin/mdimport", str(app)] in calls
@@ -92,7 +105,7 @@ class AppAliasTests(unittest.TestCase):
         other = tmp_path / "Other.app"
         original = [tile(other), tile(alias)]
         prefs = Preferences(copy.deepcopy(original))
-        backup, calls = execute(app, tmp_path / "backup.noindex", prefs)
+        backup_output, calls = execute(app, tmp_path / "backup.noindex", prefs)
         assert not alias.exists() and not alias.is_symlink()
         assert app.is_dir()
         assert prefs.values["persistent-apps"][0] == original[0]
@@ -102,8 +115,12 @@ class AppAliasTests(unittest.TestCase):
         assert changed["tile-data"]["file-data"]["_CFURLString"] == app.as_uri() + "/"
         assert changed["tile-data"]["bundle-identifier"] == "com.pudge.app"
         assert "book" not in changed["tile-data"]
-        assert plistlib.loads((backup / "dock-before.plist").read_bytes())["persistent-apps"] == original
-        assert json.loads((backup / "aliases.json").read_text()) == {str(alias): app.name if relative else str(app)}
+        assert (
+            plistlib.loads((backup_output / "dock-before.plist").read_bytes())["persistent-apps"] == original
+        )
+        assert json.loads((backup_output / "aliases.json").read_text()) == {
+            str(alias): app.name if relative else str(app)
+        }
         assert [LSREGISTER, "-u", str(alias)] in calls
         assert [LSREGISTER, "-f", str(app)] in calls
         assert ["/usr/bin/mdimport", str(app)] in calls
@@ -111,7 +128,7 @@ class AppAliasTests(unittest.TestCase):
 
     def test_preserves_real_or_unrelated_legacy_path_directory(self):
         app, tmp_path = self.app, self.tmp_path
-        kind = 'directory'
+        kind = "directory"
         alias = app.parent / "Anime MPV.app"
         if kind == "directory":
             alias.mkdir()
@@ -132,7 +149,7 @@ class AppAliasTests(unittest.TestCase):
 
     def test_preserves_real_or_unrelated_legacy_path_foreign_symlink(self):
         app, tmp_path = self.app, self.tmp_path
-        kind = 'foreign-symlink'
+        kind = "foreign-symlink"
         alias = app.parent / "Anime MPV.app"
         if kind == "directory":
             alias.mkdir()
@@ -153,7 +170,7 @@ class AppAliasTests(unittest.TestCase):
 
     def test_preserves_real_or_unrelated_legacy_path_broken_symlink(self):
         app, tmp_path = self.app, self.tmp_path
-        kind = 'broken-symlink'
+        kind = "broken-symlink"
         alias = app.parent / "Anime MPV.app"
         if kind == "directory":
             alias.mkdir()
@@ -178,7 +195,9 @@ class AppAliasTests(unittest.TestCase):
         prefs = Preferences([tile(alias)])
         backup, _ = execute(app, tmp_path / "backup.noindex", prefs)
         assert backup and not alias.exists()
-        assert prefs.values["persistent-apps"][0]["tile-data"]["file-data"]["_CFURLString"] == app.as_uri() + "/"
+        assert (
+            prefs.values["persistent-apps"][0]["tile-data"]["file-data"]["_CFURLString"] == app.as_uri() + "/"
+        )
 
     def test_repeat_does_not_create_extra_backups_or_restart_dock(self):
         app, tmp_path = self.app, self.tmp_path
@@ -214,7 +233,7 @@ class AppAliasTests(unittest.TestCase):
         assert not (tmp_path / "backup.noindex").exists()
 
     def test_tile_transform_ignores_remote_urls_and_malformed_tiles(self):
-        app, tmp_path = self.app, self.tmp_path
+        tmp_path = self.tmp_path
         alias = tmp_path / "Anime MPV.app"
         data = [None, "invalid", tile(alias)]
         data[2]["tile-data"]["file-data"]["_CFURLString"] = "file://remote" + str(alias)

@@ -21,15 +21,11 @@ def _write_cbz(path: Path, count: int = 3) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         for index in range(count):
             buffer = io.BytesIO()
-            Image.new("RGB", (32 + index, 40 + index), "white").save(
-                buffer, format="PNG"
-            )
+            Image.new("RGB", (32 + index, 40 + index), "white").save(buffer, format="PNG")
             archive.writestr(f"{index + 1:03d}.png", buffer.getvalue())
 
 
-def test_single_page_ocr_update_reads_only_changed_archive_page(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_single_page_ocr_update_reads_only_changed_archive_page(tmp_path: Path, monkeypatch) -> None:
     db = Database(tmp_path / "manga.sqlite3")
     service = MangaService(db, cache_dir=tmp_path / "cache")
     archive_path = tmp_path / "book.cbz"
@@ -73,9 +69,7 @@ def test_single_page_ocr_update_reads_only_changed_archive_page(
     assert int(artifact["revision"]) == service._ocr_context(book_id)[2]
 
 
-def test_incremental_page_refresh_preserves_other_artifact_pages(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_incremental_page_refresh_preserves_other_artifact_pages(tmp_path: Path, monkeypatch) -> None:
     db = Database(tmp_path / "manga.sqlite3")
     service = MangaService(db, cache_dir=tmp_path / "cache")
     archive_path = tmp_path / "book.cbz"

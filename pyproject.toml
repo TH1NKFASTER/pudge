@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pudge"
-version = "0.7.30"
+version = "0.8.0"
 description = "A local-first Mac app for anime, Japanese subtitles, manga, Light Novels, and audiobooks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,13 +32,12 @@ sync = [
   "ffsubsync>=0.4.31,<0.5",
   "mlx-whisper>=0.4.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-manga = ["manga-ocr>=0.1.14,<1"]
 dev = [
   "coverage[toml]>=7,<8",
   "hypothesis>=6,<7",
   "mypy>=1.13,<2",
   "pytest>=8,<9",
-  "ruff>=0.9,<1",
+  "ruff>=0.16,<0.17",
 ]
 
 [project.scripts]
@@ -49,7 +48,7 @@ pudge-agent = "pudge.agent:main"
 include = ["pudge*"]
 
 [tool.setuptools.package-data]
-pudge = ["build-info.json", "brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "web/companion/*", "subtitles/*.json", "assets/*", "THIRD_PARTY_NOTICES.md"]
+pudge = ["build-info.json", "brand.env", "config.example.toml", "mpv_scripts/*.lua", "web/*.html", "web/*.css", "web/*.js", "web/*.png", "subtitles/*.json", "assets/*", "THIRD_PARTY_NOTICES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -103,9 +103,7 @@ def _download(hash_value: str, *, backend: str, progress: float = 0.1) -> Downlo
     )
 
 
-def test_partial_backend_failure_does_not_prune_other_backend_rows(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_partial_backend_failure_does_not_prune_other_backend_rows(tmp_path: Path, monkeypatch) -> None:
     cfg = AppConfig()
     cfg.config_path = tmp_path / "config.toml"
     cfg.library.database_path = tmp_path / "library.sqlite3"
@@ -127,22 +125,14 @@ def test_partial_backend_failure_does_not_prune_other_backend_rows(
             ("aria2", _StaticClient([aria_item])),
         ],
     )
-    monkeypatch.setattr(
-        manager, "_discard_completed_aria2_recovery_tasks", lambda *_args: 0
-    )
+    monkeypatch.setattr(manager, "_discard_completed_aria2_recovery_tasks", lambda *_args: 0)
     monkeypatch.setattr(manager, "_recover_stalled_aria2_downloads", lambda *_args: 0)
-    monkeypatch.setattr(
-        manager, "_discard_watched_empty_aria2_shells", lambda _client, items: items
-    )
+    monkeypatch.setattr(manager, "_discard_watched_empty_aria2_shells", lambda _client, items: items)
     monkeypatch.setattr(manager, "_remove_missing_episode_rows", lambda _hashes: 0)
     monkeypatch.setattr(manager, "_resolve_download_media", lambda _item: None)
     monkeypatch.setattr(manager, "_recover_stale_aria2_zero_shell", lambda _item: None)
-    monkeypatch.setattr(
-        manager, "_stale_aria2_row_shadowed_by_completed_local", lambda *_args: False
-    )
-    monkeypatch.setattr(
-        manager, "_repair_stale_completed_current_download_intents", lambda _items: 0
-    )
+    monkeypatch.setattr(manager, "_stale_aria2_row_shadowed_by_completed_local", lambda *_args: False)
+    monkeypatch.setattr(manager, "_repair_stale_completed_current_download_intents", lambda _items: 0)
 
     manager.sync_downloads()
 
@@ -215,7 +205,7 @@ def test_concurrent_artifact_writers_use_independent_tempfiles(tmp_path: Path) -
 
     assert not failures
     assert all(not thread.is_alive() for thread in threads)
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads((tmp_path / "artifact.json").read_text(encoding="utf-8"))
     assert payload["writer"] in range(8)
     assert not list(tmp_path.glob("*.tmp"))
 
@@ -234,9 +224,7 @@ def test_artifact_revision_matches_current_ocr_projection(tmp_path: Path) -> Non
         generation=generation,
         updates=[(0, [{"text": "current"}], "ready", "", False)],
     )
-    current_fingerprint, current_generation, current_revision = service._ocr_context(
-        book_id
-    )
+    current_fingerprint, current_generation, current_revision = service._ocr_context(book_id)
     artifact = read_artifact(service._ocr_artifact_path(book_id))
     assert artifact is not None
     assert artifact["source"]["fingerprint"] == current_fingerprint

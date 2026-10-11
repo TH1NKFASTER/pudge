@@ -191,7 +191,11 @@ package.preload['mp.msg'] = function() return mp.msg end
 sim = {log = log, props = props, bindings = bindings}
 
 function sim.set(name, value) props[name] = value; notify(name) end
-function sim.fire(name) for _, fn in ipairs(events[name] or {}) do fn({event = name}) end end
+function sim.fire(name, fields)
+    local event = {event = name}
+    for key, value in pairs(fields or {}) do event[key] = value end
+    for _, fn in ipairs(events[name] or {}) do fn(event) end
+end
 function sim.run_timers()
     for _, t in ipairs(timers) do
         if t.active and t.due <= clock + 1e-9 then

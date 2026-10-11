@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from .i18n import err
 from .runtime import worker_environment
 
 
@@ -33,7 +34,10 @@ def mpv_supports_option(mpv: str, option: str) -> bool:
         try:
             result = subprocess.run(
                 [mpv, "--no-config", "--list-options"],
-                capture_output=True, text=True, timeout=3.0, check=False,
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
             )
         except Exception:  # noqa: BLE001 - optional capability probe
             return False
@@ -45,6 +49,26 @@ def mpv_supports_option(mpv: str, option: str) -> bool:
         if key is not None:
             _MPV_OPTION_CACHE[key] = options
     return f"--{option}" in options
+
+
+def _user_mpv_config_mentions(option: str) -> bool:
+    """Whether the user's mpv.conf sets ``option`` anywhere (any profile counts)."""
+    roots: list[Path] = []
+    if os.getenv("MPV_HOME", "").strip():
+        roots.append(Path(os.environ["MPV_HOME"]).expanduser())
+    xdg = os.getenv("XDG_CONFIG_HOME", "").strip()
+    roots.append((Path(xdg).expanduser() if xdg else Path.home() / ".config") / "mpv")
+    roots.append(Path.home() / ".mpv")
+    for root in roots:
+        try:
+            text = (root / "mpv.conf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            name = line.split("#", 1)[0].strip().lstrip("-").split("=", 1)[0].strip().casefold()
+            if name in {option, f"no-{option}"}:
+                return True
+    return False
 
 
 def build_mpv_command(
@@ -68,7 +92,20 @@ def build_mpv_command(
     # A Pudge playback session owns one video and must finish with it. Global
     # mpv profiles must not leave an idle player/helper after its content closes.
     command.append("--idle=no")
-    if not any(arg == "--keep-open" or arg.startswith("--keep-open=") or arg == "--no-keep-open" for arg in extra_args):
+    # Hardware decoding (VideoToolbox) costs a few watts less than software
+    # decoding for the whole episode; mpv falls back to software by itself for
+    # codecs the GPU cannot decode. A choice in the user's arguments or mpv.conf wins.
+    if (
+        sys.platform == "darwin"
+        and not any(arg.startswith("--hwdec") or arg.startswith("--no-hwdec") for arg in extra_args)
+        and not _user_mpv_config_mentions("hwdec")
+        and mpv_supports_option(mpv, "hwdec")
+    ):
+        command.append("--hwdec=videotoolbox")
+    if not any(
+        arg == "--keep-open" or arg.startswith("--keep-open=") or arg == "--no-keep-open"
+        for arg in extra_args
+    ):
         command.append("--keep-open=no")
     # mpv can collapse gaps shorter than 210 ms when sub-fix-timing is enabled
     # in the global mpv.conf. That recreates exact boundaries and makes libass
@@ -130,7 +167,7 @@ def _focus_mpv_process(pid: int) -> None:
         return
     script = (
         'tell application "System Events" to set frontmost of first process '
-        f'whose unix id is {int(pid)} to true'
+        f"whose unix id is {int(pid)} to true"
     )
     for delay in (0.15, 0.35, 0.7):
         time.sleep(delay)
@@ -151,6 +188,7 @@ def _focus_mpv_process(pid: int) -> None:
 def _observe_decoder(process, ipc_socket, logger):
     import socket
     import threading
+
     def sample():
         for _ in range(12):
             if process.poll() is not None:
@@ -159,23 +197,33 @@ def _observe_decoder(process, ipc_socket, logger):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                     client.settimeout(1)
                     client.connect(ipc_socket)
-                    client.sendall(b'{"command":["get_property","hwdec-current"],"request_id":91}\n{"command":["get_property","video-codec"],"request_id":92}\n')
+                    client.sendall(
+                        b'{"command":["get_property","hwdec-current"],"request_id":91}\n{"command":["get_property","video-codec"],"request_id":92}\n'
+                    )
                     values = {}
                     with client.makefile("r") as reader:
                         for _ in range(32):
                             line = reader.readline()
-                            if not line: break
+                            if not line:
+                                break
                             row = json.loads(line)
-                            if row.get("request_id") in {91,92} and row.get("error") == "success":
+                            if row.get("request_id") in {91, 92} and row.get("error") == "success":
                                 values[row["request_id"]] = row.get("data")
-                            if len(values) == 2: break
+                            if len(values) == 2:
+                                break
                     if values.get(92):
-                        logger.info("EVENT mpv.decoder pid=%s hwdec=%s codec=%s", process.pid, values.get(91), values[92])
+                        logger.info(
+                            "EVENT mpv.decoder pid=%s hwdec=%s codec=%s",
+                            process.pid,
+                            values.get(91),
+                            values[92],
+                        )
                         return
             except (OSError, ValueError):
                 pass
-            time.sleep(.5)
-    threading.Thread(target=sample,name="mpv-decoder-probe",daemon=True).start()
+            time.sleep(0.5)
+
+    threading.Thread(target=sample, name="mpv-decoder-probe", daemon=True).start()
 
 
 def run_mpv(
@@ -194,7 +242,7 @@ def run_mpv(
     try:
         process = subprocess.Popen(command, env=env)
     except FileNotFoundError as exc:
-        raise RuntimeError(f"Не найден mpv: {command[0]}") from exc
+        raise RuntimeError(err("media.mpvNotFound", path=command[0])) from exc
     ack_path = _write_mpv_start_ack(process.pid)
     try:
         from .logging_utils import configure_logging
@@ -211,7 +259,10 @@ def run_mpv(
     if focus:
         _focus_mpv_process(process.pid)
     from .playback_process import wait_playback_process
-    ipc_socket = next((arg.split("=", 1)[1] for arg in command if arg.startswith("--input-ipc-server=")), None)
+
+    ipc_socket = next(
+        (arg.split("=", 1)[1] for arg in command if arg.startswith("--input-ipc-server=")), None
+    )
     if logger is None:
         return wait_playback_process(process, ipc_socket=ipc_socket)
     if ipc_socket:

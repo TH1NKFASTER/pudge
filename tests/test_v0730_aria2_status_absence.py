@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 
+from pudge import i18n
 from pudge.manager import AnimeManager
 from pudge.providers.aria2 import Aria2Client, Aria2Error
 
@@ -39,11 +40,14 @@ def rpc_client(tmp_path):
         client.close()
 
 
-@pytest.mark.parametrize("message", [
-    f"GID #{GID}# is not found",
-    f"GID {GID} is not found",
-    f"Invalid GID {GID}",
-])
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"GID #{GID}# is not found",
+        f"GID {GID} is not found",
+        f"Invalid GID {GID}",
+    ],
+)
 def test_missing_gid_status_returns_none(rpc_client, message):
     def respond(method, _params):
         if method in {"aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"}:
@@ -54,13 +58,16 @@ def test_missing_gid_status_returns_none(rpc_client, message):
     assert rpc_client(respond).torrent_status(GID) is None
 
 
-@pytest.mark.parametrize("message", [
-    "permission denied",
-    "File not found",
-    "Invalid GID unrelated-value",
-    "GID #fedcba0987654321# is not found",
-    f"permission denied; GID #{GID}# is not found",
-])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "permission denied",
+        "File not found",
+        "Invalid GID unrelated-value",
+        "GID #fedcba0987654321# is not found",
+        f"permission denied; GID #{GID}# is not found",
+    ],
+)
 def test_other_rpc_status_errors_are_not_absence(rpc_client, message):
     def respond(method, _params):
         if method in {"aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"}:
@@ -79,8 +86,9 @@ def test_network_error_containing_missing_gid_text_is_not_absence(rpc_client):
         assert method == "aria2.tellStatus"
         raise httpx.ConnectError(f"GID #{GID}# is not found")
 
-    with pytest.raises(Aria2Error, match="RPC недоступен"):
+    with pytest.raises(Aria2Error, match="aria2 RPC unavailable") as raised:
         rpc_client(respond).torrent_status(GID)
+    assert i18n.message(str(raised.value), "ru").startswith("aria2 RPC недоступен")
 
 
 def test_gid_resolution_failure_is_not_absence(rpc_client):
@@ -95,8 +103,12 @@ def test_gid_resolution_failure_is_not_absence(rpc_client):
 def test_manager_confirms_real_aria2_removal_after_metadata_is_deleted(tmp_path, rpc_client):
     video = tmp_path / "episode.mkv"
     video.write_bytes(b"owned video")
-    item = {"gid": GID, "infoHash": INFO_HASH, "status": "active",
-            "files": [{"path": str(video), "length": "11", "completedLength": "11", "selected": "true"}]}
+    item = {
+        "gid": GID,
+        "infoHash": INFO_HASH,
+        "status": "active",
+        "files": [{"path": str(video), "length": "11", "completedLength": "11", "selected": "true"}],
+    }
     tasks = {GID: item}
 
     def respond(method, params):

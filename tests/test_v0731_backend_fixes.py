@@ -116,16 +116,16 @@ def test_analyze_audio_activity_kills_hung_decoder_after_timeout(tmp_path: Path)
 def test_write_srt_is_atomic_when_replace_fails(tmp_path: Path, monkeypatch) -> None:
     from pudge import subtitle_formats
 
-    target = tmp_path / "out.srt"
-    target.write_text("1\n00:00:01,000 --> 00:00:02,000\nold\n", encoding="utf-8")
+    output_srt = tmp_path / "out.srt"
+    output_srt.write_text("1\n00:00:01,000 --> 00:00:02,000\nold\n", encoding="utf-8")
 
     def boom(_src, _dst):
         raise OSError("disk full")
 
     monkeypatch.setattr(subtitle_formats.os, "replace", boom)
     with pytest.raises(OSError):
-        subtitle_formats.write_srt([(1.0, 2.0, "new")], target)
-    assert "old" in target.read_text(encoding="utf-8")
+        subtitle_formats.write_srt([(1.0, 2.0, "new")], output_srt)
+    assert "old" in output_srt.read_text(encoding="utf-8")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.srt"]
 
 
@@ -253,7 +253,9 @@ class _FakeClient:
 
 
 @pytest.mark.parametrize("protected", [True, False])
-def test_enforce_disk_limit_skips_identity_repair_protected_file(tmp_path: Path, monkeypatch, protected: bool) -> None:
+def test_enforce_disk_limit_skips_identity_repair_protected_file(
+    tmp_path: Path, monkeypatch, protected: bool
+) -> None:
     manager = _manager(tmp_path)
     video = manager.config.library.root_dir / "Show" / "ep1.mkv"
     video.parent.mkdir()
@@ -274,7 +276,8 @@ def test_enforce_disk_limit_skips_identity_repair_protected_file(tmp_path: Path,
     )
     deleted: list[str] = []
     monkeypatch.setattr(
-        manager, "storage_status",
+        manager,
+        "storage_status",
         lambda: {"over_limit": True, "used_bytes": 4096, "limit_bytes": 1},
     )
     monkeypatch.setattr(manager, "downloads_enabled", lambda: True)
